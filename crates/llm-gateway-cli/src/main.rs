@@ -180,7 +180,7 @@ fn models(config_path: &Path) -> Result<ExitCode, String> {
         }
 
         for model in &models {
-            let route = config.credentials_for(model).join(" → ");
+            let route = gateway.route_names(model).await.join(" → ");
             println!("{model}\t{route}");
         }
         Ok(ExitCode::SUCCESS)

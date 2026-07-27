@@ -64,6 +64,11 @@ impl<P: Persistence> Gateway<P> {
         self.router.models().await
     }
 
+    /// このモデルを実際に試す順。設定の優先順のうち、扱える経路だけ。
+    pub async fn route_names(&self, model: &str) -> Vec<String> {
+        self.router.route_names(model).await
+    }
+
     /// 転送する。
     ///
     /// `path` は `/v1/messages` のようなクライアントが叩いたパス。

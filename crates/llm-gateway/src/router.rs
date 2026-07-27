@@ -205,6 +205,24 @@ impl Router {
             .unwrap_or_else(|| model.to_owned())
     }
 
+    /// このモデルを実際に試す順。表示用。
+    ///
+    /// 設定の優先順そのままではなく、**そのモデルを扱える credential だけ**に
+    /// 絞ったもの。設定を見ただけでは分からないので、確認に使える。
+    pub async fn route_names(&self, model: &str) -> Vec<String> {
+        let model = self.resolve(model).await;
+        let catalog = self.catalog.read().await;
+        let Some(available) = catalog.models.get(&model) else {
+            return Vec::new();
+        };
+        self.config
+            .credentials_for(&model)
+            .into_iter()
+            .filter(|name| available.iter().any(|a| a == name))
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// この会話でこのモデルを使うときの経路を、試す順に返す。
     pub async fn routes_for(&self, model: &str, session: &SessionKey) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
@@ -541,6 +559,47 @@ credentials = ["cpa"]
             vec!["oauth-a", "oauth-b"],
             "別のモデルには効かない"
         );
+    }
+
+    /// 表示用の経路は、実際に試すものと一致する。
+    ///
+    /// 設定の優先順をそのまま出すと、そのモデルを扱えない credential まで
+    /// 並んで実態と食い違う。
+    #[tokio::test]
+    async fn route_names_match_what_is_actually_tried() {
+        let r = router().await;
+        let s = session("s1");
+
+        for model in [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let actual: Vec<String> = r
+                .routes_for(model, &s)
+                .await
+                .unwrap()
+                .iter()
+                .map(|route| route.name().to_owned())
+                .collect();
+            assert_eq!(r.route_names(model).await, actual, "{model}");
+        }
+    }
+
+    /// エイリアスでも実際の経路を出す。
+    #[tokio::test]
+    async fn route_names_resolves_aliases() {
+        let r = router().await;
+        assert_eq!(
+            r.route_names("fable").await,
+            r.route_names("claude-fable-5").await
+        );
+    }
+
+    #[tokio::test]
+    async fn route_names_is_empty_for_unknown_model() {
+        let r = router().await;
+        assert!(r.route_names("no-such-model").await.is_empty());
     }
 
     /// 一覧が空なら何も出さない (起動直後で discovery 前の状態)。
