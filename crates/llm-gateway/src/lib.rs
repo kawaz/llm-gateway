@@ -11,10 +11,12 @@
 pub mod backend;
 pub mod config;
 pub mod credential;
+pub mod gateway;
 pub mod router;
 pub mod session;
 
 pub use config::Config;
+pub use gateway::Gateway;
 
 mod error;
 
