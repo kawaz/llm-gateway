@@ -466,3 +466,28 @@ deny_beta = ["some-flag"]
         );
     }
 }
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// 配る雛形が実際に読めるか。壊れていると `just init-config` の直後に
+    /// 起動できず、初めて使う人が最初につまずく。
+    #[test]
+    fn shipped_example_is_valid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../dist/config.example.toml"
+        );
+        let raw = std::fs::read_to_string(path).expect("dist/config.example.toml が要る");
+        let config: Config = toml::from_str(&raw).expect("雛形が壊れている");
+        config.validate().expect("雛形の参照が壊れている");
+
+        assert!(config.models.contains_key("claude-fable-5"));
+        assert_eq!(
+            config.models["claude-fable-5"].upstream_name.as_deref(),
+            Some("anthropic.claude-fable-5"),
+            "Bedrock は upstream のモデル名を要求する"
+        );
+    }
+}

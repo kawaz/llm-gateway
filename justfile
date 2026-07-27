@@ -49,6 +49,84 @@ build:
 # check + test + build (CI entry point)
 ci: check test build
 
+# ---------- 常駐 (launchd) ----------
+
+# 常駐の識別子。plist 名・launchctl の対象・ログ先の全部がこれで決まる
+label := "com.kawaz.llm-gateway"
+
+# ビルドして launchd に登録する (既に居れば入れ替える)
+[script]
+install: build
+    label="{{label}}"
+    plist="$HOME/Library/LaunchAgents/$label.plist"
+    binary="$PWD/target/release/llm-gateway"
+    config="${XDG_CONFIG_HOME:-$HOME/.config}/llm-gateway/config.toml"
+    log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/llm-gateway/logs"
+
+    if [ ! -f "$config" ]; then
+        echo >&2 "設定がありません: $config"
+        echo >&2 "  just init-config で雛形を作れます"
+        exit 1
+    fi
+
+    mkdir -p "$log_dir" "$(dirname "$plist")"
+    sed -e "s|@LABEL@|$label|g" \
+        -e "s|@BINARY@|$binary|g" \
+        -e "s|@CONFIG@|$config|g" \
+        -e "s|@LOG_DIR@|$log_dir|g" \
+        dist/com.kawaz.llm-gateway.plist.in > "$plist"
+
+    # 入れ替え時に古い定義が残らないよう、一度外してから入れる
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    echo "登録しました: $label"
+    echo "  設定  $config"
+    echo "  ログ  $log_dir"
+
+# launchd から外す (plist も消す)
+[script]
+uninstall:
+    label="{{label}}"
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$label.plist"
+    echo "解除しました: $label"
+
+# 入れ替えずに再起動する (設定を読み直したいとき)
+restart:
+    launchctl kickstart -k "gui/$(id -u)/{{label}}"
+
+# 常駐しているか、待ち受けているか
+[script]
+status:
+    label="{{label}}"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        launchctl print "gui/$(id -u)/$label" | grep -E '^\s*(state|pid|last exit code) ' || true
+    else
+        echo "登録されていません ($label)"
+        exit 1
+    fi
+    listen=$(awk -F'"' '/^listen/ {print $2; exit}' "${XDG_CONFIG_HOME:-$HOME/.config}/llm-gateway/config.toml" 2>/dev/null)
+    [ -n "$listen" ] && lsof -nP -iTCP@"${listen%:*}" -sTCP:LISTEN 2>/dev/null | grep ":${listen##*:} " || true
+
+# ログを追う
+[script]
+logs *args:
+    log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/llm-gateway/logs"
+    tail -F "$@" "$log_dir/stdout.log" "$log_dir/stderr.log"
+
+# 設定の雛形を作る (既にあれば触らない)
+[script]
+init-config:
+    config="${XDG_CONFIG_HOME:-$HOME/.config}/llm-gateway/config.toml"
+    if [ -f "$config" ]; then
+        echo "既にあります: $config"
+        exit 0
+    fi
+    mkdir -p "$(dirname "$config")"
+    cp dist/config.example.toml "$config"
+    echo "作成しました: $config"
+    echo "認証情報を ${XDG_STATE_HOME:-$HOME/.local/state}/llm-gateway/credentials/ に置いてください"
+
 # uncommitted change がない状態か確認
 [private]
 ensure-clean:

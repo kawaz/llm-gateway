@@ -424,9 +424,17 @@ cache-warden の `macos-process-inspect` は、Unix socket の接続相手を
 (cache-warden の `approver-run` recipe と同じ形)。dev build も実 identity で
 署名する — ad-hoc 署名では Team ID が付かず peer 認証を通れないため。
 
-常駐は launchd で行う。cpa と同じ「plist → ラッパスクリプト → バイナリ」形式に
-揃える (cpa からの移行なので運用形態を変えない)。ラッパが要るのは、launchd が
-plist 内で環境変数の展開やディレクトリ作成をできないため。
+常駐は launchd で行う。**plist から直接バイナリを起動する** (ラッパを挟まない)。
+
+cpa は「plist → `start.sh` → バイナリ」の 3 段だったが、これは
+**cpa 固有の制約への対処**であって真似する理由がない。cpa はログの出力先を
+コードで決め打っており設定から変えられないため、ラッパで `WRITABLE_PATH` を
+用意してから `exec` する必要があった。llm-gateway は自分で書くので、
+
+- ログ先は plist の `StandardOutPath` / `StandardErrorPath` で指定する
+- そのディレクトリはバイナリ自身が起動時に作る
+
+とすれば 2 段で済む。段を減らすほど、起動失敗時に見る場所が減る。
 
 `.app` bundle 方式 (cache-warden) は採らない。あれは TCC 権限 (TouchID) が
 要る cache-warden 固有の事情によるもので、本リポには不要。

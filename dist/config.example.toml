@@ -1,0 +1,70 @@
+# llm-gateway の設定。
+#
+# 置き場は $XDG_CONFIG_HOME/llm-gateway/config.toml (--config で変更可)。
+# 認証情報の中身はここに書かない。store のディレクトリに <key>.json を置く。
+
+[server]
+# cpa が 8317 / 8318 を使っているので、当面はぶつからない番号にしておく。
+listen = "127.0.0.1:8319"
+
+[store]
+type = "file"
+# 省略時は $XDG_STATE_HOME/llm-gateway/credentials
+# dir = "/path/to/credentials"
+
+# ---------------------------------------------------------------------------
+# 認証情報
+#
+# キーが store 内のファイル名になる (claude-personal → claude-personal.json)。
+# relay 以外は、そのファイルに token を置く必要がある。cpa から移すなら
+#   cp ~/.config/cliproxyapi/auth-personal/claude-*.json <store dir>/
+# で足りる (形式が同じ)。
+# ---------------------------------------------------------------------------
+
+[credentials.claude-personal]
+type = "claude_oauth"
+
+[credentials.claude-work]
+type = "claude_oauth"
+
+# Bedrock。モデル名が自分の名前空間なので、下の models で upstream_name を指定する。
+[credentials.bedrock]
+type = "claude_bedrock"
+url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+# 受け付けない beta フラグは既定で落とす。顔ぶれを変えたいときだけ書く。
+# deny_beta = ["oauth-2025-04-20", "prompt-caching-scope-2026-01-05"]
+
+# gpt 系は当面 cpa に任せる。cpa 側が認証を持つので、ここに鍵は要らない。
+[credentials.cpa]
+type = "relay"
+url = "http://127.0.0.1:8317"
+
+# ---------------------------------------------------------------------------
+# モデルごとの経路
+#
+# credentials は優先順。上から試し、経路が断たれていれば次へ回る。
+# ここに無いモデルは 404 になる。
+# ---------------------------------------------------------------------------
+
+# 通常は Bedrock (Claude アカウントを消費しない)。落ちている間だけ OAuth へ。
+[models."claude-fable-5"]
+upstream_name = "anthropic.claude-fable-5"
+credentials = ["bedrock", "claude-personal"]
+
+[models."claude-opus-5"]
+credentials = ["claude-personal", "claude-work"]
+
+[models."claude-sonnet-5"]
+credentials = ["claude-personal", "claude-work"]
+
+[models."claude-haiku-4-5-20251001"]
+credentials = ["claude-personal", "claude-work"]
+
+[models."gpt-5.6-sol"]
+credentials = ["cpa"]
+
+[models."gpt-5.6-terra"]
+credentials = ["cpa"]
+
+[models."gpt-5.6-luna"]
+credentials = ["cpa"]

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  llm-gateway の launchd 定義のひな形。`just install` が @PLACEHOLDER@ を
+  埋めて ~/Library/LaunchAgents/ に置く。
+
+  ラッパスクリプトを挟まず、ここから直接バイナリを起動する。ログの出力先は
+  下の StandardOutPath / StandardErrorPath で指定し、そのディレクトリは
+  バイナリが起動時に自分で作る。
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>@BINARY@</string>
+		<string>serve</string>
+		<string>--config</string>
+		<string>@CONFIG@</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<!--
+	  起動直後に落ち続ける状態 (設定の誤り等) で回り続けないよう間隔を空ける。
+	  既定の 1 秒だと、原因を直す前にログが埋まる。
+	-->
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/stdout.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/stderr.log</string>
+
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
