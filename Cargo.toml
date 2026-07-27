@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/llm-gateway",
+    "crates/llm-gateway-server",
+    "crates/llm-gateway-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["Yoshiaki Kawazu <kawazzz@gmail.com>"]
+repository = "https://github.com/kawaz/llm-gateway"
+description = "クライアントに認証を意識させない、薄い LLM proxy"
+
+[workspace.dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "fs",
+] }
+# サーバ側。http1 のみ (バインド先は 127.0.0.1、h2 を話す相手がいない)。
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+# upstream への転送。stream は SSE のバイト列中継に必須。
+# http2 は upstream (api.anthropic.com / bedrock) が対応しているので有効化する。
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "rustls",
+    "rustls-native-certs",
+] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: リクエストボディを読み書きする時にキー順を保つ。
+# gateway は model フィールドしか触らないので、それ以外は入力のまま返したい。
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "1", default-features = false, features = [
+    "parse",
+    "display",
+    "serde",
+] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# 秘密の Drop 時消去。cache-warden と同じ選択。
+zeroize = { version = "1", features = ["derive"] }
+url = { version = "2", features = ["serde"] }
+futures-util = { version = "0.3", default-features = false }
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

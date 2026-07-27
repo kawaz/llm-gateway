@@ -326,7 +326,17 @@ cpa も `singleflight.Group` を使っており、`refresh_token_reused` エラ�
 - リフレッシュを試す前のバックアップは
   `~/.cache/llm-gateway/auth-backup/<timestamp>/` に取る (取得済み)
 
-cache-warden の暗号化永続が固まったら `CacheWarden` 実装を足して差し替える。
+cache-warden の永続化が固まったら `CacheWarden` 実装を足して差し替える。
+
+**移行後に得られるのは暗号化だけではない**。cache-warden は Unix socket の
+接続相手を署名で検証できる (`macos-process-inspect` の `verify_peer`)。
+平文ファイルは「同じ UID なら誰でも読める」のに対し、cache-warden 経由なら
+**同じ Team ID で署名されたバイナリからしか取得できない**状態を作れる。
+gateway 本体に署名する理由もここにある (上記「配布しない」節)。
+
+つまり `Persistence` の 2 実装は「同じことを別の場所でやる」のではなく、
+**アクセス制御の有無が違う**。v1 が平文なのは cache-warden 側の準備待ちであって、
+この差を許容し続ける判断ではない。
 
 ### OAuth リフレッシュの仕様 (cpa v7.2.100 のソースで確定)
 
@@ -388,10 +398,31 @@ Phase 1 の時点で、直近 6 万行のモデル別内訳
 | GH Release / tag / 配布 artifact | **無し**。`.github/workflows/release.yml` を作らない |
 | `check-version-bumped` gate | **無し**。リリースしないので version を進める意味がない |
 | README / DESIGN の英訳ペア | **無し**。日本語のみ (公開・配布しないため) |
-| `.app` bundle / codesign / notarize | **無し** |
+| `.app` bundle | **無し** |
+| **codesign** | **する** (kawaz 裁定 mid=20) |
+| notarize | **無し**。ローカルビルドは quarantine されないので不要 |
 | launchd 登録 | **持つ**。常駐は要る (下記) |
 
 `push = 完了` として扱う (release workflow を持たないリポの標準)。
+
+**バイナリには Apple 署名をする** (kawaz 裁定 mid=20, mid=21)。
+配布のためではなく、**cache-warden の peer 認証に乗るため**:
+
+> cache-warden は get 要求時にソケット通信のプロセスの capability チェック機能を
+> モデル設計になっていて、署名のチーム ID 一致するバイナリからのみ取得可能の
+> ような設定が出来るのでそこに乗せると色々セキュリティ面が簡単に楽にできる。
+
+cache-warden の `macos-process-inspect` は、Unix socket の接続相手を
+`peer_identity(fd)` / `verify_peer(fd, prefix)` で検証できる (実装済み)。
+署名しておけば、秘密の取得元を「同じ Team ID で署名されたバイナリ」に
+絞れる。**これは平文ファイルでは得られない性質**で、
+`CacheWarden` バックエンドが単なる「暗号化された保存先」ではなく
+**アクセス制御を持つ保存先**であることを意味する。
+
+`just build` の中で `codesign` を実行する。identity は `CODESIGN_IDENTITY` env で
+上書き可、既定はローカル keychain の Developer ID Application を自動検出
+(cache-warden の `approver-run` recipe と同じ形)。dev build も実 identity で
+署名する — ad-hoc 署名では Team ID が付かず peer 認証を通れないため。
 
 常駐は launchd で行う。cpa と同じ「plist → ラッパスクリプト → バイナリ」形式に
 揃える (cpa からの移行なので運用形態を変えない)。ラッパが要るのは、launchd が

@@ -2,11 +2,8 @@
 #
 # 配布しない個人用ツール (DR-0002)。release workflow / version bump gate /
 # 翻訳ペアは持たず、push = 完了として扱う。
-# 実装 (Rust) を入れる時点で ci (cargo fmt --check + clippy -D warnings + test)
-# を足し、push の deps に入れる。
 # 参考: kawaz/bump-semver の justfile が canonical、
 #       kawaz/hyoui が axum + workspace 分割の実例。
-# 現時点の push gate は「default branch 上」「clean」の 2 つだけ。
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -18,6 +15,39 @@ default: list
 # show recipes
 list:
     @just --list --unsorted
+
+# cargo fmt --check + clippy (-D warnings)
+check:
+    cargo fmt --check --all
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# cargo fmt (書き換える)
+fmt:
+    cargo fmt --all
+
+# cargo test (workspace 全体)
+test: check
+    cargo test --workspace
+
+# release build + codesign
+#
+# 署名は配布のためではなく cache-warden の peer 認証に乗るため (DR-0002)。
+# ad-hoc 署名では Team ID が付かず検証を通れないので、dev/release とも
+# 実 identity で署名する。identity は CODESIGN_IDENTITY で上書き可。
+[script]
+build:
+    cargo build --release -p llm-gateway-cli
+    bin=target/release/llm-gateway
+    identity="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"
+    if [ -z "$identity" ]; then
+        echo >&2 "error: 'Developer ID Application' identity が keychain に見つかりません。CODESIGN_IDENTITY で指定してください"
+        exit 1
+    fi
+    codesign --sign "$identity" --options runtime --force "$bin"
+    codesign --verify --verbose "$bin"
+
+# check + test + build (CI entry point)
+ci: check test build
 
 # uncommitted change がない状態か確認
 [private]
@@ -43,5 +73,5 @@ promote:
     bump-semver vcs promote
 
 # push (release artifact 無しなので push = 完了)
-push: check-on-default-branch ensure-clean
+push: ci check-on-default-branch ensure-clean
     bump-semver vcs push --branch main --jj-bookmark-auto-advance

@@ -1,0 +1,28 @@
+[package]
+name = "llm-gateway-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "llm-gateway の HTTP 層 (Anthropic Messages API を話す口)"
+
+[lib]
+name = "llm_gateway_server"
+path = "src/lib.rs"
+
+[dependencies]
+llm-gateway = { path = "../llm-gateway", version = "0.1" }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+reqwest = { workspace = true }
