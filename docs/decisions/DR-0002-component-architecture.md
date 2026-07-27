@@ -377,6 +377,29 @@ Phase 1 の時点で、直近 6 万行のモデル別内訳
 `internal/translator/claude/openai/responses/` は本体 **1,758 行**
 (request 834 + response 924)、テスト込み 2,940 行。Phase 1 と分ける根拠はここ。
 
+### 配布しない (kawaz 裁定 2026-07-27)
+
+> 当面配布しない。個人用。
+
+これに伴い、kawaz リポの標準構成から以下を**持たない**:
+
+| 通常やること | 本リポでの扱い |
+|---|---|
+| GH Release / tag / 配布 artifact | **無し**。`.github/workflows/release.yml` を作らない |
+| `check-version-bumped` gate | **無し**。リリースしないので version を進める意味がない |
+| README / DESIGN の英訳ペア | **無し**。日本語のみ (公開・配布しないため) |
+| `.app` bundle / codesign / notarize | **無し** |
+| launchd 登録 | **持つ**。常駐は要る (下記) |
+
+`push = 完了` として扱う (release workflow を持たないリポの標準)。
+
+常駐は launchd で行う。cpa と同じ「plist → ラッパスクリプト → バイナリ」形式に
+揃える (cpa からの移行なので運用形態を変えない)。ラッパが要るのは、launchd が
+plist 内で環境変数の展開やディレクトリ作成をできないため。
+
+`.app` bundle 方式 (cache-warden) は採らない。あれは TCC 権限 (TouchID) が
+要る cache-warden 固有の事情によるもので、本リポには不要。
+
 ### 技術選定
 
 | 項目 | 選択 | 根拠 |

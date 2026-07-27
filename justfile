@@ -1,11 +1,11 @@
 # llm-gateway justfile
 #
-# 現在は設計 docs のみ。実装 (Rust) を入れる時点で以下を足す:
-#   - ci (cargo fmt --check + clippy -D warnings + test)
-#   - check-version-bumped (配布 artifact を持つなら)
-#   - push の deps に ci を追加
+# 配布しない個人用ツール (DR-0002)。release workflow / version bump gate /
+# 翻訳ペアは持たず、push = 完了として扱う。
+# 実装 (Rust) を入れる時点で ci (cargo fmt --check + clippy -D warnings + test)
+# を足し、push の deps に入れる。
 # 参考: kawaz/bump-semver の justfile が canonical、
-#       kawaz/cache-warden が Rust + 常駐 daemon の実例。
+#       kawaz/hyoui が axum + workspace 分割の実例。
 # 現時点の push gate は「default branch 上」「clean」の 2 つだけ。
 
 set shell := ["bash", "-euo", "pipefail", "-c"]

@@ -48,16 +48,6 @@ a の懸念: 再試行 1 回分のレイテンシが乗る (平常時は既定�
 学習がプロセス内メモリなので再起動でリセットされる (= 恒久化するなら
 設定ファイルへの書き戻しが要るが、cpa の書き戻し問題と同じ道になるので避けたい)。
 
-### 👺GW-Q2: v1 の配布形態と常駐方法
-
-- [ ] a (推奨): cpa と同じ launchd + ラッパスクリプト方式 (`~/Library/LaunchAgents/com.kawaz.llm-gateway-<face>.plist`)
-- [ ] b: cache-warden と同じ `.app` bundle 方式
-- [ ] c: 常駐させず foreground 実行のみ (v1 は手動起動)
-
-a を推す理由: cpa からの移行なので同じ運用形態が乗り換えやすい。
-b の `.app` は TCC 権限 (TouchID 等) が要る cache-warden 固有の事情によるもので、
-llm-gateway には不要。c は移行判定に日単位の常用が要るので不便。
-
 ## 確認待ち
 
 （現在なし）
