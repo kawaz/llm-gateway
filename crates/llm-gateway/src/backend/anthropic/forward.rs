@@ -97,7 +97,8 @@ pub async fn collect_body(body: BodyStream) -> Result<Vec<u8>> {
 /// 経路が断たれている場合だけ切り替える。429 では切り替えない — レート制限は
 /// 別の経路でも同じように当たる可能性が高く、切り替えると単に負荷が移るだけ。
 pub fn should_try_next(status: u16) -> bool {
-    matches!(status, 502 | 503 | 504) || status == 500
+    // 501 (未実装) は除く。別の経路に替えても実装されていないものは動かない。
+    matches!(status, 500 | 502..=504)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -141,6 +142,12 @@ mod tests {
         for status in [400, 401, 403, 404, 422] {
             assert!(!should_try_next(status), "{status} は次を試さない");
         }
+    }
+
+    /// 未実装は別の経路でも未実装。
+    #[test]
+    fn does_not_switch_on_not_implemented() {
+        assert!(!should_try_next(501));
     }
 
     #[test]
