@@ -9,9 +9,12 @@
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 
 pub mod backend;
+pub mod config;
 pub mod credential;
 pub mod router;
 pub mod session;
+
+pub use config::Config;
 
 mod error;
 
