@@ -22,23 +22,31 @@
 
 ### 👺GW-Q1: Bedrock 経路で `anthropic-beta` をどう扱うか
 
-実測: クライアントが送る beta 束をそのまま透過すると Bedrock は 400。
-10 個中 5 個 (`oauth-2025-04-20` / `prompt-caching-scope-2026-01-05` /
-`fast-mode-2026-02-01` / `redact-thinking-2026-02-12` /
-`token-efficient-tools-2026-03-28`) を拒否する。beta 無しなら 200。
+実測 (Claude Code 2.1.220 の実リクエストを 8319 のプローブで観測):
+送られる beta は 8 個で、そのまま透過すると Bedrock は 400。
+**8 個中 4 個** (`oauth-2025-04-20` / `prompt-caching-scope-2026-01-05` /
+`advisor-tool-2026-03-01` / `extended-cache-ttl-2025-04-11`) を拒否する。
+beta 無しなら 200。
 
-- [ ] a (推奨): **拒否リストを持ち、Bedrock 向けにはそれだけ落として残りを透過**
-- [ ] b: Bedrock 向けは `anthropic-beta` を丸ごと落とす
-- [ ] c: 許可リストを設定に持ち、列挙されたものだけ通す (cpa の現行方式)
+**拒否フラグの集合はクライアントのバージョンで変わる**。llm-notes findings が
+測った束 (cpa の注入値) とは中身が違い、`thinking-token-count` /
+`advisor-tool` / `extended-cache-ttl` は findings に無かった新フラグだった。
 
-a を推す理由: 拒否されるフラグだけを外すので、受理される機能
-(`context-1m` / `context-management` / `interleaved-thinking` /
-`structured-outputs` / `claude-code`) が落ちない。cpa は c 方式で「束ごと置換」した
-結果 `context-management` を落として実障害を出した (llm-notes DR-0001)。
-b は安全側だが 5 機能を捨てる。
+- [ ] a (推奨): **拒否リスト + 自己修復**。既定リストで除去し、`invalid beta flag`
+      の 400 を受けたら該当フラグを外して 1 回再試行、実行時リストに学習させる
+- [ ] b: 拒否リストのみ (自己修復なし)。設定で上書き可
+- [ ] c: Bedrock 向けは `anthropic-beta` を丸ごと落とす
+- [ ] d: 許可リストを設定に持ち、列挙されたものだけ通す (cpa の現行方式)
 
-懸念: 拒否リストはハードコードだと upstream 変更に追従できない。
-設定ファイルで上書き可能にした上で、既定値をコードに持つのが妥当と考える。
+a を推す理由: 固定リストだけだと、Claude Code が新しい beta を足した日に
+fable-5 が全滅する (今日それが起きた形跡がある = findings と実測の差)。
+自己修復があれば未知のフラグでも自動復旧する。
+c は安全側だが受理される 4 機能を捨てる。d は cpa 方式で、「束ごと置換」した結果
+`context-management` を落として実障害を出した前科がある (llm-notes DR-0001)。
+
+a の懸念: 再試行 1 回分のレイテンシが乗る (平常時は既定リストで回避)。
+学習がプロセス内メモリなので再起動でリセットされる (= 恒久化するなら
+設定ファイルへの書き戻しが要るが、cpa の書き戻し問題と同じ道になるので避けたい)。
 
 ### 👺GW-Q2: v1 の配布形態と常駐方法
 
@@ -52,21 +60,4 @@ llm-gateway には不要。c は移行判定に日単位の常用が要るので
 
 ## 確認待ち
 
-### 👺GW-C1: 秘密の保存先とファイル形式
-
-- [ ] a: 保存先は `~/.cache/llm-gateway/auth/` (XDG_CACHE_HOME 配下)
-- [ ] b: ファイル形式は cpa 互換 JSON (`{type, email, access_token, refresh_token, expired, last_refresh, priority, disabled, excluded-models}`)
-- [ ] c: 初期投入は cpa の `auth-personal/*.json` からのコピー (元ファイルは触らない = cpa と併存)
-- [ ] d: バックアップ済み `~/.cache/llm-gateway/auth-backup/20260727T190012/` (4 ファイル、chmod 600)
-
-「おいおいファイル保存から脱却するまでは気にしなくて良い」との指示なので
-このまま進める前提。認識違いがあれば指摘してほしい。
-
-### 👺GW-C2: Phase 1 のスコープ (gpt は cpa へ転送)
-
-- [ ] a: Phase 1 は Claude 系 (OAuth プール + Bedrock) のみ自前実装
-- [ ] b: `gpt-*` は設定で cpa (8317) へ丸ごと転送する `PassthroughProxy` バックエンド
-- [ ] c: Phase 2 で Anthropic⇄Responses 変換 (cpa 実装で本体 1,758 行) を自前化して cpa 依存を切る
-
-b の副作用: cpa を残す間、sol 経路には cpa の beta 注入問題が残る
-(現状 実害なし)。「cpa を完全に止める」のは c の完了後になる。
+（現在なし）

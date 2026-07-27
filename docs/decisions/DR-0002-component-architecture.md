@@ -95,9 +95,10 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認):
                     │                    │                     │
                     │                    ▼                     │
                     │ BackendAdapter (trait)                   │
-                    │  ├ AnthropicOAuth  ヘッダ差替のみ  ──────┼──▶ api.anthropic.com
-                    │  ├ AnthropicApiKey model 書換 + beta 除去 ┼──▶ bedrock-mantle.*.api.aws
-                    │  ├ PassthroughProxy 別 gateway へ丸投げ   ┼──▶ cpa (8317) ※Phase 1
+                    │  ├ Anthropic 系 (共通の転送・中継を共有)   │
+                    │  │   ├ AnthropicOAuth   ────────────────┼──▶ api.anthropic.com
+                    │  │   ├ AnthropicBedrock ────────────────┼──▶ bedrock-mantle.*.api.aws
+                    │  │   └ AnthropicRelay   ────────────────┼──▶ cpa (8317) ※Phase 1
                     │  └ OpenAiResponses  プロトコル変換        ┼──▶ chatgpt.com ※Phase 2
                     │                    │                     │
                     │                    ▼                     │
@@ -120,19 +121,51 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認):
 初めて効く。現状クライアントは Claude Code だけで、その予定もない。
 変換を OpenAI アダプタ内部に閉じておけば、後から IR を抜き出すのは局所的な作業で済む。
 
-### BackendAdapter の責務は「非対称でよい」
+### BackendAdapter は 2 系統に分かれる (kawaz 裁定 mid=15)
 
-kawaz の指摘どおり、バックエンドごとに厚みが違うのは設計の歪みではなく実態:
+> anthropic バックエンドアダプタの亜種で別アダプタという建て付けが良いでしょう。
 
-| アダプタ | 介入の度合い |
-|---|---|
-| `AnthropicOAuth` | `Authorization: Bearer` を差し替えるだけ。ボディ・SSE ともバイト列中継 |
-| `AnthropicApiKey` (Bedrock) | `x-api-key` 生成 + ボディの `model` 書き換え + `anthropic-beta` の拒否フラグ除去 |
-| `PassthroughProxy` | 認証ヘッダを付けずに別 gateway へ丸投げ (転送先が認証を持つ) |
-| `OpenAiResponses` | リクエスト・レスポンス双方のプロトコル変換 (SSE イベント列の再構築を含む) |
+**Anthropic Messages API を話す upstream は共通の土台を持ち、その亜種として
+個別アダプタを作る**。OpenAI 系だけが別系統になる。
 
-trait は「Anthropic Messages リクエストを受けて、Anthropic Messages レスポンス
-(またはその SSE ストリーム) を返す」で共通化し、内部の厚みは実装に委ねる。
+| 系統 | アダプタ | 差分 |
+|---|---|---|
+| Anthropic 系 | `AnthropicOAuth` | `Authorization: Bearer <token>` |
+| | `AnthropicBedrock` | `x-api-key` / `model` を upstream 名へ / 拒否 beta を除去 |
+| | `AnthropicRelay` | 認証を付けない (転送先が持つ)。Phase 1 の cpa 転送用 |
+| OpenAI 系 | `OpenAiResponses` | プロトコル変換 (Phase 2) |
+
+Anthropic 系が共有するのは **転送とストリーム中継の実体**:
+リクエストボディの読み出し、upstream への転送、レスポンスヘッダの受領、
+**SSE のバイト列中継**、フォールバック境界の判定、エラー整形。
+これらは upstream が Messages API である限り同一で、実測でも確認済み
+(Bedrock と公式で SSE の形式は同じ)。
+
+各亜種が自分で書くのは **upstream ごとの差分だけ**:
+
+```rust
+trait AnthropicUpstream {
+    /// 接続先。
+    fn endpoint(&self) -> &Url;
+    /// 認証ヘッダを載せる。credential の種類は実装ごとに違う。
+    async fn authorize(&self, req: &mut RequestParts) -> Result<()>;
+    /// リクエストを upstream の要求に合わせる (model 名の変換、beta の除去など)。
+    /// 既定は何もしない。
+    fn adapt(&self, _req: &mut MessagesRequest) {}
+}
+```
+
+**フラグの塊にしない**のが要点。「beta を落とすか」「model を書き換えるか」を
+bool で共通実装に持たせると、upstream が増えるたびに条件分岐が増える。
+`adapt` に処理そのものを書かせれば、共通側は upstream の事情を知らずに済む。
+
+将来 Vertex AI の Anthropic 互換のような upstream が増えても、
+`AnthropicUpstream` の実装を 1 つ足すだけで済む。
+
+OpenAI 系が別系統になるのは、**共有できる実体が無い**ため。
+リクエスト・レスポンスとも別スキーマで、SSE はイベント列の再構築が要る
+(バイト列中継ができない)。ここを無理に共通化すると、共通側が
+「変換するかしないか」の分岐を抱えることになる。
 
 ### `anthropic-beta` の除去は「拒否リスト + 自己修復」で行う
 
@@ -191,7 +224,7 @@ OAuth token を直投げして確認: `message_start` / `content_block_start` /
 `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop` の
 生イベント列がそのまま返る。**パースも再構築も不要。**
 
-これにより `AnthropicOAuth` / `AnthropicApiKey` はストリームを触らずに済み、
+これにより Anthropic 系アダプタはストリームを触らずに済み、
 レイテンシとメモリを upstream 直結と同等に保てる。
 
 ### session affinity は ModelRouter が担う
@@ -261,7 +294,16 @@ cpa も `singleflight.Group` を使っており、`refresh_token_reused` エラ�
 検出コードを持つ = ローテート方式であることの裏付け。二重リフレッシュは
 後発が失敗して**全アカウント再ログイン**を招く。
 
-`Persistence` の v1 実装は `PlainFile` (cpa 互換 JSON、`~/.cache/llm-gateway/auth/`)。
+`Persistence` の v1 実装は `PlainFile` (kawaz 確認 2026-07-27):
+
+- 保存先: **`~/.cache/llm-gateway/auth/`** (`$XDG_CACHE_HOME` 配下)
+- 形式: **cpa 互換 JSON**
+  (`{type, email, access_token, refresh_token, expired, last_refresh, priority, disabled, excluded-models}`)
+- 初期投入: cpa の `auth-personal/*.json` からコピーする。
+  **元ファイルは触らない**ので cpa と併存できる
+- リフレッシュを試す前のバックアップは
+  `~/.cache/llm-gateway/auth-backup/<timestamp>/` に取る (取得済み)
+
 cache-warden の暗号化永続が固まったら `CacheWarden` 実装を足して差し替える。
 
 ### OAuth リフレッシュの仕様 (cpa v7.2.100 のソースで確定)
@@ -288,11 +330,11 @@ cache-warden の暗号化永続が固まったら `CacheWarden` 実装を足し�
   (DR-0001 の「偽装しない」方針は Anthropic 経路についての判断であって、
   ChatGPT 経路には適用できない — upstream が Codex CLI 用の口しか公開していないため)
 
-### 段階リリース
+### 段階リリース (kawaz 確認 2026-07-27)
 
 | Phase | 内容 | cpa の扱い |
 |---|---|---|
-| **1** | Claude 系 (OAuth プール + Bedrock) を自前実装。`gpt-*` は `PassthroughProxy` で cpa (8317) へ転送 | 8317 で稼働継続 |
+| **1** | Claude 系 (OAuth プール + Bedrock) を自前実装。`gpt-*` は `AnthropicRelay` で cpa (8317) へ転送 | 8317 で稼働継続 |
 | **2** | Anthropic ⇄ Responses 変換を自前実装し、ChatGPT 直結に切替 | 停止可能になる |
 
 Phase 1 の時点で、直近 6 万行のモデル別内訳
@@ -353,7 +395,7 @@ crates/llm-gateway-cli     バイナリ + サブコマンド (serve / auth / sta
     (レイテンシとメモリで損をする)。入口が増えた時に抜き出せばよい
 - **案 B: Phase 1 から OpenAI 変換も実装する**
   - 不採用理由: 1,758 行の変換が完成するまで移行を始められない。
-    `PassthroughProxy` は捨て駒ではなく、将来 work 面など別 gateway に
+    `AnthropicRelay` は捨て駒ではなく、将来 work 面など別 gateway に
     転送したい時に同じ実装が使える
 - **案 C: Bedrock 向けに `anthropic-beta` を丸ごと落とす**
   - 不採用理由: Bedrock が受理する 5 機能 (`context-1m` / `context-management` /
