@@ -33,7 +33,8 @@ pub struct Route {
 }
 
 impl Route {
-    fn name(&self) -> &str {
+    /// ログや失敗記録に出す名前。
+    pub fn name(&self) -> &str {
         self.provider.name()
     }
 }
