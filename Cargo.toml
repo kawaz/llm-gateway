@@ -56,6 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 zeroize = { version = "1", features = ["derive"] }
 url = { version = "2", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false }
+# SSE のバイト列中継。reqwest の bytes_stream が返す型に合わせる。
+bytes = "1"
 tempfile = "3"
 
 [profile.release]

@@ -427,12 +427,14 @@ cache-warden の `macos-process-inspect` は、Unix socket の接続相手を
 常駐は launchd で行う。**plist から直接バイナリを起動する** (ラッパを挟まない)。
 
 cpa は「plist → `start.sh` → バイナリ」の 3 段だったが、これは
-**cpa 固有の制約への対処**であって真似する理由がない。cpa はログの出力先を
-コードで決め打っており設定から変えられないため、ラッパで `WRITABLE_PATH` を
-用意してから `exec` する必要があった。llm-gateway は自分で書くので、
+**cpa 固有の制約への対処**であって真似する理由がない。cpa はログや鍵の
+置き場が cwd 基準で固定されており設定から変えられないため、ラッパで
+書き込み可能な場所を用意し `WRITABLE_PATH` を渡してから `exec` する
+必要があった。llm-gateway は置き場を自分で決められるので、
 
 - ログ先は plist の `StandardOutPath` / `StandardErrorPath` で指定する
-- そのディレクトリはバイナリ自身が起動時に作る
+- 認証情報の置き場は設定の `[store] dir` (既定は `$XDG_STATE_HOME` 配下)
+- どちらのディレクトリも cwd に依存せず、無ければ起動時に作る
 
 とすれば 2 段で済む。段を減らすほど、起動失敗時に見る場所が減る。
 

@@ -19,6 +19,7 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 url = { workspace = true }
 futures-util = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

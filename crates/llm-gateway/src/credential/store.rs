@@ -37,6 +37,17 @@ impl Credential {
     pub fn api_key(&self) -> &str {
         &self.token
     }
+
+    /// 試験用。store を経由せずに作る。
+    #[cfg(test)]
+    pub fn for_test(token: &str) -> Self {
+        Self {
+            id: CredentialId::new("test"),
+            kind: super::Kind::Claude,
+            token: Arc::from(token),
+            account_id: None,
+        }
+    }
 }
 
 /// 更新の結果を待っている側へ配るための合図。
