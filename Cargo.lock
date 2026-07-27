@@ -716,6 +716,7 @@ dependencies = [
 name = "llm-gateway-cli"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "llm-gateway",
  "llm-gateway-server",
  "serde_json",
@@ -736,6 +737,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml",
  "tracing",
 ]
 
