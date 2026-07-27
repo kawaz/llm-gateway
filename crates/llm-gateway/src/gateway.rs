@@ -21,6 +21,7 @@ pub struct Gateway<P: Persistence> {
     router: Router,
     credentials: CredentialStore<P>,
     http: reqwest::Client,
+    refresh_interval: std::time::Duration,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -33,17 +34,34 @@ impl<P: Persistence> Gateway<P> {
             .map_err(|e| Error::Config(format!("HTTP クライアントを作れません: {e}")))?;
 
         Ok(Self {
-            router: Router::from_config(config)?,
+            refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
+            router: Router::new(config.clone()),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
         })
     }
 
+    /// upstream に一覧を聞く。起動時に 1 回呼ぶ。
+    pub async fn refresh_models(&self) {
+        self.router.refresh(&self.http, &self.credentials).await;
+    }
+
+    /// 一覧を取り直し続ける。
+    ///
+    /// 新しいモデルが出たときに、再起動せずに拾えるようにする。
+    pub async fn keep_models_fresh(&self) {
+        let mut ticker = tokio::time::interval(self.refresh_interval);
+        // 起動直後の 1 回目は呼び出し側が済ませている。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            self.refresh_models().await;
+        }
+    }
+
     /// 公開しているモデル名。
-    pub fn models(&self) -> Vec<String> {
-        let mut models: Vec<String> = self.router.models().map(str::to_owned).collect();
-        models.sort_unstable();
-        models
+    pub async fn models(&self) -> Vec<String> {
+        self.router.models().await
     }
 
     /// 転送する。
@@ -53,10 +71,18 @@ impl<P: Persistence> Gateway<P> {
         &self,
         path: &str,
         query: Option<&str>,
-        body: Value,
+        mut body: Value,
         headers: Vec<(String, String)>,
     ) -> Result<forward::Response> {
-        let model = model_of(&body)?.to_owned();
+        let requested = model_of(&body)?.to_owned();
+
+        // `opus` のような短い名前は、ここで実際のモデル名に直す。
+        // upstream はこの名前を知らないので、ボディも書き換える。
+        let model = self.router.resolve(&requested).await;
+        if model != requested {
+            crate::backend::anthropic::rewrite_model(&mut body, &model);
+        }
+
         let session = session::derive(&body, &headers);
         let routes = self.router.routes_for(&model, &session).await?;
 
@@ -244,10 +270,16 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         }
     }
 
-    fn gateway(config_toml: &str) -> Gateway<StaticStore> {
+    /// discovery を済ませた状態で返す。
+    ///
+    /// 試験では relay 型を使う。upstream に一覧を聞きに行かず、設定に
+    /// 書いたモデルをそのまま扱うので、偽の upstream 1 つで完結する。
+    async fn gateway(config_toml: &str) -> Gateway<StaticStore> {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
-        Gateway::new(&config, StaticStore::new()).unwrap()
+        let gw = Gateway::new(&config, StaticStore::new()).unwrap();
+        gw.refresh_models().await;
+        gw
     }
 
     fn request() -> Value {
@@ -269,14 +301,17 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let gw = gateway(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#,
             up.url
-        ));
+        ))
+        .await;
 
         let resp = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -296,18 +331,22 @@ credentials = ["a"]
         let gw = gateway(&format!(
             r#"
 [credentials.down]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
 [credentials.alive]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["down", "alive"]
 "#,
             down.url, alive.url
-        ));
+        ))
+        .await;
 
         let resp = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -326,18 +365,22 @@ credentials = ["down", "alive"]
         let gw = gateway(&format!(
             r#"
 [credentials.nowhere]
-type = "claude_oauth"
+type = "relay"
 url = "http://127.0.0.1:9"
+models = ["m"]
 
 [credentials.alive]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["nowhere", "alive"]
 "#,
             alive.url
-        ));
+        ))
+        .await;
 
         let resp = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -355,18 +398,22 @@ credentials = ["nowhere", "alive"]
         let gw = gateway(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
 [credentials.b]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a", "b"]
 "#,
             up.url, other.url
-        ));
+        ))
+        .await;
 
         let resp = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -385,18 +432,22 @@ credentials = ["a", "b"]
         let gw = gateway(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
 [credentials.b]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a", "b"]
 "#,
             up.url, other.url
-        ));
+        ))
+        .await;
 
         let resp = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -414,18 +465,22 @@ credentials = ["a", "b"]
         let gw = gateway(&format!(
             r#"
 [credentials.first]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
 [credentials.second]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["first", "second"]
 "#,
             a.url, b.url
-        ));
+        ))
+        .await;
 
         let err = gw
             .forward("/v1/messages", None, request(), vec![])
@@ -453,18 +508,22 @@ credentials = ["first", "second"]
         let gw = gateway(&format!(
             r#"
 [credentials.flaky]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
 [credentials.alive]
-type = "claude_oauth"
+type = "relay"
 url = "{}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["flaky", "alive"]
 "#,
             flaky.url, alive.url
-        ));
+        ))
+        .await;
 
         // 1 回目: flaky が落ちていて alive が通る。
         gw.forward("/v1/messages", None, request(), vec![])
@@ -488,12 +547,16 @@ credentials = ["flaky", "alive"]
         let gw = gateway(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
 
-[models."known"]
+[[routing]]
+models = ["known"]
 credentials = ["a"]
 "#,
-        );
+        )
+        .await;
         let err = gw
             .forward("/v1/messages", None, json!({"model": "unknown"}), vec![])
             .await
@@ -506,12 +569,16 @@ credentials = ["a"]
         let gw = gateway(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#,
-        );
+        )
+        .await;
         assert!(
             gw.forward("/v1/messages", None, json!({"max_tokens": 1}), vec![])
                 .await
@@ -519,20 +586,83 @@ credentials = ["a"]
         );
     }
 
+    /// 公開する一覧は credential が扱えるものから作る。
     #[tokio::test]
-    async fn lists_models_sorted() {
+    async fn lists_models_from_credentials() {
         let gw = gateway(
             r#"
 [credentials.a]
-type = "claude_oauth"
-
-[models."z-model"]
-credentials = ["a"]
-
-[models."a-model"]
-credentials = ["a"]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["z-model", "a-model"]
 "#,
+        )
+        .await;
+        assert_eq!(
+            gw.models().await,
+            vec!["a-model", "z-model"],
+            "名前順に並ぶ"
         );
-        assert_eq!(gw.models(), vec!["a-model", "z-model"]);
+    }
+
+    /// 隠したモデルは一覧にも出ないし、転送もしない。
+    #[tokio::test]
+    async fn excluded_models_are_hidden() {
+        let gw = gateway(
+            r#"
+[filter]
+exclude = ["claude-opus-4*"]
+
+[credentials.a]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5", "claude-opus-4-8"]
+"#,
+        )
+        .await;
+        assert_eq!(
+            gw.models().await,
+            vec!["claude-opus-5", "opus"],
+            "隠した 4-8 は出ない。opus はエイリアス"
+        );
+
+        let err = gw
+            .forward(
+                "/v1/messages",
+                None,
+                json!({"model": "claude-opus-4-8"}),
+                vec![],
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("claude-opus-4-8"), "{err}");
+    }
+
+    /// 短い名前で指定できる。upstream には実際のモデル名で送る。
+    #[tokio::test]
+    async fn alias_is_resolved_before_forwarding() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["claude-opus-5"]
+"#,
+            up.url
+        ))
+        .await;
+
+        assert!(
+            gw.models().await.contains(&"opus".to_owned()),
+            "一覧に短い名前も出る"
+        );
+
+        let resp = gw
+            .forward("/v1/messages", None, json!({"model": "opus"}), vec![])
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(up.hits(), 1);
     }
 }

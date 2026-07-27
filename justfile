@@ -25,9 +25,26 @@ check:
 fmt:
     cargo fmt --all
 
+# カバレッジの下限。これを割ったら test が落ちる。
+#
+# 計測するだけでは劣化を止められない。上げる分には歓迎なので、
+# 実績が安定して上回るようになったら引き上げる。
+min_coverage := "85"
+
 # cargo test (workspace 全体)
+#
+# カバレッジも一緒に出す。別 recipe に分けると計測しないまま日が経ち、
+# 気づいたときには落ちている。
 test: check
+    cargo llvm-cov --workspace --summary-only --fail-under-lines {{min_coverage}}
+
+# テストだけ (計測のビルドを挟まないぶん速い)
+test-only: check
     cargo test --workspace
+
+# カバレッジの HTML を開く (どの行が通っていないか見る)
+coverage-html:
+    cargo llvm-cov --workspace --open
 
 # release build + codesign
 #

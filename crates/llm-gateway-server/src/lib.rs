@@ -47,7 +47,10 @@ async fn messages<P: Persistence + 'static>(
     let json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
-            return client_error(StatusCode::BAD_REQUEST, &format!("JSON として読めません: {e}"));
+            return client_error(
+                StatusCode::BAD_REQUEST,
+                &format!("JSON として読めません: {e}"),
+            );
         }
     };
 
@@ -68,7 +71,10 @@ async fn messages<P: Persistence + 'static>(
             resp.body(Body::from_stream(upstream.body))
                 .unwrap_or_else(|e| {
                     error!(%e, "応答を組み立てられません");
-                    client_error(StatusCode::INTERNAL_SERVER_ERROR, "応答を組み立てられません")
+                    client_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "応答を組み立てられません",
+                    )
                 })
         }
         Err(e) => error_response(&e),
@@ -79,6 +85,7 @@ async fn messages<P: Persistence + 'static>(
 async fn models<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
     let data: Vec<Value> = gateway
         .models()
+        .await
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "type": "model"}))
         .collect();
@@ -117,7 +124,10 @@ fn error_response(e: &Error) -> Response {
     let message = match e {
         Error::AllUpstreamsFailed { model, attempts } => {
             let detail: Vec<String> = attempts.iter().map(ToString::to_string).collect();
-            format!("model `{model}` の経路が全て失敗しました: {}", detail.join(" / "))
+            format!(
+                "model `{model}` の経路が全て失敗しました: {}",
+                detail.join(" / ")
+            )
         }
         other => other.to_string(),
     };
@@ -198,7 +208,8 @@ mod tests {
                     let mut buf = vec![0u8; 65536];
                     let _ = sock.read(&mut buf).await;
                     let (status, body, extra) = respond();
-                    let mut head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\n", body.len());
+                    let mut head =
+                        format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\n", body.len());
                     for (k, v) in extra {
                         head.push_str(&format!("{k}: {v}\r\n"));
                     }
@@ -218,6 +229,7 @@ mod tests {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
         let gateway = Arc::new(Gateway::new(&config, StaticStore).unwrap());
+        gateway.refresh_models().await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -249,10 +261,12 @@ mod tests {
         let base = serve(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{upstream}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#
         ))
@@ -293,10 +307,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let base = serve(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{upstream}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#
         ))
@@ -322,9 +338,12 @@ credentials = ["a"]
         let base = serve(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m", "claude-opus-5", "claude-fable-5"]
 
-[models."known"]
+[[routing]]
+models = ["known"]
 credentials = ["a"]
 "#,
         )
@@ -342,7 +361,10 @@ credentials = ["a"]
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "not_found_error");
         assert!(
-            body["error"]["message"].as_str().unwrap().contains("no-such-model"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("no-such-model"),
             "{body}"
         );
     }
@@ -354,10 +376,12 @@ credentials = ["a"]
         let base = serve(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{down}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#
         ))
@@ -392,10 +416,12 @@ credentials = ["a"]
         let base = serve(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{upstream}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#
         ))
@@ -410,7 +436,10 @@ credentials = ["a"]
 
         assert_eq!(resp.status(), 400);
         assert!(
-            resp.text().await.unwrap().contains("max_tokens is required"),
+            resp.text()
+                .await
+                .unwrap()
+                .contains("max_tokens is required"),
             "upstream の説明をそのまま渡す"
         );
     }
@@ -420,9 +449,12 @@ credentials = ["a"]
         let base = serve(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m", "claude-opus-5", "claude-fable-5"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#,
         )
@@ -446,13 +478,9 @@ credentials = ["a"]
         let base = serve(
             r#"
 [credentials.a]
-type = "claude_oauth"
-
-[models."claude-opus-5"]
-credentials = ["a"]
-
-[models."claude-fable-5"]
-credentials = ["a"]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5", "claude-fable-5"]
 "#,
         )
         .await;
@@ -471,7 +499,11 @@ credentials = ["a"]
             .iter()
             .map(|m| m["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["claude-fable-5", "claude-opus-5"]);
+        assert_eq!(
+            ids,
+            vec!["claude-fable-5", "claude-opus-5", "fable", "opus"],
+            "実際のモデル名と、短い名前の両方を出す"
+        );
     }
 
     /// count_tokens も同じ経路で捌く。パスは upstream へそのまま渡る。
@@ -481,10 +513,12 @@ credentials = ["a"]
         let base = serve(&format!(
             r#"
 [credentials.a]
-type = "claude_oauth"
+type = "relay"
 url = "{upstream}"
+models = ["m"]
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a"]
 "#
         ))

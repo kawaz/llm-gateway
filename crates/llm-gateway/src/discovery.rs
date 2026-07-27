@@ -1,0 +1,373 @@
+//! upstream からモデル一覧を取る。
+//!
+//! 手で書いた一覧は、新しいモデルが出るたびに追記が要る。upstream に聞けば
+//! その手間が消える。取れなかったときは前回の結果を使い続ける — 一時的に
+//! 繋がらないだけで、公開しているモデルが消えるのは困る。
+//!
+//! upstream ごとに応答の形が違うので、ここで吸収する:
+//! - Anthropic 公式 `/v1/models`: `{id, created_at: "2026-07-24T00:00:00Z"}`
+//! - Bedrock `/v1/models` (OpenAI 互換側): `{id: "anthropic.…", created: 1782950400}`
+//!   Anthropic 互換側の `/anthropic/v1/models` は 404 なので、こちらを使う。
+
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+use crate::credential::Credential;
+use crate::{Error, Result};
+
+/// upstream が公開している 1 モデル。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Model {
+    /// クライアントに見せる名前。
+    pub id: String,
+    /// upstream に送る名前。Bedrock は名前空間が付く。
+    pub upstream_id: String,
+    /// 公開日。新旧の判定に使う。取れなければ 0。
+    pub created: i64,
+}
+
+/// 一覧の取り方。upstream ごとに違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    /// Anthropic 公式。`Authorization: Bearer` で `/v1/models`。
+    Anthropic,
+    /// Bedrock。`Authorization: Bearer` で OpenAI 互換側の `/v1/models`。
+    /// 返る id は `anthropic.claude-opus-5` の形なので接頭辞を剥がす。
+    Bedrock,
+}
+
+pub async fn fetch(
+    http: &reqwest::Client,
+    flavor: Flavor,
+    base_url: &str,
+    credential: &Credential,
+) -> Result<Vec<Model>> {
+    let (url, auth) = match flavor {
+        Flavor::Anthropic => (
+            format!("{}/v1/models", base_url.trim_end_matches('/')),
+            ("authorization", credential.bearer()),
+        ),
+        Flavor::Bedrock => (
+            // base_url は `…/anthropic` を指しているが、モデル一覧は
+            // その隣の `/v1/models` にしかない。
+            format!(
+                "{}/v1/models",
+                base_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/anthropic")
+            ),
+            ("authorization", format!("Bearer {}", credential.api_key())),
+        ),
+    };
+
+    let resp = http
+        .get(&url)
+        .header(auth.0, auth.1)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+        .map_err(|e| Error::UpstreamUnreachable {
+            provider: credential.id.to_string(),
+            source: e,
+        })?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| Error::Config(format!("一覧を読めません: {e}")))?;
+
+    if !status.is_success() {
+        return Err(Error::UpstreamStatus {
+            provider: credential.id.to_string(),
+            status: status.as_u16(),
+            body: text.chars().take(200).collect(),
+        });
+    }
+
+    parse(flavor, &text)
+}
+
+pub fn parse(flavor: Flavor, body: &str) -> Result<Vec<Model>> {
+    #[derive(Deserialize)]
+    struct List {
+        data: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        id: String,
+        /// Anthropic は RFC 3339 の文字列。
+        #[serde(default)]
+        created_at: Option<String>,
+        /// Bedrock は unix 秒。
+        #[serde(default)]
+        created: Option<i64>,
+        /// Bedrock だけが持つ。`available` 以外は使えない。
+        #[serde(default)]
+        status: Option<String>,
+    }
+
+    let list: List = serde_json::from_str(body)?;
+    let mut models = Vec::new();
+
+    for e in list.data {
+        if e.status.as_deref().is_some_and(|s| s != "available") {
+            continue;
+        }
+        let (id, upstream_id) = match flavor {
+            Flavor::Anthropic => (e.id.clone(), e.id),
+            Flavor::Bedrock => match e.id.strip_prefix("anthropic.") {
+                // Bedrock には OpenAI 系も並ぶ。Anthropic 互換の口に
+                // 投げられるのは anthropic.* だけなので、他は拾わない。
+                Some(short) => (short.to_owned(), e.id.clone()),
+                None => continue,
+            },
+        };
+        models.push(Model {
+            id,
+            upstream_id,
+            created: e
+                .created
+                .or_else(|| e.created_at.as_deref().and_then(parse_date))
+                .unwrap_or(0),
+        });
+    }
+
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
+/// `2026-07-24T00:00:00Z` を unix 秒にする。日付部分だけで足りる。
+fn parse_date(s: &str) -> Option<i64> {
+    let (y, rest) = s.split_once('-')?;
+    let (m, rest) = rest.split_once('-')?;
+    let d = rest.get(..2)?;
+    let (y, m, d) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    Some(days_from_civil(y, m, d) * 86_400)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// エイリアスを実際のモデル名に解決する。
+///
+/// `opus` のような短い名前を、`claude-opus-*` に当たるもののうち
+/// **一番新しいもの**へ向ける。新しいモデルが出たら自動で乗り換わる。
+pub fn resolve_alias(pattern: &str, available: &[Model]) -> Option<String> {
+    available
+        .iter()
+        .filter(|m| crate::pattern::matches(pattern, &m.id))
+        // 日付が同じなら名前の大きい方 (新しい版が後ろに来る想定)。
+        .max_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)))
+        .map(|m| m.id.clone())
+}
+
+/// 短い名前の既定。`opus` と書けば最新の opus に向く。
+pub fn default_aliases() -> BTreeMap<String, String> {
+    [
+        ("fable", "claude-fable-*"),
+        ("opus", "claude-opus-*"),
+        ("sonnet", "claude-sonnet-*"),
+        ("haiku", "claude-haiku-*"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-07-27 に Anthropic 公式が実際に返した応答。
+    const ANTHROPIC_BODY: &str = r#"{"data":[
+        {"id":"claude-opus-4-1-20250805","created_at":"2025-08-05T00:00:00Z"},
+        {"id":"claude-sonnet-4-5-20250929","created_at":"2025-09-29T00:00:00Z"},
+        {"id":"claude-haiku-4-5-20251001","created_at":"2025-10-15T00:00:00Z"},
+        {"id":"claude-opus-4-5-20251101","created_at":"2025-11-24T00:00:00Z"},
+        {"id":"claude-opus-4-6","created_at":"2026-02-04T00:00:00Z"},
+        {"id":"claude-sonnet-4-6","created_at":"2026-02-17T00:00:00Z"},
+        {"id":"claude-opus-4-7","created_at":"2026-04-14T00:00:00Z"},
+        {"id":"claude-opus-4-8","created_at":"2026-05-28T00:00:00Z"},
+        {"id":"claude-fable-5","created_at":"2026-06-07T00:00:00Z"},
+        {"id":"claude-sonnet-5","created_at":"2026-06-29T00:00:00Z"},
+        {"id":"claude-opus-5","created_at":"2026-07-24T00:00:00Z"}
+    ]}"#;
+
+    /// 同日に Bedrock が返した応答 (OpenAI 系も混ざる)。
+    const BEDROCK_BODY: &str = r#"{"data":[
+        {"id":"anthropic.claude-fable-5","created":1780272000,"status":"available"},
+        {"id":"anthropic.claude-opus-5","created":1782950400,"status":"available"},
+        {"id":"anthropic.claude-haiku-4-5","created":1759276800,"status":"available"},
+        {"id":"openai.gpt-oss-120b","created":1750000000,"status":"available"},
+        {"id":"anthropic.claude-opus-4-8","created":1770000000,"status":"available"}
+    ]}"#;
+
+    fn anthropic() -> Vec<Model> {
+        parse(Flavor::Anthropic, ANTHROPIC_BODY).unwrap()
+    }
+
+    #[test]
+    fn parses_anthropic_list() {
+        let models = anthropic();
+        assert_eq!(models.len(), 11);
+        let opus5 = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
+        assert_eq!(
+            opus5.upstream_id, "claude-opus-5",
+            "公式は名前をそのまま使う"
+        );
+        assert!(opus5.created > 0, "created_at から日付が取れる");
+    }
+
+    /// Bedrock は名前空間が付く。クライアントには剥がした名前を見せ、
+    /// upstream には元の名前で送る。
+    #[test]
+    fn strips_bedrock_namespace() {
+        let models = parse(Flavor::Bedrock, BEDROCK_BODY).unwrap();
+        let fable = models.iter().find(|m| m.id == "claude-fable-5").unwrap();
+        assert_eq!(fable.upstream_id, "anthropic.claude-fable-5");
+    }
+
+    /// Anthropic 互換の口に投げられないものは拾わない。
+    #[test]
+    fn skips_non_anthropic_models_on_bedrock() {
+        let models = parse(Flavor::Bedrock, BEDROCK_BODY).unwrap();
+        assert!(
+            !models.iter().any(|m| m.id.contains("gpt")),
+            "OpenAI 系は Anthropic 互換の口では使えない"
+        );
+        assert_eq!(models.len(), 4);
+    }
+
+    /// 使えない状態のものは出さない。
+    #[test]
+    fn skips_unavailable_models() {
+        let body = r#"{"data":[
+            {"id":"anthropic.claude-opus-5","created":1,"status":"available"},
+            {"id":"anthropic.claude-opus-9","created":2,"status":"coming_soon"}
+        ]}"#;
+        let models = parse(Flavor::Bedrock, body).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-opus-5");
+    }
+
+    /// エイリアスは一番新しいものに向く。
+    #[test]
+    fn alias_picks_the_newest() {
+        let models = anthropic();
+        assert_eq!(
+            resolve_alias("claude-opus-*", &models).as_deref(),
+            Some("claude-opus-5"),
+            "4-8 や 4-1 ではなく 5"
+        );
+        assert_eq!(
+            resolve_alias("claude-sonnet-*", &models).as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(
+            resolve_alias("claude-haiku-*", &models).as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+    }
+
+    /// 新しいモデルが出たら、設定を触らずに乗り換わる。
+    #[test]
+    fn alias_follows_new_releases() {
+        let mut models = anthropic();
+        assert_eq!(
+            resolve_alias("claude-opus-*", &models).as_deref(),
+            Some("claude-opus-5")
+        );
+
+        models.push(Model {
+            id: "claude-opus-6".into(),
+            upstream_id: "claude-opus-6".into(),
+            created: 1_800_000_000,
+        });
+        assert_eq!(
+            resolve_alias("claude-opus-*", &models).as_deref(),
+            Some("claude-opus-6"),
+            "設定を触らずに追随する"
+        );
+    }
+
+    /// 日付が無ければ名前の大きい方を選ぶ (日付が取れない upstream 向け)。
+    #[test]
+    fn alias_falls_back_to_name_order() {
+        let models = vec![
+            Model {
+                id: "claude-opus-4".into(),
+                upstream_id: "claude-opus-4".into(),
+                created: 0,
+            },
+            Model {
+                id: "claude-opus-5".into(),
+                upstream_id: "claude-opus-5".into(),
+                created: 0,
+            },
+        ];
+        assert_eq!(
+            resolve_alias("claude-opus-*", &models).as_deref(),
+            Some("claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn alias_without_match_resolves_to_nothing() {
+        assert_eq!(resolve_alias("claude-nonexistent-*", &anthropic()), None);
+    }
+
+    /// 既定のエイリアスが実際の一覧で解決できる。
+    #[test]
+    fn default_aliases_resolve() {
+        let models = anthropic();
+        let expected = [
+            ("fable", "claude-fable-5"),
+            ("opus", "claude-opus-5"),
+            ("sonnet", "claude-sonnet-5"),
+            ("haiku", "claude-haiku-4-5-20251001"),
+        ];
+        for (alias, want) in expected {
+            let pattern = &default_aliases()[alias];
+            assert_eq!(
+                resolve_alias(pattern, &models).as_deref(),
+                Some(want),
+                "{alias} → {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_dates() {
+        assert_eq!(parse_date("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_date("2026-07-24T00:00:00Z"), Some(1_784_851_200));
+        assert_eq!(parse_date("broken"), None);
+    }
+
+    /// 形が違っても panic しない。
+    #[test]
+    fn rejects_malformed_body() {
+        assert!(parse(Flavor::Anthropic, "not json").is_err());
+        assert!(parse(Flavor::Anthropic, r#"{"data":"wrong"}"#).is_err());
+        assert!(
+            parse(Flavor::Anthropic, r#"{"data":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 日付が無い応答でも読める。
+    #[test]
+    fn missing_dates_are_tolerated() {
+        let models = parse(Flavor::Anthropic, r#"{"data":[{"id":"claude-opus-5"}]}"#).unwrap();
+        assert_eq!(models[0].created, 0);
+    }
+}

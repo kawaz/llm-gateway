@@ -1,6 +1,6 @@
 //! llm-gateway のコマンドライン。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -67,28 +67,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
 fn parse_config_path(args: &[String]) -> Result<PathBuf, String> {
     let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--config" => {
-                return it
-                    .next()
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "--config にパスが指定されていません".to_owned());
-            }
-            other if other.starts_with("--config=") => {
-                return Ok(PathBuf::from(&other["--config=".len()..]));
-            }
-            other => return Err(format!("`{other}` は解釈できません")),
-        }
+    let Some(arg) = it.next() else {
+        return Ok(Config::default_path());
+    };
+    match arg.as_str() {
+        "--config" => it
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| "--config にパスが指定されていません".to_owned()),
+        other => match other.strip_prefix("--config=") {
+            Some(path) => Ok(PathBuf::from(path)),
+            None => Err(format!("`{other}` は解釈できません")),
+        },
     }
-    Ok(Config::default_path())
 }
 
-fn load(path: &PathBuf) -> Result<Config, String> {
+fn load(path: &Path) -> Result<Config, String> {
     Config::load(path).map_err(|e| e.to_string())
 }
 
-fn serve(config_path: &PathBuf) -> Result<ExitCode, String> {
+fn serve(config_path: &Path) -> Result<ExitCode, String> {
     init_logging();
     let config = load(config_path)?;
 
@@ -104,12 +102,19 @@ fn serve(config_path: &PathBuf) -> Result<ExitCode, String> {
             .await
             .map_err(|e| format!("{} で待ち受けられません: {e}", config.server.listen))?;
 
+        // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
+        gateway.refresh_models().await;
+
         tracing::info!(
             listen = %config.server.listen,
             credentials = %dir.display(),
-            models = gateway.models().len(),
+            models = gateway.models().await.len(),
             "待ち受けを始めます"
         );
+
+        // 新しいモデルが出たときに、再起動せずに拾えるようにする。
+        let refresher = Arc::clone(&gateway);
+        tokio::spawn(async move { refresher.keep_models_fresh().await });
 
         axum::serve(listener, llm_gateway_server::router(gateway))
             .with_graceful_shutdown(shutdown_signal())
@@ -121,14 +126,15 @@ fn serve(config_path: &PathBuf) -> Result<ExitCode, String> {
 }
 
 /// 設定を読んで確かめるだけ。起動前の確認に使う。
-fn check(config_path: &PathBuf) -> Result<ExitCode, String> {
+fn check(config_path: &Path) -> Result<ExitCode, String> {
     let config = load(config_path)?;
     let dir = config.store.resolve_dir();
 
     println!("設定       {}", config_path.display());
     println!("待ち受け   {}", config.server.listen);
     println!("認証情報   {}", dir.display());
-    println!("モデル     {} 件", config.models.len());
+    println!("認証情報数 {} 件", config.credentials.len());
+    println!("振り分け   {} 規則", config.routing.len());
 
     // 認証情報が置かれているかは、起動しないと分からない部分。ここで見ておくと
     // 動かしてから 401 で気づく事態を減らせる。
@@ -154,12 +160,31 @@ fn check(config_path: &PathBuf) -> Result<ExitCode, String> {
     Ok(ExitCode::FAILURE)
 }
 
-fn models(config_path: &PathBuf) -> Result<ExitCode, String> {
+/// upstream に聞いて、実際に公開されるモデルを出す。
+fn models(config_path: &Path) -> Result<ExitCode, String> {
     let config = load(config_path)?;
-    for (model, route) in &config.models {
-        println!("{model}\t{}", route.credentials.join(" → "));
-    }
-    Ok(ExitCode::SUCCESS)
+
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+
+    runtime.block_on(async move {
+        let store = FileStore::open(config.store.resolve_dir()).map_err(|e| e.to_string())?;
+        let gateway = Gateway::new(&config, store).map_err(|e| e.to_string())?;
+        gateway.refresh_models().await;
+
+        let models = gateway.models().await;
+        if models.is_empty() {
+            println!("公開できるモデルがありません。");
+            println!("認証情報が置かれているか、exclude で全部隠していないか確認してください。");
+            return Ok(ExitCode::FAILURE);
+        }
+
+        for model in &models {
+            let route = config.credentials_for(model).join(" → ");
+            println!("{model}\t{route}");
+        }
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
 fn init_logging() {

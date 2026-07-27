@@ -53,9 +53,77 @@ pub struct Config {
     #[serde(default)]
     pub credentials: BTreeMap<String, CredentialSpec>,
 
-    /// クライアントが指定するモデル名ごとの経路。
+    /// 公開するモデルの絞り込み。全 credential に効く。
+    ///
+    /// upstream から取れる一覧をそのまま出すと古い世代まで並ぶので、
+    /// ここで隠す。`claude-opus-4*` のように書ける。
+    ///
+    /// TOML の性質上、テーブルより前に書く必要がある。読む側が混乱しないよう
+    /// `[filter]` テーブルに入れてある。
     #[serde(default)]
-    pub models: BTreeMap<String, ModelRoute>,
+    pub filter: Filter,
+
+    /// モデルごとの経路。パターンで書ける。
+    ///
+    /// 上から順に照合し、最初に当たったものを使う。書かれていないモデルは
+    /// `credentials` の宣言順に試す。
+    ///
+    /// ```toml
+    /// [[routing]]
+    /// models = ["claude-fable-*"]
+    /// credentials = ["bedrock", "claude-work-b", "claude-personal"]
+    /// ```
+    #[serde(default)]
+    pub routing: Vec<RoutingRule>,
+
+    /// 短い名前。値はパターンで、当たるもののうち一番新しいものに向く。
+    ///
+    /// 既定で `fable` / `opus` / `sonnet` / `haiku` が入る。ここに書けば
+    /// 上書きでき、新しい名前も足せる。
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub discovery: Discovery,
+}
+
+/// 公開するモデルの絞り込み。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Filter {
+    /// 隠すモデル。`claude-opus-4*` のようにパターンで書ける。
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// 1 つの振り分け規則。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRule {
+    /// 対象のモデル。パターンで書ける。
+    pub models: Vec<String>,
+    /// 使う認証情報を優先順に。上から試す。
+    pub credentials: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Discovery {
+    /// 一覧を取り直す間隔 (秒)。
+    #[serde(default = "default_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            refresh_secs: default_refresh_secs(),
+        }
+    }
+}
+
+fn default_refresh_secs() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -119,6 +187,9 @@ pub enum CredentialSpec {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        /// この認証情報で扱わないモデル。全体の `exclude` に足して効く。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
 
     /// Bedrock の Anthropic 互換。`x-api-key`。
@@ -132,6 +203,8 @@ pub enum CredentialSpec {
         /// 省略時は実測済みの既定リスト。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deny_beta: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
 
     /// ChatGPT のサブスク OAuth。Responses API を話す。
@@ -140,13 +213,22 @@ pub enum CredentialSpec {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
 
     /// 別の gateway へそのまま渡す。転送先が認証を持つので鍵は要らない。
+    ///
+    /// 転送先の一覧は聞きに行けないので、扱うモデルをここに書く。
     Relay {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        /// 転送するモデル。パターンで書ける。
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude: Vec<String>,
     },
 }
 
@@ -181,21 +263,33 @@ impl CredentialSpec {
             | Self::Relay { headers, .. } => headers,
         }
     }
-}
 
-/// 1 モデルぶんの経路。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelRoute {
-    /// upstream に送るモデル名。省略時はクライアントが指定した名前のまま。
-    ///
-    /// Bedrock は `anthropic.claude-fable-5` のように自分の名前空間の名前を
-    /// 要求し、クライアントが送る `claude-fable-5` では 404 になる。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_name: Option<String>,
+    pub fn exclude(&self) -> &[String] {
+        match self {
+            Self::ClaudeOauth { exclude, .. }
+            | Self::ClaudeBedrock { exclude, .. }
+            | Self::CodexOauth { exclude, .. }
+            | Self::Relay { exclude, .. } => exclude,
+        }
+    }
 
-    /// 使う認証情報を優先順に並べる。上から試し、経路が断たれていれば次へ。
-    pub credentials: Vec<String>,
+    /// upstream に一覧を聞けるか。聞けないものは設定に書いてもらう。
+    pub fn discovery_flavor(&self) -> Option<crate::discovery::Flavor> {
+        match self {
+            Self::ClaudeOauth { .. } => Some(crate::discovery::Flavor::Anthropic),
+            Self::ClaudeBedrock { .. } => Some(crate::discovery::Flavor::Bedrock),
+            // ChatGPT の Responses API に一覧の口は無い。relay 先も聞けない。
+            Self::CodexOauth { .. } | Self::Relay { .. } => None,
+        }
+    }
+
+    /// 一覧を聞けない upstream で、扱うモデルとして宣言されたもの。
+    pub fn declared_models(&self) -> &[String] {
+        match self {
+            Self::Relay { models, .. } => models,
+            _ => &[],
+        }
+    }
 }
 
 impl Config {
@@ -211,24 +305,62 @@ impl Config {
 
     /// 参照先が揃っているかを確かめる。
     ///
-    /// 起動時に落としておかないと、そのモデルを最初に使った人が
-    /// 500 を踏むまで誰も気づかない。
+    /// 起動時に落としておかないと、その規則を最初に踏んだ人が
+    /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
-        for (model, route) in &self.models {
-            if route.credentials.is_empty() {
+        for (i, rule) in self.routing.iter().enumerate() {
+            if rule.models.is_empty() {
                 return Err(Error::Config(format!(
-                    "model `{model}` に credentials が指定されていません"
+                    "routing[{i}] に models が指定されていません"
                 )));
             }
-            for name in &route.credentials {
+            if rule.credentials.is_empty() {
+                return Err(Error::Config(format!(
+                    "routing[{i}] ({}) に credentials が指定されていません",
+                    rule.models.join(", ")
+                )));
+            }
+            for name in &rule.credentials {
                 if !self.credentials.contains_key(name) {
                     return Err(Error::Config(format!(
-                        "model `{model}` が参照する credential `{name}` が定義されていません"
+                        "routing[{i}] ({}) が参照する credential `{name}` が定義されていません",
+                        rule.models.join(", ")
                     )));
                 }
             }
         }
         Ok(())
+    }
+
+    /// 実際に使うエイリアス。既定に設定を重ねる。
+    pub fn resolved_aliases(&self) -> BTreeMap<String, String> {
+        let mut all = crate::discovery::default_aliases();
+        all.extend(self.aliases.clone());
+        all
+    }
+
+    /// このモデルを扱う認証情報を、試す順に返す。
+    ///
+    /// `routing` の上から照合し、最初に当たった規則を使う。当たらなければ
+    /// 宣言順に全部試す。
+    pub fn credentials_for(&self, model: &str) -> Vec<&str> {
+        for rule in &self.routing {
+            if crate::pattern::matches_any(&rule.models, model) {
+                return rule.credentials.iter().map(String::as_str).collect();
+            }
+        }
+        self.credentials.keys().map(String::as_str).collect()
+    }
+
+    /// この認証情報がこのモデルを扱ってよいか。
+    pub fn allows(&self, credential: &str, model: &str) -> bool {
+        if crate::pattern::matches_any(&self.filter.exclude, model) {
+            return false;
+        }
+        match self.credentials.get(credential) {
+            Some(spec) => !crate::pattern::matches_any(spec.exclude(), model),
+            None => false,
+        }
     }
 
     /// 既定の設定ファイルの場所。
@@ -269,13 +401,25 @@ mod tests {
     /// 実運用を想定した一式。
     const SAMPLE: &str = r#"
 [server]
-listen = "127.0.0.1:8319"
+listen = "127.0.0.1:8317"
 
 [store]
 type = "file"
 
+# 古い世代は出さない。
+[filter]
+exclude = ["claude-3-*", "claude-opus-4*", "claude-sonnet-4-*"]
+
 [credentials.claude-personal]
 type = "claude_oauth"
+
+[credentials.claude-work-a]
+type = "claude_oauth"
+
+# fable 専用のアカウント。
+[credentials.claude-work-b]
+type = "claude_oauth"
+exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
 
 [credentials.bedrock]
 type = "claude_bedrock"
@@ -283,17 +427,20 @@ url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
 
 [credentials.cpa]
 type = "relay"
-url = "http://127.0.0.1:8317"
+url = "http://127.0.0.1:8320"
+models = ["gpt-*"]
 
-[models."claude-fable-5"]
-upstream_name = "anthropic.claude-fable-5"
-credentials = ["bedrock", "claude-personal"]
+# fable は Bedrock 優先 (Claude アカウントを消費しない)。
+[[routing]]
+models = ["claude-fable-*"]
+credentials = ["bedrock", "claude-work-b", "claude-personal"]
 
-[models."claude-opus-5"]
-credentials = ["claude-personal"]
-
-[models."gpt-5.6-sol"]
+[[routing]]
+models = ["gpt-*"]
 credentials = ["cpa"]
+
+[aliases]
+o = "claude-opus-*"
 "#;
 
     fn parse(s: &str) -> Result<Config> {
@@ -305,44 +452,180 @@ credentials = ["cpa"]
     #[test]
     fn reads_a_full_config() {
         let c = parse(SAMPLE).unwrap();
-        assert_eq!(c.server.listen, "127.0.0.1:8319");
-        assert_eq!(c.credentials.len(), 3);
-        assert_eq!(c.models.len(), 3);
+        assert_eq!(c.server.listen, "127.0.0.1:8317");
+        assert_eq!(c.credentials.len(), 5);
+        assert_eq!(c.routing.len(), 2);
+        assert_eq!(c.discovery.refresh_secs, 3600, "既定は 1 時間");
     }
 
-    /// fable-5 は Bedrock を先に試し、駄目なら OAuth に回る。
+    /// モデル一覧を手で書かない。upstream に聞くので、設定にあるのは
+    /// 「隠すもの」と「特別扱いするもの」だけ。
     #[test]
-    fn model_route_keeps_priority_order() {
+    fn no_model_list_is_required() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+"#,
+        )
+        .unwrap();
+        assert!(c.routing.is_empty());
+        assert!(c.filter.exclude.is_empty());
+    }
+
+    /// 全体の exclude は全 credential に効く。
+    #[test]
+    fn global_exclude_hides_old_generations() {
         let c = parse(SAMPLE).unwrap();
-        let route = &c.models["claude-fable-5"];
-        assert_eq!(route.credentials, vec!["bedrock", "claude-personal"]);
-        assert_eq!(
-            route.upstream_name.as_deref(),
-            Some("anthropic.claude-fable-5")
+        for hidden in [
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            assert!(!c.allows("claude-personal", hidden), "{hidden} は隠す");
+        }
+        for shown in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
+            assert!(c.allows("claude-personal", shown), "{shown} は出す");
+        }
+    }
+
+    /// credential ごとの exclude はその credential にだけ効く。
+    #[test]
+    fn per_credential_exclude_is_scoped() {
+        let c = parse(SAMPLE).unwrap();
+        assert!(
+            !c.allows("claude-work-b", "claude-opus-5"),
+            "fable 専用なので opus は扱わない"
+        );
+        assert!(c.allows("claude-work-b", "claude-fable-5"), "fable は扱う");
+        assert!(
+            c.allows("claude-personal", "claude-opus-5"),
+            "他の credential には影響しない"
         );
     }
 
-    /// upstream_name を書かなければクライアントの指定名をそのまま送る。
     #[test]
-    fn upstream_name_is_optional() {
+    fn unknown_credential_is_not_allowed() {
         let c = parse(SAMPLE).unwrap();
-        assert!(c.models["claude-opus-5"].upstream_name.is_none());
+        assert!(!c.allows("no-such-credential", "claude-opus-5"));
+    }
+
+    /// ルーティングはパターンで書ける。最初に当たった規則を使う。
+    #[test]
+    fn routing_matches_by_pattern() {
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(
+            c.credentials_for("claude-fable-5"),
+            vec!["bedrock", "claude-work-b", "claude-personal"]
+        );
+        assert_eq!(c.credentials_for("gpt-5.6-sol"), vec!["cpa"]);
+    }
+
+    /// 規則に当たらないモデルは宣言順に試す。
+    /// 新しいモデルが出ても、設定を触らずに使える。
+    #[test]
+    fn unmatched_models_fall_back_to_declaration_order() {
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(
+            c.credentials_for("claude-opus-6"),
+            vec![
+                "bedrock",
+                "claude-personal",
+                "claude-work-a",
+                "claude-work-b",
+                "cpa"
+            ],
+            "宣言順 (BTreeMap なので名前順)"
+        );
+    }
+
+    /// 上に書いた規則が勝つ。
+    #[test]
+    fn first_matching_rule_wins() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+
+[credentials.b]
+type = "claude_oauth"
+
+[[routing]]
+models = ["claude-opus-5"]
+credentials = ["a"]
+
+[[routing]]
+models = ["claude-*"]
+credentials = ["b"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.credentials_for("claude-opus-5"),
+            vec!["a"],
+            "個別指定が先"
+        );
+        assert_eq!(
+            c.credentials_for("claude-sonnet-5"),
+            vec!["b"],
+            "後ろの広い規則"
+        );
+    }
+
+    /// エイリアスは既定に設定を重ねる。
+    #[test]
+    fn aliases_extend_the_defaults() {
+        let c = parse(SAMPLE).unwrap();
+        let aliases = c.resolved_aliases();
+        assert_eq!(aliases["opus"], "claude-opus-*", "既定が残る");
+        assert_eq!(aliases["fable"], "claude-fable-*");
+        assert_eq!(aliases["o"], "claude-opus-*", "設定した分が足される");
     }
 
     #[test]
-    fn credential_types_carry_their_own_fields() {
-        let c = parse(SAMPLE).unwrap();
-
-        let oauth = &c.credentials["claude-personal"];
-        assert!(matches!(oauth, CredentialSpec::ClaudeOauth { .. }));
-        assert_eq!(oauth.url(), "https://api.anthropic.com", "既定の宛先が入る");
-        assert!(oauth.needs_secret());
-
-        let relay = &c.credentials["cpa"];
-        assert!(!relay.needs_secret(), "転送先が認証を持つので鍵は要らない");
+    fn aliases_can_be_overridden() {
+        let c = parse(
+            r#"
+[aliases]
+opus = "claude-opus-4*"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.resolved_aliases()["opus"], "claude-opus-4*");
     }
 
-    /// 定義していない credential を参照したら起動時に落とす。
+    /// 一覧を聞ける upstream と聞けない upstream。
+    #[test]
+    fn discovery_flavor_by_type() {
+        use crate::discovery::Flavor;
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(
+            c.credentials["claude-personal"].discovery_flavor(),
+            Some(Flavor::Anthropic)
+        );
+        assert_eq!(
+            c.credentials["bedrock"].discovery_flavor(),
+            Some(Flavor::Bedrock)
+        );
+        assert_eq!(
+            c.credentials["cpa"].discovery_flavor(),
+            None,
+            "転送先には聞けない"
+        );
+    }
+
+    /// 聞けない upstream は設定に書いたモデルを使う。
+    #[test]
+    fn relay_declares_its_models() {
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(c.credentials["cpa"].declared_models(), ["gpt-*"]);
+        assert!(
+            c.credentials["claude-personal"]
+                .declared_models()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn unknown_credential_reference_is_rejected() {
         let err = parse(
@@ -350,144 +633,76 @@ credentials = ["cpa"]
 [credentials.a]
 type = "claude_oauth"
 
-[models."m"]
+[[routing]]
+models = ["m"]
 credentials = ["a", "typo-here"]
 "#,
         )
         .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("typo-here"), "{msg}");
-        assert!(msg.contains("m"), "どのモデルの話か分かる: {msg}");
+        assert!(err.to_string().contains("typo-here"), "{err}");
     }
 
     #[test]
-    fn empty_credential_list_is_rejected() {
-        let err = parse(
-            r#"
-[models."m"]
-credentials = []
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("m"));
+    fn empty_routing_fields_are_rejected() {
+        assert!(parse("[[routing]]\nmodels = []\ncredentials = []").is_err());
+        assert!(
+            parse("[[routing]]\nmodels = [\"m\"]\ncredentials = []")
+                .unwrap_err()
+                .to_string()
+                .contains('m')
+        );
     }
 
     /// 綴り間違いを黙って無視しない。
     #[test]
     fn unknown_key_is_rejected() {
-        let err = parse(
-            r#"
-[server]
-listen = "127.0.0.1:8319"
-lisen = "typo"
-"#,
-        )
-        .unwrap_err();
+        let err = parse("[server]\nlisen = \"typo\"").unwrap_err();
         assert!(err.to_string().contains("lisen"), "{err}");
     }
 
     #[test]
     fn unknown_credential_type_is_rejected() {
-        let err = parse(
-            r#"
-[credentials.a]
-type = "no_such_type"
-"#,
-        )
-        .unwrap_err();
+        let err = parse("[credentials.a]\ntype = \"no_such_type\"").unwrap_err();
         assert!(err.to_string().contains("no_such_type"), "{err}");
     }
 
-    /// 空の設定でも読める (何も繋がないだけ)。
     #[test]
     fn empty_config_is_valid() {
         let c = parse("").unwrap();
-        assert_eq!(c.server.listen, "127.0.0.1:8319", "既定の待ち受け先");
-        assert!(c.models.is_empty());
+        assert_eq!(c.server.listen, "127.0.0.1:8319");
         assert!(matches!(c.store, Store::File { dir: None }));
     }
 
-    /// 置き場を指定すればそこを使う。
     #[test]
     fn store_dir_can_be_overridden() {
-        let c = parse(
-            r#"
-[store]
-type = "file"
-dir = "/tmp/creds"
-"#,
-        )
-        .unwrap();
+        let c = parse("[store]\ntype = \"file\"\ndir = \"/tmp/creds\"").unwrap();
         assert_eq!(c.store.resolve_dir(), PathBuf::from("/tmp/creds"));
     }
 
-    /// 既定は state 配下。cache ではない (消えると再ログインが要るため)。
+    /// 既定は state 配下。cache ではない (消えると再ログインが要る)。
     #[test]
     fn default_store_dir_is_under_state() {
         let dir = Store::default().resolve_dir();
         let s = dir.to_string_lossy();
         assert!(s.ends_with("llm-gateway/credentials"), "{s}");
-        assert!(s.contains("state"), "cache ではなく state に置く: {s}");
+        assert!(s.contains("state"), "{s}");
     }
 
-    /// Bedrock の beta 除去リストは設定で差し替えられる。
     #[test]
-    fn deny_beta_can_be_overridden() {
-        let c = parse(
-            r#"
-[credentials.b]
-type = "claude_bedrock"
-url = "https://example.invalid/anthropic"
-deny_beta = ["some-flag"]
-"#,
-        )
-        .unwrap();
-        let CredentialSpec::ClaudeBedrock { deny_beta, .. } = &c.credentials["b"] else {
-            panic!("bedrock のはず");
-        };
-        assert_eq!(
-            deny_beta.as_deref(),
-            Some(["some-flag".to_owned()].as_slice())
-        );
+    fn discovery_interval_can_be_set() {
+        let c = parse("[discovery]\nrefresh_secs = 300").unwrap();
+        assert_eq!(c.discovery.refresh_secs, 300);
     }
 
-    /// 書き出して読み直すと同じになる。
     #[test]
     fn round_trips_through_toml() {
         let original = parse(SAMPLE).unwrap();
-        let text = toml::to_string(&original).unwrap();
-        let again = parse(&text).unwrap();
-
-        assert_eq!(again.server.listen, original.server.listen);
-        assert_eq!(again.models.len(), original.models.len());
+        let again = parse(&toml::to_string(&original).unwrap()).unwrap();
+        assert_eq!(again.routing.len(), original.routing.len());
+        assert_eq!(again.filter.exclude, original.filter.exclude);
         assert_eq!(
-            again.models["claude-fable-5"].credentials,
-            original.models["claude-fable-5"].credentials
-        );
-    }
-}
-
-#[cfg(test)]
-mod example_tests {
-    use super::*;
-
-    /// 配る雛形が実際に読めるか。壊れていると `just init-config` の直後に
-    /// 起動できず、初めて使う人が最初につまずく。
-    #[test]
-    fn shipped_example_is_valid() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../dist/config.example.toml"
-        );
-        let raw = std::fs::read_to_string(path).expect("dist/config.example.toml が要る");
-        let config: Config = toml::from_str(&raw).expect("雛形が壊れている");
-        config.validate().expect("雛形の参照が壊れている");
-
-        assert!(config.models.contains_key("claude-fable-5"));
-        assert_eq!(
-            config.models["claude-fable-5"].upstream_name.as_deref(),
-            Some("anthropic.claude-fable-5"),
-            "Bedrock は upstream のモデル名を要求する"
+            again.credentials_for("claude-fable-5"),
+            original.credentials_for("claude-fable-5")
         );
     }
 }

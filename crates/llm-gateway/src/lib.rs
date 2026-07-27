@@ -11,7 +11,9 @@
 pub mod backend;
 pub mod config;
 pub mod credential;
+pub mod discovery;
 pub mod gateway;
+pub mod pattern;
 pub mod router;
 pub mod session;
 
