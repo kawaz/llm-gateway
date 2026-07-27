@@ -64,7 +64,7 @@ launchctl kickstart -k gui/501/com.kawaz.cliproxyapi-personal
 # 8317 の LISTEN 復帰を待ってから /v1/models と実リクエストで検証
 ```
 
-work 面 (8318、pid 93649) は無傷であることを再起動の前後で確認した
+もう一方の面 (8318、業務用インスタンス) は無傷であることを再起動の前後で確認した
 (`kickstart` の対象を personal のラベルに限定しているため)。
 
 ## 関連

@@ -34,11 +34,11 @@ DR-0001 は「この gateway はそもそもヘッダを足さないので同種
 | 送った `anthropic-beta` | Bedrock |
 |---|---|
 | 無し | **200** |
-| クライアント (Claude Code) が送る束 9 個をそのまま透過 | **400** `invalid beta flag` |
+| クライアントが送る束をそのまま透過 | **400** `invalid beta flag` |
 
 **実クライアント (Claude Code 2.1.220) が送る束を実測**した
-(8319 に受信専用プローブを立てて観測)。cpa のログに残っていた束とは中身が違い、
-8 個中 4 個を Bedrock が拒否する:
+(8319 に受信専用プローブを立てて観測)。送られるのは 8 個で、
+うち 4 個を Bedrock が拒否する:
 
 | フラグ | Bedrock |
 |---|---|
@@ -94,11 +94,12 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認):
                     │   優先順位リスト。上から試す                │
                     │                    │                     │
                     │                    ▼                     │
-                    │ BackendAdapter (trait)                   │
-                    │  ├ Anthropic 系 (共通の転送・中継を共有)   │
-                    │  │   ├ AnthropicOAuth   ────────────────┼──▶ api.anthropic.com
-                    │  │   ├ AnthropicBedrock ────────────────┼──▶ bedrock-mantle.*.api.aws
-                    │  │   └ AnthropicRelay   ────────────────┼──▶ cpa (8317) ※Phase 1
+                    │ BackendAdapter (話す API ごと)            │
+                    │  ├ AnthropicMessages                     │
+                    │  │   転送 + SSE 中継の実体。差分は Provider │
+                    │  │   ├ Anthropic ───────────────────────┼──▶ api.anthropic.com
+                    │  │   ├ Bedrock   ───────────────────────┼──▶ bedrock-mantle.*.api.aws
+                    │  │   └ Relay     ───────────────────────┼──▶ cpa (8317) ※Phase 1
                     │  └ OpenAiResponses  プロトコル変換        ┼──▶ chatgpt.com ※Phase 2
                     │                    │                     │
                     │                    ▼                     │
@@ -121,51 +122,72 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認):
 初めて効く。現状クライアントは Claude Code だけで、その予定もない。
 変換を OpenAI アダプタ内部に閉じておけば、後から IR を抜き出すのは局所的な作業で済む。
 
-### BackendAdapter は 2 系統に分かれる (kawaz 裁定 mid=15)
+### BackendAdapter は「話す API」で分け、その中をプロバイダで分ける
+
+kawaz 裁定 (mid=15, mid=16):
 
 > anthropic バックエンドアダプタの亜種で別アダプタという建て付けが良いでしょう。
+> bedrock は一皮ラップしてるだけのバックエンドアダプタ? プロバイダ? でしょ。
 
-**Anthropic Messages API を話す upstream は共通の土台を持ち、その亜種として
-個別アダプタを作る**。OpenAI 系だけが別系統になる。
+**アダプタは「どの API を話すか」で分ける**。実測で、Bedrock は Anthropic
+Messages API をそのまま提供しており (SSE の形式まで同一)、公式との違いは
+接続先・認証方式・モデル名の接頭辞・beta の受理範囲だけだった。
+つまり Bedrock は **Anthropic アダプタを一皮ラップしたプロバイダ**であって、
+別種のアダプタではない。
 
-| 系統 | アダプタ | 差分 |
-|---|---|---|
-| Anthropic 系 | `AnthropicOAuth` | `Authorization: Bearer <token>` |
-| | `AnthropicBedrock` | `x-api-key` / `model` を upstream 名へ / 拒否 beta を除去 |
-| | `AnthropicRelay` | 認証を付けない (転送先が持つ)。Phase 1 の cpa 転送用 |
-| OpenAI 系 | `OpenAiResponses` | プロトコル変換 (Phase 2) |
+```
+BackendAdapter (話す API ごと)
+├ AnthropicMessages    Messages API を話す。転送と SSE 中継の実体はここが持つ
+│   ├ Anthropic  api.anthropic.com / Bearer / 変換なし
+│   ├ Bedrock    bedrock-mantle.*  / x-api-key / 接頭辞 + beta 除去
+│   └ Relay      別 gateway        / 認証なし    ※Phase 1 の cpa 転送
+└ OpenAiResponses      Responses API を話す。プロトコル変換を持つ ※Phase 2
+```
 
-Anthropic 系が共有するのは **転送とストリーム中継の実体**:
-リクエストボディの読み出し、upstream への転送、レスポンスヘッダの受領、
-**SSE のバイト列中継**、フォールバック境界の判定、エラー整形。
-これらは upstream が Messages API である限り同一で、実測でも確認済み
-(Bedrock と公式で SSE の形式は同じ)。
+`AnthropicMessages` が持つ実体: リクエストの受領、upstream への転送、
+レスポンスヘッダの受領、**SSE のバイト列中継**、フォールバック境界の判定。
+これらは upstream が Messages API である限り同一。
 
-各亜種が自分で書くのは **upstream ごとの差分だけ**:
+プロバイダは trait 実装として書く:
 
 ```rust
-trait AnthropicUpstream {
-    /// 接続先。
+/// Messages API を話す upstream ごとの差分。
+trait AnthropicProvider {
     fn endpoint(&self) -> &Url;
-    /// 認証ヘッダを載せる。credential の種類は実装ごとに違う。
+    /// 認証ヘッダを載せる。方式は実装ごとに違う (Bearer / x-api-key / 無し)。
     async fn authorize(&self, req: &mut RequestParts) -> Result<()>;
-    /// リクエストを upstream の要求に合わせる (model 名の変換、beta の除去など)。
-    /// 既定は何もしない。
+    /// upstream の要求に合わせる (model 名の変換、拒否 beta の除去など)。
+    /// 既定は何もしない = 公式 Anthropic はこれで済む。
     fn adapt(&self, _req: &mut MessagesRequest) {}
 }
 ```
 
-**フラグの塊にしない**のが要点。「beta を落とすか」「model を書き換えるか」を
-bool で共通実装に持たせると、upstream が増えるたびに条件分岐が増える。
-`adapt` に処理そのものを書かせれば、共通側は upstream の事情を知らずに済む。
+**差分をパラメータ化しない** (kawaz 裁定 mid=18)。
 
-将来 Vertex AI の Anthropic 互換のような upstream が増えても、
-`AnthropicUpstream` の実装を 1 つ足すだけで済む。
+> パラメータ調整可能にしたとして無限に要求が増える上に使うパラメータの
+> 組み合わせなんてプロバイダごとに 1 個ずつしかないんだから、全ての組み合わせ
+> 自由度は無駄な上に学習コストが上がるだけ (しかも無意味に)
 
-OpenAI 系が別系統になるのは、**共有できる実体が無い**ため。
+`{endpoint, auth_scheme, model_map, beta_policy}` のような設定 struct にすると、
+理論上は 4 つの直交する軸になる。だが**実際に使われる組み合わせは
+プロバイダごとに 1 個ずつしかない** (Bedrock は必ず x-api-key + 接頭辞 +
+beta 除去のセットで、その一部だけ違う構成は存在しない)。
+使われない自由度の代償は 3 つ:
+
+- 設定スキーマを覚える学習コスト
+- 「x-api-key なのに beta 除去なし」のような**成立しない組み合わせが書ける**余地
+- 軸が足りなくなるたびに軸が増える (= 無限に要求が増える)
+
+trait なら、プロバイダ 1 つ = 実装 1 つで対応が閉じる。
+実際に必要な組み合わせだけがコードに現れ、不正な組み合わせは表現できない。
+
+同じ理由で、`adapt` の中身を `bool` で分岐させることもしない。
+処理そのものを実装に書かせれば、共通側は upstream の事情を知らずに済む。
+
+一方 `OpenAiResponses` が別アダプタなのは、**共有できる実体が無い**ため。
 リクエスト・レスポンスとも別スキーマで、SSE はイベント列の再構築が要る
-(バイト列中継ができない)。ここを無理に共通化すると、共通側が
-「変換するかしないか」の分岐を抱えることになる。
+(バイト列中継ができない)。ここを同じ trait に押し込むと、
+`AnthropicMessages` の中にまったく別の実装が同居することになる。
 
 ### `anthropic-beta` の除去は「拒否リスト + 自己修復」で行う
 
@@ -334,7 +356,7 @@ cache-warden の暗号化永続が固まったら `CacheWarden` 実装を足し�
 
 | Phase | 内容 | cpa の扱い |
 |---|---|---|
-| **1** | Claude 系 (OAuth プール + Bedrock) を自前実装。`gpt-*` は `AnthropicRelay` で cpa (8317) へ転送 | 8317 で稼働継続 |
+| **1** | Claude 系 (OAuth プール + Bedrock) を自前実装。`gpt-*` は Relay プロバイダで cpa (8317) へ転送 | 8317 で稼働継続 |
 | **2** | Anthropic ⇄ Responses 変換を自前実装し、ChatGPT 直結に切替 | 停止可能になる |
 
 Phase 1 の時点で、直近 6 万行のモデル別内訳
@@ -396,6 +418,7 @@ crates/llm-gateway-cli     バイナリ + サブコマンド (serve / auth / sta
 - **案 B: Phase 1 から OpenAI 変換も実装する**
   - 不採用理由: 1,758 行の変換が完成するまで移行を始められない。
     `AnthropicRelay` は捨て駒ではなく、将来 work 面など別 gateway に
++    Relay プロバイダは捨て駒ではなく、業務面など別 gateway に
     転送したい時に同じ実装が使える
 - **案 C: Bedrock 向けに `anthropic-beta` を丸ごと落とす**
   - 不採用理由: Bedrock が受理する 5 機能 (`context-1m` / `context-management` /
@@ -406,6 +429,16 @@ crates/llm-gateway-cli     バイナリ + サブコマンド (serve / auth / sta
   - 不採用理由: refresh_token がローテートする以上、「失効判定 → リフレッシュ →
     保存」を呼び出し側に書かせると競合制御が漏れる。二重リフレッシュの代償が
     全アカウント再ログインなので、store 側で束ねる
+- **案 F: プロバイダ差分を設定 struct でパラメータ化する**
+  (`{endpoint, auth_scheme, model_map, beta_policy}` を設定ファイルに書き、
+  プロバイダ追加をコード変更なしで済ませる)
+  - 不採用理由: **実際に使われる組み合わせはプロバイダごとに 1 個ずつしかない**。
+    Bedrock は必ず「x-api-key + モデル名接頭辞 + beta 除去」のセットで、
+    その一部だけ違う構成は存在しない。理論上の直交軸が実運用で使われない以上、
+    自由度は学習コストと不正な組み合わせの余地を増やすだけになる。
+    軸が足りなくなるたびに軸が増える (要求が無限に増える) 問題もある。
+    trait なら「プロバイダ 1 つ = 実装 1 つ」で対応が閉じ、
+    成立しない組み合わせは表現できない
 - **案 E: cpa と同じく管理 GUI を持つ**
   - 不採用理由: DR-0001 のスコープ外。auth の確認は CLI サブコマンドで足りる
 
