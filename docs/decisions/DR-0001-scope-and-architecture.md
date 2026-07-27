@@ -1,7 +1,11 @@
 # DR-0001: スコープとアーキテクチャ
 
-- Status: Active
+- Status: Active (一部を [DR-0002](./DR-0002-component-architecture.md) が改訂)
 - Date: 2026-07-27
+
+> **改訂あり**: 「ボディは触らない」「ヘッダを足さないので事故は起きない」の 2 点は
+> 実測により覆った。ボディの `model` 書き換えと、Bedrock 向けの `anthropic-beta`
+> 除去が要る。また OpenAI 系プロバイダ対応が要求に追加された。詳細は DR-0002。
 
 ## Context
 
@@ -22,7 +26,7 @@ kawaz の要求 (原文):
 | # | 機能 | 詳細 |
 |---|---|---|
 | 1 | OAuth token リフレッシュ | `POST https://api.anthropic.com/v1/oauth/token`、`grant_type=refresh_token`、`client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e`。token 寿命 8 時間 |
-| 2 | session → auth 固定 | `X-Claude-Code-Session-Id` ヘッダをキーに、同じ session を同じ auth に貼り続ける。ヘッダが無ければリクエスト内容からフォールバックキーを作る |
+| 2 | session → auth 固定 | session キーで同じ auth に貼り続ける。キーの導出はボディの `metadata.user_id` が最優先 (DR-0002 で仕様を確定)。取れなければリクエスト内容のハッシュ |
 | 3 | モデル名ルーティング | モデル名 → upstream の**優先順位リスト**。上から試し、経路断なら次へ |
 
 ### 実装しない (v1 では持たない)
@@ -32,7 +36,8 @@ kawaz の要求 (原文):
 - **429 検知 → cooldown → 分散** — 2 日分のログ (218,537 行) で発生 0 件。
   「レート制限による分散」と「経路断のフォールバック」は別物で、後者だけ持つ
 - **config の書き戻し / 管理 GUI / plugin 機構**
-- **Claude 以外のプロバイダ** (gemini / vertex / qwen 等) — 使っていない
+- **gemini / vertex / qwen 等のプロバイダ** — 使っていない
+  (OpenAI 系は要求に追加された。DR-0002 の Phase 2)
 
 ### アーキテクチャ
 
@@ -53,7 +58,8 @@ kawaz の要求 (原文):
                   └─────────────────────────────┘
 ```
 
-**ボディは触らない。** ヘッダも `Authorization` / `x-api-key` の差し替えのみ。
+**ボディは `model` フィールドのみ書き換える** (DR-0002 で改訂)。
+ヘッダは認証情報の生成に加え、Bedrock 向けに `anthropic-beta` の拒否フラグを除去する。
 
 ### SecretStore はプラガブルにする
 
@@ -64,7 +70,10 @@ trait SecretStore {
 }
 ```
 
-v1 は `PlainFile` (cpa 互換 JSON、平文)。kawaz 裁定 2026-07-27:
+trait の形は DR-0002 で改訂した (`get`/`set` では refresh_token ローテートの
+競合制御が呼び出し側に漏れるため、`acquire` + `Persistence` の 2 層にする)。
+
+v1 の永続化は `PlainFile` (cpa 互換 JSON、平文)。kawaz 裁定 2026-07-27:
 
 > cache-warden 側のその辺のサポートが現在まだ計画段階なので、get/set も
 > 永続化問題がまだ解決してないので、そこに関してはプラガブルな設計にして、
@@ -105,8 +114,8 @@ Bedrock 障害時まで止まる理由にはならない。
 
 ## Consequences
 
-- **upstream 仕様変更に強くなる**。偽装しないので Claude Code のバージョン
-  追従が不要
+- **Anthropic 経路は upstream 仕様変更に強い**。偽装しないので Claude Code の
+  バージョン追従が不要 (ただし ChatGPT 経路は偽装が要る。DR-0002)
 - **cpa の管理 GUI が失われる**。auth の追加・確認は CLI サブコマンドが要る
 - **429 が起きても何もしない**。手動でモデル/アカウントを変える運用。
   実際に困ってから足す
@@ -128,7 +137,7 @@ Bedrock 障害時まで止まる理由にはならない。
 | `anthropic-beta` の要否 | **不要** (有無に関わらず 200) |
 | OAuth リフレッシュ経路 | `POST /v1/oauth/token` (標準的) |
 | token 寿命 | 8 時間 |
-| session キー | `X-Claude-Code-Session-Id` |
+| session キー | ボディ `metadata.user_id` 由来の `claude:<uuid>` (DR-0002 で確定) |
 | 実 failover の発生 | **2 日で 0 件** |
 | Bedrock が拒否する beta | 10 中 **5** (`oauth-2025-04-20` 他) |
 
