@@ -24,5 +24,6 @@ tracing = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
