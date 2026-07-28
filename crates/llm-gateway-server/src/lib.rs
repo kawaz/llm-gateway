@@ -35,7 +35,8 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages))
         .route("/v1/models", get(models))
-        .route("/healthz", get(healthz))
+        // gateway 自身の機能はここの下にまとめる (DR-0006)。
+        .route("/llm-gateway/healthz", get(healthz))
         .with_state(gateway)
 }
 
@@ -48,6 +49,10 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
 /// 監視側に縛られる。実際 `/v1/models` を監視に使っていたために、
 /// 既定 namespace へ認証をかけると監視が 401 で落ちて全断する状態になっていた。
 /// 責務が違うものを同じ口にしない。
+///
+/// `/llm-gateway/` の下に置くのは、upstream の API 名と衝突しないため
+/// (DR-0006)。裸で `/healthz` に置くと、upstream がその名前を使い始めたときに
+/// こちらが避難することになる。
 async fn healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
 }
@@ -920,7 +925,9 @@ auth_token = "secret-token"
     #[tokio::test]
     async fn healthz_needs_no_token() {
         let base = serve(TWO_NS).await;
-        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        let resp = reqwest::get(format!("{base}/llm-gateway/healthz"))
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.text().await.unwrap(), "ok");
@@ -930,7 +937,7 @@ auth_token = "secret-token"
     #[tokio::test]
     async fn healthz_is_not_namespaced() {
         let base = serve(TWO_NS).await;
-        let resp = reqwest::get(format!("{base}/ns-locked/healthz"))
+        let resp = reqwest::get(format!("{base}/ns-locked/llm-gateway/healthz"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 404, "namespace 付きでは生やさない");
