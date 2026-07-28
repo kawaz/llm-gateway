@@ -4,6 +4,7 @@
 //! `POST /v1/messages` / `POST /v1/messages/count_tokens` / `GET /v1/models`。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -72,10 +73,21 @@ async fn messages<P: Persistence + 'static>(
     let (parts, body) = request.into_parts();
     let uri = parts.uri.clone();
 
+    // このリクエストに番号を振る。以降のログは全部この下に入るので、
+    // 節目 (本文を受け取った / ヘッダが返った / 流し始めた / 終端) を
+    // 突き合わせられる。番号を振るのは本文を読む前 — 読むのにかかった
+    // 時間も、この番号の下に残したい。
+    let span = relay::request_span();
+
+    let receiving = Instant::now();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(e) => return client_error(StatusCode::BAD_REQUEST, &format!("本文を読めません: {e}")),
     };
+    // 大きさは受け取った実バイト数で数える。Content-Length は手前の
+    // プロキシが chunked で渡してくると付かないが、こちらは必ず取れる。
+    relay::record_request_body(&span, bytes.len(), receiving.elapsed());
+
     let json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -102,10 +114,6 @@ async fn messages<P: Persistence + 'static>(
 
     let path = upstream_path(uri.path()).to_owned();
     let query = uri.query().map(str::to_owned);
-
-    // このリクエストに番号を振る。転送中に出るログは全部この下に入るので、
-    // 開始 (ヘッダ受信) と終了 (本文の終端) を突き合わせられる。
-    let span = relay::request_span();
 
     match gateway
         .forward(ns, &path, query.as_deref(), json, headers)
@@ -542,11 +550,16 @@ credentials = ["a"]
             .unwrap_or_else(|| panic!("途切れた記録が無い:\n{text}"));
         assert!(broken.contains("bytes="), "どこまで流したか: {broken}");
         assert!(broken.contains("elapsed_ms="), "かかった時間: {broken}");
+        assert!(
+            broken.contains("body_bytes="),
+            "受け取った本文の大きさ (手前のアクセスログと突き合わせる): {broken}"
+        );
 
+        // span には番号の後ろに他の値も並ぶので、番号はそこで切る。
         let req = broken
             .split_once("req=")
-            .and_then(|(_, rest)| rest.split_once('}'))
-            .map(|(n, _)| n.to_owned())
+            .and_then(|(_, rest)| rest.split([',', '}']).next())
+            .map(str::to_owned)
             .unwrap_or_else(|| panic!("番号が振られていない: {broken}"));
         assert!(
             text.lines()
