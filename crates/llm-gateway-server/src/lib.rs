@@ -481,6 +481,10 @@ credentials = ["a"]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-fable-5"]
+
+[aliases]
+fable = "claude-fable-*"
+opus = "claude-opus-*"
 "#,
         )
         .await;

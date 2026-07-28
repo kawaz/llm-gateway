@@ -395,6 +395,11 @@ credentials = ["bedrock", "oauth-a"]
 [[routing]]
 models = ["gpt-*"]
 credentials = ["cpa"]
+
+[aliases]
+fable = "claude-fable-*"
+opus = "claude-opus-*"
+haiku = "claude-haiku-*"
 "#;
 
     /// discovery 済みの状態を作る。

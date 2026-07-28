@@ -170,17 +170,12 @@ pub fn resolve_alias(pattern: &str, available: &[Model]) -> Option<String> {
         .map(|m| m.id.clone())
 }
 
-/// 短い名前の既定。`opus` と書けば最新の opus に向く。
+/// 短い名前の既定。
+///
+/// **空**。エイリアスは設定に書く。コードに既定を置くと、設定を読んだだけでは
+/// 何が公開されるか分からなくなり、消したいときにコードを触ることになる。
 pub fn default_aliases() -> BTreeMap<String, String> {
-    [
-        ("fable", "claude-fable-*"),
-        ("opus", "claude-opus-*"),
-        ("sonnet", "claude-sonnet-*"),
-        ("haiku", "claude-haiku-*"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-    .collect()
+    BTreeMap::new()
 }
 
 #[cfg(test)]
@@ -325,22 +320,30 @@ mod tests {
         assert_eq!(resolve_alias("claude-nonexistent-*", &anthropic()), None);
     }
 
-    /// 既定のエイリアスが実際の一覧で解決できる。
+    /// エイリアスはコードに持たない。設定に書く。
     #[test]
-    fn default_aliases_resolve() {
+    fn no_aliases_are_built_in() {
+        assert!(
+            default_aliases().is_empty(),
+            "コードに既定があると、設定を読んだだけでは何が公開されるか分からない"
+        );
+    }
+
+    /// 実運用で使うパターンが、実際の一覧で意図どおり解決する。
+    #[test]
+    fn typical_patterns_resolve_to_newest() {
         let models = anthropic();
-        let expected = [
-            ("fable", "claude-fable-5"),
-            ("opus", "claude-opus-5"),
-            ("sonnet", "claude-sonnet-5"),
-            ("haiku", "claude-haiku-4-5-20251001"),
+        let cases = [
+            ("claude-fable-*", "claude-fable-5"),
+            ("claude-opus-*", "claude-opus-5"),
+            ("claude-sonnet-*", "claude-sonnet-5"),
+            ("claude-haiku-*", "claude-haiku-4-5-20251001"),
         ];
-        for (alias, want) in expected {
-            let pattern = &default_aliases()[alias];
+        for (pattern, want) in cases {
             assert_eq!(
                 resolve_alias(pattern, &models).as_deref(),
                 Some(want),
-                "{alias} → {want}"
+                "{pattern} → {want}"
             );
         }
     }

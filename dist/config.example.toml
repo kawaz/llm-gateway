@@ -1,10 +1,11 @@
 # llm-gateway の設定。
 #
 # 置き場は $XDG_CONFIG_HOME/llm-gateway/config.toml (--config で変更可)。
-# 認証情報の中身はここに書かない。store のディレクトリに <key>.json を置く。
+#
+# モデルの一覧は upstream に聞くので、ここには書かない。書くのは
+# 「隠すもの」「特別扱いするもの」「短い名前」だけ。
 
 [server]
-# cpa が 8317 / 8318 を使っているので、当面はぶつからない番号にしておく。
 listen = "127.0.0.1:8319"
 
 [store]
@@ -12,13 +13,30 @@ type = "file"
 # 省略時は $XDG_STATE_HOME/llm-gateway/credentials
 # dir = "/path/to/credentials"
 
+[discovery]
+# 一覧を取り直す間隔。新しいモデルが出たときに再起動せず拾える。
+refresh_secs = 3600
+
+# ---------------------------------------------------------------------------
+# 公開しないモデル
+#
+# upstream が返す一覧をそのまま出すと古い世代まで並ぶので、ここで隠す。
+# 全 credential に効く。
+# ---------------------------------------------------------------------------
+
+[filter]
+exclude = [
+    "claude-3-*",
+    "claude-opus-4*",
+    "claude-sonnet-4*",
+    "claude-haiku-3*",
+]
+
 # ---------------------------------------------------------------------------
 # 認証情報
 #
 # キーが store 内のファイル名になる (claude-personal → claude-personal.json)。
-# relay 以外は、そのファイルに token を置く必要がある。cpa から移すなら
-#   cp ~/.config/cliproxyapi/auth-personal/claude-*.json <store dir>/
-# で足りる (形式が同じ)。
+# relay 以外は、そのファイルに token を置く必要がある。
 # ---------------------------------------------------------------------------
 
 [credentials.claude-personal]
@@ -27,44 +45,55 @@ type = "claude_oauth"
 [credentials.claude-work]
 type = "claude_oauth"
 
-# Bedrock。モデル名が自分の名前空間なので、下の models で upstream_name を指定する。
+# 特定のモデル専用にしたいアカウントは、他を exclude で塞ぐ。
+# ここに書いた分は、上の [filter] に足して効く。
+# exclude = ["claude-opus-*", "claude-sonnet-*"]
+
+# Bedrock は fable 専用。Claude アカウントを消費しないのが目的なので、
+# 他のモデルまで引き受けると意味がない。
+#
+# 名前の分裂も防げる: Bedrock は claude-haiku-4-5、公式は
+# claude-haiku-4-5-20251001 と名乗るので、両方拾うと別モデルとして並ぶ。
 [credentials.bedrock]
 type = "claude_bedrock"
 url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
+exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
 # 受け付けない beta フラグは既定で落とす。顔ぶれを変えたいときだけ書く。
 # deny_beta = ["oauth-2025-04-20", "prompt-caching-scope-2026-01-05"]
 
-# gpt 系は当面 cpa に任せる。cpa 側が認証を持つので、ここに鍵は要らない。
-[credentials.cpa]
+# 別の gateway へ丸ごと渡す。転送先が認証を持つので鍵は要らない。
+# 一覧も聞けないので、扱うモデルをここに書く (これは許可リスト)。
+[credentials.other-gateway]
 type = "relay"
-url = "http://127.0.0.1:8317"
+url = "http://127.0.0.1:8320"
+models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
 # ---------------------------------------------------------------------------
-# モデルごとの経路
+# 振り分け
 #
-# credentials は優先順。上から試し、経路が断たれていれば次へ回る。
-# ここに無いモデルは 404 になる。
+# 上から照合し、最初に当たった規則を使う。ここに書かないモデルは、
+# discovery でそれを持っていた credential へ流れる。
 # ---------------------------------------------------------------------------
 
-# 通常は Bedrock (Claude アカウントを消費しない)。落ちている間だけ OAuth へ。
-[models."claude-fable-5"]
-upstream_name = "anthropic.claude-fable-5"
-credentials = ["bedrock", "claude-personal"]
+# fable は Bedrock 優先。落ちている間だけ OAuth へ回る。
+[[routing]]
+models = ["claude-fable-*"]
+credentials = ["bedrock", "claude-work", "claude-personal"]
 
-[models."claude-opus-5"]
-credentials = ["claude-personal", "claude-work"]
+[[routing]]
+models = ["gpt-*"]
+credentials = ["other-gateway"]
 
-[models."claude-sonnet-5"]
-credentials = ["claude-personal", "claude-work"]
+# ---------------------------------------------------------------------------
+# 短い名前
+#
+# 値はパターン。当たるもののうち created が一番新しいものへ向くので、
+# 新しい世代が出れば自動で乗り換わる。ここに書いたものだけが有効
+# (コード側に既定は無い)。
+# ---------------------------------------------------------------------------
 
-[models."claude-haiku-4-5-20251001"]
-credentials = ["claude-personal", "claude-work"]
-
-[models."gpt-5.6-sol"]
-credentials = ["cpa"]
-
-[models."gpt-5.6-terra"]
-credentials = ["cpa"]
-
-[models."gpt-5.6-luna"]
-credentials = ["cpa"]
+[aliases]
+fable = "claude-fable-*"
+opus = "claude-opus-*"
+sonnet = "claude-sonnet-*"
+haiku = "claude-haiku-*"

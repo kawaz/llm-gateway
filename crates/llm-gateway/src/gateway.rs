@@ -622,6 +622,9 @@ exclude = ["claude-opus-4*"]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-opus-4-8"]
+
+[aliases]
+opus = "claude-opus-*"
 "#,
         )
         .await;
@@ -653,6 +656,9 @@ models = ["claude-opus-5", "claude-opus-4-8"]
 type = "relay"
 url = "{}"
 models = ["claude-opus-5"]
+
+[aliases]
+opus = "claude-opus-*"
 "#,
             up.url
         ))

@@ -572,18 +572,21 @@ credentials = ["b"]
         );
     }
 
-    /// エイリアスは既定に設定を重ねる。
+    /// エイリアスは設定に書いたものだけ。コードに既定は無い。
     #[test]
-    fn aliases_extend_the_defaults() {
+    fn aliases_come_only_from_config() {
         let c = parse(SAMPLE).unwrap();
-        let aliases = c.resolved_aliases();
-        assert_eq!(aliases["opus"], "claude-opus-*", "既定が残る");
-        assert_eq!(aliases["fable"], "claude-fable-*");
-        assert_eq!(aliases["o"], "claude-opus-*", "設定した分が足される");
+        assert_eq!(c.resolved_aliases()["o"], "claude-opus-*");
+
+        let empty = parse("").unwrap();
+        assert!(
+            empty.resolved_aliases().is_empty(),
+            "書かなければ 1 つも無い"
+        );
     }
 
     #[test]
-    fn aliases_can_be_overridden() {
+    fn aliases_are_read_as_written() {
         let c = parse(
             r#"
 [aliases]
@@ -704,5 +707,55 @@ credentials = ["a", "typo-here"]
             again.credentials_for("claude-fable-5"),
             original.credentials_for("claude-fable-5")
         );
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// 配る雛形が実際に読めるか。
+    ///
+    /// 壊れていると `just init-config` の直後に起動できず、初めて使う人が
+    /// 最初につまずく。設定の書き方を変えたときに追従を忘れやすい。
+    #[test]
+    fn shipped_example_is_valid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../dist/config.example.toml"
+        );
+        let raw = std::fs::read_to_string(path).expect("dist/config.example.toml が要る");
+        let config: Config = toml::from_str(&raw).expect("雛形が壊れている");
+        config.validate().expect("雛形の参照が壊れている");
+
+        // 使い方を示す要素が一通り入っているか。
+        assert!(!config.filter.exclude.is_empty(), "隠し方の例");
+        assert!(!config.routing.is_empty(), "振り分けの例");
+        assert!(!config.aliases.is_empty(), "短い名前の例");
+        assert!(
+            config.credentials.values().any(|c| !c.exclude().is_empty()),
+            "credential ごとの絞り込みの例"
+        );
+        assert!(
+            config
+                .credentials
+                .values()
+                .any(|c| !c.declared_models().is_empty()),
+            "relay で扱うモデルを宣言する例"
+        );
+    }
+
+    /// 雛形にモデル一覧を書かない。
+    ///
+    /// 一覧は upstream に聞くのが本筋で、雛形が手書きの例を示すと
+    /// そちらに引きずられる。
+    #[test]
+    fn example_does_not_hardcode_a_model_list() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../dist/config.example.toml"
+        );
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(!raw.contains("[models."), "旧形式のモデル定義が残っている");
     }
 }
