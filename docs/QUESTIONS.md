@@ -20,6 +20,18 @@
 
 ## 裁定待ち
 
+（現在なし）
+
+<!--
+以下は 2026-07-29 に裁定済み。DR-0006 へ反映して削除する。
+
+AUTH-Q1 / AUTH-Q2 / AUTH-Q3 の 3 件は、いずれも DR-0006 の設計が入れば解ける話だった。
+kawaz 裁定: 「ヘルスチェック以外は何の考慮も不要」「無認証で通したけりゃ別に構わん」
+「default→personal になってそれも emrd も認証アリにするから認証は勝手についてくる」。
+
+つまり認証は設定の帰結であって、緊急対処や Caddy 側の応急処置は要らなかった。
+canddy 側と詰める必要があるのは health check のパス切り替えだけ。
+
 ### AUTH-Q1: default namespace が認証なしで外から叩ける
 
 config に `auth_token` があるのは `ns.personal` と `ns.emrd` だけで、**default namespace には認証がない**。
