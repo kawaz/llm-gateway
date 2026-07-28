@@ -40,6 +40,10 @@ min_coverage := "85"
 #
 # カバレッジも一緒に出す。別 recipe に分けると計測しないまま日が経ち、
 # 気づいたときには落ちている。
+#
+# just は直前コメントの最終行を --list の説明に使う。詳細を書くと説明が
+# その最終行になってしまうので、出したい 1 行は [doc] で明示する。
+[doc("cargo test (workspace 全体) + カバレッジ下限")]
 test: check
     cargo llvm-cov --workspace --summary-only --fail-under-lines {{min_coverage}}
 
@@ -63,6 +67,7 @@ build:
 #
 # 署名は手元でしかできない (証明書が keychain にある) ので、build とは
 # 別 recipe にしてある。CI は build までしか走らせない。
+[doc("release build + codesign")]
 [script]
 sign: build
     bin=target/release/llm-gateway
@@ -78,6 +83,7 @@ sign: build
 #
 # 署名は含めない。CI に証明書は無いし、配布物の署名は release workflow が
 # 別途行う。手元で署名込みが欲しいときは just sign。
+[doc("check + test + build (CI entry point)")]
 ci: check test build
 
 # ---------- 常駐 (launchd) ----------
@@ -202,6 +208,7 @@ check-version-bumped:
 
 # Cargo.toml workspace.package.version を bump (default: patch) し、
 # workspace 内 path 依存の version 制約も同期して Release commit を作る。
+[doc("version を上げて Release commit を作る")]
 [script]
 bump-version level="patch": ensure-clean
     new_version=$(bump-semver "$1" Cargo.toml --write --no-hint)
