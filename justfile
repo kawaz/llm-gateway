@@ -46,14 +46,20 @@ test-only: check
 coverage-html:
     cargo llvm-cov --workspace --open
 
+# release build (署名なし)
+build:
+    cargo build --release -p llm-gateway-cli
+
 # release build + codesign
 #
 # 署名は配布のためではなく cache-warden の peer 認証に乗るため (DR-0002)。
-# ad-hoc 署名では Team ID が付かず検証を通れないので、dev/release とも
-# 実 identity で署名する。identity は CODESIGN_IDENTITY で上書き可。
+# ad-hoc 署名では Team ID が付かず検証を通れないので、実 identity で署名する。
+# identity は CODESIGN_IDENTITY で上書き可。
+#
+# 署名は手元でしかできない (証明書が keychain にある) ので、build とは
+# 別 recipe にしてある。CI は build までしか走らせない。
 [script]
-build:
-    cargo build --release -p llm-gateway-cli
+sign: build
     bin=target/release/llm-gateway
     identity="${CODESIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/ {print $2; exit}')}"
     if [ -z "$identity" ]; then
@@ -64,6 +70,9 @@ build:
     codesign --verify --verbose "$bin"
 
 # check + test + build (CI entry point)
+#
+# 署名は含めない。CI に証明書は無いし、配布物の署名は release workflow が
+# 別途行う。手元で署名込みが欲しいときは just sign。
 ci: check test build
 
 # ---------- 常駐 (launchd) ----------
@@ -73,7 +82,7 @@ label := "com.kawaz.llm-gateway"
 
 # ビルドして launchd に登録する (既に居れば入れ替える)
 [script]
-install: build
+install: sign
     label="{{label}}"
     plist="$HOME/Library/LaunchAgents/$label.plist"
     binary="$PWD/target/release/llm-gateway"
