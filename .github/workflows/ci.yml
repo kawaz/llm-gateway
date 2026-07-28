@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # release.yml が CI 一式を release gate として再利用するための呼び出し口
+  workflow_call:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} / ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    # test hang 時に既定 6h まで runner を空焼きしない上限。
+    # hang しても suite は fail として顕在化する。
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-${{ matrix.rust }}
+      - uses: extractions/setup-just@v3
+      # just test はカバレッジ下限 gate を兼ねているので cargo-llvm-cov が要る
+      # (= ローカルと同じ recipe を CI でも通すための前提)。
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # just ci = check (fmt + clippy) + test (カバレッジ下限) + build。
+      # ローカルと同一エントリで検査範囲を一致させる。
+      - run: just ci
+
+  msrv:
+    name: MSRV check (rust-version = 1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ubuntu-latest-1.90
+      - name: cargo check on MSRV
+        run: cargo check --workspace
+
+  audit:
+    name: cargo-audit (RUSTSEC advisories)
+    runs-on: ubuntu-latest
+    # rustsec/audit-check@v2 は check-run を作成するため checks:write が必要
+    # (= 既定の read-only token では `Resource not accessible by integration` で失敗)
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

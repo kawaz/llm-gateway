@@ -1,11 +1,16 @@
 # llm-gateway justfile
 #
-# 配布しない個人用ツール (DR-0002)。release workflow / version bump gate /
-# 翻訳ペアは持たず、push = 完了として扱う。
+# 自分用にリリースする (DR-0005)。version の正本は Cargo.toml の
+# workspace.package.version で、push 時に check-version-bumped が
+# 「crates/ の src を変えたのに version が据え置き」を止める。
+# tag と GitHub Release は .github/workflows/release.yml が作る。
+# 翻訳ペアは持たない (public 化の判断待ち、DR-0005「未確定」)。
 # 参考: kawaz/bump-semver の justfile が canonical、
 #       kawaz/hyoui が axum + workspace 分割の実例。
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
+
+set script-interpreter := ["bash", "-euo", "pipefail"]
 
 set positional-arguments
 
@@ -168,6 +173,57 @@ check-on-default-branch:
         exit 1
     fi
 
+# crates/ の src が main@origin から変わっているのに Cargo.toml の version が
+# 上がっていなければ fail。
+#
+# 対象を src/ に絞るのは、release 成果物に影響しない変更 (docs / justfile /
+# dist の雛形) で version bump を強制しないため。
+#
+# bump-semver vcs diff の exit code:
+#   0 = 対象 path に変更なし → bump 不要
+#   1 = 変更あり → version bump 済みかチェックに進む
+#   その他 = VCS error (main@origin 未 track 等)
+[private]
+[script]
+check-version-bumped:
+    rc=0
+    bump-semver vcs diff -q main@origin -- \
+      crates/llm-gateway/src/ crates/llm-gateway-server/src/ crates/llm-gateway-cli/src/ || rc=$?
+    case "$rc" in
+      0) exit 0 ;;
+      1) ;;
+      *) echo "ERROR: bump-semver vcs diff failed (rc=$rc). main@origin が track されていない可能性。先に 'jj git fetch' / 'git fetch' を試してください" >&2; exit 1 ;;
+    esac
+    bump-semver compare gt Cargo.toml vcs:main@origin:Cargo.toml --no-hint && exit 0
+    echo 'ERROR: crates/ の src が変わっているが Cargo.toml version 未 bump。"just bump-version" を実行してください' >&2
+    exit 1
+
+# ---------- release flow ----------
+
+# Cargo.toml workspace.package.version を bump (default: patch) し、
+# workspace 内 path 依存の version 制約も同期して Release commit を作る。
+[script]
+bump-version level="patch": ensure-clean
+    new_version=$(bump-semver "$1" Cargo.toml --write --no-hint)
+    # workspace 内 path 依存の version 制約も同期
+    # (例: llm-gateway-cli が llm-gateway / llm-gateway-server を参照)。
+    # `version = "X.Y"` 形式 (semver major.minor の short form) のみ更新する。
+    # `version = "X.Y.Z"` 等の full pin や `>=X.Y` は変えない (= 意図ある制約は保持)。
+    new_minor=$(printf '%s' "$new_version" | perl -ne 'print "$1.$2" if /^(\d+)\.(\d+)\.\d+/')
+    for f in crates/*/Cargo.toml; do
+      perl -i -pe 'BEGIN{$v=shift @ARGV} s/(path\s*=\s*"\.\.\/[^"]+"\s*,\s*version\s*=\s*")\d+\.\d+(")/$1$v$2/g' \
+        "$new_minor" "$f"
+    done
+    # cargo check で Cargo.lock を再生成 (workspace 全体)
+    cargo check --workspace --offline >/dev/null 2>&1 || cargo check --workspace >/dev/null
+    # Cargo.toml + crates/*/Cargo.toml + Cargo.lock を一括 commit (--staged = 全 dirty)
+    bump-semver vcs commit -m "Release v${new_version}" --staged
+    echo "Version: -> ${new_version}"
+
+# 現在の version を表示 (Cargo.toml workspace.package.version)
+version:
+    @bump-semver get Cargo.toml --no-hint
+
 # 現在の worktree を default branch (= origin/<default>) に rebase
 sync:
     bump-semver vcs sync --onto $(bump-semver vcs get default-branch)@origin
@@ -176,6 +232,6 @@ sync:
 promote:
     bump-semver vcs promote
 
-# push (release artifact 無しなので push = 完了)
-push: ci check-on-default-branch ensure-clean
+# push (version が上がっていれば release workflow が tag と artifact を作る)
+push: ci check-on-default-branch ensure-clean check-version-bumped
     bump-semver vcs push --branch main --jj-bookmark-auto-advance

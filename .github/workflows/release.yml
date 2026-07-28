@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+  # workflow 自体の修正を Cargo.toml 変更なしで再走させる手動トリガ
+  workflow_dispatch:
+
+jobs:
+  # CI 一式 (test + msrv + audit) を release の必須 gate にする。
+  # build-release が needs で待つため、CI が green でない commit からは
+  # release artifact が一切作られない。
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write # audit job (rustsec/audit-check) が check-run 作成に必要
+
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.current }}
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # bump-semver の `vcs get latest-tag` で全 tag が必要
+
+      # bump-semver を install (release flow が bump-semver に依存)。
+      # 最新 release のバイナリを curl で取得 (linux-amd64)。
+      - name: Install bump-semver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo kawaz/bump-semver --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//')
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 60 \
+            "https://github.com/kawaz/bump-semver/releases/download/v${LATEST}/bump-semver-linux-amd64" \
+            -o /usr/local/bin/bump-semver
+          chmod +x /usr/local/bin/bump-semver
+          bump-semver --version
+
+      - name: Check version change
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Cargo.toml workspace.package.version を正本として読む。
+          # 要 bump-semver >= v0.38.0 (= GHA の run step は stdin が writer 不在の
+          # FIFO になり、旧版は stdin pipe shortcut が誤発火して空読みする)
+          CURRENT_VERSION=$(bump-semver get Cargo.toml --no-hint)
+          echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # ---- semver gate (= bump-semver DR-0039 canonical pattern) ----
+          #
+          # CURRENT_VERSION が「過去の release / tag いずれよりも大」を並列 check
+          # する。両 source を短絡せず評価し、どちらかの gate を越えなかったら
+          # release を作らない:
+          #   - latest-release: GH の release 一覧 (= 過去リリース済 versions)
+          #   - latest-tag    : git tag (= origin の git ref)
+          #
+          # なぜ両方必要か (= latest-tag 単独では不足):
+          #   `gh release create` は GH 内部に release + tag object を作るが
+          #   origin の git ref には tag を push しない (cli/cli#4357)。よって
+          #   checkout 後の `vcs get latest-tag` が GH の最新 release より古い
+          #   tag を返すケースがあり、そのギャップを latest-release が埋める。
+          #
+          # Design rationale (canonical との差分): 本リポの trigger は
+          # paths [Cargo.toml] で、version bump を伴わない変更 (依存追加等)
+          # でも発火する。そのため「現 version == 最新」は良性 skip
+          # (changed=false, exit 0)、「現 version < 最新」のみ設定 error
+          # (exit 1) に分ける。VERSION file trigger の canonical は常に
+          # bump 意図なので gate 不通過 = 一律 error だが、ここでは過剰。
+          FAIL=0
+          SKIP=0
+          check_axis() {
+            local label="$1" latest="$2"
+            echo "${label}: ${latest}"
+            if bump-semver compare gt "$CURRENT_VERSION" "$latest" -qq; then
+              : # CURRENT > latest: この軸は通過
+            elif bump-semver compare eq "$CURRENT_VERSION" "$latest" -qq; then
+              SKIP=1
+            else
+              echo "::error::v${CURRENT_VERSION} is less than ${label} v${latest}"
+              FAIL=1
+            fi
+          }
+          if LATEST_REL=$(bump-semver vcs get latest-release --repository "$REPO" 2>/dev/null); then
+            check_axis "latest-release" "$LATEST_REL"
+          else
+            echo "latest-release: (none yet); bootstrap"
+          fi
+          if LATEST_TAG=$(bump-semver vcs get latest-tag --include-prerelease --vcs git 2>/dev/null); then
+            check_axis "latest-tag" "$LATEST_TAG"
+          else
+            echo "latest-tag: (none yet, or transient migration); bootstrap"
+          fi
+          if [ "$FAIL" = "1" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$SKIP" = "1" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version v${CURRENT_VERSION} is already the latest; release skip"
+            exit 0
+          fi
+
+          # gh release で既存確認 (compare で通っても念のため二重防止)
+          if gh release view "v${CURRENT_VERSION}" --repo "$REPO" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version unchanged: v${CURRENT_VERSION} already released"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New version detected: v${CURRENT_VERSION}"
+          fi
+
+  build-release:
+    needs: [check-version, ci]
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      # 配布物は CLI だけ。lib crate は成果物にならないので workspace 全体は建てない。
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          if [ "$CROSS" = "true" ]; then
+            cross build --release -p llm-gateway-cli --target "$TARGET"
+          else
+            cargo build --release -p llm-gateway-cli --target "$TARGET"
+          fi
+
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          ARCHIVE="llm-gateway-${VERSION}-${TARGET}.tar.gz"
+          # バイナリと LICENSE / README を一度別ディレクトリに集めてから固める
+          # (アーカイブの中身を平らに保つため)
+          STAGE=$(mktemp -d)
+          cp "target/${TARGET}/release/llm-gateway" "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          tar czf "$ARCHIVE" -C "$STAGE" .
+          rm -rf "$STAGE"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  publish-release:
+    needs: [check-version, build-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # sigstore の署名 (SLSA provenance) に要る
+      attestations: write   # actions/attest-build-provenance に要る
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum ./*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate SLSA build provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            *.tar.gz
+            SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          gh release create "v${VERSION}" \
+            ./*.tar.gz SHA256SUMS \
+            --repo "$REPO" \
+            --title "v${VERSION}" \
+            --target "$COMMIT_SHA" \
+            --generate-notes
