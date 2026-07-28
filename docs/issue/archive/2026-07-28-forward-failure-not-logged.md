@@ -1,6 +1,6 @@
 ---
 title: 転送の失敗を記録できない (ストリーム中継の失敗が無記録)
-status: open
+status: resolved
 category: bug
 created: 2026-07-28T22:58:19+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T00:29:28+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
