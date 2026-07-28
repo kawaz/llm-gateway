@@ -12,10 +12,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use tracing::error;
+use tracing::{Instrument as _, error};
 
 use llm_gateway::credential::Persistence;
-use llm_gateway::{Error, Gateway};
+use llm_gateway::{Error, Gateway, relay};
 
 /// 転送するリクエストの上限。
 ///
@@ -103,8 +103,13 @@ async fn messages<P: Persistence + 'static>(
     let path = upstream_path(uri.path()).to_owned();
     let query = uri.query().map(str::to_owned);
 
+    // このリクエストに番号を振る。転送中に出るログは全部この下に入るので、
+    // 開始 (ヘッダ受信) と終了 (本文の終端) を突き合わせられる。
+    let span = relay::request_span();
+
     match gateway
         .forward(ns, &path, query.as_deref(), json, headers)
+        .instrument(span.clone())
         .await
     {
         Ok(upstream) => {
@@ -113,7 +118,8 @@ async fn messages<P: Persistence + 'static>(
                 resp = resp.header(name, value);
             }
             // 本文は読まずに流す。SSE はここを通り抜けるだけ。
-            resp.body(Body::from_stream(upstream.body))
+            // 包むのは終端 (流し切った / 途切れた / 中断された) を残すため。
+            resp.body(Body::from_stream(relay::observe(upstream.body, span)))
                 .unwrap_or_else(|e| {
                     error!(%e, "応答を組み立てられません");
                     client_error(
@@ -247,6 +253,7 @@ pub(crate) mod tests {
     use super::*;
     use llm_gateway::Config;
     use llm_gateway::credential::{CredentialId, OauthTokens, Payload, StoredCredential};
+    use std::sync::{Mutex, OnceLock};
     use tokio::net::TcpListener;
 
     struct StaticStore;
@@ -303,6 +310,80 @@ pub(crate) mod tests {
         });
 
         format!("http://{addr}")
+    }
+
+    /// 途中で切れる upstream。
+    ///
+    /// 宣言した長さより短い本文を書いて、そのまま閉じる。SSE の中継中に
+    /// upstream が落ちたときと同じ形 (ヘッダは通り、本文が終わらない)。
+    async fn truncating_upstream(head: &'static str, declared: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 65536];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 X\r\ncontent-type: text/event-stream\r\n\
+content-length: {declared}\r\n\r\n{head}"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = sock.flush().await;
+                    // 残りを書かずに閉じる。
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// 試験中のログを集める先。
+    ///
+    /// 記録するのはクライアントへ本文を流す側 (別のタスク) なので、
+    /// スレッドローカルでは捕まえられない。プロセスに 1 つだけ差し込む。
+    fn captured_logs() -> &'static Mutex<Vec<u8>> {
+        static LOGS: OnceLock<&'static Mutex<Vec<u8>>> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Sink(logs))
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            // 既に誰かが差し込んでいても構わない (その場合は集まらないだけ)。
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            logs
+        })
+    }
+
+    #[derive(Clone)]
+    struct Sink(&'static Mutex<Vec<u8>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// gateway を立てて、その待ち受け先を返す。
@@ -411,6 +492,67 @@ credentials = ["a"]
             "text/event-stream"
         );
         assert_eq!(resp.text().await.unwrap(), sse, "1 バイトも変えない");
+    }
+
+    /// 中継の途中で upstream が切れたら、ログに残る。
+    ///
+    /// ヘッダを受け取った時点のログだけでは「最後まで届いたか」が分からない。
+    /// 同じ番号 (req) の終了ログまで見て、初めて切り分けられる。
+    #[tokio::test]
+    async fn broken_stream_is_recorded() {
+        let logs = captured_logs();
+
+        // 100 バイトあると言って 20 バイト程度で閉じる。
+        let upstream = truncating_upstream(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n",
+            100,
+        )
+        .await;
+
+        let base = serve(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{upstream}"
+models = ["m"]
+
+[[routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        ))
+        .await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .json(&json!({"model": "m", "stream": true, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "ヘッダは通る");
+
+        // 本文はここで途切れる。クライアントが受け取り損ねた時点では、
+        // 中継側は既に記録を終えている (記録してから先へ渡すため)。
+        assert!(resp.text().await.is_err(), "本文は最後まで来ない");
+
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let broken = text
+            .lines()
+            .find(|l| l.contains("転送が途切れました"))
+            .unwrap_or_else(|| panic!("途切れた記録が無い:\n{text}"));
+        assert!(broken.contains("bytes="), "どこまで流したか: {broken}");
+        assert!(broken.contains("elapsed_ms="), "かかった時間: {broken}");
+
+        let req = broken
+            .split_once("req=")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(n, _)| n.to_owned())
+            .unwrap_or_else(|| panic!("番号が振られていない: {broken}"));
+        assert!(
+            text.lines()
+                .any(|l| l.contains("ヘッダを受け取りました") && l.contains(&format!("req={req}"))),
+            "開始と終了が同じ番号で対になる (req={req}):\n{text}"
+        );
     }
 
     /// 設定に無いモデルは 404。どのモデルか分かる文言にする。

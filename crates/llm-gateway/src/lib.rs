@@ -7,6 +7,7 @@
 //! - [`router`] モデル名 + session キー → (backend, credential) の優先順位
 //! - [`backend`] upstream ごとのアダプタ。Messages API 系はプロバイダで分岐
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
+//! - [`relay`] 本文を流し終えた (途切れた) ところの記録
 
 pub mod backend;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod credential;
 pub mod discovery;
 pub mod gateway;
 pub mod pattern;
+pub mod relay;
 pub mod router;
 pub mod session;
 

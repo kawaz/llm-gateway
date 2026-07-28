@@ -109,11 +109,13 @@ impl<P: Persistence> Gateway<P> {
             match self.try_route(route, path, query, &body, &headers).await {
                 Ok(resp) => {
                     self.router.remember(&session, &model, route).await;
+                    // ここまでで届いているのはヘッダだけ。本文がクライアント
+                    // まで流れ切ったかどうかは crate::relay が記録する。
                     info!(
                         model = %model,
                         route = route.name(),
                         status = resp.status,
-                        "転送しました"
+                        "upstream のヘッダを受け取りました"
                     );
                     return Ok(resp);
                 }

@@ -25,5 +25,7 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
+# 記録が残ることを試験で確かめるための受け取り先。
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
