@@ -158,6 +158,82 @@ jobs:
             cargo build --release -p llm-gateway-cli --target "$TARGET"
           fi
 
+      # ---- macOS の署名と notarize ----
+      #
+      # 署名は配布のためだけではない。cache-warden は接続してきたプロセスを
+      # Team ID で検証するので、署名が無いと秘密を取り出せない (DR-0002)。
+      # notarize が要るのは、ダウンロードした配布物が quarantine されるため
+      # (ローカルビルドは対象外なので DR-0002 では不要としていた。DR-0005 で反転)。
+      #
+      # 単独バイナリには staple できない (ticket の埋め込み先がない) ので
+      # submit までで完了する。Gatekeeper はオンラインで公証を確認する。
+
+      - name: 署名の準備ができているか見る (macOS)
+        if: runner.os == 'macOS'
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+        run: |
+          if [ -z "$CERT" ]; then
+            echo "::error::署名用の Secrets が未投入です。未署名のバイナリは cache-warden の peer 認証を通れず Gatekeeper にも止められるため、ここで止めます。投入手順は rules-personal:macos-signing-notarization の setup-certificates.md にあります (APPLE_CERTIFICATE_BASE64 / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID の 6 つ)"
+            exit 1
+          fi
+
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Sign binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          codesign --sign "$APPLE_SIGNING_IDENTITY" --options runtime --force --timestamp \
+            "target/${TARGET}/release/llm-gateway"
+          codesign -dv --verbose=2 "target/${TARGET}/release/llm-gateway"
+
+      - name: Notarize binary (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          xcrun notarytool store-credentials "notary-profile" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            --keychain "$RUNNER_TEMP/app-signing.keychain-db"
+
+          cd "target/${TARGET}/release"
+          zip notarize.zip llm-gateway
+          xcrun notarytool submit notarize.zip \
+            --keychain-profile "notary-profile" --keychain "$RUNNER_TEMP/app-signing.keychain-db" \
+            --wait --timeout 10m
+          rm notarize.zip
+
+      - name: Clean up keychain (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db"
+          fi
+
       - name: Package
         env:
           TARGET: ${{ matrix.target }}
@@ -234,3 +310,95 @@ jobs:
             --title "v${VERSION}" \
             --target "$COMMIT_SHA" \
             --generate-notes
+
+  # tap の formula を書き換えて配る。deploy key の作り方は
+  # rules-personal:homebrew-tap-deploy-key を参照。
+  update-homebrew:
+    needs: [check-version, publish-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Calculate checksums
+        id: checksums
+        run: |
+          set -euo pipefail
+          {
+            echo "darwin_arm64=$(sha256sum artifacts/aarch64-apple-darwin/*.tar.gz | cut -d' ' -f1)"
+            echo "darwin_amd64=$(sha256sum artifacts/x86_64-apple-darwin/*.tar.gz | cut -d' ' -f1)"
+            echo "linux_arm64=$(sha256sum artifacts/aarch64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)"
+            echo "linux_amd64=$(sha256sum artifacts/x86_64-unknown-linux-gnu/*.tar.gz | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v5
+        with:
+          repository: kawaz/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
+          DARWIN_AMD64: ${{ steps.checksums.outputs.darwin_amd64 }}
+          LINUX_ARM64: ${{ steps.checksums.outputs.linux_arm64 }}
+          LINUX_AMD64: ${{ steps.checksums.outputs.linux_amd64 }}
+        run: |
+          cat > homebrew-tap/Formula/llm-gateway.rb <<FORMULA
+          class LlmGateway < Formula
+            desc "A thin LLM proxy that keeps authentication out of the client's way"
+            homepage "https://github.com/kawaz/llm-gateway"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/kawaz/llm-gateway/releases/download/v#{version}/llm-gateway-#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/kawaz/llm-gateway/releases/download/v#{version}/llm-gateway-#{version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_AMD64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/kawaz/llm-gateway/releases/download/v#{version}/llm-gateway-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/kawaz/llm-gateway/releases/download/v#{version}/llm-gateway-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_AMD64}"
+              end
+            end
+
+            def install
+              bin.install "llm-gateway"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/llm-gateway --version")
+            end
+          end
+          FORMULA
+
+      - name: Commit and publish formula
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/llm-gateway.rb
+          if git diff --staged --quiet; then
+            echo "formula に変更なし"
+            exit 0
+          fi
+          git commit -m "llm-gateway ${VERSION}"
+          git push
