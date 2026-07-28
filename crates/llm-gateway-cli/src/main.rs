@@ -273,17 +273,25 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
         println!();
         println!("  {}", authorization.url());
         println!();
+        println!("許可のあと、token を取得して使えることを確かめてから保存します。");
+        println!("ブラウザの画面はその結果が出るまで待ちます。");
         open_browser(authorization.url());
-
-        let tokens = authorization.finish().await.map_err(|e| e.to_string())?;
 
         // 既にあれば、その内容を土台にする (priority や除外リストを消さない)。
         let existing = store.load(&id).ok();
-        let credential = tokens.to_stored(kind, existing.as_ref());
-        store.store(&id, &credential).map_err(|e| e.to_string())?;
+
+        // 交換・確認・保存が全部済んでから、ブラウザにも端末にも結果が出る。
+        let credential = authorization
+            .finish(|tokens| {
+                let credential = tokens.to_stored(kind, existing.as_ref());
+                store.store(&id, &credential)?;
+                Ok(credential)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
 
         println!(
-            "{} に保存しました",
+            "token が使えることを確認し、{} に保存しました",
             dir.join(format!("{name}.json")).display()
         );
         if !credential.payload.email().is_empty() {
