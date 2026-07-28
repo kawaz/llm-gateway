@@ -38,6 +38,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/v1/models", get(models))
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
+        .route("/llm-gateway/usage", get(usage))
         .with_state(gateway)
 }
 
@@ -56,6 +57,33 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
 /// こちらが避難することになる。
 async fn healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+/// credential ごとの利用状況を返す。
+///
+/// 認証を掛けないのは healthz と同じ扱い (DR-0007)。出すのは使用率・
+/// リセット時刻・フラグだけで、token も organization id も出さない。
+///
+/// `?refresh=true` のときだけ能動プローブに入る。既定を便乗のみにするのは、
+/// usage の確認が usage を勝手に消費する構図を避けるため。
+async fn usage<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let refresh = wants_refresh(request.uri().query());
+    Json(gateway.usage_report(refresh).await).into_response()
+}
+
+/// `?refresh=true` が付いているか。
+///
+/// 値を見るのは、`?refresh=false` を「付いている」と読むと、消費しない側を
+/// 選んだつもりの相手に実リクエストを投げることになるため。
+fn wants_refresh(query: Option<&str>) -> bool {
+    query.is_some_and(|q| {
+        q.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .any(|(k, v)| k == "refresh" && matches!(v, "true" | "1"))
+    })
 }
 
 /// パスの先頭から namespace 名を取り出す。
@@ -313,7 +341,7 @@ pub(crate) mod tests {
     }
 
     /// 受け取ったリクエストを覚えておく試験用 upstream。
-    async fn fake_upstream(
+    pub(crate) async fn fake_upstream(
         respond: impl Fn() -> (u16, String, Vec<(String, String)>) + Send + Sync + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -836,6 +864,297 @@ credentials = ["a"]
 
         assert_eq!(resp.status(), 200);
         assert!(resp.text().await.unwrap().contains("42"));
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::tests::{authed, fake_upstream, serve_with_default_ns};
+    use super::*;
+    use serde_json::json;
+
+    /// 実測された unified ヘッダ (DR-0007 の表)。
+    fn unified_headers() -> Vec<(String, String)> {
+        vec![
+            (
+                "anthropic-ratelimit-unified-5h-utilization".into(),
+                "0.71".into(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-reset".into(),
+                "1785344400".into(),
+            ),
+            (
+                "anthropic-ratelimit-unified-5h-status".into(),
+                "allowed".into(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization".into(),
+                "0.3".into(),
+            ),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason".into(),
+                "out_of_credits".into(),
+            ),
+        ]
+    }
+
+    async fn get(base: &str, path: &str) -> Value {
+        reqwest::get(format!("{base}{path}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    fn entry<'a>(report: &'a Value, name: &str) -> &'a Value {
+        report["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が一覧にない: {report}"))
+    }
+
+    /// 使ったことのない credential も、名前と理由付きで並ぶ。
+    #[tokio::test]
+    async fn lists_credentials_that_were_never_used() {
+        let base = serve_with_default_ns(
+            r#"
+[credentials.bedrock]
+type = "claude_bedrock"
+url = "https://bedrock.invalid/anthropic"
+
+[credentials.cpa]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
+"#,
+        )
+        .await;
+
+        let report = get(&base, "/llm-gateway/usage").await;
+        assert!(report["generated_at"].as_i64().unwrap() > 1_700_000_000);
+        assert!(report.get("probe").is_none(), "既定では投げない");
+
+        let bedrock = entry(&report, "bedrock");
+        assert_eq!(bedrock["type"], "claude_bedrock");
+        assert_eq!(bedrock["support"], "not_applicable");
+        assert!(
+            bedrock["note"].as_str().unwrap().contains("AWS"),
+            "対象外の理由が読める: {bedrock}"
+        );
+
+        let cpa = entry(&report, "cpa");
+        assert_eq!(cpa["support"], "upstream_dependent");
+        assert!(cpa["note"].as_str().unwrap().contains("転送先"));
+        assert!(cpa.get("snapshot").is_none(), "未観測に中身は無い");
+    }
+
+    /// 転送のついでに読んだ値が出る。追加の API コールは要らない。
+    #[tokio::test]
+    async fn a_forwarded_response_fills_the_snapshot() {
+        // 同じ応答を一覧の問い合わせにも返す。転送の試験に要るのは
+        // ヘッダだけなので、本文はモデル一覧の形にしておく。
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"data":[{"id":"m","created_at":"2026-07-24T00:00:00Z"}]}"#.to_owned(),
+                unified_headers(),
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.claude-personal]
+type = "claude_oauth"
+url = "{upstream}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["claude-personal"]
+"#
+        ))
+        .await;
+
+        let before = get(&base, "/llm-gateway/usage").await;
+        assert_eq!(entry(&before, "claude-personal")["support"], "unobserved");
+
+        authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({"model": "m", "max_tokens": 8, "messages": []})),
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let after = get(&base, "/llm-gateway/usage").await;
+        let c = entry(&after, "claude-personal");
+        assert_eq!(c["support"], "observed");
+
+        let s = &c["snapshot"];
+        assert_eq!(s["5h"]["utilization"], 0.71);
+        assert_eq!(s["5h"]["status"], "allowed");
+        assert_eq!(s["5h"]["reset"], 1_785_344_400_i64);
+        assert_eq!(
+            s["5h"]["reset_iso"], "2026-07-29T17:00:00Z",
+            "Unix 秒と ISO の両方を出す"
+        );
+        assert_eq!(s["7d"]["utilization"], 0.3);
+        assert_eq!(s["overage"]["disabled_reason"], "out_of_credits");
+        assert!(
+            s["observed_at"].as_i64().unwrap() > 1_700_000_000,
+            "いつ観測したかが分かる: {s}"
+        );
+    }
+
+    /// `?refresh=true` のときだけ投げに行く。消費した分を出力に残す。
+    #[tokio::test]
+    async fn refresh_probes_and_reports_what_it_spent() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"type":"message","usage":{"input_tokens":8,"output_tokens":1}}"#.to_owned(),
+                unified_headers(),
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.claude-personal]
+type = "claude_oauth"
+url = "{upstream}"
+"#
+        ))
+        .await;
+
+        let report = get(&base, "/llm-gateway/usage?refresh=true").await;
+        let probe = &report["probe"];
+        assert_eq!(probe["requests"], 1);
+        assert_eq!(probe["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(probe["input_tokens"], 8, "確認そのものが消費した分");
+        assert_eq!(probe["output_tokens"], 1);
+
+        let c = entry(&report, "claude-personal");
+        assert_eq!(c["support"], "observed", "投げた結果が反映される");
+        assert!(c.get("probe_error").is_none());
+    }
+
+    /// 1 つ失敗しても、他の credential は返る。
+    #[tokio::test]
+    async fn a_failing_probe_does_not_empty_the_list() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"usage":{"input_tokens":8,"output_tokens":1}}"#.to_owned(),
+                unified_headers(),
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.alive]
+type = "claude_oauth"
+url = "{upstream}"
+
+[credentials.nowhere]
+type = "claude_oauth"
+url = "http://127.0.0.1:9"
+"#
+        ))
+        .await;
+
+        let report = get(&base, "/llm-gateway/usage?refresh=true").await;
+        assert_eq!(report["probe"]["requests"], 2);
+
+        let alive = entry(&report, "alive");
+        assert_eq!(alive["support"], "observed");
+        assert!(alive.get("probe_error").is_none());
+
+        let dead = entry(&report, "nowhere");
+        assert_eq!(dead["support"], "unobserved");
+        assert!(
+            !dead["probe_error"].as_str().unwrap().is_empty(),
+            "何が起きたか書いてある: {dead}"
+        );
+    }
+
+    /// 上限に当たった応答からも読む (むしろそのときこそ見たい)。
+    #[tokio::test]
+    async fn a_rate_limited_probe_still_yields_a_snapshot() {
+        let upstream = fake_upstream(|| {
+            let mut headers = unified_headers();
+            headers.push((
+                "anthropic-ratelimit-unified-5h-status".into(),
+                "rejected".into(),
+            ));
+            (429, r#"{"error":"rate_limit"}"#.to_owned(), headers)
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.busy]
+type = "claude_oauth"
+url = "{upstream}"
+"#
+        ))
+        .await;
+
+        let c = entry(&get(&base, "/llm-gateway/usage?refresh=true").await, "busy").clone();
+        assert_eq!(c["support"], "observed", "429 でもヘッダは読む");
+        assert!(
+            c["probe_error"].as_str().unwrap().contains("429"),
+            "失敗したことも隠さない: {c}"
+        );
+    }
+
+    /// 死活監視と同じで、トークンは要らない (DR-0007)。
+    #[tokio::test]
+    async fn usage_needs_no_token() {
+        let base = serve_with_default_ns(
+            r#"
+[credentials.cpa]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
+"#,
+        )
+        .await;
+
+        let resp = reqwest::get(format!("{base}/llm-gateway/usage"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// namespace 付きでは生やさない (gateway 自身の機能なので)。
+    #[tokio::test]
+    async fn usage_is_not_namespaced() {
+        let base = serve_with_default_ns("").await;
+        let resp = reqwest::get(format!("{base}/ns-default/llm-gateway/usage"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// 値を見る。`refresh=false` を「付いている」と読むと、消費しない側を
+    /// 選んだ相手に実リクエストを投げることになる。
+    #[test]
+    fn refresh_is_opt_in() {
+        assert!(wants_refresh(Some("refresh=true")));
+        assert!(wants_refresh(Some("refresh=1")));
+        assert!(wants_refresh(Some("x=1&refresh=true")));
+
+        for off in [None, Some(""), Some("refresh=false"), Some("refresh=0")] {
+            assert!(!wants_refresh(off), "{off:?}");
+        }
+        assert!(!wants_refresh(Some("refresh")), "値なしは付いていない扱い");
     }
 }
 

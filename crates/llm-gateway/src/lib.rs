@@ -18,6 +18,7 @@ pub mod pattern;
 pub mod relay;
 pub mod router;
 pub mod session;
+pub mod usage;
 
 pub use config::Config;
 pub use gateway::Gateway;

@@ -311,6 +311,16 @@ impl CredentialSpec {
         }
     }
 
+    /// config.toml に書く `type` と同じ語。表示に使う。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeOauth { .. } => "claude_oauth",
+            Self::ClaudeBedrock { .. } => "claude_bedrock",
+            Self::CodexOauth { .. } => "codex_oauth",
+            Self::Relay { .. } => "relay",
+        }
+    }
+
     /// upstream に一覧を聞けるか。聞けないものは設定に書いてもらう。
     pub fn discovery_flavor(&self) -> Option<crate::discovery::Flavor> {
         match self {

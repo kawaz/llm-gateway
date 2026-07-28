@@ -772,6 +772,7 @@ dependencies = [
  "axum",
  "llm-gateway",
  "llm-gateway-server",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",

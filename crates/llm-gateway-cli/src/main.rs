@@ -7,6 +7,7 @@ use std::sync::Arc;
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Kind, Persistence as _, oauth};
+use llm_gateway::usage::{CredentialUsage, Report, Window};
 use llm_gateway::{Config, Gateway};
 
 const USAGE: &str = "\
@@ -20,12 +21,17 @@ llm-gateway — クライアントに認証を意識させない、薄い LLM pr
   serve       待ち受けを始める
   check       設定を読んで確かめる (起動はしない)
   models      設定に書かれているモデルを一覧する
+  usage       認証情報ごとの利用量を一覧する (server に問い合わせる)
   login       ブラウザで認可を通し、認証情報を <名前>.json に保存する
 
 オプション:
   --config <path>   設定ファイル (既定: $XDG_CONFIG_HOME/llm-gateway/config.toml)
   --help, -h        この説明
   --version         版を表示
+
+usage のオプション:
+  --refresh         使っていない認証情報にも最小のリクエストを投げて取り直す
+                    (確認そのものが利用量を少し消費する)
 
 login のオプション:
   --type <種別>     claude_oauth または codex_oauth
@@ -66,6 +72,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "serve" => serve(&parse_config_path(rest)?),
         "check" => check(&parse_config_path(rest)?),
         "models" => models(&parse_config_path(rest)?),
+        "usage" => usage(rest),
         "login" => login(rest),
         other => Err(format!(
             "`{other}` というコマンドはありません。`llm-gateway --help` を見てください"
@@ -235,6 +242,292 @@ fn models(config_path: &Path) -> Result<ExitCode, String> {
         }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// `usage` に渡された内容。
+#[derive(Debug, PartialEq, Eq)]
+struct UsageArgs {
+    refresh: bool,
+    config_path: PathBuf,
+}
+
+/// 認証情報ごとの利用量を出す。
+///
+/// スナップショットを持っているのは server なので、ここは HTTP で聞いて
+/// 整形するだけ (DR-0007)。CLI 単独では何も答えられない。
+fn usage(args: &[String]) -> Result<ExitCode, String> {
+    let UsageArgs {
+        refresh,
+        config_path,
+    } = parse_usage_args(args)?;
+    let config = load(&config_path)?;
+    let url = usage_url(&config.server.listen, refresh);
+
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+
+    runtime.block_on(async move {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| server_unreachable(&config.server.listen, &e.to_string()))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("応答を読めません: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("server が {status} を返しました: {body}"));
+        }
+
+        let report: Report =
+            serde_json::from_str(&body).map_err(|e| format!("応答を解釈できません: {e}"))?;
+        print!("{}", render(&report));
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn parse_usage_args(args: &[String]) -> Result<UsageArgs, String> {
+    let mut refresh = false;
+    let mut config_path: Option<PathBuf> = None;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--refresh" => refresh = true,
+            "--config" => {
+                config_path = Some(PathBuf::from(
+                    it.next()
+                        .cloned()
+                        .ok_or("--config にパスが指定されていません")?,
+                ));
+            }
+            other => match other.strip_prefix("--config=") {
+                Some(path) => config_path = Some(PathBuf::from(path)),
+                None => return Err(format!("`{other}` は解釈できません")),
+            },
+        }
+    }
+
+    Ok(UsageArgs {
+        refresh,
+        config_path: config_path.unwrap_or_else(Config::default_path),
+    })
+}
+
+/// 問い合わせ先。
+///
+/// 設定の `listen` は待ち受け側の書き方なので、どこからでも受ける指定
+/// (`0.0.0.0` / `::`) をそのまま宛先にはできない。手元から叩く前提で
+/// loopback に読み替える。
+fn usage_url(listen: &str, refresh: bool) -> String {
+    let host = match listen.rsplit_once(':') {
+        Some((host, port)) => {
+            let host = match host.trim_matches(['[', ']']) {
+                "" | "0.0.0.0" | "::" => "127.0.0.1",
+                other => other,
+            };
+            if other_is_ipv6(host) {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            }
+        }
+        None => listen.to_owned(),
+    };
+    let query = if refresh { "?refresh=true" } else { "" };
+    format!("http://{host}/llm-gateway/usage{query}")
+}
+
+fn other_is_ipv6(host: &str) -> bool {
+    host.contains(':')
+}
+
+fn server_unreachable(listen: &str, reason: &str) -> String {
+    format!(
+        "{listen} の server に繋がりません ({reason})。\n\
+         起動しているか確認してください (launchctl list | grep llm-gateway、または just status)"
+    )
+}
+
+/// 人が読む形に整える。
+fn render(report: &Report) -> String {
+    let now = report.generated_at;
+    let mut rows = vec![vec![
+        "名前".to_owned(),
+        "種別".to_owned(),
+        "5h".to_owned(),
+        "リセット (5h)".to_owned(),
+        "7d".to_owned(),
+        "リセット (7d)".to_owned(),
+        "取得 / 状態".to_owned(),
+    ]];
+
+    for c in &report.credentials {
+        let (five, seven) = match &c.snapshot {
+            Some(s) => (s.five_hour.as_ref(), s.seven_day.as_ref()),
+            None => (None, None),
+        };
+        rows.push(vec![
+            c.name.clone(),
+            c.kind.clone(),
+            percent(five),
+            reset_at(five, now),
+            percent(seven),
+            reset_at(seven, now),
+            state(c, now),
+        ]);
+    }
+
+    let mut out = table(&rows);
+
+    // 上限や従量課金の状態は、表に収めると読み飛ばされる。当たっている
+    // ものだけ下に並べる。
+    for c in &report.credentials {
+        for line in remarks(c) {
+            out.push_str(&format!("\n{line}"));
+        }
+    }
+    if let Some(p) = &report.probe {
+        out.push_str(&format!(
+            "\n\n{} 件に {} を投げて取り直しました (入力 {} / 出力 {} トークン消費)",
+            p.requests, p.model, p.input_tokens, p.output_tokens
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// 使用率。取れていなければ `-`。
+fn percent(window: Option<&Window>) -> String {
+    match window.and_then(|w| w.utilization) {
+        Some(v) => format!("{:.0}%", v * 100.0),
+        None => "-".to_owned(),
+    }
+}
+
+/// リセット時刻と、そこまでの残り。
+///
+/// 時刻だけだと「あとどれくらい使えるのか」が読み取れない。逆に残りだけだと
+/// 何時に戻るかが分からないので、両方出す。
+fn reset_at(window: Option<&Window>, now: i64) -> String {
+    let Some(reset) = window.and_then(|w| w.reset) else {
+        return "-".to_owned();
+    };
+    format!("{} ({})", clock(reset), remaining(reset - now))
+}
+
+/// `07/30 05:00Z`。表示は UTC で揃える。
+///
+/// Design rationale: 地方時に直さない。日時ライブラリを持たない
+/// (`credential::time` は RFC 3339 の読み書きだけ) ので、変換すると
+/// 環境依存の実装を抱えることになる。ずれても誤解が起きないよう `Z` を
+/// 明示し、判断に使う「残り時間」は時間帯に依らない形で併記する。
+fn clock(unix: i64) -> String {
+    let iso = llm_gateway::credential::time::format_rfc3339(unix);
+    match (iso.get(5..10), iso.get(11..16)) {
+        (Some(date), Some(time)) => format!("{date} {time}Z"),
+        _ => iso,
+    }
+}
+
+fn remaining(secs: i64) -> String {
+    match secs {
+        s if s <= 0 => "リセット済み".to_owned(),
+        s if s < 3600 => format!("あと {} 分", (s + 59) / 60),
+        s if s < 86_400 => format!("あと {} 時間", s / 3600),
+        s => format!("あと {} 日", s / 86_400),
+    }
+}
+
+/// 最終列。観測済みなら古さ、そうでなければ理由。
+fn state(c: &CredentialUsage, now: i64) -> String {
+    match (&c.snapshot, &c.note) {
+        (Some(s), _) => elapsed(now - s.observed_at),
+        (None, Some(note)) => note.clone(),
+        (None, None) => "-".to_owned(),
+    }
+}
+
+fn elapsed(secs: i64) -> String {
+    match secs {
+        s if s < 60 => "たった今".to_owned(),
+        s if s < 3600 => format!("{} 分前", s / 60),
+        s if s < 86_400 => format!("{} 時間前", s / 3600),
+        s => format!("{} 日前", s / 86_400),
+    }
+}
+
+/// 表に収まらないもの (上限到達・従量課金の可否・プローブの失敗)。
+fn remarks(c: &CredentialUsage) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if let Some(s) = &c.snapshot {
+        for (label, window) in [("5h", &s.five_hour), ("7d", &s.seven_day)] {
+            if let Some(status) = window.as_ref().and_then(|w| w.status.as_deref())
+                && status != "allowed"
+            {
+                lines.push(format!("{}: {label} が {status} です", c.name));
+            }
+        }
+        if let Some(overage) = &s.overage
+            && let Some(reason) = &overage.disabled_reason
+        {
+            lines.push(format!(
+                "{}: 従量課金へのフォールバックが使えません ({reason})",
+                c.name
+            ));
+        }
+    }
+    if let Some(e) = &c.probe_error {
+        lines.push(format!("{}: 取り直せませんでした ({e})", c.name));
+    }
+    lines
+}
+
+/// 列を揃えて並べる。
+fn table(rows: &[Vec<String>]) -> String {
+    let columns = rows.first().map_or(0, Vec::len);
+    let widths: Vec<usize> = (0..columns)
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| width(c))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+
+    let mut out = String::new();
+    for (n, row) in rows.iter().enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            line.push_str(cell);
+            // 最後の列は詰め物が要らない (行末の空白になるだけ)。
+            if i + 1 < row.len() {
+                line.push_str(&" ".repeat(widths[i].saturating_sub(width(cell)) + 2));
+            }
+        }
+        out.push_str(line.trim_end());
+    }
+    out
+}
+
+/// 端末上の見た目の幅。日本語は 2 桁ぶん取る。
+fn width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
+}
+
+fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD)
 }
 
 /// `login` に渡された内容。
@@ -600,6 +893,251 @@ mod tests {
     fn declared_type_without_login_is_refused() {
         let err = check_declared_type("r", Kind::Claude, Some(&relay())).unwrap_err();
         assert!(err.contains("login"), "{err}");
+    }
+
+    fn usage_args(list: &[&str]) -> Result<UsageArgs, String> {
+        parse_usage_args(&args(list))
+    }
+
+    #[test]
+    fn usage_takes_refresh_and_config() {
+        let plain = usage_args(&[]).unwrap();
+        assert!(!plain.refresh, "既定では投げない (利用量を消費しない)");
+        assert_eq!(plain.config_path, Config::default_path());
+
+        let refreshing = usage_args(&["--refresh", "--config", "/tmp/c.toml"]).unwrap();
+        assert!(refreshing.refresh);
+        assert_eq!(refreshing.config_path, PathBuf::from("/tmp/c.toml"));
+
+        assert_eq!(
+            usage_args(&["--config=/tmp/c.toml"]).unwrap().config_path,
+            PathBuf::from("/tmp/c.toml")
+        );
+    }
+
+    #[test]
+    fn usage_rejects_unknown_options() {
+        let err = usage_args(&["--refesh"]).unwrap_err();
+        assert!(err.contains("--refesh"), "{err}");
+    }
+
+    /// 待ち受けの書き方をそのまま宛先にしない。
+    ///
+    /// `0.0.0.0` は「どこからでも受ける」の意味で、繋ぎに行く先ではない。
+    #[test]
+    fn listen_address_becomes_a_reachable_url() {
+        assert_eq!(
+            usage_url("127.0.0.1:8319", false),
+            "http://127.0.0.1:8319/llm-gateway/usage"
+        );
+        assert_eq!(
+            usage_url("0.0.0.0:8319", false),
+            "http://127.0.0.1:8319/llm-gateway/usage"
+        );
+        assert_eq!(
+            usage_url("[::]:8319", false),
+            "http://127.0.0.1:8319/llm-gateway/usage"
+        );
+        assert_eq!(
+            usage_url("[::1]:8319", false),
+            "http://[::1]:8319/llm-gateway/usage"
+        );
+        assert_eq!(
+            usage_url("127.0.0.1:8319", true),
+            "http://127.0.0.1:8319/llm-gateway/usage?refresh=true"
+        );
+    }
+
+    /// server が居ないときは、次に何を見ればよいかまで言う。
+    #[test]
+    fn unreachable_server_says_what_to_check() {
+        let message = server_unreachable("127.0.0.1:8319", "connection refused");
+        assert!(message.contains("127.0.0.1:8319"), "{message}");
+        assert!(message.contains("起動"), "{message}");
+        assert!(message.contains("launchctl"), "{message}");
+    }
+
+    /// 2026-07-29T12:00:00Z
+    const NOW: i64 = 1_785_326_400;
+
+    fn window(utilization: f64, reset: i64, status: &str) -> Window {
+        Window {
+            utilization: Some(utilization),
+            status: Some(status.to_owned()),
+            reset: Some(reset),
+            reset_iso: Some(llm_gateway::credential::time::format_rfc3339(reset)),
+        }
+    }
+
+    fn observed() -> CredentialUsage {
+        let mut c = CredentialUsage::new(
+            "claude-personal",
+            "claude_oauth",
+            llm_gateway::usage::Support::Observed,
+            Some(llm_gateway::usage::Snapshot {
+                observed_at: NOW - 120,
+                observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW - 120),
+                five_hour: Some(window(0.71, NOW + 960, "allowed")),
+                seven_day: Some(window(0.3, NOW + 86_400 * 4, "allowed")),
+                overage: None,
+            }),
+        );
+        c.note = None;
+        c
+    }
+
+    fn report(credentials: Vec<CredentialUsage>) -> Report {
+        Report::new(NOW, credentials)
+    }
+
+    #[test]
+    fn renders_percentages_and_time_left() {
+        let out = render(&report(vec![observed()]));
+
+        assert!(out.contains("71%"), "使用率は % で出す:\n{out}");
+        assert!(out.contains("30%"), "{out}");
+        assert!(
+            out.contains("07-29 12:16Z (あと 16 分)"),
+            "リセットは時刻と残りの両方:\n{out}"
+        );
+        assert!(out.contains("(あと 4 日)"), "{out}");
+        assert!(out.contains("2 分前"), "いつ観測した値か:\n{out}");
+    }
+
+    /// 未観測・対象外も行として並ぶ (名前ごと消さない)。
+    #[test]
+    fn renders_a_row_for_credentials_without_numbers() {
+        let out = render(&report(vec![
+            CredentialUsage::new(
+                "bedrock",
+                "claude_bedrock",
+                llm_gateway::usage::Support::NotApplicable,
+                None,
+            ),
+            CredentialUsage::new(
+                "claude-work",
+                "claude_oauth",
+                llm_gateway::usage::Support::Unobserved,
+                None,
+            ),
+        ]));
+
+        assert!(out.contains("bedrock"), "{out}");
+        assert!(out.contains("対象外 (AWS 課金)"), "{out}");
+        assert!(out.contains("claude-work"), "{out}");
+        assert!(out.contains("未観測"), "{out}");
+    }
+
+    /// 上限や従量課金の状態は表の下に出す (数字の列に埋もれさせない)。
+    #[test]
+    fn calls_out_limits_and_failures() {
+        let mut hit = observed();
+        if let Some(s) = hit.snapshot.as_mut() {
+            s.five_hour = Some(window(1.0, NOW + 600, "rejected"));
+            s.overage = Some(llm_gateway::usage::Overage {
+                status: Some("disabled".to_owned()),
+                disabled_reason: Some("out_of_credits".to_owned()),
+            });
+        }
+        let mut broken = CredentialUsage::new(
+            "nowhere",
+            "claude_oauth",
+            llm_gateway::usage::Support::Unobserved,
+            None,
+        );
+        broken.probe_error = Some("繋がりません".to_owned());
+
+        let out = render(&report(vec![hit, broken]));
+        assert!(
+            out.contains("claude-personal: 5h が rejected です"),
+            "{out}"
+        );
+        assert!(out.contains("out_of_credits"), "{out}");
+        assert!(out.contains("nowhere: 取り直せませんでした"), "{out}");
+    }
+
+    /// 確認そのものが消費した分を出す (DR-0007)。
+    #[test]
+    fn probe_cost_is_visible() {
+        let mut r = report(vec![observed()]);
+        r.probe = Some(llm_gateway::usage::Probe {
+            requests: 2,
+            model: "claude-haiku-4-5-20251001".to_owned(),
+            input_tokens: 16,
+            output_tokens: 2,
+        });
+
+        let out = render(&r);
+        assert!(out.contains("claude-haiku-4-5-20251001"), "{out}");
+        assert!(out.contains("入力 16 / 出力 2 トークン消費"), "{out}");
+    }
+
+    /// 列が揃う。日本語を 1 桁で数えると、名前の長さで表が崩れる。
+    #[test]
+    fn columns_line_up() {
+        let out = render(&report(vec![
+            observed(),
+            CredentialUsage::new(
+                "b",
+                "relay",
+                llm_gateway::usage::Support::UpstreamDependent,
+                None,
+            ),
+        ]));
+
+        // 2 列目 (種別) の開始位置が、見出しと全ての行で揃っている。
+        let second_column = |line: &str| {
+            let (name, rest) = line.split_once("  ").expect("2 列目がある");
+            width(name) + 2 + (rest.len() - rest.trim_start().len())
+        };
+        let lines: Vec<&str> = out.lines().take(3).collect();
+        assert_eq!(lines.len(), 3, "見出し + 2 行:\n{out}");
+        for line in &lines[1..] {
+            assert_eq!(
+                second_column(line),
+                second_column(lines[0]),
+                "揃っていない:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn width_counts_japanese_as_two_columns() {
+        assert_eq!(width("abc"), 3);
+        assert_eq!(width("名前"), 4);
+        assert_eq!(width("あと 16 分"), 4 + 6);
+    }
+
+    #[test]
+    fn remaining_time_is_readable() {
+        assert_eq!(remaining(-1), "リセット済み");
+        assert_eq!(remaining(0), "リセット済み");
+        assert_eq!(remaining(60), "あと 1 分");
+        assert_eq!(remaining(961), "あと 17 分");
+        assert_eq!(remaining(7200), "あと 2 時間");
+        assert_eq!(remaining(86_400 * 3), "あと 3 日");
+    }
+
+    #[test]
+    fn elapsed_time_is_readable() {
+        assert_eq!(elapsed(0), "たった今");
+        assert_eq!(elapsed(59), "たった今");
+        assert_eq!(elapsed(120), "2 分前");
+        assert_eq!(elapsed(7200), "2 時間前");
+        assert_eq!(elapsed(86_400 * 2), "2 日前");
+    }
+
+    /// 時刻は UTC と明示する (地方時に直さないので、誤読を防ぐ)。
+    #[test]
+    fn clock_marks_utc() {
+        assert_eq!(clock(NOW), "07-29 12:00Z");
+    }
+
+    /// help に usage の使い方が載っている (実装と説明を揃える)。
+    #[test]
+    fn usage_documents_the_usage_command() {
+        assert!(USAGE.contains("usage"), "{USAGE}");
+        assert!(USAGE.contains("--refresh"), "{USAGE}");
     }
 
     /// login コマンドがある。無い名前は help へ案内する。

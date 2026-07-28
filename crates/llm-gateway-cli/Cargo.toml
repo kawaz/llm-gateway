@@ -21,3 +21,5 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
+# usage は server の HTTP 越しに取る (CLI 単独では持たない、DR-0007)。
+reqwest = { workspace = true }

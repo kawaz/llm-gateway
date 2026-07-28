@@ -9,13 +9,22 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::backend::anthropic::{Headers, beta, forward, model_of};
-use crate::config::{Config, Namespace};
-use crate::credential::{CredentialStore, Persistence};
+use crate::backend::anthropic::{Headers, Official, Provider, beta, forward, model_of};
+use crate::config::{Config, CredentialSpec, Namespace};
+use crate::credential::time::now_unix;
+use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
 use crate::session;
+use crate::usage::{self, Usage};
 use crate::{Error, Result};
+
+/// 能動プローブに使うモデル。
+///
+/// ヘッダを得るには実リクエストが要る (副作用ゼロで usage だけ返す口は
+/// 見つかっていない、DR-0007)。一番小さいモデルに `max_tokens = 1` で
+/// 投げて、消費を最小にする。
+const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 pub struct Gateway<P: Persistence> {
     config: Config,
@@ -23,6 +32,7 @@ pub struct Gateway<P: Persistence> {
     credentials: CredentialStore<P>,
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
+    usage: Usage,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -40,6 +50,7 @@ impl<P: Persistence> Gateway<P> {
             config: config.clone(),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
+            usage: Usage::default(),
         })
     }
 
@@ -216,7 +227,7 @@ impl<P: Persistence> Gateway<P> {
         body: &Value,
         headers: Headers,
     ) -> std::result::Result<forward::Response, String> {
-        forward::send(
+        let resp = forward::send(
             &self.http,
             route.provider.as_ref(),
             credential,
@@ -226,7 +237,163 @@ impl<P: Persistence> Gateway<P> {
             headers,
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+        // 便乗して利用状況を拾う (DR-0007)。読むのはヘッダだけなので、
+        // 本文はこの後もそのまま流れる。上限に当たった応答こそ見たいので、
+        // status では絞らない。
+        if let Some(id) = &route.credential {
+            self.usage.observe(id, &resp.headers, now_unix()).await;
+        }
+        Ok(resp)
+    }
+
+    /// credential ごとの利用状況。
+    ///
+    /// `probe` が真なら、先に能動プローブを投げてから作る。既定を便乗のみに
+    /// するのは、usage の確認が usage を勝手に消費する構図を避けるため
+    /// (DR-0007)。
+    pub async fn usage_report(&self, probe: bool) -> usage::Report {
+        let probed = if probe {
+            self.probe_usage().await
+        } else {
+            None
+        };
+
+        let mut credentials = Vec::new();
+        for (name, spec) in &self.config.credentials {
+            let id = CredentialId::new(name.as_str());
+            let snapshot = self.usage.get(&id).await;
+            let support = support_of(spec, snapshot.is_some());
+
+            let mut entry = usage::CredentialUsage::new(name, spec.type_name(), support, snapshot);
+            entry.probe_error = probed
+                .as_ref()
+                .and_then(|p| p.errors.get(name.as_str()).cloned());
+            credentials.push(entry);
+        }
+
+        let mut report = usage::Report::new(now_unix(), credentials);
+        report.probe = probed.map(|p| p.spent);
+        report
+    }
+
+    /// 使用率を取れる credential に、最小のリクエストを 1 本ずつ投げる。
+    ///
+    /// 失敗した credential はその理由を控えて先へ進む。1 つの認証切れで
+    /// 一覧全体が返らなくなると、確認したかった他の credential まで見えない。
+    async fn probe_usage(&self) -> Option<Probed> {
+        let mut spent = usage::Probe {
+            model: PROBE_MODEL.to_owned(),
+            ..usage::Probe::default()
+        };
+        let mut errors = std::collections::BTreeMap::new();
+
+        for (name, spec) in &self.config.credentials {
+            // ヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。
+            if !matches!(spec, CredentialSpec::ClaudeOauth { .. }) {
+                continue;
+            }
+            spent.requests += 1;
+            match self.probe_one(name, spec).await {
+                Ok((input, output)) => {
+                    spent.input_tokens += input;
+                    spent.output_tokens += output;
+                }
+                Err(reason) => {
+                    warn!(credential = %name, %reason, "利用状況を取りに行けません");
+                    errors.insert(name.clone(), reason);
+                }
+            }
+        }
+        Some(Probed { spent, errors })
+    }
+
+    /// 1 つの credential に投げて、ヘッダを拾う。返すのは消費したトークン。
+    async fn probe_one(
+        &self,
+        name: &str,
+        spec: &CredentialSpec,
+    ) -> std::result::Result<(u64, u64), String> {
+        let id = CredentialId::new(name);
+        let credential = self
+            .credentials
+            .acquire(&id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let provider = Official::new(name, spec.url(), spec.headers().clone());
+
+        let body = serde_json::json!({
+            "model": PROBE_MODEL,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "."}],
+        });
+        let headers = Headers::new(vec![
+            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+            ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
+        ]);
+
+        let resp = forward::send(
+            &self.http,
+            &provider as &dyn Provider,
+            Some(&credential),
+            "/v1/messages",
+            None,
+            body,
+            headers,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // 上限に当たった応答にも使用率は載る。状態を見る前に拾っておく。
+        let status = resp.status;
+        self.usage.observe(&id, &resp.headers, now_unix()).await;
+
+        let raw = forward::collect_body(resp.body)
+            .await
+            .map_err(|e| e.to_string())?;
+        if status != 200 {
+            return Err(format!(
+                "upstream が {status} を返しました: {}",
+                String::from_utf8_lossy(&raw)
+                    .chars()
+                    .take(200)
+                    .collect::<String>()
+            ));
+        }
+
+        let spent: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+        let count = |key: &str| {
+            spent
+                .pointer(&format!("/usage/{key}"))
+                .and_then(Value::as_u64)
+        };
+        Ok((
+            count("input_tokens").unwrap_or(0),
+            count("output_tokens").unwrap_or(0),
+        ))
+    }
+}
+
+/// プローブの結果。消費した分と、credential ごとの失敗。
+struct Probed {
+    spent: usage::Probe,
+    errors: std::collections::BTreeMap<String, String>,
+}
+
+/// この credential の利用状況をどこまで出せるか。
+fn support_of(spec: &CredentialSpec, observed: bool) -> usage::Support {
+    if observed {
+        return usage::Support::Observed;
+    }
+    match spec {
+        CredentialSpec::ClaudeOauth { .. } => usage::Support::Unobserved,
+        // 使用量は別の IAM アクションで、実行権限しかない API キーでは取れない。
+        CredentialSpec::ClaudeBedrock { .. } => usage::Support::NotApplicable,
+        // Codex は転送で凌いでいる段階。転送先が返さないものは見えない。
+        CredentialSpec::CodexOauth { .. } | CredentialSpec::Relay { .. } => {
+            usage::Support::UpstreamDependent
+        }
     }
 }
 
@@ -1005,6 +1172,122 @@ credentials = ["a"]
                 .values()
                 .all(|t| t == &format_rfc3339(crate::credential::time::parse_rfc3339(t).unwrap())),
             "時刻は RFC 3339 で書く: {json}"
+        );
+    }
+
+    /// 種別ごとに、利用状況をどこまで出せるか。
+    #[test]
+    fn support_depends_on_the_credential_type() {
+        use crate::usage::Support;
+
+        let oauth = CredentialSpec::ClaudeOauth {
+            url: "https://api.anthropic.com".to_owned(),
+            headers: Default::default(),
+            exclude: Vec::new(),
+        };
+        let bedrock = CredentialSpec::ClaudeBedrock {
+            url: "https://bedrock.invalid/anthropic".to_owned(),
+            headers: Default::default(),
+            deny_beta: None,
+            exclude: Vec::new(),
+        };
+        let relay = CredentialSpec::Relay {
+            url: "http://127.0.0.1:8317".to_owned(),
+            headers: Default::default(),
+            models: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        assert_eq!(support_of(&oauth, false), Support::Unobserved);
+        assert_eq!(support_of(&bedrock, false), Support::NotApplicable);
+        assert_eq!(support_of(&relay, false), Support::UpstreamDependent);
+
+        // 観測できているなら、種別に関わらずその値を出す。
+        for spec in [&oauth, &bedrock, &relay] {
+            assert_eq!(support_of(spec, true), Support::Observed);
+        }
+    }
+
+    /// 使っていない credential も名前は出す。
+    ///
+    /// 消してしまうと「設定にあるが未観測」と「設定に無い」の区別がつかない。
+    #[tokio::test]
+    async fn usage_report_lists_every_credential() {
+        let gw = gateway(
+            r#"
+[credentials.claude-personal]
+type = "claude_oauth"
+
+[credentials.bedrock]
+type = "claude_bedrock"
+url = "https://bedrock.invalid/anthropic"
+
+[credentials.cpa]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
+
+[ns.default]
+"#,
+        )
+        .await;
+
+        let report = gw.usage_report(false).await;
+        let names: Vec<&str> = report.credentials.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["bedrock", "claude-personal", "cpa"]);
+
+        assert!(report.probe.is_none(), "既定では投げない");
+        assert!(
+            report.credentials.iter().all(|c| c.snapshot.is_none()),
+            "転送していないので未観測"
+        );
+        assert!(
+            report
+                .credentials
+                .iter()
+                .all(|c| c.note.as_ref().is_some_and(|n| !n.is_empty())),
+            "出せない理由が書いてある"
+        );
+    }
+
+    /// プローブが失敗した credential は理由を載せ、他は返す。
+    #[tokio::test]
+    async fn a_failing_probe_does_not_take_the_others_down() {
+        let gw = gateway(
+            r#"
+[credentials.nowhere]
+type = "claude_oauth"
+url = "http://127.0.0.1:9"
+
+[credentials.bedrock]
+type = "claude_bedrock"
+url = "https://bedrock.invalid/anthropic"
+
+[ns.default]
+"#,
+        )
+        .await;
+
+        let report = gw.usage_report(true).await;
+        let probe = report.probe.expect("投げた記録が残る");
+        assert_eq!(probe.requests, 1, "ヘッダを返すのは claude_oauth だけ");
+        assert_eq!(probe.model, PROBE_MODEL);
+
+        let by_name = |name: &str| {
+            report
+                .credentials
+                .iter()
+                .find(|c| c.name == name)
+                .expect("設定にある")
+                .clone()
+        };
+        assert!(
+            by_name("nowhere").probe_error.is_some(),
+            "繋がらなかった理由を載せる"
+        );
+        assert!(
+            by_name("bedrock").probe_error.is_none(),
+            "投げていない相手に失敗は書かない"
         );
     }
 
