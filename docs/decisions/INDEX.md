@@ -9,6 +9,7 @@
 - [DR-0005](./DR-0005-distribute.md) — 配布する (GH Release + Homebrew tap + notarize)。DR-0002 の「配布しない」を無効にする
 - [DR-0006](./DR-0006-namespace-routing.md) — 既定 namespace を特別扱いせず、`/v1` を `/ns-default` へ内部ルーティングする
 - [DR-0007](./DR-0007-usage-visibility.md) — 全 credential の利用量 (5h/7d 使用率・リセット時刻) を /llm-gateway/usage で一括表示する
+- [DR-0008](./DR-0008-user-facing-language.md) — プログラムが出す文言 (JSON 値 / error / help) は英語にする。新規から適用
 
 ## Archived
 
