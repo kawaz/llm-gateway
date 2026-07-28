@@ -352,38 +352,53 @@ fn server_unreachable(listen: &str, reason: &str) -> String {
     )
 }
 
-/// 人が読む形に整える。
+/// 人が読む形に整える。claude-statusline の 5h/7d バー表示 (`dualBar` /
+/// `dualInfo`) を Rust に移植し、1 credential 1 行で並べる。
 fn render(report: &Report) -> String {
     let now = report.generated_at;
-    let mut rows = vec![vec![
-        "名前".to_owned(),
-        "種別".to_owned(),
-        "5h".to_owned(),
-        "リセット (5h)".to_owned(),
-        "7d".to_owned(),
-        "リセット (7d)".to_owned(),
-        "取得 / 状態".to_owned(),
-    ]];
+    let color = color_enabled();
+    let name_width = report
+        .credentials
+        .iter()
+        .map(|c| width(&c.name))
+        .max()
+        .unwrap_or(0);
 
+    let mut out = String::new();
     for c in &report.credentials {
-        let (five, seven) = match &c.snapshot {
-            Some(s) => (s.five_hour.as_ref(), s.seven_day.as_ref()),
-            None => (None, None),
-        };
-        rows.push(vec![
-            c.name.clone(),
-            c.kind.clone(),
-            percent(five),
-            reset_at(five, now),
-            percent(seven),
-            reset_at(seven, now),
-            state(c, now),
-        ]);
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&c.name);
+        out.push_str(&" ".repeat(name_width.saturating_sub(width(&c.name)) + 2));
+
+        match &c.snapshot {
+            Some(s) => {
+                out.push_str(&window_field(
+                    '⏰',
+                    s.five_hour.as_ref(),
+                    now,
+                    5 * 3600,
+                    color,
+                ));
+                out.push(' ');
+                out.push_str(&window_field(
+                    '📆',
+                    s.seven_day.as_ref(),
+                    now,
+                    7 * 86_400,
+                    color,
+                ));
+                let age = now - s.observed_at;
+                if age > 300 {
+                    out.push_str(&format!(" ({})", elapsed(age)));
+                }
+            }
+            None => out.push_str(c.note.as_deref().unwrap_or("-")),
+        }
     }
 
-    let mut out = table(&rows);
-
-    // 上限や従量課金の状態は、表に収めると読み飛ばされる。当たっている
+    // 上限や従量課金の状態は、行に収めると読み飛ばされる。当たっている
     // ものだけ下に並べる。
     for c in &report.credentials {
         for line in remarks(c) {
@@ -400,55 +415,139 @@ fn render(report: &Report) -> String {
     out
 }
 
-/// 使用率。取れていなければ `-`。
-fn percent(window: Option<&Window>) -> String {
-    match window.and_then(|w| w.utilization) {
-        Some(v) => format!("{:.0}%", v * 100.0),
-        None => "-".to_owned(),
-    }
-}
-
-/// リセット時刻と、そこまでの残り。
-///
-/// 時刻だけだと「あとどれくらい使えるのか」が読み取れない。逆に残りだけだと
-/// 何時に戻るかが分からないので、両方出す。
-fn reset_at(window: Option<&Window>, now: i64) -> String {
-    let Some(reset) = window.and_then(|w| w.reset) else {
-        return "-".to_owned();
+/// 1 つの窓 (5h/7d) の表示。使用率とウィンドウ経過率を `dualBar` で重ねて
+/// 描き、続けて `使用率%/経過率%/残り時間` を出す。取れていなければ `-`。
+fn window_field(
+    icon: char,
+    window: Option<&Window>,
+    now: i64,
+    window_secs: i64,
+    color: bool,
+) -> String {
+    let (Some(util), Some(reset)) = (
+        window.and_then(|w| w.utilization),
+        window.and_then(|w| w.reset),
+    ) else {
+        return format!("{icon}-");
     };
-    format!("{} ({})", clock(reset), remaining(reset - now))
+    let util_pct = util * 100.0;
+    let elapsed_pct = calc_elapsed(reset, window_secs, now);
+    let bar = dual_bar(util_pct, elapsed_pct, 10, color);
+    let remaining = format_duration(reset - now);
+    let info = dual_info(util_pct, elapsed_pct, &remaining, color);
+    format!("{icon}{bar}{info}")
 }
 
-/// `07/30 05:00Z`。表示は UTC で揃える。
-///
-/// Design rationale: 地方時に直さない。日時ライブラリを持たない
-/// (`credential::time` は RFC 3339 の読み書きだけ) ので、変換すると
-/// 環境依存の実装を抱えることになる。ずれても誤解が起きないよう `Z` を
-/// 明示し、判断に使う「残り時間」は時間帯に依らない形で併記する。
-fn clock(unix: i64) -> String {
-    let iso = llm_gateway::credential::time::format_rfc3339(unix);
-    match (iso.get(5..10), iso.get(11..16)) {
-        (Some(date), Some(time)) => format!("{date} {time}Z"),
-        _ => iso,
+/// リセット時刻とウィンドウ長から、窓の経過率 (0〜100) を逆算する。
+/// (claude-statusline `calcElapsed` の移植)
+fn calc_elapsed(reset: i64, window_secs: i64, now: i64) -> f64 {
+    if window_secs <= 0 {
+        return 0.0;
+    }
+    let window_start = reset - window_secs;
+    let pct = (now - window_start) as f64 / window_secs as f64 * 100.0;
+    pct.clamp(0.0, 100.0)
+}
+
+/// 使用率に応じた危険度の色 (xterm-256)。(`utilColor` の移植)
+fn util_color(util_pct: f64) -> u8 {
+    if util_pct >= 80.0 {
+        196
+    } else if util_pct >= 50.0 {
+        220
+    } else {
+        40
     }
 }
 
-fn remaining(secs: i64) -> String {
-    match secs {
-        s if s <= 0 => "リセット済み".to_owned(),
-        s if s < 3600 => format!("あと {} 分", (s + 59) / 60),
-        s if s < 86_400 => format!("あと {} 時間", s / 3600),
-        s => format!("あと {} 日", s / 86_400),
+/// 半ブロック `▀` を width 個並べ、上半分の色 (fg) で使用率、下半分の色 (bg)
+/// でウィンドウ経過率を同時に表す。(`dualBar` の移植)
+fn dual_bar(util_pct: f64, elapsed_pct: f64, width: usize, color: bool) -> String {
+    let util_pct = util_pct.clamp(0.0, 100.0);
+    let elapsed_pct = elapsed_pct.clamp(0.0, 100.0);
+    let top_filled = (util_pct / 100.0 * width as f64).round() as usize;
+    let bot_filled = (elapsed_pct / 100.0 * width as f64).round() as usize;
+
+    let mut out = String::new();
+    for i in 0..width {
+        let fg = if i < top_filled {
+            util_color(util_pct)
+        } else {
+            240
+        };
+        let bg = if i < bot_filled { 39 } else { 24 };
+        out.push_str(&sgr_fg(fg, color));
+        out.push_str(&sgr_bg(bg, color));
+        out.push('▀');
+    }
+    out.push_str(&sgr_reset(color));
+    out
+}
+
+/// `<使用率>%/<窓の経過率>%/<残り時間>`。(`dualInfo` の移植)
+fn dual_info(util_pct: f64, elapsed_pct: f64, remaining: &str, color: bool) -> String {
+    format!(
+        "{}{:>2.0}%{}/{}{:.0}%{}/{}{}{}",
+        sgr_fg(util_color(util_pct), color),
+        util_pct,
+        sgr_reset(color),
+        sgr_fg(39, color),
+        elapsed_pct,
+        sgr_reset(color),
+        sgr_fg(24, color),
+        remaining,
+        sgr_reset(color),
+    )
+}
+
+/// 残り時間を `3h01m` / `1d20h` のような形式にする。(`formatDuration` の移植)
+fn format_duration(secs: i64) -> String {
+    let total_m = secs.max(0) / 60;
+    let m = total_m % 60;
+    let total_h = total_m / 60;
+    let h = total_h % 24;
+    let d = total_h / 24;
+
+    if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if total_h >= 10 {
+        format!("{total_h:02}h{m:02}m")
+    } else if total_h >= 1 {
+        format!("{total_h}h{m:02}m")
+    } else {
+        format!("{total_m:02}m")
     }
 }
 
-/// 最終列。観測済みなら古さ、そうでなければ理由。
-fn state(c: &CredentialUsage, now: i64) -> String {
-    match (&c.snapshot, &c.note) {
-        (Some(s), _) => elapsed(now - s.observed_at),
-        (None, Some(note)) => note.clone(),
-        (None, None) => "-".to_owned(),
+/// `NO_COLOR` が空でない値で設定されているか。
+fn no_color() -> bool {
+    std::env::var("NO_COLOR").is_ok_and(|v| !v.is_empty())
+}
+
+/// 色を出してよいか (`NO_COLOR` 無指定 かつ 標準出力が TTY)。
+fn color_enabled() -> bool {
+    use std::io::IsTerminal as _;
+    !no_color() && std::io::stdout().is_terminal()
+}
+
+fn sgr(params: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{params}m")
+    } else {
+        String::new()
     }
+}
+
+fn sgr_fg(n: u8, color: bool) -> String {
+    sgr(&format!("38;5;{n}"), color)
+}
+
+fn sgr_bg(n: u8, color: bool) -> String {
+    sgr(&format!("48;5;{n}"), color)
+}
+
+fn sgr_reset(color: bool) -> String {
+    sgr("0", color)
 }
 
 fn elapsed(secs: i64) -> String {
@@ -460,7 +559,11 @@ fn elapsed(secs: i64) -> String {
     }
 }
 
-/// 表に収まらないもの (上限到達・従量課金の可否・プローブの失敗)。
+/// 表に収まらないもの (上限到達の警告・プローブの失敗)。
+///
+/// overage (従量課金フォールバックの可否) はここに出さない。クレジットを
+/// 使わない運用では毎回同じ行が並ぶだけで、表を見れば足りる (kawaz 裁定)。
+/// JSON には残っているので、機械で読む分には失われない。
 fn remarks(c: &CredentialUsage) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -472,50 +575,11 @@ fn remarks(c: &CredentialUsage) -> Vec<String> {
                 lines.push(format!("{}: {label} が {status} です", c.name));
             }
         }
-        if let Some(overage) = &s.overage
-            && let Some(reason) = &overage.disabled_reason
-        {
-            lines.push(format!(
-                "{}: 従量課金へのフォールバックが使えません ({reason})",
-                c.name
-            ));
-        }
     }
     if let Some(e) = &c.probe_error {
         lines.push(format!("{}: 取り直せませんでした ({e})", c.name));
     }
     lines
-}
-
-/// 列を揃えて並べる。
-fn table(rows: &[Vec<String>]) -> String {
-    let columns = rows.first().map_or(0, Vec::len);
-    let widths: Vec<usize> = (0..columns)
-        .map(|i| {
-            rows.iter()
-                .filter_map(|r| r.get(i))
-                .map(|c| width(c))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-
-    let mut out = String::new();
-    for (n, row) in rows.iter().enumerate() {
-        if n > 0 {
-            out.push('\n');
-        }
-        let mut line = String::new();
-        for (i, cell) in row.iter().enumerate() {
-            line.push_str(cell);
-            // 最後の列は詰め物が要らない (行末の空白になるだけ)。
-            if i + 1 < row.len() {
-                line.push_str(&" ".repeat(widths[i].saturating_sub(width(cell)) + 2));
-            }
-        }
-        out.push_str(line.trim_end());
-    }
-    out
 }
 
 /// 端末上の見た目の幅。日本語は 2 桁ぶん取る。
@@ -990,18 +1054,29 @@ mod tests {
         Report::new(NOW, credentials)
     }
 
+    /// util / 窓の経過率 / 残り時間 を `%/%/時間` の形で出す
+    /// (claude-statusline `dualInfo` と同じ組み立て)。
     #[test]
     fn renders_percentages_and_time_left() {
         let out = render(&report(vec![observed()]));
 
-        assert!(out.contains("71%"), "使用率は % で出す:\n{out}");
-        assert!(out.contains("30%"), "{out}");
+        assert!(out.contains("71%/95%/16m"), "5h 窓:\n{out}");
+        assert!(out.contains("30%/43%/4d00h"), "7d 窓:\n{out}");
         assert!(
-            out.contains("07-29 12:16Z (あと 16 分)"),
-            "リセットは時刻と残りの両方:\n{out}"
+            !out.contains("分前"),
+            "取得から間もないので古さは出さない:\n{out}"
         );
-        assert!(out.contains("(あと 4 日)"), "{out}");
-        assert!(out.contains("2 分前"), "いつ観測した値か:\n{out}");
+    }
+
+    /// 取得から 5 分を超えたスナップショットだけ古さを添える。
+    #[test]
+    fn shows_age_only_when_snapshot_is_stale() {
+        let mut c = observed();
+        if let Some(s) = c.snapshot.as_mut() {
+            s.observed_at = NOW - 400;
+        }
+        let out = render(&report(vec![c]));
+        assert!(out.contains("(6 分前)"), "{out}");
     }
 
     /// 未観測・対象外も行として並ぶ (名前ごと消さない)。
@@ -1052,7 +1127,8 @@ mod tests {
             out.contains("claude-personal: 5h が rejected です"),
             "{out}"
         );
-        assert!(out.contains("out_of_credits"), "{out}");
+        // overage は表を見れば足りる情報の重複なので、表示には出さない (JSON には残る)。
+        assert!(!out.contains("out_of_credits"), "{out}");
         assert!(out.contains("nowhere: 取り直せませんでした"), "{out}");
     }
 
@@ -1072,9 +1148,9 @@ mod tests {
         assert!(out.contains("入力 16 / 出力 2 トークン消費"), "{out}");
     }
 
-    /// 列が揃う。日本語を 1 桁で数えると、名前の長さで表が崩れる。
+    /// 名前の列幅が揃う。日本語を 1 桁で数えると、名前の長さで崩れる。
     #[test]
-    fn columns_line_up() {
+    fn names_are_padded_to_the_widest() {
         let out = render(&report(vec![
             observed(),
             CredentialUsage::new(
@@ -1085,20 +1161,14 @@ mod tests {
             ),
         ]));
 
-        // 2 列目 (種別) の開始位置が、見出しと全ての行で揃っている。
-        let second_column = |line: &str| {
-            let (name, rest) = line.split_once("  ").expect("2 列目がある");
-            width(name) + 2 + (rest.len() - rest.trim_start().len())
-        };
-        let lines: Vec<&str> = out.lines().take(3).collect();
-        assert_eq!(lines.len(), 3, "見出し + 2 行:\n{out}");
-        for line in &lines[1..] {
-            assert_eq!(
-                second_column(line),
-                second_column(lines[0]),
-                "揃っていない:\n{out}"
-            );
-        }
+        let lines: Vec<&str> = out.lines().take(2).collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        // "claude-personal" が最長なので、2 列目はその幅 + 2 桁の空白から始まる。
+        assert!(lines[0].starts_with("claude-personal  "), "{out}");
+        assert!(
+            lines[1].starts_with(&format!("b{}", " ".repeat(16))),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1106,16 +1176,6 @@ mod tests {
         assert_eq!(width("abc"), 3);
         assert_eq!(width("名前"), 4);
         assert_eq!(width("あと 16 分"), 4 + 6);
-    }
-
-    #[test]
-    fn remaining_time_is_readable() {
-        assert_eq!(remaining(-1), "リセット済み");
-        assert_eq!(remaining(0), "リセット済み");
-        assert_eq!(remaining(60), "あと 1 分");
-        assert_eq!(remaining(961), "あと 17 分");
-        assert_eq!(remaining(7200), "あと 2 時間");
-        assert_eq!(remaining(86_400 * 3), "あと 3 日");
     }
 
     #[test]
@@ -1127,10 +1187,32 @@ mod tests {
         assert_eq!(elapsed(86_400 * 2), "2 日前");
     }
 
-    /// 時刻は UTC と明示する (地方時に直さないので、誤読を防ぐ)。
     #[test]
-    fn clock_marks_utc() {
-        assert_eq!(clock(NOW), "07-29 12:00Z");
+    fn format_duration_switches_units_by_magnitude() {
+        assert_eq!(format_duration(-1), "00m");
+        assert_eq!(format_duration(59), "00m");
+        assert_eq!(format_duration(181), "03m");
+        assert_eq!(format_duration(3660), "1h01m");
+        assert_eq!(format_duration(36_060), "10h01m");
+        assert_eq!(format_duration(90_000 + 3600), "1d02h");
+    }
+
+    #[test]
+    fn calc_elapsed_reads_back_the_window_progress() {
+        // 5h 窓、リセットまで残り 1h ⇒ 窓の 80% が経過している。
+        assert_eq!(calc_elapsed(NOW + 3600, 5 * 3600, NOW), 80.0);
+        // 経過率は 0〜100 にクランプする。
+        assert_eq!(calc_elapsed(NOW - 3600, 5 * 3600, NOW), 100.0);
+        assert_eq!(calc_elapsed(NOW + 5 * 3600 + 3600, 5 * 3600, NOW), 0.0);
+    }
+
+    #[test]
+    fn util_color_thresholds() {
+        assert_eq!(util_color(0.0), 40);
+        assert_eq!(util_color(49.9), 40);
+        assert_eq!(util_color(50.0), 220);
+        assert_eq!(util_color(79.9), 220);
+        assert_eq!(util_color(80.0), 196);
     }
 
     /// help に usage の使い方が載っている (実装と説明を揃える)。
