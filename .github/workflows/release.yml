@@ -196,7 +196,25 @@ jobs:
           sha256sum ./*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # provenance は public リポでしか作れない。private のまま実行すると
+      # 「Feature not available for user-owned private repositories」で
+      # release ごと落ちるので、公開状態を見てから判断する。
+      # public 化すれば何も変えずに有効になる。
+      - name: 公開リポかどうかを見る
+        id: visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          public=$(gh api "repos/${REPO}" --jq '.private | not')
+          echo "public=${public}" >> "$GITHUB_OUTPUT"
+          if [ "$public" != "true" ]; then
+            echo "::notice::private リポなので provenance は付けません (public 化すると付きます)"
+          fi
+
       - name: Generate SLSA build provenance attestation
+        if: steps.visibility.outputs.public == 'true'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
