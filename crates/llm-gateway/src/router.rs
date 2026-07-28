@@ -401,7 +401,7 @@ mod tests {
     use super::*;
 
     const CONFIG: &str = r#"
-[filter]
+[ns.default.filter]
 exclude = ["claude-opus-4*"]
 
 [credentials.bedrock]
@@ -420,15 +420,15 @@ type = "relay"
 url = "http://127.0.0.1:8320"
 models = ["gpt-5.6-sol"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["claude-fable-*"]
 credentials = ["bedrock", "oauth-a"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["gpt-*"]
 credentials = ["cpa"]
 
-[aliases]
+[ns.default.aliases]
 # 正式な短縮名
 claude-fable = "claude-fable-*"
 claude-opus = "claude-opus-*"

@@ -15,6 +15,7 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use tracing::{Instrument as _, error};
 
+use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::Persistence;
 use llm_gateway::{Error, Gateway, relay};
 
@@ -122,13 +123,8 @@ async fn messages<P: Persistence + 'static>(
     let Some(ns) = gateway.namespace(&ns_name) else {
         return unknown_namespace(&ns_name, &gateway.namespace_names());
     };
-    if !ns.accepts(
-        parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        return unauthorized(&ns_name);
+    if let Some(denied) = rejection(ns, &ns_name, &parts.headers) {
+        return denied;
     }
 
     let path = upstream_path(uri.path()).to_owned();
@@ -170,13 +166,8 @@ async fn models<P: Persistence + 'static>(
     let Some(ns) = gateway.namespace(&ns_name) else {
         return unknown_namespace(&ns_name, &gateway.namespace_names());
     };
-    if !ns.accepts(
-        request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        return unauthorized(&ns_name);
+    if let Some(denied) = rejection(ns, &ns_name, request.headers()) {
+        return denied;
     }
 
     let data: Vec<Value> = gateway
@@ -198,18 +189,35 @@ fn unknown_namespace(name: &str, known: &[&str]) -> Response {
     )
 }
 
-fn unauthorized(ns: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "type": "authentication_error",
-                "message": format!("namespace `{ns}` のトークンが違います"),
-            },
-        })),
+/// トークンを検査して、通さないなら返す応答を作る。
+///
+/// 文言を分けるのは、送っているトークンが疑わしいのか、gateway 側の設定が
+/// 足りないのかで打つ手が違うから。同じ文言だと、正しいトークンを送っている
+/// 利用者が「合っているはずなのに」で止まる (DR-0006)。
+fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response> {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let message = match ns.authorize(presented) {
+        Authorization::Accepted => return None,
+        Authorization::WrongToken => format!("namespace `{name}` のトークンが違います"),
+        Authorization::NoTokenConfigured => format!(
+            "namespace `{name}` に auth_token が設定されていないので、誰も通せません。\
+             設定の `[ns.{name}]` に auth_token を書いてください"
+        ),
+    };
+
+    Some(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "type": "error",
+                "error": {"type": "authentication_error", "message": message},
+            })),
+        )
+            .into_response(),
     )
-        .into_response()
 }
 
 fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -413,6 +421,25 @@ content-length: {declared}\r\n\r\n{head}"
         }
     }
 
+    /// 試験で名乗るトークン。
+    pub(crate) const TOKEN: &str = "test-token";
+
+    /// 認証を書いた `[ns.default]` を足して立てる。
+    ///
+    /// `auth_token` の無い namespace は誰も通さない (DR-0006) ので、認証以外を
+    /// 見る試験でも既定 namespace には token が要る。名乗る側は [`authed`]。
+    pub(crate) async fn serve_with_default_ns(config_toml: &str) -> String {
+        serve(&format!(
+            "{config_toml}\n[ns.default]\nauth_token = \"{TOKEN}\"\n"
+        ))
+        .await
+    }
+
+    /// トークンを名乗る。
+    pub(crate) fn authed(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder.bearer_auth(TOKEN)
+    }
+
     /// gateway を立てて、その待ち受け先を返す。
     pub(crate) async fn serve(config_toml: &str) -> String {
         let config: Config = toml::from_str(config_toml).unwrap();
@@ -447,26 +474,28 @@ content-length: {declared}\r\n\r\n{head}"
         })
         .await;
 
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{upstream}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&request_body())
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 200);
         assert_eq!(
@@ -493,26 +522,28 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         })
         .await;
 
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{upstream}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&json!({"model": "m", "stream": true, "messages": []}))
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({"model": "m", "stream": true, "messages": []})),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
@@ -536,26 +567,28 @@ credentials = ["a"]
         )
         .await;
 
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{upstream}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&json!({"model": "m", "stream": true, "messages": []}))
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({"model": "m", "stream": true, "messages": []})),
+        )
+        .send()
+        .await
+        .unwrap();
         assert_eq!(resp.status(), 200, "ヘッダは通る");
 
         // 本文はここで途切れる。クライアントが受け取り損ねた時点では、
@@ -590,26 +623,28 @@ credentials = ["a"]
     /// 設定に無いモデルは 404。どのモデルか分かる文言にする。
     #[tokio::test]
     async fn unknown_model_yields_404() {
-        let base = serve(
+        let base = serve_with_default_ns(
             r#"
 [credentials.a]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["m", "claude-opus-5", "claude-fable-5"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["known"]
 credentials = ["a"]
 "#,
         )
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&json!({"model": "no-such-model", "messages": []}))
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({"model": "no-such-model", "messages": []})),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 404);
         let body: Value = resp.json().await.unwrap();
@@ -628,26 +663,28 @@ credentials = ["a"]
     #[tokio::test]
     async fn all_routes_down_yields_503_with_detail() {
         let down = fake_upstream(|| (503, "{}".to_owned(), vec![])).await;
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{down}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&request_body())
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 503);
         let body: Value = resp.json().await.unwrap();
@@ -668,26 +705,28 @@ credentials = ["a"]
         })
         .await;
 
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{upstream}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&request_body())
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 400);
         assert!(
@@ -701,27 +740,29 @@ credentials = ["a"]
 
     #[tokio::test]
     async fn malformed_json_yields_400() {
-        let base = serve(
+        let base = serve_with_default_ns(
             r#"
 [credentials.a]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["m", "claude-opus-5", "claude-fable-5"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#,
         )
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .header("content-type", "application/json")
-            .body("{ not json")
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("content-type", "application/json")
+                .body("{ not json"),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 400);
         let body: Value = resp.json().await.unwrap();
@@ -730,21 +771,22 @@ credentials = ["a"]
 
     #[tokio::test]
     async fn lists_models() {
-        let base = serve(
+        let base = serve_with_default_ns(
             r#"
 [credentials.a]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-fable-5"]
 
-[aliases]
+[ns.default.aliases]
 fable = "claude-fable-*"
 opus = "claude-opus-*"
 "#,
         )
         .await;
 
-        let body: Value = reqwest::get(format!("{base}/v1/models"))
+        let body: Value = authed(reqwest::Client::new().get(format!("{base}/v1/models")))
+            .send()
             .await
             .unwrap()
             .json()
@@ -769,26 +811,28 @@ opus = "claude-opus-*"
     #[tokio::test]
     async fn count_tokens_is_routed_too() {
         let upstream = fake_upstream(|| (200, r#"{"input_tokens":42}"#.to_owned(), vec![])).await;
-        let base = serve(&format!(
+        let base = serve_with_default_ns(&format!(
             r#"
 [credentials.a]
 type = "relay"
 url = "{upstream}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
         ))
         .await;
 
-        let resp = reqwest::Client::new()
-            .post(format!("{base}/v1/messages/count_tokens"))
-            .json(&request_body())
-            .send()
-            .await
-            .unwrap();
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages/count_tokens"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
 
         assert_eq!(resp.status(), 200);
         assert!(resp.text().await.unwrap().contains("42"));
@@ -797,10 +841,12 @@ credentials = ["a"]
 
 #[cfg(test)]
 mod e2e_namespace_tests {
-    use super::tests::serve;
+    use super::tests::{TOKEN, authed, serve};
     use serde_json::Value;
 
     /// 2 つの namespace を持つ設定。見えるモデルが違う。
+    ///
+    /// `tokenless` は `auth_token` を書き忘れた namespace。誰も通れない。
     const TWO_NS: &str = r#"
 [credentials.a]
 type = "relay"
@@ -808,21 +854,26 @@ url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-fable-5", "gpt-5.6-sol"]
 
 [ns.personal]
+auth_token = "test-token"
 [ns.personal.filter]
 exclude = ["gpt-*"]
 [ns.personal.aliases]
 opus = "claude-opus-*"
 
 [ns.work]
+auth_token = "test-token"
 [ns.work.filter]
 exclude = ["claude-fable-*"]
 
 [ns.locked]
 auth_token = "secret-token"
+
+[ns.tokenless]
 "#;
 
     async fn ids(base: &str, path: &str) -> Vec<String> {
-        let body: Value = reqwest::get(format!("{base}{path}"))
+        let body: Value = authed(reqwest::Client::new().get(format!("{base}{path}")))
+            .send()
             .await
             .unwrap()
             .json()
@@ -865,7 +916,8 @@ auth_token = "secret-token"
     #[tokio::test]
     async fn unknown_namespace_is_rejected() {
         let base = serve(TWO_NS).await;
-        let resp = reqwest::get(format!("{base}/ns-nope/v1/models"))
+        let resp = authed(reqwest::Client::new().get(format!("{base}/ns-nope/v1/models")))
+            .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 404);
@@ -908,14 +960,132 @@ auth_token = "secret-token"
         }
     }
 
-    /// トークンを設定していない namespace は誰でも使える。
+    /// `auth_token` を書いていない namespace は誰も通れない (fail-closed)。
+    ///
+    /// 書き忘れが「誰でも通れる穴」になっていた。設定ファイルの外 (前段に
+    /// 公開経路が生えた) で前提が崩れても、書き忘れが穴にならないようにする
+    /// (DR-0006)。
     #[tokio::test]
-    async fn namespace_without_token_is_open() {
+    async fn namespace_without_token_lets_nobody_in() {
         let base = serve(TWO_NS).await;
-        let resp = reqwest::get(format!("{base}/ns-personal/v1/models"))
+        let client = reqwest::Client::new();
+
+        let bare = client
+            .get(format!("{base}/ns-tokenless/v1/models"))
+            .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        assert_eq!(bare.status(), 401, "名乗らない相手も通さない");
+
+        for value in ["Bearer anything", TOKEN, "secret-token"] {
+            let resp = client
+                .get(format!("{base}/ns-tokenless/v1/models"))
+                .header("authorization", value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 401, "{value} でも通らない");
+        }
+    }
+
+    /// 通さない理由で文言が違う。
+    ///
+    /// 同じ文言だと、正しいトークンを送っている利用者が「合っているはずなのに」
+    /// で止まり、原因が gateway 側の設定漏れだと気づけない。
+    #[tokio::test]
+    async fn denial_message_tells_which_problem_it_is() {
+        let base = serve(TWO_NS).await;
+        let client = reqwest::Client::new();
+
+        let wrong: Value = client
+            .get(format!("{base}/ns-locked/v1/models"))
+            .header("authorization", "Bearer nope")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let wrong = wrong["error"]["message"].as_str().unwrap().to_owned();
+        assert!(wrong.contains("トークンが違います"), "{wrong}");
+
+        let unset: Value = client
+            .get(format!("{base}/ns-tokenless/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let unset = unset["error"]["message"].as_str().unwrap().to_owned();
+        assert!(
+            unset.contains("auth_token"),
+            "設定側の問題だと分かる文言: {unset}"
+        );
+        assert!(
+            unset.contains("tokenless"),
+            "どの namespace か分かる: {unset}"
+        );
+        assert_ne!(wrong, unset, "2 つの理由を同じ文言にしない");
+    }
+
+    /// `[ns.default]` を書かなければ `/v1/...` は 404。
+    ///
+    /// 既定 namespace を特別扱いしないので、`/v1/...` は `/ns-default/...`
+    /// と同じ扱いになる。「名前を明示したリクエストしか受けない」構成は
+    /// `[ns.default]` を書かないことで実現できる (DR-0006)。
+    #[tokio::test]
+    async fn plain_path_is_404_without_a_default_namespace() {
+        let base = serve(TWO_NS).await;
+
+        let client = reqwest::Client::new();
+        let listing = authed(client.get(format!("{base}/v1/models")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listing.status(), 404, "/v1/models");
+
+        let sending = authed(client.post(format!("{base}/v1/messages")))
+            .json(&serde_json::json!({"model": "claude-opus-5", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sending.status(), 404, "/v1/messages");
+
+        let body: Value = authed(reqwest::Client::new().get(format!("{base}/v1/models")))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("default"), "どの namespace が無いのか: {msg}");
+    }
+
+    /// `[ns.default]` を書けば `/v1/...` が使える。
+    #[tokio::test]
+    async fn plain_path_works_once_the_default_namespace_exists() {
+        let base = super::tests::serve_with_default_ns(
+            r#"
+[credentials.a]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5"]
+"#,
+        )
+        .await;
+
+        assert_eq!(
+            ids(&base, "/v1/models").await,
+            ids(&base, "/ns-default/v1/models").await,
+            "`/v1/...` は `/ns-default/...` と同じもの"
+        );
+        assert!(
+            ids(&base, "/v1/models")
+                .await
+                .contains(&"claude-opus-5".to_owned())
+        );
     }
 
     /// 死活監視の口は、認証を設定した namespace があっても通る。

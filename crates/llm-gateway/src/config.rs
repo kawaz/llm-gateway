@@ -24,12 +24,22 @@
 //! type = "relay"
 //! url = "http://127.0.0.1:8317"
 //!
+//! # 何を公開し、どこへ流すかは namespace ごとに書く。`default` は
+//! # `/v1/...` (namespace を書かないパス) が解決される先で、他と同じ書式。
+//! # `auth_token` を書かないと誰も通れない。
+//! [ns.default]
+//! auth_token = "十分に長い乱数"
+//!
+//! [ns.default.filter]
+//! exclude = ["claude-3-*"]
+//!
 //! # モデルごとに、使う認証情報を優先順に並べる。上から試す。
-//! [models."claude-fable-5"]
-//! upstream_name = "anthropic.claude-fable-5"
+//! [[ns.default.routing]]
+//! models = ["claude-fable-*"]
 //! credentials = ["bedrock", "claude-personal"]
 //!
-//! [models."gpt-5.6-sol"]
+//! [[ns.default.routing]]
+//! models = ["gpt-*"]
 //! credentials = ["cpa"]
 //! ```
 
@@ -67,14 +77,12 @@ pub struct Config {
     ///
     /// 何を隠すか・どう振り分けるか・短い名前をどうするかは、使う人ごとに
     /// 違う。そこだけ分ける。
+    ///
+    /// `default` も特別扱いしない。namespace を書かないパス (`/v1/...`) は
+    /// `default` に解決されるので、`[ns.default]` を書かなければ `/v1/...` は
+    /// 404 になる (DR-0006)。
     #[serde(default, rename = "ns")]
     pub namespaces: BTreeMap<String, Namespace>,
-
-    /// namespace を書かないときに使う設定。
-    ///
-    /// 単一の用途で使う分には namespace を意識せずに済む。
-    #[serde(flatten)]
-    pub default_namespace: Namespace,
 }
 
 /// 1 つの名前空間。使う人ごとに変えたいものだけを持つ。
@@ -102,8 +110,11 @@ pub struct Namespace {
 
     /// この namespace を使うのに要るトークン。
     ///
-    /// 書けばクライアントの `Authorization` を検証する。書かなければ
-    /// 誰でも使える (127.0.0.1 で待ち受けている前提)。
+    /// クライアントの `Authorization` をこれと突き合わせる。**書かなければ
+    /// 誰も通さない** (DR-0006)。型を `Option` のままにしてあるのは、
+    /// 書き忘れを起動時ではなくアクセス時に弾くため。1 つの namespace の
+    /// 設定漏れで gateway 全体が起動できなくなるより、影響がその namespace
+    /// だけに閉じるほうがよい。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 
@@ -335,7 +346,6 @@ impl Config {
     /// 起動時に落としておかないと、その規則を最初に踏んだ人が
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
-        self.validate_namespace("(既定)", &self.default_namespace)?;
         for (name, ns) in &self.namespaces {
             if name.is_empty() {
                 return Err(Error::Config("namespace 名が空です".to_owned()));
@@ -379,24 +389,17 @@ impl Config {
         Ok(())
     }
 
-    /// 名前で namespace を引く。
+    /// 名前で namespace を引く。書いていなければ無い。
     ///
-    /// `default` は特別扱いで、設定に無ければトップレベルに書かれた分を返す。
-    /// パスに namespace が無いリクエストもここへ落ちる。
+    /// パスに namespace が無いリクエストは `default` を引く。`[ns.default]` を
+    /// 書かなければここで None になり、呼び出し側が 404 を返す (DR-0006)。
     pub fn namespace(&self, name: &str) -> Option<&Namespace> {
-        self.namespaces
-            .get(name)
-            .or_else(|| (name == DEFAULT_NAMESPACE).then_some(&self.default_namespace))
+        self.namespaces.get(name)
     }
 
     /// 公開している namespace 名。
     pub fn namespace_names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.namespaces.keys().map(String::as_str).collect();
-        if !self.namespaces.contains_key(DEFAULT_NAMESPACE) {
-            names.push(DEFAULT_NAMESPACE);
-        }
-        names.sort_unstable();
-        names
+        self.namespaces.keys().map(String::as_str).collect()
     }
 
     /// 既定の設定ファイルの場所。
@@ -453,20 +456,42 @@ impl Namespace {
         }
     }
 
-    /// クライアントが名乗ったトークンを受け入れてよいか。
+    /// クライアントが名乗ったトークンを検査する。
     ///
-    /// 設定に書いていなければ誰でも通す。127.0.0.1 で待ち受けている前提で、
-    /// 同じマシンの他プロセスと区別したいときだけ書く。
-    pub fn accepts(&self, presented: Option<&str>) -> bool {
+    /// `auth_token` を書いていない namespace は、トークンの有無にかかわらず
+    /// 通さない (DR-0006)。書き忘れが穴になるのを無くすため、fail-closed。
+    pub fn authorize(&self, presented: Option<&str>) -> Authorization {
         let Some(expected) = &self.auth_token else {
-            return true;
+            return Authorization::NoTokenConfigured;
         };
         // `Bearer xxx` でも `xxx` でも受ける。クライアントによって送り方が違う。
-        presented.is_some_and(|p| {
+        let matched = presented.is_some_and(|p| {
             let p = p.strip_prefix("Bearer ").unwrap_or(p).trim();
             p == expected
-        })
+        });
+        if matched {
+            Authorization::Accepted
+        } else {
+            Authorization::WrongToken
+        }
     }
+}
+
+/// トークン検査の結果。
+///
+/// bool で返すと「通らなかった理由」が消える。正しいトークンを送っている
+/// 利用者と、そもそも namespace に `auth_token` が書かれていない場合とでは
+/// 打つ手が違うので、呼び出し側が文言を分けられるようにする (DR-0006)。
+/// 列挙にしておくと `match` が網羅を強制するので、拒否の枝を書き落として
+/// fail-open に戻ることもない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authorization {
+    /// トークンが合っている。
+    Accepted,
+    /// トークンが違う (名乗っていない場合を含む)。
+    WrongToken,
+    /// この namespace に `auth_token` が書かれていない。誰も通さない。
+    NoTokenConfigured,
 }
 
 /// 既定の認証情報の置き場。
@@ -504,10 +529,6 @@ listen = "127.0.0.1:8317"
 [store]
 type = "file"
 
-# 古い世代は出さない。
-[filter]
-exclude = ["claude-3-*", "claude-opus-4*", "claude-sonnet-4-*"]
-
 [credentials.claude-personal]
 type = "claude_oauth"
 
@@ -528,16 +549,20 @@ type = "relay"
 url = "http://127.0.0.1:8320"
 models = ["gpt-*"]
 
+# 古い世代は出さない。
+[ns.default.filter]
+exclude = ["claude-3-*", "claude-opus-4*", "claude-sonnet-4-*"]
+
 # fable は Bedrock 優先 (Claude アカウントを消費しない)。
-[[routing]]
+[[ns.default.routing]]
 models = ["claude-fable-*"]
 credentials = ["bedrock", "claude-work-b", "claude-personal"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["gpt-*"]
 credentials = ["cpa"]
 
-[aliases]
+[ns.default.aliases]
 o = "claude-opus-*"
 "#;
 
@@ -547,12 +572,82 @@ o = "claude-opus-*"
         Ok(c)
     }
 
+    /// 既定の namespace。`/v1/...` が解決される先。
+    pub(super) fn ns(c: &Config) -> &Namespace {
+        c.namespace(DEFAULT_NAMESPACE)
+            .expect("この設定には [ns.default] がある")
+    }
+
+    /// `auth_token` を書かない namespace は誰も通さない (fail-closed)。
+    ///
+    /// 「書かなければ誰でも通す」だった頃、既定 namespace への書き忘れが
+    /// そのまま公開経路の穴になった。書き忘れが穴にならない側へ倒す
+    /// (DR-0006)。
+    #[test]
+    fn namespace_without_token_accepts_nobody() {
+        let ns = Namespace::default();
+        assert_eq!(ns.auth_token, None, "書いていない状態");
+
+        for presented in [None, Some("anything"), Some("Bearer anything"), Some("")] {
+            assert_eq!(
+                ns.authorize(presented),
+                Authorization::NoTokenConfigured,
+                "{presented:?} は通さない"
+            );
+        }
+    }
+
+    /// 書いてあれば、合っているものだけ通す。
+    ///
+    /// `Bearer xxx` と裸の `xxx` の両方を受けるのは、クライアントによって
+    /// 送り方が違うため。
+    #[test]
+    fn configured_token_is_matched_both_ways() {
+        let ns = Namespace {
+            auth_token: Some("s3cret".to_owned()),
+            ..Namespace::default()
+        };
+
+        for ok in ["s3cret", "Bearer s3cret"] {
+            assert_eq!(ns.authorize(Some(ok)), Authorization::Accepted, "{ok}");
+        }
+        for bad in ["", "nope", "Bearer nope", "bearer s3cret", "s3cretx"] {
+            assert_eq!(ns.authorize(Some(bad)), Authorization::WrongToken, "{bad}");
+        }
+        assert_eq!(
+            ns.authorize(None),
+            Authorization::WrongToken,
+            "名乗らないのは不一致と同じ扱い"
+        );
+    }
+
+    /// 書いていない `default` は存在しない。`/v1/...` は 404 になる。
+    #[test]
+    fn default_namespace_is_not_conjured_up() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+
+[ns.personal]
+"#,
+        )
+        .unwrap();
+
+        assert!(c.namespace(DEFAULT_NAMESPACE).is_none());
+        assert_eq!(
+            c.namespace_names(),
+            vec!["personal"],
+            "書いた分しか公開しない"
+        );
+    }
+
     #[test]
     fn reads_a_full_config() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(c.server.listen, "127.0.0.1:8317");
         assert_eq!(c.credentials.len(), 5);
-        assert_eq!(c.default_namespace.routing.len(), 2);
+        assert_eq!(ns(&c).routing.len(), 2);
         assert_eq!(c.discovery.refresh_secs, 3600, "既定は 1 時間");
     }
 
@@ -564,11 +659,13 @@ o = "claude-opus-*"
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[ns.default]
 "#,
         )
         .unwrap();
-        assert!(c.default_namespace.routing.is_empty());
-        assert!(c.default_namespace.filter.exclude.is_empty());
+        assert!(ns(&c).routing.is_empty());
+        assert!(ns(&c).filter.exclude.is_empty());
     }
 
     /// 全体の exclude は全 credential に効く。
@@ -581,13 +678,13 @@ type = "claude_oauth"
             "claude-3-5-sonnet-20241022",
         ] {
             assert!(
-                !c.default_namespace.allows("claude-personal", hidden, &c),
+                !ns(&c).allows("claude-personal", hidden, &c),
                 "{hidden} は隠す"
             );
         }
         for shown in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
             assert!(
-                c.default_namespace.allows("claude-personal", shown, &c),
+                ns(&c).allows("claude-personal", shown, &c),
                 "{shown} は出す"
             );
         }
@@ -598,18 +695,15 @@ type = "claude_oauth"
     fn per_credential_exclude_is_scoped() {
         let c = parse(SAMPLE).unwrap();
         assert!(
-            !c.default_namespace
-                .allows("claude-work-b", "claude-opus-5", &c),
+            !ns(&c).allows("claude-work-b", "claude-opus-5", &c),
             "fable 専用なので opus は扱わない"
         );
         assert!(
-            c.default_namespace
-                .allows("claude-work-b", "claude-fable-5", &c),
+            ns(&c).allows("claude-work-b", "claude-fable-5", &c),
             "fable は扱う"
         );
         assert!(
-            c.default_namespace
-                .allows("claude-personal", "claude-opus-5", &c),
+            ns(&c).allows("claude-personal", "claude-opus-5", &c),
             "他の credential には影響しない"
         );
     }
@@ -617,10 +711,7 @@ type = "claude_oauth"
     #[test]
     fn unknown_credential_is_not_allowed() {
         let c = parse(SAMPLE).unwrap();
-        assert!(
-            !c.default_namespace
-                .allows("no-such-credential", "claude-opus-5", &c)
-        );
+        assert!(!ns(&c).allows("no-such-credential", "claude-opus-5", &c));
     }
 
     /// ルーティングはパターンで書ける。最初に当たった規則を使う。
@@ -628,13 +719,10 @@ type = "claude_oauth"
     fn routing_matches_by_pattern() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(
-            c.default_namespace.credentials_for("claude-fable-5", &c),
+            ns(&c).credentials_for("claude-fable-5", &c),
             vec!["bedrock", "claude-work-b", "claude-personal"]
         );
-        assert_eq!(
-            c.default_namespace.credentials_for("gpt-5.6-sol", &c),
-            vec!["cpa"]
-        );
+        assert_eq!(ns(&c).credentials_for("gpt-5.6-sol", &c), vec!["cpa"]);
     }
 
     /// 規則に当たらないモデルは宣言順に試す。
@@ -643,7 +731,7 @@ type = "claude_oauth"
     fn unmatched_models_fall_back_to_declaration_order() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(
-            c.default_namespace.credentials_for("claude-opus-6", &c),
+            ns(&c).credentials_for("claude-opus-6", &c),
             vec![
                 "bedrock",
                 "claude-personal",
@@ -666,23 +754,23 @@ type = "claude_oauth"
 [credentials.b]
 type = "claude_oauth"
 
-[[routing]]
+[[ns.default.routing]]
 models = ["claude-opus-5"]
 credentials = ["a"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["claude-*"]
 credentials = ["b"]
 "#,
         )
         .unwrap();
         assert_eq!(
-            c.default_namespace.credentials_for("claude-opus-5", &c),
+            ns(&c).credentials_for("claude-opus-5", &c),
             vec!["a"],
             "個別指定が先"
         );
         assert_eq!(
-            c.default_namespace.credentials_for("claude-sonnet-5", &c),
+            ns(&c).credentials_for("claude-sonnet-5", &c),
             vec!["b"],
             "後ろの広い規則"
         );
@@ -692,11 +780,11 @@ credentials = ["b"]
     #[test]
     fn aliases_come_only_from_config() {
         let c = parse(SAMPLE).unwrap();
-        assert_eq!(c.default_namespace.resolved_aliases()["o"], "claude-opus-*");
+        assert_eq!(ns(&c).resolved_aliases()["o"], "claude-opus-*");
 
-        let empty = parse("").unwrap();
+        let empty = parse("[ns.default]").unwrap();
         assert!(
-            empty.default_namespace.resolved_aliases().is_empty(),
+            ns(&empty).resolved_aliases().is_empty(),
             "書かなければ 1 つも無い"
         );
     }
@@ -705,15 +793,12 @@ credentials = ["b"]
     fn aliases_are_read_as_written() {
         let c = parse(
             r#"
-[aliases]
+[ns.default.aliases]
 opus = "claude-opus-4*"
 "#,
         )
         .unwrap();
-        assert_eq!(
-            c.default_namespace.resolved_aliases()["opus"],
-            "claude-opus-4*"
-        );
+        assert_eq!(ns(&c).resolved_aliases()["opus"], "claude-opus-4*");
     }
 
     /// 一覧を聞ける upstream と聞けない upstream。
@@ -755,7 +840,7 @@ opus = "claude-opus-4*"
 [credentials.a]
 type = "claude_oauth"
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a", "typo-here"]
 "#,
@@ -766,9 +851,9 @@ credentials = ["a", "typo-here"]
 
     #[test]
     fn empty_routing_fields_are_rejected() {
-        assert!(parse("[[routing]]\nmodels = []\ncredentials = []").is_err());
+        assert!(parse("[[ns.default.routing]]\nmodels = []\ncredentials = []").is_err());
         assert!(
-            parse("[[routing]]\nmodels = [\"m\"]\ncredentials = []")
+            parse("[[ns.default.routing]]\nmodels = [\"m\"]\ncredentials = []")
                 .unwrap_err()
                 .to_string()
                 .contains('m')
@@ -820,27 +905,18 @@ credentials = ["a", "typo-here"]
     fn round_trips_through_toml() {
         let original = parse(SAMPLE).unwrap();
         let again = parse(&toml::to_string(&original).unwrap()).unwrap();
+        assert_eq!(ns(&again).routing.len(), ns(&original).routing.len());
+        assert_eq!(ns(&again).filter.exclude, ns(&original).filter.exclude);
         assert_eq!(
-            again.default_namespace.routing.len(),
-            original.default_namespace.routing.len()
-        );
-        assert_eq!(
-            again.default_namespace.filter.exclude,
-            original.default_namespace.filter.exclude
-        );
-        assert_eq!(
-            again
-                .default_namespace
-                .credentials_for("claude-fable-5", &again),
-            original
-                .default_namespace
-                .credentials_for("claude-fable-5", &original)
+            ns(&again).credentials_for("claude-fable-5", &again),
+            ns(&original).credentials_for("claude-fable-5", &original)
         );
     }
 }
 
 #[cfg(test)]
 mod example_tests {
+    use super::tests::ns;
     use super::*;
 
     /// 配る雛形が実際に読めるか。
@@ -858,12 +934,13 @@ mod example_tests {
         config.validate().expect("雛形の参照が壊れている");
 
         // 使い方を示す要素が一通り入っているか。
+        assert!(!ns(&config).filter.exclude.is_empty(), "隠し方の例");
+        assert!(!ns(&config).routing.is_empty(), "振り分けの例");
+        assert!(!ns(&config).aliases.is_empty(), "短い名前の例");
         assert!(
-            !config.default_namespace.filter.exclude.is_empty(),
-            "隠し方の例"
+            ns(&config).auth_token.is_some(),
+            "雛形どおりに書けば認証がかかる (未設定は全拒否なので、書き方が要る)"
         );
-        assert!(!config.default_namespace.routing.is_empty(), "振り分けの例");
-        assert!(!config.default_namespace.aliases.is_empty(), "短い名前の例");
         assert!(
             config.credentials.values().any(|c| !c.exclude().is_empty()),
             "credential ごとの絞り込みの例"

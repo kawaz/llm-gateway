@@ -18,21 +18,6 @@ type = "file"
 refresh_secs = 3600
 
 # ---------------------------------------------------------------------------
-# 公開しないモデル
-#
-# upstream が返す一覧をそのまま出すと古い世代まで並ぶので、ここで隠す。
-# 全 credential に効く。
-# ---------------------------------------------------------------------------
-
-[filter]
-exclude = [
-    "claude-3-*",
-    "claude-opus-4*",
-    "claude-sonnet-4*",
-    "claude-haiku-3*",
-]
-
-# ---------------------------------------------------------------------------
 # 認証情報
 #
 # キーが store 内のファイル名になる (claude-personal → claude-personal.json)。
@@ -69,31 +54,63 @@ url = "http://127.0.0.1:8320"
 models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
 # ---------------------------------------------------------------------------
-# 振り分け
+# 名前空間
 #
-# 上から照合し、最初に当たった規則を使う。ここに書かないモデルは、
-# discovery でそれを持っていた credential へ流れる。
+# 何を見せるか・どこへ流すか・どう名乗らせるかは、ここから下に書く。
+# クライアントの ANTHROPIC_BASE_URL は http://<host>/ns-<名前> になる。
+#
+# `default` は namespace を書かないパス (/v1/...) が解決される先で、
+# 他と同じ書式。書かなければ /v1/... は 404 になる (DR-0006)。
+#
+# gateway 自身の口 (/llm-gateway/healthz など) は namespace の外にある。
 # ---------------------------------------------------------------------------
 
+[ns.default]
+# この namespace を使うのに要るトークン。
+#
+# **書かないと誰も通れない。** 書き忘れが穴になるのを防ぐため、
+# 未設定は「開放」ではなく「全拒否」として扱う (DR-0006)。
+# クライアントは Authorization: Bearer <値> で名乗る。
+auth_token = "ここに十分に長い乱数を書く"
+
+# 公開しないモデル。
+#
+# upstream が返す一覧をそのまま出すと古い世代まで並ぶので、ここで隠す。
+# この namespace の全 credential に効く。
+[ns.default.filter]
+exclude = [
+    "claude-3-*",
+    "claude-opus-4*",
+    "claude-sonnet-4*",
+    "claude-haiku-3*",
+]
+
+# 振り分け。上から照合し、最初に当たった規則を使う。ここに書かないモデルは、
+# discovery でそれを持っていた credential へ流れる。
+
 # fable は Bedrock 優先。落ちている間だけ OAuth へ回る。
-[[routing]]
+[[ns.default.routing]]
 models = ["claude-fable-*"]
 credentials = ["bedrock", "claude-work", "claude-personal"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["gpt-*"]
 credentials = ["other-gateway"]
 
-# ---------------------------------------------------------------------------
-# 短い名前
+# 短い名前。
 #
 # 値はパターン。当たるもののうち created が一番新しいものへ向くので、
 # 新しい世代が出れば自動で乗り換わる。ここに書いたものだけが有効
 # (コード側に既定は無い)。
-# ---------------------------------------------------------------------------
-
-[aliases]
+[ns.default.aliases]
 fable = "claude-fable-*"
 opus = "claude-opus-*"
 sonnet = "claude-sonnet-*"
 haiku = "claude-haiku-*"
+
+# 面ごとに分けたいときは namespace を足す。使う credential も絞れる。
+# クライアント側は ANTHROPIC_BASE_URL=http://127.0.0.1:8319/ns-work。
+#
+# [ns.work]
+# auth_token = "別の乱数"
+# credentials = ["claude-work"]

@@ -436,7 +436,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#,
@@ -471,7 +471,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["down", "alive"]
 "#,
@@ -505,7 +505,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["nowhere", "alive"]
 "#,
@@ -538,7 +538,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a", "b"]
 "#,
@@ -572,7 +572,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a", "b"]
 "#,
@@ -605,7 +605,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["first", "second"]
 "#,
@@ -648,7 +648,7 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["flaky", "alive"]
 "#,
@@ -682,7 +682,7 @@ type = "relay"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["known"]
 credentials = ["a"]
 "#,
@@ -710,7 +710,7 @@ type = "relay"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#,
@@ -738,6 +738,8 @@ credentials = ["a"]
 type = "relay"
 url = "http://127.0.0.1:9"
 models = ["z-model", "a-model"]
+
+[ns.default]
 "#,
         )
         .await;
@@ -753,7 +755,7 @@ models = ["z-model", "a-model"]
     async fn excluded_models_are_hidden() {
         let gw = gateway(
             r#"
-[filter]
+[ns.default.filter]
 exclude = ["claude-opus-4*"]
 
 [credentials.a]
@@ -761,7 +763,7 @@ type = "relay"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-opus-4-8"]
 
-[aliases]
+[ns.default.aliases]
 opus = "claude-opus-*"
 "#,
         )
@@ -801,7 +803,7 @@ advisor-tool-2026-03-01";
 type = "claude_oauth"
 url = "{url}"
 
-[[routing]]
+[[ns.default.routing]]
 models = ["m"]
 credentials = ["a"]
 "#
@@ -1017,7 +1019,7 @@ type = "relay"
 url = "{}"
 models = ["claude-opus-5"]
 
-[aliases]
+[ns.default.aliases]
 opus = "claude-opus-*"
 "#,
             up.url
