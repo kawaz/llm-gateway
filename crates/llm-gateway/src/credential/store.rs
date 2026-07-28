@@ -129,7 +129,9 @@ impl<P: Persistence> CredentialStore<P> {
         if flags.is_empty() {
             return Ok(());
         }
-        let current = self.read(id).await?;
+        // 控えではなく置き場から積み直す。控えを土台にすると、別のプロセスが
+        // 更新した token を古い値で上書きして消す。
+        let current = self.reload(id).await?;
         let mut next = (*current).clone();
         next.record_denied_beta(flags, self.clock.now_unix());
 
@@ -143,6 +145,15 @@ impl<P: Persistence> CredentialStore<P> {
         if let Some(hit) = self.cache.read().await.get(id) {
             return Ok(Arc::clone(hit));
         }
+        self.reload(id).await
+    }
+
+    /// 置き場から読み直し、控えを入れ替える。
+    ///
+    /// 同じ置き場を複数のプロセスが共有しているので、控えだけを見ていると
+    /// 他のプロセスが書いた結果に気づけない。書き込みの前と、refresh token を
+    /// 使う前は、ここを通って最新を掴む。
+    async fn reload(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
         let loaded = Arc::new(self.persistence.load(id)?);
         self.cache
             .write()
@@ -205,8 +216,12 @@ impl<P: Persistence> CredentialStore<P> {
     }
 
     /// 実際の更新。保存まで済ませる。
+    ///
+    /// 控えではなく置き場から読み直してから入る。refresh token は 1 回しか
+    /// 使えないので、控えを信じて走ると、同じ置き場を共有する別のプロセスが
+    /// 既に使い切った値を送ることになる。
     async fn do_refresh(&self, id: &CredentialId) -> Result<()> {
-        let current = self.read(id).await?;
+        let current = self.reload(id).await?;
         let (Some(kind), Some(refresh_token)) = (
             current.payload.oauth_kind(),
             current.payload.refresh_token(),
@@ -219,14 +234,40 @@ impl<P: Persistence> CredentialStore<P> {
             });
         };
 
-        let resp = oauth::refresh_at(
+        // 読み直した時点で期限に余裕があるなら、別のプロセスが更新を済ませて
+        // いる。ここで走らせても、有効な refresh token を 1 つ捨てるだけ。
+        if !self.needs_refresh(&current) {
+            return Ok(());
+        }
+
+        let resp = match oauth::refresh_at(
             &self.http,
             id,
             kind,
             refresh_token,
             self.token_url_override.as_deref(),
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            // 断られた理由が「別のプロセスが先に使った」なら、その結果はもう
+            // 置き場にある。拾えたら回復し、拾えなければ元の理由を返す。
+            //
+            // Design rationale: 失敗の種別で振り分けていない。読み直して有効
+            // なら成功、古いままなら失敗、という判定は理由に依らず正しく、
+            // 種別を見分けるには理由の文字列を当てにするしかないため。
+            Err(e) => {
+                // 読み直せなかったときも断られた理由を返す。ここを `?` にすると
+                // 原因が「更新を断られた」から「置き場を読めない」にすり替わる。
+                let Ok(latest) = self.reload(id).await else {
+                    return Err(e);
+                };
+                if self.needs_refresh(&latest) {
+                    return Err(e);
+                }
+                return Ok(());
+            }
+        };
 
         let now = self.clock.now_unix();
         let mut next = (*current).clone();
@@ -276,8 +317,12 @@ mod tests {
     }
 
     fn cred(expired: &str) -> StoredCredential {
+        cred_with("at-1", expired)
+    }
+
+    fn cred_with(access_token: &str, expired: &str) -> StoredCredential {
         StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
-            access_token: "at-1".into(),
+            access_token: access_token.into(),
             refresh_token: "rt-1".into(),
             expired: expired.into(),
             email: "someone@example.com".into(),
@@ -294,9 +339,15 @@ mod tests {
     }
 
     /// 保存回数と内容を数えるだけの置き場。
+    ///
+    /// [`Spy::swapping`] を使うと、途中で内容が入れ替わる置き場になる
+    /// (= 同じ置き場を共有する別のプロセスが書いた状況)。
     struct Spy {
         current: StdMutex<StoredCredential>,
         stores: AtomicUsize,
+        loads: AtomicUsize,
+        /// 何回目の読み出しで、何に入れ替わるか。
+        swap: StdMutex<Option<(usize, StoredCredential)>>,
     }
 
     impl Spy {
@@ -304,12 +355,28 @@ mod tests {
             Self {
                 current: StdMutex::new(c),
                 stores: AtomicUsize::new(0),
+                loads: AtomicUsize::new(0),
+                swap: StdMutex::new(None),
             }
+        }
+
+        /// `at` 回目の読み出しの直前に、別のプロセスが `next` を書いた形にする。
+        fn swapping(self, at: usize, next: StoredCredential) -> Self {
+            *self.swap.lock().unwrap() = Some((at, next));
+            self
         }
     }
 
     impl Persistence for Spy {
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
+            let n = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut swap = self.swap.lock().unwrap();
+            if let Some((at, next)) = swap.as_ref()
+                && n >= *at
+            {
+                *self.current.lock().unwrap() = next.clone();
+                *swap = None;
+            }
             Ok(self.current.lock().unwrap().clone())
         }
         fn store(&self, _id: &CredentialId, value: &StoredCredential) -> Result<()> {
@@ -323,7 +390,11 @@ mod tests {
     }
 
     fn store_with(c: StoredCredential) -> CredentialStore<Spy> {
-        CredentialStore::with_clock(Spy::new(c), reqwest::Client::new(), Clock::Fixed(NOW))
+        store_sharing(Spy::new(c))
+    }
+
+    fn store_sharing(disk: Spy) -> CredentialStore<Spy> {
+        CredentialStore::with_clock(disk, reqwest::Client::new(), Clock::Fixed(NOW))
     }
 
     /// 更新要求を数える試験用サーバ。
@@ -337,6 +408,15 @@ mod tests {
 
     impl FakeTokenServer {
         async fn start(delay: std::time::Duration) -> Self {
+            Self::start_with(delay, false).await
+        }
+
+        /// 更新を断るサーバ。refresh token が既に使われていた状況。
+        async fn start_rejecting() -> Self {
+            Self::start_with(std::time::Duration::ZERO, true).await
+        }
+
+        async fn start_with(delay: std::time::Duration, reject: bool) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
@@ -357,11 +437,18 @@ mod tests {
                         tokio::time::sleep(delay).await;
 
                         let n = counter.load(Ordering::SeqCst);
-                        let body = format!(
-                            r#"{{"access_token":"at-{n}","refresh_token":"rt-{n}","expires_in":28800}}"#
-                        );
+                        let (status, body) = if reject {
+                            ("400 Bad Request", r#"{"error":"invalid_grant"}"#.to_owned())
+                        } else {
+                            (
+                                "200 OK",
+                                format!(
+                                    r#"{{"access_token":"at-{n}","refresh_token":"rt-{n}","expires_in":28800}}"#
+                                ),
+                            )
+                        };
                         let resp = format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
 content-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()
                         );
@@ -382,9 +469,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         }
     }
 
-    async fn store_against(c: StoredCredential, server: &FakeTokenServer) -> CredentialStore<Spy> {
-        let mut store =
-            CredentialStore::with_clock(Spy::new(c), reqwest::Client::new(), Clock::Fixed(NOW));
+    async fn store_against(disk: Spy, server: &FakeTokenServer) -> CredentialStore<Spy> {
+        let mut store = store_sharing(disk);
         store.token_url_override = Some(server.url.clone());
         store
     }
@@ -534,7 +620,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[tokio::test]
     async fn expired_token_is_refreshed_and_persisted() {
         let server = FakeTokenServer::start(std::time::Duration::ZERO).await;
-        let store = store_against(cred(&at(-1)), &server).await;
+        let store = store_against(Spy::new(cred(&at(-1))), &server).await;
         let id = CredentialId::new("c");
 
         let got = store.acquire(&id).await.unwrap();
@@ -565,7 +651,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[tokio::test]
     async fn concurrent_acquires_trigger_exactly_one_refresh() {
         let server = FakeTokenServer::start(std::time::Duration::from_millis(50)).await;
-        let store = Arc::new(store_against(cred(&at(-1)), &server).await);
+        let store = Arc::new(store_against(Spy::new(cred(&at(-1))), &server).await);
         let id = CredentialId::new("c");
 
         let mut tasks = Vec::new();
@@ -596,7 +682,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[tokio::test]
     async fn refreshed_credential_is_reused() {
         let server = FakeTokenServer::start(std::time::Duration::ZERO).await;
-        let store = store_against(cred(&at(-1)), &server).await;
+        let store = store_against(Spy::new(cred(&at(-1))), &server).await;
         let id = CredentialId::new("c");
 
         let first = store.acquire(&id).await.unwrap();
@@ -617,5 +703,89 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         // 2 回目も同じように失敗する (待ちっぱなしにならない)。
         assert!(store.acquire(&id).await.is_err());
+    }
+
+    /// 別のプロセスが先に更新していたら、更新に走らずその結果を使う。
+    ///
+    /// 控えだけを見ていると、有効な refresh token を送って焼いてしまう。
+    /// refresh token は 1 回しか使えないので、焼いた側も相手も失う。
+    #[tokio::test]
+    async fn a_newer_disk_is_used_instead_of_refreshing() {
+        let server = FakeTokenServer::start(std::time::Duration::ZERO).await;
+        // 1 回目の読み出しで控えに古い内容が乗り、2 回目 (更新の直前) で
+        // 別のプロセスが書いた内容に入れ替わる。
+        let disk = Spy::new(cred(&at(-1))).swapping(2, cred_with("at-elsewhere", &at(3600)));
+        let store = store_against(disk, &server).await;
+
+        let got = store.acquire(&CredentialId::new("c")).await.unwrap();
+
+        assert_eq!(got.bearer(), "Bearer at-elsewhere");
+        assert_eq!(server.hits(), 0, "更新先を叩かない");
+        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
+    }
+
+    /// 断られても、置き場が新しくなっていれば回復する。
+    ///
+    /// 別のプロセスが一足先に同じ refresh token を使い切った状況。
+    /// ここで諦めると、そのプロセスは再ログインするまで戻れない。
+    #[tokio::test]
+    async fn a_rejected_refresh_recovers_from_a_newer_disk() {
+        let server = FakeTokenServer::start_rejecting().await;
+        // 3 回目の読み出し = 断られた後の読み直し。そこで結果が見える。
+        let disk = Spy::new(cred(&at(-1))).swapping(3, cred_with("at-elsewhere", &at(3600)));
+        let store = store_against(disk, &server).await;
+
+        let got = store.acquire(&CredentialId::new("c")).await.unwrap();
+
+        assert_eq!(got.bearer(), "Bearer at-elsewhere");
+        assert_eq!(server.hits(), 1, "断られるまでは 1 回試している");
+        assert_eq!(
+            store.persistence.stores.load(Ordering::SeqCst),
+            0,
+            "拾っただけなので自分では書かない"
+        );
+    }
+
+    /// 置き場も古いままなら、断られた理由をそのまま返す。
+    ///
+    /// ここが成功に化けると、期限切れの token で転送に進んで原因が見えなくなる。
+    #[tokio::test]
+    async fn a_rejected_refresh_still_fails_when_the_disk_is_unchanged() {
+        let server = FakeTokenServer::start_rejecting().await;
+        let store = store_against(Spy::new(cred(&at(-1))), &server).await;
+
+        let err = store
+            .acquire(&CredentialId::new("c"))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("再ログイン"), "{err}");
+        assert!(store.in_flight.lock().await.is_empty());
+    }
+
+    /// 拒否された beta を覚えるときも、控えではなく置き場から積み直す。
+    ///
+    /// 控えを土台にすると、別のプロセスが更新した token を古い値で上書きする。
+    #[tokio::test]
+    async fn recording_denied_beta_does_not_clobber_a_newer_disk() {
+        let disk = Spy::new(cred(&at(3600))).swapping(2, cred_with("at-elsewhere", &at(7200)));
+        let store = store_sharing(disk);
+        let id = CredentialId::new("c");
+
+        // 1 回目の読み出しで控えに古い内容が乗る。
+        store.acquire(&id).await.unwrap();
+        store
+            .record_denied_beta(&id, &["advisor-tool-2026-03-01".to_owned()])
+            .await
+            .unwrap();
+
+        let saved = store.persistence.current.lock().unwrap().clone();
+        assert_eq!(
+            saved.payload.secret(),
+            "at-elsewhere",
+            "別のプロセスの更新を消さない"
+        );
+        assert!(saved.denied_beta.contains_key("advisor-tool-2026-03-01"));
     }
 }
