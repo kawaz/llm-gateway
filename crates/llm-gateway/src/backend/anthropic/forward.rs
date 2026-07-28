@@ -46,7 +46,7 @@ pub async fn send(
     mut body: Value,
     mut headers: Headers,
 ) -> Result<Response> {
-    headers.strip_hop_by_hop();
+    headers.strip_for_upstream();
     provider.authorize(&mut headers, credential)?;
     provider.adapt(&mut body, &mut headers);
 

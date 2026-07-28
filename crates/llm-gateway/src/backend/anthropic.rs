@@ -100,11 +100,11 @@ impl Headers {
 
     /// クライアント由来のヘッダのうち、upstream へ渡さないもの。
     ///
-    /// 接続に紐づくもの (hop-by-hop) と、こちらで付け直すものを落とす。
     /// 残りは触らない — 何が意味を持つかは upstream が決めることで、
     /// gateway が判断すると新しいヘッダが増えるたびに落としてしまう。
-    pub fn strip_hop_by_hop(&mut self) {
+    pub fn strip_for_upstream(&mut self) {
         const DROP: &[&str] = &[
+            // 接続に紐づくもの (hop-by-hop)。
             "connection",
             "keep-alive",
             "proxy-authenticate",
@@ -120,6 +120,16 @@ impl Headers {
             "x-api-key",
             // 圧縮は転送側の都合で決める。
             "accept-encoding",
+            // 手前のプロキシが付けた経路情報。upstream から見れば
+            // この gateway がクライアントなので、こちら側の内部経路
+            // (LAN や tailnet の IP、内向きのホスト名) を渡す理由がない。
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "x-forwarded-host",
+            "x-forwarded-port",
+            "x-real-ip",
+            "forwarded",
+            "via",
         ];
         self.0
             .retain(|(k, _)| !DROP.iter().any(|d| k.eq_ignore_ascii_case(d)));
@@ -206,7 +216,7 @@ mod tests {
             ("User-Agent", "claude-cli/2.1.220"),
             ("x-app", "cli"),
         ]);
-        h.strip_hop_by_hop();
+        h.strip_for_upstream();
 
         let names: Vec<&str> = h.iter().map(|(k, _)| k).collect();
         for gone in [
@@ -233,8 +243,35 @@ mod tests {
     #[test]
     fn strips_auth_regardless_of_case() {
         let mut h = headers(&[("X-API-KEY", "client-key"), ("AUTHORIZATION", "Bearer x")]);
-        h.strip_hop_by_hop();
+        h.strip_for_upstream();
         assert_eq!(h.iter().count(), 0);
+    }
+
+    /// 手前のプロキシが付けた経路情報は upstream へ渡さない。
+    ///
+    /// 前段に Caddy を置くと、クライアントの LAN / tailnet の IP や
+    /// 内向きのホスト名が乗ってくる。upstream から見えるのはこの gateway
+    /// なので、こちら側の内部経路を知らせる理由がない。
+    #[test]
+    fn strips_proxy_added_route_information() {
+        let mut h = headers(&[
+            ("X-Forwarded-For", "100.76.5.89"),
+            ("X-Forwarded-Proto", "https"),
+            ("X-Forwarded-Host", "llm-gateway.example.internal"),
+            ("X-Forwarded-Port", "443"),
+            ("X-Real-IP", "100.76.5.89"),
+            ("Forwarded", "for=100.76.5.89;proto=https"),
+            ("Via", "1.1 caddy"),
+            ("anthropic-version", "2023-06-01"),
+        ]);
+        h.strip_for_upstream();
+
+        let names: Vec<&str> = h.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            names,
+            vec!["anthropic-version"],
+            "経路情報だけ落として残りは触らない: {names:?}"
+        );
     }
 
     #[test]
