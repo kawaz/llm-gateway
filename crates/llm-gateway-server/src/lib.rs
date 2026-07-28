@@ -758,7 +758,7 @@ mod namespace_tests {
     #[test]
     fn extracts_namespace_from_path() {
         assert_eq!(namespace_of("/ns-personal/v1/messages"), "personal");
-        assert_eq!(namespace_of("/ns-emrd/v1/models"), "emrd");
+        assert_eq!(namespace_of("/ns-work/v1/models"), "work");
     }
 
     /// 接頭辞が無ければ既定。単一の用途では namespace を意識せずに済む。
@@ -787,7 +787,7 @@ mod namespace_tests {
     fn strips_namespace_before_forwarding() {
         assert_eq!(upstream_path("/ns-personal/v1/messages"), "/v1/messages");
         assert_eq!(
-            upstream_path("/ns-emrd/v1/messages/count_tokens"),
+            upstream_path("/ns-work/v1/messages/count_tokens"),
             "/v1/messages/count_tokens"
         );
     }
