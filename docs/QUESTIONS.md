@@ -20,28 +20,7 @@
 
 ## 裁定待ち
 
-### 👺GW-Q2: credential payload 分離で `email` / `last_refresh` をどちらに置くか
-
-credential json を「トップ = 運用設定 + `type`」「`payload` = プロバイダの生要素」に
-分ける方針は確定 (kawaz mid=47, mid=48)。境界が自明でないフィールドが 2 つある。
-
-- [x] a (推奨): `email` → payload / `last_refresh` → トップ
-- [ ] b: 両方 payload
-- [ ] c: 両方トップ
-
-a の理由: `email` はプロバイダが id_token 等で返す生要素、`last_refresh` は
-gateway が書く運用メタデータでプロバイダ由来ではない。
-
-`extra` (cpa が書く未知項目) は payload 側とする (プロバイダ生要素の扱い)。
-
-### 👺GW-Q3: payload 分離で旧形式の読み込みを残すか
-
-- [x] a (推奨): 残さない。新形式のみ読む
-- [ ] b: `#[serde(untagged)]` で新旧両対応、書き込みは常に新形式
-
-a の理由: `login` サブコマンドがあれば再ログインで復旧できるので、読み込みコードを
-二重に持つ価値が薄い。ただし **`login` の動作確認が済んでから** 分離を入れる順序が前提
-(今 `claude-emrd` は 401 で、`login` 未完成のまま分離すると復旧手段が無くなる)。
+（現在なし）
 
 ## 確認待ち
 
