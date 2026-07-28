@@ -367,7 +367,8 @@ fn render(report: &Report) -> String {
     let mut out = String::new();
     for c in &report.credentials {
         if !out.is_empty() {
-            out.push('\n');
+            // バーの ▀ が上下の行と溶けて見えるので、1 行ずつ空ける (kawaz 裁定)。
+            out.push_str("\n\n");
         }
         out.push_str(&c.name);
         out.push_str(&" ".repeat(name_width.saturating_sub(width(&c.name)) + 2));
@@ -405,12 +406,8 @@ fn render(report: &Report) -> String {
             out.push_str(&format!("\n{line}"));
         }
     }
-    if let Some(p) = &report.probe {
-        out.push_str(&format!(
-            "\n\n{} 件に {} を投げて取り直しました (入力 {} / 出力 {} トークン消費)",
-            p.requests, p.model, p.input_tokens, p.output_tokens
-        ));
-    }
+    // probe の消費報告は出さない (kawaz 裁定: 要らない)。JSON には残っているので、
+    // 消費量を確かめたければ /llm-gateway/usage?refresh=true を直接見る。
     out.push('\n');
     out
 }
@@ -487,7 +484,7 @@ fn dual_bar(util_pct: f64, elapsed_pct: f64, width: usize, color: bool) -> Strin
 /// `<使用率>%/<窓の経過率>%/<残り時間>`。(`dualInfo` の移植)
 fn dual_info(util_pct: f64, elapsed_pct: f64, remaining: &str, color: bool) -> String {
     format!(
-        "{}{:>2.0}%{}/{}{:.0}%{}/{}{}{}",
+        "{}{:>2.0}%{}/{}{:>2.0}%{}/{}{}{}",
         sgr_fg(util_color(util_pct), color),
         util_pct,
         sgr_reset(color),
@@ -561,21 +558,11 @@ fn elapsed(secs: i64) -> String {
 
 /// 表に収まらないもの (上限到達の警告・プローブの失敗)。
 ///
-/// overage (従量課金フォールバックの可否) はここに出さない。クレジットを
-/// 使わない運用では毎回同じ行が並ぶだけで、表を見れば足りる (kawaz 裁定)。
-/// JSON には残っているので、機械で読む分には失われない。
+/// overage (従量課金フォールバックの可否) と window の status はここに出さない。
+/// どちらも使用率の % を見れば足りる情報の重複で、毎回並ぶとノイズになる
+/// (kawaz 裁定)。JSON には残っているので、機械で読む分には失われない。
 fn remarks(c: &CredentialUsage) -> Vec<String> {
     let mut lines = Vec::new();
-
-    if let Some(s) = &c.snapshot {
-        for (label, window) in [("5h", &s.five_hour), ("7d", &s.seven_day)] {
-            if let Some(status) = window.as_ref().and_then(|w| w.status.as_deref())
-                && status != "allowed"
-            {
-                lines.push(format!("{}: {label} が {status} です", c.name));
-            }
-        }
-    }
     if let Some(e) = &c.probe_error {
         lines.push(format!("{}: 取り直せませんでした ({e})", c.name));
     }
@@ -1103,9 +1090,10 @@ mod tests {
         assert!(out.contains("未観測"), "{out}");
     }
 
-    /// 上限や従量課金の状態は表の下に出す (数字の列に埋もれさせない)。
+    /// 表の下に出すのはプローブの失敗だけ。window の status や overage は
+    /// 使用率の % で足りる情報の重複なので出さない (kawaz 裁定。JSON には残る)。
     #[test]
-    fn calls_out_limits_and_failures() {
+    fn calls_out_probe_failures_only() {
         let mut hit = observed();
         if let Some(s) = hit.snapshot.as_mut() {
             s.five_hour = Some(window(1.0, NOW + 600, "rejected"));
@@ -1123,18 +1111,20 @@ mod tests {
         broken.probe_error = Some("繋がりません".to_owned());
 
         let out = render(&report(vec![hit, broken]));
-        assert!(
-            out.contains("claude-personal: 5h が rejected です"),
-            "{out}"
-        );
-        // overage は表を見れば足りる情報の重複なので、表示には出さない (JSON には残る)。
+        assert!(!out.contains("rejected です"), "{out}");
         assert!(!out.contains("out_of_credits"), "{out}");
         assert!(out.contains("nowhere: 取り直せませんでした"), "{out}");
     }
 
-    /// 確認そのものが消費した分を出す (DR-0007)。
+    /// バーの ▀ が上下の行と溶けないよう、credential の間は空行で区切る。
     #[test]
-    fn probe_cost_is_visible() {
+    fn rows_are_separated_by_a_blank_line() {
+        let out = render(&report(vec![observed(), observed()]));
+        assert!(out.contains("\n\n"), "{out}");
+    }
+
+    #[test]
+    fn probe_cost_is_not_shown() {
         let mut r = report(vec![observed()]);
         r.probe = Some(llm_gateway::usage::Probe {
             requests: 2,
@@ -1143,9 +1133,10 @@ mod tests {
             output_tokens: 2,
         });
 
+        // 消費報告は出さない (kawaz 裁定)。JSON 側には残る。
         let out = render(&r);
-        assert!(out.contains("claude-haiku-4-5-20251001"), "{out}");
-        assert!(out.contains("入力 16 / 出力 2 トークン消費"), "{out}");
+        assert!(!out.contains("claude-haiku-4-5-20251001"), "{out}");
+        assert!(!out.contains("トークン消費"), "{out}");
     }
 
     /// 名前の列幅が揃う。日本語を 1 桁で数えると、名前の長さで崩れる。
@@ -1161,7 +1152,7 @@ mod tests {
             ),
         ]));
 
-        let lines: Vec<&str> = out.lines().take(2).collect();
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).take(2).collect();
         assert_eq!(lines.len(), 2, "{out}");
         // "claude-personal" が最長なので、2 列目はその幅 + 2 桁の空白から始まる。
         assert!(lines[0].starts_with("claude-personal  "), "{out}");

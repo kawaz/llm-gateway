@@ -68,8 +68,9 @@ credential ID ごとの最新スナップショットを持つ**。追加の API
 
 - スナップショットには必ず**取得時刻**を付け、表示側で古さが見えるようにする
 - `?refresh=true` (CLI は `--refresh`) のときだけ**能動プローブ**する。
-  Codex は副作用なしの `wham/usage`、Anthropic は haiku + max_tokens=1 の最小リクエスト
-  (= usage の確認自体が usage を微量消費することを、出力に注記する)
+  Codex は副作用なしの `wham/usage`、Anthropic は haiku + max_tokens=1 の最小リクエスト。
+  プローブの消費量は JSON にだけ載せる。CLI には出さない — 表示して得るものが無い
+  (kawaz 裁定 2026-07-29。window の status 注記・overage 注記も同じ理由で CLI に出さない)
 
 既定を便乗のみにするのは、usage 計測が usage を勝手に消費する構図を避けるため。
 
