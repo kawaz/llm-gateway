@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::backend::anthropic::{Headers, forward, model_of};
-use crate::config::Config;
+use crate::config::{Config, Namespace};
 use crate::credential::{CredentialStore, Persistence};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
@@ -18,6 +18,7 @@ use crate::session;
 use crate::{Error, Result};
 
 pub struct Gateway<P: Persistence> {
+    config: Config,
     router: Router,
     credentials: CredentialStore<P>,
     http: reqwest::Client,
@@ -36,6 +37,7 @@ impl<P: Persistence> Gateway<P> {
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             router: Router::new(config.clone()),
+            config: config.clone(),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
         })
@@ -59,14 +61,24 @@ impl<P: Persistence> Gateway<P> {
         }
     }
 
-    /// 公開しているモデル名。
-    pub async fn models(&self) -> Vec<String> {
-        self.router.models().await
+    /// 名前で namespace を引く。無ければ `None`。
+    pub fn namespace(&self, name: &str) -> Option<&Namespace> {
+        self.config.namespace(name)
+    }
+
+    /// 公開している namespace 名。
+    pub fn namespace_names(&self) -> Vec<&str> {
+        self.config.namespace_names()
+    }
+
+    /// この namespace に見せるモデル名。
+    pub async fn models(&self, ns: &Namespace) -> Vec<String> {
+        self.router.models(ns).await
     }
 
     /// このモデルを実際に試す順。設定の優先順のうち、扱える経路だけ。
-    pub async fn route_names(&self, model: &str) -> Vec<String> {
-        self.router.route_names(model).await
+    pub async fn route_names(&self, ns: &Namespace, model: &str) -> Vec<String> {
+        self.router.route_names(ns, model).await
     }
 
     /// 転送する。
@@ -74,6 +86,7 @@ impl<P: Persistence> Gateway<P> {
     /// `path` は `/v1/messages` のようなクライアントが叩いたパス。
     pub async fn forward(
         &self,
+        ns: &Namespace,
         path: &str,
         query: Option<&str>,
         mut body: Value,
@@ -83,13 +96,13 @@ impl<P: Persistence> Gateway<P> {
 
         // `opus` のような短い名前は、ここで実際のモデル名に直す。
         // upstream はこの名前を知らないので、ボディも書き換える。
-        let model = self.router.resolve(&requested).await;
+        let model = self.router.resolve(ns, &requested).await;
         if model != requested {
             crate::backend::anthropic::rewrite_model(&mut body, &model);
         }
 
         let session = session::derive(&body, &headers);
-        let routes = self.router.routes_for(&model, &session).await?;
+        let routes = self.router.routes_for(ns, &model, &session).await?;
 
         let mut attempts = Vec::new();
         for route in &routes {
@@ -287,6 +300,12 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         gw
     }
 
+    /// 既定の namespace。
+    fn ns<P: Persistence>(gw: &Gateway<P>) -> &Namespace {
+        gw.namespace(crate::config::DEFAULT_NAMESPACE)
+            .expect("既定は必ずある")
+    }
+
     fn request() -> Value {
         json!({
             "model": "m",
@@ -319,7 +338,7 @@ credentials = ["a"]
         .await;
 
         let resp = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -354,7 +373,7 @@ credentials = ["down", "alive"]
         .await;
 
         let resp = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -388,7 +407,7 @@ credentials = ["nowhere", "alive"]
         .await;
 
         let resp = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!(resp.status, 200);
@@ -421,7 +440,7 @@ credentials = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -455,7 +474,7 @@ credentials = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!(resp.status, 429);
@@ -488,7 +507,7 @@ credentials = ["first", "second"]
         .await;
 
         let err = gw
-            .forward("/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap_err();
 
@@ -531,13 +550,13 @@ credentials = ["flaky", "alive"]
         .await;
 
         // 1 回目: flaky が落ちていて alive が通る。
-        gw.forward("/v1/messages", None, request(), vec![])
+        gw.forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!((flaky.hits(), alive.hits()), (1, 1));
 
         // 2 回目: flaky は復帰しているが、通った alive を先に試す。
-        gw.forward("/v1/messages", None, request(), vec![])
+        gw.forward(ns(&gw), "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!(
@@ -563,7 +582,13 @@ credentials = ["a"]
         )
         .await;
         let err = gw
-            .forward("/v1/messages", None, json!({"model": "unknown"}), vec![])
+            .forward(
+                ns(&gw),
+                "/v1/messages",
+                None,
+                json!({"model": "unknown"}),
+                vec![],
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown"), "{err}");
@@ -585,9 +610,15 @@ credentials = ["a"]
         )
         .await;
         assert!(
-            gw.forward("/v1/messages", None, json!({"max_tokens": 1}), vec![])
-                .await
-                .is_err()
+            gw.forward(
+                ns(&gw),
+                "/v1/messages",
+                None,
+                json!({"max_tokens": 1}),
+                vec![]
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -604,7 +635,7 @@ models = ["z-model", "a-model"]
         )
         .await;
         assert_eq!(
-            gw.models().await,
+            gw.models(ns(&gw)).await,
             vec!["a-model", "z-model"],
             "名前順に並ぶ"
         );
@@ -629,13 +660,14 @@ opus = "claude-opus-*"
         )
         .await;
         assert_eq!(
-            gw.models().await,
+            gw.models(ns(&gw)).await,
             vec!["claude-opus-5", "opus"],
             "隠した 4-8 は出ない。opus はエイリアス"
         );
 
         let err = gw
             .forward(
+                ns(&gw),
                 "/v1/messages",
                 None,
                 json!({"model": "claude-opus-4-8"}),
@@ -665,12 +697,18 @@ opus = "claude-opus-*"
         .await;
 
         assert!(
-            gw.models().await.contains(&"opus".to_owned()),
+            gw.models(ns(&gw)).await.contains(&"opus".to_owned()),
             "一覧に短い名前も出る"
         );
 
         let resp = gw
-            .forward("/v1/messages", None, json!({"model": "opus"}), vec![])
+            .forward(
+                ns(&gw),
+                "/v1/messages",
+                None,
+                json!({"model": "opus"}),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(resp.status, 200);

@@ -108,7 +108,7 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         tracing::info!(
             listen = %config.server.listen,
             credentials = %dir.display(),
-            models = gateway.models().await.len(),
+            namespaces = gateway.namespace_names().len(),
             "待ち受けを始めます"
         );
 
@@ -134,7 +134,7 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     println!("待ち受け   {}", config.server.listen);
     println!("認証情報   {}", dir.display());
     println!("認証情報数 {} 件", config.credentials.len());
-    println!("振り分け   {} 規則", config.routing.len());
+    println!("namespace  {}", config.namespace_names().join(", "));
 
     // 認証情報が置かれているかは、起動しないと分からない部分。ここで見ておくと
     // 動かしてから 401 で気づく事態を減らせる。
@@ -172,16 +172,40 @@ fn models(config_path: &Path) -> Result<ExitCode, String> {
         let gateway = Gateway::new(&config, store).map_err(|e| e.to_string())?;
         gateway.refresh_models().await;
 
-        let models = gateway.models().await;
-        if models.is_empty() {
+        let names: Vec<String> = gateway
+            .namespace_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut any = false;
+
+        for (i, ns_name) in names.iter().enumerate() {
+            let Some(ns) = gateway.namespace(ns_name) else {
+                continue;
+            };
+            let models = gateway.models(ns).await;
+            if models.is_empty() {
+                continue;
+            }
+            any = true;
+
+            // namespace が 1 つだけなら見出しは邪魔。
+            if names.len() > 1 {
+                if i > 0 {
+                    println!();
+                }
+                println!("[{ns_name}]");
+            }
+            for model in &models {
+                let route = gateway.route_names(ns, model).await.join(" → ");
+                println!("{model}\t{route}");
+            }
+        }
+
+        if !any {
             println!("公開できるモデルがありません。");
             println!("認証情報が置かれているか、exclude で全部隠していないか確認してください。");
             return Ok(ExitCode::FAILURE);
-        }
-
-        for model in &models {
-            let route = gateway.route_names(model).await.join(" → ");
-            println!("{model}\t{route}");
         }
         Ok(ExitCode::SUCCESS)
     })

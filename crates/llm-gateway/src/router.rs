@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::backend::anthropic::{Bedrock, Official, Provider, Relay};
-use crate::config::{Config, CredentialSpec};
+use crate::config::{Config, CredentialSpec, Namespace};
 use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
 use crate::discovery::{self, Model};
 use crate::session::SessionKey;
@@ -50,15 +50,42 @@ impl std::fmt::Debug for Route {
 }
 
 /// upstream に聞いて分かったこと。
+///
+/// **namespace で絞る前の生の一覧**。問い合わせは credential 単位で 1 回だけ
+/// 行い、誰に見せるかは参照時に決める。namespace ごとに聞きに行っても、
+/// 同じアカウントからは同じ答えしか返らない。
 #[derive(Default)]
 struct Catalog {
-    /// 公開するモデル名 → それを扱える credential 名 (宣言順)。
-    models: BTreeMap<String, Vec<String>>,
-    /// credential ごとの「クライアント名 → upstream 名」。
-    /// Bedrock は名前空間が付くので変換が要る。
-    upstream_names: HashMap<String, BTreeMap<String, String>>,
-    /// 短い名前 → 実際のモデル名。
-    aliases: BTreeMap<String, String>,
+    /// credential 名 → その credential が扱えるモデル
+    /// (クライアント向けの名前 → upstream での名前)。
+    ///
+    /// Bedrock は `anthropic.` の名前空間が付くので変換が要る。
+    by_credential: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl Catalog {
+    /// この namespace に見せるモデルと、それを扱える credential。
+    fn visible(&self, ns: &Namespace, config: &Config) -> BTreeMap<String, Vec<String>> {
+        let mut visible: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (credential, models) in &self.by_credential {
+            for model in models.keys() {
+                if ns.allows(credential, model, config) {
+                    visible
+                        .entry(model.clone())
+                        .or_default()
+                        .push(credential.clone());
+                }
+            }
+        }
+        visible
+    }
+
+    fn upstream_name(&self, credential: &str, model: &str) -> Option<&str> {
+        self.by_credential
+            .get(credential)?
+            .get(model)
+            .map(String::as_str)
+    }
 }
 
 pub struct Router {
@@ -92,76 +119,45 @@ impl Router {
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
     ) {
-        let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut upstream_names: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+        let mut by_credential: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let previous = self.catalog.read().await;
 
         for (name, spec) in &self.config.credentials {
             let found = match spec.discovery_flavor() {
-                Some(flavor) => {
-                    match self.discover(http, credentials, name, spec, flavor).await {
-                        Ok(found) => found,
-                        Err(e) => {
-                            warn!(credential = %name, %e, "一覧を取れません。前回の結果を使います");
-                            // 前回の結果から、この credential の分を復元する。
-                            previous
-                                .upstream_names
-                                .get(name)
-                                .map(|m| {
-                                    m.iter()
-                                        .map(|(id, upstream)| Model {
-                                            id: id.clone(),
-                                            upstream_id: upstream.clone(),
-                                            created: 0,
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        }
+                Some(flavor) => match self.discover(http, credentials, name, spec, flavor).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        warn!(credential = %name, %e, "一覧を取れません。前回の結果を使います");
+                        previous
+                            .by_credential
+                            .get(name)
+                            .cloned()
+                            .unwrap_or_default()
                     }
-                }
+                },
                 // 聞けない upstream は設定に書かれたものを使う。
                 None => spec
                     .declared_models()
                     .iter()
-                    .map(|pattern| Model {
-                        id: pattern.clone(),
-                        upstream_id: pattern.clone(),
-                        created: 0,
-                    })
+                    .map(|m| (m.clone(), m.clone()))
                     .collect(),
             };
-
-            let mut mapping = BTreeMap::new();
-            for m in found {
-                if !self.config.allows(name, &m.id) {
-                    continue;
-                }
-                mapping.insert(m.id.clone(), m.upstream_id.clone());
-                models.entry(m.id).or_default().push(name.clone());
-            }
-            upstream_names.insert(name.clone(), mapping);
+            by_credential.insert(name.clone(), found);
         }
         drop(previous);
 
-        let known: Vec<Model> = models
-            .keys()
-            .map(|id| Model {
-                id: id.clone(),
-                upstream_id: id.clone(),
-                created: 0,
-            })
-            .collect();
-        let aliases = resolve_aliases(&self.config.resolved_aliases(), &known);
-
-        info!(models = models.len(), "モデル一覧を更新しました");
-        *self.catalog.write().await = Catalog {
-            models,
-            upstream_names,
-            aliases,
-        };
+        let total: usize = by_credential.values().map(BTreeMap::len).sum();
+        info!(
+            credentials = by_credential.len(),
+            models = total,
+            "モデル一覧を更新しました"
+        );
+        *self.catalog.write().await = Catalog { by_credential };
     }
 
+    /// 1 つの credential に一覧を聞く。
+    ///
+    /// 返すのは「クライアント向けの名前 → upstream での名前」。
     async fn discover<P: Persistence>(
         &self,
         http: &reqwest::Client,
@@ -169,29 +165,31 @@ impl Router {
         name: &str,
         spec: &CredentialSpec,
         flavor: discovery::Flavor,
-    ) -> Result<Vec<Model>> {
+    ) -> Result<BTreeMap<String, String>> {
         let credential = credentials.acquire(&CredentialId::new(name)).await?;
-        let mut found = discovery::fetch(http, flavor, spec.url(), &credential).await?;
-        // 日付は resolve_alias が使う。取れないものは 0 のまま。
-        found.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(found)
+        let found = discovery::fetch(http, flavor, spec.url(), &credential).await?;
+        Ok(found.into_iter().map(|m| (m.id, m.upstream_id)).collect())
     }
 
-    /// 公開しているモデル名 (エイリアスを含む)。
-    pub async fn models(&self) -> Vec<String> {
+    /// この namespace に見せるモデル名 (エイリアスを含む)。
+    ///
+    /// 一覧そのものは共有だが、**何を見せるかは namespace ごとに違う**。
+    pub async fn models(&self, ns: &Namespace) -> Vec<String> {
         let catalog = self.catalog.read().await;
-        let mut all: Vec<String> = catalog.models.keys().cloned().collect();
-        all.extend(catalog.aliases.keys().cloned());
+        let visible = catalog.visible(ns, &self.config);
+
+        let mut all: Vec<String> = visible.keys().cloned().collect();
+        all.extend(aliases_for(ns, &visible).into_keys());
         all.sort_unstable();
         all.dedup();
         all
     }
 
     /// エイリアスなら実際のモデル名に直す。
-    pub async fn resolve(&self, model: &str) -> String {
+    pub async fn resolve(&self, ns: &Namespace, model: &str) -> String {
         let catalog = self.catalog.read().await;
-        catalog
-            .aliases
+        let visible = catalog.visible(ns, &self.config);
+        aliases_for(ns, &visible)
             .get(model)
             .cloned()
             .unwrap_or_else(|| model.to_owned())
@@ -201,14 +199,18 @@ impl Router {
     ///
     /// 設定の優先順そのままではなく、**そのモデルを扱える credential だけ**に
     /// 絞ったもの。設定を見ただけでは分からないので、確認に使える。
-    pub async fn route_names(&self, model: &str) -> Vec<String> {
-        let model = self.resolve(model).await;
+    pub async fn route_names(&self, ns: &Namespace, model: &str) -> Vec<String> {
         let catalog = self.catalog.read().await;
-        let Some(available) = catalog.models.get(&model) else {
+        let visible = catalog.visible(ns, &self.config);
+        let model = aliases_for(ns, &visible)
+            .get(model)
+            .cloned()
+            .unwrap_or_else(|| model.to_owned());
+
+        let Some(available) = visible.get(&model) else {
             return Vec::new();
         };
-        self.config
-            .credentials_for(&model)
+        ns.credentials_for(&model, &self.config)
             .into_iter()
             .filter(|name| available.iter().any(|a| a == name))
             .map(str::to_owned)
@@ -216,17 +218,21 @@ impl Router {
     }
 
     /// この会話でこのモデルを使うときの経路を、試す順に返す。
-    pub async fn routes_for(&self, model: &str, session: &SessionKey) -> Result<Vec<Arc<Route>>> {
+    pub async fn routes_for(
+        &self,
+        ns: &Namespace,
+        model: &str,
+        session: &SessionKey,
+    ) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
-        let available = catalog
-            .models
+        let visible = catalog.visible(ns, &self.config);
+        let available = visible
             .get(model)
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
 
         // 設定の優先順のうち、このモデルを実際に扱えるものだけを残す。
-        let ordered: Vec<&str> = self
-            .config
-            .credentials_for(model)
+        let ordered: Vec<&str> = ns
+            .credentials_for(model, &self.config)
             .into_iter()
             .filter(|name| available.iter().any(|a| a == name))
             .collect();
@@ -256,16 +262,10 @@ impl Router {
 
     fn build_route(&self, catalog: &Catalog, name: &str, model: &str) -> Option<Arc<Route>> {
         let spec = self.config.credentials.get(name)?;
-        let upstream_name = catalog
-            .upstream_names
-            .get(name)
-            .and_then(|m| m.get(model))
-            .cloned();
-
         // upstream での名前が違う場合だけ書き換える。
-        let model_map = match &upstream_name {
+        let model_map = match catalog.upstream_name(name, model) {
             Some(upstream) if upstream != model => {
-                BTreeMap::from([(model.to_owned(), upstream.clone())])
+                BTreeMap::from([(model.to_owned(), upstream.to_owned())])
             }
             _ => BTreeMap::new(),
         };
@@ -311,42 +311,44 @@ impl Router {
         );
     }
 
+    /// discovery が済んだ状態を作る。
+    ///
+    /// 引数は「credential → その credential が扱えるモデル
+    /// (クライアント向けの名前, upstream での名前)」。
     #[cfg(test)]
-    async fn set_catalog(&self, models: &[(&str, &[&str])], upstream: &[(&str, &[(&str, &str)])]) {
-        let mut catalog = self.catalog.write().await;
-        catalog.models = models
+    async fn set_catalog(&self, by_credential: &[(&str, &[(&str, &str)])]) {
+        self.catalog.write().await.by_credential = by_credential
             .iter()
-            .map(|(m, creds)| {
-                (
-                    (*m).to_owned(),
-                    creds.iter().map(|c| (*c).to_owned()).collect(),
-                )
-            })
-            .collect();
-        catalog.upstream_names = upstream
-            .iter()
-            .map(|(cred, pairs)| {
+            .map(|(cred, models)| {
                 (
                     (*cred).to_owned(),
-                    pairs
+                    models
                         .iter()
-                        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+                        .map(|(id, upstream)| ((*id).to_owned(), (*upstream).to_owned()))
                         .collect(),
                 )
             })
             .collect();
-        let known: Vec<Model> = catalog
-            .models
-            .keys()
-            .map(|id| Model {
-                id: id.clone(),
-                upstream_id: id.clone(),
-                created: 0,
-            })
-            .collect();
-        catalog.aliases = self.config.resolved_aliases();
-        catalog.aliases = resolve_aliases(&catalog.aliases.clone(), &known);
     }
+}
+
+/// この namespace で使えるエイリアス。
+///
+/// 見えているモデルの中から解決する。同じ設定でも、namespace が違えば
+/// 見えるモデルが違うので、行き先も変わる。
+fn aliases_for(
+    ns: &Namespace,
+    visible: &BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, String> {
+    let known: Vec<Model> = visible
+        .keys()
+        .map(|id| Model {
+            id: id.clone(),
+            upstream_id: id.clone(),
+            created: 0,
+        })
+        .collect();
+    resolve_aliases(&ns.resolved_aliases(), &known)
 }
 
 /// エイリアスを実際のモデル名まで解決する。
@@ -442,20 +444,35 @@ haiku = "claude-haiku"
         let config: Config = toml::from_str(CONFIG).unwrap();
         config.validate().unwrap();
         let r = Router::new(config);
-        r.set_catalog(
-            &[
-                ("claude-fable-5", &["bedrock", "oauth-a"]),
-                ("claude-opus-5", &["oauth-a", "oauth-b"]),
-                ("claude-haiku-4-5-20251001", &["oauth-a"]),
-                ("gpt-5.6-sol", &["cpa"]),
-            ],
-            &[
-                ("bedrock", &[("claude-fable-5", "anthropic.claude-fable-5")]),
-                ("oauth-a", &[("claude-fable-5", "claude-fable-5")]),
-            ],
-        )
+        r.set_catalog(&[
+            // Bedrock は fable だけ扱い、upstream では名前空間が付く。
+            ("bedrock", &[("claude-fable-5", "anthropic.claude-fable-5")]),
+            (
+                "oauth-a",
+                &[
+                    ("claude-fable-5", "claude-fable-5"),
+                    ("claude-opus-5", "claude-opus-5"),
+                    ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+                ],
+            ),
+            (
+                "oauth-b",
+                &[
+                    ("claude-opus-5", "claude-opus-5"),
+                    ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+                ],
+            ),
+            ("cpa", &[("gpt-5.6-sol", "gpt-5.6-sol")]),
+        ])
         .await;
         r
+    }
+
+    /// 既定の namespace。
+    fn ns(r: &Router) -> &Namespace {
+        r.config
+            .namespace(crate::config::DEFAULT_NAMESPACE)
+            .expect("既定は必ずある")
     }
 
     fn session(name: &str) -> SessionKey {
@@ -470,7 +487,7 @@ haiku = "claude-haiku"
     async fn follows_routing_rules() {
         let r = router().await;
         let got = r
-            .routes_for("claude-fable-5", &session("s1"))
+            .routes_for(ns(&r), "claude-fable-5", &session("s1"))
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
@@ -481,7 +498,10 @@ haiku = "claude-haiku"
     #[tokio::test]
     async fn unrouted_model_uses_whoever_can_serve_it() {
         let r = router().await;
-        let got = r.routes_for("claude-opus-5", &session("s1")).await.unwrap();
+        let got = r
+            .routes_for(ns(&r), "claude-opus-5", &session("s1"))
+            .await
+            .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "oauth-b"]);
     }
 
@@ -490,7 +510,7 @@ haiku = "claude-haiku"
     async fn excluded_credential_is_not_offered() {
         let r = router().await;
         let got = r
-            .routes_for("claude-haiku-4-5-20251001", &session("s1"))
+            .routes_for(ns(&r), "claude-haiku-4-5-20251001", &session("s1"))
             .await
             .unwrap();
         assert_eq!(
@@ -504,7 +524,7 @@ haiku = "claude-haiku"
     async fn unknown_model_is_rejected() {
         let r = router().await;
         let err = r
-            .routes_for("no-such-model", &session("s1"))
+            .routes_for(ns(&r), "no-such-model", &session("s1"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no-such-model"), "{err}");
@@ -518,7 +538,7 @@ haiku = "claude-haiku"
 
         let r = router().await;
         let routes = r
-            .routes_for("claude-fable-5", &session("s1"))
+            .routes_for(ns(&r), "claude-fable-5", &session("s1"))
             .await
             .unwrap();
 
@@ -538,24 +558,27 @@ haiku = "claude-haiku"
     #[tokio::test]
     async fn aliases_resolve_to_concrete_models() {
         let r = router().await;
-        assert_eq!(r.resolve("opus").await, "claude-opus-5");
-        assert_eq!(r.resolve("fable").await, "claude-fable-5");
-        assert_eq!(r.resolve("haiku").await, "claude-haiku-4-5-20251001");
+        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5");
+        assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
+        assert_eq!(
+            r.resolve(ns(&r), "haiku").await,
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     /// エイリアスでない名前はそのまま通す。
     #[tokio::test]
     async fn non_alias_passes_through() {
         let r = router().await;
-        assert_eq!(r.resolve("claude-opus-5").await, "claude-opus-5");
-        assert_eq!(r.resolve("unknown").await, "unknown");
+        assert_eq!(r.resolve(ns(&r), "claude-opus-5").await, "claude-opus-5");
+        assert_eq!(r.resolve(ns(&r), "unknown").await, "unknown");
     }
 
     /// 一覧にはエイリアスも並べる。短い名前で選べるようにする。
     #[tokio::test]
     async fn model_list_includes_aliases() {
         let r = router().await;
-        let models = r.models().await;
+        let models = r.models(ns(&r)).await;
         assert!(models.contains(&"claude-opus-5".to_owned()));
         assert!(models.contains(&"opus".to_owned()));
         assert!(models.contains(&"fable".to_owned()));
@@ -569,10 +592,10 @@ haiku = "claude-haiku"
         let r = router().await;
         let s = session("s1");
 
-        let first = r.routes_for("claude-fable-5", &s).await.unwrap();
+        let first = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
         r.remember(&s, "claude-fable-5", &first[1]).await;
 
-        let again = r.routes_for("claude-fable-5", &s).await.unwrap();
+        let again = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
         assert_eq!(names(&again), vec!["oauth-a", "bedrock"]);
         assert_eq!(again.len(), 2, "候補は減らさない");
     }
@@ -582,12 +605,12 @@ haiku = "claude-haiku"
         let r = router().await;
         let s = session("s1");
 
-        let routes = r.routes_for("claude-fable-5", &s).await.unwrap();
+        let routes = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
         r.remember(&s, "claude-fable-5", &routes[1]).await;
 
         assert_eq!(
             names(
-                &r.routes_for("claude-fable-5", &session("s2"))
+                &r.routes_for(ns(&r), "claude-fable-5", &session("s2"))
                     .await
                     .unwrap()
             ),
@@ -595,7 +618,7 @@ haiku = "claude-haiku"
             "別の会話には効かない"
         );
         assert_eq!(
-            names(&r.routes_for("claude-opus-5", &s).await.unwrap()),
+            names(&r.routes_for(ns(&r), "claude-opus-5", &s).await.unwrap()),
             vec!["oauth-a", "oauth-b"],
             "別のモデルには効かない"
         );
@@ -616,13 +639,13 @@ haiku = "claude-haiku"
             "claude-haiku-4-5-20251001",
         ] {
             let actual: Vec<String> = r
-                .routes_for(model, &s)
+                .routes_for(ns(&r), model, &s)
                 .await
                 .unwrap()
                 .iter()
                 .map(|route| route.name().to_owned())
                 .collect();
-            assert_eq!(r.route_names(model).await, actual, "{model}");
+            assert_eq!(r.route_names(ns(&r), model).await, actual, "{model}");
         }
     }
 
@@ -632,10 +655,17 @@ haiku = "claude-haiku"
     #[tokio::test]
     async fn aliases_can_point_at_other_aliases() {
         let r = router().await;
-        assert_eq!(r.resolve("claude-opus").await, "claude-opus-5", "一段目");
-        assert_eq!(r.resolve("opus").await, "claude-opus-5", "二段目");
-        assert_eq!(r.resolve("fable").await, "claude-fable-5");
-        assert_eq!(r.resolve("haiku").await, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            r.resolve(ns(&r), "claude-opus").await,
+            "claude-opus-5",
+            "一段目"
+        );
+        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5", "二段目");
+        assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
+        assert_eq!(
+            r.resolve(ns(&r), "haiku").await,
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     /// 循環したエイリアスは捨てる。名前解決が戻ってこないよりまし。
@@ -675,15 +705,15 @@ haiku = "claude-haiku"
     async fn route_names_resolves_aliases() {
         let r = router().await;
         assert_eq!(
-            r.route_names("fable").await,
-            r.route_names("claude-fable-5").await
+            r.route_names(ns(&r), "fable").await,
+            r.route_names(ns(&r), "claude-fable-5").await
         );
     }
 
     #[tokio::test]
     async fn route_names_is_empty_for_unknown_model() {
         let r = router().await;
-        assert!(r.route_names("no-such-model").await.is_empty());
+        assert!(r.route_names(ns(&r), "no-such-model").await.is_empty());
     }
 
     /// 一覧が空なら何も出さない (起動直後で discovery 前の状態)。
@@ -691,7 +721,11 @@ haiku = "claude-haiku"
     async fn empty_catalog_serves_nothing() {
         let config: Config = toml::from_str(CONFIG).unwrap();
         let r = Router::new(config);
-        assert!(r.models().await.is_empty());
-        assert!(r.routes_for("claude-opus-5", &session("s")).await.is_err());
+        assert!(r.models(ns(&r)).await.is_empty());
+        assert!(
+            r.routes_for(ns(&r), "claude-opus-5", &session("s"))
+                .await
+                .is_err()
+        );
     }
 }

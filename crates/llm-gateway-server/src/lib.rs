@@ -26,10 +26,42 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
     Router::new()
+        // namespace 付き。`/ns-personal/v1/messages` のように使う。
+        .route("/{ns}/v1/messages", post(messages))
+        .route("/{ns}/v1/messages/count_tokens", post(messages))
+        .route("/{ns}/v1/models", get(models))
+        // 付けなければ既定の namespace。単一の用途で使う分には意識しなくてよい。
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages))
         .route("/v1/models", get(models))
         .with_state(gateway)
+}
+
+/// パスの先頭から namespace 名を取り出す。
+///
+/// `/ns-personal/v1/messages` → `personal`。接頭辞を付けるのは、
+/// namespace 名と API のパスを見分けるため (`/v1/...` と衝突しない)。
+fn namespace_of(path: &str) -> &str {
+    path.strip_prefix('/')
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|first| first.strip_prefix("ns-"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or(llm_gateway::config::DEFAULT_NAMESPACE)
+}
+
+/// upstream へ送るパス。namespace の部分を落とす。
+///
+/// `/ns-personal/v1/messages` → `/v1/messages`。upstream は namespace を
+/// 知らないので、こちらの都合で付けた分は取り除いて渡す。
+fn upstream_path(path: &str) -> &str {
+    let Some(rest) = path.strip_prefix('/') else {
+        return path;
+    };
+    match rest.split_once('/') {
+        // `/ns-xxx` の分 (先頭の `/` と名前) を飛ばす。
+        Some((first, _)) if first.starts_with("ns-") => &path[1 + first.len()..],
+        _ => path,
+    }
 }
 
 /// upstream へ渡して、返ってきたものをそのまま返す。
@@ -55,11 +87,24 @@ async fn messages<P: Persistence + 'static>(
     };
 
     let headers = collect_headers(&parts.headers);
-    let path = uri.path().to_owned();
+    let ns_name = namespace_of(uri.path()).to_owned();
+    let Some(ns) = gateway.namespace(&ns_name) else {
+        return unknown_namespace(&ns_name, &gateway.namespace_names());
+    };
+    if !ns.accepts(
+        parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return unauthorized(&ns_name);
+    }
+
+    let path = upstream_path(uri.path()).to_owned();
     let query = uri.query().map(str::to_owned);
 
     match gateway
-        .forward(&path, query.as_deref(), json, headers)
+        .forward(ns, &path, query.as_deref(), json, headers)
         .await
     {
         Ok(upstream) => {
@@ -82,14 +127,56 @@ async fn messages<P: Persistence + 'static>(
 }
 
 /// 使えるモデルの一覧。クライアントのモデル選択に出る。
-async fn models<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
+///
+/// 何が見えるかは namespace ごとに違う。
+async fn models<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let ns_name = namespace_of(request.uri().path()).to_owned();
+    let Some(ns) = gateway.namespace(&ns_name) else {
+        return unknown_namespace(&ns_name, &gateway.namespace_names());
+    };
+    if !ns.accepts(
+        request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        return unauthorized(&ns_name);
+    }
+
     let data: Vec<Value> = gateway
-        .models()
+        .models(ns)
         .await
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "type": "model"}))
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
+}
+
+fn unknown_namespace(name: &str, known: &[&str]) -> Response {
+    client_error(
+        StatusCode::NOT_FOUND,
+        &format!(
+            "namespace `{name}` は設定されていません。使えるのは: {}",
+            known.join(", ")
+        ),
+    )
+}
+
+fn unauthorized(ns: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": format!("namespace `{ns}` のトークンが違います"),
+            },
+        })),
+    )
+        .into_response()
 }
 
 fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -156,7 +243,7 @@ fn client_error(status: StatusCode, message: &str) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use llm_gateway::Config;
     use llm_gateway::credential::{CredentialId, Kind, StoredCredential};
@@ -225,7 +312,7 @@ mod tests {
     }
 
     /// gateway を立てて、その待ち受け先を返す。
-    async fn serve(config_toml: &str) -> String {
+    pub(crate) async fn serve(config_toml: &str) -> String {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
         let gateway = Arc::new(Gateway::new(&config, StaticStore).unwrap());
@@ -537,5 +624,194 @@ credentials = ["a"]
 
         assert_eq!(resp.status(), 200);
         assert!(resp.text().await.unwrap().contains("42"));
+    }
+}
+
+#[cfg(test)]
+mod e2e_namespace_tests {
+    use super::tests::serve;
+    use serde_json::Value;
+
+    /// 2 つの namespace を持つ設定。見えるモデルが違う。
+    const TWO_NS: &str = r#"
+[credentials.a]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5", "claude-fable-5", "gpt-5.6-sol"]
+
+[ns.personal]
+[ns.personal.filter]
+exclude = ["gpt-*"]
+[ns.personal.aliases]
+opus = "claude-opus-*"
+
+[ns.work]
+[ns.work.filter]
+exclude = ["claude-fable-*"]
+
+[ns.locked]
+auth_token = "secret-token"
+"#;
+
+    async fn ids(base: &str, path: &str) -> Vec<String> {
+        let body: Value = reqwest::get(format!("{base}{path}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// 同じ upstream を見ていても、namespace ごとに見えるモデルが違う。
+    #[tokio::test]
+    async fn each_namespace_sees_its_own_models() {
+        let base = serve(TWO_NS).await;
+
+        let personal = ids(&base, "/ns-personal/v1/models").await;
+        assert!(personal.contains(&"claude-fable-5".to_owned()));
+        assert!(
+            !personal.iter().any(|m| m.starts_with("gpt-")),
+            "personal は gpt を隠している: {personal:?}"
+        );
+        assert!(
+            personal.contains(&"opus".to_owned()),
+            "エイリアスも namespace ごと"
+        );
+
+        let work = ids(&base, "/ns-work/v1/models").await;
+        assert!(work.contains(&"gpt-5.6-sol".to_owned()));
+        assert!(
+            !work.contains(&"claude-fable-5".to_owned()),
+            "work は fable を隠している: {work:?}"
+        );
+        assert!(!work.contains(&"opus".to_owned()), "エイリアスは共有しない");
+    }
+
+    /// 設定していない namespace は 404。使えるものを教える。
+    #[tokio::test]
+    async fn unknown_namespace_is_rejected() {
+        let base = serve(TWO_NS).await;
+        let resp = reqwest::get(format!("{base}/ns-nope/v1/models"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let body: Value = resp.json().await.unwrap();
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("nope"), "{msg}");
+        assert!(msg.contains("personal"), "使えるものを挙げる: {msg}");
+    }
+
+    /// トークンを設定した namespace は、合っていないと通さない。
+    #[tokio::test]
+    async fn namespace_token_is_checked() {
+        let base = serve(TWO_NS).await;
+        let client = reqwest::Client::new();
+
+        let without = client
+            .get(format!("{base}/ns-locked/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(without.status(), 401, "トークン無しは通さない");
+
+        let wrong = client
+            .get(format!("{base}/ns-locked/v1/models"))
+            .header("authorization", "Bearer nope")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), 401);
+
+        for value in ["Bearer secret-token", "secret-token"] {
+            let ok = client
+                .get(format!("{base}/ns-locked/v1/models"))
+                .header("authorization", value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(ok.status(), 200, "{value} は通す");
+        }
+    }
+
+    /// トークンを設定していない namespace は誰でも使える。
+    #[tokio::test]
+    async fn namespace_without_token_is_open() {
+        let base = serve(TWO_NS).await;
+        let resp = reqwest::get(format!("{base}/ns-personal/v1/models"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_namespace_from_path() {
+        assert_eq!(namespace_of("/ns-personal/v1/messages"), "personal");
+        assert_eq!(namespace_of("/ns-emrd/v1/models"), "emrd");
+    }
+
+    /// 接頭辞が無ければ既定。単一の用途では namespace を意識せずに済む。
+    #[test]
+    fn plain_path_uses_the_default() {
+        assert_eq!(namespace_of("/v1/messages"), "default");
+        assert_eq!(namespace_of("/v1/models"), "default");
+        assert_eq!(namespace_of("/"), "default");
+        assert_eq!(namespace_of(""), "default");
+    }
+
+    /// `ns-` だけでは名前にならない。
+    #[test]
+    fn empty_namespace_name_falls_back() {
+        assert_eq!(namespace_of("/ns-/v1/messages"), "default");
+    }
+
+    /// 接頭辞を付けるのは API のパスと見分けるため。
+    /// `v1` を namespace 名と誤認しない。
+    #[test]
+    fn api_path_is_not_mistaken_for_a_namespace() {
+        assert_eq!(namespace_of("/v1/messages/count_tokens"), "default");
+    }
+
+    #[test]
+    fn strips_namespace_before_forwarding() {
+        assert_eq!(upstream_path("/ns-personal/v1/messages"), "/v1/messages");
+        assert_eq!(
+            upstream_path("/ns-emrd/v1/messages/count_tokens"),
+            "/v1/messages/count_tokens"
+        );
+    }
+
+    /// 接頭辞が無ければそのまま。
+    #[test]
+    fn plain_path_is_unchanged() {
+        assert_eq!(upstream_path("/v1/messages"), "/v1/messages");
+        assert_eq!(upstream_path("/v1/models"), "/v1/models");
+    }
+
+    /// upstream は namespace を知らない。渡すパスに残してはいけない。
+    #[test]
+    fn upstream_never_sees_the_namespace() {
+        for path in [
+            "/ns-personal/v1/messages",
+            "/ns-a/v1/models",
+            "/ns-x/v1/messages/count_tokens",
+        ] {
+            assert!(
+                !upstream_path(path).contains("ns-"),
+                "{path} → {}",
+                upstream_path(path)
+            );
+        }
     }
 }
