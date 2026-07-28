@@ -245,8 +245,18 @@ push: ci check-on-default-branch ensure-clean check-version-bumped
     ccmsg notify --self --text "Monitor で 'just watch' を起動して" 2>/dev/null || true
 
 # release.yml の完了を SHA-pinned watch (push 後の `ccmsg notify --self` で AI に起動指示が届く)
+#
+# watch-workflow.sh は gh-monitor plugin の中にあり PATH に乗らないので、
+# cache から最新版を探して使う (裸で呼ぶと 127 で落ちる。実測 2026-07-29)。
+[doc("release.yml の完了を SHA-pinned watch する")]
+[script]
 watch:
-    watch-workflow.sh --sha $(bump-semver vcs get commit-id --rev "$(bump-semver vcs get default-branch)") --on-success release.yml 'just on-success-release' kawaz/llm-gateway
+    ws=$(ls "$HOME"/.claude-personal/plugins/cache/gh-monitor/gh-monitor/*/scripts/watch-workflow.sh 2>/dev/null | sort -V | tail -1)
+    if [ -z "$ws" ]; then
+        echo "watch-workflow.sh が見つかりません (gh-monitor plugin が未インストール?)" >&2
+        exit 1
+    fi
+    "$ws" --sha "$(bump-semver vcs get commit-id --rev "$(bump-semver vcs get default-branch)")" --on-success release.yml 'just on-success-release' kawaz/llm-gateway
 
 # release.yml workflow が success になった時に AI が実行する action
 # (watch-workflow の `--on-success release.yml 'just on-success-release'` 経由で
