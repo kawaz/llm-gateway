@@ -102,6 +102,35 @@ pub async fn collect_body(body: BodyStream) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 本文を読んだうえで、まだ読んでいない応答として返し直す。
+///
+/// 失敗の中身を見てから「そのままクライアントへ返す」ことができる。
+/// 読んだら返せない作りだと、中身を見るために応答を捨てる羽目になる。
+/// 呼ぶのは失敗時だけ — 生成中の応答を丸ごと抱えると、その分の遅延と
+/// メモリがそのまま乗る。
+pub async fn buffer(resp: Response) -> Result<(Response, Vec<u8>)> {
+    let Response {
+        status,
+        headers,
+        body,
+    } = resp;
+    let raw = collect_body(body).await?;
+    let replayed = futures_util::stream::once({
+        let raw = raw.clone();
+        async move { Ok(bytes::Bytes::from(raw)) }
+    })
+    .boxed();
+
+    Ok((
+        Response {
+            status,
+            headers,
+            body: replayed,
+        },
+        raw,
+    ))
+}
+
 /// この状態なら別の upstream を試す価値があるか。
 ///
 /// 経路が断たれている場合だけ切り替える。429 では切り替えない — レート制限は
@@ -165,6 +194,33 @@ mod tests {
         for status in [200, 201, 204] {
             assert!(!should_try_next(status));
         }
+    }
+
+    /// 中身を見た後も、そのままクライアントへ返せる。
+    #[tokio::test]
+    async fn buffered_response_can_still_be_forwarded() {
+        let resp = Response {
+            status: 400,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: futures_util::stream::iter(vec![
+                Ok(bytes::Bytes::from_static(b"{\"error\":")),
+                Ok(bytes::Bytes::from_static(b"\"invalid beta flag\"}")),
+            ])
+            .boxed(),
+        };
+
+        let (resp, raw) = buffer(resp).await.unwrap();
+        assert_eq!(
+            String::from_utf8(raw).unwrap(),
+            r#"{"error":"invalid beta flag"}"#
+        );
+        assert_eq!(resp.status, 400);
+        assert_eq!(resp.headers.len(), 1, "ヘッダは失わない");
+        assert_eq!(
+            String::from_utf8(collect_body(resp.body).await.unwrap()).unwrap(),
+            r#"{"error":"invalid beta flag"}"#,
+            "読んだ後でも同じ本文を流せる"
+        );
     }
 
     #[test]

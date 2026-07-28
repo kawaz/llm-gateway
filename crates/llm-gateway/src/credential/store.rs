@@ -4,13 +4,14 @@
 //! 束ね、全員が同じ結果を受け取る。束ねないと、並行リクエストの数だけ更新が
 //! 走り、後発が `refresh_token_reused` で弾かれて再ログインが要る状態に落ちる。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::{Error, Result};
 
+use super::time::{format_rfc3339, parse_rfc3339};
 use super::{CredentialId, Persistence, StoredCredential, oauth};
 
 /// 期限のこれだけ手前から更新に入る。
@@ -22,9 +23,13 @@ const REFRESH_MARGIN_SECS: i64 = 300;
 #[derive(Debug, Clone)]
 pub struct Credential {
     pub id: CredentialId,
-    pub kind: super::Kind,
     token: Arc<str>,
     pub account_id: Option<String>,
+    /// この upstream が拒否したと分かっている beta フラグ (DR-0003)。
+    ///
+    /// 取り出した時点で期限を見て絞ってある。期限切れの記録はここに入らず、
+    /// 「試してみる」側に回る。
+    pub denied_beta: BTreeSet<String>,
 }
 
 impl Credential {
@@ -43,9 +48,9 @@ impl Credential {
     pub fn for_test(token: &str) -> Self {
         Self {
             id: CredentialId::new("test"),
-            kind: super::Kind::Claude,
             token: Arc::from(token),
             account_id: None,
+            denied_beta: BTreeSet::new(),
         }
     }
 }
@@ -107,13 +112,30 @@ impl<P: Persistence> CredentialStore<P> {
         let current = self.read(id).await?;
 
         if !self.needs_refresh(&current) {
-            return Ok(to_credential(id, &current));
+            return Ok(self.to_credential(id, &current));
         }
 
         self.refresh_once(id).await?;
 
         let refreshed = self.read(id).await?;
-        Ok(to_credential(id, &refreshed))
+        Ok(self.to_credential(id, &refreshed))
+    }
+
+    /// upstream が拒否した beta フラグを覚える (DR-0003)。
+    ///
+    /// 覚えないと同じ 400 を毎回踏む。時刻を一緒に置くのは、upstream が
+    /// 対応したときに自動で戻すため。
+    pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
+        if flags.is_empty() {
+            return Ok(());
+        }
+        let current = self.read(id).await?;
+        let mut next = (*current).clone();
+        next.record_denied_beta(flags, self.clock.now_unix());
+
+        self.persistence.store(id, &next)?;
+        self.cache.write().await.insert(id.clone(), Arc::new(next));
+        Ok(())
     }
 
     /// 現在の内容を返す。控えがあればそれを使う。
@@ -130,7 +152,13 @@ impl<P: Persistence> CredentialStore<P> {
     }
 
     fn needs_refresh(&self, c: &StoredCredential) -> bool {
-        match parse_rfc3339(&c.expired) {
+        // 更新の口が無いもの (API キー認証) は、期限が過ぎていても更新に
+        // 走らない。走らせても直らず、失敗の理由が認証情報の期限切れから
+        // 「更新できません」にすり替わって原因が見えなくなる。
+        if c.payload.oauth_kind().is_none() {
+            return false;
+        }
+        match parse_rfc3339(c.payload.expired()) {
             Some(exp) => exp - self.clock.now_unix() <= REFRESH_MARGIN_SECS,
             // 期限が読めないものは更新しない。壊れた値を根拠に
             // refresh token を使い切るほうが害が大きい。
@@ -179,27 +207,41 @@ impl<P: Persistence> CredentialStore<P> {
     /// 実際の更新。保存まで済ませる。
     async fn do_refresh(&self, id: &CredentialId) -> Result<()> {
         let current = self.read(id).await?;
+        let (Some(kind), Some(refresh_token)) = (
+            current.payload.oauth_kind(),
+            current.payload.refresh_token(),
+        ) else {
+            return Err(Error::Refresh {
+                id: id.to_string(),
+                reason: "OAuth ではないので更新できません。\
+新しいキーを発行して認証情報を保存し直してください"
+                    .to_owned(),
+            });
+        };
+
         let resp = oauth::refresh_at(
             &self.http,
             id,
-            current.kind,
-            &current.refresh_token,
+            kind,
+            refresh_token,
             self.token_url_override.as_deref(),
         )
         .await?;
 
-        let mut next = (*current).clone();
-        next.access_token = resp.access_token;
-        // 返らなかった場合は入れ替わっていないとみなし、今の値を残す。
-        if let Some(rt) = resp.refresh_token {
-            next.refresh_token = rt;
-        }
         let now = self.clock.now_unix();
-        next.expired = format_rfc3339(now + resp.expires_in);
-        next.last_refresh = format_rfc3339(now);
-        if let Some(email) = resp.account.and_then(|a| a.email_address) {
-            next.email = email;
+        let mut next = (*current).clone();
+        if let Some(tokens) = next.payload.oauth_tokens_mut() {
+            tokens.access_token = resp.access_token;
+            // 返らなかった場合は入れ替わっていないとみなし、今の値を残す。
+            if let Some(rt) = resp.refresh_token {
+                tokens.refresh_token = rt;
+            }
+            tokens.expired = format_rfc3339(now + resp.expires_in);
+            if let Some(email) = resp.account.and_then(|a| a.email_address) {
+                tokens.email = email;
+            }
         }
+        next.last_refresh = format_rfc3339(now);
 
         // 保存が先。ここで落ちると新しい token を失うが、控えだけ更新して
         // 保存に失敗するよりはよい (次回起動時に古い token で動こうとして
@@ -208,83 +250,21 @@ impl<P: Persistence> CredentialStore<P> {
         self.cache.write().await.insert(id.clone(), Arc::new(next));
         Ok(())
     }
-}
 
-fn to_credential(id: &CredentialId, c: &StoredCredential) -> Credential {
-    Credential {
-        id: id.clone(),
-        kind: c.kind,
-        token: Arc::from(c.access_token.as_str()),
-        account_id: c.account_id.clone(),
-    }
-}
-
-/// RFC 3339 を unix 秒にする。
-///
-/// 認証情報の `expired` を読むためだけに使う。日時ライブラリを足すほどの
-/// 用途ではないので、必要な形 (`2026-07-28T02:54:00+09:00`) だけ解釈する。
-fn parse_rfc3339(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 19 {
-        return None;
-    }
-    let num = |from: usize, to: usize| s.get(from..to)?.parse::<i64>().ok();
-    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
-    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-
-    let offset = match b.get(19) {
-        None | Some(b'Z') | Some(b'z') => 0,
-        Some(&sign @ (b'+' | b'-')) => {
-            let oh = num(20, 22)?;
-            let om = num(23, 25)?;
-            let secs = oh * 3600 + om * 60;
-            if sign == b'-' { -secs } else { secs }
+    fn to_credential(&self, id: &CredentialId, c: &StoredCredential) -> Credential {
+        Credential {
+            id: id.clone(),
+            token: Arc::from(c.payload.secret()),
+            account_id: c.payload.account_id().map(str::to_owned),
+            denied_beta: c.denied_beta_at(self.clock.now_unix()),
         }
-        // 小数秒付き (`…:00.123Z`) は今のところ出てこない。
-        Some(_) => return None,
-    };
-
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset)
-}
-
-/// unix 秒を RFC 3339 にする。認証情報の `expired` / `last_refresh` を書くのに使う。
-pub(crate) fn format_rfc3339(unix: i64) -> String {
-    let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
-    let (y, mo, d) = civil_from_days(days);
-    let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-/// Howard Hinnant の civil_from_days / days_from_civil。
-/// 1970-01-01 からの日数と暦日を相互変換する。
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::{Kind, stored::StoredCredential};
-    use std::collections::BTreeMap;
+    use crate::credential::stored::{ApiKey, OauthTokens, Payload, StoredCredential};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -296,19 +276,21 @@ mod tests {
     }
 
     fn cred(expired: &str) -> StoredCredential {
-        StoredCredential {
-            kind: Kind::Claude,
-            email: "someone@example.com".into(),
+        StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
             access_token: "at-1".into(),
             refresh_token: "rt-1".into(),
             expired: expired.into(),
-            last_refresh: String::new(),
-            priority: 0,
-            disabled: false,
-            excluded_models: vec![],
-            account_id: None,
-            extra: BTreeMap::new(),
-        }
+            email: "someone@example.com".into(),
+            extra: Default::default(),
+        }))
+    }
+
+    fn api_key_cred(expired: &str) -> StoredCredential {
+        StoredCredential::new(Payload::ClaudeBedrock(ApiKey {
+            api_key: "ak-1".into(),
+            expired: expired.into(),
+            extra: Default::default(),
+        }))
     }
 
     /// 保存回数と内容を数えるだけの置き場。
@@ -439,33 +421,82 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         }
     }
 
+    /// 更新の口が無い認証情報は、期限が切れていても更新に走らない。
+    ///
+    /// 走らせても直らないうえ、失敗の理由が「キーの期限切れ」から
+    /// 「更新できません」にすり替わって原因が見えなくなる。
     #[test]
-    fn parses_offsets() {
-        // 同じ時刻を別の書き方で表したもの。
-        let utc = parse_rfc3339("2026-07-27T19:00:00Z").unwrap();
-        assert_eq!(parse_rfc3339("2026-07-28T04:00:00+09:00"), Some(utc));
-        assert_eq!(parse_rfc3339("2026-07-27T14:00:00-05:00"), Some(utc));
-        assert_eq!(parse_rfc3339("2026-07-27T19:00:00"), Some(utc));
+    fn api_key_is_never_refreshed() {
+        let store = store_with(api_key_cred(&at(-1)));
+        assert!(!store.needs_refresh(&api_key_cred(&at(-1))));
+        assert!(!store.needs_refresh(&api_key_cred(&at(0))));
     }
 
-    /// 実運用の auth JSON にある値をそのまま読めるか。
-    #[test]
-    fn parses_real_expiry_values() {
-        assert!(parse_rfc3339("2026-07-28T02:54:00+09:00").is_some());
-        assert!(parse_rfc3339("2026-08-02T10:08:18+09:00").is_some());
+    /// それでも更新を頼まれたら、何をすればよいかを言って断る。
+    #[tokio::test]
+    async fn refreshing_an_api_key_says_what_to_do() {
+        let store = store_with(api_key_cred(&at(-1)));
+        let err = store
+            .do_refresh(&CredentialId::new("c"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OAuth ではない"), "{err}");
+        assert!(err.contains("発行"), "対処を書く: {err}");
     }
 
-    #[test]
-    fn round_trips_through_format() {
-        for t in [0, NOW, NOW + 28_800, 253_402_300_799] {
-            assert_eq!(parse_rfc3339(&format_rfc3339(t)), Some(t), "t={t}");
-        }
+    /// API キーはそのまま渡る (期限を理由に握りつぶさない)。
+    #[tokio::test]
+    async fn api_key_is_handed_out_as_is() {
+        let store = store_with(api_key_cred(&at(-1)));
+        let got = store.acquire(&CredentialId::new("c")).await.unwrap();
+        assert_eq!(got.api_key(), "ak-1");
+        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn handles_leap_day() {
-        let feb29 = parse_rfc3339("2028-02-29T12:00:00Z").unwrap();
-        assert_eq!(format_rfc3339(feb29), "2028-02-29T12:00:00Z");
+    /// 拒否された beta フラグを覚えて保存する。
+    #[tokio::test]
+    async fn denied_beta_is_recorded_and_persisted() {
+        let store = store_with(cred(&at(3600)));
+        let id = CredentialId::new("c");
+
+        store
+            .record_denied_beta(&id, &["advisor-tool-2026-03-01".to_owned()])
+            .await
+            .unwrap();
+
+        let saved = store.persistence.current.lock().unwrap().clone();
+        assert_eq!(
+            saved.denied_beta.get("advisor-tool-2026-03-01").unwrap(),
+            &format_rfc3339(NOW),
+            "確認した時刻を一緒に残す"
+        );
+        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 1);
+    }
+
+    /// 覚えることが無ければ書かない (無駄な書き込みで競合を増やさない)。
+    #[tokio::test]
+    async fn recording_nothing_does_not_write() {
+        let store = store_with(cred(&at(3600)));
+        store
+            .record_denied_beta(&CredentialId::new("c"), &[])
+            .await
+            .unwrap();
+        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
+    }
+
+    /// 取り出した認証情報には、期限内の拒否リストだけが乗る。
+    #[tokio::test]
+    async fn acquire_carries_live_denials_only() {
+        let mut c = cred(&at(3600));
+        c.record_denied_beta(&["fresh".to_owned()], NOW - 3600);
+        c.record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
+
+        let store = store_with(c);
+        let got = store.acquire(&CredentialId::new("c")).await.unwrap();
+
+        assert!(got.denied_beta.contains("fresh"));
+        assert!(!got.denied_beta.contains("old"), "期限切れは試してみる側");
     }
 
     /// 同時に来た要求が更新を重ねない。
@@ -513,13 +544,14 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 1);
 
         let saved = store.persistence.current.lock().unwrap().clone();
-        assert_eq!(saved.access_token, "at-1");
+        assert_eq!(saved.payload.secret(), "at-1");
         assert_eq!(
-            saved.refresh_token, "rt-1",
+            saved.payload.refresh_token(),
+            Some("rt-1"),
             "入れ替わった refresh token を保存する"
         );
         assert_eq!(
-            saved.expired,
+            saved.payload.expired(),
             format_rfc3339(NOW + 28_800),
             "期限は expires_in から引き直す"
         );

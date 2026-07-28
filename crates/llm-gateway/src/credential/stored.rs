@@ -1,18 +1,32 @@
 //! 保存される認証情報の形。
 //!
-//! cpa の auth JSON と同じ項目を持つ。移行期に cpa と同じファイルを
-//! 読み書きできるようにしておくと、片方ずつ切り替えて様子を見られる。
-//! 知らない項目は捨てずに持ち回る (cpa が書いた値を消してしまわないため)。
+//! 2 層に分ける。**トップ**は人が触ってよい層 — 運用の設定 (`priority` /
+//! `disabled` / `excluded_models`) と、gateway が観測して書き戻した値
+//! (`last_refresh` / `denied_beta`)。**payload** はプロバイダが返した認証
+//! 情報そのままで、人が手で直すものではない。平坦に混ぜると、どれを直して
+//! よいのか読み手に区別が付かない。
+//!
+//! payload は `type` で判別する enum。「account_id は ChatGPT 経路だけが
+//! 要求する」「Bedrock は API キー認証なので refresh token が無い」といった
+//! 暗黙の約束を型で表す。平坦な 1 つの構造体に押し込むと、使わない項目を
+//! 空文字で埋めることになり、読み手も実装も「入っていないのが正しい」のか
+//! 「入れ忘れ」なのか区別できない。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap as _;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use zeroize::Zeroize;
 
-/// 認証情報の種別。cpa の `type` フィールドに対応する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+use super::time::{format_rfc3339, parse_rfc3339};
+
+/// login で認可を通せる種別。
+///
+/// 設定ファイルの `type` と保存ファイルの `type` は同じ語を使う。
+/// API キー認証 (`claude_bedrock`) や転送 (`relay`) は認可の流れを持たない
+/// ので、ここには無い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Anthropic のサブスク OAuth。
     Claude,
@@ -21,11 +35,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// 設定ファイルの `type` から引く。
-    ///
-    /// 保存側 (`claude` / `codex`) と設定側 (`claude_oauth` / `codex_oauth`) で
-    /// 語が違う。使う側に 2 通り覚えさせないよう、CLI の `--type` も設定側の語で
-    /// 受け、ここで対応づける。login を要さない種別 (bedrock / relay) は `None`。
+    /// `type` の語から引く。login を要さない種別 (bedrock / relay) は `None`。
     pub fn from_config_type(name: &str) -> Option<Self> {
         match name {
             "claude_oauth" => Some(Self::Claude),
@@ -43,27 +53,163 @@ impl Kind {
     }
 }
 
-/// ディスク上の認証情報。
+/// OAuth で受け取った認証情報。
 ///
 /// `access_token` / `refresh_token` は [`Drop`] で消す。ファイルから読んだ
 /// 時点でメモリに乗るのは避けられないので、せめて残さない。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredCredential {
-    #[serde(rename = "type")]
-    pub kind: Kind,
-
-    pub email: String,
-
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OauthTokens {
     pub access_token: String,
     pub refresh_token: String,
 
     /// access token の期限。RFC 3339。
+    #[serde(default)]
     pub expired: String,
 
-    /// 最後に更新した時刻。RFC 3339。
+    /// プロバイダが名乗ったアカウント。どの人格の認証情報か見分けるために持つ。
     #[serde(default)]
-    pub last_refresh: String,
+    pub email: String,
 
+    /// プロバイダが返したが gateway は解釈しない項目。読んだまま書き戻す。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Drop for OauthTokens {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
+/// ChatGPT の OAuth。
+///
+/// `account_id` は ChatGPT 経路だけが要求する。id_token の claim から拾うので、
+/// 返らないこともある。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexTokens {
+    #[serde(flatten)]
+    pub oauth: OauthTokens,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+/// API キー認証 (Bedrock)。
+///
+/// 更新の口が無いので refresh token を持たない。期限が切れたらキーを
+/// 発行し直す以外に手が無く、gateway 側で回復できない。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApiKey {
+    pub api_key: String,
+
+    /// キーの期限。RFC 3339。期限を持たないキーもあるので省略できる。
+    #[serde(default)]
+    pub expired: String,
+
+    /// プロバイダが返したが gateway は解釈しない項目。読んだまま書き戻す。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl Drop for ApiKey {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
+}
+
+/// プロバイダから受け取った認証情報。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum Payload {
+    ClaudeOauth(OauthTokens),
+    CodexOauth(CodexTokens),
+    ClaudeBedrock(ApiKey),
+}
+
+impl Payload {
+    /// 保存ファイルに書く `type`。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeOauth(_) => "claude_oauth",
+            Self::CodexOauth(_) => "codex_oauth",
+            Self::ClaudeBedrock(_) => "claude_bedrock",
+        }
+    }
+
+    /// 更新に使える OAuth の種別。API キー認証は `None`。
+    pub fn oauth_kind(&self) -> Option<Kind> {
+        match self {
+            Self::ClaudeOauth(_) => Some(Kind::Claude),
+            Self::CodexOauth(_) => Some(Kind::Codex),
+            Self::ClaudeBedrock(_) => None,
+        }
+    }
+
+    /// upstream に載せる秘密。方式 (Bearer / x-api-key) は provider が決める。
+    pub fn secret(&self) -> &str {
+        match self {
+            Self::ClaudeOauth(t) => &t.access_token,
+            Self::CodexOauth(c) => &c.oauth.access_token,
+            Self::ClaudeBedrock(k) => &k.api_key,
+        }
+    }
+
+    /// 秘密の期限。RFC 3339。
+    pub fn expired(&self) -> &str {
+        match self {
+            Self::ClaudeOauth(t) => &t.expired,
+            Self::CodexOauth(c) => &c.oauth.expired,
+            Self::ClaudeBedrock(k) => &k.expired,
+        }
+    }
+
+    /// 更新した token を書き戻す先。API キー認証は `None`。
+    pub fn oauth_tokens_mut(&mut self) -> Option<&mut OauthTokens> {
+        match self {
+            Self::ClaudeOauth(t) => Some(t),
+            Self::CodexOauth(c) => Some(&mut c.oauth),
+            Self::ClaudeBedrock(_) => None,
+        }
+    }
+
+    /// 更新に使う refresh token。持たない種別は `None`。
+    pub fn refresh_token(&self) -> Option<&str> {
+        match self {
+            Self::ClaudeOauth(t) => Some(&t.refresh_token),
+            Self::CodexOauth(c) => Some(&c.oauth.refresh_token),
+            Self::ClaudeBedrock(_) => None,
+        }
+    }
+
+    /// プロバイダが名乗ったアカウント。分からなければ空。
+    pub fn email(&self) -> &str {
+        match self {
+            Self::ClaudeOauth(t) => &t.email,
+            Self::CodexOauth(c) => &c.oauth.email,
+            Self::ClaudeBedrock(_) => "",
+        }
+    }
+
+    /// ChatGPT 経路が要求するアカウント識別子。
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::CodexOauth(c) => c.account_id.as_deref(),
+            Self::ClaudeOauth(_) | Self::ClaudeBedrock(_) => None,
+        }
+    }
+}
+
+/// ディスク上の認証情報。
+///
+/// serde の派生では `type` と `payload` が隣り合ってしまう (adjacently tagged
+/// enum を flatten するため) ので、書き出しだけ手で並べる。読み手が先に見たい
+/// のは触ってよい層で、payload は最後でよい。
+///
+/// Design rationale: 書き出しを手で並べる代わり、読み込みは派生のままにして
+/// ある。両方手で書くと二重管理になるので、往復とキーの並びを試験で押さえる。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredCredential {
     /// 小さいほど先に選ばれる。
     #[serde(default)]
     pub priority: i32,
@@ -73,19 +219,67 @@ pub struct StoredCredential {
     pub disabled: bool,
 
     /// この認証情報で扱わないモデル。`claude-opus-*` のような後方ワイルドカードが書ける。
-    #[serde(default, rename = "excluded-models")]
+    #[serde(default)]
     pub excluded_models: Vec<String>,
 
-    /// ChatGPT 経路が要求するアカウント識別子。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
+    /// 最後に更新した時刻。RFC 3339。
+    #[serde(default)]
+    pub last_refresh: String,
 
-    /// cpa が書くが gateway は解釈しない項目。読んだまま書き戻す。
+    /// 拒否された beta フラグを再び試すまでの間隔 (ミリ秒)。
+    #[serde(default = "default_denied_beta_expires_ms")]
+    pub denied_beta_expires_ms: u64,
+
+    /// upstream が拒否した beta フラグ → 最後に確認した時刻 (RFC 3339)。
+    ///
+    /// 期限切れの記録は消さずに残す。「試してよい」状態として扱うので害は
+    /// 無く、消しに行くと成功のたびに書き込みが要る (DR-0003)。
+    #[serde(default)]
+    pub denied_beta: BTreeMap<String, String>,
+
+    /// プロバイダから受け取った認証情報。
     #[serde(flatten)]
-    pub extra: BTreeMap<String, Value>,
+    pub payload: Payload,
+}
+
+/// 24 時間。upstream が対応したときに、その日のうちには拾い直せる長さ。
+fn default_denied_beta_expires_ms() -> u64 {
+    86_400_000
+}
+
+impl Serialize for StoredCredential {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", self.payload.type_name())?;
+        map.serialize_entry("priority", &self.priority)?;
+        map.serialize_entry("disabled", &self.disabled)?;
+        map.serialize_entry("excluded_models", &self.excluded_models)?;
+        map.serialize_entry("last_refresh", &self.last_refresh)?;
+        map.serialize_entry("denied_beta_expires_ms", &self.denied_beta_expires_ms)?;
+        map.serialize_entry("denied_beta", &self.denied_beta)?;
+        match &self.payload {
+            Payload::ClaudeOauth(p) => map.serialize_entry("payload", p)?,
+            Payload::CodexOauth(p) => map.serialize_entry("payload", p)?,
+            Payload::ClaudeBedrock(p) => map.serialize_entry("payload", p)?,
+        }
+        map.end()
+    }
 }
 
 impl StoredCredential {
+    /// 運用の設定を既定にして作る。初めての login で使う。
+    pub fn new(payload: Payload) -> Self {
+        Self {
+            priority: 0,
+            disabled: false,
+            excluded_models: Vec::new(),
+            last_refresh: String::new(),
+            denied_beta_expires_ms: default_denied_beta_expires_ms(),
+            denied_beta: BTreeMap::new(),
+            payload,
+        }
+    }
+
     /// このモデルをこの認証情報で扱ってよいか。
     pub fn accepts_model(&self, model: &str) -> bool {
         !self
@@ -93,16 +287,43 @@ impl StoredCredential {
             .iter()
             .any(|pat| matches_pattern(pat, model))
     }
-}
 
-impl Drop for StoredCredential {
-    fn drop(&mut self) {
-        self.access_token.zeroize();
-        self.refresh_token.zeroize();
+    /// この beta フラグを今回は落とすか (DR-0003)。
+    ///
+    /// 記録が無ければ通す。あっても `denied_beta_expires_ms` を過ぎていれば
+    /// 通してみる — upstream が対応していれば、そのまま使えるようになる。
+    /// 時刻が読めない記録も通す側に倒す。「いつ試したか分からない」ものを
+    /// 落とし続けると、書き損じ 1 つで機能が永久に消える。
+    pub fn denies_beta(&self, flag: &str, now_unix: i64) -> bool {
+        let Some(seen) = self.denied_beta.get(flag).map(String::as_str) else {
+            return false;
+        };
+        let Some(seen) = parse_rfc3339(seen) else {
+            return false;
+        };
+        let elapsed_ms = now_unix.saturating_sub(seen).saturating_mul(1000);
+        elapsed_ms < i64::try_from(self.denied_beta_expires_ms).unwrap_or(i64::MAX)
+    }
+
+    /// 今この時点で落とす beta フラグ。
+    pub fn denied_beta_at(&self, now_unix: i64) -> BTreeSet<String> {
+        self.denied_beta
+            .keys()
+            .filter(|flag| self.denies_beta(flag, now_unix))
+            .cloned()
+            .collect()
+    }
+
+    /// 拒否されたフラグと、確認した時刻を覚える。
+    pub fn record_denied_beta(&mut self, flags: &[String], now_unix: i64) {
+        let now = format_rfc3339(now_unix);
+        for flag in flags {
+            self.denied_beta.insert(flag.clone(), now.clone());
+        }
     }
 }
 
-/// cpa の除外パターン。`*` は 1 個まで、前方・後方・両端のいずれかに置く。
+/// 除外パターン。`*` は 1 個まで、前方・後方・両端のいずれかに置く。
 fn matches_pattern(pattern: &str, model: &str) -> bool {
     match (pattern.strip_prefix('*'), pattern.strip_suffix('*')) {
         (Some(_), Some(_)) => {
@@ -119,20 +340,37 @@ fn matches_pattern(pattern: &str, model: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn sample(excluded: &[&str]) -> StoredCredential {
-        StoredCredential {
-            kind: Kind::Claude,
-            email: "someone@example.com".into(),
-            access_token: "at".into(),
+    /// 2026-07-27T19:00:00Z
+    const NOW: i64 = 1_785_178_800;
+    const DAY_MS: u64 = 86_400_000;
+
+    fn oauth(access_token: &str) -> OauthTokens {
+        oauth_with(access_token, BTreeMap::new())
+    }
+
+    fn oauth_with(access_token: &str, extra: BTreeMap<String, Value>) -> OauthTokens {
+        OauthTokens {
+            access_token: access_token.into(),
             refresh_token: "rt".into(),
             expired: "2026-07-28T02:54:00+09:00".into(),
-            last_refresh: "2026-07-27T18:54:00+09:00".into(),
-            priority: 10,
-            disabled: false,
-            excluded_models: excluded.iter().map(|s| (*s).to_owned()).collect(),
-            account_id: None,
-            extra: BTreeMap::new(),
+            email: "someone@example.com".into(),
+            extra,
         }
+    }
+
+    fn api_key(extra: BTreeMap<String, Value>) -> ApiKey {
+        ApiKey {
+            api_key: "ak".into(),
+            expired: "2026-08-02T10:08:18+09:00".into(),
+            extra,
+        }
+    }
+
+    fn sample(excluded: &[&str]) -> StoredCredential {
+        let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
+        c.priority = 10;
+        c.excluded_models = excluded.iter().map(|s| (*s).to_owned()).collect();
+        c
     }
 
     #[test]
@@ -147,7 +385,7 @@ mod tests {
         assert!(c.accepts_model("claude-sonnet-5"));
     }
 
-    /// cpa の設定で実際に使われている形 (`claude-opus-*` など)。
+    /// 実運用の設定で使われている形 (`claude-opus-*` など)。
     #[test]
     fn trailing_wildcard() {
         let c = sample(&["claude-opus-*"]);
@@ -170,7 +408,7 @@ mod tests {
         assert!(c.accepts_model("claude-opus-5"));
     }
 
-    /// 実運用の auth JSON にある形 (fable 専用アカウントの除外リスト)。
+    /// 実運用の除外リスト (fable 専用アカウント)。
     #[test]
     fn realistic_exclusion_set() {
         let c = sample(&[
@@ -187,44 +425,246 @@ mod tests {
         assert!(!c.accepts_model("claude-haiku-4-5-20251001"));
     }
 
-    /// cpa 形式をそのまま読める。知らない項目は保持する。
+    /// 保存する形。触ってよい層が先、payload が最後。
     #[test]
-    fn reads_cpa_json_and_keeps_unknown_fields() {
+    fn writes_the_documented_shape() {
+        let mut c = sample(&["claude-opus-*"]);
+        c.last_refresh = "2026-07-27T18:54:00+09:00".into();
+        c.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
+
+        let json = serde_json::to_string_pretty(&c).unwrap();
+        let written: serde_json::Map<String, Value> = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = written.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "type",
+                "priority",
+                "disabled",
+                "excluded_models",
+                "last_refresh",
+                "denied_beta_expires_ms",
+                "denied_beta",
+                "payload",
+            ],
+            "並びごと固定する:\n{json}"
+        );
+
+        let v: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "claude_oauth");
+        assert_eq!(v["excluded_models"][0], "claude-opus-*", "ハイフンでない");
+        assert_eq!(v["denied_beta_expires_ms"], 86_400_000);
+        assert_eq!(
+            v["denied_beta"]["advisor-tool-2026-03-01"],
+            format_rfc3339(NOW)
+        );
+        assert_eq!(v["payload"]["access_token"], "at");
+        assert_eq!(v["payload"]["email"], "someone@example.com");
+        assert!(
+            v["payload"].get("account_id").is_none(),
+            "claude 側は account_id を持たない: {json}"
+        );
+    }
+
+    /// 書いたものを読み直して同じになる (往復で欠けない)。
+    #[test]
+    fn round_trips_every_variant() {
+        let mut extra = BTreeMap::new();
+        extra.insert("id_token".to_owned(), Value::String("jwt".to_owned()));
+
+        let payloads = [
+            Payload::ClaudeOauth(oauth_with("at", extra.clone())),
+            Payload::CodexOauth(CodexTokens {
+                oauth: oauth("at"),
+                account_id: Some("acc-1".to_owned()),
+            }),
+            Payload::ClaudeBedrock(api_key(extra)),
+        ];
+
+        for payload in payloads {
+            let mut before = StoredCredential::new(payload);
+            before.priority = 7;
+            before.disabled = true;
+            before.excluded_models = vec!["claude-haiku-*".to_owned()];
+            before.last_refresh = "2026-07-27T18:54:00+09:00".into();
+            before.denied_beta_expires_ms = 3_600_000;
+            before.record_denied_beta(&["oauth-2025-04-20".to_owned()], NOW);
+
+            let json = serde_json::to_string(&before).unwrap();
+            let after: StoredCredential = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(serde_json::to_string(&after).unwrap(), json, "{json}");
+            assert_eq!(after.payload.type_name(), before.payload.type_name());
+            assert_eq!(after.payload.secret(), before.payload.secret());
+            assert_eq!(after.payload.account_id(), before.payload.account_id());
+            assert_eq!(after.denied_beta_expires_ms, 3_600_000);
+        }
+    }
+
+    /// 種別ごとに持てる項目が違う。
+    #[test]
+    fn payload_shape_differs_by_type() {
+        let claude = Payload::ClaudeOauth(oauth("at"));
+        assert_eq!(claude.oauth_kind(), Some(Kind::Claude));
+        assert_eq!(claude.refresh_token(), Some("rt"));
+        assert_eq!(claude.account_id(), None, "claude に account_id は無い");
+
+        let codex = Payload::CodexOauth(CodexTokens {
+            oauth: oauth("at"),
+            account_id: Some("acc-1".to_owned()),
+        });
+        assert_eq!(codex.oauth_kind(), Some(Kind::Codex));
+        assert_eq!(codex.account_id(), Some("acc-1"));
+
+        let bedrock = Payload::ClaudeBedrock(api_key(BTreeMap::new()));
+        assert_eq!(bedrock.oauth_kind(), None, "更新の口が無い");
+        assert_eq!(
+            bedrock.refresh_token(),
+            None,
+            "OAuth ではないので refresh token を持たない"
+        );
+        assert_eq!(bedrock.secret(), "ak");
+        assert_eq!(bedrock.email(), "");
+    }
+
+    /// 書き出す `type` は設定ファイルの語と同じ。
+    ///
+    /// 保存側と設定側で語が違うと、`login` の案内文をそのまま config.toml に
+    /// 貼れなくなる。
+    #[test]
+    fn type_name_matches_config_type() {
+        let claude = Payload::ClaudeOauth(oauth("at"));
+        assert_eq!(claude.type_name(), Kind::Claude.config_type());
+
+        let codex = Payload::CodexOauth(CodexTokens {
+            oauth: oauth("at"),
+            account_id: None,
+        });
+        assert_eq!(codex.type_name(), Kind::Codex.config_type());
+
+        let bedrock = Payload::ClaudeBedrock(api_key(BTreeMap::new()));
+        assert_eq!(bedrock.type_name(), "claude_bedrock");
+    }
+
+    /// 運用の設定は省略できる。payload は省略できない。
+    #[test]
+    fn operational_fields_may_be_absent() {
+        let raw = r#"{
+            "type": "claude_oauth",
+            "payload": {"access_token": "at", "refresh_token": "rt"}
+        }"#;
+        let c: StoredCredential = serde_json::from_str(raw).unwrap();
+        assert_eq!(c.priority, 0);
+        assert!(!c.disabled);
+        assert!(c.excluded_models.is_empty());
+        assert!(c.denied_beta.is_empty());
+        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "既定は 24 時間");
+
+        let err = serde_json::from_str::<StoredCredential>(r#"{"type": "claude_oauth"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("payload"), "{err}");
+    }
+
+    /// 旧形式 (平坦・cpa 互換) は読まない。
+    ///
+    /// 読めてしまうと、どちらの形で保存されているのか分からないまま
+    /// 両方を持ち回ることになる。login で取り直せるので断る (GW-Q3)。
+    #[test]
+    fn flat_legacy_format_is_refused() {
         let raw = r#"{
             "type": "claude",
             "email": "someone@example.com",
             "access_token": "at",
             "refresh_token": "rt",
             "expired": "2026-07-28T02:54:00+09:00",
-            "last_refresh": "2026-07-27T18:54:00+09:00",
-            "priority": 10,
-            "disabled": false,
-            "id_token": ""
+            "excluded-models": ["claude-opus-*"]
         }"#;
-        let c: StoredCredential = serde_json::from_str(raw).unwrap();
-        assert_eq!(c.kind, Kind::Claude);
-        assert_eq!(c.priority, 10);
-        assert!(c.extra.contains_key("id_token"), "未知の項目を捨てない");
-
-        let back = serde_json::to_value(&c).unwrap();
-        assert_eq!(back.get("id_token").and_then(Value::as_str), Some(""));
-        assert_eq!(back.get("type").and_then(Value::as_str), Some("claude"));
+        let err = serde_json::from_str::<StoredCredential>(raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("claude_oauth"), "指定できる語を示す: {err}");
     }
 
-    /// codex 形式は account_id を持つ。
+    fn with_denied(flag: &str, at: i64, expires_ms: u64) -> StoredCredential {
+        let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
+        c.denied_beta_expires_ms = expires_ms;
+        c.record_denied_beta(&[flag.to_owned()], at);
+        c
+    }
+
+    /// 記録が無いフラグは通す。
     #[test]
-    fn reads_codex_json() {
-        let raw = r#"{
-            "type": "codex",
-            "email": "someone@example.com",
-            "access_token": "at",
-            "refresh_token": "rt",
-            "account_id": "acc-1",
-            "expired": "2026-08-02T10:08:18+09:00"
-        }"#;
-        let c: StoredCredential = serde_json::from_str(raw).unwrap();
-        assert_eq!(c.kind, Kind::Codex);
-        assert_eq!(c.account_id.as_deref(), Some("acc-1"));
+    fn unknown_flag_is_sent() {
+        let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
+        assert!(!c.denies_beta("context-management-2025-06-27", NOW));
+    }
+
+    /// 期限内の記録は落とす。
+    #[test]
+    fn recently_denied_flag_is_dropped() {
+        let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
+        assert!(c.denies_beta("advisor-tool-2026-03-01", NOW));
+        assert!(c.denies_beta("advisor-tool-2026-03-01", NOW + 3600));
+    }
+
+    /// 期限が切れたら試す (upstream が対応していれば戻る)。
+    #[test]
+    fn expired_denial_is_retried() {
+        let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
+        assert!(
+            c.denies_beta("advisor-tool-2026-03-01", NOW + 86_399),
+            "24 時間未満はまだ落とす"
+        );
+        assert!(
+            !c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400),
+            "24 時間経ったら試す"
+        );
+        assert!(!c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400 * 30));
+    }
+
+    /// 間隔は credential ごとに変えられる。
+    #[test]
+    fn interval_is_configurable() {
+        let c = with_denied("f", NOW, 3_600_000);
+        assert!(c.denies_beta("f", NOW + 3599));
+        assert!(!c.denies_beta("f", NOW + 3600), "1 時間で試し直す");
+
+        let never = with_denied("f", NOW, 0);
+        assert!(!never.denies_beta("f", NOW), "0 なら毎回試す");
+    }
+
+    /// 時刻が読めない記録は落とさない (書き損じで機能を永久に失わない)。
+    #[test]
+    fn unreadable_timestamp_is_retried() {
+        let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
+        c.denied_beta.insert("f".to_owned(), "きのう".to_owned());
+        assert!(!c.denies_beta("f", NOW));
+    }
+
+    /// 落とす一覧は、期限内のものだけになる。
+    #[test]
+    fn denied_set_holds_only_live_records() {
+        let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
+        c.record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
+        c.record_denied_beta(&["fresh".to_owned()], NOW);
+
+        let denied = c.denied_beta_at(NOW);
+        assert_eq!(denied, BTreeSet::from(["fresh".to_owned()]));
+        assert!(
+            c.denied_beta.contains_key("old"),
+            "期限切れの記録自体は消さない"
+        );
+    }
+
+    /// 同じフラグを再び拒否されたら、時刻だけ進む。
+    #[test]
+    fn re_denial_updates_the_timestamp() {
+        let mut c = with_denied("f", NOW, DAY_MS);
+        c.record_denied_beta(&["f".to_owned()], NOW + 86_400 * 3);
+
+        assert_eq!(c.denied_beta.len(), 1, "重複して増えない");
+        assert!(c.denies_beta("f", NOW + 86_400 * 3));
     }
 
     /// 設定側の語から種別を引ける。login できない種別は弾く。
@@ -243,21 +683,5 @@ mod tests {
         for kind in [Kind::Claude, Kind::Codex] {
             assert_eq!(Kind::from_config_type(kind.config_type()), Some(kind));
         }
-    }
-
-    /// 省略可能な項目が無くても読める。
-    #[test]
-    fn optional_fields_may_be_absent() {
-        let raw = r#"{
-            "type": "claude",
-            "email": "a@b.c",
-            "access_token": "at",
-            "refresh_token": "rt",
-            "expired": "2026-07-28T02:54:00+09:00"
-        }"#;
-        let c: StoredCredential = serde_json::from_str(raw).unwrap();
-        assert_eq!(c.priority, 0);
-        assert!(!c.disabled);
-        assert!(c.excluded_models.is_empty());
     }
 }

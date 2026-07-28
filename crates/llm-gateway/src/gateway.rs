@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::backend::anthropic::{Headers, forward, model_of};
+use crate::backend::anthropic::{Headers, beta, forward, model_of};
 use crate::config::{Config, Namespace};
 use crate::credential::{CredentialStore, Persistence};
 use crate::error::UpstreamAttempt;
@@ -154,61 +154,135 @@ impl<P: Persistence> Gateway<P> {
             None => None,
         };
 
-        let resp = forward::send(
+        // upstream の既定に、この認証情報で拒否されたと分かっている分を足す。
+        // 同じ upstream でも region や契約で受け付ける beta が違うので、
+        // 学習結果は認証情報ごとに持つ (DR-0003)。
+        let mut policy = route.provider.beta_policy();
+        if let Some(c) = &credential {
+            policy.deny_all(c.denied_beta.iter().cloned());
+        }
+
+        let mut sending = Headers::new(headers.to_vec());
+        let sent = policy.apply_to(&mut sending);
+
+        let resp = self
+            .send(route, credential.as_ref(), path, query, body, sending)
+            .await?;
+
+        // beta を載せていないなら、400 の原因は他にある。
+        if resp.status != 400 || sent.is_empty() {
+            return accept_or_switch(resp);
+        }
+
+        let (resp, raw) = forward::buffer(resp).await.map_err(|e| e.to_string())?;
+        let raw = String::from_utf8_lossy(&raw);
+        if !beta::is_invalid_beta_error(&raw) {
+            return accept_or_switch(resp);
+        }
+
+        let blamed = beta::blamed_flags(&raw, &sent);
+        warn!(
+            route = route.name(),
+            flags = ?blamed,
+            "beta フラグが拒否されました。落として送り直します"
+        );
+        if let Some(id) = &route.credential
+            && let Err(e) = self.credentials.record_denied_beta(id, &blamed).await
+        {
+            // 覚えられなくても転送は続ける。次も同じ 400 を 1 回踏むだけで、
+            // ここで諦めるとクライアントには何も返らない。
+            warn!(credential = %id, %e, "拒否された beta フラグを保存できません");
+        }
+
+        policy.deny_all(blamed);
+        let mut retrying = Headers::new(headers.to_vec());
+        policy.apply_to(&mut retrying);
+
+        // 送り直すのは 1 回だけ。これでも 400 ならクライアントへ返す。
+        let resp = self
+            .send(route, credential.as_ref(), path, query, body, retrying)
+            .await?;
+        accept_or_switch(resp)
+    }
+
+    async fn send(
+        &self,
+        route: &Arc<Route>,
+        credential: Option<&crate::credential::Credential>,
+        path: &str,
+        query: Option<&str>,
+        body: &Value,
+        headers: Headers,
+    ) -> std::result::Result<forward::Response, String> {
+        forward::send(
             &self.http,
             route.provider.as_ref(),
-            credential.as_ref(),
+            credential,
             path,
             query,
             body.clone(),
-            Headers::new(headers.to_vec()),
+            headers,
         )
         .await
-        .map_err(|e| e.to_string())?;
-
-        if forward::should_try_next(resp.status) {
-            return Err(format!("upstream が {} を返しました", resp.status));
-        }
-
-        Ok(resp)
+        .map_err(|e| e.to_string())
     }
+}
+
+/// この応答をクライアントへ返すか、別の経路を試すか。
+fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Response, String> {
+    if forward::should_try_next(resp.status) {
+        return Err(format!("upstream が {} を返しました", resp.status));
+    }
+    Ok(resp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::{CredentialId, Kind, StoredCredential};
+    use crate::credential::stored::{OauthTokens, Payload};
+    use crate::credential::time::{format_rfc3339, now_unix};
+    use crate::credential::{CredentialId, StoredCredential};
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 何度目の要求かで応答を変えられる試験用 upstream。
+    ///
+    /// 受け取った要求も覚えておく。何を送ったか (どのヘッダが載っていたか) を
+    /// 確かめないと、落としたつもりで載せたままの取り違えに気づけない。
     struct FakeUpstream {
         url: String,
         hits: Arc<AtomicUsize>,
+        requests: Arc<StdMutex<Vec<String>>>,
     }
+
+    /// discovery の問い合わせに返す一覧。転送の試験と混ぜない。
+    const MODELS: &str = r#"{"data":[{"id":"m","created_at":"2026-07-24T00:00:00Z"}]}"#;
 
     impl FakeUpstream {
         /// `status` を返し続ける。
         async fn always(status: u16) -> Self {
-            Self::start(move |_| (status, body_for(status))).await
+            Self::start(move |_, _| (status, body_for(status))).await
         }
 
         /// 最初の 1 回だけ `first`、以降 `rest`。
         async fn then(first: u16, rest: u16) -> Self {
-            Self::start(move |n| {
+            Self::start(move |n, _| {
                 let s = if n == 1 { first } else { rest };
                 (s, body_for(s))
             })
             .await
         }
 
-        async fn start(respond: impl Fn(usize) -> (u16, String) + Send + Sync + 'static) -> Self {
+        async fn start(
+            respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(StdMutex::new(Vec::new()));
             let counter = Arc::clone(&hits);
+            let seen = Arc::clone(&requests);
             let respond = Arc::new(respond);
 
             tokio::spawn(async move {
@@ -217,13 +291,24 @@ mod tests {
                         return;
                     };
                     let counter = Arc::clone(&counter);
+                    let seen = Arc::clone(&seen);
                     let respond = Arc::clone(&respond);
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
                         let mut buf = vec![0u8; 65536];
-                        let _ = sock.read(&mut buf).await;
-                        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                        let (status, body) = respond(n);
+                        let read = sock.read(&mut buf).await.unwrap_or(0);
+                        let req = String::from_utf8_lossy(&buf[..read]).into_owned();
+
+                        // 一覧の問い合わせは数に入れない (転送だけ数える)。
+                        let (status, body) = if req.starts_with("GET /v1/models") {
+                            (200, MODELS.to_owned())
+                        } else {
+                            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            let answer = respond(n, &req);
+                            seen.lock().unwrap().push(req);
+                            answer
+                        };
+
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
 content-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -238,11 +323,17 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Self {
                 url: format!("http://{addr}"),
                 hits,
+                requests,
             }
         }
 
         fn hits(&self) -> usize {
             self.hits.load(Ordering::SeqCst)
+        }
+
+        /// 受け取った要求 (ヘッダを含む生のまま)。
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -254,33 +345,42 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         }
     }
 
-    /// 常に有効な認証情報を返す置き場。
-    struct StaticStore(StdMutex<StoredCredential>);
+    /// 常に有効な認証情報を返す置き場。保存された内容は覚えておく。
+    #[derive(Clone)]
+    struct StaticStore(Arc<StdMutex<StoredCredential>>);
 
     impl StaticStore {
         fn new() -> Self {
-            Self(StdMutex::new(StoredCredential {
-                kind: Kind::Claude,
-                email: "a@b.c".into(),
-                access_token: "tok".into(),
-                refresh_token: "rt".into(),
-                // 十分先。更新に入らせない。
-                expired: "2099-01-01T00:00:00Z".into(),
-                last_refresh: String::new(),
-                priority: 0,
-                disabled: false,
-                excluded_models: vec![],
-                account_id: None,
-                extra: BTreeMap::new(),
-            }))
+            Self::holding(valid_credential())
         }
+
+        fn holding(c: StoredCredential) -> Self {
+            Self(Arc::new(StdMutex::new(c)))
+        }
+
+        /// 最後に保存された内容。
+        fn saved(&self) -> StoredCredential {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn valid_credential() -> StoredCredential {
+        StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
+            access_token: "tok".into(),
+            refresh_token: "rt".into(),
+            // 十分先。更新に入らせない。
+            expired: "2099-01-01T00:00:00Z".into(),
+            email: "a@b.c".into(),
+            extra: Default::default(),
+        }))
     }
 
     impl Persistence for StaticStore {
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
             Ok(self.0.lock().unwrap().clone())
         }
-        fn store(&self, _id: &CredentialId, _v: &StoredCredential) -> Result<()> {
+        fn store(&self, _id: &CredentialId, v: &StoredCredential) -> Result<()> {
+            *self.0.lock().unwrap() = v.clone();
             Ok(())
         }
         fn list(&self) -> Result<Vec<CredentialId>> {
@@ -292,10 +392,15 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     ///
     /// 試験では relay 型を使う。upstream に一覧を聞きに行かず、設定に
     /// 書いたモデルをそのまま扱うので、偽の upstream 1 つで完結する。
+    /// 認証情報が要る経路を試すときだけ `claude_oauth` を使う。
     async fn gateway(config_toml: &str) -> Gateway<StaticStore> {
+        gateway_with(config_toml, StaticStore::new()).await
+    }
+
+    async fn gateway_with(config_toml: &str, store: StaticStore) -> Gateway<StaticStore> {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
-        let gw = Gateway::new(&config, StaticStore::new()).unwrap();
+        let gw = Gateway::new(&config, store).unwrap();
         gw.refresh_models().await;
         gw
     }
@@ -676,6 +781,227 @@ opus = "claude-opus-*"
             .await
             .unwrap_err();
         assert!(err.to_string().contains("claude-opus-4-8"), "{err}");
+    }
+
+    /// Claude Code 2.1.220 が実際に送る beta の束。
+    const CLIENT_BETA: &str = "oauth-2025-04-20,claude-code-20250219,\
+advisor-tool-2026-03-01";
+
+    fn beta_header() -> Vec<(String, String)> {
+        vec![("anthropic-beta".to_owned(), CLIENT_BETA.to_owned())]
+    }
+
+    /// 認証情報を要する経路 1 本だけの設定。
+    fn oauth_config(url: &str) -> String {
+        format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{url}"
+
+[[routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        )
+    }
+
+    /// beta が原因の 400 は、フラグを落として 1 回だけ送り直す (DR-0003)。
+    ///
+    /// 拒否された顔ぶれは認証情報に書き戻す。覚えないと毎回 400 を踏む。
+    #[tokio::test]
+    async fn rejected_beta_is_dropped_learned_and_retried() {
+        let up = FakeUpstream::start(|n, _| match n {
+            1 => (
+                400,
+                r#"{"type":"error","error":{"message":"invalid beta flag"}}"#.to_owned(),
+            ),
+            _ => (200, body_for(200)),
+        })
+        .await;
+        let store = StaticStore::new();
+        let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
+
+        let resp = gw
+            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200, "落として送り直した結果が返る");
+        assert_eq!(up.hits(), 2, "送り直すのは 1 回だけ");
+
+        let sent = up.requests();
+        assert!(
+            sent[0].contains("anthropic-beta"),
+            "1 本目はそのまま送る: {}",
+            sent[0]
+        );
+        assert!(
+            !sent[1].to_lowercase().contains("anthropic-beta"),
+            "2 本目は落として送る: {}",
+            sent[1]
+        );
+
+        let learned = store.saved();
+        for flag in CLIENT_BETA.split(',') {
+            assert!(
+                learned.denied_beta.contains_key(flag),
+                "名前が分からないので送った分を覚える: {:?}",
+                learned.denied_beta
+            );
+        }
+
+        // 覚えた分は、同じ工程の次の転送から効く (毎回 400 を踏まない)。
+        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+        assert_eq!(up.hits(), 3, "2 度目は 1 本で済む");
+        assert!(
+            !up.requests()[2].to_lowercase().contains("anthropic-beta"),
+            "覚えた分を載せ直さない: {}",
+            up.requests()[2]
+        );
+    }
+
+    /// 覚えたフラグは、次から最初の 1 本目で落ちる。
+    #[tokio::test]
+    async fn learned_beta_is_dropped_before_sending() {
+        let up = FakeUpstream::always(200).await;
+        let mut known = valid_credential();
+        known.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], now_unix());
+        let store = StaticStore::holding(known);
+        let gw = gateway_with(&oauth_config(&up.url), store).await;
+
+        let resp = gw
+            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(up.hits(), 1, "400 を踏まずに済む");
+
+        let sent = &up.requests()[0];
+        assert!(
+            sent.contains("oauth-2025-04-20") && sent.contains("claude-code-20250219"),
+            "拒否されていない分は残す: {sent}"
+        );
+        assert!(
+            !sent.contains("advisor-tool-2026-03-01"),
+            "覚えた分だけ落とす: {sent}"
+        );
+    }
+
+    /// 記録の期限が切れていたら、また試してみる。
+    ///
+    /// upstream が対応したときに戻れないと、新機能を取りこぼし続ける。
+    #[tokio::test]
+    async fn expired_denial_is_tried_again() {
+        let up = FakeUpstream::always(200).await;
+        let mut stale = valid_credential();
+        stale.record_denied_beta(
+            &["advisor-tool-2026-03-01".to_owned()],
+            now_unix() - 86_400 * 2,
+        );
+        let store = StaticStore::holding(stale);
+        let gw = gateway_with(&oauth_config(&up.url), store).await;
+
+        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert!(
+            up.requests()[0].contains("advisor-tool-2026-03-01"),
+            "24 時間経ったものは通してみる: {}",
+            up.requests()[0]
+        );
+    }
+
+    /// beta と関係ない 400 は、そのままクライアントへ返す。
+    #[tokio::test]
+    async fn unrelated_client_error_is_not_retried() {
+        let up = FakeUpstream::always(400).await;
+        let store = StaticStore::new();
+        let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
+
+        let resp = gw
+            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 400);
+        assert!(
+            body_text(resp).await.contains("status 400"),
+            "本文を読んだ後もそのまま返す"
+        );
+        assert_eq!(up.hits(), 1, "送り直さない");
+        assert!(
+            store.saved().denied_beta.is_empty(),
+            "beta のせいでないなら覚えない"
+        );
+    }
+
+    /// 名指しされた場合は、そのフラグだけを覚える。
+    #[tokio::test]
+    async fn only_the_named_flag_is_remembered() {
+        let up = FakeUpstream::start(|n, _| match n {
+            1 => (
+                400,
+                r#"{"error":{"message":"unsupported beta: advisor-tool-2026-03-01"}}"#.to_owned(),
+            ),
+            _ => (200, body_for(200)),
+        })
+        .await;
+        let store = StaticStore::new();
+        let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
+
+        let resp = gw
+            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+
+        let learned = store.saved();
+        assert_eq!(
+            learned.denied_beta.keys().collect::<Vec<_>>(),
+            vec!["advisor-tool-2026-03-01"],
+            "通るフラグを巻き添えにしない"
+        );
+        assert!(
+            up.requests()[1].contains("claude-code-20250219"),
+            "残りは載せたまま送り直す: {}",
+            up.requests()[1]
+        );
+    }
+
+    /// 覚えた時刻は書き戻したものが読み直せる (往復で欠けない)。
+    #[tokio::test]
+    async fn learned_denial_survives_a_round_trip() {
+        let up = FakeUpstream::start(|n, _| match n {
+            1 => (400, r#"{"error":"invalid beta flag"}"#.to_owned()),
+            _ => (200, body_for(200)),
+        })
+        .await;
+        let store = StaticStore::new();
+        let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
+
+        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        let json = serde_json::to_string(&store.saved()).unwrap();
+        let reloaded: StoredCredential = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            reloaded.denied_beta_at(now_unix()).len(),
+            3,
+            "読み直しても落とす対象のまま: {json}"
+        );
+        assert!(
+            reloaded
+                .denied_beta
+                .values()
+                .all(|t| t == &format_rfc3339(crate::credential::time::parse_rfc3339(t).unwrap())),
+            "時刻は RFC 3339 で書く: {json}"
+        );
     }
 
     /// 短い名前で指定できる。upstream には実際のモデル名で送る。

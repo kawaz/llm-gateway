@@ -19,6 +19,8 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{Error, Result};
 
+use super::stored::{CodexTokens, OauthTokens, Payload};
+use super::time::{format_rfc3339, now_unix};
 use super::{CredentialId, Kind, StoredCredential};
 
 /// Anthropic (Claude サブスク) の更新先。
@@ -176,6 +178,23 @@ pub struct AuthProfile {
     pub scope: &'static str,
     /// provider 固有の追加パラメータ。
     pub extra_params: &'static [(&'static str, &'static str)],
+    /// 認可コードを交換するときの body の形式。
+    ///
+    /// 更新 (`refresh`) は両者とも JSON で通るが、**交換は揃っていない**。
+    /// ChatGPT は form でないと 400 を返す (実測 2026-07-28)。
+    pub exchange_form: ExchangeForm,
+    /// 交換の body に `state` を載せるか。
+    ///
+    /// `state` は認可エンドポイント専用で token エンドポイントには定義が無い。
+    /// Anthropic は受け取るが、ChatGPT は載せると 400 を返す。
+    pub exchange_state: bool,
+}
+
+/// 認可コードの交換で送る body の形式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeForm {
+    Json,
+    UrlEncoded,
 }
 
 impl AuthProfile {
@@ -200,6 +219,8 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
             scope: "user:profile user:inference user:sessions:claude_code \
                     user:mcp_servers user:file_upload",
             extra_params: &[],
+            exchange_form: ExchangeForm::Json,
+            exchange_state: true,
         },
         Kind::Codex => AuthProfile {
             authorize_url: OPENAI_AUTHORIZE_URL,
@@ -220,6 +241,8 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
                 ("codex_cli_simplified_flow", "true"),
                 ("originator", "codex_cli_rs"),
             ],
+            exchange_form: ExchangeForm::UrlEncoded,
+            exchange_state: false,
         },
     }
 }
@@ -267,31 +290,17 @@ impl Authorization {
     }
 }
 
-/// 戻り先を待ち受けるアドレス。
-///
-/// 既定はループバックのみ。`LLM_GATEWAY_LOGIN_BIND` で上書きできる。
-///
-/// 手元のブラウザと gateway が別マシンにある時 (リモート作業) は
-/// ループバックに戻ってこられないので、tailnet のアドレスを指定して直接
-/// 受ける。`0.0.0.0` にすれば全インタフェースで待つが、認可コードを
-/// 受ける口を広く晒すことになるので、必要な 1 つに絞るのが望ましい。
-fn callback_bind_addr() -> String {
-    std::env::var("LLM_GATEWAY_LOGIN_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned())
-}
-
 /// 認可を始める。戻り先を開き、ブラウザで開く URL を組み立てる。
 pub async fn begin(kind: Kind) -> Result<Authorization> {
     let profile = auth_profile_for(kind);
-    let host = callback_bind_addr();
-    let listener = tokio::net::TcpListener::bind((host.as_str(), profile.redirect_port))
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", profile.redirect_port))
         .await
         .map_err(|e| Error::Login {
             reason: format!(
-                "{host}:{} で待ち受けられません: {e}。\
-戻り先のポートは client_id に登録済みの値なので他では代用できません。\
-このポートを使っている別のログイン処理 (cpa など) を止めるか、\
-LLM_GATEWAY_LOGIN_BIND で待ち受けるアドレスを指定してから、もう一度実行してください",
-                profile.redirect_port
+                "{} で待ち受けられません: {e}。\
+この戻り先は client_id に登録済みの値なので他のポートでは代用できません。\
+このポートを使っている別のログイン処理 (cpa など) を止めてから、もう一度実行してください",
+                profile.redirect_uri()
             ),
         })?;
     Ok(begin_on(kind, profile, listener))
@@ -509,60 +518,64 @@ impl Tokens {
 
     /// 時刻を指定して保存する形にする。`now_unix` は試験用。
     ///
-    /// `base` は再ログイン時の既存の内容。priority / disabled / 除外リストは
-    /// 認可で決まるものではなく運用側の設定なので、上書きせず引き継ぐ
-    /// (消すと、再ログインのたびにモデルの割り当てが崩れる)。
+    /// `base` は再ログイン時の既存の内容。priority / disabled / 除外リスト /
+    /// 拒否された beta の記録は認可で決まるものではなく運用側の値なので、
+    /// 上書きせず引き継ぐ (消すと、再ログインのたびにモデルの割り当てが崩れる)。
+    ///
+    /// payload は引き継がない。認可を通し直して受け取ったものが全てで、
+    /// 前回の残骸を混ぜる理由が無い。ただし email / account_id は今回の応答で
+    /// 分からなかったときだけ前の値を残す — どちらもアカウントの identity で、
+    /// 応答に無かったことは「変わった」を意味しない。
     pub fn to_stored_at(
         &self,
         kind: Kind,
         base: Option<&StoredCredential>,
         now_unix: i64,
     ) -> StoredCredential {
-        let mut next = match base {
-            Some(base) => base.clone(),
-            None => StoredCredential {
-                kind,
-                email: String::new(),
-                access_token: String::new(),
-                refresh_token: String::new(),
-                expired: String::new(),
-                last_refresh: String::new(),
-                priority: 0,
-                disabled: false,
-                excluded_models: Vec::new(),
-                account_id: None,
-                extra: BTreeMap::new(),
-            },
+        let previous = base.map(|b| &b.payload);
+        let email = self
+            .email
+            .clone()
+            .or_else(|| previous.map(|p| p.email().to_owned()))
+            .unwrap_or_default();
+
+        let tokens = OauthTokens {
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expired: format_rfc3339(now_unix + self.expires_in),
+            email,
+            extra: BTreeMap::new(),
         };
 
-        next.kind = kind;
-        next.access_token = self.access_token.clone();
-        next.refresh_token = self.refresh_token.clone();
-        next.expired = crate::credential::store::format_rfc3339(now_unix + self.expires_in);
-        next.last_refresh = crate::credential::store::format_rfc3339(now_unix);
-        // 分からなかった項目で既存の値を消さない。
-        if let Some(email) = &self.email {
-            next.email = email.clone();
-        }
-        if self.account_id.is_some() {
-            next.account_id = self.account_id.clone();
-        }
+        let payload = match kind {
+            Kind::Claude => Payload::ClaudeOauth(tokens),
+            Kind::Codex => Payload::CodexOauth(CodexTokens {
+                oauth: tokens,
+                account_id: self
+                    .account_id
+                    .clone()
+                    .or_else(|| previous.and_then(|p| p.account_id().map(str::to_owned))),
+            }),
+        };
+
+        let mut next = match base {
+            Some(base) => {
+                let mut next = base.clone();
+                next.payload = payload;
+                next
+            }
+            None => StoredCredential::new(payload),
+        };
+        next.last_refresh = format_rfc3339(now_unix);
         next
     }
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// 交換の要求。
 ///
-/// `state` は Anthropic が交換時にも要求する。ChatGPT 側は見ないが、
-/// 認可サーバは知らないパラメータを無視する規定 (RFC 6749 §3.2) なので
-/// 経路を分けず、常に送る。
+/// `state` は認可エンドポイント専用のパラメータで、token エンドポイントには
+/// RFC 6749 の定義が無い。Anthropic は受け取るが、ChatGPT は送ると 400 を返す
+/// (実測 2026-07-28)。要求する側にだけ送る。
 #[derive(Debug, Serialize)]
 struct ExchangeRequest<'a> {
     client_id: &'a str,
@@ -570,7 +583,8 @@ struct ExchangeRequest<'a> {
     code: &'a str,
     redirect_uri: &'a str,
     code_verifier: &'a str,
-    state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
 }
 
 /// 交換の応答。
@@ -607,7 +621,7 @@ async fn exchange_code(
         code,
         redirect_uri: &profile.redirect_uri(),
         code_verifier: verifier,
-        state,
+        state: profile.exchange_state.then_some(state),
     };
 
     // 更新と違い、ここでは共有のクライアントを持ち回らない (login は 1 回で終わる)。
@@ -618,14 +632,14 @@ async fn exchange_code(
             reason: format!("HTTP クライアントを作れません: {e}"),
         })?;
 
-    let resp = http
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Login {
-            reason: format!("{url} に接続できません: {e}"),
-        })?;
+    let request = http.post(url);
+    let request = match profile.exchange_form {
+        ExchangeForm::Json => request.json(&body),
+        ExchangeForm::UrlEncoded => request.form(&body),
+    };
+    let resp = request.send().await.map_err(|e| Error::Login {
+        reason: format!("{url} に接続できません: {e}"),
+    })?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Login {
@@ -634,7 +648,7 @@ async fn exchange_code(
 
     if !status.is_success() {
         return Err(Error::Login {
-            reason: exchange_failure_reason(status.as_u16()),
+            reason: exchange_failure_reason(status.as_u16(), &text),
         });
     }
 
@@ -703,8 +717,8 @@ fn email_of(claims: &Value) -> Option<String> {
 ///
 /// 応答本文は受け取らない。認可コードや token が混ざったものを、そのまま
 /// 文言に出さないための形。
-fn exchange_failure_reason(status: u16) -> String {
-    match status {
+fn exchange_failure_reason(status: u16, body: &str) -> String {
+    let base = match status {
         400 => "認可コードが受け付けられませんでした。\
 使い切ったか期限切れの可能性があります。もう一度 login をやり直してください"
             .to_owned(),
@@ -714,6 +728,32 @@ fn exchange_failure_reason(status: u16) -> String {
         429 => "要求が多すぎます。しばらく待ってから再試行してください".to_owned(),
         500..=599 => format!("交換先が {status} を返しました。一時的な障害の可能性があります"),
         other => format!("交換先が {other} を返しました"),
+    };
+    match oauth_error_detail(body) {
+        Some(detail) => format!("{base} (交換先の応答: {detail})"),
+        None => base,
+    }
+}
+
+/// 失敗応答から原因を取り出す。
+///
+/// OAuth の失敗応答 (RFC 6749 §5.2) は `error` と `error_description` を持ち、
+/// token は含まれない。状態から言い換えるだけだと「何が違うのか」が分からず
+/// 推測で直す羽目になるので、upstream が言っていることをそのまま添える。
+fn oauth_error_detail(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct OauthError {
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        error_description: Option<String>,
+    }
+    let parsed: OauthError = serde_json::from_str(body).ok()?;
+    match (parsed.error, parsed.error_description) {
+        (Some(e), Some(d)) => Some(format!("{e}: {d}")),
+        (Some(e), None) => Some(e),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
     }
 }
 
@@ -1021,12 +1061,33 @@ mod tests {
     fn stored_credential_is_built_from_tokens() {
         let c = tokens().to_stored_at(Kind::Claude, None, NOW);
 
-        assert_eq!(c.kind, Kind::Claude);
-        assert_eq!(c.access_token, "at");
-        assert_eq!(c.refresh_token, "rt");
-        assert_eq!(c.email, "someone@example.com");
-        assert_eq!(c.expired, "2026-07-28T03:00:00Z", "now + expires_in");
+        assert_eq!(c.payload.type_name(), "claude_oauth");
+        assert_eq!(c.payload.secret(), "at");
+        assert_eq!(c.payload.refresh_token(), Some("rt"));
+        assert_eq!(c.payload.email(), "someone@example.com");
+        assert_eq!(
+            c.payload.expired(),
+            "2026-07-28T03:00:00Z",
+            "now + expires_in"
+        );
         assert_eq!(c.last_refresh, "2026-07-27T19:00:00Z");
+        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "既定が入る");
+    }
+
+    /// ChatGPT の識別子は codex 側にだけ入る。
+    #[test]
+    fn codex_credential_carries_the_account_id() {
+        let c = Tokens {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            expires_in: 28_800,
+            email: None,
+            account_id: Some("acc-1".into()),
+        }
+        .to_stored_at(Kind::Codex, None, NOW);
+
+        assert_eq!(c.payload.type_name(), "codex_oauth");
+        assert_eq!(c.payload.account_id(), Some("acc-1"));
     }
 
     /// 再ログインで運用側の設定を消さない。
@@ -1038,8 +1099,8 @@ mod tests {
         base.priority = 20;
         base.disabled = true;
         base.excluded_models = vec!["claude-opus-*".to_owned()];
-        base.extra
-            .insert("id_token".to_owned(), Value::String(String::new()));
+        base.denied_beta_expires_ms = 3_600_000;
+        base.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
 
         let next = Tokens {
             access_token: "at-2".into(),
@@ -1050,14 +1111,39 @@ mod tests {
         }
         .to_stored_at(Kind::Claude, Some(&base), NOW + 60);
 
-        assert_eq!(next.access_token, "at-2", "token は入れ替わる");
+        assert_eq!(next.payload.secret(), "at-2", "token は入れ替わる");
         assert_eq!(next.priority, 20);
         assert!(next.disabled);
         assert_eq!(next.excluded_models, vec!["claude-opus-*"]);
-        assert!(next.extra.contains_key("id_token"), "未知の項目も残す");
+        assert_eq!(next.denied_beta_expires_ms, 3_600_000);
+        assert!(
+            next.denied_beta.contains_key("advisor-tool-2026-03-01"),
+            "upstream の観測結果は認可と無関係なので残す"
+        );
         assert_eq!(
-            next.email, "someone@example.com",
+            next.payload.email(),
+            "someone@example.com",
             "分からなかった項目で既存の値を消さない"
+        );
+    }
+
+    /// payload は取り直したもので置き換える。
+    ///
+    /// 前回の応答に混ざっていた項目を引きずると、今どのプロバイダから何を
+    /// 受け取ったのかが分からなくなる。
+    #[test]
+    fn relogin_replaces_the_payload() {
+        let mut base = tokens().to_stored_at(Kind::Claude, None, NOW);
+        if let Some(t) = base.payload.oauth_tokens_mut() {
+            t.extra
+                .insert("id_token".to_owned(), Value::String("old".to_owned()));
+        }
+
+        let next = tokens().to_stored_at(Kind::Claude, Some(&base), NOW + 60);
+        let json = serde_json::to_value(&next).unwrap();
+        assert!(
+            json["payload"].get("id_token").is_none(),
+            "前回の残骸を持ち回らない: {json}"
         );
     }
 
@@ -1070,7 +1156,7 @@ mod tests {
             code: "the-code",
             redirect_uri: "http://localhost:54545/callback",
             code_verifier: "the-verifier",
-            state: "the-state",
+            state: Some("the-state"),
         };
         let v: Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
 
@@ -1084,11 +1170,29 @@ mod tests {
     /// 交換の失敗は、やり直せるものと待つべきものを言い分ける。
     #[test]
     fn exchange_failure_is_actionable() {
-        assert!(exchange_failure_reason(400).contains("やり直"));
-        assert!(exchange_failure_reason(403).contains("利用権"));
-        assert!(exchange_failure_reason(429).contains("待って"));
-        assert!(exchange_failure_reason(503).contains("一時的"));
-        assert!(exchange_failure_reason(418).contains("418"));
+        assert!(exchange_failure_reason(400, "").contains("やり直"));
+        assert!(exchange_failure_reason(403, "").contains("利用権"));
+        assert!(exchange_failure_reason(429, "").contains("待って"));
+        assert!(exchange_failure_reason(503, "").contains("一時的"));
+        assert!(exchange_failure_reason(418, "").contains("418"));
+    }
+
+    /// upstream が理由を言っているなら、それを添えて出す。
+    /// 状態からの言い換えだけだと、何が違うのか分からず推測で直すことになる。
+    #[test]
+    fn exchange_failure_carries_upstream_reason() {
+        let body = r#"{"error":"invalid_grant","error_description":"code is expired"}"#;
+        let reason = exchange_failure_reason(400, body);
+        assert!(reason.contains("invalid_grant"), "{reason}");
+        assert!(reason.contains("code is expired"), "{reason}");
+    }
+
+    /// 失敗応答が OAuth の形でなければ、状態からの言い換えだけを出す。
+    #[test]
+    fn exchange_failure_without_oauth_shape_is_plain() {
+        let reason = exchange_failure_reason(400, "<html>gateway error</html>");
+        assert!(reason.contains("やり直"));
+        assert!(!reason.contains("応答:"), "{reason}");
     }
 
     /// 交換先を装うサーバ。1 本受けたら決め打ちの応答を返す。

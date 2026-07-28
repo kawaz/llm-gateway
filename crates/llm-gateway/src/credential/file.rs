@@ -1,7 +1,7 @@
 //! 平文ファイルへの保存。
 //!
-//! cpa と同じ JSON 形式で 1 認証情報 1 ファイル。移行期は cpa の auth ディレクトリ
-//! からコピーして使う (元は触らないので併存できる)。
+//! 1 認証情報 1 ファイルの JSON ([`StoredCredential`] の形)。ファイル名の
+//! stem がそのまま識別子になる。
 //!
 //! 平文なので、同じ UID のプロセスなら誰でも読める。パーミッションは絞るが
 //! それ以上の保護は無い。ここを埋めるのが cache-warden への移行。
@@ -42,7 +42,11 @@ impl Persistence for FileStore {
         })?;
         serde_json::from_str(&raw).map_err(|e| Error::Credential {
             id: id.to_string(),
-            reason: format!("{} の形式が想定と違います: {e}", path.display()),
+            reason: format!(
+                "{} の形式が想定と違います: {e}。\
+`llm-gateway login` で取り直すか、認証情報を payload に入れた形に直してください",
+                path.display()
+            ),
         })
     }
 
@@ -98,23 +102,19 @@ fn restrict(_path: &Path, _mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::{Kind, stored::StoredCredential};
-    use std::collections::BTreeMap;
+    use crate::credential::stored::{OauthTokens, Payload, StoredCredential};
 
     fn sample() -> StoredCredential {
-        StoredCredential {
-            kind: Kind::Claude,
-            email: "someone@example.com".into(),
+        let mut c = StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
             access_token: "at-1".into(),
             refresh_token: "rt-1".into(),
             expired: "2026-07-28T02:54:00+09:00".into(),
-            last_refresh: "2026-07-27T18:54:00+09:00".into(),
-            priority: 10,
-            disabled: false,
-            excluded_models: vec![],
-            account_id: None,
-            extra: BTreeMap::new(),
-        }
+            email: "someone@example.com".into(),
+            extra: Default::default(),
+        }));
+        c.priority = 10;
+        c.last_refresh = "2026-07-27T18:54:00+09:00".into();
+        c
     }
 
     #[test]
@@ -126,8 +126,8 @@ mod tests {
         store.store(&id, &sample()).unwrap();
         let got = store.load(&id).unwrap();
 
-        assert_eq!(got.email, "someone@example.com");
-        assert_eq!(got.access_token, "at-1");
+        assert_eq!(got.payload.email(), "someone@example.com");
+        assert_eq!(got.payload.secret(), "at-1");
         assert_eq!(got.priority, 10);
     }
 
@@ -139,13 +139,15 @@ mod tests {
 
         store.store(&id, &sample()).unwrap();
         let mut updated = sample();
-        updated.access_token = "at-2".into();
-        updated.refresh_token = "rt-2".into();
+        if let Some(tokens) = updated.payload.oauth_tokens_mut() {
+            tokens.access_token = "at-2".into();
+            tokens.refresh_token = "rt-2".into();
+        }
         store.store(&id, &updated).unwrap();
 
         let got = store.load(&id).unwrap();
-        assert_eq!(got.access_token, "at-2");
-        assert_eq!(got.refresh_token, "rt-2");
+        assert_eq!(got.payload.secret(), "at-2");
+        assert_eq!(got.payload.refresh_token(), Some("rt-2"));
     }
 
     /// 書き換え後に一時ファイルが残っていないか (残ると list に混ざる)。
@@ -207,23 +209,46 @@ mod tests {
         assert!(err.to_string().contains("broken.json"), "{err}");
     }
 
-    /// cpa が書いたファイルをそのまま読める。
+    /// 手で書いたファイルを読める (Bedrock は login できないので手で置く)。
     #[test]
-    fn reads_cpa_written_file() {
+    fn reads_a_hand_written_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("bedrock.json"),
+            r#"{"type":"claude_bedrock","priority":5,
+                "excluded_models":["claude-opus-*"],
+                "payload":{"api_key":"ak","expired":"2026-08-02T10:08:18+09:00"}}"#,
+        )
+        .unwrap();
+
+        let got = store.load(&CredentialId::new("bedrock")).unwrap();
+        assert_eq!(got.payload.secret(), "ak");
+        assert_eq!(got.excluded_models, vec!["claude-opus-*"]);
+        assert!(!got.accepts_model("claude-opus-5"));
+    }
+
+    /// 旧形式 (平坦・cpa 互換) はどのファイルかを言って断る。
+    ///
+    /// 読めないままだと「なぜ動かないのか」が分からない。login し直せば
+    /// 新しい形で書き直される。
+    #[test]
+    fn legacy_flat_file_reports_the_path() {
         let dir = tempfile::tempdir().unwrap();
         let store = FileStore::open(dir.path()).unwrap();
         fs::write(
             dir.path().join("claude-someone.json"),
             r#"{"type":"claude","email":"a@b.c","access_token":"at",
                 "refresh_token":"rt","expired":"2026-07-28T02:54:00+09:00",
-                "last_refresh":"2026-07-27T18:54:00+09:00","priority":10,
-                "disabled":false,"id_token":"","excluded-models":["claude-opus-*"]}"#,
+                "excluded-models":["claude-opus-*"]}"#,
         )
         .unwrap();
 
-        let got = store.load(&CredentialId::new("claude-someone")).unwrap();
-        assert_eq!(got.excluded_models, vec!["claude-opus-*"]);
-        assert!(!got.accepts_model("claude-opus-5"));
+        let err = store
+            .load(&CredentialId::new("claude-someone"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("claude-someone.json"), "{err}");
     }
 
     #[cfg(unix)]

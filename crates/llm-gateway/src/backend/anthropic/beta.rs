@@ -26,6 +26,8 @@
 
 use std::collections::BTreeSet;
 
+use super::Headers;
+
 pub const HEADER: &str = "anthropic-beta";
 
 /// Bedrock が受け付けないと分かっているフラグ。
@@ -55,35 +57,55 @@ impl Policy {
         Self::Deny(BEDROCK_REJECTED.iter().map(|s| (*s).to_owned()).collect())
     }
 
-    /// ヘッダ値を書き換える。全て落ちたら `None` (= ヘッダごと消す)。
+    /// 残すフラグ。
     ///
     /// 順序と表記はクライアントが送ったまま保つ。upstream が順序を見ている
     /// 可能性は低いが、変える理由も無い。
-    pub fn apply(&self, value: &str) -> Option<String> {
-        let Self::Deny(denied) = self else {
-            return Some(value.to_owned());
+    pub fn keep(&self, value: &str) -> Vec<String> {
+        let denied = match self {
+            Self::Deny(denied) => Some(denied),
+            Self::Passthrough => None,
         };
-        let kept: Vec<&str> = value
+        value
             .split(',')
             .map(str::trim)
-            .filter(|f| !f.is_empty() && !denied.contains(*f))
-            .collect();
+            .filter(|f| !f.is_empty() && !denied.is_some_and(|d| d.contains(*f)))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// ヘッダ値を書き換える。全て落ちたら `None` (= ヘッダごと消す)。
+    pub fn apply(&self, value: &str) -> Option<String> {
+        let kept = self.keep(value);
         (!kept.is_empty()).then(|| kept.join(","))
     }
 
-    /// 400 応答をきっかけに、追加で落とすフラグを覚える。
+    /// ヘッダに反映し、実際に載せたフラグを返す。
     ///
-    /// upstream は弾いたフラグ名を教えてくれないことがある (実際 Bedrock の
-    /// 応答は `invalid beta flag` だけだった)。その場合は名前を特定できないので
-    /// 呼び出し側が全部落として再試行するしかない。
+    /// 返り値は 400 を受けたときの手掛かりになる。何を送ったか分からないと、
+    /// どれを覚えればよいかも決められない。
+    pub fn apply_to(&self, headers: &mut Headers) -> Vec<String> {
+        let Some(value) = headers.get(HEADER) else {
+            return Vec::new();
+        };
+        let kept = self.keep(value);
+        match kept.is_empty() {
+            true => headers.remove(HEADER),
+            false => headers.set(HEADER, kept.join(",")),
+        }
+        kept
+    }
+
+    /// 400 応答をきっかけに、追加で落とすフラグを覚える。
     pub fn deny(&mut self, flag: &str) {
+        self.deny_all([flag.to_owned()]);
+    }
+
+    /// まとめて落とす。
+    pub fn deny_all(&mut self, flags: impl IntoIterator<Item = String>) {
         match self {
-            Self::Deny(set) => {
-                set.insert(flag.to_owned());
-            }
-            Self::Passthrough => {
-                *self = Self::Deny([flag.to_owned()].into_iter().collect());
-            }
+            Self::Deny(set) => set.extend(flags),
+            Self::Passthrough => *self = Self::Deny(flags.into_iter().collect()),
         }
     }
 }
@@ -93,6 +115,28 @@ impl Policy {
 /// これが真なら、フラグを落とした再試行に意味がある。
 pub fn is_invalid_beta_error(body: &str) -> bool {
     body.contains("invalid beta flag") || body.contains("unsupported beta")
+}
+
+/// 400 応答から、拒否されたフラグを割り出す。
+///
+/// 名前が書かれていれば、それだけを返す。書かれていなければ **送った全部**を
+/// 返す。upstream は弾いたフラグ名を教えてくれないことがあり (実際 Bedrock の
+/// 応答は `invalid beta flag` だけだった)、そのときは犯人を絞れない。
+///
+/// Design rationale: 絞れないときに巻き添えを避ける手は「1 つずつ送って
+/// 二分探索する」しかなく、リクエスト 1 本のために何往復もすることになる。
+/// 全部覚えるほうは通るフラグまで一時的に落とすが、記録には確認時刻が付いて
+/// いて期限が来れば試し直す (DR-0003) ので、取りこぼしは持続しない。
+pub fn blamed_flags(body: &str, sent: &[String]) -> Vec<String> {
+    let named: Vec<String> = sent
+        .iter()
+        .filter(|flag| body.contains(flag.as_str()))
+        .cloned()
+        .collect();
+    match named.is_empty() {
+        true => sent.to_vec(),
+        false => named,
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +228,79 @@ context-management-2025-06-27,claude-code-20250219"
             policy.apply("bad-flag,good-flag").as_deref(),
             Some("good-flag")
         );
+    }
+
+    /// credential が学習した分を足して使える (DR-0003)。
+    #[test]
+    fn learned_denials_add_to_the_upstream_default() {
+        let mut policy = Policy::bedrock();
+        policy.deny_all(["some-future-flag-2027-01-01".to_owned()]);
+
+        let kept = policy.apply(OBSERVED).unwrap();
+        assert!(!kept.contains("oauth-2025-04-20"), "既定の分は落ちたまま");
+        assert!(kept.contains("context-management-2025-06-27"));
+
+        let mut passthrough = Policy::Passthrough;
+        passthrough.deny_all(["a".to_owned(), "b".to_owned()]);
+        assert_eq!(passthrough.apply("a,b,c").as_deref(), Some("c"));
+    }
+
+    /// ヘッダに反映すると、実際に載せたフラグが返る。
+    #[test]
+    fn apply_to_headers_reports_what_was_sent() {
+        let mut headers = Headers::new(vec![(HEADER.to_owned(), OBSERVED.to_owned())]);
+        let sent = Policy::bedrock().apply_to(&mut headers);
+
+        assert_eq!(
+            sent,
+            vec![
+                "interleaved-thinking-2025-05-14",
+                "thinking-token-count-2026-05-13",
+                "context-management-2025-06-27",
+                "claude-code-20250219",
+            ]
+        );
+        assert_eq!(headers.get(HEADER), Some(sent.join(",").as_str()));
+    }
+
+    /// 全部落ちたらヘッダごと消し、何も送っていないと報告する。
+    #[test]
+    fn apply_to_headers_removes_an_empty_header() {
+        let mut headers = Headers::new(vec![(
+            HEADER.to_owned(),
+            "oauth-2025-04-20,advisor-tool-2026-03-01".to_owned(),
+        )]);
+        assert!(Policy::bedrock().apply_to(&mut headers).is_empty());
+        assert_eq!(headers.get(HEADER), None);
+    }
+
+    /// beta を送っていないクライアントには何もしない。
+    #[test]
+    fn apply_to_headers_without_the_header() {
+        let mut headers = Headers::default();
+        assert!(Policy::bedrock().apply_to(&mut headers).is_empty());
+        assert_eq!(headers.get(HEADER), None);
+    }
+
+    /// 名指しされていれば、そのフラグだけを覚える。
+    #[test]
+    fn blames_the_named_flag() {
+        let sent = vec![
+            "claude-code-20250219".to_owned(),
+            "advisor-tool-2026-03-01".to_owned(),
+        ];
+        let body = r#"{"error":{"message":"unsupported beta: advisor-tool-2026-03-01"}}"#;
+        assert_eq!(blamed_flags(body, &sent), vec!["advisor-tool-2026-03-01"]);
+    }
+
+    /// 名前が無ければ送った全部を覚える (犯人を絞れない)。
+    ///
+    /// 通るフラグまで一時的に落とすが、期限が来れば試し直す。
+    #[test]
+    fn blames_everything_when_the_body_names_nothing() {
+        let sent = vec!["a-flag".to_owned(), "b-flag".to_owned()];
+        let body = r#"{"error":{"message":"invalid beta flag"}}"#;
+        assert_eq!(blamed_flags(body, &sent), sent);
     }
 
     #[test]

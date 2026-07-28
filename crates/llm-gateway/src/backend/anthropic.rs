@@ -36,6 +36,16 @@ pub trait Provider: Send + Sync {
     /// 認証ヘッダを載せる。方式は upstream ごとに違う。
     fn authorize(&self, headers: &mut Headers, credential: Option<&Credential>) -> Result<()>;
 
+    /// この upstream に送るときの beta の既定。
+    ///
+    /// 適用は [`adapt`](Self::adapt) ではなく転送側が行う。credential が
+    /// 学習した拒否リストを足したうえで、何を載せたかを控え、400 なら
+    /// 落として送り直す — という一連が provider 1 つでは完結しないため
+    /// (DR-0003)。
+    fn beta_policy(&self) -> beta::Policy {
+        beta::Policy::Passthrough
+    }
+
     /// リクエストを upstream の要求に合わせる。
     ///
     /// 既定は素通し。公式 Anthropic はこれで足りる。

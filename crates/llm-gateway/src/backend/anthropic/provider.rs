@@ -112,20 +112,16 @@ impl Provider for Bedrock {
         Ok(())
     }
 
+    fn beta_policy(&self) -> beta::Policy {
+        self.beta_policy.clone()
+    }
+
     fn adapt(&self, body: &mut Value, headers: &mut Headers) {
         if let Some(model) = body.get("model").and_then(Value::as_str)
             && let Some(upstream) = self.model_map.get(model)
         {
             let upstream = upstream.clone();
             rewrite_model(body, &upstream);
-        }
-
-        // 受け付けないフラグを落とす。全部落ちたらヘッダごと消す。
-        if let Some(value) = headers.get(beta::HEADER) {
-            match self.beta_policy.apply(value) {
-                Some(kept) => headers.set(beta::HEADER, kept),
-                None => headers.remove(beta::HEADER),
-            }
         }
 
         headers.extend_from(&self.extra_headers);
@@ -196,6 +192,11 @@ extended-cache-ttl-2025-04-11";
         ])
     }
 
+    /// 転送側と同じ手順で beta を整える (適用は provider の外)。
+    fn negotiate_beta(provider: &dyn Provider, headers: &mut Headers) -> Vec<String> {
+        provider.beta_policy().apply_to(headers)
+    }
+
     fn official() -> Official {
         Official::new(
             "claude-personal",
@@ -225,6 +226,7 @@ extended-cache-ttl-2025-04-11";
         let before = body.clone();
 
         official().adapt(&mut body, &mut headers);
+        negotiate_beta(&official(), &mut headers);
 
         assert_eq!(body, before, "ボディを触らない");
         assert_eq!(
@@ -258,7 +260,7 @@ extended-cache-ttl-2025-04-11";
     #[test]
     fn bedrock_drops_only_rejected_beta_flags() {
         let mut headers = client_headers();
-        bedrock().adapt(&mut json!({}), &mut headers);
+        negotiate_beta(&bedrock(), &mut headers);
 
         let kept = headers.get("anthropic-beta").expect("残るものがある");
         for gone in [
@@ -286,7 +288,7 @@ extended-cache-ttl-2025-04-11";
             "anthropic-beta".into(),
             "oauth-2025-04-20,advisor-tool-2026-03-01".into(),
         )]);
-        bedrock().adapt(&mut json!({}), &mut headers);
+        negotiate_beta(&bedrock(), &mut headers);
         assert_eq!(headers.get("anthropic-beta"), None);
     }
 
@@ -301,7 +303,7 @@ extended-cache-ttl-2025-04-11";
             BTreeMap::new(),
         );
         let mut headers = client_headers();
-        provider.adapt(&mut json!({}), &mut headers);
+        negotiate_beta(&provider, &mut headers);
 
         let kept = headers.get("anthropic-beta").unwrap();
         assert!(!kept.contains("claude-code-20250219"), "指定した分は落ちる");
@@ -339,6 +341,7 @@ extended-cache-ttl-2025-04-11";
         let mut h = client_headers();
         relay.authorize(&mut h, None).unwrap();
         relay.adapt(&mut json!({"model": "gpt-5.6-sol"}), &mut h);
+        negotiate_beta(&relay, &mut h);
 
         assert_eq!(h.get("authorization"), None);
         assert_eq!(h.get("x-api-key"), None);

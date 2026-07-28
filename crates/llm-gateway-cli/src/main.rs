@@ -147,23 +147,41 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     // 認証情報が置かれているかは、起動しないと分からない部分。ここで見ておくと
     // 動かしてから 401 で気づく事態を減らせる。
     let store = FileStore::open(&dir).map_err(|e| e.to_string())?;
-    let missing: Vec<&str> = config
-        .credentials
-        .iter()
-        .filter(|(name, spec)| {
-            spec.needs_secret() && store.load(&CredentialId::new(*name)).is_err()
-        })
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let placed = store.list().unwrap_or_default();
 
-    if missing.is_empty() {
+    let mut missing = Vec::new();
+    let mut unreadable = Vec::new();
+    for (name, spec) in &config.credentials {
+        if !spec.needs_secret() {
+            continue;
+        }
+        let id = CredentialId::new(name.as_str());
+        match store.load(&id) {
+            Ok(_) => {}
+            // ファイルはあるのに読めない場合を「ありません」と言うと、
+            // 置き直しても直らない原因を探すことになる。
+            Err(e) if placed.contains(&id) => unreadable.push((name.as_str(), e.to_string())),
+            Err(_) => missing.push(name.as_str()),
+        }
+    }
+
+    if missing.is_empty() && unreadable.is_empty() {
         println!("\n問題ありません");
         return Ok(ExitCode::SUCCESS);
     }
 
-    println!("\n次の認証情報が {} にありません:", dir.display());
-    for name in &missing {
-        println!("  {name}.json");
+    if !missing.is_empty() {
+        println!("\n次の認証情報が {} にありません:", dir.display());
+        for name in &missing {
+            println!("  {name}.json");
+        }
+        println!("  llm-gateway login --type <種別> <名前> で取得できます");
+    }
+    if !unreadable.is_empty() {
+        println!("\n次の認証情報を読めません:");
+        for (name, reason) in &unreadable {
+            println!("  {name}: {reason}");
+        }
     }
     Ok(ExitCode::FAILURE)
 }
@@ -268,8 +286,8 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
             "{} に保存しました",
             dir.join(format!("{name}.json")).display()
         );
-        if !credential.email.is_empty() {
-            println!("アカウント {}", credential.email);
+        if !credential.payload.email().is_empty() {
+            println!("アカウント {}", credential.payload.email());
         }
         if declared.is_none() {
             print_config_hint(&name, kind);

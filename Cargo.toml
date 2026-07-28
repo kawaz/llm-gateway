@@ -35,6 +35,8 @@ axum = { version = "0.8", default-features = false, features = [
 # http2 は upstream (api.anthropic.com / bedrock) が対応しているので有効化する。
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
+    # 認可コードの交換。ChatGPT は form でないと 400 を返す (実測 2026-07-28)。
+    "form",
     "stream",
     "http2",
     "rustls",

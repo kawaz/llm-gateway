@@ -246,27 +246,21 @@ fn client_error(status: StatusCode, message: &str) -> Response {
 pub(crate) mod tests {
     use super::*;
     use llm_gateway::Config;
-    use llm_gateway::credential::{CredentialId, Kind, StoredCredential};
-    use std::collections::BTreeMap;
+    use llm_gateway::credential::{CredentialId, OauthTokens, Payload, StoredCredential};
     use tokio::net::TcpListener;
 
     struct StaticStore;
 
     impl Persistence for StaticStore {
         fn load(&self, _id: &CredentialId) -> llm_gateway::Result<StoredCredential> {
-            Ok(StoredCredential {
-                kind: Kind::Claude,
-                email: "a@b.c".into(),
+            Ok(StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
                 access_token: "tok".into(),
                 refresh_token: "rt".into(),
+                // 十分先。更新に入らせない。
                 expired: "2099-01-01T00:00:00Z".into(),
-                last_refresh: String::new(),
-                priority: 0,
-                disabled: false,
-                excluded_models: vec![],
-                account_id: None,
-                extra: BTreeMap::new(),
-            })
+                email: "a@b.c".into(),
+                extra: Default::default(),
+            })))
         }
         fn store(&self, _id: &CredentialId, _v: &StoredCredential) -> llm_gateway::Result<()> {
             Ok(())
