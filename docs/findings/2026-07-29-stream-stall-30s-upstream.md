@@ -16,7 +16,12 @@
 - **30 秒の正体は Claude Code 側の byte stream watchdog** だった (後述の続報で訂正)。Claude Code v2.1.220 の実装で、無音がこの閾値を超えるとクライアントが接続を切り「Response stalled mid-stream」を表示する
 - 閾値はコード既定 180 秒 (firstParty) だが、**リモート設定 `tengu_byte_stream_idle_timeout_ms` でサーバから動的に上書き**され、観測時点では 30000ms が配布されていたとみられる (観測 5 件が 30002〜30095ms に揃うことと整合)
 - 「upstream が黙る」こと自体は upstream 由来のまま (トリガ)。**切るのはクライアント** (30 秒 watchdog)。当初の「upstream 内部に 30 秒タイマー」という解釈は誤りで、30 秒の規則性はクライアント側タイマーの signature だった
-- リモート設定は任意のタイミングで変わるため、「2026-07-28 に急増し、それ以前 (cpa 経路時代) はほぼ出ていなかった」ことも経路と無関係に説明できる (7/28 の日別集計: 平時 1〜9 件/日 → 67 件)
+- watchdog の閾値は**以前から 30 秒で変わっていない** (kawaz が `~/.claude.json` /
+  `~/.claude-personal` を grep し、過去の `tengu_byte_stream_idle_timeout_ms` の記録が
+  すべて 30000 であることを確認)。したがって「2026-07-28 の急増 (平時 1〜9 件/日 → 67 件)」の
+  原因は切る側ではなく**黙る側**で、upstream が 30 秒以上停滞する頻度がその日に跳ねた。
+  同日の 529 Overloaded ×32 / 503 ×32 と同根の upstream 品質劣化とみられる。
+  cpa 経路の時代にほぼ出ていなかったのも、経路や設定の差ではなく upstream が健全だっただけ
 - 対処: `CLAUDE_STREAM_IDLE_TIMEOUT_MS` (undocumented、バイナリで実在確認) を settings.json の env に設定すると、SSE idle が max(設定値, 5 分) になり、**byte watchdog へのリモート上書きも無効化される**。`API_TIMEOUT_MS` (documented、既定 10 分) も全体上限として併用。2026-07-29 に 3 面 (personal / emeradaco / emrd) へ `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000` / `API_TIMEOUT_MS=1200000` を適用済み。環境変数は起動時固定なので適用後に起動したセッションから有効
 
 ## 実用的な示唆 / ベストプラクティス
