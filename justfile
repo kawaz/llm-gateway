@@ -242,3 +242,18 @@ promote:
 # push (version が上がっていれば release workflow が tag と artifact を作る)
 push: ci check-on-default-branch ensure-clean check-version-bumped
     bump-semver vcs push --branch main --jj-bookmark-auto-advance
+    ccmsg notify --self --text "Monitor で 'just watch' を起動して" 2>/dev/null || true
+
+# release.yml の完了を SHA-pinned watch (push 後の `ccmsg notify --self` で AI に起動指示が届く)
+watch:
+    watch-workflow.sh --sha $(bump-semver vcs get commit-id --rev "$(bump-semver vcs get default-branch)") --on-success release.yml 'just on-success-release' kawaz/llm-gateway
+
+# release.yml workflow が success になった時に AI が実行する action
+# (watch-workflow の `--on-success release.yml 'just on-success-release'` 経由で
+# 通知 event に `[ACTION:release.yml] just on-success-release` が emit される)
+[doc("release.yml success 時に tap を pull して brew upgrade する")]
+on-success-release:
+    # tap repo を直接 git pull (= `brew update` 全 tap 巡回より速い)
+    git -C "$(brew --repository)/Library/Taps/kawaz/homebrew-tap" pull --ff-only
+    brew upgrade kawaz/tap/llm-gateway
+    llm-gateway --version

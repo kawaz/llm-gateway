@@ -266,11 +266,17 @@ jobs:
         with:
           merge-multiple: true
 
-      - name: Generate SHA256SUMS
+      - name: Generate per-binary .sha256
         run: |
           set -euo pipefail
-          sha256sum ./*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
+          # アーカイブごとの <アーカイブ名>.sha256 sidecar (単一 SHA256SUMS ではなく)。
+          # 利用者は自分が落とした 1 アーカイブだけ検証すればよく、
+          # `sha256sum -c llm-gateway-X.Y.Z-<target>.tar.gz.sha256` で完結する。
+          # ripgrep / starship / zellij 等 Rust 系 canonical の慣習に合わせる。
+          for f in ./*.tar.gz; do
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -lh ./*.sha256
 
       # provenance は public リポでしか作れない。private のまま実行すると
       # 「Feature not available for user-owned private repositories」で
@@ -295,7 +301,7 @@ jobs:
         with:
           subject-path: |
             *.tar.gz
-            SHA256SUMS
+            *.sha256
 
       - name: Create release
         env:
@@ -305,7 +311,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           gh release create "v${VERSION}" \
-            ./*.tar.gz SHA256SUMS \
+            ./*.tar.gz ./*.sha256 \
             --repo "$REPO" \
             --title "v${VERSION}" \
             --target "$COMMIT_SHA" \
@@ -317,6 +323,20 @@ jobs:
     needs: [check-version, publish-release]
     runs-on: ubuntu-latest
     steps:
+      # tap への commit/push を bump-semver vcs 経由にするため install する
+      # (check-version job と同じ、最新 release バイナリを curl で取得する方式)。
+      - name: Install bump-semver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo kawaz/bump-semver --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//')
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 60 \
+            "https://github.com/kawaz/bump-semver/releases/download/v${LATEST}/bump-semver-linux-amd64" \
+            -o /usr/local/bin/bump-semver
+          chmod +x /usr/local/bin/bump-semver
+          bump-semver --version
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -393,12 +413,11 @@ jobs:
           VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           set -euo pipefail
+          # git identity は fresh runner には無いため明示設定 (bump-semver は identity を自前設定しない)。
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/llm-gateway.rb
-          if git diff --staged --quiet; then
-            echo "formula に変更なし"
-            exit 0
+          # 差分があるときだけ commit + push (vcs diff -q は差分あり=exit 1)。
+          if ! bump-semver vcs diff -q HEAD -- Formula/llm-gateway.rb; then
+            bump-semver vcs commit -m "llm-gateway ${VERSION}" Formula/llm-gateway.rb
+            bump-semver vcs push --branch main
           fi
-          git commit -m "llm-gateway ${VERSION}"
-          git push
