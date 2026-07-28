@@ -150,12 +150,8 @@ upstream がその名前を使い始めたときに避難が要る。
 `/healthz` (トップレベル) は `/llm-gateway/healthz` へ移す。実装済みだが稼働プロセスには
 未反映なので、移行による影響はない。
 
-## 検討が要る点
-
-- **fail-open をやめるか**。本 DR は既定 namespace の特別扱いを外すが、
-  「`auth_token` 未設定の namespace は誰でも通す」という `accepts()` の挙動自体は
-  変えていない。名前付き namespace で書き忘れれば同じ穴が開く。これを
-  fail-closed にするかは別途裁定が要る
+`accepts()` の「`auth_token` 未設定なら誰でも通す」挙動は変えない。本 DR の対象は
+パス空間と設定構造であって、認証の強制ではない。
 
 ## 移行
 
