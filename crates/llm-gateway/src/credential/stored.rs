@@ -20,6 +20,29 @@ pub enum Kind {
     Codex,
 }
 
+impl Kind {
+    /// 設定ファイルの `type` から引く。
+    ///
+    /// 保存側 (`claude` / `codex`) と設定側 (`claude_oauth` / `codex_oauth`) で
+    /// 語が違う。使う側に 2 通り覚えさせないよう、CLI の `--type` も設定側の語で
+    /// 受け、ここで対応づける。login を要さない種別 (bedrock / relay) は `None`。
+    pub fn from_config_type(name: &str) -> Option<Self> {
+        match name {
+            "claude_oauth" => Some(Self::Claude),
+            "codex_oauth" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// 設定ファイルに書くときの `type`。
+    pub fn config_type(self) -> &'static str {
+        match self {
+            Self::Claude => "claude_oauth",
+            Self::Codex => "codex_oauth",
+        }
+    }
+}
+
 /// ディスク上の認証情報。
 ///
 /// `access_token` / `refresh_token` は [`Drop`] で消す。ファイルから読んだ
@@ -202,6 +225,24 @@ mod tests {
         let c: StoredCredential = serde_json::from_str(raw).unwrap();
         assert_eq!(c.kind, Kind::Codex);
         assert_eq!(c.account_id.as_deref(), Some("acc-1"));
+    }
+
+    /// 設定側の語から種別を引ける。login できない種別は弾く。
+    #[test]
+    fn kind_from_config_type() {
+        assert_eq!(Kind::from_config_type("claude_oauth"), Some(Kind::Claude));
+        assert_eq!(Kind::from_config_type("codex_oauth"), Some(Kind::Codex));
+        for other in ["claude_bedrock", "relay", "claude", "codex", ""] {
+            assert_eq!(Kind::from_config_type(other), None, "{other}");
+        }
+    }
+
+    /// 引いた語で書き戻せる (help や案内文がそのまま設定に貼れる)。
+    #[test]
+    fn config_type_round_trips() {
+        for kind in [Kind::Claude, Kind::Codex] {
+            assert_eq!(Kind::from_config_type(kind.config_type()), Some(kind));
+        }
     }
 
     /// 省略可能な項目が無くても読める。

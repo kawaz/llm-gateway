@@ -59,6 +59,13 @@ futures-util = { version = "0.3", default-features = false }
 # SSE のバイト列中継。reqwest の bytes_stream が返す型に合わせる。
 bytes = "1"
 tempfile = "3"
+# PKCE の verifier と state。推測されると認可を横取りされるので、
+# 暗号論的に安全な生成器 (ThreadRng = OS 由来の種で回す ChaCha) を使う。
+rand = "0.10"
+# PKCE の code_challenge (S256)。
+sha2 = "0.10"
+# base64url。PKCE の値と、id_token (JWT) の payload に使う。
+base64 = "0.22"
 
 [profile.release]
 lto = "fat"

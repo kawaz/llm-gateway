@@ -45,6 +45,12 @@ pub enum Error {
     #[error("`{id}` の token 更新に失敗しました: {reason}")]
     Refresh { id: String, reason: String },
 
+    /// 認可 (login) が最後まで進まなかった。
+    ///
+    /// 転送の最中には起きない (CLI からの login でだけ出る)。
+    #[error("認可を完了できませんでした: {reason}")]
+    Login { reason: String },
+
     #[error("設定を読めません: {0}")]
     Config(String),
 

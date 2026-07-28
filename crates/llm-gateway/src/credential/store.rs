@@ -247,7 +247,8 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset)
 }
 
-fn format_rfc3339(unix: i64) -> String {
+/// unix 秒を RFC 3339 にする。認証情報の `expired` / `last_refresh` を書くのに使う。
+pub(crate) fn format_rfc3339(unix: i64) -> String {
     let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
     let (y, mo, d) = civil_from_days(days);
     let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
