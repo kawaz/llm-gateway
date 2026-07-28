@@ -28,20 +28,24 @@ beta 無しなら 200 が返る。
 ```json
 {
   "type": "claude_bedrock",
-  "denied-beta": {
+  "denied_beta_expires_ms": 86400000,
+  "denied_beta": {
     "advisor-tool-2026-03-01": "2026-07-28T09:28:21+09:00"
   },
   "payload": { ... }
 }
 ```
 
+`denied_beta_expires_ms` は再試行までの間隔。省略時は 86400000 (24 時間)。
+credential ごとに調整できる。
+
 判定:
 
 | 状態 | 動作 |
 |---|---|
-| `denied-beta` にあり、最終確認から 24 時間未満 | 落とす (最近試した) |
-| `denied-beta` にあり、24 時間以上経過 | **通してみる**。400 なら時刻を更新 |
-| `denied-beta` に無い | 通す。400 なら追加 |
+| `denied_beta` にあり、最終確認から 24 時間未満 | 落とす (最近試した) |
+| `denied_beta` にあり、24 時間以上経過 | **通してみる**。400 なら時刻を更新 |
+| `denied_beta` に無い | 通す。400 なら追加 |
 
 400 を受けたら該当フラグを外して 1 回だけ再試行する。
 
@@ -61,7 +65,7 @@ upstream が違えば可否も違う。`bedrock-us-east-1` と `bedrock-ap-north
 
 ### なぜ許可リストを持たないか
 
-「通る」は `denied-beta` に無いことで表現できる。別リストを足しても判定に
+「通る」は `denied_beta` に無いことで表現できる。別リストを足しても判定に
 寄与せず、2 つの真実を同期させる手間だけが増える。
 
 ### なぜ TZ 付き ISO 8601 か
@@ -72,8 +76,14 @@ epoch ms だと時刻表現が 2 種類混在して読み手が迷う。TZ を�
 
 ### なぜ payload でなくトップに置くか
 
-`denied-beta` は gateway が観測した運用知識であって、プロバイダが返した
+`denied_beta` は gateway が観測した運用知識であって、プロバイダが返した
 認証情報ではない。`last_refresh` と同じ層に属する。
+
+### フィールド名は snake_case に統一する
+
+既存の `excluded-models` はハイフンだが、これは cpa 互換のために合わせたもの。
+payload 分離で cpa 互換を捨てるので、同じタイミングで `excluded_models` に直す。
+1 つの json 内で命名規則が混在する状態を残さない。
 
 ### 全 credential 種別に持たせる
 
