@@ -35,7 +35,21 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages))
         .route("/v1/models", get(models))
+        .route("/healthz", get(healthz))
         .with_state(gateway)
+}
+
+/// 生きているかだけを返す。
+///
+/// 前段のロードバランサが数秒ごとに叩く前提なので、認証も namespace も
+/// 持たず、credential にも upstream にも触らない。
+///
+/// 業務のエンドポイントを死活監視に使うと、そのエンドポイントの認証方針が
+/// 監視側に縛られる。実際 `/v1/models` を監視に使っていたために、
+/// 既定 namespace へ認証をかけると監視が 401 で落ちて全断する状態になっていた。
+/// 責務が違うものを同じ口にしない。
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok").into_response()
 }
 
 /// パスの先頭から namespace 名を取り出す。
@@ -897,6 +911,29 @@ auth_token = "secret-token"
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    /// 死活監視の口は、認証を設定した namespace があっても通る。
+    ///
+    /// ここが認証に巻き込まれると、前段の監視が落ちて upstream ごと
+    /// 切り離される。業務のエンドポイントと分けてある理由がこれ。
+    #[tokio::test]
+    async fn healthz_needs_no_token() {
+        let base = serve(TWO_NS).await;
+        let resp = reqwest::get(format!("{base}/healthz")).await.unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    /// 死活監視の口は namespace を取らない。
+    #[tokio::test]
+    async fn healthz_is_not_namespaced() {
+        let base = serve(TWO_NS).await;
+        let resp = reqwest::get(format!("{base}/ns-locked/healthz"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "namespace 付きでは生やさない");
     }
 }
 
