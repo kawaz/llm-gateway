@@ -387,7 +387,10 @@ Phase 1 の時点で、直近 6 万行のモデル別内訳
 `internal/translator/claude/openai/responses/` は本体 **1,758 行**
 (request 834 + response 924)、テスト込み 2,940 行。Phase 1 と分ける根拠はここ。
 
-### 配布しない (kawaz 裁定 2026-07-27)
+### 配布しない (kawaz 裁定 2026-07-27) — Superseded by [DR-0005](./DR-0005-distribute.md)
+
+> **本節は無効。** 2026-07-28 に kawaz が裁定を覆し、配布する方針に変わった
+> ([DR-0005](./DR-0005-distribute.md))。以下は当時の判断記録として残す。
 
 > 当面配布しない。個人用。
 
