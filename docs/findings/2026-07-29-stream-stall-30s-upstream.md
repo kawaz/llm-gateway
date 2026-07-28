@@ -13,6 +13,11 @@
 - パターン (c) の実例: 2026-07-28 19:06:38.992 UTC、req=211、body 1.59MB、197.5 秒走行、54.5 秒地点に 30095ms の無音、最終的に正常クローズ。クライアント側エラー時刻とミリ秒単位で一致
 - ボディサイズとの相関 (400KB 未満で中断 0 件) は**交絡**。大きいボディ = 長い文脈 = upstream の処理時間が長い、の代理指標であって原因ではない (Caddy 側の 300 件検証でサイズ由来の転送遅延は無いと確定)
 - upstream の不安定さはストリーム開始前にも出ている: Caddy の access.log で 529 Overloaded ×32 / 503 ×32 / 429 ×52 (2026-07-28、/v1/messages 2227 件中)
+- **30 秒の正体は Claude Code 側の byte stream watchdog** だった (後述の続報で訂正)。Claude Code v2.1.220 の実装で、無音がこの閾値を超えるとクライアントが接続を切り「Response stalled mid-stream」を表示する
+- 閾値はコード既定 180 秒 (firstParty) だが、**リモート設定 `tengu_byte_stream_idle_timeout_ms` でサーバから動的に上書き**され、観測時点では 30000ms が配布されていたとみられる (観測 5 件が 30002〜30095ms に揃うことと整合)
+- 「upstream が黙る」こと自体は upstream 由来のまま (トリガ)。**切るのはクライアント** (30 秒 watchdog)。当初の「upstream 内部に 30 秒タイマー」という解釈は誤りで、30 秒の規則性はクライアント側タイマーの signature だった
+- リモート設定は任意のタイミングで変わるため、「2026-07-28 に急増し、それ以前 (cpa 経路時代) はほぼ出ていなかった」ことも経路と無関係に説明できる (7/28 の日別集計: 平時 1〜9 件/日 → 67 件)
+- 対処: `CLAUDE_STREAM_IDLE_TIMEOUT_MS` (undocumented、バイナリで実在確認) を settings.json の env に設定すると、SSE idle が max(設定値, 5 分) になり、**byte watchdog へのリモート上書きも無効化される**。`API_TIMEOUT_MS` (documented、既定 10 分) も全体上限として併用。2026-07-29 に 3 面 (personal / emeradaco / emrd) へ `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000` / `API_TIMEOUT_MS=1200000` を適用済み。環境変数は起動時固定なので適用後に起動したセッションから有効
 
 ## 実用的な示唆 / ベストプラクティス
 
@@ -64,3 +69,14 @@
 | axum | 0.8.9 | 無し |
 
 考察: Cargo.lock 固定版のソースを確認した範囲で、macOS 上で 30 秒に発火するものは無い。唯一実動しうる reqwest の TCP keepalive は本現象と無関係 (別途 `docs/issue/2026-07-29-upstream-tcp-keepalive-library-default.md` に記録済み)。
+
+### 続報 (2026-07-29): 30 秒の正体
+
+- Claude Code v2.1.220 のバイナリ (`~/.local/share/claude/versions/2.1.220`) を直接 grep して実装を確認した
+- 該当コード (整形):
+  - SSE イベント idle: `max(CLAUDE_STREAM_IDLE_TIMEOUT_MS || 0, 300000)` = 既定 5 分、5 分未満へは下げられない
+  - byte watchdog: `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` が最優先 → 未設定かつ `CLAUDE_STREAM_IDLE_TIMEOUT_MS` も未設定なら **remote config `tengu_byte_stream_idle_timeout_ms`** (fallback: firstParty=180000ms) → clamp [10000ms, 1800000ms]
+  - `CLAUDE_STREAM_IDLE_TIMEOUT_MS` を設定すると remote config の分岐に入らなくなる (= 30 秒上書きが外れる)
+- 30 秒 gap の観測 5 件: 30073 / 30008 / 30095 / 30002 / 30010 ms。うち 2 件 (30095, 30010) は gap 後にストリームが再開しており、watchdog 発火とチャンク到達の競合で生き延びたケースと解釈できる
+- 追加の実例 (2026-07-28 19:45:05Z): req=769, body 1.70MB, 306.7 秒走行, 266.8 秒地点で 30002ms → クライアント切断。クライアント側エラー時刻とミリ秒一致
+- `API_FORCE_IDLE_TIMEOUT` (documented, v2.1.169+) は「5 分の idle タイムアウト」の有効/無効を制御する別系統で、今回の 30 秒とは別物
