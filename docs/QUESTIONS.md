@@ -20,40 +20,12 @@
 
 ## 裁定待ち
 
-### 👺GW-Q1: Bedrock 経路で `anthropic-beta` をどう扱うか
-
-実測 (Claude Code 2.1.220 の実リクエストを 8319 のプローブで観測):
-送られる beta は 8 個で、そのまま透過すると Bedrock は 400。
-**8 個中 4 個** (`oauth-2025-04-20` / `prompt-caching-scope-2026-01-05` /
-`advisor-tool-2026-03-01` / `extended-cache-ttl-2025-04-11`) を拒否する。
-beta 無しなら 200。
-
-**拒否フラグの集合はクライアントのバージョンで変わる**。llm-notes findings が
-測った束 (cpa の注入値) とは中身が違い、`thinking-token-count` /
-`advisor-tool` / `extended-cache-ttl` は findings に無かった新フラグだった。
-
-- [ ] a (推奨): **拒否リスト + 自己修復**。既定リストで除去し、`invalid beta flag`
-      の 400 を受けたら該当フラグを外して 1 回再試行、実行時リストに学習させる
-- [ ] b: 拒否リストのみ (自己修復なし)。設定で上書き可
-- [ ] c: Bedrock 向けは `anthropic-beta` を丸ごと落とす
-- [ ] d: 許可リストを設定に持ち、列挙されたものだけ通す (cpa の現行方式)
-
-a を推す理由: 固定リストだけだと、Claude Code が新しい beta を足した日に
-fable-5 が全滅する (今日それが起きた形跡がある = findings と実測の差)。
-自己修復があれば未知のフラグでも自動復旧する。
-c は安全側だが受理される 4 機能を捨てる。d は cpa 方式で、「束ごと置換」した結果
-`context-management` を落として実障害を出した前科がある (llm-notes DR-0001)。
-
-a の懸念: 再試行 1 回分のレイテンシが乗る (平常時は既定リストで回避)。
-学習がプロセス内メモリなので再起動でリセットされる (= 恒久化するなら
-設定ファイルへの書き戻しが要るが、cpa の書き戻し問題と同じ道になるので避けたい)。
-
 ### 👺GW-Q2: credential payload 分離で `email` / `last_refresh` をどちらに置くか
 
 credential json を「トップ = 運用設定 + `type`」「`payload` = プロバイダの生要素」に
 分ける方針は確定 (kawaz mid=47, mid=48)。境界が自明でないフィールドが 2 つある。
 
-- [ ] a (推奨): `email` → payload / `last_refresh` → トップ
+- [x] a (推奨): `email` → payload / `last_refresh` → トップ
 - [ ] b: 両方 payload
 - [ ] c: 両方トップ
 
@@ -64,7 +36,7 @@ gateway が書く運用メタデータでプロバイダ由来ではない。
 
 ### 👺GW-Q3: payload 分離で旧形式の読み込みを残すか
 
-- [ ] a (推奨): 残さない。新形式のみ読む
+- [x] a (推奨): 残さない。新形式のみ読む
 - [ ] b: `#[serde(untagged)]` で新旧両対応、書き込みは常に新形式
 
 a の理由: `login` サブコマンドがあれば再ログインで復旧できるので、読み込みコードを
