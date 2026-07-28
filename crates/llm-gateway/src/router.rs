@@ -144,7 +144,6 @@ impl Router {
         }
         drop(previous);
 
-        // エイリアスは、集まった一覧の中から一番新しいものへ向ける。
         let known: Vec<Model> = models
             .keys()
             .map(|id| Model {
@@ -153,14 +152,7 @@ impl Router {
                 created: 0,
             })
             .collect();
-        let aliases = self
-            .config
-            .resolved_aliases()
-            .into_iter()
-            .filter_map(|(alias, pattern)| {
-                discovery::resolve_alias(&pattern, &known).map(|target| (alias, target))
-            })
-            .collect();
+        let aliases = resolve_aliases(&self.config.resolved_aliases(), &known);
 
         info!(models = models.len(), "モデル一覧を更新しました");
         *self.catalog.write().await = Catalog {
@@ -352,13 +344,51 @@ impl Router {
                 created: 0,
             })
             .collect();
-        catalog.aliases = self
-            .config
-            .resolved_aliases()
-            .into_iter()
-            .filter_map(|(a, p)| discovery::resolve_alias(&p, &known).map(|t| (a, t)))
-            .collect();
+        catalog.aliases = self.config.resolved_aliases();
+        catalog.aliases = resolve_aliases(&catalog.aliases.clone(), &known);
     }
+}
+
+/// エイリアスを実際のモデル名まで解決する。
+///
+/// 値には実モデルのパターン (`claude-opus-*`) だけでなく、**別のエイリアス**も
+/// 書ける。`opus = "claude-opus"` / `claude-opus = "claude-opus-*"` のように
+/// 段を分けると、正式な短縮名と手癖の短縮名を別々に管理できる。
+///
+/// 循環 (`a = "b"`, `b = "a"`) を書いてしまった分は捨てる。名前解決が
+/// 戻ってこないより、そのエイリアスが無い方がまだ分かりやすい。
+fn resolve_aliases(
+    aliases: &BTreeMap<String, String>,
+    known: &[Model],
+) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::new();
+
+    for (name, value) in aliases {
+        let mut seen = vec![name.clone()];
+        let mut cursor = value.clone();
+
+        let target = loop {
+            // 実モデルに当たるならそれで確定。
+            if let Some(hit) = discovery::resolve_alias(&cursor, known) {
+                break Some(hit);
+            }
+            // 当たらないなら別のエイリアスを指しているとみなして辿る。
+            let Some(next) = aliases.get(&cursor) else {
+                break None;
+            };
+            if seen.contains(&cursor) {
+                warn!(alias = %name, "エイリアスが循環しています。この定義は使いません");
+                break None;
+            }
+            seen.push(cursor.clone());
+            cursor = next.clone();
+        };
+
+        if let Some(target) = target {
+            resolved.insert(name.clone(), target);
+        }
+    }
+    resolved
 }
 
 /// 認証情報を渡す先。gateway が持つ store をそのまま使う。
@@ -397,9 +427,14 @@ models = ["gpt-*"]
 credentials = ["cpa"]
 
 [aliases]
-fable = "claude-fable-*"
-opus = "claude-opus-*"
-haiku = "claude-haiku-*"
+# 正式な短縮名
+claude-fable = "claude-fable-*"
+claude-opus = "claude-opus-*"
+claude-haiku = "claude-haiku-*"
+# さらに短い名前 (上の短縮名を指す)
+fable = "claude-fable"
+opus = "claude-opus"
+haiku = "claude-haiku"
 "#;
 
     /// discovery 済みの状態を作る。
@@ -589,6 +624,50 @@ haiku = "claude-haiku-*"
                 .collect();
             assert_eq!(r.route_names(model).await, actual, "{model}");
         }
+    }
+
+    /// エイリアスがエイリアスを指してもよい。
+    ///
+    /// 長い短縮名と短い短縮名を分けて書けるようにするため。
+    #[tokio::test]
+    async fn aliases_can_point_at_other_aliases() {
+        let r = router().await;
+        assert_eq!(r.resolve("claude-opus").await, "claude-opus-5", "一段目");
+        assert_eq!(r.resolve("opus").await, "claude-opus-5", "二段目");
+        assert_eq!(r.resolve("fable").await, "claude-fable-5");
+        assert_eq!(r.resolve("haiku").await, "claude-haiku-4-5-20251001");
+    }
+
+    /// 循環したエイリアスは捨てる。名前解決が戻ってこないよりまし。
+    #[test]
+    fn circular_aliases_are_dropped() {
+        let known = vec![Model {
+            id: "claude-opus-5".into(),
+            upstream_id: "claude-opus-5".into(),
+            created: 0,
+        }];
+        let aliases = BTreeMap::from([
+            ("a".to_owned(), "b".to_owned()),
+            ("b".to_owned(), "a".to_owned()),
+            ("ok".to_owned(), "claude-opus-*".to_owned()),
+        ]);
+
+        let resolved = resolve_aliases(&aliases, &known);
+        assert!(!resolved.contains_key("a"), "循環は落とす");
+        assert!(!resolved.contains_key("b"));
+        assert_eq!(resolved["ok"], "claude-opus-5", "他は巻き添えにしない");
+    }
+
+    /// どこにも当たらないエイリアスは捨てる (一覧に出さない)。
+    #[test]
+    fn unresolvable_aliases_are_dropped() {
+        let known = vec![Model {
+            id: "claude-opus-5".into(),
+            upstream_id: "claude-opus-5".into(),
+            created: 0,
+        }];
+        let aliases = BTreeMap::from([("gone".to_owned(), "claude-gemini-*".to_owned())]);
+        assert!(resolve_aliases(&aliases, &known).is_empty());
     }
 
     /// エイリアスでも実際の経路を出す。
