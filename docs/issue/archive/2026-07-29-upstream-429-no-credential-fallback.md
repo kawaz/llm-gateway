@@ -1,6 +1,6 @@
 ---
 title: gateway が upstream 429 で次 credential にフォールバックしない
-status: open
+status: resolved
 category: bug
 created: 2026-07-29T11:21:46+09:00
 last_read: 2026-07-29T14:34:20+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T15:26:48+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0009","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
