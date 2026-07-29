@@ -133,20 +133,30 @@ pub async fn buffer(resp: Response) -> Result<(Response, Vec<u8>)> {
 
 /// この状態なら別の upstream を試す価値があるか。
 ///
-/// 経路が断たれている場合だけ切り替える。認証情報の側で断られた分は
-/// [`is_credential_denial`] が見る。
+/// 経路が断たれている場合だけ切り替える。応答を持ち回る値打ちのない失敗で、
+/// 中身は捨てる。断られた応答を残したまま切り替えるものは
+/// [`is_route_denial`] が見る。
 pub fn should_try_next(status: u16) -> bool {
     // 501 (未実装) は除く。別の経路に替えても実装されていないものは動かない。
     matches!(status, 500 | 502..=504)
 }
 
-/// この状態は、送った認証情報そのものが断られたか。
+/// この経路には断られたが、別の経路なら通りうるか。
 ///
-/// 上限もトークンの有効性もアカウント単位なので、別の認証情報を持つ経路なら
-/// 通る見込みがある。クライアント側の認証は gateway が namespace のトークンで
-/// 別に確かめているので、ここに来る 401 / 403 は upstream との間の話。
-pub fn is_credential_denial(status: u16) -> bool {
-    matches!(status, 401 | 403 | 429)
+/// 上限もトークンの有効性も混み具合も、この経路の向こう側 (アカウントと
+/// 宛先) に付く。並んでいる認証情報は別のアカウントで、宛先も
+/// Bedrock / Anthropic / 中継と分かれているので、ここが断ったことは
+/// 次が断ることを意味しない。
+///
+/// - 401 / 403: upstream との認証の話。クライアント側の認証は gateway が
+///   namespace のトークンで別に確かめている
+/// - 429: 上限はアカウント単位
+/// - 529: 宛先の混み具合。宛先が分かれている構成では、片方が詰まっていても
+///   もう片方は空いている (実測 2026-07-29)
+///
+/// 応答は捨てずに持ち回る。全部断られたときは、これをそのまま返す。
+pub fn is_route_denial(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429 | 529)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -177,11 +187,11 @@ mod tests {
         }
     }
 
-    /// 認証情報を断られた分は、経路断ではなく認証情報側の失敗として扱う。
+    /// この経路に断られた分は、経路断とは別に扱う (応答を持ち回る側)。
     #[test]
-    fn credential_denials_are_told_apart_from_outages() {
-        for status in [401, 403, 429] {
-            assert!(is_credential_denial(status), "{status} は認証情報側の失敗");
+    fn route_denials_are_told_apart_from_outages() {
+        for status in [401, 403, 429, 529] {
+            assert!(is_route_denial(status), "{status} はこの経路が断った");
             assert!(!should_try_next(status), "{status} は経路断ではない");
         }
     }
@@ -191,18 +201,15 @@ mod tests {
     fn does_not_switch_on_client_error() {
         for status in [400, 404, 422] {
             assert!(!should_try_next(status), "{status} は次を試さない");
-            assert!(
-                !is_credential_denial(status),
-                "{status} は認証情報のせいではない"
-            );
+            assert!(!is_route_denial(status), "{status} は経路のせいではない");
         }
     }
 
-    /// 経路断と成功は、認証情報を断られたわけではない。
+    /// 経路断と成功は、この経路に断られたわけではない。
     #[test]
-    fn outages_and_success_are_not_credential_denials() {
-        for status in [200, 500, 502, 503, 504, 529] {
-            assert!(!is_credential_denial(status), "{status}");
+    fn outages_and_success_are_not_route_denials() {
+        for status in [200, 500, 502, 503, 504] {
+            assert!(!is_route_denial(status), "{status}");
         }
     }
 

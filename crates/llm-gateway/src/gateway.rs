@@ -120,7 +120,7 @@ impl<P: Persistence> Gateway<P> {
             .await?;
 
         let mut attempts = Vec::new();
-        // 認証情報を断られた応答のうち、最後のもの。全滅したときに返す。
+        // この経路に断られた応答のうち、最後のもの。全滅したときに返す。
         let mut denied: Option<forward::Response> = None;
         for route in &routes {
             match self.try_route(route, path, query, &body, &headers).await {
@@ -427,7 +427,7 @@ fn support_of(spec: &CredentialSpec, observed: bool) -> usage::Support {
 /// 次の経路へ回す理由。
 struct Switch {
     reason: String,
-    /// 認証情報を断られた応答。次の経路が全滅したときにクライアントへ返す。
+    /// この経路に断られた応答。次の経路が全滅したときにクライアントへ返す。
     ///
     /// 本文は読まずに抱えたまま持ち回る。断られた応答は小さいので、後続を
     /// 試している間コネクションを握っていても割に合う。
@@ -450,7 +450,7 @@ fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Res
     if forward::should_try_next(resp.status) {
         return Err(Switch::to_next(reason));
     }
-    if forward::is_credential_denial(resp.status) {
+    if forward::is_route_denial(resp.status) {
         return Err(Switch {
             reason,
             denial: Some(resp),
@@ -916,6 +916,56 @@ credentials = ["a", "b"]
             Some("30"),
             "いつ再開できるかを伝える: {:?}",
             resp.headers
+        );
+    }
+
+    /// 混んでいる (529) 先も次へ回す。
+    ///
+    /// 混み具合は宛先ごとに付く。ここに並ぶ経路は宛先が分かれている
+    /// (Bedrock / Anthropic / 中継) ので、片方が詰まっていても、もう片方は
+    /// 空いている (実測 2026-07-29)。
+    #[tokio::test]
+    async fn an_overloaded_upstream_falls_back_to_the_next() {
+        let crowded = FakeUpstream::always(529).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&crowded.url, &spare.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert!(body_text(resp).await.contains("ok"));
+        assert_eq!((crowded.hits(), spare.hits()), (1, 1));
+    }
+
+    /// どの宛先も混んでいたら、最後に見た 529 をそのまま返す。
+    ///
+    /// 503 に化けさせると「落ちている」という別の事実になり、
+    /// クライアントのリトライの判断材料が変わる。
+    #[tokio::test]
+    async fn every_upstream_overloaded_returns_the_last_529() {
+        let first = FakeUpstream::always(529).await;
+        let last = FakeUpstream::start(|_, _| {
+            (
+                529,
+                r#"{"type":"error","error":{"message":"the last one"}}"#.to_owned(),
+            )
+        })
+        .await;
+        let gw = gateway(&two_credentials(&first.url, &last.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 529);
+        assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
+        assert!(
+            body_text(resp).await.contains("the last one"),
+            "最後に見た応答の本文がそのまま返る"
         );
     }
 
