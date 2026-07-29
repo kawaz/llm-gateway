@@ -3,6 +3,10 @@
 //! ボディは `model` だけ差し替え、あとはそのまま渡す。応答はヘッダを受け取った
 //! 時点で返し、本文はストリームのまま流す — Claude 系は SSE の形式が
 //! upstream 間で同じなので、解釈せずバイト列のまま中継できる。
+//!
+//! 要求の側が `Value` を受け取って組み立て直しているのは、ここが経路ごとに
+//! 何度も呼ばれるため。理由は受け取り口 (`llm-gateway-server` の `messages`)
+//! に書いてある。
 
 use futures_util::StreamExt as _;
 use serde_json::Value;

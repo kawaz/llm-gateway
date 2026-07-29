@@ -127,6 +127,20 @@ async fn messages<P: Persistence + 'static>(
     // 時間も、この番号の下に残したい。
     let span = relay::request_span();
 
+    // Design rationale: 応答は流すのに、要求は全部読んでから渡す。
+    //
+    // 要求の本文は 1 回で終わらない。どのモデルかを読まないと経路が決まらず
+    // (`Gateway::forward` の `model_of`)、決まった経路は上から順に試すので、
+    // 断られるたびに同じ本文を次の upstream へ送り直す。beta フラグを落として
+    // の送り直し (DR-0003) も同じ本文をもう 1 度使う。しかも送る内容は経路
+    // ごとに違う — 短い名前の解決や Bedrock の名前空間付与で `model` を
+    // 書き換えるため、経路の数だけ別の本文ができる。読み流しの本文は 1 度
+    // しか読めないので、この作りとは両立しない。
+    //
+    // 部分的に読んで `model` だけ差し替える手もあるが、JSON のキーの順は
+    // 決まっておらず `model` が長い `messages` の後ろに来ることもある。
+    // 結局そこまで抱えることになるうえ、送り直しのために抱え続ける必要は
+    // 変わらない。上限 (`MAX_BODY`) までのメモリを見込むのはその代償。
     let receiving = Instant::now();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
