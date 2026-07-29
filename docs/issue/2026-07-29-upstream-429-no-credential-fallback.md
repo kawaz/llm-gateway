@@ -3,7 +3,7 @@ title: gateway が upstream 429 で次 credential にフォールバックしな
 status: open
 category: bug
 created: 2026-07-29T11:21:46+09:00
-last_read:
+last_read: 2026-07-29T14:34:20+09:00
 open_entered: 2026-07-29T11:21:46+09:00
 wip_entered:
 blocked_entered:
