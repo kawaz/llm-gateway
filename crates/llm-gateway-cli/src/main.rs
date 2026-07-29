@@ -512,7 +512,8 @@ fn format_duration(secs: i64) -> String {
     } else if total_h >= 1 {
         format!("{total_h}h{m:02}m")
     } else {
-        format!("{total_m:02}m")
+        // `32m` だと `1h01m` / `1d01h` と桁が揃わず表が波打つ。`0h` を付けて幅を保つ。
+        format!("0h{m:02}m")
     }
 }
 
@@ -1047,7 +1048,7 @@ mod tests {
     fn renders_percentages_and_time_left() {
         let out = render(&report(vec![observed()]));
 
-        assert!(out.contains("71%/95%/16m"), "5h 窓:\n{out}");
+        assert!(out.contains("71%/95%/0h16m"), "5h 窓:\n{out}");
         assert!(out.contains("30%/43%/4d00h"), "7d 窓:\n{out}");
         assert!(
             !out.contains("分前"),
@@ -1180,9 +1181,9 @@ mod tests {
 
     #[test]
     fn format_duration_switches_units_by_magnitude() {
-        assert_eq!(format_duration(-1), "00m");
-        assert_eq!(format_duration(59), "00m");
-        assert_eq!(format_duration(181), "03m");
+        assert_eq!(format_duration(-1), "0h00m");
+        assert_eq!(format_duration(59), "0h00m");
+        assert_eq!(format_duration(181), "0h03m");
         assert_eq!(format_duration(3660), "1h01m");
         assert_eq!(format_duration(36_060), "10h01m");
         assert_eq!(format_duration(90_000 + 3600), "1d02h");
