@@ -430,7 +430,10 @@ fn window_field(
     let util_pct = util * 100.0;
     let elapsed_pct = calc_elapsed(reset, window_secs, now);
     let bar = dual_bar(util_pct, elapsed_pct, 10, color);
-    let remaining = format_duration(reset - now);
+    // 7d 窓は日〜分をまたいで幅が揺れるので、先頭単位を 2 桁にして 6 桁固定にする。
+    // 5h 窓は 10 時間に届かず 5 桁で揃うので、そのまま。
+    let wide = window_secs >= 86_400;
+    let remaining = format_duration(reset - now, wide);
     let info = dual_info(util_pct, elapsed_pct, &remaining, color);
     format!("{icon}{bar}{info}")
 }
@@ -498,7 +501,10 @@ fn dual_info(util_pct: f64, elapsed_pct: f64, remaining: &str, color: bool) -> S
 }
 
 /// 残り時間を `3h01m` / `1d20h` のような形式にする。(`formatDuration` の移植)
-fn format_duration(secs: i64) -> String {
+///
+/// `wide` なら先頭の単位を 2 桁にして `01d20h` / `00h32m` の 6 桁固定にする。
+/// 複数 credential を縦に並べる表で、日〜分をまたいでも桁が波打たないように。
+fn format_duration(secs: i64, wide: bool) -> String {
     let total_m = secs.max(0) / 60;
     let m = total_m % 60;
     let total_h = total_m / 60;
@@ -506,8 +512,12 @@ fn format_duration(secs: i64) -> String {
     let d = total_h / 24;
 
     if d > 0 {
-        format!("{d}d{h:02}h")
-    } else if total_h >= 10 {
+        if wide {
+            format!("{d:02}d{h:02}h")
+        } else {
+            format!("{d}d{h:02}h")
+        }
+    } else if wide || total_h >= 10 {
         format!("{total_h:02}h{m:02}m")
     } else if total_h >= 1 {
         format!("{total_h}h{m:02}m")
@@ -1049,7 +1059,7 @@ mod tests {
         let out = render(&report(vec![observed()]));
 
         assert!(out.contains("71%/95%/0h16m"), "5h 窓:\n{out}");
-        assert!(out.contains("30%/43%/4d00h"), "7d 窓:\n{out}");
+        assert!(out.contains("30%/43%/04d00h"), "7d 窓:\n{out}");
         assert!(
             !out.contains("分前"),
             "取得から間もないので古さは出さない:\n{out}"
@@ -1181,12 +1191,23 @@ mod tests {
 
     #[test]
     fn format_duration_switches_units_by_magnitude() {
-        assert_eq!(format_duration(-1), "0h00m");
-        assert_eq!(format_duration(59), "0h00m");
-        assert_eq!(format_duration(181), "0h03m");
-        assert_eq!(format_duration(3660), "1h01m");
-        assert_eq!(format_duration(36_060), "10h01m");
-        assert_eq!(format_duration(90_000 + 3600), "1d02h");
+        assert_eq!(format_duration(-1, false), "0h00m");
+        assert_eq!(format_duration(59, false), "0h00m");
+        assert_eq!(format_duration(181, false), "0h03m");
+        assert_eq!(format_duration(3660, false), "1h01m");
+        assert_eq!(format_duration(36_060, false), "10h01m");
+        assert_eq!(format_duration(90_000 + 3600, false), "1d02h");
+    }
+
+    /// 7d 窓用の wide は、日〜分のどこでも 6 桁に揃う。
+    #[test]
+    fn wide_duration_is_always_six_columns() {
+        assert_eq!(format_duration(59, true), "00h00m");
+        assert_eq!(format_duration(32 * 60, true), "00h32m");
+        assert_eq!(format_duration(3660, true), "01h01m");
+        assert_eq!(format_duration(36_060, true), "10h01m");
+        assert_eq!(format_duration(90_000 + 3600, true), "01d02h");
+        assert_eq!(format_duration(86_400 * 10 + 3600, true), "10d01h");
     }
 
     #[test]
