@@ -3,7 +3,7 @@ title: credential をプロセス間で共有する前提の残課題 (同時 re
 status: open
 category: design
 created: 2026-07-28T23:14:54+09:00
-last_read:
+last_read: 2026-07-29T21:02:12+09:00
 open_entered: 2026-07-28T23:14:54+09:00
 wip_entered:
 blocked_entered:
