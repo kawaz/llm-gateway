@@ -11,6 +11,7 @@
 - [DR-0007](./DR-0007-usage-visibility.md) — 全 credential の利用量 (5h/7d 使用率・リセット時刻) を /llm-gateway/usage で一括表示する
 - [DR-0008](./DR-0008-user-facing-language.md) — プログラムが出す文言 (JSON 値 / error / help) は英語にする。新規から適用
 - [DR-0009](./DR-0009-credential-denial-fallback.md) — 401/403/429 は認証情報を断られたとみなして次の経路を試す。全滅時は最後の応答を透過し、affinity は 2xx かつ namespace 単位で覚える
+- [DR-0010](./DR-0010-credential-cross-process-lock.md) — 認証情報の書き換えを `.lock` サイドカーの flock でプロセス間排他し、控えは版 (mtime) の照合で鮮度を保つ
 
 ## Archived
 

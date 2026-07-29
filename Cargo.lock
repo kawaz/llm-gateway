@@ -752,6 +752,7 @@ dependencies = [
  "futures-util",
  "rand",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

@@ -43,8 +43,29 @@ impl fmt::Display for CredentialId {
 /// 当面の実装は平文ファイル ([`file::FileStore`])。cache-warden の
 /// 永続化が固まったらそちらへ移す。移行で得られるのは暗号化だけでなく、
 /// 「同じ Team ID で署名されたバイナリからしか読めない」というアクセス制御。
-pub trait Persistence: Send + Sync {
+pub trait Persistence: Send + Sync + 'static {
+    /// 書き換えの権利。持っている間だけ、同じ置き場を使う他のプロセスを
+    /// 締め出せる。手放す (drop する) と待っている相手が起きる。
+    type Guard: Send;
+
     fn load(&self, id: &CredentialId) -> Result<StoredCredential>;
     fn store(&self, id: &CredentialId, value: &StoredCredential) -> Result<()>;
     fn list(&self) -> Result<Vec<CredentialId>>;
+
+    /// 書き換えの権利を取る。取れるまで待つ。
+    ///
+    /// 待ちは呼び出し元をブロックするので、非同期の側から呼ぶときは
+    /// ブロックしてよい場所へ逃がすこと。
+    fn lock(&self, id: &CredentialId) -> Result<Self::Guard>;
+
+    /// 今の中身の版。
+    ///
+    /// 読んだときと値が違えば、他の誰かが書いたと分かる。**同じ値なら
+    /// 変わっていないとみなす** — 別物になったのに同じ値が返る置き場では、
+    /// その入れ替わりを見落とす (`FileStore` は更新時刻のナノ秒。同じ
+    /// 時刻が 2 度使われる粒度の置き場では取りこぼす)。
+    ///
+    /// 版が無い置き場や、中身がまだ無い場合は `None`。`None` 同士も
+    /// 「変わっていない」側。
+    fn version(&self, id: &CredentialId) -> Option<u64>;
 }

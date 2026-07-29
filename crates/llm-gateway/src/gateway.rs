@@ -613,6 +613,9 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     }
 
     impl Persistence for StaticStore {
+        /// 置き場を共有する相手がいないので、締め出すものが無い。
+        type Guard = ();
+
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
             Ok(self.0.lock().unwrap().clone())
         }
@@ -622,6 +625,13 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         }
         fn list(&self) -> Result<Vec<CredentialId>> {
             Ok(vec![])
+        }
+        fn lock(&self, _id: &CredentialId) -> Result<Self::Guard> {
+            Ok(())
+        }
+        /// 版を持たない。書き換えるのは自分だけなので、控えを疑う理由が無い。
+        fn version(&self, _id: &CredentialId) -> Option<u64> {
+            None
         }
     }
 

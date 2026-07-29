@@ -31,9 +31,22 @@ impl FileStore {
     fn path_of(&self, id: &CredentialId) -> PathBuf {
         self.dir.join(format!("{}.json", id.as_str()))
     }
+
+    /// 排他に使う脇のファイル。中身は空で、開けること自体に意味がある。
+    fn lock_path_of(&self, id: &CredentialId) -> PathBuf {
+        self.dir.join(format!("{}.json.lock", id.as_str()))
+    }
+}
+
+/// 書き換えの権利。落とすと flock が外れ、待っている相手が起きる。
+pub struct FileGuard {
+    /// 開いたまま抱えておくためだけに持つ。閉じるとロックが外れる。
+    _file: fs::File,
 }
 
 impl Persistence for FileStore {
+    type Guard = FileGuard;
+
     fn load(&self, id: &CredentialId) -> Result<StoredCredential> {
         let path = self.path_of(id);
         let raw = fs::read_to_string(&path).map_err(|e| Error::Credential {
@@ -57,7 +70,9 @@ impl Persistence for FileStore {
     /// rename すれば、読み手からは切り替わる前か後のどちらかしか見えない。
     fn store(&self, id: &CredentialId, value: &StoredCredential) -> Result<()> {
         let path = self.path_of(id);
-        let tmp = path.with_extension("json.tmp");
+        // 一時ファイルの名前に書き手を混ぜる。共通の名前だと、同時に書いた
+        // 2 者が同じファイルを切り詰め合い、混ざった JSON が rename される。
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
 
         let json = serde_json::to_vec_pretty(value)?;
         {
@@ -70,6 +85,41 @@ impl Persistence for FileStore {
         }
         fs::rename(&tmp, &path)?;
         Ok(())
+    }
+
+    /// 脇の `.lock` ファイルを掴む。掴めるまで待つ。
+    ///
+    /// ロックを認証情報そのものに付けない。書き換えは rename で行うので、
+    /// 掴んだファイルは書き換えの瞬間に古い中身のほうへ取り残され、後から
+    /// 来た相手は別のファイルを掴んで素通りする。名前が動かない脇の
+    /// ファイルなら、全員が同じ 1 つを待つ。この `.lock` は消さない
+    /// (消して作り直すと、既に掴んでいる側と後から来た側が別のファイルを
+    /// 見ることになり、同じ理由で締め出しが破れる)。
+    fn lock(&self, id: &CredentialId) -> Result<Self::Guard> {
+        let path = self.lock_path_of(id);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        restrict(&path, 0o600)?;
+        loop {
+            match rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive) {
+                Ok(()) => return Ok(FileGuard { _file: file }),
+                // 待っている間にシグナルが届くと中断される。掴むのをやめる
+                // 理由ではないので待ち直す。
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(std::io::Error::from(e).into()),
+            }
+        }
+    }
+
+    /// 更新時刻を版として使う。書き換えは rename なので、中身が入れ替われば
+    /// 必ず動く。
+    fn version(&self, id: &CredentialId) -> Option<u64> {
+        let modified = fs::metadata(self.path_of(id)).ok()?.modified().ok()?;
+        let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(since_epoch.as_nanos() as u64)
     }
 
     fn list(&self) -> Result<Vec<CredentialId>> {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
-use llm_gateway::credential::{CredentialId, Kind, Persistence as _, oauth};
+use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
 use llm_gateway::usage::{CredentialUsage, Report, Window};
 use llm_gateway::{Config, Gateway};
 
@@ -592,6 +592,25 @@ fn is_wide(c: char) -> bool {
         | 0xFE30..=0xFE6F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD)
 }
 
+/// 認可で得た token を置き場に書く。
+///
+/// 土台を読んでから書くまでを締め出す (DR-0010)。再ログインするのは refresh
+/// token が失効したときで、その裏では常駐している側が同じ認証情報の更新を
+/// 試している。締め出さないと、認可の結果と相手の書き込みが互いを消し合う。
+fn save<P: Persistence>(
+    store: &P,
+    id: &CredentialId,
+    kind: Kind,
+    tokens: &oauth::Tokens,
+) -> llm_gateway::Result<StoredCredential> {
+    let _guard = store.lock(id)?;
+    // 既にあれば、その内容を土台にする (priority や除外リストを消さない)。
+    let existing = store.load(id).ok();
+    let credential = tokens.to_stored(kind, existing.as_ref());
+    store.store(id, &credential)?;
+    Ok(credential)
+}
+
 /// `login` に渡された内容。
 #[derive(Debug, PartialEq, Eq)]
 struct LoginArgs {
@@ -632,16 +651,9 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
         println!("ブラウザの画面はその結果が出るまで待ちます。");
         open_browser(authorization.url());
 
-        // 既にあれば、その内容を土台にする (priority や除外リストを消さない)。
-        let existing = store.load(&id).ok();
-
         // 交換・確認・保存が全部済んでから、ブラウザにも端末にも結果が出る。
         let credential = authorization
-            .finish(|tokens| {
-                let credential = tokens.to_stored(kind, existing.as_ref());
-                store.store(&id, &credential)?;
-                Ok(credential)
-            })
+            .finish(|tokens| save(&store, &id, kind, tokens))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -828,9 +840,131 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// 置き場に何をした順に、何をしたかを覚える偽物。
+    #[derive(Default)]
+    struct Recorder {
+        steps: Arc<Mutex<Vec<&'static str>>>,
+        current: Mutex<Option<StoredCredential>>,
+    }
+
+    /// 手放したことも記録に残す。締め出しっぱなしを見つけるため。
+    struct Mark(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().push("unlock");
+        }
+    }
+
+    impl Recorder {
+        fn holding(c: StoredCredential) -> Self {
+            Self {
+                steps: Arc::default(),
+                current: Mutex::new(Some(c)),
+            }
+        }
+
+        fn note(&self, step: &'static str) {
+            self.steps.lock().unwrap().push(step);
+        }
+
+        fn steps(&self) -> Vec<&'static str> {
+            self.steps.lock().unwrap().clone()
+        }
+    }
+
+    impl Persistence for Recorder {
+        type Guard = Mark;
+
+        fn load(&self, _id: &CredentialId) -> llm_gateway::Result<StoredCredential> {
+            self.note("load");
+            self.current
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| llm_gateway::Error::Credential {
+                    id: "c".to_owned(),
+                    reason: "not stored yet".to_owned(),
+                })
+        }
+        fn store(&self, _id: &CredentialId, v: &StoredCredential) -> llm_gateway::Result<()> {
+            self.note("store");
+            *self.current.lock().unwrap() = Some(v.clone());
+            Ok(())
+        }
+        fn list(&self) -> llm_gateway::Result<Vec<CredentialId>> {
+            Ok(vec![])
+        }
+        fn lock(&self, _id: &CredentialId) -> llm_gateway::Result<Self::Guard> {
+            self.note("lock");
+            Ok(Mark(Arc::clone(&self.steps)))
+        }
+        fn version(&self, _id: &CredentialId) -> Option<u64> {
+            None
+        }
+    }
+
+    fn fresh_tokens() -> oauth::Tokens {
+        oauth::Tokens {
+            access_token: "at-new".into(),
+            refresh_token: "rt-new".into(),
+            expires_in: 28_800,
+            email: Some("someone@example.com".into()),
+            account_id: None,
+        }
+    }
+
+    /// 認可の結果を書くまでの間、置き場を締め出す。
+    ///
+    /// 再ログインは refresh token が失効したときに走るので、常駐している側が
+    /// 同じ認証情報の更新を試している最中に当たりやすい。
+    #[test]
+    fn a_login_writes_under_the_lock() {
+        let disk = Recorder::default();
+        let id = CredentialId::new("c");
+
+        save(&disk, &id, Kind::Claude, &fresh_tokens()).unwrap();
+
+        assert_eq!(
+            disk.steps(),
+            vec!["lock", "load", "store", "unlock"],
+            "土台を読む前に締め出し、書き終えてから手放す"
+        );
+    }
+
+    /// 締め出している間に読み直すので、運用側の値を土台のまま引き継げる。
+    #[test]
+    fn a_login_keeps_what_the_operator_set() {
+        let mut existing = StoredCredential::new(llm_gateway::credential::Payload::ClaudeOauth(
+            llm_gateway::credential::OauthTokens {
+                access_token: "at-old".into(),
+                refresh_token: "rt-old".into(),
+                expired: "2026-07-28T02:54:00+09:00".into(),
+                email: "someone@example.com".into(),
+                extra: Default::default(),
+            },
+        ));
+        existing.priority = 10;
+        existing.excluded_models = vec!["claude-opus-*".to_owned()];
+
+        let disk = Recorder::holding(existing);
+        let saved = save(
+            &disk,
+            &CredentialId::new("c"),
+            Kind::Claude,
+            &fresh_tokens(),
+        )
+        .unwrap();
+
+        assert_eq!(saved.payload.secret(), "at-new");
+        assert_eq!(saved.priority, 10);
+        assert_eq!(saved.excluded_models, vec!["claude-opus-*"]);
     }
 
     fn parse(list: &[&str]) -> Result<LoginArgs, String> {

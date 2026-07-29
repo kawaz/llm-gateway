@@ -322,6 +322,9 @@ pub(crate) mod tests {
     struct StaticStore;
 
     impl Persistence for StaticStore {
+        /// 置き場を共有する相手がいないので、締め出すものが無い。
+        type Guard = ();
+
         fn load(&self, _id: &CredentialId) -> llm_gateway::Result<StoredCredential> {
             Ok(StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
                 access_token: "tok".into(),
@@ -337,6 +340,13 @@ pub(crate) mod tests {
         }
         fn list(&self) -> llm_gateway::Result<Vec<CredentialId>> {
             Ok(vec![])
+        }
+        fn lock(&self, _id: &CredentialId) -> llm_gateway::Result<Self::Guard> {
+            Ok(())
+        }
+        /// 版を持たない。中身が動かないので控えを疑う理由が無い。
+        fn version(&self, _id: &CredentialId) -> Option<u64> {
+            None
         }
     }
 

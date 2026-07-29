@@ -3,6 +3,10 @@
 //! 期限が近ければ更新してから返す。同じ認証情報への同時要求は 1 回の更新に
 //! 束ね、全員が同じ結果を受け取る。束ねないと、並行リクエストの数だけ更新が
 //! 走り、後発が `refresh_token_reused` で弾かれて再ログインが要る状態に落ちる。
+//!
+//! 置き場は他のプロセスとも共有しているので、束ねるだけでは足りない。書き換え
+//! の間は置き場のロックで締め出し、読み出しでは控えの版を照合して相手の書き
+//! 込みに気づく (DR-0010)。
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -58,13 +62,24 @@ impl Credential {
 /// 更新の結果を待っている側へ配るための合図。
 type RefreshSignal = broadcast::Sender<std::result::Result<(), String>>;
 
+/// 控えの 1 件。読んだ時点の版を一緒に持つ。
+///
+/// 版を持たないと、他のプロセスが書いた結果に期限切れまで気づけない。
+#[derive(Clone)]
+struct Cached {
+    value: Arc<StoredCredential>,
+    version: Option<u64>,
+}
+
 pub struct CredentialStore<P: Persistence> {
-    persistence: P,
+    /// ロックを取る待ち時間はブロックするので、置き場ごと別スレッドへ
+    /// 渡せるように抱える。
+    persistence: Arc<P>,
     http: reqwest::Client,
     /// 進行中の更新。同じ id への 2 人目以降はここに相乗りする。
     in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
     /// 読み出しのたびにファイルを開かないための控え。
-    cache: RwLock<HashMap<CredentialId, Arc<StoredCredential>>>,
+    cache: RwLock<HashMap<CredentialId, Cached>>,
     clock: Clock,
     /// 更新先の差し替え口。テストで手元のサーバへ向けるために持つ。
     token_url_override: Option<String>,
@@ -98,7 +113,7 @@ impl<P: Persistence> CredentialStore<P> {
 
     fn with_clock(persistence: P, http: reqwest::Client, clock: Clock) -> Self {
         Self {
-            persistence,
+            persistence: Arc::new(persistence),
             http,
             in_flight: Mutex::new(HashMap::new()),
             cache: RwLock::new(HashMap::new()),
@@ -129,6 +144,10 @@ impl<P: Persistence> CredentialStore<P> {
         if flags.is_empty() {
             return Ok(());
         }
+        // 読んで直して書くまでの間、他のプロセスを締め出す。挟まれると、
+        // 相手が書いた更新を古い土台で上書きして消す。
+        let _guard = self.lock(id).await?;
+
         // 控えではなく置き場から積み直す。控えを土台にすると、別のプロセスが
         // 更新した token を古い値で上書きして消す。
         let current = self.reload(id).await?;
@@ -136,14 +155,31 @@ impl<P: Persistence> CredentialStore<P> {
         next.record_denied_beta(flags, self.clock.now_unix());
 
         self.persistence.store(id, &next)?;
-        self.cache.write().await.insert(id.clone(), Arc::new(next));
+        self.remember(id, next).await;
         Ok(())
     }
 
-    /// 現在の内容を返す。控えがあればそれを使う。
+    /// 書き換えの権利を取る。手放すのは戻り値を落としたとき。
+    ///
+    /// 取れるまでの待ちはブロックするので、専用のスレッドへ逃がす。待ちの
+    /// 間は寝ていて、相手が手放した時点で起きる (様子を見に行かない)。
+    async fn lock(&self, id: &CredentialId) -> Result<P::Guard> {
+        let persistence = Arc::clone(&self.persistence);
+        let owned = id.clone();
+        tokio::task::spawn_blocking(move || persistence.lock(&owned))
+            .await
+            .map_err(|e| Error::Credential {
+                id: id.to_string(),
+                reason: format!("could not wait for the credential lock: {e}"),
+            })?
+    }
+
+    /// 現在の内容を返す。控えが今の版のままならそれを使う。
     async fn read(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
-        if let Some(hit) = self.cache.read().await.get(id) {
-            return Ok(Arc::clone(hit));
+        if let Some(hit) = self.cache.read().await.get(id)
+            && hit.version == self.persistence.version(id)
+        {
+            return Ok(Arc::clone(&hit.value));
         }
         self.reload(id).await
     }
@@ -154,12 +190,34 @@ impl<P: Persistence> CredentialStore<P> {
     /// 他のプロセスが書いた結果に気づけない。書き込みの前と、refresh token を
     /// 使う前は、ここを通って最新を掴む。
     async fn reload(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
-        let loaded = Arc::new(self.persistence.load(id)?);
-        self.cache
-            .write()
-            .await
-            .insert(id.clone(), Arc::clone(&loaded));
-        Ok(loaded)
+        // 版を先に見る。読んだ後に見ると、読み終えてから書かれた中身を
+        // 「今の版」として覚え、その更新に気づけなくなる。逆の順なら、
+        // 取りこぼしても次の読み出しで版が食い違って読み直しになる。
+        let version = self.persistence.version(id);
+        let value = Arc::new(self.persistence.load(id)?);
+        self.cache.write().await.insert(
+            id.clone(),
+            Cached {
+                value: Arc::clone(&value),
+                version,
+            },
+        );
+        Ok(value)
+    }
+
+    /// 自分が書いた内容を控えに載せる。
+    ///
+    /// 版は書いた後に読む。書き換えの権利を持っている間しか呼ばないので、
+    /// この間に他のプロセスが割り込むことはない。
+    async fn remember(&self, id: &CredentialId, value: StoredCredential) {
+        let version = self.persistence.version(id);
+        self.cache.write().await.insert(
+            id.clone(),
+            Cached {
+                value: Arc::new(value),
+                version,
+            },
+        );
     }
 
     fn needs_refresh(&self, c: &StoredCredential) -> bool {
@@ -221,6 +279,12 @@ impl<P: Persistence> CredentialStore<P> {
     /// 使えないので、控えを信じて走ると、同じ置き場を共有する別のプロセスが
     /// 既に使い切った値を送ることになる。
     async fn do_refresh(&self, id: &CredentialId) -> Result<()> {
+        // 読み直しから保存までを丸ごと締め出す。同じ置き場を使う別のプロセスは
+        // ここで待たされ、権利を得た時点の読み直しで「相手が済ませた」と分かり、
+        // 更新に入らずに済む。束ねているのは同じプロセスの中だけなので、
+        // ここに来るのは 1 プロセスにつき 1 本。
+        let _guard = self.lock(id).await?;
+
         let current = self.reload(id).await?;
         let (Some(kind), Some(refresh_token)) = (
             current.payload.oauth_kind(),
@@ -288,7 +352,7 @@ impl<P: Persistence> CredentialStore<P> {
         // 保存に失敗するよりはよい (次回起動時に古い token で動こうとして
         // 弾かれ、原因が分からなくなる)。
         self.persistence.store(id, &next)?;
-        self.cache.write().await.insert(id.clone(), Arc::new(next));
+        self.remember(id, next).await;
         Ok(())
     }
 
@@ -305,6 +369,7 @@ impl<P: Persistence> CredentialStore<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::file::FileStore;
     use crate::credential::stored::{ApiKey, OauthTokens, Payload, StoredCredential};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -348,6 +413,10 @@ mod tests {
         loads: AtomicUsize,
         /// 何回目の読み出しで、何に入れ替わるか。
         swap: StdMutex<Option<(usize, StoredCredential)>>,
+        /// 中身が入れ替わるたびに進む版。
+        version: AtomicUsize,
+        /// 書き換えの権利。プロセスをまたがないので、ただの Mutex で足りる。
+        guard: Arc<tokio::sync::Mutex<()>>,
     }
 
     impl Spy {
@@ -357,6 +426,8 @@ mod tests {
                 stores: AtomicUsize::new(0),
                 loads: AtomicUsize::new(0),
                 swap: StdMutex::new(None),
+                version: AtomicUsize::new(0),
+                guard: Arc::new(tokio::sync::Mutex::new(())),
             }
         }
 
@@ -368,6 +439,8 @@ mod tests {
     }
 
     impl Persistence for Spy {
+        type Guard = tokio::sync::OwnedMutexGuard<()>;
+
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
             let n = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
             let mut swap = self.swap.lock().unwrap();
@@ -376,16 +449,24 @@ mod tests {
             {
                 *self.current.lock().unwrap() = next.clone();
                 *swap = None;
+                self.version.fetch_add(1, Ordering::SeqCst);
             }
             Ok(self.current.lock().unwrap().clone())
         }
         fn store(&self, _id: &CredentialId, value: &StoredCredential) -> Result<()> {
             *self.current.lock().unwrap() = value.clone();
             self.stores.fetch_add(1, Ordering::SeqCst);
+            self.version.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         fn list(&self) -> Result<Vec<CredentialId>> {
             Ok(vec![CredentialId::new("c")])
+        }
+        fn lock(&self, _id: &CredentialId) -> Result<Self::Guard> {
+            Ok(Arc::clone(&self.guard).blocking_lock_owned())
+        }
+        fn version(&self, _id: &CredentialId) -> Option<u64> {
+            Some(self.version.load(Ordering::SeqCst) as u64)
         }
     }
 
@@ -404,37 +485,81 @@ mod tests {
     struct FakeTokenServer {
         url: String,
         hits: Arc<AtomicUsize>,
+        /// 要求が届いた合図。届いた時点を掴めないと、更新の最中に何かを
+        /// させる試験が「たぶんこの辺」になる。
+        arrived: Arc<tokio::sync::Notify>,
+        hold: Hold,
+    }
+
+    /// 応答をいつ返すか。
+    #[derive(Clone)]
+    enum Hold {
+        /// 決めた時間だけ待つ。
+        For(std::time::Duration),
+        /// [`FakeTokenServer::release`] で開くまで待つ。
+        Until(Arc<tokio::sync::watch::Sender<bool>>),
+    }
+
+    impl Hold {
+        async fn wait(&self) {
+            match self {
+                Self::For(d) => tokio::time::sleep(*d).await,
+                // 一度開いたら開きっぱなし。1 本だけ通す作りにすると、
+                // 締め出しが壊れて要求が 2 本来たときに試験が落ちずに
+                // 止まってしまい、原因が見えない。
+                Self::Until(gate) => {
+                    let mut open = gate.subscribe();
+                    let _ = open.wait_for(|open| *open).await;
+                }
+            }
+        }
     }
 
     impl FakeTokenServer {
         async fn start(delay: std::time::Duration) -> Self {
-            Self::start_with(delay, false).await
+            Self::start_with(Hold::For(delay), false).await
+        }
+
+        /// 応答を握ったまま待つサーバ。
+        ///
+        /// 更新の最中に相手が何をしているかを見てから先へ進めたいときに使う。
+        /// 時間で待つと「間に合ったから通った」試験になり、締め出しが効いて
+        /// いるのか単に速かったのか区別がつかない。
+        async fn start_gated() -> Self {
+            let gate = Arc::new(tokio::sync::watch::Sender::new(false));
+            Self::start_with(Hold::Until(gate), false).await
         }
 
         /// 更新を断るサーバ。refresh token が既に使われていた状況。
         async fn start_rejecting() -> Self {
-            Self::start_with(std::time::Duration::ZERO, true).await
+            Self::start_with(Hold::For(std::time::Duration::ZERO), true).await
         }
 
-        async fn start_with(delay: std::time::Duration, reject: bool) -> Self {
+        async fn start_with(hold: Hold, reject: bool) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
+            let arrived = Arc::new(tokio::sync::Notify::new());
 
             let counter = Arc::clone(&hits);
+            let bell = Arc::clone(&arrived);
+            let holding = hold.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         return;
                     };
                     let counter = Arc::clone(&counter);
+                    let bell = Arc::clone(&bell);
+                    let holding = holding.clone();
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
                         let mut buf = vec![0u8; 8192];
                         let _ = sock.read(&mut buf).await;
                         counter.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(delay).await;
+                        bell.notify_one();
+                        holding.wait().await;
 
                         let n = counter.load(Ordering::SeqCst);
                         let (status, body) = if reject {
@@ -461,11 +586,29 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Self {
                 url: format!("http://{addr}/oauth/token"),
                 hits,
+                arrived,
+                hold,
             }
         }
 
         fn hits(&self) -> usize {
             self.hits.load(Ordering::SeqCst)
+        }
+
+        /// 要求が 1 本届くまで待つ。届いた時点で、更新を始めた側は
+        /// 応答待ちに入っている。
+        async fn wait_for_hit(&self) {
+            self.arrived.notified().await;
+        }
+
+        /// 握っていた応答を返す。以後の要求も待たせない。
+        fn release(&self) {
+            match &self.hold {
+                Hold::Until(gate) => {
+                    gate.send_replace(true);
+                }
+                Hold::For(_) => panic!("時間で待つサーバに release は無い"),
+            }
         }
     }
 
@@ -473,6 +616,275 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let mut store = store_sharing(disk);
         store.token_url_override = Some(server.url.clone());
         store
+    }
+
+    /// 同じディレクトリを見る別プロセスぶんの窓口。
+    ///
+    /// flock は同じプロセスの別の fd どうしでも競合するので、置き場を
+    /// 開き直せば「もう 1 つのプロセス」として通る。
+    fn another_process(
+        dir: &std::path::Path,
+        server: Option<&FakeTokenServer>,
+    ) -> CredentialStore<FileStore> {
+        process_over(FileStore::open(dir).unwrap(), server)
+    }
+
+    fn process_over<P: Persistence>(
+        disk: P,
+        server: Option<&FakeTokenServer>,
+    ) -> CredentialStore<P> {
+        let mut store =
+            CredentialStore::with_clock(disk, reqwest::Client::new(), Clock::Fixed(NOW));
+        store.token_url_override = server.map(|s| s.url.clone());
+        store
+    }
+
+    /// 置き場の出入りを共有の帳面に残す包み。
+    ///
+    /// 結果だけを見る試験は、締め出しが効いたのか単にすれ違わなかったのかを
+    /// 区別できない。誰がいつ待たされ、いつ掴み、いつ書いたかを順に残して
+    /// おけば、順序そのものを確かめられる。
+    struct Watched {
+        inner: FileStore,
+        who: &'static str,
+        log: Log,
+        /// 締め出しに入った合図。ここまで進めてから先へ動かす。
+        entering: Arc<tokio::sync::Notify>,
+    }
+
+    type Log = Arc<StdMutex<Vec<String>>>;
+
+    fn log() -> Log {
+        Arc::default()
+    }
+
+    impl Watched {
+        fn open(dir: &std::path::Path, who: &'static str, log: &Log) -> Self {
+            Self {
+                inner: FileStore::open(dir).unwrap(),
+                who,
+                log: Arc::clone(log),
+                entering: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        fn note(&self, what: &str) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{} {what}", self.who));
+        }
+
+        fn bell(&self) -> Arc<tokio::sync::Notify> {
+            Arc::clone(&self.entering)
+        }
+    }
+
+    /// 手放したことも帳面に残す権利。
+    struct Noted {
+        who: &'static str,
+        log: Log,
+        /// 先に落とすと、待っている側が起きてから記録することになる。
+        /// [`Drop`] の本体はフィールドより先に走るので順序は保たれる。
+        _inner: <FileStore as Persistence>::Guard,
+    }
+
+    impl Drop for Noted {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push(format!("{} frees", self.who));
+        }
+    }
+
+    impl Persistence for Watched {
+        type Guard = Noted;
+
+        fn load(&self, id: &CredentialId) -> Result<StoredCredential> {
+            self.inner.load(id)
+        }
+        fn store(&self, id: &CredentialId, value: &StoredCredential) -> Result<()> {
+            self.note("writes");
+            self.inner.store(id, value)
+        }
+        fn list(&self) -> Result<Vec<CredentialId>> {
+            self.inner.list()
+        }
+        fn lock(&self, id: &CredentialId) -> Result<Self::Guard> {
+            // 掴みに行く直前に知らせる。相手が持っている限り、この後は待つ。
+            self.note("waits");
+            self.entering.notify_one();
+            let inner = self.inner.lock(id)?;
+            self.note("holds");
+            Ok(Noted {
+                who: self.who,
+                log: Arc::clone(&self.log),
+                _inner: inner,
+            })
+        }
+        fn version(&self, id: &CredentialId) -> Option<u64> {
+            self.inner.version(id)
+        }
+    }
+
+    /// 置き場に認証情報を 1 つ置く。
+    fn place(dir: &std::path::Path, c: StoredCredential) -> CredentialId {
+        let id = CredentialId::new("c");
+        FileStore::open(dir).unwrap().store(&id, &c).unwrap();
+        id
+    }
+
+    /// 2 つのプロセスが同時に期限切れを見つけても、更新は 1 回で済む。
+    ///
+    /// 束ねているのはプロセスの中だけなので、ここが崩れると 2 本目が
+    /// 使用済みの refresh token を送って弾かれる。
+    ///
+    /// 順番は待ち合わせで作る: 先行が応答待ちに入り、後発が期限切れを読んで
+    /// 締め出しに突き当たったところまで進めてから、応答を返す。
+    #[tokio::test]
+    async fn two_processes_share_one_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = FakeTokenServer::start_gated().await;
+        let id = place(dir.path(), cred(&at(-1)));
+        let log = log();
+
+        let ahead = Arc::new(process_over(
+            Watched::open(dir.path(), "ahead", &log),
+            Some(&server),
+        ));
+        let behind = Arc::new(process_over(
+            Watched::open(dir.path(), "behind", &log),
+            Some(&server),
+        ));
+        let waiting = behind.persistence.bell();
+
+        let first = {
+            let (store, id) = (Arc::clone(&ahead), id.clone());
+            tokio::spawn(async move { store.acquire(&id).await })
+        };
+        // 更新先に要求が届いた = 先行は権利を持ったまま応答待ち。
+        server.wait_for_hit().await;
+
+        let second = {
+            let (store, id) = (Arc::clone(&behind), id.clone());
+            tokio::spawn(async move { store.acquire(&id).await })
+        };
+        // 後発は期限切れを読み終え、締め出しに突き当たっている。
+        waiting.notified().await;
+
+        server.release();
+        let ahead_token = first.await.unwrap().unwrap().bearer();
+        let behind_token = second
+            .await
+            .unwrap()
+            .expect("負けた側も失敗しない")
+            .bearer();
+
+        assert_eq!(server.hits(), 1, "更新先を叩くのは 1 回だけ");
+        assert_eq!(ahead_token, "Bearer at-1");
+        assert_eq!(behind_token, ahead_token, "待たされた側も同じ token を得る");
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "ahead waits",
+                "ahead holds",
+                "behind waits",
+                "ahead writes",
+                "ahead frees",
+                "behind holds",
+                "behind frees",
+            ],
+            "後発が掴めるのは先行が書き終えて手放した後"
+        );
+    }
+
+    /// 更新の最中に別のプロセスが覚えようとした拒否を、更新が消さない。
+    ///
+    /// 更新は読み直した時点の内容を土台に書き戻すので、締め出しが無いと
+    /// その間に書かれた学習ごと巻き戻る。
+    ///
+    /// 覚える側は締め出しに突き当たって待つので、その書き込みが済むのは
+    /// 更新の後。ここで見たいのは「待たされた結果、両方残る」ことなので、
+    /// 待ちに入ったのを見届けてから応答を返す。
+    #[tokio::test]
+    async fn a_refresh_does_not_swallow_a_denial_recorded_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = FakeTokenServer::start_gated().await;
+        let id = place(dir.path(), cred(&at(-1)));
+
+        let log = log();
+        let refreshing = Arc::new(process_over(
+            Watched::open(dir.path(), "refresh", &log),
+            Some(&server),
+        ));
+        let recording = Arc::new(process_over(
+            Watched::open(dir.path(), "record", &log),
+            None,
+        ));
+        let waiting = recording.persistence.bell();
+
+        let refresh = {
+            let (store, id) = (Arc::clone(&refreshing), id.clone());
+            tokio::spawn(async move { store.acquire(&id).await })
+        };
+        server.wait_for_hit().await;
+
+        let record = {
+            let (store, id) = (Arc::clone(&recording), id.clone());
+            tokio::spawn(async move {
+                store
+                    .record_denied_beta(&id, &["advisor-tool-2026-03-01".to_owned()])
+                    .await
+            })
+        };
+        waiting.notified().await;
+
+        server.release();
+        refresh.await.unwrap().unwrap();
+        record.await.unwrap().unwrap();
+
+        let saved = FileStore::open(dir.path()).unwrap().load(&id).unwrap();
+        assert_eq!(saved.payload.secret(), "at-1", "更新の結果が残る");
+        assert!(
+            saved.denied_beta.contains_key("advisor-tool-2026-03-01"),
+            "待たされた側の学習も残る"
+        );
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                "refresh waits",
+                "refresh holds",
+                "record waits",
+                "refresh writes",
+                "refresh frees",
+                "record holds",
+                "record writes",
+                "record frees",
+            ],
+            "覚える側は更新が書き終えるまで土台を読まない"
+        );
+    }
+
+    /// 別のプロセスの書き込みに、期限を待たずに気づく。
+    ///
+    /// 控えの期限が切れるまでディスクを見ないと、他のプロセスが更新した
+    /// 結果も、手で直した内容も、何時間も反映されない。
+    #[tokio::test]
+    async fn a_write_from_another_process_is_seen_before_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = place(dir.path(), cred(&at(3600)));
+        let mine = another_process(dir.path(), None);
+        let elsewhere = FileStore::open(dir.path()).unwrap();
+
+        assert_eq!(mine.acquire(&id).await.unwrap().bearer(), "Bearer at-1");
+
+        // 期限はまだ先のまま。控えの期限切れでは気づけない書き換え。
+        elsewhere
+            .store(&id, &cred_with("at-elsewhere", &at(3600)))
+            .unwrap();
+
+        assert_eq!(
+            mine.acquire(&id).await.unwrap().bearer(),
+            "Bearer at-elsewhere"
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,9 @@ futures-util = { version = "0.3", default-features = false }
 # SSE のバイト列中継。reqwest の bytes_stream が返す型に合わせる。
 bytes = "1"
 tempfile = "3"
+# 認証情報のプロセス間排他 (flock)。std に口が無く、libc を直に叩くより
+# 型が付く。fs feature だけで足りる。
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # PKCE の verifier と state。推測されると認可を横取りされるので、
 # 暗号論的に安全な生成器 (ThreadRng = OS 由来の種で回す ChaCha) を使う。
 rand = "0.10"
