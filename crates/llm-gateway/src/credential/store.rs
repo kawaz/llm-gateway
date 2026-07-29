@@ -62,6 +62,18 @@ impl Credential {
 /// 更新の結果を待っている側へ配るための合図。
 type RefreshSignal = broadcast::Sender<std::result::Result<(), String>>;
 
+/// 待っている側へ配る言葉。
+///
+/// 更新の失敗は理由だけを渡す。丸ごと渡すと、受け取った側がもう一度
+/// [`Error::Refresh`] に包んで「更新に失敗しました: 更新に失敗しました: …」に
+/// なる。
+fn reason_of(e: &Error) -> String {
+    match e {
+        Error::Refresh { reason, .. } => reason.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// 控えの 1 件。読んだ時点の版を一緒に持つ。
 ///
 /// 版を持たないと、他のプロセスが書いた結果に期限切れまで気づけない。
@@ -72,9 +84,15 @@ struct Cached {
 }
 
 pub struct CredentialStore<P: Persistence> {
-    /// ロックを取る待ち時間はブロックするので、置き場ごと別スレッドへ
-    /// 渡せるように抱える。
-    persistence: Arc<P>,
+    inner: Arc<Inner<P>>,
+}
+
+/// 共有される中身。
+///
+/// 更新は要求とは切り離した仕事として走らせるので、控えも進行中の印も
+/// 「誰か 1 人のもの」にできない。まとめて抱えて渡す。
+struct Inner<P: Persistence> {
+    persistence: P,
     http: reqwest::Client,
     /// 進行中の更新。同じ id への 2 人目以降はここに相乗りする。
     in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
@@ -108,22 +126,40 @@ impl Clock {
 
 impl<P: Persistence> CredentialStore<P> {
     pub fn new(persistence: P, http: reqwest::Client) -> Self {
-        Self::with_clock(persistence, http, Clock::System)
+        Self::with_clock(persistence, http, Clock::System, None)
     }
 
-    fn with_clock(persistence: P, http: reqwest::Client, clock: Clock) -> Self {
+    fn with_clock(
+        persistence: P,
+        http: reqwest::Client,
+        clock: Clock,
+        token_url_override: Option<String>,
+    ) -> Self {
         Self {
-            persistence: Arc::new(persistence),
-            http,
-            in_flight: Mutex::new(HashMap::new()),
-            cache: RwLock::new(HashMap::new()),
-            clock,
-            token_url_override: None,
+            inner: Arc::new(Inner {
+                persistence,
+                http,
+                in_flight: Mutex::new(HashMap::new()),
+                cache: RwLock::new(HashMap::new()),
+                clock,
+                token_url_override,
+            }),
         }
     }
 
     /// 使える認証情報を返す。期限が近ければ更新してから返す。
     pub async fn acquire(&self, id: &CredentialId) -> Result<Credential> {
+        self.inner.acquire(id).await
+    }
+
+    /// upstream が拒否した beta フラグを覚える (DR-0003)。
+    pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
+        self.inner.record_denied_beta(id, flags).await
+    }
+}
+
+impl<P: Persistence> Inner<P> {
+    async fn acquire(self: &Arc<Self>, id: &CredentialId) -> Result<Credential> {
         let current = self.read(id).await?;
 
         if !self.needs_refresh(&current) {
@@ -140,7 +176,11 @@ impl<P: Persistence> CredentialStore<P> {
     ///
     /// 覚えないと同じ 400 を毎回踏む。時刻を一緒に置くのは、upstream が
     /// 対応したときに自動で戻すため。
-    pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
+    async fn record_denied_beta(
+        self: &Arc<Self>,
+        id: &CredentialId,
+        flags: &[String],
+    ) -> Result<()> {
         if flags.is_empty() {
             return Ok(());
         }
@@ -163,10 +203,10 @@ impl<P: Persistence> CredentialStore<P> {
     ///
     /// 取れるまでの待ちはブロックするので、専用のスレッドへ逃がす。待ちの
     /// 間は寝ていて、相手が手放した時点で起きる (様子を見に行かない)。
-    async fn lock(&self, id: &CredentialId) -> Result<P::Guard> {
-        let persistence = Arc::clone(&self.persistence);
+    async fn lock(self: &Arc<Self>, id: &CredentialId) -> Result<P::Guard> {
+        let me = Arc::clone(self);
         let owned = id.clone();
-        tokio::task::spawn_blocking(move || persistence.lock(&owned))
+        tokio::task::spawn_blocking(move || me.persistence.lock(&owned))
             .await
             .map_err(|e| Error::Credential {
                 id: id.to_string(),
@@ -235,42 +275,49 @@ impl<P: Persistence> CredentialStore<P> {
         }
     }
 
-    /// 更新を 1 回だけ走らせる。同時に来た要求は結果を待つ。
-    async fn refresh_once(&self, id: &CredentialId) -> Result<()> {
-        // 先着がいれば、その結果を待つ側に回る。
-        let leader = {
+    /// 更新を 1 回だけ走らせ、その結果を待つ。
+    ///
+    /// 更新そのものは要求から切り離した仕事として走らせる。要求は途中で
+    /// 消える (クライアントが切る、上位が諦める) が、更新は途中で消えては
+    /// 困る — refresh token は 1 回しか使えないので、送った後に投げ出すと
+    /// 結果を受け取れないまま焼いたことになる。進行中の印を外すのも
+    /// 切り離した側なので、要求が消えても後続が待ちっぱなしにならない。
+    async fn refresh_once(self: &Arc<Self>, id: &CredentialId) -> Result<()> {
+        let mut result = {
             let mut in_flight = self.in_flight.lock().await;
             match in_flight.get(id) {
-                Some(tx) => {
-                    let mut rx = tx.subscribe();
-                    drop(in_flight);
-                    return match rx.recv().await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(reason)) => Err(Error::Refresh {
-                            id: id.to_string(),
-                            reason,
-                        }),
-                        // 先着が結果を配る前に消えた = 更新できたか分からない。
-                        Err(_) => Err(Error::Refresh {
-                            id: id.to_string(),
-                            reason: "更新の結果を受け取れませんでした".to_owned(),
-                        }),
-                    };
-                }
+                // 先着がいれば、その結果を待つ側に回る。
+                Some(tx) => tx.subscribe(),
                 None => {
-                    let (tx, _) = broadcast::channel(1);
+                    let (tx, rx) = broadcast::channel(1);
                     in_flight.insert(id.clone(), tx.clone());
-                    tx
+
+                    let me = Arc::clone(self);
+                    let owned = id.clone();
+                    tokio::spawn(async move {
+                        let outcome = me.do_refresh(&owned).await;
+                        // 印を外してから配る。逆にすると、起きた側が
+                        // 残った印を見て次の更新に入れなくなる。
+                        me.in_flight.lock().await.remove(&owned);
+                        let _ = tx.send(outcome.as_ref().map(|_| ()).map_err(reason_of));
+                    });
+                    rx
                 }
             }
         };
 
-        let outcome = self.do_refresh(id).await;
-
-        // 待っている側へ配ってから、進行中の印を外す。
-        self.in_flight.lock().await.remove(id);
-        let _ = leader.send(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
-        outcome
+        match result.recv().await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(Error::Refresh {
+                id: id.to_string(),
+                reason,
+            }),
+            // 結果が配られる前に消えた = 更新できたか分からない。
+            Err(_) => Err(Error::Refresh {
+                id: id.to_string(),
+                reason: "更新の結果を受け取れませんでした".to_owned(),
+            }),
+        }
     }
 
     /// 実際の更新。保存まで済ませる。
@@ -278,7 +325,7 @@ impl<P: Persistence> CredentialStore<P> {
     /// 控えではなく置き場から読み直してから入る。refresh token は 1 回しか
     /// 使えないので、控えを信じて走ると、同じ置き場を共有する別のプロセスが
     /// 既に使い切った値を送ることになる。
-    async fn do_refresh(&self, id: &CredentialId) -> Result<()> {
+    async fn do_refresh(self: &Arc<Self>, id: &CredentialId) -> Result<()> {
         // 読み直しから保存までを丸ごと締め出す。同じ置き場を使う別のプロセスは
         // ここで待たされ、権利を得た時点の読み直しで「相手が済ませた」と分かり、
         // 更新に入らずに済む。束ねているのは同じプロセスの中だけなので、
@@ -475,7 +522,7 @@ mod tests {
     }
 
     fn store_sharing(disk: Spy) -> CredentialStore<Spy> {
-        CredentialStore::with_clock(disk, reqwest::Client::new(), Clock::Fixed(NOW))
+        process_over(disk, None)
     }
 
     /// 更新要求を数える試験用サーバ。
@@ -613,9 +660,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     }
 
     async fn store_against(disk: Spy, server: &FakeTokenServer) -> CredentialStore<Spy> {
-        let mut store = store_sharing(disk);
-        store.token_url_override = Some(server.url.clone());
-        store
+        process_over(disk, Some(server))
     }
 
     /// 同じディレクトリを見る別プロセスぶんの窓口。
@@ -633,10 +678,12 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         disk: P,
         server: Option<&FakeTokenServer>,
     ) -> CredentialStore<P> {
-        let mut store =
-            CredentialStore::with_clock(disk, reqwest::Client::new(), Clock::Fixed(NOW));
-        store.token_url_override = server.map(|s| s.url.clone());
-        store
+        CredentialStore::with_clock(
+            disk,
+            reqwest::Client::new(),
+            Clock::Fixed(NOW),
+            server.map(|s| s.url.clone()),
+        )
     }
 
     /// 置き場の出入りを共有の帳面に残す包み。
@@ -754,7 +801,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Watched::open(dir.path(), "behind", &log),
             Some(&server),
         ));
-        let waiting = behind.persistence.bell();
+        let waiting = behind.inner.persistence.bell();
 
         let first = {
             let (store, id) = (Arc::clone(&ahead), id.clone());
@@ -819,7 +866,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Watched::open(dir.path(), "record", &log),
             None,
         ));
-        let waiting = recording.persistence.bell();
+        let waiting = recording.inner.persistence.bell();
 
         let refresh = {
             let (store, id) = (Arc::clone(&refreshing), id.clone());
@@ -863,6 +910,40 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         );
     }
 
+    /// 要求が途中で消えても、更新は最後まで走って次の要求を通す。
+    ///
+    /// 更新を要求と同じ寿命にすると、クライアントが切っただけで
+    /// (1) 進行中の印が外れず、以後その認証情報を求めた全員が結果の来ない
+    /// 合図を待ち続け、(2) 送信済みの refresh token が結果を受け取れないまま
+    /// 焼ける。どちらも認証情報 1 つを再ログインまで使えなくする。
+    #[tokio::test]
+    async fn a_cancelled_request_does_not_strand_the_refresh() {
+        let server = FakeTokenServer::start_gated().await;
+        let store = Arc::new(store_against(Spy::new(cred(&at(-1))), &server).await);
+        let id = CredentialId::new("c");
+
+        let cancelled = {
+            let (store, id) = (Arc::clone(&store), id.clone());
+            tokio::spawn(async move { store.acquire(&id).await })
+        };
+        // 更新先に要求が届いた = 更新は応答待ち。ここで呼び出し元が消える。
+        server.wait_for_hit().await;
+        cancelled.abort();
+        server.release();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
+            .await
+            .expect("次の要求が待ちっぱなしにならない")
+            .expect("更新は最後まで走っている");
+
+        assert_eq!(got.bearer(), "Bearer at-1");
+        assert_eq!(server.hits(), 1, "同じ refresh token で 2 度叩かない");
+        assert!(
+            store.inner.in_flight.lock().await.is_empty(),
+            "進行中の印が残っていると次回以降が永久に待つ"
+        );
+    }
+
     /// 別のプロセスの書き込みに、期限を待たずに気づく。
     ///
     /// 控えの期限が切れるまでディスクを見ないと、他のプロセスが更新した
@@ -894,7 +975,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-1");
         assert_eq!(
-            store.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence.stores.load(Ordering::SeqCst),
             0,
             "まだ有効なら更新しない"
         );
@@ -904,10 +985,14 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[test]
     fn refresh_margin() {
         let store = store_with(cred(""));
-        assert!(!store.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1))));
-        assert!(store.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS))));
-        assert!(store.needs_refresh(&cred(&at(0))), "期限ちょうど");
-        assert!(store.needs_refresh(&cred(&at(-1))), "切れている");
+        assert!(
+            !store
+                .inner
+                .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1)))
+        );
+        assert!(store.inner.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS))));
+        assert!(store.inner.needs_refresh(&cred(&at(0))), "期限ちょうど");
+        assert!(store.inner.needs_refresh(&cred(&at(-1))), "切れている");
     }
 
     /// 期限が壊れていても更新に走らない。refresh token を無駄に使わない。
@@ -915,7 +1000,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     fn unreadable_expiry_does_not_trigger_refresh() {
         let store = store_with(cred(""));
         for bad in ["", "not-a-date", "2026-07", "yesterday"] {
-            assert!(!store.needs_refresh(&cred(bad)), "{bad:?}");
+            assert!(!store.inner.needs_refresh(&cred(bad)), "{bad:?}");
         }
     }
 
@@ -926,8 +1011,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[test]
     fn api_key_is_never_refreshed() {
         let store = store_with(api_key_cred(&at(-1)));
-        assert!(!store.needs_refresh(&api_key_cred(&at(-1))));
-        assert!(!store.needs_refresh(&api_key_cred(&at(0))));
+        assert!(!store.inner.needs_refresh(&api_key_cred(&at(-1))));
+        assert!(!store.inner.needs_refresh(&api_key_cred(&at(0))));
     }
 
     /// それでも更新を頼まれたら、何をすればよいかを言って断る。
@@ -935,6 +1020,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     async fn refreshing_an_api_key_says_what_to_do() {
         let store = store_with(api_key_cred(&at(-1)));
         let err = store
+            .inner
             .do_refresh(&CredentialId::new("c"))
             .await
             .unwrap_err()
@@ -949,7 +1035,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let store = store_with(api_key_cred(&at(-1)));
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
         assert_eq!(got.api_key(), "ak-1");
-        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
     }
 
     /// 拒否された beta フラグを覚えて保存する。
@@ -963,13 +1049,13 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .await
             .unwrap();
 
-        let saved = store.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence.current.lock().unwrap().clone();
         assert_eq!(
             saved.denied_beta.get("advisor-tool-2026-03-01").unwrap(),
             &format_rfc3339(NOW),
             "確認した時刻を一緒に残す"
         );
-        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
     }
 
     /// 覚えることが無ければ書かない (無駄な書き込みで競合を増やさない)。
@@ -980,7 +1066,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .record_denied_beta(&CredentialId::new("c"), &[])
             .await
             .unwrap();
-        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
     }
 
     /// 取り出した認証情報には、期限内の拒否リストだけが乗る。
@@ -1023,7 +1109,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(failures, 8, "更新先に繋がらないので全員失敗する");
         assert!(
-            store.in_flight.lock().await.is_empty(),
+            store.inner.in_flight.lock().await.is_empty(),
             "進行中の印が残っていると次回以降が永久に待つ"
         );
     }
@@ -1039,9 +1125,9 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-1", "新しい token が返る");
         assert_eq!(server.hits(), 1);
-        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
 
-        let saved = store.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence.current.lock().unwrap().clone();
         assert_eq!(saved.payload.secret(), "at-1");
         assert_eq!(
             saved.payload.refresh_token(),
@@ -1080,7 +1166,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(server.hits(), 1, "更新先を叩くのは 1 回だけ");
         assert_eq!(
-            store.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence.stores.load(Ordering::SeqCst),
             1,
             "保存も 1 回だけ"
         );
@@ -1111,7 +1197,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let id = CredentialId::new("c");
 
         assert!(store.acquire(&id).await.is_err());
-        assert!(store.in_flight.lock().await.is_empty());
+        assert!(store.inner.in_flight.lock().await.is_empty());
 
         // 2 回目も同じように失敗する (待ちっぱなしにならない)。
         assert!(store.acquire(&id).await.is_err());
@@ -1133,7 +1219,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
         assert_eq!(server.hits(), 0, "更新先を叩かない");
-        assert_eq!(store.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
     }
 
     /// 断られても、置き場が新しくなっていれば回復する。
@@ -1152,7 +1238,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
         assert_eq!(server.hits(), 1, "断られるまでは 1 回試している");
         assert_eq!(
-            store.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence.stores.load(Ordering::SeqCst),
             0,
             "拾っただけなので自分では書かない"
         );
@@ -1173,7 +1259,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .to_string();
 
         assert!(err.contains("再ログイン"), "{err}");
-        assert!(store.in_flight.lock().await.is_empty());
+        assert!(store.inner.in_flight.lock().await.is_empty());
     }
 
     /// 拒否された beta を覚えるときも、控えではなく置き場から積み直す。
@@ -1192,7 +1278,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .await
             .unwrap();
 
-        let saved = store.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence.current.lock().unwrap().clone();
         assert_eq!(
             saved.payload.secret(),
             "at-elsewhere",
