@@ -133,11 +133,20 @@ pub async fn buffer(resp: Response) -> Result<(Response, Vec<u8>)> {
 
 /// この状態なら別の upstream を試す価値があるか。
 ///
-/// 経路が断たれている場合だけ切り替える。429 では切り替えない — レート制限は
-/// 別の経路でも同じように当たる可能性が高く、切り替えると単に負荷が移るだけ。
+/// 経路が断たれている場合だけ切り替える。認証情報の側で断られた分は
+/// [`is_credential_denial`] が見る。
 pub fn should_try_next(status: u16) -> bool {
     // 501 (未実装) は除く。別の経路に替えても実装されていないものは動かない。
     matches!(status, 500 | 502..=504)
+}
+
+/// この状態は、送った認証情報そのものが断られたか。
+///
+/// 上限もトークンの有効性もアカウント単位なので、別の認証情報を持つ経路なら
+/// 通る見込みがある。クライアント側の認証は gateway が namespace のトークンで
+/// 別に確かめているので、ここに来る 401 / 403 は upstream との間の話。
+pub fn is_credential_denial(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429)
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -168,18 +177,32 @@ mod tests {
         }
     }
 
-    /// レート制限では切り替えない。別の経路でも同じように当たるので、
-    /// 負荷を移すだけで解決しない。
+    /// 認証情報を断られた分は、経路断ではなく認証情報側の失敗として扱う。
     #[test]
-    fn does_not_switch_on_rate_limit() {
-        assert!(!should_try_next(429));
+    fn credential_denials_are_told_apart_from_outages() {
+        for status in [401, 403, 429] {
+            assert!(is_credential_denial(status), "{status} は認証情報側の失敗");
+            assert!(!should_try_next(status), "{status} は経路断ではない");
+        }
     }
 
     /// リクエスト側の誤りは切り替えても直らない。
     #[test]
     fn does_not_switch_on_client_error() {
-        for status in [400, 401, 403, 404, 422] {
+        for status in [400, 404, 422] {
             assert!(!should_try_next(status), "{status} は次を試さない");
+            assert!(
+                !is_credential_denial(status),
+                "{status} は認証情報のせいではない"
+            );
+        }
+    }
+
+    /// 経路断と成功は、認証情報を断られたわけではない。
+    #[test]
+    fn outages_and_success_are_not_credential_denials() {
+        for status in [200, 500, 502, 503, 504, 529] {
+            assert!(!is_credential_denial(status), "{status}");
         }
     }
 

@@ -91,7 +91,12 @@ impl Catalog {
 pub struct Router {
     config: Config,
     catalog: RwLock<Catalog>,
-    affinity: Mutex<HashMap<SessionKey, Binding>>,
+    /// 会話と経路の結びつき。鍵は (namespace 名, 会話)。
+    ///
+    /// namespace が違えば見えるモデルも経路の順も違うので、会話だけで引くと
+    /// 別の namespace の結果が混ざる。同じ本文から derive した会話の鍵は
+    /// namespace をまたいでも一致するので、分けないと経路の順が汚れる。
+    affinity: Mutex<HashMap<(String, SessionKey), Binding>>,
 }
 
 struct Binding {
@@ -218,9 +223,13 @@ impl Router {
     }
 
     /// この会話でこのモデルを使うときの経路を、試す順に返す。
+    ///
+    /// `ns_name` は前回通った経路を引くための鍵。`ns` から名前は取れないので
+    /// 呼び出し側から渡す。
     pub async fn routes_for(
         &self,
         ns: &Namespace,
+        ns_name: &str,
         model: &str,
         session: &SessionKey,
     ) -> Result<Vec<Arc<Route>>> {
@@ -252,7 +261,8 @@ impl Router {
         let now = Instant::now();
         affinity.retain(|_, b| now.duration_since(b.seen) < AFFINITY_TTL);
 
-        if let Some(bound) = affinity.get(session).filter(|b| b.model == model)
+        let key = (ns_name.to_owned(), session.clone());
+        if let Some(bound) = affinity.get(&key).filter(|b| b.model == model)
             && let Some(at) = routes.iter().position(|r| r.name() == bound.route.name())
         {
             routes.swap(0, at);
@@ -300,9 +310,15 @@ impl Router {
     }
 
     /// 実際に使えた経路を覚える。
-    pub async fn remember(&self, session: &SessionKey, model: &str, route: &Arc<Route>) {
+    pub async fn remember(
+        &self,
+        ns_name: &str,
+        session: &SessionKey,
+        model: &str,
+        route: &Arc<Route>,
+    ) {
         self.affinity.lock().await.insert(
-            session.clone(),
+            (ns_name.to_owned(), session.clone()),
             Binding {
                 route: Arc::clone(route),
                 model: model.to_owned(),
@@ -437,6 +453,11 @@ claude-haiku = "claude-haiku-*"
 fable = "claude-fable"
 opus = "claude-opus"
 haiku = "claude-haiku"
+
+# 結びつきが namespace をまたがないことを見るための面。
+[[ns.other.routing]]
+models = ["claude-fable-*"]
+credentials = ["bedrock", "oauth-a"]
 "#;
 
     /// discovery 済みの状態を作る。
@@ -468,11 +489,12 @@ haiku = "claude-haiku"
         r
     }
 
+    /// 試験で使う namespace 名。
+    const NS: &str = crate::config::DEFAULT_NAMESPACE;
+
     /// 既定の namespace。
     fn ns(r: &Router) -> &Namespace {
-        r.config
-            .namespace(crate::config::DEFAULT_NAMESPACE)
-            .expect("既定は必ずある")
+        r.config.namespace(NS).expect("既定は必ずある")
     }
 
     fn session(name: &str) -> SessionKey {
@@ -487,7 +509,7 @@ haiku = "claude-haiku"
     async fn follows_routing_rules() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), "claude-fable-5", &session("s1"))
+            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
@@ -499,7 +521,7 @@ haiku = "claude-haiku"
     async fn unrouted_model_uses_whoever_can_serve_it() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), "claude-opus-5", &session("s1"))
+            .routes_for(ns(&r), NS, "claude-opus-5", &session("s1"))
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "oauth-b"]);
@@ -510,7 +532,7 @@ haiku = "claude-haiku"
     async fn excluded_credential_is_not_offered() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), "claude-haiku-4-5-20251001", &session("s1"))
+            .routes_for(ns(&r), NS, "claude-haiku-4-5-20251001", &session("s1"))
             .await
             .unwrap();
         assert_eq!(
@@ -524,7 +546,7 @@ haiku = "claude-haiku"
     async fn unknown_model_is_rejected() {
         let r = router().await;
         let err = r
-            .routes_for(ns(&r), "no-such-model", &session("s1"))
+            .routes_for(ns(&r), NS, "no-such-model", &session("s1"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no-such-model"), "{err}");
@@ -538,7 +560,7 @@ haiku = "claude-haiku"
 
         let r = router().await;
         let routes = r
-            .routes_for(ns(&r), "claude-fable-5", &session("s1"))
+            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
             .await
             .unwrap();
 
@@ -592,10 +614,16 @@ haiku = "claude-haiku"
         let r = router().await;
         let s = session("s1");
 
-        let first = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
-        r.remember(&s, "claude-fable-5", &first[1]).await;
+        let first = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        r.remember(NS, &s, "claude-fable-5", &first[1]).await;
 
-        let again = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
+        let again = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
         assert_eq!(names(&again), vec!["oauth-a", "bedrock"]);
         assert_eq!(again.len(), 2, "候補は減らさない");
     }
@@ -605,12 +633,15 @@ haiku = "claude-haiku"
         let r = router().await;
         let s = session("s1");
 
-        let routes = r.routes_for(ns(&r), "claude-fable-5", &s).await.unwrap();
-        r.remember(&s, "claude-fable-5", &routes[1]).await;
+        let routes = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
 
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), "claude-fable-5", &session("s2"))
+                &r.routes_for(ns(&r), NS, "claude-fable-5", &session("s2"))
                     .await
                     .unwrap()
             ),
@@ -618,9 +649,45 @@ haiku = "claude-haiku"
             "別の会話には効かない"
         );
         assert_eq!(
-            names(&r.routes_for(ns(&r), "claude-opus-5", &s).await.unwrap()),
+            names(&r.routes_for(ns(&r), NS, "claude-opus-5", &s).await.unwrap()),
             vec!["oauth-a", "oauth-b"],
             "別のモデルには効かない"
+        );
+    }
+
+    /// 別の namespace で覚えた結びつきは持ち込まない。
+    ///
+    /// 会話の鍵は本文から derive するので、namespace が違っても一致しうる。
+    /// 混ざると、片方の面で断られた経路がもう片方の先頭に来る。
+    #[tokio::test]
+    async fn bindings_do_not_cross_namespaces() {
+        let r = router().await;
+        let s = session("s1");
+        let other = r.config.namespace("other").expect("設定にある");
+
+        let routes = r
+            .routes_for(other, "other", "claude-fable-5", &s)
+            .await
+            .unwrap();
+        r.remember("other", &s, "claude-fable-5", &routes[1]).await;
+
+        assert_eq!(
+            names(
+                &r.routes_for(other, "other", "claude-fable-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["oauth-a", "bedrock"],
+            "覚えた面では効く"
+        );
+        assert_eq!(
+            names(
+                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["bedrock", "oauth-a"],
+            "同じ会話の鍵でも、別の面の順は変わらない"
         );
     }
 
@@ -639,7 +706,7 @@ haiku = "claude-haiku"
             "claude-haiku-4-5-20251001",
         ] {
             let actual: Vec<String> = r
-                .routes_for(ns(&r), model, &s)
+                .routes_for(ns(&r), NS, model, &s)
                 .await
                 .unwrap()
                 .iter()
@@ -723,7 +790,7 @@ haiku = "claude-haiku"
         let r = Router::new(config);
         assert!(r.models(ns(&r)).await.is_empty());
         assert!(
-            r.routes_for(ns(&r), "claude-opus-5", &session("s"))
+            r.routes_for(ns(&r), NS, "claude-opus-5", &session("s"))
                 .await
                 .is_err()
         );

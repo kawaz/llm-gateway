@@ -159,7 +159,7 @@ async fn messages<P: Persistence + 'static>(
     let query = uri.query().map(str::to_owned);
 
     match gateway
-        .forward(ns, &path, query.as_deref(), json, headers)
+        .forward(ns, &ns_name, &path, query.as_deref(), json, headers)
         .instrument(span.clone())
         .await
     {

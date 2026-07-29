@@ -98,6 +98,7 @@ impl<P: Persistence> Gateway<P> {
     pub async fn forward(
         &self,
         ns: &Namespace,
+        ns_name: &str,
         path: &str,
         query: Option<&str>,
         mut body: Value,
@@ -113,13 +114,22 @@ impl<P: Persistence> Gateway<P> {
         }
 
         let session = session::derive(&body, &headers);
-        let routes = self.router.routes_for(ns, &model, &session).await?;
+        let routes = self
+            .router
+            .routes_for(ns, ns_name, &model, &session)
+            .await?;
 
         let mut attempts = Vec::new();
+        // 認証情報を断られた応答のうち、最後のもの。全滅したときに返す。
+        let mut denied: Option<forward::Response> = None;
         for route in &routes {
             match self.try_route(route, path, query, &body, &headers).await {
                 Ok(resp) => {
-                    self.router.remember(&session, &model, route).await;
+                    // 貼り付けるのは通った経路だけ。断られた先を覚えると、
+                    // 次の転送も同じところから始めることになる。
+                    if resp.status / 100 == 2 {
+                        self.router.remember(ns_name, &session, &model, route).await;
+                    }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::relay が記録する。
                     info!(
@@ -130,14 +140,30 @@ impl<P: Persistence> Gateway<P> {
                     );
                     return Ok(resp);
                 }
-                Err(reason) => {
+                Err(Switch { reason, denial }) => {
                     warn!(model = %model, route = route.name(), %reason, "経路を切り替えます");
                     attempts.push(UpstreamAttempt {
                         provider: route.name().to_owned(),
                         reason,
                     });
+                    if denial.is_some() {
+                        denied = denial;
+                    }
                 }
             }
+        }
+
+        // 断られた応答を見ていたなら、最後のものをそのまま返す。こちらで
+        // 別の状態に置き換えると、`retry-after` のようなクライアントが次の
+        // 一手を決める手掛かりまで消える。
+        if let Some(resp) = denied {
+            warn!(
+                model = %model,
+                status = resp.status,
+                routes = routes.len(),
+                "経路を使い切りました。最後に断られた応答をそのまま返します"
+            );
+            return Ok(resp);
         }
 
         Err(Error::AllUpstreamsFailed { model, attempts })
@@ -147,8 +173,7 @@ impl<P: Persistence> Gateway<P> {
     ///
     /// 戻り値の `Err` は「次を試してよい」という意味で、呼び出し側へ
     /// そのまま返すべきエラーではない。切り替えても直らない失敗
-    /// (認証情報が無い、リクエストが不正) は `Ok` の応答として返し、
-    /// クライアントに伝える。
+    /// (リクエストが不正) は `Ok` の応答として返し、クライアントに伝える。
     async fn try_route(
         &self,
         route: &Arc<Route>,
@@ -156,13 +181,13 @@ impl<P: Persistence> Gateway<P> {
         query: Option<&str>,
         body: &Value,
         headers: &[(String, String)],
-    ) -> std::result::Result<forward::Response, String> {
+    ) -> std::result::Result<forward::Response, Switch> {
         let credential = match &route.credential {
             Some(id) => match self.credentials.acquire(id).await {
                 Ok(c) => Some(c),
                 // 認証情報を用意できないなら、この経路は使えない。
                 // 他の経路は別の認証情報を使うので、試す価値がある。
-                Err(e) => return Err(e.to_string()),
+                Err(e) => return Err(Switch::to_next(e.to_string())),
             },
             None => None,
         };
@@ -187,7 +212,9 @@ impl<P: Persistence> Gateway<P> {
             return accept_or_switch(resp);
         }
 
-        let (resp, raw) = forward::buffer(resp).await.map_err(|e| e.to_string())?;
+        let (resp, raw) = forward::buffer(resp)
+            .await
+            .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
         if !beta::is_invalid_beta_error(&raw) {
             return accept_or_switch(resp);
@@ -226,7 +253,7 @@ impl<P: Persistence> Gateway<P> {
         query: Option<&str>,
         body: &Value,
         headers: Headers,
-    ) -> std::result::Result<forward::Response, String> {
+    ) -> std::result::Result<forward::Response, Switch> {
         let resp = forward::send(
             &self.http,
             route.provider.as_ref(),
@@ -237,7 +264,7 @@ impl<P: Persistence> Gateway<P> {
             headers,
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Switch::to_next(e.to_string()))?;
 
         // 便乗して利用状況を拾う (DR-0007)。読むのはヘッダだけなので、
         // 本文はこの後もそのまま流れる。上限に当たった応答こそ見たいので、
@@ -397,10 +424,37 @@ fn support_of(spec: &CredentialSpec, observed: bool) -> usage::Support {
     }
 }
 
+/// 次の経路へ回す理由。
+struct Switch {
+    reason: String,
+    /// 認証情報を断られた応答。次の経路が全滅したときにクライアントへ返す。
+    ///
+    /// 本文は読まずに抱えたまま持ち回る。断られた応答は小さいので、後続を
+    /// 試している間コネクションを握っていても割に合う。
+    denial: Option<forward::Response>,
+}
+
+impl Switch {
+    /// 応答を伴わない切り替え (経路断・送信できなかった等)。
+    fn to_next(reason: String) -> Self {
+        Self {
+            reason,
+            denial: None,
+        }
+    }
+}
+
 /// この応答をクライアントへ返すか、別の経路を試すか。
-fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Response, String> {
+fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Response, Switch> {
+    let reason = format!("upstream returned {}", resp.status);
     if forward::should_try_next(resp.status) {
-        return Err(format!("upstream が {} を返しました", resp.status));
+        return Err(Switch::to_next(reason));
+    }
+    if forward::is_credential_denial(resp.status) {
+        return Err(Switch {
+            reason,
+            denial: Some(resp),
+        });
     }
     Ok(resp)
 }
@@ -446,6 +500,19 @@ mod tests {
         async fn start(
             respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
         ) -> Self {
+            Self::start_with_headers(&[], respond).await
+        }
+
+        /// 応答に毎回載せるヘッダを添えて立てる。
+        ///
+        /// `retry-after` のように、状態コードだけでは伝わらないものが
+        /// クライアントまで残るかを確かめるのに使う。
+        async fn start_with_headers(
+            extra: &[(&str, &str)],
+            respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
+            let extra: Arc<String> =
+                Arc::new(extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
@@ -462,6 +529,7 @@ mod tests {
                     let counter = Arc::clone(&counter);
                     let seen = Arc::clone(&seen);
                     let respond = Arc::clone(&respond);
+                    let extra = Arc::clone(&extra);
                     tokio::spawn(async move {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
                         let mut buf = vec![0u8; 65536];
@@ -480,7 +548,7 @@ mod tests {
 
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
-content-length: {}\r\nconnection: close\r\n\r\n{body}",
+content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = sock.write_all(resp.as_bytes()).await;
@@ -574,10 +642,12 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         gw
     }
 
+    /// 転送の試験で使う namespace 名。
+    const NS: &str = crate::config::DEFAULT_NAMESPACE;
+
     /// 既定の namespace。
     fn ns<P: Persistence>(gw: &Gateway<P>) -> &Namespace {
-        gw.namespace(crate::config::DEFAULT_NAMESPACE)
-            .expect("既定は必ずある")
+        gw.namespace(NS).expect("既定は必ずある")
     }
 
     fn request() -> Value {
@@ -612,7 +682,7 @@ credentials = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -647,7 +717,7 @@ credentials = ["down", "alive"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -681,7 +751,7 @@ credentials = ["nowhere", "alive"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!(resp.status, 200);
@@ -714,7 +784,7 @@ credentials = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
@@ -722,11 +792,127 @@ credentials = ["a", "b"]
         assert_eq!(other.hits(), 0, "次を試さない");
     }
 
-    /// レート制限でも切り替えない。別の経路でも同じように当たる。
+    /// 2 つの認証情報を並べた設定。
+    fn two_credentials(first: &str, second: &str) -> String {
+        format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{first}"
+models = ["m"]
+
+[credentials.b]
+type = "relay"
+url = "{second}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a", "b"]
+"#
+        )
+    }
+
+    /// 上限に当たったら次の認証情報を試す。
+    ///
+    /// 上限はアカウント単位なので、別の認証情報なら通る。
     #[tokio::test]
-    async fn rate_limit_is_returned_without_retry() {
-        let up = FakeUpstream::always(429).await;
-        let other = FakeUpstream::always(200).await;
+    async fn rate_limit_falls_back_to_the_next_credential() {
+        let limited = FakeUpstream::always(429).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert!(body_text(resp).await.contains("ok"));
+        assert_eq!((limited.hits(), spare.hits()), (1, 1));
+    }
+
+    /// 認証が通らない先も次へ回す。
+    ///
+    /// upstream との認証の話なので、別の認証情報を持つ経路なら通る
+    /// (クライアント側の認証は namespace のトークンで別に見ている)。
+    #[tokio::test]
+    async fn unauthorized_credential_falls_back_to_the_next() {
+        let stale = FakeUpstream::always(401).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&stale.url, &spare.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200);
+        assert_eq!((stale.hits(), spare.hits()), (1, 1));
+    }
+
+    /// どの認証情報でも断られたら、最後に見た応答をそのまま返す。
+    ///
+    /// こちらで別の状態に置き換えると、クライアントが次の一手を決める
+    /// 手掛かり (`retry-after` など) を失う。
+    #[tokio::test]
+    async fn the_last_denial_is_returned_when_every_credential_is_denied() {
+        let first = FakeUpstream::always(429).await;
+        let last = FakeUpstream::start(|_, _| {
+            (
+                429,
+                r#"{"type":"error","error":{"message":"the last one"}}"#.to_owned(),
+            )
+        })
+        .await;
+        let gw = gateway(&two_credentials(&first.url, &last.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429);
+        assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
+        assert!(
+            body_text(resp).await.contains("the last one"),
+            "最後に断られた応答の本文がそのまま返る"
+        );
+    }
+
+    /// 断られた応答のヘッダは落とさない。
+    ///
+    /// `retry-after` を消すと、クライアントはいつ再開してよいか分からなくなる。
+    /// 状態コードを保ったまま返す意味の中心はここにある (DR-0009)。
+    #[tokio::test]
+    async fn a_passed_through_denial_keeps_its_retry_after() {
+        let first = FakeUpstream::always(429).await;
+        let last =
+            FakeUpstream::start_with_headers(&[("retry-after", "30")], |_, _| (429, body_for(429)))
+                .await;
+        let gw = gateway(&two_credentials(&first.url, &last.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429);
+        assert_eq!(
+            resp.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, v)| v.as_str()),
+            Some("30"),
+            "いつ再開できるかを伝える: {:?}",
+            resp.headers
+        );
+    }
+
+    /// 経路が 1 本しかなければ、断られた応答をそのまま返す。
+    #[tokio::test]
+    async fn a_lone_denial_is_returned_as_is() {
+        let limited = FakeUpstream::always(429).await;
         let gw = gateway(&format!(
             r#"
 [credentials.a]
@@ -734,25 +920,56 @@ type = "relay"
 url = "{}"
 models = ["m"]
 
-[credentials.b]
-type = "relay"
-url = "{}"
-models = ["m"]
-
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+credentials = ["a"]
 "#,
-            up.url, other.url
+            limited.url
         ))
         .await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
+
         assert_eq!(resp.status, 429);
-        assert_eq!(other.hits(), 0);
+        assert!(body_text(resp).await.contains("status 429"));
+        assert_eq!(limited.hits(), 1, "同じ先へ送り直さない");
+    }
+
+    /// 経路断の次で断られたら、断られた応答を返す。
+    #[tokio::test]
+    async fn an_outage_followed_by_a_denial_returns_the_denial() {
+        let down = FakeUpstream::always(503).await;
+        let limited = FakeUpstream::always(429).await;
+        let gw = gateway(&two_credentials(&down.url, &limited.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429);
+        assert_eq!((down.hits(), limited.hits()), (1, 1));
+    }
+
+    /// 断られた後に経路断が来ても、断られた応答は残る。
+    ///
+    /// 500 番台は応答を持ち回らないので、上書きされない。
+    #[tokio::test]
+    async fn a_denial_survives_a_later_outage() {
+        let limited = FakeUpstream::always(429).await;
+        let down = FakeUpstream::always(503).await;
+        let gw = gateway(&two_credentials(&limited.url, &down.url)).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429, "経路断で塗り替えない");
+        assert_eq!((limited.hits(), down.hits()), (1, 1));
     }
 
     /// 全部落ちていたら、どこで何が起きたかを添えて返す。
@@ -781,7 +998,7 @@ credentials = ["first", "second"]
         .await;
 
         let err = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), vec![])
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap_err();
 
@@ -824,19 +1041,155 @@ credentials = ["flaky", "alive"]
         .await;
 
         // 1 回目: flaky が落ちていて alive が通る。
-        gw.forward(ns(&gw), "/v1/messages", None, request(), vec![])
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!((flaky.hits(), alive.hits()), (1, 1));
 
         // 2 回目: flaky は復帰しているが、通った alive を先に試す。
-        gw.forward(ns(&gw), "/v1/messages", None, request(), vec![])
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
         assert_eq!(
             (flaky.hits(), alive.hits()),
             (1, 2),
             "復帰した先より、通った先を優先する"
+        );
+    }
+
+    /// 断られた後に、応答すら返らない失敗が来ても断られた応答は残る。
+    ///
+    /// 繋がらない先は応答を持たないので、保持しているものを上書きしない。
+    #[tokio::test]
+    async fn a_denial_survives_an_unreachable_route() {
+        let limited = FakeUpstream::always(429).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["m"]
+
+[credentials.b]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a", "b"]
+"#,
+            limited.url
+        ))
+        .await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429, "繋がらない先で塗り替えない");
+        assert!(body_text(resp).await.contains("status 429"));
+        assert_eq!(limited.hits(), 1);
+    }
+
+    /// beta を落として送り直した先で断られたら、そこも次へ回す。
+    ///
+    /// DR-0003 の送り直しと本 DR の切り替えが重なる地点。
+    #[tokio::test]
+    async fn a_denial_after_the_beta_retry_falls_back_too() {
+        let negotiating = FakeUpstream::start(|n, _| match n {
+            1 => (
+                400,
+                r#"{"type":"error","error":{"message":"invalid beta flag"}}"#.to_owned(),
+            ),
+            _ => (429, body_for(429)),
+        })
+        .await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[credentials.b]
+type = "relay"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a", "b"]
+"#,
+                negotiating.url, spare.url
+            ),
+            StaticStore::new(),
+        )
+        .await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 200, "断られた先を飛ばして次が通る");
+        assert_eq!(negotiating.hits(), 2, "送り直すのは 1 回だけ");
+        assert_eq!(spare.hits(), 1);
+    }
+
+    /// 送り直した先で断られ、他に経路が無ければ、その応答を返す。
+    #[tokio::test]
+    async fn a_denial_from_the_beta_retry_is_passed_through() {
+        let up = FakeUpstream::start(|n, _| match n {
+            1 => (
+                400,
+                r#"{"type":"error","error":{"message":"invalid beta flag"}}"#.to_owned(),
+            ),
+            _ => (
+                429,
+                r#"{"type":"error","error":{"message":"after the retry"}}"#.to_owned(),
+            ),
+        })
+        .await;
+        let gw = gateway_with(&oauth_config(&up.url), StaticStore::new()).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 429);
+        assert_eq!(up.hits(), 2);
+        assert!(
+            body_text(resp).await.contains("after the retry"),
+            "送り直した側の応答が返る"
+        );
+    }
+
+    /// 断られた経路には貼り付かない。
+    ///
+    /// 覚えてしまうと、次の転送も上限に当たった先から始めることになる。
+    #[tokio::test]
+    async fn a_denied_route_is_not_remembered() {
+        // 1 本目だけ断り、2 本目からは通る。覚えていれば次に先頭へ来る。
+        let limited = FakeUpstream::then(429, 200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!((limited.hits(), spare.hits()), (1, 1), "断られて次へ");
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            (limited.hits(), spare.hits()),
+            (1, 2),
+            "覚えるのは通った先だけ"
         );
     }
 
@@ -858,6 +1211,7 @@ credentials = ["a"]
         let err = gw
             .forward(
                 ns(&gw),
+                NS,
                 "/v1/messages",
                 None,
                 json!({"model": "unknown"}),
@@ -886,6 +1240,7 @@ credentials = ["a"]
         assert!(
             gw.forward(
                 ns(&gw),
+                NS,
                 "/v1/messages",
                 None,
                 json!({"max_tokens": 1}),
@@ -944,6 +1299,7 @@ opus = "claude-opus-*"
         let err = gw
             .forward(
                 ns(&gw),
+                NS,
                 "/v1/messages",
                 None,
                 json!({"model": "claude-opus-4-8"}),
@@ -994,7 +1350,7 @@ credentials = ["a"]
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
 
@@ -1023,7 +1379,7 @@ credentials = ["a"]
         }
 
         // 覚えた分は、同じ工程の次の転送から効く (毎回 400 を踏まない)。
-        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
         assert_eq!(up.hits(), 3, "2 度目は 1 本で済む");
@@ -1044,7 +1400,7 @@ credentials = ["a"]
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
 
@@ -1076,7 +1432,7 @@ credentials = ["a"]
         let store = StaticStore::holding(stale);
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
-        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
 
@@ -1095,7 +1451,7 @@ credentials = ["a"]
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
 
@@ -1126,7 +1482,7 @@ credentials = ["a"]
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
         assert_eq!(resp.status, 200);
@@ -1155,7 +1511,7 @@ credentials = ["a"]
         let store = StaticStore::new();
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
-        gw.forward(ns(&gw), "/v1/messages", None, request(), beta_header())
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
 
@@ -1317,6 +1673,7 @@ opus = "claude-opus-*"
         let resp = gw
             .forward(
                 ns(&gw),
+                NS,
                 "/v1/messages",
                 None,
                 json!({"model": "opus"}),
