@@ -24,4 +24,10 @@
 
 ## 確認待ち
 
-（現在なし）
+### GW-C1: 8402 の launchd サービス重複の恒久対応
+
+2026-07-29 実測: `com.kawaz.llm-gateway-unstable` (config-unstable.toml) と旧 `com.kawaz.llm-gateway` (config.toml = config-unstable.toml への symlink) が両方 KeepAlive で 8402 を取り合っている。実効は同一 (同 binary + 同 config) だが、kickstart 再起動のたびに bind の早い者勝ちでサービスが入れ替わり、ログ出力先 (unstable.log ↔ stdout.log) も入れ替わる。負けた側は bind 失敗を err.log に吐き続ける。
+
+- [ ] a: 旧 `com.kawaz.llm-gateway` を bootout + plist 削除 (unstable に一本化、推し)
+- [ ] b: unstable 側を削除して `com.kawaz.llm-gateway` + symlink 運用に一本化
+- [ ] c: 現状維持 (kawaz が意図的に移行中なら触らない)
