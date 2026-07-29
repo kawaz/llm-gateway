@@ -41,6 +41,32 @@ impl<P: Persistence> Gateway<P> {
             // upstream の応答は長い。生成が続く限り待つ必要があるので、
             // 全体のタイムアウトは置かない。接続だけ短く切る。
             .connect_timeout(std::time::Duration::from_secs(10))
+            // Design rationale: keepalive をライブラリ既定 (無効) に任せない。
+            // 全体のタイムアウトを置かない以上、コネクションが生きているか
+            // どうかは誰かが確かめないと、経路上の NAT/LB に黙って切られた
+            // ことに気づくのが「次に何か流そうとした時」まで遅れる。生成の
+            // 待ち時間と区別が付かないので、待ち続けたまま止まる。
+            //
+            // 20 秒に置くのは、よくあるアイドル切断 (30〜60 秒級) より十分
+            // 手前で叩いて、経路上の対応表を保たせたいため。握っている
+            // コネクションは経路の本数ぶんしかないので、この間隔でも
+            // 流れるパケットは無視できる。
+            .tcp_keepalive(std::time::Duration::from_secs(20))
+            // 応答が無い側は 10 秒おきに 3 回まで。既定 (macOS なら 75 秒 ×
+            // 8 回) だと死んだ接続を掴んだまま 10 分粘ることになる。
+            .tcp_keepalive_interval(std::time::Duration::from_secs(10))
+            .tcp_keepalive_retries(3)
+            // upstream (api.anthropic.com / bedrock) とは ALPN で h2 に
+            // なる。TCP の keepalive は TLS の下を通るので、中身のバイト数
+            // でアイドルを測る類の LB からは「無音」のままに見える。h2 の
+            // PING は TLS の上に乗るので、そちらにも生きていると伝わり、
+            // かつ TCP は生きたまま h2 が応じない状態も掴める。
+            .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+            // 転送していない間も打つ。使い回し待ちで寝ている接続が黙って
+            // 死んでいると、次の転送がそれを掴んで落ち、経路を切り替えた
+            // 扱いになって別の認証情報へ流れてしまう。
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| Error::Config(format!("HTTP クライアントを作れません: {e}")))?;
 
