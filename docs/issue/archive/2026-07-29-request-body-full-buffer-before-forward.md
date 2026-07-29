@@ -1,6 +1,6 @@
 ---
 title: リクエストボディを全量メモリに載せてから転送している
-status: open
+status: resolved
 category: design
 created: 2026-07-29T00:30:40+09:00
 last_read: 2026-07-29T17:26:43+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T17:40:03+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0003","implemented","done:v0.4.0 (34959b96), comment-only change — crates/llm-gateway-server/src/lib.rs messages handler + crates/llm-gateway/src/backend/anthropic/forward.rs module comment. Verified necessary: route fallback (5xx/401/403/429/529) and beta resend (DR-0003) both require resending the same body; per-route model rewriting produces a different body per route, incompatible with a body readable only once (streaming)."]
 blocked_by:
 origin: 自リポ TODO
 ---

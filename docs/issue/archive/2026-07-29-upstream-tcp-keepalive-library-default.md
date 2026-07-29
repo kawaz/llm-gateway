@@ -1,6 +1,6 @@
 ---
 title: upstream 接続の TCP keepalive をライブラリ既定任せにしている
-status: open
+status: resolved
 category: design
 created: 2026-07-29T00:14:52+09:00
 last_read: 2026-07-29T17:26:43+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-29T17:40:03+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:v0.4.0 (f5d03c09) — crates/llm-gateway/src/gateway.rs Design rationale comment; tcp_keepalive 20s + interval 10s + retries 3, h2 PING 20s/timeout 10s + while_idle explicit. Long-idle real-world behavior not empirically verified (stated as unverified in the comment)."]
 blocked_by:
 origin: 自リポ TODO
 ---
