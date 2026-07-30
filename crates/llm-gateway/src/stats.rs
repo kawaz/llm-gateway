@@ -241,10 +241,11 @@ impl Stats {
     ///
     /// serve の開始前に 1 回だけ呼ぶ前提。積み始めた後に呼ぶと、読み戻した
     /// 日についてはメモリの積み分が読み戻しで置き換わる。
-    pub fn restore(&self) {
+    /// `now` を引数で受けるのは、読み戻す「当日」を試験から固定するため
+    /// (実時計に縛ると、固定時刻で積んだデータが日付の進みで範囲外になる)。
+    pub fn restore(&self, now: i64) {
         self.sweep_temporaries();
 
-        let now = crate::credential::time::now_unix();
         let recent: Vec<String> = (0..RESTORED_DAYS as i64)
             .map(|back| local_date(now - back * 86_400))
             .collect();
@@ -908,7 +909,7 @@ mod tests {
         let after = {
             let s = stats(dir.path());
             assert!(s.in_memory().is_empty(), "読み戻す前は空");
-            s.restore();
+            s.restore(NOW);
             s.in_memory()
         };
 
@@ -929,12 +930,12 @@ mod tests {
         }
 
         let s = stats(dir.path());
-        s.restore();
+        s.restore(NOW);
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
         s.flush().unwrap();
 
         let s = stats(dir.path());
-        s.restore();
+        s.restore(NOW);
         let counts = s.in_memory();
         let c = &counts.values().next().unwrap()["a"]["m"];
         assert_eq!(c.requests, 2, "前回の 1 本に足す");
@@ -1064,7 +1065,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Stats::new(dir.path().join("not-yet"), "8402");
         assert!(s.report(7, NOW).days.is_empty());
-        s.restore();
+        s.restore(NOW);
         assert!(s.in_memory().is_empty());
     }
 
@@ -1120,7 +1121,7 @@ mod tests {
         );
         // 書いたものを自分で読み戻せる。
         let s = Stats::new(dir.path(), "127.0.0.1:8402");
-        s.restore();
+        s.restore(NOW);
         assert!(!s.in_memory().is_empty());
     }
 
@@ -1195,7 +1196,7 @@ mod tests {
 
         // 再起動。読み戻すのは直近 RESTORED_DAYS 日分だけ。
         let s = stats(dir.path());
-        s.restore();
+        s.restore(NOW);
         assert!(
             !s.in_memory().contains_key(&local_date(old)),
             "10 日前はメモリに載せない"
@@ -1222,7 +1223,7 @@ mod tests {
         }
 
         let s = stats(dir.path());
-        s.restore();
+        s.restore(NOW);
         // 時計が巻き戻った等で、載せていない日へ積む。
         s.record(old, Some("a"), "m", &tokens(1, 1));
         s.flush().unwrap();
@@ -1334,7 +1335,7 @@ mod tests {
         std::fs::write(&mine, "{}").unwrap();
         std::fs::write(&theirs, "{}").unwrap();
 
-        stats(dir.path()).restore();
+        stats(dir.path()).restore(NOW);
 
         assert!(!mine.exists(), "自分の書き損じは消す");
         assert!(
