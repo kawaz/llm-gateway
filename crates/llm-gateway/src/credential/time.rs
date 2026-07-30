@@ -74,6 +74,26 @@ fn date_at_offset(unix: i64, offset: i64) -> String {
 /// `tm_gmtoff` は POSIX ではなく BSD / glibc の拡張。このリポの対象は macOS
 /// (DR-0010)、CI も含めて Linux までなので、どちらにもある。
 fn local_offset(unix: i64) -> i64 {
+    // libc crate は `tzset` を Windows 向けにしか宣言していないので、こちらで
+    // 引く。POSIX の関数なので macOS / Linux では libc に必ずある。
+    unsafe extern "C" {
+        fn tzset();
+    }
+
+    // タイムゾーンの読み込みを先に 1 回だけ済ませる。
+    //
+    // `localtime_r` は POSIX 上 tzname を設定する義務が無く、tz 状態の初期化を
+    // いつ行うかは実装任せ。ここで明示的に 1 回通しておけば、以降の
+    // `localtime_r` は**初期化済みの状態を読むだけ**になり、初回の初期化が
+    // 複数スレッドから同時に走る形を考えなくてよくなる。
+    static TZ_READY: std::sync::Once = std::sync::Once::new();
+    TZ_READY.call_once(|| {
+        // SAFETY: `tzset` は引数も戻り値も無く、プロセスのタイムゾーン状態を
+        // `TZ` (と OS のタイムゾーン表) から読み直すだけ。`Once` で包んで
+        // あるので同時に走らず、終わるまで後続のスレッドは待つ。
+        unsafe { tzset() };
+    });
+
     // SAFETY: `libc::tm` は repr(C) の整数の並びと `tm_zone` (生ポインタ) だけで
     // でき、どのフィールドも全 0 が有効な値 (生ポインタは null が有効)。
     // 不正な値の型を作らないので、ゼロ埋めで初期化できる。この後
@@ -86,7 +106,9 @@ fn local_offset(unix: i64) -> i64 {
     //
     // `localtime_r` は**スレッドセーフ**: `localtime` が共有の static に書くのに
     // 対し、こちらは渡した `tm` にだけ結果を書く (POSIX が再入可能版として
-    // 規定するのがこの違い)。tokio の worker から同時に呼ばれても互いを壊さない。
+    // 規定するのがこの違い)。tz の初期化は上の `tzset` で済ませてあるので、
+    // ここで触るのは渡した `tm` と、読み取り専用になった tz 状態だけ。
+    // tokio の worker から同時に呼ばれても互いを壊さない。
     //
     // 残る前提は 1 つ、**`TZ` 環境変数を書き換える者がいないこと**。書き換えと
     // 同時に読むとデータ競合になる。この crate は `std::env::set_var` を呼ばず
