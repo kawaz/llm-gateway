@@ -7,6 +7,7 @@ use std::sync::Arc;
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
+use llm_gateway::stats::{Counters, Report as StatsReport};
 use llm_gateway::usage::{CredentialUsage, Report, Window};
 use llm_gateway::{Config, Gateway};
 
@@ -22,6 +23,7 @@ llm-gateway — クライアントに認証を意識させない、薄い LLM pr
   check       設定を読んで確かめる (起動はしない)
   models      設定に書かれているモデルを一覧する
   usage       認証情報ごとの利用量を一覧する (server に問い合わせる)
+  stats       認証情報 × モデル × 日のトークン使用量を一覧する
   login       ブラウザで認可を通し、認証情報を <名前>.json に保存する
 
 オプション:
@@ -32,6 +34,9 @@ llm-gateway — クライアントに認証を意識させない、薄い LLM pr
 usage のオプション:
   --refresh         使っていない認証情報にも最小のリクエストを投げて取り直す
                     (確認そのものが利用量を少し消費する)
+
+stats のオプション:
+  --days <N>        直近 N 日を出す (既定: 7、0 で全期間)
 
 login のオプション:
   --type <種別>     claude_oauth または codex_oauth
@@ -79,6 +84,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "check" => check(&parse_config_path(rest)?),
         "models" => models(&parse_config_path(rest)?),
         "usage" => usage(rest),
+        "stats" => stats(rest),
         "login" => login(rest),
         other => Err(format!(
             "`{other}` というコマンドはありません。`llm-gateway --help` を見てください"
@@ -340,12 +346,105 @@ fn parse_usage_args(args: &[String]) -> Result<UsageArgs, String> {
     })
 }
 
+/// `stats` に渡された内容。
+#[derive(Debug, PartialEq, Eq)]
+struct StatsArgs {
+    days: usize,
+    config_path: PathBuf,
+}
+
+/// 認証情報 × モデル × 日のトークン使用量を出す。
+///
+/// 集計を持っているのは server なので、ここは HTTP で聞いて整形するだけ
+/// (usage と同じ形、DR-0011)。過去日の分もディスクに残っているので、
+/// server が再集計せずに返す。
+fn stats(args: &[String]) -> Result<ExitCode, String> {
+    let StatsArgs { days, config_path } = parse_stats_args(args)?;
+    let config = load(&config_path)?;
+    let url = format!(
+        "{}?days={days}",
+        gateway_url(&config.server.listen, "stats")
+    );
+
+    let runtime =
+        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+
+    runtime.block_on(async move {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| server_unreachable(&config.server.listen, &e.to_string()))?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("応答を読めません: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("server が {status} を返しました: {body}"));
+        }
+
+        let report: StatsReport =
+            serde_json::from_str(&body).map_err(|e| format!("応答を解釈できません: {e}"))?;
+        print!("{}", render_stats(&report));
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn parse_stats_args(args: &[String]) -> Result<StatsArgs, String> {
+    let mut days = 7;
+    let mut config_path: Option<PathBuf> = None;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--days" => {
+                days = take_days(it.next().map(String::as_str))?;
+            }
+            "--config" => {
+                config_path = Some(PathBuf::from(
+                    it.next()
+                        .cloned()
+                        .ok_or("--config にパスが指定されていません")?,
+                ));
+            }
+            other => {
+                if let Some(v) = other.strip_prefix("--days=") {
+                    days = take_days(Some(v))?;
+                } else if let Some(path) = other.strip_prefix("--config=") {
+                    config_path = Some(PathBuf::from(path));
+                } else {
+                    return Err(format!("`{other}` は解釈できません"));
+                }
+            }
+        }
+    }
+
+    Ok(StatsArgs {
+        days,
+        config_path: config_path.unwrap_or_else(Config::default_path),
+    })
+}
+
+fn take_days(value: Option<&str>) -> Result<usize, String> {
+    let raw = value.ok_or("--days に日数が指定されていません")?;
+    raw.parse()
+        .map_err(|_| format!("--days には 0 以上の整数を渡してください (`{raw}`)"))
+}
+
 /// 問い合わせ先。
 ///
 /// 設定の `listen` は待ち受け側の書き方なので、どこからでも受ける指定
 /// (`0.0.0.0` / `::`) をそのまま宛先にはできない。手元から叩く前提で
 /// loopback に読み替える。
 fn usage_url(listen: &str, refresh: bool) -> String {
+    let query = if refresh { "?refresh=true" } else { "" };
+    format!("{}{query}", gateway_url(listen, "usage"))
+}
+
+/// `/llm-gateway/<name>` の宛先。
+fn gateway_url(listen: &str, name: &str) -> String {
     let host = match listen.rsplit_once(':') {
         Some((host, port)) => {
             let host = match host.trim_matches(['[', ']']) {
@@ -360,8 +459,7 @@ fn usage_url(listen: &str, refresh: bool) -> String {
         }
         None => listen.to_owned(),
     };
-    let query = if refresh { "?refresh=true" } else { "" };
-    format!("http://{host}/llm-gateway/usage{query}")
+    format!("http://{host}/llm-gateway/{name}")
 }
 
 fn other_is_ipv6(host: &str) -> bool {
@@ -432,6 +530,116 @@ fn render(report: &Report) -> String {
     // probe の消費報告は出さない (kawaz 裁定: 要らない)。JSON には残っているので、
     // 消費量を確かめたければ /llm-gateway/usage?refresh=true を直接見る。
     out.push('\n');
+    out
+}
+
+/// 日次集計を人が読む形に整える。
+///
+/// 1 つの桁組に全部を並べる。日ごとに合計を先に出し、その下に認証情報 ×
+/// モデルの内訳を字下げして置く。合計を先にするのは「その日いくら使ったか」が
+/// 一番よく見る数字で、内訳は当たりを付けた後に見るため。
+///
+/// 桁は全日で揃える。日ごとに幅が変わると、縦に並べて比べられない。
+fn render_stats(report: &StatsReport) -> String {
+    if report.days.is_empty() {
+        return "記録がありません。\n\
+                gateway を通したリクエストがまだ無いか、集計の置き場が空です。\n"
+            .to_owned();
+    }
+
+    // 先に全行を組み立てる。幅は全体を見てからでないと決まらない。
+    let mut lines: Vec<(String, Counters)> = Vec::new();
+    // 新しい日を上に出す。見たいのは直近。
+    for (date, creds) in report.days.iter().rev() {
+        let mut total = Counters::default();
+        for models in creds.values() {
+            for c in models.values() {
+                add(&mut total, c);
+            }
+        }
+        lines.push((format!("{date} {TOTAL_LABEL}"), total));
+
+        for (cred, models) in creds {
+            for (model, c) in models {
+                lines.push((format!("  {cred} {model}"), *c));
+            }
+        }
+    }
+
+    let label_width = lines.iter().map(|(l, _)| width(l)).max().unwrap_or(0);
+    let cell_width = lines
+        .iter()
+        .flat_map(|(_, c)| columns(c))
+        .map(|n| thousands(n).len())
+        .max()
+        .unwrap_or(0)
+        .max(HEADERS.iter().map(|h| h.len()).max().unwrap_or(0));
+
+    // 見出しは 1 度だけ。日ごとに挟むと、行数の少ない日ほど見出しで埋まる。
+    let mut out = " ".repeat(label_width);
+    for head in HEADERS {
+        out.push_str(&format!(" {head:>cell_width$}"));
+    }
+    out.push('\n');
+
+    let mut previous_day_ended = false;
+    for (label, counters) in &lines {
+        // 日の切り替わりで 1 行空ける。合計行は字下げが無いので見分けられる。
+        if !label.starts_with(' ') && previous_day_ended {
+            out.push('\n');
+        }
+        previous_day_ended = true;
+
+        out.push_str(label);
+        out.push_str(&" ".repeat(label_width.saturating_sub(width(label))));
+        out.push_str(&row(counters, cell_width));
+        out.push('\n');
+    }
+    out
+}
+
+/// 合計行の印。内訳の行と見分けられればよい。
+const TOTAL_LABEL: &str = "total";
+
+/// 集計の並び。表示と見出しでこの順を守る。
+const HEADERS: [&str; 5] = ["reqs", "input", "output", "cache_w", "cache_r"];
+
+fn columns(c: &Counters) -> [u64; 5] {
+    [
+        c.requests,
+        c.input_tokens,
+        c.output_tokens,
+        c.cache_creation_input_tokens,
+        c.cache_read_input_tokens,
+    ]
+}
+
+fn add(into: &mut Counters, c: &Counters) {
+    into.requests += c.requests;
+    into.input_tokens += c.input_tokens;
+    into.output_tokens += c.output_tokens;
+    into.cache_creation_input_tokens += c.cache_creation_input_tokens;
+    into.cache_read_input_tokens += c.cache_read_input_tokens;
+}
+
+/// 数を桁揃えで 1 行に並べる。見出しと同じ幅で、先頭に区切りの 1 桁を置く。
+fn row(c: &Counters, cell_width: usize) -> String {
+    columns(c)
+        .iter()
+        .map(|n| format!(" {:>cell_width$}", thousands(*n)))
+        .collect()
+}
+
+/// 3 桁ごとに区切る。トークン数は 6〜7 桁になるので、区切らないと読めない。
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
     out
 }
 
@@ -1406,5 +1614,241 @@ mod tests {
         assert!(USAGE.contains("--type"), "{USAGE}");
         assert!(USAGE.contains("claude_oauth"), "{USAGE}");
         assert!(USAGE.contains("codex_oauth"), "{USAGE}");
+    }
+
+    // ---------- stats (DR-0011) ----------
+
+    fn counters(reqs: u64, input: u64, output: u64) -> Counters {
+        Counters {
+            requests: reqs,
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }
+    }
+
+    /// 試験で書く 1 行。`(認証情報, モデル, 集計)`。
+    type Row<'a> = (&'a str, &'a str, Counters);
+
+    fn stats_report(days: &[(&str, &[Row<'_>])]) -> StatsReport {
+        let mut by_date = llm_gateway::stats::ByDate::new();
+        for (date, rows) in days {
+            let day = by_date.entry((*date).to_owned()).or_default();
+            for (cred, model, c) in *rows {
+                day.entry((*cred).to_owned())
+                    .or_default()
+                    .insert((*model).to_owned(), *c);
+            }
+        }
+        // JSON を経由するのは、server が返す形をそのまま読めることも一緒に
+        // 確かめられるため。
+        serde_json::from_value(serde_json::json!({
+            "generated_at": 1_785_326_400_i64,
+            "generated_at_iso": "2026-07-29T12:00:00Z",
+            "days": by_date,
+        }))
+        .unwrap()
+    }
+
+    /// 日ごとの合計と、認証情報 × モデルの内訳が出る。
+    #[test]
+    fn stats_shows_a_total_and_a_breakdown() {
+        let out = render_stats(&stats_report(&[(
+            "2026-07-29",
+            &[
+                ("claude-one", "claude-haiku-4-5", counters(3, 1_200, 340)),
+                ("claude-two", "claude-opus-5", counters(1, 50_000, 8_000)),
+            ],
+        )]));
+
+        assert!(out.contains("2026-07-29"), "{out}");
+        // 合計は 4 本 / input 51,200 / output 8,340。
+        assert!(out.contains("51,200"), "3 桁区切りの合計: {out}");
+        assert!(out.contains("8,340"), "{out}");
+        assert!(out.contains("claude-one"), "内訳に認証情報が出る: {out}");
+        assert!(out.contains("claude-opus-5"), "内訳にモデルが出る: {out}");
+        for head in HEADERS {
+            assert!(out.contains(head), "見出し {head} が無い: {out}");
+        }
+    }
+
+    /// 新しい日が上に来る。見たいのは直近。
+    #[test]
+    fn stats_puts_the_newest_day_first() {
+        let out = render_stats(&stats_report(&[
+            ("2026-07-28", &[("a", "m", counters(1, 1, 1))]),
+            ("2026-07-30", &[("a", "m", counters(1, 2, 2))]),
+        ]));
+
+        let newest = out.find("2026-07-30").expect("新しい日");
+        let oldest = out.find("2026-07-28").expect("古い日");
+        assert!(newest < oldest, "新しい日が先: {out}");
+    }
+
+    /// 桁は全日で揃える。日ごとに幅が変わると縦に読めない。
+    #[test]
+    fn stats_aligns_columns_across_days() {
+        let out = render_stats(&stats_report(&[
+            ("2026-07-29", &[("a", "m", counters(1, 1_000_000, 1))]),
+            ("2026-07-30", &[("a", "m", counters(1, 5, 1))]),
+        ]));
+
+        // 内訳の行だけ集めて、数の始まる桁が揃っているか見る。
+        let starts: Vec<usize> = out
+            .lines()
+            .filter(|l| l.starts_with("  a "))
+            .map(|l| l.find(|c: char| c.is_ascii_digit() || c == ',').unwrap())
+            .collect();
+        assert_eq!(starts.len(), 2, "{out}");
+        assert_eq!(starts[0], starts[1], "桁が揃う: {out}");
+    }
+
+    /// 記録が無ければ、何をすれば出るのかを言う。
+    #[test]
+    fn empty_stats_say_why() {
+        let out = render_stats(&stats_report(&[]));
+        assert!(out.contains("記録がありません"), "{out}");
+        assert!(out.contains("gateway"), "次に見る所を示す: {out}");
+    }
+
+    /// 認証情報を持たない経路は予約名で出る。
+    #[test]
+    fn stats_show_the_credentialless_route() {
+        let out = render_stats(&stats_report(&[(
+            "2026-07-29",
+            &[(llm_gateway::stats::NO_CREDENTIAL, "m", counters(1, 5, 6))],
+        )]));
+        assert!(out.contains(llm_gateway::stats::NO_CREDENTIAL), "{out}");
+    }
+
+    #[test]
+    fn thousands_separates_every_three_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(7), "7");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(12_345), "12,345");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    fn parse_stats(list: &[&str]) -> Result<StatsArgs, String> {
+        parse_stats_args(&args(list))
+    }
+
+    #[test]
+    fn stats_defaults_to_a_week() {
+        assert_eq!(parse_stats(&[]).unwrap().days, 7);
+    }
+
+    #[test]
+    fn stats_takes_a_day_count() {
+        assert_eq!(parse_stats(&["--days", "30"]).unwrap().days, 30);
+        assert_eq!(parse_stats(&["--days=1"]).unwrap().days, 1);
+        assert_eq!(parse_stats(&["--days", "0"]).unwrap().days, 0, "0 は全期間");
+    }
+
+    #[test]
+    fn stats_takes_a_config_path() {
+        let parsed = parse_stats(&["--config", "/tmp/c.toml"]).unwrap();
+        assert_eq!(parsed.config_path, PathBuf::from("/tmp/c.toml"));
+        assert_eq!(parsed.days, 7);
+        assert_eq!(
+            parse_stats(&["--config=/tmp/d.toml", "--days=3"])
+                .unwrap()
+                .config_path,
+            PathBuf::from("/tmp/d.toml")
+        );
+    }
+
+    /// 読めない日数は断る。黙って既定に落とすと、絞ったつもりの相手が別の
+    /// 範囲を見ることになる。
+    #[test]
+    fn stats_rejects_an_unreadable_day_count() {
+        for bad in [vec!["--days", "lots"], vec!["--days=-1"], vec!["--days"]] {
+            assert!(parse_stats(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn stats_rejects_unknown_options() {
+        assert!(parse_stats(&["--refresh"]).is_err());
+    }
+
+    /// 問い合わせ先は待ち受け先から作る。受け口の指定は loopback に読み替える。
+    #[test]
+    fn the_stats_url_points_at_the_local_server() {
+        assert_eq!(
+            gateway_url("127.0.0.1:8402", "stats"),
+            "http://127.0.0.1:8402/llm-gateway/stats"
+        );
+        assert_eq!(
+            gateway_url("0.0.0.0:8402", "stats"),
+            "http://127.0.0.1:8402/llm-gateway/stats"
+        );
+        assert_eq!(
+            gateway_url("[::]:8402", "stats"),
+            "http://127.0.0.1:8402/llm-gateway/stats"
+        );
+    }
+
+    /// usage の宛先は変わっていない。
+    #[test]
+    fn the_usage_url_is_unchanged() {
+        assert_eq!(
+            usage_url("127.0.0.1:8319", false),
+            "http://127.0.0.1:8319/llm-gateway/usage"
+        );
+        assert_eq!(
+            usage_url("127.0.0.1:8319", true),
+            "http://127.0.0.1:8319/llm-gateway/usage?refresh=true"
+        );
+    }
+
+    /// help に stats が並ぶ。
+    #[test]
+    fn help_mentions_stats() {
+        assert!(USAGE.contains("stats"), "コマンド一覧に無い");
+        assert!(USAGE.contains("--days"), "オプションの説明が無い");
+    }
+
+    /// 表の形を丸ごと固定する。
+    ///
+    /// 桁揃えは目で見て決めたもので、崩れても個別の assert には出にくい。
+    /// 1 度だけの見出し・日ごとの合計・字下げした内訳・日の間の空行を、
+    /// まとめてここで見張る。
+    #[test]
+    fn the_table_keeps_its_shape() {
+        let out = render_stats(&stats_report(&[
+            (
+                "2026-07-29",
+                &[
+                    (
+                        "claude-one",
+                        "claude-haiku-4-5",
+                        counters(312, 1_204_887, 34_002),
+                    ),
+                    ("claude-two", "claude-opus-5", counters(12, 98_120, 7_431)),
+                ],
+            ),
+            (
+                "2026-07-30",
+                &[("claude-one", "claude-haiku-4-5", counters(7, 8_120, 931))],
+            ),
+        ]));
+
+        let expected = concat!(
+            "                                   reqs     input    output   cache_w   cache_r\n",
+            "2026-07-30 total                      7     8,120       931         0         0\n",
+            "  claude-one claude-haiku-4-5         7     8,120       931         0         0\n",
+            "\n",
+            "2026-07-29 total                    324 1,303,007    41,433         0         0\n",
+            "  claude-one claude-haiku-4-5       312 1,204,887    34,002         0         0\n",
+            "  claude-two claude-opus-5           12    98,120     7,431         0         0\n",
+        );
+        assert_eq!(
+            out, expected,
+            "\n--- 実際 ---\n{out}--- 期待 ---\n{expected}"
+        );
     }
 }
