@@ -238,6 +238,9 @@ impl Stats {
     ///
     /// 載せるのは直近 [`RESTORED_DAYS`] 日分。それ以前の自分のファイルは
     /// 触らないまま、閲覧では読み込まれる ([`Self::report`])。
+    ///
+    /// serve の開始前に 1 回だけ呼ぶ前提。積み始めた後に呼ぶと、読み戻した
+    /// 日についてはメモリの積み分が読み戻しで置き換わる。
     pub fn restore(&self) {
         self.sweep_temporaries();
 
