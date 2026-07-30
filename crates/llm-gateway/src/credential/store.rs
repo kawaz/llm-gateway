@@ -9,9 +9,9 @@
 //! 込みに気づく (DR-0010)。
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast};
 
 use crate::{Error, Result};
 
@@ -95,6 +95,10 @@ struct Inner<P: Persistence> {
     persistence: P,
     http: reqwest::Client,
     /// 進行中の更新。同じ id への 2 人目以降はここに相乗りする。
+    ///
+    /// 待たない Mutex なのは、印を外すのが [`RefreshHandoff`] の [`Drop`] で、
+    /// そこで await できないため。持っている間にするのは印の出し入れだけで、
+    /// 待ちを挟まないので待たない錠で足りる。
     in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
     /// 読み出しのたびにファイルを開かないための控え。
     cache: RwLock<HashMap<CredentialId, Cached>>,
@@ -275,6 +279,17 @@ impl<P: Persistence> Inner<P> {
         }
     }
 
+    /// 進行中の印を開く。
+    ///
+    /// 毒 (持ち手が panic した印) は無視して中身を使う。入っているのは印だけ
+    /// で、途中まで書き換えた不整合な状態にならない。加えてここを開くのは
+    /// 後始末の [`Drop`] でもあり、そこで panic すると process ごと落ちる。
+    fn in_flight(&self) -> MutexGuard<'_, HashMap<CredentialId, RefreshSignal>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// 更新を 1 回だけ走らせ、その結果を待つ。
     ///
     /// 更新そのものは要求から切り離した仕事として走らせる。要求は途中で
@@ -284,7 +299,7 @@ impl<P: Persistence> Inner<P> {
     /// 切り離した側なので、要求が消えても後続が待ちっぱなしにならない。
     async fn refresh_once(self: &Arc<Self>, id: &CredentialId) -> Result<()> {
         let mut result = {
-            let mut in_flight = self.in_flight.lock().await;
+            let mut in_flight = self.in_flight();
             match in_flight.get(id) {
                 // 先着がいれば、その結果を待つ側に回る。
                 Some(tx) => tx.subscribe(),
@@ -295,11 +310,12 @@ impl<P: Persistence> Inner<P> {
                     let me = Arc::clone(self);
                     let owned = id.clone();
                     tokio::spawn(async move {
+                        // 印を外して結果を配るのは handoff に任せる。仕事が
+                        // 途中で落ちても必ず通る道にしておかないと、待って
+                        // いる側が来ない合図を待ち続ける。
+                        let mut handoff = RefreshHandoff::new(Arc::clone(&me), owned.clone(), tx);
                         let outcome = me.do_refresh(&owned).await;
-                        // 印を外してから配る。逆にすると、起きた側が
-                        // 残った印を見て次の更新に入れなくなる。
-                        me.in_flight.lock().await.remove(&owned);
-                        let _ = tx.send(outcome.as_ref().map(|_| ()).map_err(reason_of));
+                        handoff.finish(outcome.as_ref().map(|_| ()).map_err(reason_of));
                     });
                     rx
                 }
@@ -413,6 +429,51 @@ impl<P: Persistence> Inner<P> {
     }
 }
 
+/// 切り離した更新の後始末。落ちるときに印を外して結果を配る。
+///
+/// 走り切った経路だけで後始末をすると、途中で panic した場合に印が残り、
+/// その認証情報を求めた全員が来ない合図を待ち続ける (process を入れ替える
+/// まで戻らない)。[`Drop`] に寄せておけば、走り切っても落ちても同じ道を通る。
+struct RefreshHandoff<P: Persistence> {
+    inner: Arc<Inner<P>>,
+    id: CredentialId,
+    tx: RefreshSignal,
+    /// 走り切った結果。無いまま落ちたら、途中で途切れたということ。
+    outcome: Option<std::result::Result<(), String>>,
+}
+
+impl<P: Persistence> RefreshHandoff<P> {
+    fn new(inner: Arc<Inner<P>>, id: CredentialId, tx: RefreshSignal) -> Self {
+        Self {
+            inner,
+            id,
+            tx,
+            outcome: None,
+        }
+    }
+
+    /// 走り切った結果を預ける。配るのは落ちるとき。
+    fn finish(&mut self, outcome: std::result::Result<(), String>) {
+        self.outcome = Some(outcome);
+    }
+}
+
+impl<P: Persistence> Drop for RefreshHandoff<P> {
+    fn drop(&mut self) {
+        // 印を外してから配る。逆にすると、起きた側が残った印を見て次の
+        // 更新に入れなくなる。
+        self.inner.in_flight().remove(&self.id);
+
+        // 途切れた理由は追わない。待っている側にできるのは「もう一度頼む」
+        // だけなので、panic の中身を運んでも打つ手は変わらない。
+        let outcome = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| Err("the refresh task ended unexpectedly".to_owned()));
+        let _ = self.tx.send(outcome);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +521,8 @@ mod tests {
         loads: AtomicUsize,
         /// 何回目の読み出しで、何に入れ替わるか。
         swap: StdMutex<Option<(usize, StoredCredential)>>,
+        /// 何回目の読み出しで落ちるか (0 = 落ちない)。
+        panic_at: AtomicUsize,
         /// 中身が入れ替わるたびに進む版。
         version: AtomicUsize,
         /// 書き換えの権利。プロセスをまたがないので、ただの Mutex で足りる。
@@ -473,6 +536,7 @@ mod tests {
                 stores: AtomicUsize::new(0),
                 loads: AtomicUsize::new(0),
                 swap: StdMutex::new(None),
+                panic_at: AtomicUsize::new(0),
                 version: AtomicUsize::new(0),
                 guard: Arc::new(tokio::sync::Mutex::new(())),
             }
@@ -483,6 +547,14 @@ mod tests {
             *self.swap.lock().unwrap() = Some((at, next));
             self
         }
+
+        /// `at` 回目の読み出しで落ちる置き場にする。
+        ///
+        /// 更新の経路に自前の unwrap は無いので、panic は置き場側から起こす。
+        fn panicking(self, at: usize) -> Self {
+            self.panic_at.store(at, Ordering::SeqCst);
+            self
+        }
     }
 
     impl Persistence for Spy {
@@ -490,6 +562,10 @@ mod tests {
 
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
             let n = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(
+                n != self.panic_at.load(Ordering::SeqCst),
+                "試験用: {n} 回目の読み出しで落ちる"
+            );
             let mut swap = self.swap.lock().unwrap();
             if let Some((at, next)) = swap.as_ref()
                 && n >= *at
@@ -939,7 +1015,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(got.bearer(), "Bearer at-1");
         assert_eq!(server.hits(), 1, "同じ refresh token で 2 度叩かない");
         assert!(
-            store.inner.in_flight.lock().await.is_empty(),
+            store.inner.in_flight().is_empty(),
             "進行中の印が残っていると次回以降が永久に待つ"
         );
     }
@@ -1109,7 +1185,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(failures, 8, "更新先に繋がらないので全員失敗する");
         assert!(
-            store.inner.in_flight.lock().await.is_empty(),
+            store.inner.in_flight().is_empty(),
             "進行中の印が残っていると次回以降が永久に待つ"
         );
     }
@@ -1197,10 +1273,45 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let id = CredentialId::new("c");
 
         assert!(store.acquire(&id).await.is_err());
-        assert!(store.inner.in_flight.lock().await.is_empty());
+        assert!(store.inner.in_flight().is_empty());
 
         // 2 回目も同じように失敗する (待ちっぱなしにならない)。
         assert!(store.acquire(&id).await.is_err());
+    }
+
+    /// 更新が途中で落ちても、待っている側が起きて次の更新に入り直せる。
+    ///
+    /// 印を外して結果を配るのは更新を走らせた側なので、途中で panic すると
+    /// どちらも起きない。印が残ると、その認証情報を求めた全員が来ない合図を
+    /// 待ち続け、process を入れ替えるまで戻らない。
+    #[tokio::test]
+    async fn a_panicking_refresh_does_not_strand_the_next_request() {
+        let server = FakeTokenServer::start(std::time::Duration::ZERO).await;
+        // 2 回目の読み出し = 更新に入ってからの読み直し。そこで落ちる。
+        let store = store_against(Spy::new(cred(&at(-1))).panicking(2), &server).await;
+        let id = CredentialId::new("c");
+
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
+            .await
+            .expect("落ちた更新を待ち続けない")
+            .unwrap_err()
+            .to_string();
+
+        assert!(failed.contains("unexpectedly"), "{failed}");
+        assert_eq!(server.hits(), 0, "更新先へ行く前に落ちている");
+        assert!(
+            store.inner.in_flight().is_empty(),
+            "印が残ると次回以降が永久に待つ"
+        );
+
+        // 次の要求は普通に更新できる (道を塞いだままにしない)。
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
+            .await
+            .expect("次の要求も待ちっぱなしにならない")
+            .expect("更新に入り直せる");
+
+        assert_eq!(got.bearer(), "Bearer at-1");
+        assert_eq!(server.hits(), 1);
     }
 
     /// 別のプロセスが先に更新していたら、更新に走らずその結果を使う。
@@ -1259,7 +1370,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .to_string();
 
         assert!(err.contains("再ログイン"), "{err}");
-        assert!(store.inner.in_flight.lock().await.is_empty());
+        assert!(store.inner.in_flight().is_empty());
     }
 
     /// 拒否された beta を覚えるときも、控えではなく置き場から積み直す。
