@@ -129,7 +129,7 @@ impl<P: Persistence> Gateway<P> {
         query: Option<&str>,
         mut body: Value,
         headers: Vec<(String, String)>,
-    ) -> Result<forward::Response> {
+    ) -> Result<Forwarded> {
         let requested = model_of(&body)?.to_owned();
 
         // `opus` のような短い名前は、ここで実際のモデル名に直す。
@@ -147,7 +147,9 @@ impl<P: Persistence> Gateway<P> {
 
         let mut attempts = Vec::new();
         // この経路に断られた応答のうち、最後のもの。全滅したときに返す。
-        let mut denied: Option<forward::Response> = None;
+        // 出した経路の認証情報を添えるのは、断られた応答も使用量の集計対象
+        // (どの credential が断られたか) になるため。
+        let mut denied: Option<(forward::Response, Option<CredentialId>)> = None;
         for route in &routes {
             match self.try_route(route, path, query, &body, &headers).await {
                 Ok(resp) => {
@@ -164,7 +166,11 @@ impl<P: Persistence> Gateway<P> {
                         status = resp.status,
                         "upstream のヘッダを受け取りました"
                     );
-                    return Ok(resp);
+                    return Ok(Forwarded {
+                        response: resp,
+                        credential: route.credential.clone(),
+                        model,
+                    });
                 }
                 Err(Switch { reason, denial }) => {
                     warn!(model = %model, route = route.name(), %reason, "経路を切り替えます");
@@ -172,8 +178,8 @@ impl<P: Persistence> Gateway<P> {
                         provider: route.name().to_owned(),
                         reason,
                     });
-                    if denial.is_some() {
-                        denied = denial;
+                    if let Some(resp) = denial {
+                        denied = Some((resp, route.credential.clone()));
                     }
                 }
             }
@@ -182,14 +188,18 @@ impl<P: Persistence> Gateway<P> {
         // 断られた応答を見ていたなら、最後のものをそのまま返す。こちらで
         // 別の状態に置き換えると、`retry-after` のようなクライアントが次の
         // 一手を決める手掛かりまで消える。
-        if let Some(resp) = denied {
+        if let Some((resp, credential)) = denied {
             warn!(
                 model = %model,
                 status = resp.status,
                 routes = routes.len(),
                 "経路を使い切りました。最後に断られた応答をそのまま返します"
             );
-            return Ok(resp);
+            return Ok(Forwarded {
+                response: resp,
+                credential,
+                model,
+            });
         }
 
         Err(Error::AllUpstreamsFailed { model, attempts })
@@ -426,6 +436,22 @@ impl<P: Persistence> Gateway<P> {
             count("output_tokens").unwrap_or(0),
         ))
     }
+}
+
+/// 転送した結果。応答と、それを出した経路の身元。
+///
+/// 身元を応答と別に持つのは、使用量の集計が「どの credential のどのモデルか」で
+/// 束ねるのに対し、[`forward::Response`] は HTTP の応答そのもの (状態・ヘッダ・
+/// 本文) を表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
+/// upstream の応答を表す構造体に溜まっていく (DR-0011)。
+#[derive(Debug)]
+pub struct Forwarded {
+    pub response: forward::Response,
+    /// この応答を出した credential。relay 型のように認証情報を持たない経路は
+    /// `None`。
+    pub credential: Option<CredentialId>,
+    /// 解決後の実モデル名。短い名前 (`opus`) はここでは解決済み。
+    pub model: String,
 }
 
 /// プローブの結果。消費した分と、credential ごとの失敗。
@@ -722,9 +748,137 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
-        assert!(body_text(resp).await.contains("ok"));
+        assert_eq!(resp.response.status, 200);
+        assert!(body_text(resp.response).await.contains("ok"));
         assert_eq!(up.hits(), 1);
+    }
+
+    /// 通った経路の認証情報が応答に付いてくる。使用量をこの鍵で束ねる。
+    #[tokio::test]
+    async fn a_forwarded_response_names_the_credential_that_answered() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            up.url
+        ))
+        .await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 200);
+        assert_eq!(
+            resp.credential.as_ref().map(CredentialId::as_str),
+            Some("a"),
+            "どの認証情報が答えたか"
+        );
+    }
+
+    /// モデル名は**解決後**のものが付く。
+    ///
+    /// 短い名前のまま集計すると、同じモデルが別名の数だけ行に分かれる。
+    #[tokio::test]
+    async fn a_forwarded_response_carries_the_resolved_model() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["claude-opus-5"]
+
+[ns.default.aliases]
+opus = "claude-opus-*"
+"#,
+            up.url
+        ))
+        .await;
+
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                "/v1/messages",
+                None,
+                json!({"model": "opus", "max_tokens": 8, "messages": []}),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 200);
+        assert_eq!(
+            resp.model, "claude-opus-5",
+            "短い名前ではなく解決後のモデル名"
+        );
+    }
+
+    /// 認証情報を持たない経路 (relay) は `None`。集計側で「持ち主なし」に振る。
+    #[tokio::test]
+    async fn a_route_without_a_credential_has_no_owner() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            up.url
+        ))
+        .await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.credential, None);
+        assert_eq!(resp.model, "m");
+    }
+
+    /// 断られた応答を透過するときも、断った経路の身元が付く。
+    ///
+    /// 上限に当たった分を集計から落とすと、「使い切った日」が記録に残らない。
+    #[tokio::test]
+    async fn a_passed_through_denial_still_names_the_route() {
+        let denying = FakeUpstream::always(429).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            denying.url
+        ))
+        .await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 429);
+        assert_eq!(resp.model, "m", "断られた応答にもモデル名は付く");
     }
 
     /// 経路が断たれていたら次を試す。
@@ -757,7 +911,7 @@ credentials = ["down", "alive"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
         assert_eq!(down.hits(), 1, "先に試す");
         assert_eq!(alive.hits(), 1, "落ちていたので次へ");
     }
@@ -790,7 +944,7 @@ credentials = ["nowhere", "alive"]
             .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
     }
 
     /// リクエスト側の誤りは、そのままクライアントへ返す。
@@ -824,7 +978,7 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 400);
+        assert_eq!(resp.response.status, 400);
         assert_eq!(other.hits(), 0, "次を試さない");
     }
 
@@ -863,8 +1017,8 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
-        assert!(body_text(resp).await.contains("ok"));
+        assert_eq!(resp.response.status, 200);
+        assert!(body_text(resp.response).await.contains("ok"));
         assert_eq!((limited.hits(), spare.hits()), (1, 1));
     }
 
@@ -883,7 +1037,7 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
         assert_eq!((stale.hits(), spare.hits()), (1, 1));
     }
 
@@ -908,10 +1062,10 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429);
+        assert_eq!(resp.response.status, 429);
         assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
         assert!(
-            body_text(resp).await.contains("the last one"),
+            body_text(resp.response).await.contains("the last one"),
             "最後に断られた応答の本文がそのまま返る"
         );
     }
@@ -933,15 +1087,16 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429);
+        assert_eq!(resp.response.status, 429);
         assert_eq!(
-            resp.headers
+            resp.response
+                .headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
                 .map(|(_, v)| v.as_str()),
             Some("30"),
             "いつ再開できるかを伝える: {:?}",
-            resp.headers
+            resp.response.headers
         );
     }
 
@@ -961,8 +1116,8 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
-        assert!(body_text(resp).await.contains("ok"));
+        assert_eq!(resp.response.status, 200);
+        assert!(body_text(resp.response).await.contains("ok"));
         assert_eq!((crowded.hits(), spare.hits()), (1, 1));
     }
 
@@ -987,10 +1142,10 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 529);
+        assert_eq!(resp.response.status, 529);
         assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
         assert!(
-            body_text(resp).await.contains("the last one"),
+            body_text(resp.response).await.contains("the last one"),
             "最後に見た応答の本文がそのまま返る"
         );
     }
@@ -1019,8 +1174,8 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429);
-        assert!(body_text(resp).await.contains("status 429"));
+        assert_eq!(resp.response.status, 429);
+        assert!(body_text(resp.response).await.contains("status 429"));
         assert_eq!(limited.hits(), 1, "同じ先へ送り直さない");
     }
 
@@ -1036,7 +1191,7 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429);
+        assert_eq!(resp.response.status, 429);
         assert_eq!((down.hits(), limited.hits()), (1, 1));
     }
 
@@ -1054,7 +1209,7 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429, "経路断で塗り替えない");
+        assert_eq!(resp.response.status, 429, "経路断で塗り替えない");
         assert_eq!((limited.hits(), down.hits()), (1, 1));
     }
 
@@ -1174,8 +1329,8 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429, "繋がらない先で塗り替えない");
-        assert!(body_text(resp).await.contains("status 429"));
+        assert_eq!(resp.response.status, 429, "繋がらない先で塗り替えない");
+        assert!(body_text(resp.response).await.contains("status 429"));
         assert_eq!(limited.hits(), 1);
     }
 
@@ -1220,7 +1375,7 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200, "断られた先を飛ばして次が通る");
+        assert_eq!(resp.response.status, 200, "断られた先を飛ばして次が通る");
         assert_eq!(negotiating.hits(), 2, "送り直すのは 1 回だけ");
         assert_eq!(spare.hits(), 1);
     }
@@ -1246,10 +1401,10 @@ credentials = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 429);
+        assert_eq!(resp.response.status, 429);
         assert_eq!(up.hits(), 2);
         assert!(
-            body_text(resp).await.contains("after the retry"),
+            body_text(resp.response).await.contains("after the retry"),
             "送り直した側の応答が返る"
         );
     }
@@ -1440,7 +1595,7 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200, "落として送り直した結果が返る");
+        assert_eq!(resp.response.status, 200, "落として送り直した結果が返る");
         assert_eq!(up.hits(), 2, "送り直すのは 1 回だけ");
 
         let sent = up.requests();
@@ -1490,7 +1645,7 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
         assert_eq!(up.hits(), 1, "400 を踏まずに済む");
 
         let sent = &up.requests()[0];
@@ -1541,9 +1696,9 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.status, 400);
+        assert_eq!(resp.response.status, 400);
         assert!(
-            body_text(resp).await.contains("status 400"),
+            body_text(resp.response).await.contains("status 400"),
             "本文を読んだ後もそのまま返す"
         );
         assert_eq!(up.hits(), 1, "送り直さない");
@@ -1571,7 +1726,7 @@ credentials = ["a"]
             .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
 
         let learned = store.saved();
         assert_eq!(
@@ -1767,7 +1922,7 @@ opus = "claude-opus-*"
             )
             .await
             .unwrap();
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.response.status, 200);
         assert_eq!(up.hits(), 1);
     }
 }

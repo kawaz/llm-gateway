@@ -189,7 +189,8 @@ async fn messages<P: Persistence + 'static>(
         .instrument(span.clone())
         .await
     {
-        Ok(upstream) => {
+        Ok(forwarded) => {
+            let upstream = forwarded.response;
             let mut resp = Response::builder().status(upstream.status);
             for (name, value) in &upstream.headers {
                 resp = resp.header(name, value);
