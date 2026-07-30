@@ -1,6 +1,6 @@
 ---
 title: credential×モデル毎のデイリー使用量集計を蓄積・閲覧できるようにする
-status: open
+status: resolved
 category: request
 created: 2026-07-30T22:03:30+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-07-30T23:30:07+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0011","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
