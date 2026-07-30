@@ -162,8 +162,9 @@ impl<P: Persistence> Gateway<P> {
 
         let mut attempts = Vec::new();
         // この経路に断られた応答のうち、最後のもの。全滅したときに返す。
-        // 出した経路の認証情報を添えるのは、断られた応答も使用量の集計対象
-        // (どの credential が断られたか) になるため。
+        // 認証情報を添えて持ち回るのは、どの経路を通って返る応答でも同じ形
+        // (応答 + 身元) にするため。使用量の集計に乗るのは 2xx だけで、断られた
+        // 応答は集計されない (エラーの本文に usage は無い、DR-0011)。
         let mut denied: Option<(forward::Response, Option<CredentialId>)> = None;
         for route in &routes {
             match self.try_route(route, path, query, &body, &headers).await {
@@ -866,9 +867,10 @@ credentials = ["a"]
         assert_eq!(resp.model, "m");
     }
 
-    /// 断られた応答を透過するときも、断った経路の身元が付く。
+    /// 断られた応答を透過するときも、同じ形 (応答 + 身元) で返る。
     ///
-    /// 上限に当たった分を集計から落とすと、「使い切った日」が記録に残らない。
+    /// 身元が付くのは形を揃えるためで、集計に乗るという意味ではない
+    /// (断られた応答は集計されない、DR-0011)。
     #[tokio::test]
     async fn a_passed_through_denial_still_names_the_route() {
         let denying = FakeUpstream::always(429).await;
@@ -894,6 +896,7 @@ credentials = ["a"]
 
         assert_eq!(resp.response.status, 429);
         assert_eq!(resp.model, "m", "断られた応答にもモデル名は付く");
+        assert_eq!(resp.credential, None, "relay 型なので持ち主なし");
     }
 
     /// 経路が断たれていたら次を試す。
