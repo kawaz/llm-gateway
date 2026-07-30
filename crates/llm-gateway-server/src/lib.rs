@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use tracing::{Instrument as _, error};
+use tracing::{Instrument as _, error, warn};
 
 use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::Persistence;
@@ -126,6 +126,8 @@ async fn messages<P: Persistence + 'static>(
     // 突き合わせられる。番号を振るのは本文を読む前 — 読むのにかかった
     // 時間も、この番号の下に残したい。
     let span = relay::request_span();
+    // 断るときのログにも載せるので、経路が決まる前に取り出しておく。
+    let ns_name = namespace_of(uri.path()).to_owned();
 
     // Design rationale: 応答は流すのに、要求は全部読んでから渡す。
     //
@@ -144,7 +146,15 @@ async fn messages<P: Persistence + 'static>(
     let receiving = Instant::now();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
-        Err(e) => return client_error(StatusCode::BAD_REQUEST, &format!("本文を読めません: {e}")),
+        Err(e) => {
+            return span.in_scope(|| {
+                client_error(
+                    &ns_name,
+                    StatusCode::BAD_REQUEST,
+                    &format!("本文を読めません: {e}"),
+                )
+            });
+        }
     };
     // 大きさは受け取った実バイト数で数える。Content-Length は手前の
     // プロキシが chunked で渡してくると付かないが、こちらは必ず取れる。
@@ -153,19 +163,21 @@ async fn messages<P: Persistence + 'static>(
     let json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
-            return client_error(
-                StatusCode::BAD_REQUEST,
-                &format!("JSON として読めません: {e}"),
-            );
+            return span.in_scope(|| {
+                client_error(
+                    &ns_name,
+                    StatusCode::BAD_REQUEST,
+                    &format!("JSON として読めません: {e}"),
+                )
+            });
         }
     };
 
     let headers = collect_headers(&parts.headers);
-    let ns_name = namespace_of(uri.path()).to_owned();
     let Some(ns) = gateway.namespace(&ns_name) else {
-        return unknown_namespace(&ns_name, &gateway.namespace_names());
+        return span.in_scope(|| unknown_namespace(&ns_name, &gateway.namespace_names()));
     };
-    if let Some(denied) = rejection(ns, &ns_name, &parts.headers) {
+    if let Some(denied) = span.in_scope(|| rejection(ns, &ns_name, &parts.headers)) {
         return denied;
     }
 
@@ -184,16 +196,21 @@ async fn messages<P: Persistence + 'static>(
             }
             // 本文は読まずに流す。SSE はここを通り抜けるだけ。
             // 包むのは終端 (流し切った / 途切れた / 中断された) を残すため。
-            resp.body(Body::from_stream(relay::observe(upstream.body, span)))
-                .unwrap_or_else(|e| {
-                    error!(%e, "応答を組み立てられません");
+            resp.body(Body::from_stream(relay::observe(
+                upstream.body,
+                span.clone(),
+            )))
+            .unwrap_or_else(|e| {
+                span.in_scope(|| {
                     client_error(
+                        &ns_name,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "応答を組み立てられません",
+                        &format!("could not build the response: {e}"),
                     )
                 })
+            })
         }
-        Err(e) => error_response(&e),
+        Err(e) => span.in_scope(|| error_response(&ns_name, &e)),
     }
 }
 
@@ -223,6 +240,7 @@ async fn models<P: Persistence + 'static>(
 
 fn unknown_namespace(name: &str, known: &[&str]) -> Response {
     client_error(
+        name,
         StatusCode::NOT_FOUND,
         &format!(
             "namespace `{name}` は設定されていません。使えるのは: {}",
@@ -250,16 +268,12 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
         ),
     };
 
-    Some(
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "type": "error",
-                "error": {"type": "authentication_error", "message": message},
-            })),
-        )
-            .into_response(),
-    )
+    Some(refused(
+        name,
+        StatusCode::UNAUTHORIZED,
+        "authentication_error",
+        &message,
+    ))
 }
 
 fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -276,7 +290,7 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// gateway の失敗をクライアントへ返す形にする。
 ///
 /// Anthropic のエラー形式に合わせる。クライアントはこの形を読める。
-fn error_response(e: &Error) -> Response {
+fn error_response(ns: &str, e: &Error) -> Response {
     let (status, kind) = match e {
         Error::UnknownModel(_) => (StatusCode::NOT_FOUND, "not_found_error"),
         Error::AllUpstreamsFailed { .. } | Error::UpstreamUnreachable { .. } => {
@@ -302,24 +316,34 @@ fn error_response(e: &Error) -> Response {
         other => other.to_string(),
     };
 
-    if status.is_server_error() {
-        error!(%message, "リクエストを処理できません");
-    }
-
-    (
-        status,
-        Json(json!({"type": "error", "error": {"type": kind, "message": message}})),
-    )
-        .into_response()
+    refused(ns, status, kind, &message)
 }
 
-fn client_error(status: StatusCode, message: &str) -> Response {
+/// 入口で断るときの応答。`invalid_request_error` で返す。
+fn client_error(ns: &str, status: StatusCode, message: &str) -> Response {
+    refused(ns, status, "invalid_request_error", message)
+}
+
+/// クライアントへ返す失敗を組み立てて、断ったことを 1 行残す。
+///
+/// ログをここに置くのは、経路を試す前に確定する失敗が転送のログに何も
+/// 残さないから。upstream へ行かないので経路切替も全滅も記録されず、404 や
+/// 401 の原因は再現手順を踏むまで分からない (実際に、namespace の filter で
+/// 外したモデルへの 404 をログから追えなかった)。
+fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response {
+    let status_code = status.as_u16();
+    if status.is_server_error() {
+        error!(%ns, status = status_code, %message, "リクエストを処理できません");
+    } else {
+        warn!(%ns, status = status_code, %message, "リクエストを断りました");
+    }
+
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
         Json(json!({
             "type": "error",
-            "error": {"type": "invalid_request_error", "message": message},
+            "error": {"type": kind, "message": message},
         })),
     )
         .into_response()
@@ -438,7 +462,7 @@ content-length: {declared}\r\n\r\n{head}"
     ///
     /// 記録するのはクライアントへ本文を流す側 (別のタスク) なので、
     /// スレッドローカルでは捕まえられない。プロセスに 1 つだけ差し込む。
-    fn captured_logs() -> &'static Mutex<Vec<u8>> {
+    pub(crate) fn captured_logs() -> &'static Mutex<Vec<u8>> {
         static LOGS: OnceLock<&'static Mutex<Vec<u8>>> = OnceLock::new();
         LOGS.get_or_init(|| {
             let logs: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
@@ -673,8 +697,12 @@ credentials = ["a"]
     }
 
     /// 設定に無いモデルは 404。どのモデルか分かる文言にする。
+    ///
+    /// 断った記録も残す。upstream へ行かないので転送のログには何も出ず、
+    /// 残さないと「なぜ 404 になったか」を再現手順を踏むまで追えない。
     #[tokio::test]
     async fn unknown_model_yields_404() {
+        let logs = captured_logs();
         let base = serve_with_default_ns(
             r#"
 [credentials.a]
@@ -709,6 +737,18 @@ credentials = ["a"]
                 .contains("no-such-model"),
             "{body}"
         );
+
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let refused = text
+            .lines()
+            .find(|l| l.contains("リクエストを断りました") && l.contains("no-such-model"))
+            .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
+        assert!(
+            refused.contains("ns=default"),
+            "どの namespace か: {refused}"
+        );
+        assert!(refused.contains("status=404"), "何を返したか: {refused}");
+        assert!(refused.contains("req="), "どの要求か: {refused}");
     }
 
     /// 経路が全滅したら 503。どこで何が起きたかを返す。
@@ -1184,7 +1224,7 @@ models = ["m"]
 
 #[cfg(test)]
 mod e2e_namespace_tests {
-    use super::tests::{TOKEN, authed, serve};
+    use super::tests::{TOKEN, authed, captured_logs, serve};
     use serde_json::Value;
 
     /// 2 つの namespace を持つ設定。見えるモデルが違う。
@@ -1272,8 +1312,12 @@ auth_token = "secret-token"
     }
 
     /// トークンを設定した namespace は、合っていないと通さない。
+    ///
+    /// 通さなかったことは記録に残す。どの namespace で弾いたか分からないと、
+    /// 設定の書き間違いとトークンの誤りを切り分けられない。
     #[tokio::test]
     async fn namespace_token_is_checked() {
+        let logs = captured_logs();
         let base = serve(TWO_NS).await;
         let client = reqwest::Client::new();
 
@@ -1291,6 +1335,17 @@ auth_token = "secret-token"
             .await
             .unwrap();
         assert_eq!(wrong.status(), 401);
+
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let refused = text
+            .lines()
+            .find(|l| l.contains("リクエストを断りました") && l.contains("ns=locked"))
+            .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
+        assert!(refused.contains("status=401"), "何を返したか: {refused}");
+        assert!(
+            !refused.contains("secret-token"),
+            "トークンは書かない: {refused}"
+        );
 
         for value in ["Bearer secret-token", "secret-token"] {
             let ok = client
