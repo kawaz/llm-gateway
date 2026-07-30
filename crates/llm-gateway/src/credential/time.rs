@@ -50,12 +50,15 @@ pub fn now_unix() -> i64 {
 /// 使用量を日ごとに束ねる鍵に使う。UTC で数えると JST では日の境目が朝 9 時に
 /// なり、「今日どれだけ使ったか」が体感とずれる (DR-0011)。
 pub fn local_date(unix: i64) -> String {
-    date_of(unix + local_offset(unix))
+    date_at_offset(unix, local_offset(unix))
 }
 
-/// unix 秒を `YYYY-MM-DD` にする。渡すのは地方時へずらし終えた値。
-fn date_of(shifted: i64) -> String {
-    let (y, mo, d) = civil_from_days(shifted.div_euclid(86_400));
+/// UTC から `offset` 秒ずれた地方時で見た日付 (`YYYY-MM-DD`)。
+///
+/// offset を引数で受けるのは、機械のタイムゾーンに依らず試験できるようにする
+/// ため。OS を引く部分は [`local_offset`] に寄せてある。
+fn date_at_offset(unix: i64, offset: i64) -> String {
+    let (y, mo, d) = civil_from_days((unix + offset).div_euclid(86_400));
     format!("{y:04}-{mo:02}-{d:02}")
 }
 
@@ -67,12 +70,29 @@ fn date_of(shifted: i64) -> String {
 /// `/etc/localtime` (TZif) を解くのは、この 1 用途に対して重すぎる。
 /// 時刻を渡して都度引くのは、常駐したまま夏時間の境目を跨いでも正しく
 /// 転がるようにするため。
+///
+/// `tm_gmtoff` は POSIX ではなく BSD / glibc の拡張。このリポの対象は macOS
+/// (DR-0010)、CI も含めて Linux までなので、どちらにもある。
 fn local_offset(unix: i64) -> i64 {
+    // SAFETY: `libc::tm` は repr(C) の整数の並びと `tm_zone` (生ポインタ) だけで
+    // でき、どのフィールドも全 0 が有効な値 (生ポインタは null が有効)。
+    // 不正な値の型を作らないので、ゼロ埋めで初期化できる。この後
+    // `localtime_r` が全フィールドを埋めるので、読むのは埋まった後だけ。
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: 渡すのは有効な time_t 1 つと、この場で確保した tm 1 つ。
-    // localtime_r は結果を渡した tm にだけ書き、共有の状態を触らない
-    // (再入可能版を選ぶのはそのため)。失敗すれば null が返るだけ。
+
+    // SAFETY: 第 1 引数は有効な `time_t` 1 つへの参照、第 2 引数はこの場で
+    // 初期化した `tm` への排他参照で、どちらも呼び出しの間だけ生きていれば
+    // 足りる (localtime_r は参照を保持しない)。
+    //
+    // `localtime_r` は**スレッドセーフ**: `localtime` が共有の static に書くのに
+    // 対し、こちらは渡した `tm` にだけ結果を書く (POSIX が再入可能版として
+    // 規定するのがこの違い)。tokio の worker から同時に呼ばれても互いを壊さない。
+    //
+    // 残る前提は 1 つ、**`TZ` 環境変数を書き換える者がいないこと**。書き換えと
+    // 同時に読むとデータ競合になる。この crate は `std::env::set_var` を呼ばず
+    // (edition 2024 ではそれ自体が unsafe)、依存も起動後に環境を書き換えない。
     let filled = unsafe { libc::localtime_r(&(unix as libc::time_t), &mut tm) };
+
     if filled.is_null() {
         // タイムゾーンを引けない環境では UTC として数える。日の境目はずれるが、
         // 集計そのものは続く。
@@ -161,42 +181,104 @@ mod tests {
         assert!(now_unix() > 1_700_000_000);
     }
 
-    /// 日付の切り出しは offset を足した後の値で行う。
+    /// 東にずれた地方時 (offset が正) の日付。
     ///
-    /// 実機の地方時に依らず確かめられるよう、ずらした値を直に渡す。
+    /// UTC の午後は、東側では既に翌日に入っていることがある。
     #[test]
-    fn date_is_cut_from_the_shifted_time() {
+    fn a_positive_offset_can_land_on_the_next_day() {
         // 2026-07-29T12:00:00Z
         let noon = 1_785_326_400;
-        assert_eq!(date_of(noon), "2026-07-29");
-        // JST (+9h) では同じ瞬間がまだ 29 日の 21 時。
-        assert_eq!(date_of(noon + 9 * 3600), "2026-07-29");
-        // UTC の 15 時を過ぎると JST は翌日に入る。
-        assert_eq!(date_of(noon + 12 * 3600), "2026-07-30");
-        // UTC の 0 時直前は、JST ではもう翌日。
-        assert_eq!(date_of(noon - 12 * 3600 + 9 * 3600), "2026-07-29");
+        assert_eq!(date_at_offset(noon, 0), "2026-07-29", "UTC");
+        // JST (+9h) ではまだ 29 日の 21 時。
+        assert_eq!(date_at_offset(noon, 9 * 3600), "2026-07-29");
+        // UTC の 15 時を過ぎると JST は翌日。
+        assert_eq!(date_at_offset(noon + 3 * 3600, 9 * 3600), "2026-07-30");
+        // キリバス (+14h) は最も東。UTC の 10 時で既に翌日。
+        assert_eq!(date_at_offset(noon, 14 * 3600), "2026-07-30");
+    }
+
+    /// 西にずれた地方時 (offset が負) の日付。
+    ///
+    /// UTC の午前は、西側ではまだ前日。ここを間違えると、負の offset の下で
+    /// 日付が 1 日ずれたまま集計される。
+    #[test]
+    fn a_negative_offset_can_land_on_the_previous_day() {
+        // 2026-07-29T02:00:00Z
+        let early = parse_rfc3339("2026-07-29T02:00:00Z").unwrap();
+        assert_eq!(date_at_offset(early, 0), "2026-07-29", "UTC");
+        // ニューヨーク (-4h、夏時間) ではまだ 28 日の 22 時。
+        assert_eq!(date_at_offset(early, -4 * 3600), "2026-07-28");
+        // ロサンゼルス (-7h) も前日。
+        assert_eq!(date_at_offset(early, -7 * 3600), "2026-07-28");
+        // 同じ日の午後なら、西側でも同じ日。
+        let afternoon = parse_rfc3339("2026-07-29T20:00:00Z").unwrap();
+        assert_eq!(date_at_offset(afternoon, -7 * 3600), "2026-07-29");
+    }
+
+    /// 日の境目のちょうど両側。
+    ///
+    /// 地方時の 00:00:00 は新しい日で、その 1 秒前は前の日。境界が 1 秒
+    /// ずれると、深夜の利用が隣の日に付く。
+    #[test]
+    fn the_day_boundary_falls_between_the_right_two_seconds() {
+        let offset = 9 * 3600;
+        // 地方時で 2026-07-30T00:00:00 になる瞬間 (= UTC の 07-29T15:00:00)。
+        let midnight = parse_rfc3339("2026-07-29T15:00:00Z").unwrap();
+
+        assert_eq!(date_at_offset(midnight - 1, offset), "2026-07-29", "1 秒前");
+        assert_eq!(date_at_offset(midnight, offset), "2026-07-30", "ちょうど");
+        assert_eq!(date_at_offset(midnight + 1, offset), "2026-07-30", "1 秒後");
+    }
+
+    /// epoch より前 (offset で 1970 年より手前に出る) でも崩れない。
+    ///
+    /// 負の日数になるので、切り捨ての向きを間違えると 1 日ずれる。
+    #[test]
+    fn dates_before_the_epoch_still_work() {
+        let epoch = 0;
+        assert_eq!(date_at_offset(epoch, 0), "1970-01-01");
+        // 西にずれると epoch の瞬間はまだ 1969 年。
+        assert_eq!(date_at_offset(epoch, -1), "1969-12-31");
+        assert_eq!(date_at_offset(epoch, -11 * 3600), "1969-12-31");
     }
 
     /// 年と月の境目でも桁が崩れない。
     #[test]
     fn date_pads_every_field() {
         let new_year = parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
-        assert_eq!(date_of(new_year), "2026-01-01");
-        assert_eq!(date_of(new_year - 1), "2025-12-31");
+        assert_eq!(date_at_offset(new_year, 0), "2026-01-01");
+        assert_eq!(date_at_offset(new_year, -1), "2025-12-31");
         assert_eq!(
-            date_of(parse_rfc3339("2028-02-29T00:00:00Z").unwrap()),
-            "2028-02-29"
+            date_at_offset(parse_rfc3339("2028-02-29T00:00:00Z").unwrap(), 0),
+            "2028-02-29",
+            "閏日"
         );
+    }
+
+    /// 実機の offset は現実的な範囲に収まる。
+    ///
+    /// 世界の地方時は UTC-12 〜 UTC+14 の間。ここを外れる値が返るなら
+    /// `tm_gmtoff` の読み方を間違えている。
+    #[test]
+    fn the_machine_offset_is_a_real_timezone() {
+        let offset = local_offset(now_unix());
+        assert!(
+            (-12 * 3600..=14 * 3600).contains(&offset),
+            "offset が地方時の範囲外: {offset}"
+        );
+        // 15 分刻みでないタイムゾーンは存在しない。
+        assert_eq!(offset % 900, 0, "15 分の倍数でない: {offset}");
     }
 
     /// 地方時の日付が形として読める。
     ///
-    /// 値そのものは実機のタイムゾーン次第なので、形と「UTC 日付との差は
-    /// 高々 1 日」だけを見る。
+    /// 値そのものは実機のタイムゾーン次第なので、形と「実機の offset で
+    /// 計算した値と一致する」ことを見る。
     #[test]
-    fn local_date_looks_like_a_date() {
+    fn local_date_uses_the_machine_offset() {
         let now = now_unix();
         let local = local_date(now);
+
         let parts: Vec<&str> = local.split('-').collect();
         assert_eq!(parts.len(), 3, "{local}");
         assert_eq!(
@@ -204,12 +286,10 @@ mod tests {
             (4, 2, 2),
             "{local}"
         );
-
-        // どの地方時でも、UTC の前日・当日・翌日のどれか。
-        let near: Vec<String> = [-86_400, 0, 86_400]
-            .iter()
-            .map(|d| date_of(now + d))
-            .collect();
-        assert!(near.contains(&local), "{local} が {near:?} に無い");
+        assert_eq!(
+            local,
+            date_at_offset(now, local_offset(now)),
+            "実機の offset を通している"
+        );
     }
 }
