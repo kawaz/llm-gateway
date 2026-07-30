@@ -23,7 +23,7 @@ llm-gateway — クライアントに認証を意識させない、薄い LLM pr
   check       設定を読んで確かめる (起動はしない)
   models      設定に書かれているモデルを一覧する
   usage       認証情報ごとの利用量を一覧する (server に問い合わせる)
-  stats       認証情報 × モデル × 日のトークン使用量を一覧する
+  stats       list token usage per credential x model x day
   login       ブラウザで認可を通し、認証情報を <名前>.json に保存する
 
 オプション:
@@ -35,8 +35,8 @@ usage のオプション:
   --refresh         使っていない認証情報にも最小のリクエストを投げて取り直す
                     (確認そのものが利用量を少し消費する)
 
-stats のオプション:
-  --days <N>        直近 N 日を出す (既定: 7、0 で全期間)
+stats options:
+  --days <N>        show the last N days (default: 7, 0 for everything)
 
 login のオプション:
   --type <種別>     claude_oauth または codex_oauth
@@ -150,13 +150,20 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
 
         // 使用量の集計を定期的に落とす。
         let flusher = Arc::clone(&gateway);
-        tokio::spawn(async move { flusher.stats().keep_flushing(STATS_FLUSH_INTERVAL).await });
+        let flushing =
+            tokio::spawn(async move { flusher.stats().keep_flushing(STATS_FLUSH_INTERVAL).await });
 
         let serving = Arc::clone(&gateway);
         let result = axum::serve(listener, llm_gateway_server::router(serving))
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("待ち受けが止まりました: {e}"));
+
+        // 定期の保存を先に止めて、終わるのを待つ。待たずに最後の保存へ進むと
+        // 2 者が同時に書きうる。書き込み自体も直列化されているが、待つ側で
+        // 重なりを消しておけば「同時に書いたが壊れなかった」に頼らずに済む。
+        flushing.abort();
+        let _ = flushing.await;
 
         // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
         // 直前の分を失わない。
@@ -366,8 +373,8 @@ fn stats(args: &[String]) -> Result<ExitCode, String> {
         gateway_url(&config.server.listen, "stats")
     );
 
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(async move {
         let resp = reqwest::Client::new()
@@ -380,13 +387,13 @@ fn stats(args: &[String]) -> Result<ExitCode, String> {
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("応答を読めません: {e}"))?;
+            .map_err(|e| format!("could not read the response: {e}"))?;
         if !status.is_success() {
-            return Err(format!("server が {status} を返しました: {body}"));
+            return Err(format!("the server returned {status}: {body}"));
         }
 
-        let report: StatsReport =
-            serde_json::from_str(&body).map_err(|e| format!("応答を解釈できません: {e}"))?;
+        let report: StatsReport = serde_json::from_str(&body)
+            .map_err(|e| format!("could not parse the response: {e}"))?;
         print!("{}", render_stats(&report));
         Ok(ExitCode::SUCCESS)
     })
@@ -404,9 +411,7 @@ fn parse_stats_args(args: &[String]) -> Result<StatsArgs, String> {
             }
             "--config" => {
                 config_path = Some(PathBuf::from(
-                    it.next()
-                        .cloned()
-                        .ok_or("--config にパスが指定されていません")?,
+                    it.next().cloned().ok_or("--config needs a path")?,
                 ));
             }
             other => {
@@ -415,7 +420,7 @@ fn parse_stats_args(args: &[String]) -> Result<StatsArgs, String> {
                 } else if let Some(path) = other.strip_prefix("--config=") {
                     config_path = Some(PathBuf::from(path));
                 } else {
-                    return Err(format!("`{other}` は解釈できません"));
+                    return Err(format!("could not understand `{other}`"));
                 }
             }
         }
@@ -427,10 +432,15 @@ fn parse_stats_args(args: &[String]) -> Result<StatsArgs, String> {
     })
 }
 
+/// `--days` の値を読む。
+///
+/// 上限で抑えるのは、日数を秒に直す掛け算が桁あふれするため (`llm_gateway::stats`
+/// の `MAX_DAYS`)。全期間を見たいなら `--days 0`。
 fn take_days(value: Option<&str>) -> Result<usize, String> {
-    let raw = value.ok_or("--days に日数が指定されていません")?;
-    raw.parse()
-        .map_err(|_| format!("--days には 0 以上の整数を渡してください (`{raw}`)"))
+    let raw = value.ok_or("--days needs a number of days")?;
+    raw.parse::<usize>()
+        .map(|days| days.min(llm_gateway::stats::MAX_DAYS))
+        .map_err(|_| format!("--days takes a whole number, got `{raw}`"))
 }
 
 /// 問い合わせ先。
@@ -542,8 +552,9 @@ fn render(report: &Report) -> String {
 /// 桁は全日で揃える。日ごとに幅が変わると、縦に並べて比べられない。
 fn render_stats(report: &StatsReport) -> String {
     if report.days.is_empty() {
-        return "記録がありません。\n\
-                gateway を通したリクエストがまだ無いか、集計の置き場が空です。\n"
+        return "No usage recorded yet.\n\
+                Nothing has been forwarded through the gateway, \
+                or the stats directory is empty.\n"
             .to_owned();
     }
 
@@ -1705,11 +1716,14 @@ mod tests {
     }
 
     /// 記録が無ければ、何をすれば出るのかを言う。
+    ///
+    /// 文言は英語 (DR-0008: CLI が出す文言は英語)。
     #[test]
     fn empty_stats_say_why() {
         let out = render_stats(&stats_report(&[]));
-        assert!(out.contains("記録がありません"), "{out}");
+        assert!(out.contains("No usage recorded yet"), "{out}");
         assert!(out.contains("gateway"), "次に見る所を示す: {out}");
+        assert!(out.contains("stats directory"), "置き場も示す: {out}");
     }
 
     /// 認証情報を持たない経路は予約名で出る。
@@ -1768,6 +1782,19 @@ mod tests {
         for bad in [vec!["--days", "lots"], vec!["--days=-1"], vec!["--days"]] {
             assert!(parse_stats(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// 大きすぎる日数は上限で抑える (桁あふれで何も返らなくなるのを防ぐ)。
+    #[test]
+    fn stats_clamps_an_enormous_day_count() {
+        let max = llm_gateway::stats::MAX_DAYS;
+        assert_eq!(parse_stats(&["--days", "100000"]).unwrap().days, max);
+        assert_eq!(
+            parse_stats(&[&format!("--days={}", usize::MAX)])
+                .unwrap()
+                .days,
+            max
+        );
     }
 
     #[test]

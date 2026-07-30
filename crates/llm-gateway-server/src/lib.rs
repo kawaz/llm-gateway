@@ -98,6 +98,9 @@ async fn stats<P: Persistence + 'static>(
 const DEFAULT_DAYS: usize = 7;
 
 /// `?days=N` を読む。付いていなければ既定。
+///
+/// 上限で抑えるのは、日数を秒に直す掛け算が桁あふれするため。抑えないと
+/// 絞り込みの起点が未来に回って全部消える。
 fn requested_days(query: Option<&str>) -> Result<usize, String> {
     let Some(raw) = query.and_then(|q| {
         q.split('&')
@@ -107,7 +110,8 @@ fn requested_days(query: Option<&str>) -> Result<usize, String> {
     }) else {
         return Ok(DEFAULT_DAYS);
     };
-    raw.parse()
+    raw.parse::<usize>()
+        .map(|days| days.min(llm_gateway::stats::MAX_DAYS))
         .map_err(|_| format!("`days` must be a whole number, got `{raw}`"))
 }
 
@@ -1818,6 +1822,33 @@ credentials = ["a"]
         assert_eq!(requested_days(Some("days=0")), Ok(0));
         assert!(requested_days(Some("days=-1")).is_err());
         assert!(requested_days(Some("days=")).is_err());
+    }
+
+    /// 大きすぎる日数は上限で抑える。
+    ///
+    /// 抑えないと日数を秒に直す掛け算が桁あふれし、絞り込みの起点が未来に
+    /// 回って**何も返らない**。
+    #[test]
+    fn an_enormous_day_count_is_clamped() {
+        let max = llm_gateway::stats::MAX_DAYS;
+        assert_eq!(requested_days(Some("days=100000")), Ok(max));
+        assert_eq!(
+            requested_days(Some(&format!("days={}", usize::MAX))),
+            Ok(max)
+        );
+        assert_eq!(requested_days(Some("days=36500")), Ok(max), "上限そのもの");
+    }
+
+    /// 極端な日数でも 200 が返る (落ちない)。
+    #[tokio::test]
+    async fn an_enormous_day_count_still_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_default_ns(&stats_dir(dir.path())).await;
+
+        let resp = reqwest::get(format!("{base}/llm-gateway/stats?days={}", usize::MAX))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
     }
 
     /// content-type は大小を問わず引ける。
