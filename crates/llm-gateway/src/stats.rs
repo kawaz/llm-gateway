@@ -25,17 +25,22 @@
 //! cache も再掲するため、イベント名で拾う先を決めず「usage が載っていたら、
 //! 載っているフィールドだけ上書き」で扱う。
 //!
+//! 読む単位は行ではなく**イベント**。同じイベントの連続する `data:` 行は改行で
+//! 繋いだものが 1 つの中身なので (SSE の仕様)、空行まで溜めてから解く。
+//!
 //! ## 落ちても失わない
 //!
 //! 1 リクエストごとにディスクへ書くのは無駄なので、メモリに積んで定期的に
 //! 落とす。書き込み先は**このプロセス専用のファイル** (`<日付>.<ポート>.json`)
 //! にしてあり、複数の gateway が並走しても互いのファイルを触らない。排他は
 //! 要らない — 読む側が全ファイルを足し合わせる。
+//!
+//! 落とすのは**変わった日だけ**で、書き手はプロセス内で 1 人に絞る。読み戻すのは
+//! 当日と前日だけ (それ以前は閲覧時にファイルから読む)。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -120,14 +125,39 @@ pub type ByCredential = BTreeMap<String, ByModel>;
 /// 日付 → 認証情報 → モデル → 集計。閲覧に出す形。
 pub type ByDate = BTreeMap<String, ByCredential>;
 
+/// 起動時にメモリへ載せる日数 (当日から数えて)。
+///
+/// 常駐したまま日を跨ぐと当日分と前日分の両方に積むことがある (応答の日付は
+/// 始まった時刻で決まるので、深夜に始まった応答が明けてから終わる)。載せるのは
+/// **書き足す予定のある日**だけでよく、それ以前は閲覧時にファイルから読める。
+/// 全部載せると、運用が続くほど起動時の読み込みと保存の対象が増える。
+const RESTORED_DAYS: usize = 2;
+
+/// 閲覧で遡れる日数の上限 (約 100 年)。
+///
+/// 上限を置くのは、`days` を秒に直す掛け算が桁あふれするため。`usize` の上限を
+/// そのまま渡されると `i64` へ落とす時点で負に回り、絞り込みの起点が未来に
+/// なって**全部消える**。これより長い期間を指したいなら `days = 0` (全期間)。
+pub const MAX_DAYS: usize = 36_500;
+
 /// 日ごと・認証情報ごと・モデルごとに積む器。
 ///
 /// 書き込みは中継の終わり (tap の後始末) から呼ばれる。await できない場所なので
 /// 同期の [`Mutex`] を使う。押さえている間にやるのは足し算だけ。
 pub struct Stats {
     counts: Mutex<ByDate>,
-    /// 前回落としてから変わったか。変わっていなければ書かない。
-    dirty: AtomicBool,
+    /// 前回落としてから変わった日。**日ごと**に持つ。
+    ///
+    /// 全体で 1 つの目印にすると、1 件積むだけで「メモリに載っている全部の日」を
+    /// 書き直すことになる。過去日のファイルは読むだけにしたいので、変わった日を
+    /// 名指しで覚える。
+    dirty: Mutex<BTreeSet<String>>,
+    /// 書き込み中であることの札。
+    ///
+    /// 定期の保存と終了時の保存が重なると、同じ一時ファイルを 2 者が切り詰め
+    /// 合って「混ざった中身が rename される」「片方が消したファイルをもう
+    /// 片方が rename しようとして失敗する」経路が開く。書く側を 1 人に絞る。
+    writing: Mutex<()>,
     dir: PathBuf,
     /// このプロセスの書き込み先を他と分ける名前 (待ち受けポート)。
     writer: String,
@@ -140,7 +170,8 @@ impl Stats {
     pub fn new(dir: impl Into<PathBuf>, writer: &str) -> Self {
         Self {
             counts: Mutex::new(ByDate::new()),
-            dirty: AtomicBool::new(false),
+            dirty: Mutex::new(BTreeSet::new()),
+            writing: Mutex::new(()),
             dir: dir.into(),
             writer: sanitize_writer(writer),
         }
@@ -158,17 +189,37 @@ impl Stats {
         let date = local_date(at);
         let credential = credential.unwrap_or(NO_CREDENTIAL).to_owned();
 
+        // メモリに無い日なら、その日の自分のファイルを先に読む。読まずに積むと
+        // 次の保存が**その日のファイルを上書きして消す**。読み戻しの範囲
+        // ([`RESTORED_DAYS`]) の外に落ちた日へ積む場合 (時計が巻き戻った等) も、
+        // ここで拾えば失われない。ファイルを読むのは鍵を持つ前 (I/O を
+        // 押さえた中でやらない)。
+        let seed = if self
+            .counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&date)
+        {
+            None
+        } else {
+            self.read_own_day(&date)
+        };
+
         let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         counts
-            .entry(date)
-            .or_default()
+            .entry(date.clone())
+            .or_insert_with(|| seed.unwrap_or_default())
             .entry(credential)
             .or_default()
             .entry(model.to_owned())
             .or_default()
             .add(tokens);
         drop(counts);
-        self.dirty.store(true, Ordering::Relaxed);
+
+        self.dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(date);
     }
 
     /// メモリに積んである分。
@@ -184,19 +235,21 @@ impl Stats {
     /// これをやらないと、再起動のたびに当日分が 0 から数え直しになり、次の
     /// flush で**前回までの分を上書きして消す**。読むのは自分のファイルだけ
     /// (他の writer の分は向こうが持っている)。
+    ///
+    /// 載せるのは直近 [`RESTORED_DAYS`] 日分。それ以前の自分のファイルは
+    /// 触らないまま、閲覧では読み込まれる ([`Self::report`])。
     pub fn restore(&self) {
+        self.sweep_temporaries();
+
+        let now = crate::credential::time::now_unix();
+        let recent: Vec<String> = (0..RESTORED_DAYS as i64)
+            .map(|back| local_date(now - back * 86_400))
+            .collect();
+
         let mut restored = ByDate::new();
-        for (date, path) in self.own_files() {
-            match read_day(&path) {
-                Ok(day) if !day.is_empty() => {
-                    restored.insert(date, day);
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    // 読めない 1 日分で起動を止めない。その日の自分の分は
-                    // 次の flush で書き直されるが、他の writer の分は残る。
-                    tracing::warn!(path = %path.display(), %e, "日次集計を読み戻せません");
-                }
+        for date in recent {
+            if let Some(day) = self.read_own_day(&date) {
+                restored.insert(date, day);
             }
         }
         if restored.is_empty() {
@@ -207,28 +260,51 @@ impl Stats {
         tracing::info!(days, "日次集計を読み戻しました");
     }
 
-    /// 積んである分をディスクへ落とす。変わっていなければ何もしない。
+    /// 変わった日だけをディスクへ落とす。変わっていなければ何もしない。
     ///
     /// 書くのは自分のファイルだけ。日付ごとに分けて書くので、日を跨いだ直後に
     /// 残っている前日分もそのまま正しい先へ行く。
     pub fn flush(&self) -> std::io::Result<()> {
-        if !self.dirty.swap(false, Ordering::Relaxed) {
+        // 先に目印を外す。書いている間に積まれた分は、次の周回で拾い直せる
+        // よう積み直される (取りこぼしより書き直しの方が安い)。
+        let pending: Vec<String> =
+            std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|e| e.into_inner()))
+                .into_iter()
+                .collect();
+        if pending.is_empty() {
             return Ok(());
         }
-        let counts = self.in_memory();
-        if counts.is_empty() {
-            return Ok(());
+
+        // 書く者を 1 人に絞る。ここから下は直列。
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            self.mark_dirty(pending);
+            return Err(e);
         }
-        std::fs::create_dir_all(&self.dir)?;
-        for (date, day) in &counts {
-            if let Err(e) = write_day(&self.path_of(date), day) {
-                // 書けなかった分は次の周回でまた書く。落とし損なった状態で
-                // dirty を寝かせたままにしない。
-                self.dirty.store(true, Ordering::Relaxed);
+        for (i, date) in pending.iter().enumerate() {
+            let Some(day) = self
+                .counts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(date)
+                .cloned()
+            else {
+                continue;
+            };
+            if let Err(e) = write_day(&self.path_of(date), &day) {
+                // 書けなかった日と、まだ書いていない日を積み直す。
+                self.mark_dirty(pending[i..].to_vec());
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// この日を「変わった」に戻す。保存し損なった分を次の周回へ回す。
+    fn mark_dirty(&self, dates: Vec<String>) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        dirty.extend(dates);
     }
 
     /// 一定の間隔で落とし続ける。
@@ -249,22 +325,25 @@ impl Stats {
     /// 全 writer のファイルとメモリの分を合わせた全体像。
     ///
     /// 落とす前の分もここに出る。閲覧が「さっき使った分が出ない」にならない
-    /// ようにするため。
+    /// ようにするため。ただし**他の writer がまだ落としていない分は見えない**
+    /// (向こうの保存間隔だけ遅れて現れる)。
     pub fn report(&self, days: usize, now: i64) -> Report {
-        let mut merged = self.on_disk();
-        for (date, day) in self.in_memory() {
-            let into = merged.entry(date).or_default();
-            for (credential, models) in day {
-                let into = into.entry(credential).or_default();
-                for (model, counters) in models {
-                    into.entry(model).or_default().merge(&counters);
-                }
-            }
+        let mine = self.in_memory();
+        // メモリに載っている日は、自分のファイルより新しい。その日だけ
+        // 自分のファイルを読み飛ばす (両方足すと二重に数える)。読み戻しの
+        // 範囲外の過去日は、メモリに無いのでファイルから読む。
+        let superseded: BTreeSet<&str> = mine.keys().map(String::as_str).collect();
+
+        let mut merged = self.on_disk(&superseded);
+        for (date, day) in mine {
+            merge_day(merged.entry(date).or_default(), day);
         }
 
         // 直近 N 日に絞る。日付は文字列だが `YYYY-MM-DD` は辞書順が日付順。
+        // 上限で抑えてから秒に直す (抑えないと桁あふれで起点が未来に回る)。
         if days > 0 {
-            let from = local_date(now - (days as i64 - 1) * 86_400);
+            let back = (days.min(MAX_DAYS) as i64 - 1).saturating_mul(86_400);
+            let from = local_date(now.saturating_sub(back));
             merged.retain(|date, _| date.as_str() >= from.as_str());
         }
         Report {
@@ -274,58 +353,83 @@ impl Stats {
         }
     }
 
-    /// ディスクにある全 writer の分を日付ごとに合わせる。
+    /// ディスクにある分を日付ごとに合わせる。
     ///
-    /// メモリの分は含めない。自分が落とした分はここにも出るので、[`Self::report`]
-    /// が足すのは**まだ落としていない分だけ**にしたい。だが落とした分は
-    /// メモリにも残っているため、素直に足すと二重に数える。そこで自分の
-    /// ファイルは読み飛ばし、自分の分はメモリを正本にする。
-    fn on_disk(&self) -> ByDate {
+    /// `superseded` に挙げた日については、自分のファイルを読み飛ばす
+    /// (メモリの方が新しい)。他の writer のファイルは常に読む。
+    fn on_disk(&self, superseded: &BTreeSet<&str>) -> ByDate {
         let mut merged = ByDate::new();
         let own = self.own_suffix();
-        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(date) = date_of_file(name) else {
-                continue;
-            };
-            if name.ends_with(&own) {
+        for (date, path) in self.day_files() {
+            let is_own = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&own));
+            if is_own && superseded.contains(date.as_str()) {
                 continue;
             }
             let Ok(day) = read_day(&path) else {
                 tracing::warn!(path = %path.display(), "日次集計を読めません");
                 continue;
             };
-            let into = merged.entry(date).or_default();
-            for (credential, models) in day {
-                let into = into.entry(credential).or_default();
-                for (model, counters) in models {
-                    into.entry(model).or_default().merge(&counters);
-                }
-            }
+            merge_day(merged.entry(date).or_default(), day);
         }
         merged
     }
 
-    /// 自分が書いたファイルの `(日付, パス)`。
-    fn own_files(&self) -> Vec<(String, PathBuf)> {
-        let own = self.own_suffix();
+    /// 自分が書いたその日のファイル。無い / 読めない / 空なら `None`。
+    fn read_own_day(&self, date: &str) -> Option<ByCredential> {
+        let path = self.path_of(date);
+        if !path.exists() {
+            return None;
+        }
+        match read_day(&path) {
+            Ok(day) if !day.is_empty() => Some(day),
+            Ok(_) => None,
+            Err(e) => {
+                // 読めない 1 日分で起動や集計を止めない。
+                tracing::warn!(path = %path.display(), %e, "日次集計を読めません");
+                None
+            }
+        }
+    }
+
+    /// 置き場にある日次ファイルの `(日付, パス)`。日付として読めない名前は無視する。
+    fn day_files(&self) -> Vec<(String, PathBuf)> {
         let mut found = Vec::new();
         for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !name.ends_with(&own) {
-                continue;
-            }
             if let Some(date) = date_of_file(name) {
                 found.push((date, path));
             }
         }
         found
+    }
+
+    /// 前回の保存が途中で落ちて残った自分の一時ファイルを消す。
+    ///
+    /// rename まで進めなかった残骸は誰も読まないが、置き場に溜まり続ける。
+    /// 消すのは**自分の名前が付いたものだけ** — 他の writer の一時ファイルは
+    /// 今まさに書いている途中かもしれない。
+    fn sweep_temporaries(&self) {
+        let prefix = format!("{}.json.tmp.", self.writer);
+        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // `2026-07-30.8402.json.tmp.<pid>.<連番>` の後半で見分ける。
+            if !name.contains(&prefix) {
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!(path = %path.display(), "書き損じを片付けました"),
+                Err(e) => tracing::warn!(path = %path.display(), %e, "書き損じを消せません"),
+            }
+        }
     }
 
     fn own_suffix(&self) -> String {
@@ -371,20 +475,40 @@ fn sanitize_writer(writer: &str) -> String {
     }
 }
 
+/// 1 日分を足し込む。ファイル同士・ファイルとメモリを合わせるときに使う。
+fn merge_day(into: &mut ByCredential, day: ByCredential) {
+    for (credential, models) in day {
+        let into = into.entry(credential).or_default();
+        for (model, counters) in models {
+            into.entry(model).or_default().merge(&counters);
+        }
+    }
+}
+
 fn read_day(path: &Path) -> std::io::Result<ByCredential> {
     let raw = std::fs::read_to_string(path)?;
     serde_json::from_str(&raw).map_err(std::io::Error::other)
 }
 
+/// 一時ファイルに振る通し番号。
+///
+/// pid だけでは、同じプロセスの 2 者が同じ名前を掴みうる。書く側は
+/// [`Stats::writing`] で 1 人に絞ってあるが、名前も重ならないようにして
+/// 二重に塞ぐ (排他が緩んだときに壊れ方が静かになるのを避ける)。
+static NEXT_TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 1 日分を書く。
 ///
 /// 一時ファイルに書いてから rename する。読む側 (CLI / 別プロセス) が途中の
-/// 状態を読まないようにするため。名前に pid を混ぜるのは、同じ置き場を使う
-/// 別プロセスと一時ファイルを取り違えないため (DR-0010 と同じ理由)。
+/// 状態を読まないようにするため。名前に pid と通し番号を混ぜるのは、同じ置き場を
+/// 使う別プロセス・同じプロセスの別の書き手と一時ファイルを取り違えないため
+/// (DR-0010 と同じ理由)。
 fn write_day(path: &Path, day: &ByCredential) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::sync::atomic::Ordering;
 
-    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    let seq = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
     let json = serde_json::to_vec_pretty(day).map_err(std::io::Error::other)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -396,12 +520,14 @@ fn write_day(path: &Path, day: &ByCredential) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// SSE の 1 行をどこまで抱えるか。
+/// SSE の 1 イベントをどこまで抱えるか。
 ///
-/// 行の途中でチャンクが切れるので、行が揃うまで持つ必要がある。上限を置くのは
-/// 壊れた相手 (改行を返さない upstream) にメモリを食い潰されないため。実際の
-/// `message_start` は 1KB 前後なので、これでも桁が違う。
-const MAX_SSE_LINE: usize = 256 * 1024;
+/// 行の途中でチャンクが切れるので行が揃うまで持ち、さらに 1 イベントが複数の
+/// `data:` 行に割れうるのでイベントが閉じるまで持つ。**書きかけの行と、その
+/// イベントで溜めた分の合計**をこの上限で見る。壊れた相手 (改行も空行も返さない
+/// upstream) にメモリを食い潰されないため。実際の `message_start` は 1KB 前後
+/// なので、これでも桁が違う。
+const MAX_SSE_EVENT: usize = 256 * 1024;
 
 /// ストリームでない応答を、集計のためにどこまで抱えるか。
 ///
@@ -436,6 +562,7 @@ pub fn tap(
         inner: body,
         mode,
         held: Vec::new(),
+        event: Vec::new(),
         given_up: false,
         tokens: Tokens::default(),
         stats,
@@ -478,6 +605,8 @@ struct Tap {
     mode: Mode,
     /// 行の途中 (SSE) / 本文の全部 (JSON) を溜める控え。
     held: Vec<u8>,
+    /// 今のイベントで溜めた `data:` の中身 (SSE)。複数行なら改行で繋いである。
+    event: Vec<u8>,
     /// 上限を超えたので、この応答の集計をやめた。
     given_up: bool,
     tokens: Tokens,
@@ -505,44 +634,69 @@ impl Tap {
         }
     }
 
-    /// SSE を行に切って、usage が載っている行だけ読む。
+    /// SSE を行に切り、イベントが閉じるところで中身を読む。
     ///
     /// チャンクの境目は行の途中に落ちる。揃った行だけを処理し、残りは次の
     /// チャンクまで持つ。
     fn observe_sse(&mut self, chunk: &[u8]) {
         for &b in chunk {
             if b == b'\n' {
-                // 行の中身だけ取り出して控えを空にする。
                 let line = std::mem::take(&mut self.held);
                 self.read_sse_line(&line);
                 continue;
             }
-            if self.held.len() >= MAX_SSE_LINE {
-                self.give_up("SSE の 1 行が長すぎます");
+            // 書きかけの行と、このイベントで溜めた分の合計で見る。
+            if self.held.len() + self.event.len() >= MAX_SSE_EVENT {
+                self.give_up("SSE の 1 イベントが長すぎます");
                 return;
             }
             self.held.push(b);
         }
     }
 
-    /// `data: {...}` 1 行から usage を読む。
+    /// SSE の 1 行を処理する。
     ///
-    /// JSON として解くのは usage が載っている行だけ。イベントは 1 応答で
-    /// 何十個も流れるので、全部解くと中継の脇で無駄に働くことになる。
+    /// 空行はイベントの終わり。`data:` の行は中身を溜めるだけで、読むのは
+    /// イベントが閉じたとき — **1 つのイベントの data は複数行に割れてよく、
+    /// その場合は改行で繋いだものが 1 つの中身**になる (SSE の仕様)。行ごとに
+    /// 解こうとすると、そうやって割られた usage を黙って取りこぼす。
     fn read_sse_line(&mut self, line: &[u8]) {
-        let Some(payload) = line
-            .strip_prefix(b"data:")
-            .filter(|rest| contains(rest, b"\"usage\""))
-        else {
+        // 行末の `\r` は終端の一部 (CRLF で区切る upstream がある)。
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+
+        if line.is_empty() {
+            self.finish_event();
+            return;
+        }
+        let Some(payload) = line.strip_prefix(b"data:") else {
+            // `event:` / `id:` / 注釈行は読まない。usage を載せるのは data だけ。
             return;
         };
-        let Ok(event) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        // コロンの直後の空白 1 つは区切りの一部で、中身には入らない。
+        let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+
+        if !self.event.is_empty() {
+            self.event.push(b'\n');
+        }
+        self.event.extend_from_slice(payload);
+    }
+
+    /// イベントが閉じた。溜めた中身から usage を読む。
+    ///
+    /// JSON として解くのは usage が載っているものだけ。イベントは 1 応答で
+    /// 何十個も流れるので、全部解くと中継の脇で無駄に働くことになる。
+    fn finish_event(&mut self) {
+        let event = std::mem::take(&mut self.event);
+        if !contains(&event, b"\"usage\"") {
+            return;
+        }
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&event) else {
             return;
         };
         // `message_start` は `/message/usage`、`message_delta` は `/usage` に
         // 載せる。イベント名で決め打ちせず、在る方を読む。
         for pointer in ["/message/usage", "/usage"] {
-            if let Some(usage) = event.pointer(pointer) {
+            if let Some(usage) = parsed.pointer(pointer) {
                 self.tokens.absorb(usage);
             }
         }
@@ -552,6 +706,7 @@ impl Tap {
     fn give_up(&mut self, reason: &str) {
         self.given_up = true;
         self.held = Vec::new();
+        self.event = Vec::new();
         self.tokens = Tokens::default();
         tracing::warn!(reason, model = %self.model, "使用量の集計をやめます");
     }
@@ -590,13 +745,25 @@ impl Drop for Tap {
         if self.given_up {
             return;
         }
-        // ストリームでない応答は、ここで初めて全体が揃う。
-        if self.mode == Mode::Json
-            && !self.held.is_empty()
-            && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&self.held)
-            && let Some(usage) = body.pointer("/usage")
-        {
-            self.tokens.absorb(usage);
+        match self.mode {
+            // ストリームでない応答は、ここで初めて全体が揃う。
+            Mode::Json => {
+                if !self.held.is_empty()
+                    && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&self.held)
+                    && let Some(usage) = body.pointer("/usage")
+                {
+                    self.tokens.absorb(usage);
+                }
+            }
+            // 終端が空行で閉じられていなければ、最後のイベントが溜まったまま
+            // 残る。書きかけの行も最後の 1 行として扱う。
+            Mode::Sse => {
+                let last = std::mem::take(&mut self.held);
+                if !last.is_empty() {
+                    self.read_sse_line(&last);
+                }
+                self.finish_event();
+            }
         }
         self.stats.record(
             self.at,
@@ -1006,6 +1173,189 @@ mod tests {
         assert!(!t.is_empty(), "読めた分があれば記録する");
     }
 
+    // ---------- 保存の範囲と直列化 (レビュー指摘 A / B) ----------
+
+    /// 読み戻しは直近だけでも、**過去日は閲覧に出る**。
+    ///
+    /// メモリに載っていない過去日は自分のファイルから読む。ここが抜けると、
+    /// 再起動した瞬間に過去の記録が一覧から消える。
+    #[test]
+    fn past_days_are_still_visible_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = NOW - 10 * 86_400;
+        {
+            let s = stats(dir.path());
+            s.record(old, Some("a"), "m", &tokens(100, 50));
+            s.record(NOW, Some("a"), "m", &tokens(1, 2));
+            s.flush().unwrap();
+        }
+
+        // 再起動。読み戻すのは直近 RESTORED_DAYS 日分だけ。
+        let s = stats(dir.path());
+        s.restore();
+        assert!(
+            !s.in_memory().contains_key(&local_date(old)),
+            "10 日前はメモリに載せない"
+        );
+
+        let report = s.report(0, NOW);
+        let c = &report.days[&local_date(old)]["a"]["m"];
+        assert_eq!(c.requests, 1, "過去日はファイルから読む");
+        assert_eq!(c.input_tokens, 100);
+    }
+
+    /// 読み戻しの範囲外の日へ積んでも、その日のファイルを消さない。
+    ///
+    /// メモリに無い日は、積む前にファイルを読んで土台にする。読まずに積むと
+    /// 次の保存が過去日のファイルを上書きして消す。
+    #[test]
+    fn recording_into_an_unrestored_day_keeps_what_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = NOW - 10 * 86_400;
+        {
+            let s = stats(dir.path());
+            s.record(old, Some("a"), "m", &tokens(100, 50));
+            s.flush().unwrap();
+        }
+
+        let s = stats(dir.path());
+        s.restore();
+        // 時計が巻き戻った等で、載せていない日へ積む。
+        s.record(old, Some("a"), "m", &tokens(1, 1));
+        s.flush().unwrap();
+
+        let s = stats(dir.path());
+        let c = s.report(0, NOW).days[&local_date(old)]["a"]["m"];
+        assert_eq!(c.requests, 2, "前からあった 1 本に足す");
+        assert_eq!(c.input_tokens, 101, "上書きで消さない");
+    }
+
+    /// 変わった日だけを書き直す。
+    ///
+    /// 全体で 1 つの目印だと、1 件積むだけでメモリに載っている全日を
+    /// 書き直すことになる (`an_unchanged_aggregate_is_not_rewritten` は
+    /// 「1 つも変わっていない」場合しか見ていない)。
+    #[test]
+    fn only_the_changed_day_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+        let yesterday = NOW - 86_400;
+
+        s.record(yesterday, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.flush().unwrap();
+
+        let old_path = s.path_of(&local_date(yesterday));
+        let before = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+
+        // 当日だけ積んで、もう一度落とす。
+        s.record(NOW, Some("a"), "m", &tokens(2, 2));
+        s.flush().unwrap();
+
+        let after = std::fs::metadata(&old_path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "変わっていない日は触らない");
+
+        // 当日側は更新されている。
+        let today = read_day(&s.path_of(&local_date(NOW))).unwrap();
+        assert_eq!(today["a"]["m"].requests, 2);
+    }
+
+    /// 保存に失敗した日は、次の保存で書き直される。
+    #[test]
+    fn a_failed_save_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        // 置き場と同じ名前のファイルを置いて、ディレクトリを作れなくする。
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+
+        let s = Stats::new(&blocked, "8402");
+        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        assert!(s.flush().is_err(), "書けないので失敗する");
+
+        // 目印が残っているので、書ける状態になれば落ちる。
+        std::fs::remove_file(&blocked).unwrap();
+        s.flush().unwrap();
+        assert_eq!(
+            read_day(&s.path_of(&local_date(NOW))).unwrap()["a"]["m"].requests,
+            1
+        );
+    }
+
+    /// 同時に保存しても、壊れたファイルにならない。
+    ///
+    /// 定期の保存と終了時の保存は重なりうる。同じ一時ファイルを取り合うと、
+    /// 混ざった中身が rename されたり、片方が消したファイルをもう片方が
+    /// rename しようとして失敗する。
+    #[test]
+    fn concurrent_saves_do_not_corrupt_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(stats(dir.path()));
+        for i in 0..50 {
+            s.record(NOW, Some("a"), "m", &tokens(i, i));
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = std::sync::Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+                        s.flush().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 読めること (= 途中の状態が rename されていない) を確かめる。
+        let day = read_day(&s.path_of(&local_date(NOW))).unwrap();
+        assert!(day["a"]["m"].requests > 0);
+
+        // 一時ファイルを置き去りにしない。
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// 前回の書き損じ (自分の一時ファイル) は起動時に片付ける。
+    #[test]
+    fn leftover_temporaries_are_swept_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("2026-07-29.8402.json.tmp.1234.0");
+        let theirs = dir.path().join("2026-07-29.8401.json.tmp.9999.0");
+        std::fs::write(&mine, "{}").unwrap();
+        std::fs::write(&theirs, "{}").unwrap();
+
+        stats(dir.path()).restore();
+
+        assert!(!mine.exists(), "自分の書き損じは消す");
+        assert!(
+            theirs.exists(),
+            "他の writer の一時ファイルは触らない (書いている途中かもしれない)"
+        );
+    }
+
+    /// 日数の指定が極端でも落ちない。
+    #[test]
+    fn an_extreme_day_count_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+
+        for days in [1, usize::MAX] {
+            let report = s.report(days, NOW);
+            assert!(
+                report.days.contains_key(&local_date(NOW)),
+                "days={days} で当日が消える"
+            );
+        }
+    }
+
     // ---------- tap ----------
 
     use crate::backend::anthropic::forward::BodyStream;
@@ -1266,7 +1616,7 @@ mod tests {
     #[tokio::test]
     async fn an_endless_line_is_given_up_on() {
         let dir = tempfile::tempdir().unwrap();
-        let flood = vec![b'x'; MAX_SSE_LINE + 1024];
+        let flood = vec![b'x'; MAX_SSE_EVENT + 1024];
 
         let (out, counts) = drain(
             vec![flood.clone()],
@@ -1286,7 +1636,7 @@ mod tests {
     #[tokio::test]
     async fn giving_up_does_not_stop_the_relay() {
         let dir = tempfile::tempdir().unwrap();
-        let flood = vec![b'x'; MAX_SSE_LINE + 1];
+        let flood = vec![b'x'; MAX_SSE_EVENT + 1];
         let tail = REAL_SSE.as_bytes().to_vec();
 
         let (out, counts) = drain(
@@ -1408,6 +1758,107 @@ mod tests {
         .await;
 
         assert_eq!(only_entry(&counts).output_tokens, 5);
+    }
+
+    /// 1 つのイベントの data が複数行に割れていても読む。
+    ///
+    /// SSE では同じイベントの連続する `data:` 行を改行で繋いだものが 1 つの
+    /// 中身。行ごとに JSON として解こうとすると、こう割られた usage を黙って
+    /// 取りこぼす。
+    #[tokio::test]
+    async fn a_usage_split_across_data_lines_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let sse = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\n",
+            "data:  \"usage\":{\"input_tokens\":30,\n",
+            "data:  \"output_tokens\":40}}\n",
+            "\n",
+        );
+
+        let (out, counts) = drain(
+            byte_by_byte(sse),
+            200,
+            Some("text/event-stream"),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(out, sse, "1 バイトも変えない");
+        let c = only_entry(&counts);
+        assert_eq!(c.input_tokens, 30, "割れた行を繋いで読む");
+        assert_eq!(c.output_tokens, 40);
+    }
+
+    /// 別のイベントの data 同士は繋がない。
+    ///
+    /// 空行で区切られていれば別の中身。繋ぐと壊れた JSON になって、どちらの
+    /// usage も読めなくなる。
+    #[tokio::test]
+    async fn data_from_different_events_is_not_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n",
+            "\n",
+        );
+
+        let (_, counts) = drain(
+            byte_by_byte(sse),
+            200,
+            Some("text/event-stream"),
+            dir.path(),
+        )
+        .await;
+
+        let c = only_entry(&counts);
+        assert_eq!(c.input_tokens, 7, "前のイベントから");
+        assert_eq!(c.output_tokens, 9, "後のイベントから");
+    }
+
+    /// 終端が空行で閉じられていなくても、最後のイベントを読む。
+    #[tokio::test]
+    async fn a_last_event_without_a_blank_line_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // 空行も末尾の改行も無い。
+        let sse = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":11}}";
+
+        let (out, counts) = drain(
+            vec![sse.as_bytes().to_vec()],
+            200,
+            Some("text/event-stream"),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(out, sse);
+        assert_eq!(only_entry(&counts).output_tokens, 11);
+    }
+
+    /// 溜め込む量は、書きかけの行とイベントの合計で見る。
+    ///
+    /// 行ごとの上限だけだと、短い data 行を無限に並べられて上限をすり抜ける。
+    #[tokio::test]
+    async fn many_short_data_lines_still_hit_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1 行あたり 8 バイト程度で、合計が上限を超えるまで並べる。
+        let line = "data: xx\n";
+        let count = MAX_SSE_EVENT / line.len() + 16;
+        let sse = line.repeat(count);
+
+        let (out, counts) = drain(
+            vec![sse.as_bytes().to_vec()],
+            200,
+            Some("text/event-stream"),
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(out.len(), sse.len(), "本文は最後まで流す");
+        assert!(counts.is_empty(), "溜め込まず諦める: {counts:?}");
     }
 
     /// CRLF で区切る upstream でも読める。
