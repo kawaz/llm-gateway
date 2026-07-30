@@ -13,6 +13,11 @@ type = "file"
 # 省略時は $XDG_STATE_HOME/llm-gateway/credentials
 # dir = "/path/to/credentials"
 
+[stats]
+# 使用量の日次集計の置き場。省略時は $XDG_STATE_HOME/llm-gateway/stats
+# (llm-gateway stats / /llm-gateway/stats で見る)
+# dir = "/path/to/stats"
+
 [discovery]
 # 一覧を取り直す間隔。新しいモデルが出たときに再起動せず拾える。
 refresh_secs = 3600

@@ -11,6 +11,9 @@
 //! type = "file"
 //! # dir 省略時は $XDG_STATE_HOME/llm-gateway/credentials
 //!
+//! [stats]
+//! # dir 省略時は $XDG_STATE_HOME/llm-gateway/stats
+//!
 //! # 認証情報の中身 (token 等) はここに書かない。store に置いた
 //! # <key>.json を type と結びつけるだけ。
 //! [credentials.claude-personal]
