@@ -43,6 +43,12 @@ login のオプション:
   XDG_STATE_HOME    認証情報とログの既定の置き場
 ";
 
+/// 使用量の集計をディスクへ落とす間隔。
+///
+/// リクエストごとに書くのは無駄なので間隔を空ける (DR-0011)。落ちたときに
+/// 失うのはこの間に通った分だけで、終了の合図では待たずに落とす。
+const STATS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -120,9 +126,14 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
         gateway.refresh_models().await;
 
+        // 前回落とした当日分を読み戻す。読まずに数え直すと、次の保存で
+        // 前回までの分を上書きして消す (DR-0011)。
+        gateway.stats().restore();
+
         tracing::info!(
             listen = %config.server.listen,
             credentials = %dir.display(),
+            stats = %config.stats.resolve_dir().display(),
             namespaces = gateway.namespace_names().len(),
             "待ち受けを始めます"
         );
@@ -131,10 +142,22 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         let refresher = Arc::clone(&gateway);
         tokio::spawn(async move { refresher.keep_models_fresh().await });
 
-        axum::serve(listener, llm_gateway_server::router(gateway))
+        // 使用量の集計を定期的に落とす。
+        let flusher = Arc::clone(&gateway);
+        tokio::spawn(async move { flusher.stats().keep_flushing(STATS_FLUSH_INTERVAL).await });
+
+        let serving = Arc::clone(&gateway);
+        let result = axum::serve(listener, llm_gateway_server::router(serving))
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|e| format!("待ち受けが止まりました: {e}"))?;
+            .map_err(|e| format!("待ち受けが止まりました: {e}"));
+
+        // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
+        // 直前の分を失わない。
+        if let Err(e) = gateway.stats().flush() {
+            tracing::warn!(%e, "終了時に日次集計を保存できません");
+        }
+        result?;
 
         Ok(ExitCode::SUCCESS)
     })

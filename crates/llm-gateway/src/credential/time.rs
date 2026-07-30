@@ -45,6 +45,42 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// その時刻を、この機械の地方時で見たときの日付 (`YYYY-MM-DD`)。
+///
+/// 使用量を日ごとに束ねる鍵に使う。UTC で数えると JST では日の境目が朝 9 時に
+/// なり、「今日どれだけ使ったか」が体感とずれる (DR-0011)。
+pub fn local_date(unix: i64) -> String {
+    date_of(unix + local_offset(unix))
+}
+
+/// unix 秒を `YYYY-MM-DD` にする。渡すのは地方時へずらし終えた値。
+fn date_of(shifted: i64) -> String {
+    let (y, mo, d) = civil_from_days(shifted.div_euclid(86_400));
+    format!("{y:04}-{mo:02}-{d:02}")
+}
+
+/// この機械の地方時が UTC からどれだけ離れているか (秒)。
+///
+/// Design rationale: 日時ライブラリを入れず libc の `localtime_r` を借りる。
+/// offset は夏時間の有無と切り替え時刻で年内にも動くので、`TZ` と OS の
+/// タイムゾーン表を読む相手に任せるしかない。std に口が無く、自前で
+/// `/etc/localtime` (TZif) を解くのは、この 1 用途に対して重すぎる。
+/// 時刻を渡して都度引くのは、常駐したまま夏時間の境目を跨いでも正しく
+/// 転がるようにするため。
+fn local_offset(unix: i64) -> i64 {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: 渡すのは有効な time_t 1 つと、この場で確保した tm 1 つ。
+    // localtime_r は結果を渡した tm にだけ書き、共有の状態を触らない
+    // (再入可能版を選ぶのはそのため)。失敗すれば null が返るだけ。
+    let filled = unsafe { libc::localtime_r(&(unix as libc::time_t), &mut tm) };
+    if filled.is_null() {
+        // タイムゾーンを引けない環境では UTC として数える。日の境目はずれるが、
+        // 集計そのものは続く。
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
 /// Howard Hinnant の civil_from_days / days_from_civil。
 /// 1970-01-01 からの日数と暦日を相互変換する。
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -123,5 +159,57 @@ mod tests {
     #[test]
     fn now_is_after_the_epoch() {
         assert!(now_unix() > 1_700_000_000);
+    }
+
+    /// 日付の切り出しは offset を足した後の値で行う。
+    ///
+    /// 実機の地方時に依らず確かめられるよう、ずらした値を直に渡す。
+    #[test]
+    fn date_is_cut_from_the_shifted_time() {
+        // 2026-07-29T12:00:00Z
+        let noon = 1_785_326_400;
+        assert_eq!(date_of(noon), "2026-07-29");
+        // JST (+9h) では同じ瞬間がまだ 29 日の 21 時。
+        assert_eq!(date_of(noon + 9 * 3600), "2026-07-29");
+        // UTC の 15 時を過ぎると JST は翌日に入る。
+        assert_eq!(date_of(noon + 12 * 3600), "2026-07-30");
+        // UTC の 0 時直前は、JST ではもう翌日。
+        assert_eq!(date_of(noon - 12 * 3600 + 9 * 3600), "2026-07-29");
+    }
+
+    /// 年と月の境目でも桁が崩れない。
+    #[test]
+    fn date_pads_every_field() {
+        let new_year = parse_rfc3339("2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(date_of(new_year), "2026-01-01");
+        assert_eq!(date_of(new_year - 1), "2025-12-31");
+        assert_eq!(
+            date_of(parse_rfc3339("2028-02-29T00:00:00Z").unwrap()),
+            "2028-02-29"
+        );
+    }
+
+    /// 地方時の日付が形として読める。
+    ///
+    /// 値そのものは実機のタイムゾーン次第なので、形と「UTC 日付との差は
+    /// 高々 1 日」だけを見る。
+    #[test]
+    fn local_date_looks_like_a_date() {
+        let now = now_unix();
+        let local = local_date(now);
+        let parts: Vec<&str> = local.split('-').collect();
+        assert_eq!(parts.len(), 3, "{local}");
+        assert_eq!(
+            (parts[0].len(), parts[1].len(), parts[2].len()),
+            (4, 2, 2),
+            "{local}"
+        );
+
+        // どの地方時でも、UTC の前日・当日・翌日のどれか。
+        let near: Vec<String> = [-86_400, 0, 86_400]
+            .iter()
+            .map(|d| date_of(now + d))
+            .collect();
+        assert!(near.contains(&local), "{local} が {near:?} に無い");
     }
 }

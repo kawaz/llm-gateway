@@ -59,6 +59,9 @@ pub struct Config {
     #[serde(default)]
     pub store: Store,
 
+    #[serde(default)]
+    pub stats: Stats,
+
     /// 認証情報の宣言。キーが store 内のファイル名 (`<key>.json`) になる。
     ///
     /// **全 namespace で共有する。** 同じアカウントを namespace ごとに
@@ -209,6 +212,22 @@ impl Store {
             Self::File { dir: Some(d) } => d.clone(),
             Self::File { dir: None } => default_credentials_dir(),
         }
+    }
+}
+
+/// 使用量の日次集計の置き場 (DR-0011)。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stats {
+    /// 省略時は `$XDG_STATE_HOME/llm-gateway/stats`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+}
+
+impl Stats {
+    /// 実際に使う置き場。
+    pub fn resolve_dir(&self) -> PathBuf {
+        self.dir.clone().unwrap_or_else(default_stats_dir)
     }
 }
 
@@ -512,6 +531,16 @@ pub fn default_credentials_dir() -> PathBuf {
     xdg_dir("XDG_STATE_HOME", ".local/state")
         .join("llm-gateway")
         .join("credentials")
+}
+
+/// 既定の日次集計の置き場。
+///
+/// 認証情報と同じく state に置く。過去日の集計は消えると**作り直せない**
+/// (upstream に聞き直す口が無い) ので、cache の扱いに合わない (DR-0011)。
+pub fn default_stats_dir() -> PathBuf {
+    xdg_dir("XDG_STATE_HOME", ".local/state")
+        .join("llm-gateway")
+        .join("stats")
 }
 
 fn xdg_dir(env: &str, fallback: &str) -> PathBuf {

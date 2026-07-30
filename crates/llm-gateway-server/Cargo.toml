@@ -25,6 +25,8 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
+# 日次集計の置き場を試験ごとに分ける (実運用の state を触らせない)。
+tempfile = { workspace = true }
 # 記録が残ることを試験で確かめるための受け取り先。
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

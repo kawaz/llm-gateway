@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use tracing::{Instrument as _, error, warn};
 
 use llm_gateway::config::{Authorization, Namespace};
-use llm_gateway::credential::Persistence;
+use llm_gateway::credential::time::now_unix;
+use llm_gateway::credential::{CredentialId, Persistence};
 use llm_gateway::{Error, Gateway, relay};
 
 /// 転送するリクエストの上限。
@@ -39,6 +40,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/usage", get(usage))
+        .route("/llm-gateway/stats", get(stats))
         .with_state(gateway)
 }
 
@@ -72,6 +74,41 @@ async fn usage<P: Persistence + 'static>(
 ) -> Response {
     let refresh = wants_refresh(request.uri().query());
     Json(gateway.usage_report(refresh).await).into_response()
+}
+
+/// 使用量の日次集計を返す (DR-0011)。
+///
+/// 認証は usage / healthz と同じ扱い (掛けない)。出すのはトークン数だけで、
+/// 何を書いたかは残していない。
+///
+/// `?days=N` で直近 N 日に絞る。既定を 7 日にするのは、全期間を返すと日が
+/// 経つほど応答が伸びるため。`days=0` なら全部。
+async fn stats<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let days = match requested_days(request.uri().query()) {
+        Ok(days) => days,
+        Err(message) => return client_error("stats", StatusCode::BAD_REQUEST, &message),
+    };
+    Json(gateway.stats().report(days, now_unix())).into_response()
+}
+
+/// 既定で見せる日数。
+const DEFAULT_DAYS: usize = 7;
+
+/// `?days=N` を読む。付いていなければ既定。
+fn requested_days(query: Option<&str>) -> Result<usize, String> {
+    let Some(raw) = query.and_then(|q| {
+        q.split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, _)| *k == "days")
+            .map(|(_, v)| v)
+    }) else {
+        return Ok(DEFAULT_DAYS);
+    };
+    raw.parse()
+        .map_err(|_| format!("`days` must be a whole number, got `{raw}`"))
 }
 
 /// `?refresh=true` が付いているか。
@@ -195,21 +232,31 @@ async fn messages<P: Persistence + 'static>(
             for (name, value) in &upstream.headers {
                 resp = resp.header(name, value);
             }
+
+            // 使用量は応答の本文にしか載らないので、中継の内側で覗く
+            // (DR-0011)。覗くだけで、流れるバイト列は変わらない。
+            let counted = llm_gateway::stats::tap(
+                upstream.body,
+                Arc::clone(gateway.stats()),
+                now_unix(),
+                upstream.status,
+                header_value(&upstream.headers, "content-type"),
+                forwarded.credential.as_ref().map(CredentialId::as_str),
+                &forwarded.model,
+            );
+
             // 本文は読まずに流す。SSE はここを通り抜けるだけ。
             // 包むのは終端 (流し切った / 途切れた / 中断された) を残すため。
-            resp.body(Body::from_stream(relay::observe(
-                upstream.body,
-                span.clone(),
-            )))
-            .unwrap_or_else(|e| {
-                span.in_scope(|| {
-                    client_error(
-                        &ns_name,
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("could not build the response: {e}"),
-                    )
+            resp.body(Body::from_stream(relay::observe(counted, span.clone())))
+                .unwrap_or_else(|e| {
+                    span.in_scope(|| {
+                        client_error(
+                            &ns_name,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("could not build the response: {e}"),
+                        )
+                    })
                 })
-            })
         }
         Err(e) => span.in_scope(|| error_response(&ns_name, &e)),
     }
@@ -275,6 +322,16 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
         "authentication_error",
         &message,
     ))
+}
+
+/// 名前の大小を無視して 1 つ引く。
+///
+/// upstream や手前のプロキシで大小は変わる。
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -1575,5 +1632,210 @@ mod namespace_tests {
                 upstream_path(path)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::tests::{authed, fake_upstream, serve_with_default_ns};
+    use super::*;
+    use serde_json::json;
+
+    /// 集計の置き場を試験用に差し替える設定断片。
+    ///
+    /// 指定しないと実運用の state ディレクトリを読み書きしてしまう。
+    fn stats_dir(dir: &std::path::Path) -> String {
+        format!("[stats]\ndir = \"{}\"\n", dir.display())
+    }
+
+    /// 転送 1 本で集計が現れる。
+    #[tokio::test]
+    async fn a_forwarded_request_shows_up_in_the_stats() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"type":"message","content":[],"usage":{"input_tokens":18,
+                    "output_tokens":16,"cache_creation_input_tokens":2,
+                    "cache_read_input_tokens":3}}"#
+                    .to_owned(),
+                vec![("content-type".into(), "application/json".into())],
+            )
+        })
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_default_ns(&format!(
+            r#"
+{}
+[credentials.a]
+type = "relay"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            stats_dir(dir.path())
+        ))
+        .await;
+
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({
+                    "model": "m",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi"}],
+                })),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        // 本文を読み切って、集計が確定するまで待つ。
+        let _ = resp.text().await.unwrap();
+
+        let report: Value = reqwest::get(format!("{base}/llm-gateway/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let days = report["days"].as_object().expect("日ごとの表");
+        assert_eq!(days.len(), 1, "1 日分: {report}");
+        let counters = &days.values().next().unwrap()["-"]["m"];
+        assert_eq!(counters["requests"], 1);
+        assert_eq!(counters["input_tokens"], 18);
+        assert_eq!(counters["output_tokens"], 16);
+        assert_eq!(counters["cache_creation_input_tokens"], 2);
+        assert_eq!(counters["cache_read_input_tokens"], 3);
+    }
+
+    /// SSE でも集計され、流れるバイト列は変わらない。
+    #[tokio::test]
+    async fn a_streamed_response_is_counted_without_being_altered() {
+        let sse = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":30,\"output_tokens\":40}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+        let upstream = fake_upstream(move || {
+            (
+                200,
+                sse.to_owned(),
+                vec![("content-type".into(), "text/event-stream".into())],
+            )
+        })
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_default_ns(&format!(
+            r#"
+{}
+[credentials.a]
+type = "relay"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            stats_dir(dir.path())
+        ))
+        .await;
+
+        let body = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&json!({"model": "m", "stream": true, "messages": []})),
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+        assert_eq!(body, sse, "覗いても 1 バイトも変えない");
+
+        let report: Value = reqwest::get(format!("{base}/llm-gateway/stats"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let counters = &report["days"].as_object().unwrap().values().next().unwrap()["-"]["m"];
+        assert_eq!(counters["input_tokens"], 30);
+        assert_eq!(
+            counters["output_tokens"], 40,
+            "累積の最終値。message_start の 1 を足さない"
+        );
+    }
+
+    /// 何も通していなければ空で返る (壊れずに)。
+    #[tokio::test]
+    async fn stats_are_empty_before_anything_is_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_default_ns(&stats_dir(dir.path())).await;
+
+        let resp = reqwest::get(format!("{base}/llm-gateway/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let report: Value = resp.json().await.unwrap();
+        assert!(report["days"].as_object().unwrap().is_empty(), "{report}");
+        assert!(
+            report["generated_at_iso"].is_string(),
+            "いつ作ったか: {report}"
+        );
+    }
+
+    /// 読めない `days` は断る。黙って既定に落とすと、絞ったつもりの相手が
+    /// 別の範囲を見ることになる。
+    #[tokio::test]
+    async fn an_unreadable_days_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = serve_with_default_ns(&stats_dir(dir.path())).await;
+
+        let resp = reqwest::get(format!("{base}/llm-gateway/stats?days=lots"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert!(resp.text().await.unwrap().contains("days"));
+    }
+
+    #[test]
+    fn days_defaults_to_a_week() {
+        assert_eq!(requested_days(None), Ok(DEFAULT_DAYS));
+        assert_eq!(requested_days(Some("")), Ok(DEFAULT_DAYS));
+        assert_eq!(requested_days(Some("refresh=true")), Ok(DEFAULT_DAYS));
+        assert_eq!(requested_days(Some("days=30")), Ok(30));
+        assert_eq!(requested_days(Some("days=0")), Ok(0));
+        assert!(requested_days(Some("days=-1")).is_err());
+        assert!(requested_days(Some("days=")).is_err());
+    }
+
+    /// content-type は大小を問わず引ける。
+    ///
+    /// upstream や手前のプロキシで綴りが変わる。取り違えると、SSE を覗く側が
+    /// 「知らない形」と判断して集計を丸ごと落とす。
+    #[test]
+    fn the_content_type_is_found_whatever_its_case() {
+        let headers = vec![("Content-Type".to_owned(), "text/event-stream".to_owned())];
+        assert_eq!(
+            header_value(&headers, "content-type"),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            header_value(&headers, "CONTENT-TYPE"),
+            Some("text/event-stream")
+        );
+        assert_eq!(header_value(&headers, "content-length"), None);
+        assert_eq!(header_value(&[], "content-type"), None);
     }
 }

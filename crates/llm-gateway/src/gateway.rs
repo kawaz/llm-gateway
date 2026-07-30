@@ -16,6 +16,7 @@ use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
 use crate::session;
+use crate::stats::Stats;
 use crate::usage::{self, Usage};
 use crate::{Error, Result};
 
@@ -33,6 +34,7 @@ pub struct Gateway<P: Persistence> {
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
     usage: Usage,
+    stats: Arc<Stats>,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -73,11 +75,24 @@ impl<P: Persistence> Gateway<P> {
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             router: Router::new(config.clone()),
+            // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
+            // 共有しても、互いのファイルを書かない (DR-0011)。
+            stats: Arc::new(Stats::new(
+                config.stats.resolve_dir(),
+                &config.server.listen,
+            )),
             config: config.clone(),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
             usage: Usage::default(),
         })
+    }
+
+    /// 使用量の日次集計。
+    ///
+    /// 受け取り口が中継に tap を挟むのと、閲覧の口が報告を作るのに使う。
+    pub fn stats(&self) -> &Arc<Stats> {
+        &self.stats
     }
 
     /// upstream に一覧を聞く。起動時に 1 回呼ぶ。

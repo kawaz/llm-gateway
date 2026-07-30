@@ -71,6 +71,10 @@ rand = "0.10"
 sha2 = "0.10"
 # base64url。PKCE の値と、id_token (JWT) の payload に使う。
 base64 = "0.22"
+# 地方時の UTC offset (`localtime_r`)。使用量を日ごとに束ねる鍵に使う。
+# 夏時間まで含めた offset は OS のタイムゾーン表しか知らないので、std だけでは
+# 出せない (DR-0011)。既に依存グラフに居る。
+libc = "0.2"
 
 [profile.release]
 lto = "fat"

@@ -8,6 +8,7 @@
 //! - [`backend`] upstream ごとのアダプタ。Messages API 系はプロバイダで分岐
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 //! - [`relay`] 本文を流し終えた (途切れた) ところの記録
+//! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
 
 pub mod backend;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod pattern;
 pub mod relay;
 pub mod router;
 pub mod session;
+pub mod stats;
 pub mod usage;
 
 pub use config::Config;
