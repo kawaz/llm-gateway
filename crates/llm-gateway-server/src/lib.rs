@@ -73,7 +73,22 @@ async fn usage<P: Persistence + 'static>(
     request: Request,
 ) -> Response {
     let refresh = wants_refresh(request.uri().query());
-    Json(gateway.usage_report(refresh).await).into_response()
+    json_utf8(Json(gateway.usage_report(refresh).await))
+}
+
+/// 自前の JSON 応答に文字コードを明示する。
+///
+/// JSON は仕様上 UTF-8 だが、`charset` の無い `application/json` を
+/// レガシーな文字コードで描画するブラウザがあり、日本語の note が化ける。
+/// 触るのは gateway 自身が組み立てる応答だけで、upstream の透過分には
+/// 手を入れない。
+fn json_utf8(body: impl IntoResponse) -> Response {
+    let mut resp = body.into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    resp
 }
 
 /// 使用量の日次集計を返す (DR-0011)。
@@ -91,7 +106,7 @@ async fn stats<P: Persistence + 'static>(
         Ok(days) => days,
         Err(message) => return client_error("stats", StatusCode::BAD_REQUEST, &message),
     };
-    Json(gateway.stats().report(days, now_unix())).into_response()
+    json_utf8(Json(gateway.stats().report(days, now_unix())))
 }
 
 /// 既定で見せる日数。
@@ -287,7 +302,7 @@ async fn models<P: Persistence + 'static>(
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "type": "model"}))
         .collect();
-    Json(json!({"object": "list", "data": data})).into_response()
+    json_utf8(Json(json!({"object": "list", "data": data})))
 }
 
 fn unknown_namespace(name: &str, known: &[&str]) -> Response {
@@ -400,15 +415,13 @@ fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response 
         warn!(%ns, status = status_code, %message, "リクエストを断りました");
     }
 
-    (
+    json_utf8((
         status,
-        [(header::CONTENT_TYPE, "application/json")],
         Json(json!({
             "type": "error",
             "error": {"type": kind, "message": message},
         })),
-    )
-        .into_response()
+    ))
 }
 
 #[cfg(test)]
@@ -1068,13 +1081,13 @@ models = ["m"]
         assert_eq!(bedrock["type"], "claude_bedrock");
         assert_eq!(bedrock["support"], "not_applicable");
         assert!(
-            bedrock["note"].as_str().unwrap().contains("AWS"),
-            "対象外の理由が読める: {bedrock}"
+            bedrock.get("note").is_none(),
+            "理由の文章は出さない: {bedrock}"
         );
 
         let cpa = entry(&report, "cpa");
         assert_eq!(cpa["support"], "upstream_dependent");
-        assert!(cpa["note"].as_str().unwrap().contains("転送先"));
+        assert!(cpa.get("note").is_none());
         assert!(cpa.get("snapshot").is_none(), "未観測に中身は無い");
     }
 

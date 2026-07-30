@@ -134,7 +134,9 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
 
         // 前回落とした当日分を読み戻す。読まずに数え直すと、次の保存で
         // 前回までの分を上書きして消す (DR-0011)。
-        gateway.stats().restore();
+        gateway
+            .stats()
+            .restore(llm_gateway::credential::time::now_unix());
 
         tracing::info!(
             listen = %config.server.listen,
@@ -526,7 +528,12 @@ fn render(report: &Report) -> String {
                     out.push_str(&format!(" ({})", elapsed(age)));
                 }
             }
-            None => out.push_str(c.note.as_deref().unwrap_or("-")),
+            None => out.push_str(match c.support {
+                llm_gateway::usage::Support::Unobserved => "unobserved",
+                llm_gateway::usage::Support::NotApplicable => "not_applicable",
+                llm_gateway::usage::Support::UpstreamDependent => "upstream_dependent",
+                llm_gateway::usage::Support::Observed => "-",
+            }),
         }
     }
 
@@ -1420,7 +1427,6 @@ mod tests {
                 overage: None,
             }),
         );
-        c.note = None;
         c
     }
 
@@ -1472,9 +1478,9 @@ mod tests {
         ]));
 
         assert!(out.contains("bedrock"), "{out}");
-        assert!(out.contains("対象外 (AWS 課金)"), "{out}");
+        assert!(out.contains("not_applicable"), "{out}");
         assert!(out.contains("claude-work"), "{out}");
-        assert!(out.contains("未観測"), "{out}");
+        assert!(out.contains("unobserved"), "{out}");
     }
 
     /// 表の下に出すのはプローブの失敗だけ。window の status や overage は

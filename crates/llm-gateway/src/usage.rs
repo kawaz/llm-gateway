@@ -192,19 +192,6 @@ pub enum Support {
     UpstreamDependent,
 }
 
-impl Support {
-    /// なぜその扱いになるのか。表示側で毎回書き起こさずに済むよう、
-    /// 理由はここを正本にする。
-    pub fn note(self) -> Option<&'static str> {
-        match self {
-            Self::Observed => None,
-            Self::Unobserved => Some("未観測 (この credential をまだ使っていません)"),
-            Self::NotApplicable => Some("対象外 (AWS 課金)"),
-            Self::UpstreamDependent => Some("転送先次第 (未対応)"),
-        }
-    }
-}
-
 /// credential 1 件分の報告。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialUsage {
@@ -213,8 +200,6 @@ pub struct CredentialUsage {
     #[serde(rename = "type")]
     pub kind: String,
     pub support: Support,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
     /// 能動プローブが失敗した理由。他の credential は巻き添えにしない。
@@ -228,7 +213,6 @@ impl CredentialUsage {
             name: name.to_owned(),
             kind: kind.to_owned(),
             support,
-            note: support.note().map(str::to_owned),
             snapshot,
             probe_error: None,
         }
@@ -438,21 +422,8 @@ mod tests {
         assert!(usage.get(&b).await.is_none());
     }
 
-    /// 取れない理由は表示側で書き起こさない (ここが正本)。
-    #[test]
-    fn every_unsupported_case_explains_itself() {
-        assert_eq!(Support::Observed.note(), None);
-        assert!(Support::NotApplicable.note().unwrap().contains("AWS"));
-        assert!(
-            Support::UpstreamDependent
-                .note()
-                .unwrap()
-                .contains("転送先")
-        );
-        assert!(Support::Unobserved.note().unwrap().contains("未観測"));
-    }
-
     /// 未観測の credential も名前は出す (存在ごと消さない)。
+    /// 取れない理由は support の値が担い、余計なフィールドは出さない。
     #[test]
     fn unobserved_credential_still_has_a_name() {
         let c = CredentialUsage::new("claude-work", "claude_oauth", Support::Unobserved, None);
@@ -460,7 +431,7 @@ mod tests {
         assert_eq!(json["name"], "claude-work");
         assert_eq!(json["type"], "claude_oauth");
         assert_eq!(json["support"], "unobserved");
-        assert!(json["note"].as_str().unwrap().contains("未観測"));
+        assert!(json.get("note").is_none(), "理由の文章は出さない");
         assert!(json.get("snapshot").is_none(), "無い値は出さない");
     }
 

@@ -1860,8 +1860,8 @@ models = ["m"]
             report
                 .credentials
                 .iter()
-                .all(|c| c.note.as_ref().is_some_and(|n| !n.is_empty())),
-            "出せない理由が書いてある"
+                .all(|c| c.support != crate::usage::Support::Observed),
+            "取れない扱いは support の値で分かる"
         );
     }
 
