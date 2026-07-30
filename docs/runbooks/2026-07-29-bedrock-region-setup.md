@@ -69,3 +69,24 @@ curl -s https://bedrock-mantle.<region>.api.aws/anthropic/v1/messages \
   `anthropic.claude-{haiku-4-5,opus-4-7,opus-4-8}` のみ。fable-5 / opus-5 /
   sonnet-5 は一覧・invoke (prefix `apac.`/`global.`/`jp.` を含む) とも未反映
   だった。反映ラグか region 指定漏れかは切り分け中
+
+## 追記: 東京の fable-5 が mantle に出ない件の切り分け結果 (2026-07-30)
+
+アカウント側の前提はすべて満たしても、**region の mantle が当該モデルを
+ホストしていなければ一覧にも invoke にも出ない**。
+
+- agreement: `get-foundation-model-availability` で AVAILABLE / AUTHORIZED (東京)
+- data retention: `provider_data_share` 設定済み (アカウント単位、全 region 共通)
+- それでも東京 mantle は opus-4-7 / 4-8 / haiku-4-5 のみ提供
+- 差分は inference profile: 東京で mantle に出るモデルには `jp.` プロファイルがある
+  (`jp.anthropic.claude-opus-4-8` 等)。fable-5 / opus-5 / sonnet-5 は `global.` のみで
+  `jp.` が無い = mantle 未対応。`global.` 名での invoke も 404
+- つまり AWS 側のリージョン別ロールアウト待ち。`jp.anthropic.claude-fable-5` が
+  `list-inference-profiles --region ap-northeast-1` に現れたら使えるようになる見込み
+
+確認コマンド (zunsystem アカウント、profile は kawaz@zunsystem):
+
+```bash
+AWS_PROFILE=kawaz@zunsystem aws bedrock list-inference-profiles --region ap-northeast-1 \
+  | jq -r '.inferenceProfileSummaries[].inferenceProfileId' | grep fable
+```
