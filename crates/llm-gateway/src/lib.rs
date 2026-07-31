@@ -9,6 +9,7 @@
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 //! - [`relay`] 本文を流し終えた (途切れた) ところの記録
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
+//! - [`pricing`] モデルごとの単価表。コストは閲覧時に計算する
 
 pub mod backend;
 pub mod config;
@@ -16,6 +17,7 @@ pub mod credential;
 pub mod discovery;
 pub mod gateway;
 pub mod pattern;
+pub mod pricing;
 pub mod relay;
 pub mod router;
 pub mod session;

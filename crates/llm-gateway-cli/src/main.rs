@@ -23,7 +23,7 @@ llm-gateway — クライアントに認証を意識させない、薄い LLM pr
   check       設定を読んで確かめる (起動はしない)
   models      設定に書かれているモデルを一覧する
   usage       認証情報ごとの利用量を一覧する (server に問い合わせる)
-  stats       list token usage per credential x model x day
+  stats       list token usage and USD cost per credential x model x day
   login       ブラウザで認可を通し、認証情報を <名前>.json に保存する
 
 オプション:
@@ -562,42 +562,53 @@ fn render_stats(report: &StatsReport) -> String {
     }
 
     // 先に全行を組み立てる。幅は全体を見てからでないと決まらない。
-    let mut lines: Vec<(String, Counters)> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
     // 新しい日を上に出す。見たいのは直近。
-    for (date, creds) in report.days.iter().rev() {
+    let mut all_days = Counters::default();
+    for (date, day) in report.days.iter().rev() {
         let mut total = Counters::default();
-        for models in creds.values() {
-            for c in models.values() {
-                add(&mut total, c);
+        for models in day.credentials.values() {
+            for entry in models.values() {
+                add(&mut total, &entry.counters);
             }
         }
-        lines.push((format!("{date} {TOTAL_LABEL}"), total));
+        add(&mut all_days, &total);
+        lines.push((format!("{date} {TOTAL_LABEL}"), total, day.total_usd));
 
-        for (cred, models) in creds {
-            for (model, c) in models {
-                lines.push((format!("  {cred} {model}"), *c));
+        for (cred, models) in &day.credentials {
+            for (model, entry) in models {
+                lines.push((format!("  {cred} {model}"), entry.counters, entry.usd));
             }
         }
     }
+    // 全期間の合計を最後に置く。日ごとの合計と同じ桁組に並ぶので、
+    // 「今月いくら使ったか」を表の下端で読める。
+    lines.push((TOTAL_LABEL.to_owned(), all_days, report.total_usd));
 
-    let label_width = lines.iter().map(|(l, _)| width(l)).max().unwrap_or(0);
+    let label_width = lines.iter().map(|(l, ..)| width(l)).max().unwrap_or(0);
     let cell_width = lines
         .iter()
-        .flat_map(|(_, c)| columns(c))
+        .flat_map(|(_, c, _)| columns(c))
         .map(|n| thousands(n).len())
         .max()
         .unwrap_or(0)
         .max(HEADERS.iter().map(|h| h.len()).max().unwrap_or(0));
+    let usd_width = lines
+        .iter()
+        .map(|(.., usd)| usd_cell(*usd).len())
+        .chain(std::iter::once(USD_HEADER.len()))
+        .max()
+        .unwrap_or(0);
 
     // 見出しは 1 度だけ。日ごとに挟むと、行数の少ない日ほど見出しで埋まる。
     let mut out = " ".repeat(label_width);
     for head in HEADERS {
         out.push_str(&format!(" {head:>cell_width$}"));
     }
-    out.push('\n');
+    out.push_str(&format!(" {USD_HEADER:>usd_width$}\n"));
 
     let mut previous_day_ended = false;
-    for (label, counters) in &lines {
+    for (label, counters, usd) in &lines {
         // 日の切り替わりで 1 行空ける。合計行は字下げが無いので見分けられる。
         if !label.starts_with(' ') && previous_day_ended {
             out.push('\n');
@@ -607,9 +618,20 @@ fn render_stats(report: &StatsReport) -> String {
         out.push_str(label);
         out.push_str(&" ".repeat(label_width.saturating_sub(width(label))));
         out.push_str(&row(counters, cell_width));
-        out.push('\n');
+        out.push_str(&format!(" {:>usd_width$}\n", usd_cell(*usd)));
     }
     out
+}
+
+/// 表示用の 1 行。`(ラベル, 集計, USD)`。
+type Line = (String, Counters, Option<f64>);
+
+/// USD の欄。単価表に無いモデルは `-`。
+///
+/// 小数 4 桁で止めるのは、1 リクエストが 0.1 セント未満になることがあり、
+/// 2 桁だと内訳が全部 `0.00` に潰れるため。
+fn usd_cell(usd: Option<f64>) -> String {
+    usd.map_or_else(|| "-".to_owned(), |v| format!("{v:.4}"))
 }
 
 /// 合計行の印。内訳の行と見分けられればよい。
@@ -617,6 +639,10 @@ const TOTAL_LABEL: &str = "total";
 
 /// 集計の並び。表示と見出しでこの順を守る。
 const HEADERS: [&str; 5] = ["reqs", "input", "output", "cache_w", "cache_r"];
+
+/// トークン数の右に置く金額の見出し。単位を書くのは、桁だけでは
+/// トークン数と見分けが付かないため。
+const USD_HEADER: &str = "usd";
 
 fn columns(c: &Counters) -> [u64; 5] {
     [
@@ -1659,14 +1685,43 @@ mod tests {
     type Row<'a> = (&'a str, &'a str, Counters);
 
     fn stats_report(days: &[(&str, &[Row<'_>])]) -> StatsReport {
-        let mut by_date = llm_gateway::stats::ByDate::new();
+        // 単価表を通した後の形を作る。ここで金額まで計算しておくと、
+        // 表示側の試験が単価表の中身に引きずられない。
+        let mut by_date = serde_json::Map::new();
+        let mut grand: Option<f64> = None;
         for (date, rows) in days {
-            let day = by_date.entry((*date).to_owned()).or_default();
+            let mut creds = serde_json::Map::new();
+            let mut day_total: Option<f64> = None;
             for (cred, model, c) in *rows {
-                day.entry((*cred).to_owned())
-                    .or_default()
-                    .insert((*model).to_owned(), *c);
+                let usd = llm_gateway::pricing::rates_for(model).map(|r| {
+                    r.cost(
+                        c.input_tokens,
+                        c.output_tokens,
+                        c.cache_creation_input_tokens,
+                        c.cache_read_input_tokens,
+                    )
+                });
+                if let Some(usd) = usd {
+                    day_total = Some(day_total.unwrap_or(0.0) + usd);
+                }
+                let mut entry = serde_json::to_value(c).unwrap();
+                if let Some(usd) = usd {
+                    entry["usd"] = serde_json::json!(usd);
+                }
+                creds
+                    .entry((*cred).to_owned())
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .unwrap()
+                    .insert((*model).to_owned(), entry);
             }
+            if let Some(total) = day_total {
+                grand = Some(grand.unwrap_or(0.0) + total);
+            }
+            by_date.insert(
+                (*date).to_owned(),
+                serde_json::json!({"credentials": creds, "total_usd": day_total}),
+            );
         }
         // JSON を経由するのは、server が返す形をそのまま読めることも一緒に
         // 確かめられるため。
@@ -1674,6 +1729,7 @@ mod tests {
             "generated_at": 1_785_326_400_i64,
             "generated_at_iso": "2026-07-29T12:00:00Z",
             "days": by_date,
+            "total_usd": grand,
         }))
         .unwrap()
     }
@@ -1698,6 +1754,27 @@ mod tests {
         for head in HEADERS {
             assert!(out.contains(head), "見出し {head} が無い: {out}");
         }
+    }
+
+    /// 単価表に無いモデルの金額欄は `-`。0.0000 と出すと「使ったが安かった」に
+    /// 見えるので、言えることが無いことを記号で示す。
+    #[test]
+    fn an_unpriced_model_shows_a_dash() {
+        let out = render_stats(&stats_report(&[(
+            "2026-07-29",
+            &[
+                ("a", "claude-opus-5", counters(1, 1_000_000, 0)),
+                ("a", "who-knows", counters(1, 1_000_000, 0)),
+            ],
+        )]));
+
+        let unpriced = out
+            .lines()
+            .find(|l| l.contains("who-knows"))
+            .expect("内訳の行");
+        assert!(unpriced.trim_end().ends_with('-'), "{out}");
+        // 合計は値付けできた分だけ ($5)。
+        assert!(out.contains("5.0000"), "{out}");
     }
 
     /// 新しい日が上に来る。見たいのは直近。
@@ -1881,13 +1958,15 @@ mod tests {
         ]));
 
         let expected = concat!(
-            "                                   reqs     input    output   cache_w   cache_r\n",
-            "2026-07-30 total                      7     8,120       931         0         0\n",
-            "  claude-one claude-haiku-4-5         7     8,120       931         0         0\n",
+            "                                   reqs     input    output   cache_w   cache_r    usd\n",
+            "2026-07-30 total                      7     8,120       931         0         0 0.0128\n",
+            "  claude-one claude-haiku-4-5         7     8,120       931         0         0 0.0128\n",
             "\n",
-            "2026-07-29 total                    324 1,303,007    41,433         0         0\n",
-            "  claude-one claude-haiku-4-5       312 1,204,887    34,002         0         0\n",
-            "  claude-two claude-opus-5           12    98,120     7,431         0         0\n",
+            "2026-07-29 total                    324 1,303,007    41,433         0         0 2.0513\n",
+            "  claude-one claude-haiku-4-5       312 1,204,887    34,002         0         0 1.3749\n",
+            "  claude-two claude-opus-5           12    98,120     7,431         0         0 0.6764\n",
+            "\n",
+            "total                               331 1,311,127    42,364         0         0 2.0640\n",
         );
         assert_eq!(
             out, expected,

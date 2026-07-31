@@ -1790,7 +1790,7 @@ credentials = ["a"]
 
         let days = report["days"].as_object().expect("日ごとの表");
         assert_eq!(days.len(), 1, "1 日分: {report}");
-        let counters = &days.values().next().unwrap()["-"]["m"];
+        let counters = &days.values().next().unwrap()["credentials"]["-"]["m"];
         assert_eq!(counters["requests"], 1);
         assert_eq!(counters["input_tokens"], 18);
         assert_eq!(counters["output_tokens"], 16);
@@ -1854,7 +1854,8 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        let counters = &report["days"].as_object().unwrap().values().next().unwrap()["-"]["m"];
+        let counters =
+            &report["days"].as_object().unwrap().values().next().unwrap()["credentials"]["-"]["m"];
         assert_eq!(counters["input_tokens"], 30);
         assert_eq!(
             counters["output_tokens"], 40,

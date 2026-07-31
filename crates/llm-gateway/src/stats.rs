@@ -336,10 +336,12 @@ impl Stats {
             let from = local_date(now.saturating_sub(back));
             merged.retain(|date, _| date.as_str() >= from.as_str());
         }
+        let (days, total_usd) = price(merged);
         Report {
             generated_at: now,
             generated_at_iso: crate::credential::time::format_rfc3339(now),
-            days: merged,
+            days,
+            total_usd,
         }
     }
 
@@ -701,13 +703,80 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// 閲覧に出す 1 行。トークン数に、その分の USD を添える。
+///
+/// 保存する形 ([`Counters`]) と分けているのは、**ファイルはトークン数だけ**を
+/// 持つため (DR-0011)。単価は改定されるので、閲覧のたびに今の表で計算する。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Entry {
+    #[serde(flatten)]
+    pub counters: Counters,
+    /// 単価表に無いモデルは**欄ごと出さない**。0 でも「不明」でもなく、
+    /// 言えることが無いという意味。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
+}
+
+/// 認証情報 → モデル → 行。
+pub type EntriesByModel = BTreeMap<String, Entry>;
+/// 1 日分。合計を内訳と同じ階層に置くと、認証情報名と衝突しうるので分ける。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Day {
+    pub credentials: BTreeMap<String, EntriesByModel>,
+    /// その日の合計。単価表にあるモデルの分だけを足す (無いモデルは素通し)。
+    /// 1 つも出せなければ欄を出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_usd: Option<f64>,
+}
+
 /// 閲覧に出す形。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
     pub generated_at: i64,
     pub generated_at_iso: String,
-    /// 日付 → 認証情報 → モデル → 集計。
-    pub days: ByDate,
+    /// 日付 → 1 日分。
+    pub days: BTreeMap<String, Day>,
+    /// 全期間の合計。日ごとの合計と同じく、出せる分だけを足す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_usd: Option<f64>,
+}
+
+/// トークン数の器に単価を掛けて、閲覧に出す形へ組み替える。
+///
+/// 合計は「単価が分かる行の和」。分からない行を 0 として混ぜると、
+/// 出ている数字が全体の額に見えてしまう。1 行も出せない日は合計も出さない。
+fn price(days: ByDate) -> (BTreeMap<String, Day>, Option<f64>) {
+    let mut priced = BTreeMap::new();
+    let mut grand: Option<f64> = None;
+
+    for (date, creds) in days {
+        let mut day = Day::default();
+        for (credential, models) in creds {
+            let mut entries = EntriesByModel::new();
+            for (model, counters) in models {
+                let usd = crate::pricing::rates_for(&model).map(|rates| {
+                    rates.cost(
+                        counters.input_tokens,
+                        counters.output_tokens,
+                        counters.cache_creation_input_tokens,
+                        counters.cache_read_input_tokens,
+                    )
+                });
+                if let Some(usd) = usd {
+                    day.total_usd = Some(day.total_usd.unwrap_or(0.0) + usd);
+                }
+                entries.insert(model, Entry { counters, usd });
+            }
+            day.credentials.insert(credential, entries);
+        }
+        day.total_usd = day.total_usd.map(crate::pricing::round_usd);
+        if let Some(total) = day.total_usd {
+            grand = Some(grand.unwrap_or(0.0) + total);
+        }
+        priced.insert(date, day);
+    }
+
+    (priced, grand.map(crate::pricing::round_usd))
 }
 
 #[cfg(test)]
@@ -744,6 +813,99 @@ mod tests {
         assert_eq!(c.requests, 2, "本数も数える");
         assert_eq!(c.input_tokens, 13);
         assert_eq!(c.output_tokens, 6);
+    }
+
+    // ---------- コスト換算 (DR-0011 の「表示側で足す」) ----------
+
+    /// 単価表にあるモデルには `usd` が付き、無いモデルには付かない。
+    #[test]
+    fn known_models_are_priced_and_unknown_ones_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        // haiku-4-5 は input $1 / 100 万トークン。
+        s.record(NOW, Some("a"), "claude-haiku-4-5", &tokens(1_000_000, 0));
+        s.record(NOW, Some("a"), "who-knows", &tokens(1_000_000, 0));
+
+        let day = &s.report(7, NOW).days[&local_date(NOW)];
+        let models = &day.credentials["a"];
+        assert_eq!(models["claude-haiku-4-5"].usd, Some(1.0));
+        assert_eq!(models["who-knows"].usd, None, "推測した額を出さない");
+        // トークン数はどちらも残る。
+        assert_eq!(models["who-knows"].counters.input_tokens, 1_000_000);
+    }
+
+    /// 日の合計も全体の合計も、**単価が分かる行だけ**の和。
+    ///
+    /// 分からない行を 0 として混ぜると、出ている額が全体に見えてしまう。
+    #[test]
+    fn totals_only_add_up_what_can_be_priced() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        // 同じ日に、単価の分かるモデル 2 つと分からないモデル 1 つ。
+        s.record(NOW, Some("a"), "claude-haiku-4-5", &tokens(1_000_000, 0)); // $1
+        s.record(NOW, Some("b"), "claude-opus-5", &tokens(1_000_000, 0)); // $5
+        s.record(NOW, Some("b"), "who-knows", &tokens(9_000_000, 0)); // 不明
+
+        let report = s.report(7, NOW);
+        assert_eq!(report.days[&local_date(NOW)].total_usd, Some(6.0));
+        assert_eq!(report.total_usd, Some(6.0), "全体も同じ和");
+    }
+
+    /// 1 行も値付けできない日は、合計の欄ごと出さない。
+    #[test]
+    fn a_day_with_nothing_priceable_has_no_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
+
+        let report = s.report(7, NOW);
+        assert_eq!(report.days[&local_date(NOW)].total_usd, None);
+        assert_eq!(report.total_usd, None);
+    }
+
+    /// 4 つのトークン種別がそれぞれ別の単価で効く。
+    #[test]
+    fn each_token_kind_is_priced_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        // opus-5: input $5 / output $25 / cache write $6.25 / cache read $0.5。
+        s.record(
+            NOW,
+            Some("a"),
+            "claude-opus-5",
+            &Tokens {
+                input: Some(1_000_000),
+                output: Some(1_000_000),
+                cache_creation: Some(1_000_000),
+                cache_read: Some(1_000_000),
+            },
+        );
+
+        let day = &s.report(7, NOW).days[&local_date(NOW)];
+        assert_eq!(day.credentials["a"]["claude-opus-5"].usd, Some(36.75));
+    }
+
+    /// JSON では、値付けできない行に `usd` の鍵自体が出ない。
+    ///
+    /// null や 0 を出すと、読む側が「0 ドルだった」と解釈できてしまう。
+    #[test]
+    fn an_unpriced_entry_has_no_usd_key_in_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        s.record(NOW, Some("a"), "claude-opus-5", &tokens(10, 5));
+        s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
+
+        let json = serde_json::to_value(s.report(7, NOW)).unwrap();
+        let models = &json["days"][local_date(NOW)]["credentials"]["a"];
+        assert!(models["claude-opus-5"].get("usd").is_some());
+        assert!(models["who-knows"].get("usd").is_none(), "{models}");
+        // トークン数の鍵は今までどおり平らに並ぶ。
+        assert_eq!(models["who-knows"]["input_tokens"], 10);
     }
 
     /// 認証情報とモデルは別々の行になる。
@@ -914,7 +1076,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(1, 2));
 
         let report = s.report(7, NOW);
-        let c = &report.days[&local_date(NOW)]["a"]["m"];
+        let c = &report.days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "両方の writer を数える");
         assert_eq!(c.input_tokens, 101);
         assert_eq!(c.output_tokens, 52);
@@ -930,7 +1092,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(10, 5));
         s.flush().unwrap();
 
-        let c = s.report(7, NOW).days[&local_date(NOW)]["a"]["m"];
+        let c = s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "1 本のまま");
         assert_eq!(c.input_tokens, 10);
     }
@@ -942,7 +1104,7 @@ mod tests {
         let s = stats(dir.path());
         s.record(NOW, Some("a"), "m", &tokens(3, 4));
 
-        let c = s.report(7, NOW).days[&local_date(NOW)]["a"]["m"];
+        let c = s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.output_tokens, 4, "保存を待たずに見える");
     }
 
@@ -1119,7 +1281,7 @@ mod tests {
         );
 
         let report = s.report(0, NOW);
-        let c = &report.days[&local_date(old)]["a"]["m"];
+        let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "過去日はファイルから読む");
         assert_eq!(c.input_tokens, 100);
     }
@@ -1145,7 +1307,7 @@ mod tests {
         s.flush().unwrap();
 
         let s = stats(dir.path());
-        let c = s.report(0, NOW).days[&local_date(old)]["a"]["m"];
+        let c = s.report(0, NOW).days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "前からあった 1 本に足す");
         assert_eq!(c.input_tokens, 101, "上書きで消さない");
     }
