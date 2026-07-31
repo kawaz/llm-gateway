@@ -218,7 +218,7 @@ impl<P: Persistence> Gateway<P> {
 
         // 断られている経路は飛ばす。上限に当たった認証情報が先頭にいると、
         // 印が無ければ全リクエストがそこで 1 往復ぶん無駄になる。
-        let routes = match self.denials.candidates(&routes, now) {
+        let routes = match self.denials.candidates(&routes, &model, now) {
             Candidates::Ready(ready) => ready,
             // どれも断られている。開く時刻を知っているのだから、当てに行って
             // 429 を貰い直す必要はない。同じことを retry-after で伝える。
@@ -251,7 +251,7 @@ impl<P: Persistence> Gateway<P> {
                     if resp.status / 100 == 2 {
                         self.router.remember(ns_name, &session, &model, route).await;
                         // 通ったなら締め出しの根拠は消えている。
-                        self.denials.allow(route.name());
+                        self.denials.allow(route.name(), &model);
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::relay が記録する。
@@ -277,7 +277,7 @@ impl<P: Persistence> Gateway<P> {
                         // 時間が経てば空く断りなら、次のリクエストで同じ壁に
                         // 当たらないよう期限を控える。
                         let now = now_unix();
-                        if let Some(denial) = denial_of(resp.status, &resp.headers, now) {
+                        if let Some(denial) = denial_of(resp.status, &resp.headers, &model, now) {
                             warn!(
                                 route = route.name(),
                                 status = resp.status,
@@ -540,12 +540,12 @@ impl<P: Persistence> Gateway<P> {
             let now = now_unix();
             if sample.status / 100 == 2 {
                 info!(credential = %name, "締め出していた経路が開きました");
-                denials.allow(&name);
+                denials.allow(&name, PROBE_MODEL);
                 // 聞きに行くのにも実費がかかる。隠さずに積む (DR-0011)。
                 stats.record(now, Some(&name), PROBE_MODEL, &sample.tokens);
                 return;
             }
-            match denial_of(sample.status, &sample.headers, now) {
+            match denial_of(sample.status, &sample.headers, PROBE_MODEL, now) {
                 Some(denial) => {
                     info!(
                         credential = %name,
@@ -744,7 +744,7 @@ mod tests {
     use crate::credential::stored::{OauthTokens, Payload};
     use crate::credential::time::{format_rfc3339, now_unix};
     use crate::credential::{CredentialId, StoredCredential};
-    use crate::denial::{self, Denial, Reason};
+    use crate::denial::{self, Denial, Reason, Scope};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -938,6 +938,18 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     /// 既定の namespace。
     fn ns<P: Persistence>(gw: &Gateway<P>) -> &Namespace {
         gw.namespace(NS).expect("既定は必ずある")
+    }
+
+    /// 試験のリクエストが名乗るモデル。
+    const MODEL: &str = "m";
+
+    /// 窓が塞がっている印 (credential 全体)。
+    fn window_closed(until: i64) -> Denial {
+        Denial {
+            until,
+            reason: Reason::Limited,
+            scope: Scope::Everything,
+        }
     }
 
     fn request() -> Value {
@@ -1355,6 +1367,70 @@ credentials = ["a", "b"]
         );
     }
 
+    /// あるモデルで断られても、同じ認証情報の他のモデルは使い続ける。
+    ///
+    /// 実測 (2026-07-31): 同じアカウントで haiku は 200、fable / opus /
+    /// sonnet は 429 という状態が起きる。断られたモデルの都合で認証情報ごと
+    /// 締め出すと、使えるはずの経路を自分で閉じることになる。
+    #[tokio::test]
+    async fn a_denial_for_one_model_does_not_close_the_others() {
+        // fable だけ断り、haiku には応じる upstream。
+        let picky = FakeUpstream::start(|_, req| {
+            if req.contains("m-fable") {
+                (429, body_for(429))
+            } else {
+                (200, body_for(200))
+            }
+        })
+        .await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{}"
+models = ["m-fable", "m-haiku"]
+
+[credentials.b]
+type = "relay"
+url = "{}"
+models = ["m-fable", "m-haiku"]
+
+[[ns.default.routing]]
+models = ["*"]
+credentials = ["a", "b"]
+"#,
+            picky.url, spare.url
+        ))
+        .await;
+
+        let ask = |model: &str| {
+            let body = json!({
+                "model": model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
+                "metadata": {"user_id": r#"{"session_id":"s1"}"#},
+            });
+            gw.forward(ns(&gw), NS, "/v1/messages", None, body, vec![])
+        };
+
+        for _ in 0..2 {
+            assert_eq!(ask("m-fable").await.unwrap().response.status, 200);
+        }
+        assert_eq!(ask("m-haiku").await.unwrap().response.status, 200);
+
+        assert_eq!(
+            (picky.hits(), spare.hits()),
+            (2, 2),
+            "fable は 1 回断られたら飛ばすが、haiku は同じ認証情報で試す"
+        );
+        assert_eq!(
+            gw.denials.get("a", "m-haiku", now_unix()),
+            None,
+            "断られていないモデルに印は付かない"
+        );
+    }
+
     /// 上限のヘッダが載っていれば、窓が開く時刻まで締め出す。
     #[tokio::test]
     async fn the_deadline_comes_from_the_rate_limit_headers() {
@@ -1377,11 +1453,8 @@ credentials = ["a", "b"]
             .unwrap();
 
         assert_eq!(
-            gw.denials.get("a", now_unix()),
-            Some(Denial {
-                until: reset.parse().unwrap(),
-                reason: Reason::Limited,
-            }),
+            gw.denials.get("a", MODEL, now_unix()),
+            Some(window_closed(reset.parse().unwrap())),
             "窓が開く時刻まで"
         );
     }
@@ -1394,14 +1467,7 @@ credentials = ["a", "b"]
         let gw = gateway(&two_credentials(&recovered.url, &spare.url)).await;
 
         let past = now_unix() - 1;
-        gw.denials.deny(
-            "a",
-            Denial {
-                until: past,
-                reason: Reason::Limited,
-            },
-            past,
-        );
+        gw.denials.deny("a", window_closed(past), past);
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
@@ -1409,7 +1475,7 @@ credentials = ["a", "b"]
         assert_eq!(recovered.hits(), 1, "期限切れの印は素通り");
         assert_eq!(spare.hits(), 0);
         assert_eq!(
-            gw.denials.get("a", past - 100),
+            gw.denials.get("a", MODEL, past - 100),
             None,
             "通ったので印そのものが消える"
         );
@@ -1427,14 +1493,7 @@ credentials = ["a", "b"]
 
         let now = now_unix();
         for (route, until) in [("a", now + 1000), ("b", now + 100)] {
-            gw.denials.deny(
-                route,
-                Denial {
-                    until,
-                    reason: Reason::Limited,
-                },
-                now,
-            );
+            gw.denials.deny(route, window_closed(until), now);
         }
 
         let resp = gw
@@ -1468,7 +1527,7 @@ credentials = ["a", "b"]
                 .unwrap();
 
             assert_eq!(
-                gw.denials.get("a", now_unix()),
+                gw.denials.get("a", MODEL, now_unix()),
                 None,
                 "{status} は時間で空くものではない"
             );
@@ -1508,10 +1567,7 @@ credentials = ["a"]
         let now = now_unix();
         gw.denials.deny(
             "a",
-            Denial {
-                until: now + 100_000,
-                reason: Reason::Limited,
-            },
+            window_closed(now + 100_000),
             now - denial::PROBE_INTERVAL,
         );
 
@@ -1521,7 +1577,11 @@ credentials = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(gw.denials.get("a", now), None, "開いていたので印を外す");
+        assert_eq!(
+            gw.denials.get("a", MODEL, now),
+            None,
+            "開いていたので印を外す"
+        );
         assert_eq!(reopened.hits(), 1, "聞きに行くのは 1 本だけ");
         assert!(
             !gw.stats().in_memory().is_empty(),
@@ -1556,24 +1616,15 @@ credentials = ["a"]
         .await;
 
         let now = now_unix();
-        gw.denials.deny(
-            "a",
-            Denial {
-                until: now + 100,
-                reason: Reason::Limited,
-            },
-            now - denial::PROBE_INTERVAL,
-        );
+        gw.denials
+            .deny("a", window_closed(now + 100), now - denial::PROBE_INTERVAL);
 
         let probing = gw.denials.claim_probe("a", now).expect("間隔は空いている");
         gw.probe_in_background(probing).unwrap().await.unwrap();
 
         assert_eq!(
-            gw.denials.get("a", now),
-            Some(Denial {
-                until: reset.parse().unwrap(),
-                reason: Reason::Limited,
-            }),
+            gw.denials.get("a", MODEL, now),
+            Some(window_closed(reset.parse().unwrap())),
             "聞いた結果で開く時刻を引き直す"
         );
     }
@@ -1588,10 +1639,7 @@ credentials = ["a"]
         let now = now_unix();
         gw.denials.deny(
             "a",
-            Denial {
-                until: now + 100_000,
-                reason: Reason::Limited,
-            },
+            window_closed(now + 100_000),
             now - denial::PROBE_INTERVAL,
         );
 
