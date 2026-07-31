@@ -84,7 +84,8 @@ impl<P: Persistence> Gateway<P> {
             config: config.clone(),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
-            usage: Usage::default(),
+            // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
+            usage: Usage::new(config.stats.resolve_dir(), &config.server.listen),
         })
     }
 
@@ -93,6 +94,42 @@ impl<P: Persistence> Gateway<P> {
     /// 受け取り口が中継に tap を挟むのと、閲覧の口が報告を作るのに使う。
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
+    }
+
+    /// 前回落とした分を読み戻す。待ち受けを始める前に 1 回だけ呼ぶ。
+    ///
+    /// 日次集計を読まずに数え直すと、次の保存で前回までの分を上書きして消す
+    /// (DR-0011)。利用状況を読まないと、再起動のたびに全 credential が未観測へ
+    /// 戻る (DR-0007)。`now` を受けるのは、読み戻す「当日」を試験から固定するため。
+    pub async fn restore(&self, now: i64) {
+        self.stats.restore(now);
+        self.usage.restore().await;
+    }
+
+    /// 変わった分をディスクへ落とす。
+    ///
+    /// 落とし損なっても止めない — 次の周回で書き直される。
+    pub async fn save(&self) {
+        if let Err(e) = self.stats.flush() {
+            tracing::warn!(%e, "日次集計を保存できません");
+        }
+        if let Err(e) = self.usage.save().await {
+            tracing::warn!(%e, "利用状況を保存できません");
+        }
+    }
+
+    /// 一定の間隔で落とし続ける。
+    ///
+    /// 間隔を空けるのは、1 リクエストごとに書くのが無駄だから (kawaz 裁定)。
+    /// 日次集計と利用状況を同じ周回で落とすので、書き込みが重なる先は
+    /// この 1 つだけになる。
+    pub async fn keep_saving(&self, every: std::time::Duration) {
+        let mut ticker = tokio::time::interval(every);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            self.save().await;
+        }
     }
 
     /// upstream に一覧を聞く。起動時に 1 回呼ぶ。

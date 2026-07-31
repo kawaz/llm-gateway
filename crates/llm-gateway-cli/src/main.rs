@@ -48,11 +48,11 @@ login のオプション:
   XDG_STATE_HOME    認証情報とログの既定の置き場
 ";
 
-/// 使用量の集計をディスクへ落とす間隔。
+/// 使用量の集計と利用状況をディスクへ落とす間隔。
 ///
 /// リクエストごとに書くのは無駄なので間隔を空ける (DR-0011)。落ちたときに
 /// 失うのはこの間に通った分だけで、終了の合図では待たずに落とす。
-const STATS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -132,11 +132,10 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
         gateway.refresh_models().await;
 
-        // 前回落とした当日分を読み戻す。読まずに数え直すと、次の保存で
-        // 前回までの分を上書きして消す (DR-0011)。
+        // 前回落とした分 (当日の集計・credential ごとの利用状況) を読み戻す。
         gateway
-            .stats()
-            .restore(llm_gateway::credential::time::now_unix());
+            .restore(llm_gateway::credential::time::now_unix())
+            .await;
 
         tracing::info!(
             listen = %config.server.listen,
@@ -150,10 +149,9 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         let refresher = Arc::clone(&gateway);
         tokio::spawn(async move { refresher.keep_models_fresh().await });
 
-        // 使用量の集計を定期的に落とす。
+        // 集計と利用状況を定期的に落とす。
         let flusher = Arc::clone(&gateway);
-        let flushing =
-            tokio::spawn(async move { flusher.stats().keep_flushing(STATS_FLUSH_INTERVAL).await });
+        let flushing = tokio::spawn(async move { flusher.keep_saving(SAVE_INTERVAL).await });
 
         let serving = Arc::clone(&gateway);
         let result = axum::serve(listener, llm_gateway_server::router(serving))
@@ -169,9 +167,7 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
 
         // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
         // 直前の分を失わない。
-        if let Err(e) = gateway.stats().flush() {
-            tracing::warn!(%e, "終了時に日次集計を保存できません");
-        }
+        gateway.save().await;
         result?;
 
         Ok(ExitCode::SUCCESS)
@@ -1415,7 +1411,7 @@ mod tests {
     }
 
     fn observed() -> CredentialUsage {
-        let mut c = CredentialUsage::new(
+        CredentialUsage::new(
             "claude-personal",
             "claude_oauth",
             llm_gateway::usage::Support::Observed,
@@ -1426,8 +1422,7 @@ mod tests {
                 seven_day: Some(window(0.3, NOW + 86_400 * 4, "allowed")),
                 overage: None,
             }),
-        );
-        c
+        )
     }
 
     fn report(credentials: Vec<CredentialUsage>) -> Report {
@@ -1457,6 +1452,21 @@ mod tests {
         }
         let out = render(&report(vec![c]));
         assert!(out.contains("(6 分前)"), "{out}");
+    }
+
+    /// 再起動を跨いで読み戻した値には、それだけの経過が付く。
+    ///
+    /// 永続化した利用状況は取得時刻ごと戻る (DR-0007) ので、古さの表示が
+    /// そのまま鮮度の判断材料になる。ここが効かないと、いつの値か分からない
+    /// ものを最新として読むことになる。
+    #[test]
+    fn a_snapshot_restored_from_disk_shows_how_old_it_is() {
+        let mut c = observed();
+        if let Some(s) = c.snapshot.as_mut() {
+            s.observed_at = NOW - 3 * 3600;
+        }
+        let out = render(&report(vec![c]));
+        assert!(out.contains("(3 時間前)"), "{out}");
     }
 
     /// 未観測・対象外も行として並ぶ (名前ごと消さない)。

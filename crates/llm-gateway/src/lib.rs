@@ -26,5 +26,6 @@ pub use config::Config;
 pub use gateway::Gateway;
 
 mod error;
+mod persist;
 
 pub use error::{Error, Result};

@@ -593,10 +593,25 @@ content-length: {declared}\r\n\r\n{head}"
 
     /// gateway を立てて、その待ち受け先を返す。
     pub(crate) async fn serve(config_toml: &str) -> String {
+        serve_inner(config_toml, None).await
+    }
+
+    /// 前回落とした分を読み戻してから立てる (再起動に相当)。
+    ///
+    /// 読み戻しは置き場を読むので、`[stats] dir` を試験用の置き場に向けた
+    /// 設定でだけ使う。既定のままだと利用者の実データを読む。
+    pub(crate) async fn serve_restored(config_toml: &str, now: i64) -> String {
+        serve_inner(config_toml, Some(now)).await
+    }
+
+    async fn serve_inner(config_toml: &str, restore_at: Option<i64>) -> String {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
         let gateway = Arc::new(Gateway::new(&config, StaticStore).unwrap());
         gateway.refresh_models().await;
+        if let Some(now) = restore_at {
+            gateway.restore(now).await;
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1008,7 +1023,7 @@ credentials = ["a"]
 
 #[cfg(test)]
 mod usage_tests {
-    use super::tests::{authed, fake_upstream, serve_with_default_ns};
+    use super::tests::{authed, fake_upstream, serve_restored, serve_with_default_ns};
     use super::*;
     use serde_json::json;
 
@@ -1054,6 +1069,59 @@ mod usage_tests {
             .iter()
             .find(|c| c["name"] == name)
             .unwrap_or_else(|| panic!("{name} が一覧にない: {report}"))
+    }
+
+    /// 前の起動で観測した分が、再起動しても一覧に出る (DR-0007)。
+    ///
+    /// 観測は通りすがりでしか起きないので、消えると次にその credential を
+    /// 使うまで何も見えない。取得時刻も一緒に戻るので、古さは読み手が判断できる。
+    #[tokio::test]
+    async fn a_snapshot_observed_before_the_restart_is_still_listed() {
+        use llm_gateway::credential::CredentialId;
+        use llm_gateway::usage::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "127.0.0.1:8319";
+        // 3 時間前に観測して落とした、前の起動の分。
+        let observed_at = 1_785_326_400 - 3 * 3600;
+        {
+            let usage = Usage::new(dir.path(), listen);
+            usage
+                .observe(
+                    &CredentialId::new("claude-personal"),
+                    &unified_headers(),
+                    observed_at,
+                )
+                .await;
+            usage.save().await.unwrap();
+        }
+
+        let base = serve_restored(
+            &format!(
+                r#"
+[server]
+listen = "{listen}"
+
+[stats]
+dir = "{}"
+
+[credentials.claude-personal]
+type = "claude_oauth"
+url = "https://upstream.invalid"
+"#,
+                dir.path().display()
+            ),
+            observed_at,
+        )
+        .await;
+
+        let c = entry(&get(&base, "/llm-gateway/usage").await, "claude-personal").clone();
+        assert_eq!(c["support"], "observed", "未観測に戻さない: {c}");
+        assert_eq!(c["snapshot"]["5h"]["utilization"], 0.71);
+        assert_eq!(
+            c["snapshot"]["observed_at"], observed_at,
+            "取得時刻は観測した当時のまま (読み戻した時刻に付け替えない): {c}"
+        );
     }
 
     /// 使ったことのない credential も、名前と理由付きで並ぶ。

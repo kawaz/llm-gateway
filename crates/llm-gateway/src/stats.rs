@@ -45,6 +45,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::credential::time::local_date;
+use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 認証情報を持たない経路 (relay 型) の記録先。
 ///
@@ -244,7 +245,7 @@ impl Stats {
     /// `now` を引数で受けるのは、読み戻す「当日」を試験から固定するため
     /// (実時計に縛ると、固定時刻で積んだデータが日付の進みで範囲外になる)。
     pub fn restore(&self, now: i64) {
-        self.sweep_temporaries();
+        sweep_temporaries(&self.dir, &self.writer);
 
         let recent: Vec<String> = (0..RESTORED_DAYS as i64)
             .map(|back| local_date(now - back * 86_400))
@@ -296,7 +297,7 @@ impl Stats {
             else {
                 continue;
             };
-            if let Err(e) = write_day(&self.path_of(date), &day) {
+            if let Err(e) = write_atomically(&self.path_of(date), &day) {
                 // 書けなかった日と、まだ書いていない日を積み直す。
                 self.mark_dirty(pending[i..].to_vec());
                 return Err(e);
@@ -309,21 +310,6 @@ impl Stats {
     fn mark_dirty(&self, dates: Vec<String>) {
         let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
         dirty.extend(dates);
-    }
-
-    /// 一定の間隔で落とし続ける。
-    ///
-    /// 間隔を空けるのは、1 リクエストごとに書くのが無駄だから (kawaz 裁定)。
-    /// 落とし損なった分は次の周回で書き直されるので、ここでは止まらない。
-    pub async fn keep_flushing(&self, every: std::time::Duration) {
-        let mut ticker = tokio::time::interval(every);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            if let Err(e) = self.flush() {
-                tracing::warn!(%e, "日次集計を保存できません");
-            }
-        }
     }
 
     /// 全 writer のファイルとメモリの分を合わせた全体像。
@@ -413,29 +399,6 @@ impl Stats {
         found
     }
 
-    /// 前回の保存が途中で落ちて残った自分の一時ファイルを消す。
-    ///
-    /// rename まで進めなかった残骸は誰も読まないが、置き場に溜まり続ける。
-    /// 消すのは**自分の名前が付いたものだけ** — 他の writer の一時ファイルは
-    /// 今まさに書いている途中かもしれない。
-    fn sweep_temporaries(&self) {
-        let prefix = format!("{}.json.tmp.", self.writer);
-        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // `2026-07-30.8402.json.tmp.<pid>.<連番>` の後半で見分ける。
-            if !name.contains(&prefix) {
-                continue;
-            }
-            match std::fs::remove_file(&path) {
-                Ok(()) => tracing::info!(path = %path.display(), "書き損じを片付けました"),
-                Err(e) => tracing::warn!(path = %path.display(), %e, "書き損じを消せません"),
-            }
-        }
-    }
-
     fn own_suffix(&self) -> String {
         format!(".{}.json", self.writer)
     }
@@ -462,23 +425,6 @@ fn date_of_file(name: &str) -> Option<String> {
     ok.then(|| date.to_owned())
 }
 
-/// 書き手の名前をファイル名に使える形にする。
-///
-/// `127.0.0.1:8402` のような待ち受け先がそのまま来る。`.` はファイル名の
-/// 区切りに使っているので、混ざると日付の切り出しが狂う。
-fn sanitize_writer(writer: &str) -> String {
-    let cleaned: String = writer
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let trimmed = cleaned.trim_matches('-');
-    if trimmed.is_empty() {
-        "unknown".to_owned()
-    } else {
-        trimmed.to_owned()
-    }
-}
-
 /// 1 日分を足し込む。ファイル同士・ファイルとメモリを合わせるときに使う。
 fn merge_day(into: &mut ByCredential, day: ByCredential) {
     for (credential, models) in day {
@@ -492,36 +438,6 @@ fn merge_day(into: &mut ByCredential, day: ByCredential) {
 fn read_day(path: &Path) -> std::io::Result<ByCredential> {
     let raw = std::fs::read_to_string(path)?;
     serde_json::from_str(&raw).map_err(std::io::Error::other)
-}
-
-/// 一時ファイルに振る通し番号。
-///
-/// pid だけでは、同じプロセスの 2 者が同じ名前を掴みうる。書く側は
-/// [`Stats::writing`] で 1 人に絞ってあるが、名前も重ならないようにして
-/// 二重に塞ぐ (排他が緩んだときに壊れ方が静かになるのを避ける)。
-static NEXT_TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 1 日分を書く。
-///
-/// 一時ファイルに書いてから rename する。読む側 (CLI / 別プロセス) が途中の
-/// 状態を読まないようにするため。名前に pid と通し番号を混ぜるのは、同じ置き場を
-/// 使う別プロセス・同じプロセスの別の書き手と一時ファイルを取り違えないため
-/// (DR-0010 と同じ理由)。
-fn write_day(path: &Path, day: &ByCredential) -> std::io::Result<()> {
-    use std::io::Write as _;
-    use std::sync::atomic::Ordering;
-
-    let seq = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
-    let json = serde_json::to_vec_pretty(day).map_err(std::io::Error::other)?;
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&json)?;
-        // rename する前にディスクへ落とす。省くと、クラッシュ時に「rename は
-        // 済んだが中身が空」のファイルが残りうる。
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
 }
 
 /// SSE の 1 イベントをどこまで抱えるか。

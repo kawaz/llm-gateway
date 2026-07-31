@@ -9,14 +9,30 @@
 //!
 //! 弱点は「しばらく使っていない credential の値が古い / 無い」こと。だから
 //! スナップショットには必ず取得時刻を付け、古さが見えるようにする。
+//!
+//! ## 再起動を跨いで持つ
+//!
+//! スナップショットはディスクにも落とす。落とさないと再起動のたびに全部が
+//! 未観測へ戻り、次にその credential を使うまで何も見えない。古い値が残る
+//! ことになるが、取得時刻が付いているので古さは読み手が判断できる (CLI は
+//! 5 分を超えた分に経過を添える)。値そのものは「最後に観測したときの実測」で、
+//! 推測ではない (kawaz 裁定 2026-07-31)。
+//!
+//! 書き込み先は日次集計と同じ置き場の、**このプロセス専用のファイル**
+//! (`usage-latest.<書き手>.json`)。他の writer の分は読まない — 向こうの
+//! 観測は向こうが持っている。
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::credential::CredentialId;
 use crate::credential::time::format_rfc3339;
+use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 応答ヘッダから利用状況を読む道具。
 ///
@@ -152,16 +168,42 @@ fn read_anthropic_unified(headers: &[(String, String)], now: i64) -> Option<Snap
     Some(snapshot)
 }
 
+/// ディスクに落とす形。credential 名 → 最後に観測したスナップショット。
+type Saved = BTreeMap<String, Snapshot>;
+
 /// credential ごとの最新スナップショット。
 ///
-/// メモリにだけ置く。再起動で消えるが、次のリクエストで拾い直せる
-/// (永続化すると、消えない古い値を最新だと誤解する危険のほうが大きい)。
-#[derive(Default)]
+/// メモリに持ち、変わったぶんを定期的にディスクへ落とす。落とす頻度を上げても
+/// 得るものは無い (観測できるのは通りすがりの分だけで、失っても次のリクエストで
+/// 拾い直せる) ので、日次集計と同じ周回に相乗りする。
 pub struct Usage {
     latest: RwLock<BTreeMap<CredentialId, Snapshot>>,
+    /// 前回落としてから観測があったか。無ければ書かない。
+    dirty: AtomicBool,
+    /// 書き込み中であることの札。
+    ///
+    /// 定期の保存と終了時の保存が重なると、同じ一時ファイルを 2 者が切り詰め
+    /// 合う経路が開く。書く側を 1 人に絞る ([`crate::stats::Stats`] と同じ)。
+    writing: Mutex<()>,
+    dir: PathBuf,
+    /// このプロセスの書き込み先を他と分ける名前 (待ち受けポート)。
+    writer: String,
 }
 
 impl Usage {
+    /// 置き場と書き手の名前を決めて作る。
+    ///
+    /// 前回の分を読み戻すのは呼び出し側 ([`Self::restore`])。
+    pub fn new(dir: impl Into<PathBuf>, writer: &str) -> Self {
+        Self {
+            latest: RwLock::new(BTreeMap::new()),
+            dirty: AtomicBool::new(false),
+            writing: Mutex::new(()),
+            dir: dir.into(),
+            writer: sanitize_writer(writer),
+        }
+    }
+
     /// 応答ヘッダを通りすがりに読む。
     ///
     /// 転送のホットパスから呼ばれる。ヘッダを見て何も無ければ鍵も取らない。
@@ -170,11 +212,79 @@ impl Usage {
             return;
         };
         self.latest.write().await.insert(id.clone(), snapshot);
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// この credential の最新スナップショット。まだ観測していなければ `None`。
     pub async fn get(&self, id: &CredentialId) -> Option<Snapshot> {
         self.latest.read().await.get(id).cloned()
+    }
+
+    /// 起動時に、自分が前回書いたファイルを読み戻す。
+    ///
+    /// 読めない中身は捨てて起動を続ける。ここで止まると、観測の控えという
+    /// 付随的なもののために gateway 全体が上がらなくなる。
+    ///
+    /// serve の開始前に 1 回だけ呼ぶ前提。観測を始めた後に呼ぶと、読み戻した
+    /// credential についてはメモリの値が古い値で置き換わる。
+    pub async fn restore(&self) {
+        sweep_temporaries(&self.dir, &self.writer);
+
+        let path = self.path();
+        if !path.exists() {
+            return;
+        }
+        let saved: Saved = match std::fs::read_to_string(&path)
+            .map_err(std::io::Error::other)
+            .and_then(|raw| serde_json::from_str(&raw).map_err(std::io::Error::other))
+        {
+            Ok(saved) => saved,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), %e, "利用状況を読めません");
+                return;
+            }
+        };
+        if saved.is_empty() {
+            return;
+        }
+
+        let credentials = saved.len();
+        *self.latest.write().await = saved
+            .into_iter()
+            .map(|(name, snapshot)| (CredentialId::new(name), snapshot))
+            .collect();
+        tracing::info!(credentials, "利用状況を読み戻しました");
+    }
+
+    /// 観測があればディスクへ落とす。無ければ何もしない。
+    pub async fn save(&self) -> std::io::Result<()> {
+        // 先に目印を外す。書いている間の観測は、次の周回で書き直される
+        // (取りこぼしより書き直しの方が安い)。
+        if !self.dirty.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let saved: Saved = self
+            .latest
+            .read()
+            .await
+            .iter()
+            .map(|(id, snapshot)| (id.to_string(), snapshot.clone()))
+            .collect();
+
+        // 書く者を 1 人に絞る。押さえている間に await しない。
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) =
+            std::fs::create_dir_all(&self.dir).and_then(|()| write_atomically(&self.path(), &saved))
+        {
+            // 落とし損ねた分を次の周回へ回す。
+            self.dirty.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join(format!("usage-latest.{}.json", self.writer))
     }
 }
 
@@ -261,6 +371,10 @@ mod tests {
 
     /// 2026-07-29T12:00:00Z
     const NOW: i64 = 1_785_326_400;
+
+    fn usage(dir: &std::path::Path) -> Usage {
+        Usage::new(dir, "8402")
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -372,7 +486,8 @@ mod tests {
 
     #[tokio::test]
     async fn latest_observation_wins() {
-        let usage = Usage::default();
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
         let id = CredentialId::new("claude-personal");
 
         assert_eq!(usage.get(&id).await, None, "使う前は未観測");
@@ -395,7 +510,8 @@ mod tests {
     /// 関係ない応答は、前に観測した値を消さない。
     #[tokio::test]
     async fn unrelated_response_keeps_the_previous_snapshot() {
-        let usage = Usage::default();
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
         let id = CredentialId::new("c");
 
         usage.observe(&id, &unified(), NOW).await;
@@ -413,13 +529,218 @@ mod tests {
     /// credential ごとに別々に持つ。
     #[tokio::test]
     async fn snapshots_are_per_credential() {
-        let usage = Usage::default();
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
         let a = CredentialId::new("a");
         let b = CredentialId::new("b");
 
         usage.observe(&a, &unified(), NOW).await;
         assert!(usage.get(&a).await.is_some());
         assert!(usage.get(&b).await.is_none());
+    }
+
+    // ---------- 再起動を跨いで持つ ----------
+
+    /// 落として読み戻すと、観測した値がそのまま返る。
+    ///
+    /// **取得時刻も一緒に戻る**のが肝。これが失われると、いつの値なのか
+    /// 分からないものを最新として出すことになる。
+    #[tokio::test]
+    async fn a_snapshot_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CredentialId::new("claude-personal");
+        {
+            let usage = usage(dir.path());
+            usage.observe(&id, &unified(), NOW).await;
+            usage.save().await.unwrap();
+        }
+
+        // 再起動に相当する。
+        let usage = usage(dir.path());
+        assert_eq!(usage.get(&id).await, None, "読み戻す前は未観測");
+        usage.restore().await;
+
+        let restored = usage.get(&id).await.expect("読み戻せる");
+        assert_eq!(restored.observed_at, NOW, "取得時刻も戻る");
+        assert_eq!(restored.observed_at_iso, "2026-07-29T12:00:00Z");
+        assert_eq!(restored.five_hour.unwrap().utilization, Some(0.71));
+        assert_eq!(
+            restored.overage.unwrap().disabled_reason.as_deref(),
+            Some("out_of_credits")
+        );
+    }
+
+    /// 観測していなければ書かない。
+    #[tokio::test]
+    async fn nothing_is_written_without_an_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
+
+        usage.save().await.unwrap();
+        assert!(!usage.path().exists(), "空のファイルを置かない");
+
+        // 利用状況の載っていない応答も観測ではない。
+        usage
+            .observe(
+                &CredentialId::new("a"),
+                &headers(&[("content-type", "application/json")]),
+                NOW,
+            )
+            .await;
+        usage.save().await.unwrap();
+        assert!(!usage.path().exists());
+
+        usage
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        usage.save().await.unwrap();
+        assert!(usage.path().exists(), "観測したら書く");
+    }
+
+    /// 変わっていなければ書き直さない。
+    #[tokio::test]
+    async fn an_unchanged_snapshot_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
+        usage
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        usage.save().await.unwrap();
+
+        let first = std::fs::metadata(usage.path()).unwrap().modified().unwrap();
+        usage.save().await.unwrap();
+        let second = std::fs::metadata(usage.path()).unwrap().modified().unwrap();
+        assert_eq!(first, second, "2 度目は触らない");
+    }
+
+    /// 壊れたファイルがあっても起動は続く。
+    ///
+    /// 観測の控えは付随的なもので、これで gateway が上がらないのは割に合わない。
+    #[tokio::test]
+    async fn a_broken_file_does_not_stop_the_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = usage(dir.path());
+        std::fs::write(broken.path(), "{ not json").unwrap();
+
+        broken.restore().await;
+        assert_eq!(broken.get(&CredentialId::new("a")).await, None);
+
+        // 読めなかった後も、観測して書き直せる。
+        broken
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        broken.save().await.unwrap();
+
+        let reopened = usage(dir.path());
+        reopened.restore().await;
+        assert!(reopened.get(&CredentialId::new("a")).await.is_some());
+    }
+
+    /// 他の writer のファイルは読まない。
+    ///
+    /// 向こうの観測は向こうが持っている。読むと、自分が書き戻すときに
+    /// 相手の観測を自分のファイルへ写し取ってしまう。
+    #[tokio::test]
+    async fn another_writers_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let other = Usage::new(dir.path(), "8401");
+            other
+                .observe(&CredentialId::new("a"), &unified(), NOW)
+                .await;
+            other.save().await.unwrap();
+        }
+
+        let usage = usage(dir.path());
+        usage.restore().await;
+        assert_eq!(usage.get(&CredentialId::new("a")).await, None);
+    }
+
+    /// 置き場が無くても読み戻しで落ちない (まだ 1 度も書いていない状態)。
+    #[tokio::test]
+    async fn a_missing_directory_restores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = Usage::new(dir.path().join("not-yet"), "8402");
+        usage.restore().await;
+        assert_eq!(usage.get(&CredentialId::new("a")).await, None);
+
+        // 置き場は保存のときに作る。
+        usage
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        usage.save().await.unwrap();
+        assert!(usage.path().exists());
+    }
+
+    /// 保存に失敗した分は、次の保存で書き直される。
+    #[tokio::test]
+    async fn a_failed_save_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        // 置き場と同じ名前のファイルを置いて、ディレクトリを作れなくする。
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").unwrap();
+
+        let usage = Usage::new(&blocked, "8402");
+        usage
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        assert!(usage.save().await.is_err(), "書けないので失敗する");
+
+        // 目印が残っているので、書ける状態になれば落ちる。
+        std::fs::remove_file(&blocked).unwrap();
+        usage.save().await.unwrap();
+        assert!(usage.path().exists());
+    }
+
+    /// 待ち受け先がそのまま来ても、自分のファイルを読み戻せる。
+    #[tokio::test]
+    async fn a_listen_address_becomes_a_usable_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = CredentialId::new("a");
+        {
+            let usage = Usage::new(dir.path(), "127.0.0.1:8402");
+            usage.observe(&id, &unified(), NOW).await;
+            usage.save().await.unwrap();
+        }
+
+        let usage = Usage::new(dir.path(), "127.0.0.1:8402");
+        usage.restore().await;
+        assert!(usage.get(&id).await.is_some());
+    }
+
+    /// 前回の書き損じ (自分の一時ファイル) は起動時に片付ける。
+    #[tokio::test]
+    async fn leftover_temporaries_are_swept_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = dir.path().join("usage-latest.8402.json.tmp.1234.0");
+        let theirs = dir.path().join("usage-latest.8401.json.tmp.9999.0");
+        std::fs::write(&mine, "{}").unwrap();
+        std::fs::write(&theirs, "{}").unwrap();
+
+        usage(dir.path()).restore().await;
+
+        assert!(!mine.exists(), "自分の書き損じは消す");
+        assert!(theirs.exists(), "他の writer の一時ファイルは触らない");
+    }
+
+    /// 日次集計と同じ置き場に置いても、互いのファイルを取り違えない。
+    ///
+    /// 日次集計は置き場を走査して日付ごとのファイルを足し合わせる。利用状況の
+    /// ファイルがそこに紛れて日付として読まれると、ありえない日が一覧に出る。
+    #[tokio::test]
+    async fn the_file_is_not_mistaken_for_a_daily_aggregate() {
+        let dir = tempfile::tempdir().unwrap();
+        let usage = usage(dir.path());
+        usage
+            .observe(&CredentialId::new("a"), &unified(), NOW)
+            .await;
+        usage.save().await.unwrap();
+
+        let stats = crate::stats::Stats::new(dir.path(), "8402");
+        assert!(
+            stats.report(0, NOW).days.is_empty(),
+            "利用状況のファイルを日次集計として読まない"
+        );
     }
 
     /// 未観測の credential も名前は出す (存在ごと消さない)。
