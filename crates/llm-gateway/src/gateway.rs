@@ -13,7 +13,7 @@ use crate::backend::anthropic::{Headers, Official, Provider, beta, forward, mode
 use crate::config::{Config, CredentialSpec, Namespace};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
-use crate::denial::{Candidates, Denials, Probing, denial_of};
+use crate::denial::{self, Candidates, Denials, Probing, denial_of};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
 use crate::session;
@@ -211,7 +211,9 @@ impl<P: Persistence> Gateway<P> {
         // 開いたことに気づけない。聞き終わるのは待たない — この 1 本を
         // 遅くしてまで待つ価値は無く、結果は次のリクエストが使う。
         for route in &routes {
-            if let Some(probing) = self.denials.claim_probe(route.name(), now) {
+            if self.can_probe(route.name())
+                && let Some(probing) = self.denials.claim_probe(route.name(), now)
+            {
                 let _ = self.probe_in_background(probing);
             }
         }
@@ -229,6 +231,15 @@ impl<P: Persistence> Gateway<P> {
                     seconds = until - now,
                     "どの経路も断られています。開く時刻を伝えて返します"
                 );
+                // 行き場を失った今が、状態を確かめる価値の最も高い瞬間。
+                // 次の周期を待たずに聞きに行く。
+                for route in &routes {
+                    if self.can_probe(route.name())
+                        && let Some(probing) = self.denials.claim_probe_now(route.name(), now)
+                    {
+                        let _ = self.probe_in_background(probing);
+                    }
+                }
                 return Ok(Forwarded {
                     response: rate_limited(until - now),
                     credential: None,
@@ -499,6 +510,17 @@ impl<P: Persistence> Gateway<P> {
         ))
     }
 
+    /// この経路には様子を聞きに行けるか。
+    ///
+    /// 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。他の種類は
+    /// 聞いても今の状態が読めないので、役を引き受ける前にここで落とす。
+    fn can_probe(&self, route: &str) -> bool {
+        matches!(
+            self.config.credentials.get(route),
+            Some(CredentialSpec::ClaudeOauth { .. })
+        )
+    }
+
     /// 締め出している経路に、裏で様子を聞きに行く。
     ///
     /// 実リクエストは断られている経路に当てない。代わりに一番安いモデルへ
@@ -511,13 +533,11 @@ impl<P: Persistence> Gateway<P> {
     ///
     /// 返すのは走らせた仕事。転送の側は待たない (待つと、この 1 本が聞き終わる
     /// まで遅くなる) が、試験は終わりを見届けられる。
+    ///
+    /// 札を取る前に [`Self::can_probe`] で相手を選ぶ前提。ここへ来る経路は
+    /// サブスクの認証情報を持つ (聞き方は [`Official`] に固定している)。
     fn probe_in_background(&self, probing: Probing) -> Option<tokio::task::JoinHandle<()>> {
         let spec = self.config.credentials.get(probing.route())?;
-        // 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。他は
-        // 聞きに行っても今の状態が読めないので、期限が来るのを待つ。
-        if !matches!(spec, CredentialSpec::ClaudeOauth { .. }) {
-            return None;
-        }
 
         let spec = spec.clone();
         let http = self.http.clone();
@@ -651,7 +671,12 @@ struct Sample {
 /// 開く時刻を知っているのだから、実リクエストを当てて 429 を貰い直す必要は
 /// ない。クライアントが次の一手を決めるのに要るのは状態コードと
 /// `retry-after` で、それはこちらで組み立てられる (DR-0009)。
+///
+/// 待たせる長さは [`denial::PROBE_INTERVAL`] で頭を押さえる。裏で聞きに行った
+/// 結果、宣言されたリセット時刻より早く開くことがある。2 日後と伝えてしまうと、
+/// 早期に開いたことに気づいた側から見て嘘になる。
 fn rate_limited(after: i64) -> forward::Response {
+    let after = after.min(denial::PROBE_INTERVAL);
     const BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"every route for this model is rate limited or overloaded; see the retry-after header"}}"#;
     forward::Response {
         status: 429,
@@ -757,6 +782,8 @@ mod tests {
         url: String,
         hits: Arc<AtomicUsize>,
         requests: Arc<StdMutex<Vec<String>>>,
+        /// 要求が届いたことの合図。裏で走る仕事の到着を、時間で待たずに掴む。
+        arrived: Arc<tokio::sync::Notify>,
     }
 
     /// discovery の問い合わせに返す一覧。転送の試験と混ぜない。
@@ -797,8 +824,10 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let hits = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(StdMutex::new(Vec::new()));
+            let arrived = Arc::new(tokio::sync::Notify::new());
             let counter = Arc::clone(&hits);
             let seen = Arc::clone(&requests);
+            let bell = Arc::clone(&arrived);
             let respond = Arc::new(respond);
 
             tokio::spawn(async move {
@@ -808,6 +837,7 @@ mod tests {
                     };
                     let counter = Arc::clone(&counter);
                     let seen = Arc::clone(&seen);
+                    let bell = Arc::clone(&bell);
                     let respond = Arc::clone(&respond);
                     let extra = Arc::clone(&extra);
                     tokio::spawn(async move {
@@ -823,6 +853,8 @@ mod tests {
                             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
                             let answer = respond(n, &req);
                             seen.lock().unwrap().push(req);
+                            // permit を残す合図なので、待ち始めるのが後でも取り逃がさない。
+                            bell.notify_one();
                             answer
                         };
 
@@ -841,7 +873,13 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
                 url: format!("http://{addr}"),
                 hits,
                 requests,
+                arrived,
             }
+        }
+
+        /// 次の要求が届くまで待つ。
+        async fn next_request(&self) {
+            self.arrived.notified().await;
         }
 
         fn hits(&self) -> usize {
@@ -1634,7 +1672,24 @@ credentials = ["a"]
     async fn forwarding_starts_the_probe_for_a_denied_route() {
         let denied = FakeUpstream::always(200).await;
         let spare = FakeUpstream::always(200).await;
-        let gw = gateway(&two_credentials(&denied.url, &spare.url)).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[credentials.b]
+type = "relay"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a", "b"]
+"#,
+            denied.url, spare.url
+        ))
+        .await;
 
         let now = now_unix();
         gw.denials.deny(
@@ -1648,9 +1703,100 @@ credentials = ["a"]
             .unwrap();
 
         assert_eq!(spare.hits(), 1, "実リクエストは断られていない方へ");
+        denied.next_request().await;
+        assert_eq!(denied.hits(), 1, "締め出している方へは裏で聞きに行く");
+    }
+
+    /// 認証情報の種類によっては聞きに行けない。役も立てない。
+    ///
+    /// 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。中継先に
+    /// 聞いても今の状態が読めないので、札を取って捨てるより取らない。
+    #[tokio::test]
+    async fn a_route_that_cannot_answer_is_not_probed() {
+        let denied = FakeUpstream::always(200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&denied.url, &spare.url)).await;
+
+        let now = now_unix();
+        gw.denials.deny(
+            "a",
+            window_closed(now + 100_000),
+            now - denial::PROBE_INTERVAL,
+        );
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(denied.hits(), 0, "中継の経路には聞きに行かない");
         assert!(
-            gw.denials.claim_probe("a", now).is_none(),
-            "聞きに行く役は転送の側が立てたので、もう空いていない"
+            gw.denials.claim_probe("a", now).is_some(),
+            "札は取られていない"
+        );
+    }
+
+    /// 行き場が無くなったときは、間隔を待たずに聞きに行く。
+    ///
+    /// 誰も通せないと分かった今が、状態を確かめる価値の最も高い瞬間になる。
+    #[tokio::test]
+    async fn losing_every_route_asks_right_away() {
+        let denied = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            denied.url
+        ))
+        .await;
+
+        // 今しがた断られたばかり = 間隔はまったく空いていない。
+        let now = now_unix();
+        gw.denials.deny("a", window_closed(now + 100_000), now);
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 429, "実リクエストは当てない");
+        denied.next_request().await;
+        assert_eq!(denied.hits(), 1, "間隔を待たずに 1 本だけ聞きに行く");
+    }
+
+    /// 待たせる長さは、様子を聞きに行く間隔で頭を押さえる。
+    ///
+    /// 宣言されたリセット時刻より早く開くことがあり、その早期回復に気づく
+    /// のは裏で聞きに行った時。2 日後と伝えると、気づいた側から見て嘘になる。
+    #[tokio::test]
+    async fn the_retry_after_is_capped_at_the_probe_interval() {
+        let far = FakeUpstream::always(200).await;
+        let also_far = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&far.url, &also_far.url)).await;
+
+        let now = now_unix();
+        for route in ["a", "b"] {
+            gw.denials
+                .deny(route, window_closed(now + 2 * 24 * 3600), now);
+        }
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.response
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, v)| v.as_str()),
+            Some(denial::PROBE_INTERVAL.to_string().as_str())
         );
     }
 

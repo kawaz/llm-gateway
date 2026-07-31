@@ -265,7 +265,11 @@ impl Router {
         if let Some(bound) = affinity.get(&key).filter(|b| b.model == model)
             && let Some(at) = routes.iter().position(|r| r.name() == bound.route.name())
         {
-            routes.swap(0, at);
+            // 抜いて先頭へ差し込む。入れ替えると、先頭にいた経路が抜けた穴へ
+            // 飛んで残りの優先順が入れ替わる (前回通った経路の後ろは、設定に
+            // 書いた順のままであってほしい)。
+            let bound = routes.remove(at);
+            routes.insert(0, bound);
         }
         Ok(routes)
     }
@@ -440,6 +444,12 @@ models = ["gpt-5.6-sol"]
 models = ["claude-fable-*"]
 credentials = ["bedrock", "oauth-a"]
 
+# 3 本並ぶ経路。前回通った経路を先頭へ寄せたときに、残りの順が
+# 設定のままかを見るために使う。
+[[ns.default.routing]]
+models = ["claude-sonnet-5"]
+credentials = ["bedrock", "oauth-a", "oauth-b"]
+
 [[ns.default.routing]]
 models = ["gpt-*"]
 credentials = ["cpa"]
@@ -467,12 +477,19 @@ credentials = ["bedrock", "oauth-a"]
         let r = Router::new(config);
         r.set_catalog(&[
             // Bedrock は fable だけ扱い、upstream では名前空間が付く。
-            ("bedrock", &[("claude-fable-5", "anthropic.claude-fable-5")]),
+            (
+                "bedrock",
+                &[
+                    ("claude-fable-5", "anthropic.claude-fable-5"),
+                    ("claude-sonnet-5", "anthropic.claude-sonnet-5"),
+                ],
+            ),
             (
                 "oauth-a",
                 &[
                     ("claude-fable-5", "claude-fable-5"),
                     ("claude-opus-5", "claude-opus-5"),
+                    ("claude-sonnet-5", "claude-sonnet-5"),
                     ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
                 ],
             ),
@@ -480,6 +497,7 @@ credentials = ["bedrock", "oauth-a"]
                 "oauth-b",
                 &[
                     ("claude-opus-5", "claude-opus-5"),
+                    ("claude-sonnet-5", "claude-sonnet-5"),
                     ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
                 ],
             ),
@@ -626,6 +644,33 @@ credentials = ["bedrock", "oauth-a"]
             .unwrap();
         assert_eq!(names(&again), vec!["oauth-a", "bedrock"]);
         assert_eq!(again.len(), 2, "候補は減らさない");
+    }
+
+    /// 前回通った経路を先頭へ寄せても、残りは設定の優先順のまま。
+    ///
+    /// 入れ替えで寄せると、先頭にいた経路が抜けた穴へ飛んで順が崩れる。
+    /// 崩れた順は、断られた経路を外した後の「次に試す先」を変えてしまう。
+    #[tokio::test]
+    async fn moving_the_remembered_route_keeps_the_rest_in_order() {
+        let r = router().await;
+        let s = session("s1");
+
+        let routes = r
+            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .await
+            .unwrap();
+        assert_eq!(names(&routes), vec!["bedrock", "oauth-a", "oauth-b"]);
+
+        r.remember(NS, &s, "claude-sonnet-5", &routes[2]).await;
+        assert_eq!(
+            names(
+                &r.routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["oauth-b", "bedrock", "oauth-a"],
+            "寄せた 1 本以外は動かさない"
+        );
     }
 
     #[tokio::test]

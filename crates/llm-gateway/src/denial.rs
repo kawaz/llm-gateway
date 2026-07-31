@@ -26,6 +26,12 @@ use crate::usage::{Snapshot, Window};
 /// いつ空くかの手掛かりが何も無いときに空ける間隔 (秒)。
 const DEFAULT_BACKOFF: i64 = 60;
 
+/// `retry-after` をどこまで信じるか (秒)。
+///
+/// 窓の開く時刻と違い、`retry-after` は根拠を確かめようがない。桁の壊れた値
+/// (時刻の足し算が溢れる、実質永久に閉じる) をそのまま採ると、経路を失う。
+const MAX_BACKOFF: i64 = 7 * 24 * 60 * 60;
+
 /// 締め出し中の経路に、裏で様子を聞きに行く間隔 (秒)。
 ///
 /// 上限のリセット時刻は「遅くともここまでには開く」であって、それより早く
@@ -69,8 +75,8 @@ pub struct Denial {
 ///
 /// - **429 + 塞がっている窓** → その窓が開く時刻まで、credential 全体を
 ///   ([`Reason::Limited`] / [`Scope::Everything`])。窓が複数塞がっているなら
-///   最も近い開く時刻まで (5 時間の窓が埋まっていても 7 日の窓に余裕が
-///   あるなら、5 時間の方で開く)
+///   **最も遅く開く時刻**まで — 5 時間の窓が開いても、7 日の窓が塞がった
+///   ままなら通らない
 /// - **429 で窓が読めない / 529** → `retry-after`、無ければ
 ///   [`DEFAULT_BACKOFF`] だけ、頼んだモデルにだけ
 ///   ([`Reason::Busy`] / [`Scope::Model`])
@@ -90,7 +96,7 @@ pub fn denial_of(
         return None;
     }
     if status == 429
-        && let Some(reset) = nearest_reset(headers, now)
+        && let Some(reset) = last_reset(headers, now)
     {
         return Some(Denial {
             until: reset,
@@ -100,14 +106,18 @@ pub fn denial_of(
     }
     let after = retry_after(headers).unwrap_or(DEFAULT_BACKOFF);
     Some(Denial {
-        until: now + after.max(0),
+        until: now + after.clamp(0, MAX_BACKOFF),
         reason: Reason::Busy,
         scope: Scope::Model(model.to_owned()),
     })
 }
 
-/// 塞がっている窓のうち、最も近い開く時刻。
-fn nearest_reset(headers: &[(String, String)], now: i64) -> Option<i64> {
+/// 塞がっている窓が全部開くのはいつか。
+///
+/// **最も遅い方**を採る。5 時間の窓が開いても、7 日の窓が塞がったままなら
+/// このリクエストは通らない。早い方を採ると、開いていない相手に当てに行って
+/// 429 を貰い直すことになる。
+fn last_reset(headers: &[(String, String)], now: i64) -> Option<i64> {
     let snapshot = Snapshot::from_headers(headers, now)?;
     [snapshot.five_hour, snapshot.seven_day]
         .into_iter()
@@ -116,7 +126,7 @@ fn nearest_reset(headers: &[(String, String)], now: i64) -> Option<i64> {
         .filter_map(|w| w.reset)
         // 過ぎている時刻は手掛かりにならない。次の手掛かりへ落とす。
         .filter(|reset| *reset > now)
-        .min()
+        .max()
 }
 
 /// この窓は塞がっているか。
@@ -185,6 +195,11 @@ impl Denials {
     /// 縮めない** — 60 秒の退避で、読めていた窓の開く時刻を上書きしない。
     pub fn deny(&self, route: &str, denial: Denial, now: i64) {
         let mut marks = self.marks();
+        // 期限の切れた印を落とす。モデルごとに印が増えるので、掃除しないと
+        // 使われなくなったモデル名が溜まり続ける。聞きに行っている最中の分は
+        // 札の持ち主が居るので残す。
+        marks.retain(|_, m| m.denial.until > now || m.probing);
+
         let key = (route.to_owned(), denial.scope.clone());
         let kept = marks.get(&key);
         let probing = kept.is_some_and(|m| m.probing);
@@ -208,6 +223,13 @@ impl Denials {
     ///
     /// このモデルで通ったのだから、そのモデルの印も、credential 全体の印も
     /// 間違いだったことになる。両方消す。
+    ///
+    /// Design rationale: 裏で聞きに行った結果と、実際の転送の結果が前後する
+    /// のを防ぐ仕掛けは置かない。古い観測で誤って印を外しても、次の実
+    /// リクエストが 1 往復で 429 を貰って付け直す。古い観測で誤って印を
+    /// 付けても、次に通った応答が消す。どちらも 1 リクエストで直るので、
+    /// 順序を守るための仕掛け (世代番号・観測時刻の比較) を足すと、得られる
+    /// ものより仕掛けの複雑さの方が大きい。
     pub fn allow(&self, route: &str, model: &str) {
         let mut marks = self.marks();
         marks.remove(&(route.to_owned(), Scope::Everything));
@@ -217,9 +239,9 @@ impl Denials {
     /// この経路をこのモデルで使えるか。断られていれば、その印。
     ///
     /// credential 全体の印と、このモデルの印のどちらかが生きていれば断られて
-    /// いる。両方あるなら、先に開く方を返す (どちらが先に開いても、まだ
-    /// もう一方が残っていれば使えないが、クライアントに伝える「次に見るべき
-    /// 時刻」としては近い方が正しい)。
+    /// いる。両方あるなら**遅く開く方**を返す — この経路が使えるようになる
+    /// のは両方が開いた時なので、早い方を返すとまだ塞がっている経路を
+    /// 「もう開く」と伝えることになる。
     pub fn get(&self, route: &str, model: &str, now: i64) -> Option<Denial> {
         let marks = self.marks();
         [Scope::Everything, Scope::Model(model.to_owned())]
@@ -227,7 +249,7 @@ impl Denials {
             .filter_map(|scope| marks.get(&(route.to_owned(), scope)))
             .map(|m| m.denial.clone())
             .filter(|d| d.until > now)
-            .min_by_key(|d| d.until)
+            .max_by_key(|d| d.until)
     }
 
     /// 今このリクエストで試せる経路を選ぶ。
@@ -264,15 +286,29 @@ impl Denials {
     ///
     /// 聞きに行くのは、credential 全体を上限で締め出している経路だけ。混雑は
     /// 開く時刻を持たないので短い退避で足り、定期的に聞いても実費が増える
-    /// だけになる。
+    /// だけになる。前に聞いてから [`PROBE_INTERVAL`] 経つまでは引き受けない。
     pub fn claim_probe(self: &Arc<Self>, route: &str, now: i64) -> Option<Probing> {
+        self.claim(route, now, true)
+    }
+
+    /// 間隔を待たずに引き受ける。
+    ///
+    /// どの経路も断られていて、このリクエストが行き場を失ったときに使う。
+    /// 誰も通せないと分かった今が、状態を確かめる価値の最も高い瞬間なので、
+    /// 次の周期を待つ理由がない。同時に何人も聞きに行かないための札は、
+    /// こちらの経路でも変わらず効く。
+    pub fn claim_probe_now(self: &Arc<Self>, route: &str, now: i64) -> Option<Probing> {
+        self.claim(route, now, false)
+    }
+
+    fn claim(self: &Arc<Self>, route: &str, now: i64, wait_for_interval: bool) -> Option<Probing> {
         let key = (route.to_owned(), Scope::Everything);
         let mut marks = self.marks();
         let mark = marks.get_mut(&key)?;
-        if mark.denial.reason != Reason::Limited
-            || mark.probing
-            || now - mark.seen_at < PROBE_INTERVAL
-        {
+        if mark.denial.reason != Reason::Limited || mark.probing {
+            return None;
+        }
+        if wait_for_interval && now - mark.seen_at < PROBE_INTERVAL {
             return None;
         }
         mark.probing = true;
@@ -369,11 +405,22 @@ mod tests {
         );
     }
 
-    /// 塞がっている窓が複数あるなら、先に開く方まで。
+    /// 塞がっている窓が複数あるなら、全部開くまで。
+    ///
+    /// 5 時間の窓が開いても、7 日の窓が塞がったままなら通らない。早い方を
+    /// 採ると、開いていない相手に当てに行って 429 を貰い直すことになる。
     #[test]
-    fn the_nearest_rejected_window_wins() {
+    fn every_rejected_window_must_open() {
         let mut h = window("5h", "rejected", NOW + 100);
         h.extend(window("7d", "rejected", NOW + 5000));
+        assert_eq!(denial_of(429, &h, FABLE, NOW), Some(limited(NOW + 5000)));
+    }
+
+    /// 開いている窓の時刻は数えない。塞がっている窓だけを見る。
+    #[test]
+    fn an_open_window_does_not_extend_the_deadline() {
+        let mut h = window("5h", "rejected", NOW + 100);
+        h.extend(window("7d", "allowed", NOW + 5000));
         assert_eq!(denial_of(429, &h, FABLE, NOW), Some(limited(NOW + 100)));
     }
 
@@ -568,6 +615,95 @@ mod tests {
             d.claim_probe("b", NOW + PROBE_INTERVAL).is_none(),
             "いつ空くか分からない相手に定期的に聞いても、実費が増えるだけ"
         );
+    }
+
+    /// 桁の壊れた `retry-after` で時刻の足し算を溢れさせない。
+    #[test]
+    fn an_absurd_retry_after_is_clamped() {
+        for value in [i64::MAX.to_string(), "999999999999".to_owned()] {
+            let h = headers(&[("retry-after", &value)]);
+            assert_eq!(
+                denial_of(429, &h, FABLE, NOW),
+                Some(busy(NOW + MAX_BACKOFF, FABLE)),
+                "{value}"
+            );
+        }
+    }
+
+    /// 負の `retry-after` は 0 扱い。過去の時刻を印にしない。
+    #[test]
+    fn a_negative_retry_after_does_not_look_expired() {
+        let h = headers(&[("retry-after", "-10")]);
+        assert_eq!(denial_of(429, &h, FABLE, NOW), Some(busy(NOW, FABLE)));
+    }
+
+    /// 印が 2 つ生きているなら、この経路が使えるのは遅い方が開いた時。
+    #[test]
+    fn the_later_of_two_marks_decides_when_the_route_returns() {
+        let d = Denials::new();
+        d.deny("a", limited(NOW + 100), NOW);
+        d.deny("a", busy(NOW + 5000, FABLE), NOW);
+        assert_eq!(
+            d.get("a", FABLE, NOW),
+            Some(busy(NOW + 5000, FABLE)),
+            "窓が先に開いても、モデルの印が残っていれば使えない"
+        );
+        assert_eq!(
+            d.get("a", HAIKU, NOW),
+            Some(limited(NOW + 100)),
+            "そのモデルの印が無い側は窓だけ見る"
+        );
+    }
+
+    /// 期限の切れた印は溜めない。モデル名ごとに印が増えるので、放っておくと
+    /// 使われなくなったモデルの分が残り続ける。
+    #[test]
+    fn expired_marks_are_swept() {
+        let d = Denials::new();
+        for model in ["m1", "m2", "m3"] {
+            d.deny("a", busy(NOW + 60, model), NOW);
+        }
+        assert_eq!(d.marks().len(), 3);
+
+        let later = NOW + 61;
+        d.deny("a", busy(later + 60, "m4"), later);
+        assert_eq!(d.marks().len(), 1, "生きているのは今付けた 1 つだけ");
+    }
+
+    /// 聞きに行っている最中の印は、期限が切れても掃除しない。
+    #[test]
+    fn a_probed_mark_survives_the_sweep() {
+        let d = Arc::new(Denials::new());
+        d.deny("a", limited(NOW + 10), NOW);
+        let held = d.claim_probe_now("a", NOW).expect("引き受けられる");
+
+        let later = NOW + 100;
+        d.deny("b", busy(later + 60, FABLE), later);
+        assert_eq!(d.marks().len(), 2, "札の持ち主が居る分は残す");
+        drop(held);
+    }
+
+    /// 行き場が無くなった時は、間隔を待たずに聞きに行く。
+    #[test]
+    fn an_urgent_claim_skips_the_interval() {
+        let d = Arc::new(Denials::new());
+        d.deny("a", limited(NOW + 100_000), NOW);
+
+        assert!(d.claim_probe("a", NOW).is_none(), "間隔は空いていない");
+        let held = d.claim_probe_now("a", NOW).expect("急ぎなら引き受ける");
+        assert!(
+            d.claim_probe_now("a", NOW).is_none(),
+            "急ぎでも、同時に何人も聞きに行かない"
+        );
+        drop(held);
+    }
+
+    /// 急ぎでも、混雑にはやはり聞きに行かない。
+    #[test]
+    fn an_urgent_claim_still_skips_congestion() {
+        let d = Arc::new(Denials::new());
+        d.deny("a", busy(NOW + 60, FABLE), NOW);
+        assert!(d.claim_probe_now("a", NOW).is_none());
     }
 
     #[test]
