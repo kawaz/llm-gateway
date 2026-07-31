@@ -13,6 +13,7 @@ use crate::backend::anthropic::{Headers, Official, Provider, beta, forward, mode
 use crate::config::{Config, CredentialSpec, Namespace};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
+use crate::denial::{Denials, denied_until};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
 use crate::session;
@@ -35,6 +36,8 @@ pub struct Gateway<P: Persistence> {
     refresh_interval: std::time::Duration,
     usage: Usage,
     stats: Arc<Stats>,
+    /// 断られた経路の締め出し。
+    denials: Denials,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -86,6 +89,7 @@ impl<P: Persistence> Gateway<P> {
             http,
             // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
             usage: Usage::new(config.stats.resolve_dir(), &config.server.listen),
+            denials: Denials::new(),
         })
     }
 
@@ -196,6 +200,9 @@ impl<P: Persistence> Gateway<P> {
             .router
             .routes_for(ns, ns_name, &model, &session)
             .await?;
+        // 直前に断られたばかりの経路は飛ばす。上限に当たった認証情報が先頭に
+        // いると、印が無ければ全リクエストがそこで 1 往復ぶん無駄になる。
+        let routes = self.denials.in_order(routes, now_unix()).await;
 
         let mut attempts = Vec::new();
         // この経路に断られた応答のうち、最後のもの。全滅したときに返す。
@@ -210,6 +217,9 @@ impl<P: Persistence> Gateway<P> {
                     // 次の転送も同じところから始めることになる。
                     if resp.status / 100 == 2 {
                         self.router.remember(ns_name, &session, &model, route).await;
+                        // 通ったなら締め出しの根拠は消えている。上限のリセットを
+                        // 待たずに空くこともある (別の窓が開く / 契約が変わる)。
+                        self.denials.allow(route.name()).await;
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::relay が記録する。
@@ -232,6 +242,20 @@ impl<P: Persistence> Gateway<P> {
                         reason,
                     });
                     if let Some(resp) = denial {
+                        // 上限 (429) と混雑 (529) は時間が経てば空く。次の
+                        // リクエストで同じ壁に当たらないよう、期限を控える。
+                        // 401 / 403 は待っても直らないので印を付けない。
+                        if matches!(resp.status, 429 | 529) {
+                            let now = now_unix();
+                            let until = denied_until(&resp.headers, now);
+                            warn!(
+                                route = route.name(),
+                                status = resp.status,
+                                seconds = until - now,
+                                "この経路をしばらく候補から外します"
+                            );
+                            self.denials.deny(route.name(), until).await;
+                        }
                         denied = Some((resp, route.credential.clone()));
                     }
                 }
@@ -1153,6 +1177,152 @@ credentials = ["a", "b"]
             "いつ再開できるかを伝える: {:?}",
             resp.response.headers
         );
+    }
+
+    /// 一度断られた経路は、次のリクエストでは飛ばす。
+    ///
+    /// 上限に当たった認証情報が先頭にいると、印が無い限り**毎回** そこで
+    /// 1 往復を捨ててから次へ回ることになる (DR-0009)。
+    #[tokio::test]
+    async fn a_rate_limited_route_is_skipped_next_time() {
+        let limited = FakeUpstream::always(429).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+        for _ in 0..2 {
+            let resp = gw
+                .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .await
+                .unwrap();
+            assert_eq!(resp.response.status, 200);
+        }
+
+        assert_eq!(
+            (limited.hits(), spare.hits()),
+            (1, 2),
+            "2 回目は上限に当たった先を叩かない"
+        );
+    }
+
+    /// 締め出す長さは、通らない窓のリセット時刻から決める。
+    #[tokio::test]
+    async fn the_deadline_comes_from_the_rate_limit_headers() {
+        let reset = (now_unix() + 3600).to_string();
+        let limited = FakeUpstream::start_with_headers(
+            &[
+                ("anthropic-ratelimit-unified-7d-status", "rejected"),
+                ("anthropic-ratelimit-unified-7d-reset", &reset),
+                // ヘッダが読めるなら、こちらは見ない。
+                ("retry-after", "5"),
+            ],
+            |_, _| (429, body_for(429)),
+        )
+        .await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            gw.denials.until("a", now_unix()).await,
+            Some(reset.parse().unwrap()),
+            "窓が空く時刻まで"
+        );
+    }
+
+    /// ヘッダが無ければ `retry-after`、それも無ければ既定の 60 秒。
+    #[tokio::test]
+    async fn the_deadline_falls_back_to_retry_after_then_to_the_default() {
+        for (header, expected) in [(Some(("retry-after", "30")), 30), (None, 60)] {
+            let extra: Vec<(&str, &str)> = header.into_iter().collect();
+            let limited =
+                FakeUpstream::start_with_headers(&extra, |_, _| (429, body_for(429))).await;
+            let spare = FakeUpstream::always(200).await;
+            let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+            let before = now_unix();
+            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .await
+                .unwrap();
+
+            let until = gw.denials.until("a", before).await.expect("印が付く");
+            assert!(
+                (before + expected..=before + expected + 2).contains(&until),
+                "{expected} 秒ほど空ける: {}",
+                until - before
+            );
+        }
+    }
+
+    /// 期限が過ぎたら、また試す。通ったら印は消える。
+    #[tokio::test]
+    async fn an_expired_denial_is_tried_again_and_cleared() {
+        let recovered = FakeUpstream::always(200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&recovered.url, &spare.url)).await;
+
+        let past = now_unix() - 1;
+        gw.denials.deny("a", past).await;
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.hits(), 1, "期限切れの印は素通り");
+        assert_eq!(spare.hits(), 0);
+        assert_eq!(
+            gw.denials.until("a", past - 100).await,
+            None,
+            "通ったので印そのものが消える"
+        );
+    }
+
+    /// 全部が断られていても、誰かには聞く。
+    ///
+    /// 印だけを見て即 429 を返すと、実際にはもう空いている経路を自分で
+    /// 閉じたままにする。試すのは期限が最も近い 1 本から。
+    #[tokio::test]
+    async fn every_route_denied_still_asks_the_nearest_one() {
+        let far = FakeUpstream::always(200).await;
+        let near = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&far.url, &near.url)).await;
+
+        let now = now_unix();
+        gw.denials.deny("a", now + 1000).await;
+        gw.denials.deny("b", now + 100).await;
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 200);
+        assert_eq!(
+            (far.hits(), near.hits()),
+            (0, 1),
+            "先に空く見込みの方から聞く"
+        );
+    }
+
+    /// 待っても直らない断り (401 / 403) では締め出さない。
+    #[tokio::test]
+    async fn an_auth_failure_does_not_start_a_cooldown() {
+        for status in [401, 403] {
+            let broken = FakeUpstream::always(status).await;
+            let spare = FakeUpstream::always(200).await;
+            let gw = gateway(&two_credentials(&broken.url, &spare.url)).await;
+
+            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                gw.denials.until("a", now_unix()).await,
+                None,
+                "{status} は時間で空くものではない"
+            );
+        }
     }
 
     /// 混んでいる (529) 先も次へ回す。
