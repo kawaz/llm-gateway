@@ -87,6 +87,17 @@ pub struct CredentialStore<P: Persistence> {
     inner: Arc<Inner<P>>,
 }
 
+/// 中身は共有されているので、複製しても同じ控え・同じ進行中の印を見る。
+///
+/// 要求から切り離した仕事 (裏で様子を聞きに行く等) へ持ち出すために要る。
+impl<P: Persistence> Clone for CredentialStore<P> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 /// 共有される中身。
 ///
 /// 更新は要求とは切り離した仕事として走らせるので、控えも進行中の印も

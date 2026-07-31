@@ -13,7 +13,7 @@ use crate::backend::anthropic::{Headers, Official, Provider, beta, forward, mode
 use crate::config::{Config, CredentialSpec, Namespace};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
-use crate::denial::{Denials, denied_until};
+use crate::denial::{Candidates, Denials, Probing, denial_of};
 use crate::error::UpstreamAttempt;
 use crate::router::{Route, Router};
 use crate::session;
@@ -34,10 +34,11 @@ pub struct Gateway<P: Persistence> {
     credentials: CredentialStore<P>,
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
-    usage: Usage,
+    /// 裏で様子を聞きに行く仕事と共有する。要求より長生きしうる。
+    usage: Arc<Usage>,
     stats: Arc<Stats>,
     /// 断られた経路の締め出し。
-    denials: Denials,
+    denials: Arc<Denials>,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -88,8 +89,11 @@ impl<P: Persistence> Gateway<P> {
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
             // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
-            usage: Usage::new(config.stats.resolve_dir(), &config.server.listen),
-            denials: Denials::new(),
+            usage: Arc::new(Usage::new(
+                config.stats.resolve_dir(),
+                &config.server.listen,
+            )),
+            denials: Arc::new(Denials::new()),
         })
     }
 
@@ -200,9 +204,38 @@ impl<P: Persistence> Gateway<P> {
             .router
             .routes_for(ns, ns_name, &model, &session)
             .await?;
-        // 直前に断られたばかりの経路は飛ばす。上限に当たった認証情報が先頭に
-        // いると、印が無ければ全リクエストがそこで 1 往復ぶん無駄になる。
-        let routes = self.denials.in_order(routes, now_unix()).await;
+        let now = now_unix();
+
+        // 締め出している経路には、裏で様子を聞きに行く役を立てる。上限は
+        // リセット時刻より早く開くこともあり、実リクエストを当てない限り
+        // 開いたことに気づけない。聞き終わるのは待たない — この 1 本を
+        // 遅くしてまで待つ価値は無く、結果は次のリクエストが使う。
+        for route in &routes {
+            if let Some(probing) = self.denials.claim_probe(route.name(), now) {
+                let _ = self.probe_in_background(probing);
+            }
+        }
+
+        // 断られている経路は飛ばす。上限に当たった認証情報が先頭にいると、
+        // 印が無ければ全リクエストがそこで 1 往復ぶん無駄になる。
+        let routes = match self.denials.candidates(&routes, now) {
+            Candidates::Ready(ready) => ready,
+            // どれも断られている。開く時刻を知っているのだから、当てに行って
+            // 429 を貰い直す必要はない。同じことを retry-after で伝える。
+            Candidates::AllDenied { until } => {
+                warn!(
+                    model = %model,
+                    routes = routes.len(),
+                    seconds = until - now,
+                    "どの経路も断られています。開く時刻を伝えて返します"
+                );
+                return Ok(Forwarded {
+                    response: rate_limited(until - now),
+                    credential: None,
+                    model,
+                });
+            }
+        };
 
         let mut attempts = Vec::new();
         // この経路に断られた応答のうち、最後のもの。全滅したときに返す。
@@ -217,9 +250,8 @@ impl<P: Persistence> Gateway<P> {
                     // 次の転送も同じところから始めることになる。
                     if resp.status / 100 == 2 {
                         self.router.remember(ns_name, &session, &model, route).await;
-                        // 通ったなら締め出しの根拠は消えている。上限のリセットを
-                        // 待たずに空くこともある (別の窓が開く / 契約が変わる)。
-                        self.denials.allow(route.name()).await;
+                        // 通ったなら締め出しの根拠は消えている。
+                        self.denials.allow(route.name());
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::relay が記録する。
@@ -242,19 +274,18 @@ impl<P: Persistence> Gateway<P> {
                         reason,
                     });
                     if let Some(resp) = denial {
-                        // 上限 (429) と混雑 (529) は時間が経てば空く。次の
-                        // リクエストで同じ壁に当たらないよう、期限を控える。
-                        // 401 / 403 は待っても直らないので印を付けない。
-                        if matches!(resp.status, 429 | 529) {
-                            let now = now_unix();
-                            let until = denied_until(&resp.headers, now);
+                        // 時間が経てば空く断りなら、次のリクエストで同じ壁に
+                        // 当たらないよう期限を控える。
+                        let now = now_unix();
+                        if let Some(denial) = denial_of(resp.status, &resp.headers, now) {
                             warn!(
                                 route = route.name(),
                                 status = resp.status,
-                                seconds = until - now,
-                                "この経路をしばらく候補から外します"
+                                reason = ?denial.reason,
+                                seconds = denial.until - now,
+                                "この経路を候補から外します"
                             );
-                            self.denials.deny(route.name(), until).await;
+                            self.denials.deny(route.name(), denial, now);
                         }
                         denied = Some((resp, route.credential.clone()));
                     }
@@ -455,12 +486,100 @@ impl<P: Persistence> Gateway<P> {
         name: &str,
         spec: &CredentialSpec,
     ) -> std::result::Result<(u64, u64), String> {
+        let sample = Self::sound(&self.http, &self.credentials, &self.usage, name, spec).await?;
+        if sample.status != 200 {
+            return Err(format!(
+                "upstream が {} を返しました: {}",
+                sample.status, sample.body
+            ));
+        }
+        Ok((
+            sample.tokens.input.unwrap_or(0),
+            sample.tokens.output.unwrap_or(0),
+        ))
+    }
+
+    /// 締め出している経路に、裏で様子を聞きに行く。
+    ///
+    /// 実リクエストは断られている経路に当てない。代わりに一番安いモデルへ
+    /// 最小のリクエストを 1 本投げ、返ってきたヘッダで今の状態を見る。開いて
+    /// いれば印を外し、まだ塞がっていれば開く時刻を控え直す。
+    ///
+    /// 要求から切り離した仕事として走らせる。要求は途中で消える (クライアントが
+    /// 切る) が、聞きに行った結果は次のリクエストのために残したい
+    /// ([`crate::credential`] の更新と同じ形)。
+    ///
+    /// 返すのは走らせた仕事。転送の側は待たない (待つと、この 1 本が聞き終わる
+    /// まで遅くなる) が、試験は終わりを見届けられる。
+    fn probe_in_background(&self, probing: Probing) -> Option<tokio::task::JoinHandle<()>> {
+        let spec = self.config.credentials.get(probing.route())?;
+        // 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。他は
+        // 聞きに行っても今の状態が読めないので、期限が来るのを待つ。
+        if !matches!(spec, CredentialSpec::ClaudeOauth { .. }) {
+            return None;
+        }
+
+        let spec = spec.clone();
+        let http = self.http.clone();
+        let credentials = self.credentials.clone();
+        let usage = Arc::clone(&self.usage);
+        let denials = Arc::clone(&self.denials);
+        let stats = Arc::clone(&self.stats);
+
+        Some(tokio::spawn(async move {
+            // 札は、走り切っても落ちても [`Drop`] で外れる。
+            let name = probing.route().to_owned();
+            let sample = match Self::sound(&http, &credentials, &usage, &name, &spec).await {
+                Ok(sample) => sample,
+                Err(reason) => {
+                    warn!(credential = %name, %reason, "締め出し中の経路に聞きに行けません");
+                    return;
+                }
+            };
+
+            let now = now_unix();
+            if sample.status / 100 == 2 {
+                info!(credential = %name, "締め出していた経路が開きました");
+                denials.allow(&name);
+                // 聞きに行くのにも実費がかかる。隠さずに積む (DR-0011)。
+                stats.record(now, Some(&name), PROBE_MODEL, &sample.tokens);
+                return;
+            }
+            match denial_of(sample.status, &sample.headers, now) {
+                Some(denial) => {
+                    info!(
+                        credential = %name,
+                        status = sample.status,
+                        seconds = denial.until - now,
+                        "まだ断られています。開く時刻を控え直します"
+                    );
+                    denials.deny(&name, denial, now);
+                }
+                // 時間で空く断りではない (401 等)。印は据え置き、期限が来た
+                // ときの実リクエストに判断を任せる。
+                None => warn!(
+                    credential = %name,
+                    status = sample.status,
+                    body = %sample.body,
+                    "締め出し中の経路が別の理由で断りました"
+                ),
+            }
+        }))
+    }
+
+    /// 最小のリクエストを 1 本投げて、返ってきたものを持ち帰る。
+    ///
+    /// `&self` を取らないのは、要求から切り離した仕事がこの関数だけを持って
+    /// 動くため。Gateway を丸ごと持ち出さずに済む。
+    async fn sound(
+        http: &reqwest::Client,
+        credentials: &CredentialStore<P>,
+        usage: &Usage,
+        name: &str,
+        spec: &CredentialSpec,
+    ) -> std::result::Result<Sample, String> {
         let id = CredentialId::new(name);
-        let credential = self
-            .credentials
-            .acquire(&id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let credential = credentials.acquire(&id).await.map_err(|e| e.to_string())?;
         let provider = Official::new(name, spec.url(), spec.headers().clone());
 
         let body = serde_json::json!({
@@ -474,7 +593,7 @@ impl<P: Persistence> Gateway<P> {
         ]);
 
         let resp = forward::send(
-            &self.http,
+            http,
             &provider as &dyn Provider,
             Some(&credential),
             "/v1/messages",
@@ -487,20 +606,12 @@ impl<P: Persistence> Gateway<P> {
 
         // 上限に当たった応答にも使用率は載る。状態を見る前に拾っておく。
         let status = resp.status;
-        self.usage.observe(&id, &resp.headers, now_unix()).await;
+        let headers = resp.headers.clone();
+        usage.observe(&id, &headers, now_unix()).await;
 
         let raw = forward::collect_body(resp.body)
             .await
             .map_err(|e| e.to_string())?;
-        if status != 200 {
-            return Err(format!(
-                "upstream が {status} を返しました: {}",
-                String::from_utf8_lossy(&raw)
-                    .chars()
-                    .take(200)
-                    .collect::<String>()
-            ));
-        }
 
         let spent: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
         let count = |key: &str| {
@@ -508,10 +619,49 @@ impl<P: Persistence> Gateway<P> {
                 .pointer(&format!("/usage/{key}"))
                 .and_then(Value::as_u64)
         };
-        Ok((
-            count("input_tokens").unwrap_or(0),
-            count("output_tokens").unwrap_or(0),
-        ))
+        Ok(Sample {
+            status,
+            headers,
+            // 出入りだけ見る。プローブは cache を使わないので、他は載らない。
+            tokens: crate::stats::Tokens {
+                input: count("input_tokens"),
+                output: count("output_tokens"),
+                ..Default::default()
+            },
+            body: String::from_utf8_lossy(&raw)
+                .chars()
+                .take(200)
+                .collect::<String>(),
+        })
+    }
+}
+
+/// プローブが持ち帰ったもの。
+struct Sample {
+    status: u16,
+    headers: Vec<(String, String)>,
+    /// 消費したトークン。2xx のときだけ載る。
+    tokens: crate::stats::Tokens,
+    /// 本文の頭。断られた理由を説明に使う。
+    body: String,
+}
+
+/// どの経路も断られているときに返す応答。
+///
+/// 開く時刻を知っているのだから、実リクエストを当てて 429 を貰い直す必要は
+/// ない。クライアントが次の一手を決めるのに要るのは状態コードと
+/// `retry-after` で、それはこちらで組み立てられる (DR-0009)。
+fn rate_limited(after: i64) -> forward::Response {
+    const BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"every route for this model is rate limited or overloaded; see the retry-after header"}}"#;
+    forward::Response {
+        status: 429,
+        headers: vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("retry-after".to_owned(), after.max(1).to_string()),
+        ],
+        body: Box::pin(futures_util::stream::once(std::future::ready(Ok(
+            bytes::Bytes::from_static(BODY.as_bytes()),
+        )))),
     }
 }
 
@@ -594,6 +744,7 @@ mod tests {
     use crate::credential::stored::{OauthTokens, Payload};
     use crate::credential::time::{format_rfc3339, now_unix};
     use crate::credential::{CredentialId, StoredCredential};
+    use crate::denial::{self, Denial, Reason};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1204,7 +1355,7 @@ credentials = ["a", "b"]
         );
     }
 
-    /// 締め出す長さは、通らない窓のリセット時刻から決める。
+    /// 上限のヘッダが載っていれば、窓が開く時刻まで締め出す。
     #[tokio::test]
     async fn the_deadline_comes_from_the_rate_limit_headers() {
         let reset = (now_unix() + 3600).to_string();
@@ -1212,7 +1363,7 @@ credentials = ["a", "b"]
             &[
                 ("anthropic-ratelimit-unified-7d-status", "rejected"),
                 ("anthropic-ratelimit-unified-7d-reset", &reset),
-                // ヘッダが読めるなら、こちらは見ない。
+                // 窓が読めるなら、こちらは見ない。
                 ("retry-after", "5"),
             ],
             |_, _| (429, body_for(429)),
@@ -1226,34 +1377,13 @@ credentials = ["a", "b"]
             .unwrap();
 
         assert_eq!(
-            gw.denials.until("a", now_unix()).await,
-            Some(reset.parse().unwrap()),
-            "窓が空く時刻まで"
+            gw.denials.get("a", now_unix()),
+            Some(Denial {
+                until: reset.parse().unwrap(),
+                reason: Reason::Limited,
+            }),
+            "窓が開く時刻まで"
         );
-    }
-
-    /// ヘッダが無ければ `retry-after`、それも無ければ既定の 60 秒。
-    #[tokio::test]
-    async fn the_deadline_falls_back_to_retry_after_then_to_the_default() {
-        for (header, expected) in [(Some(("retry-after", "30")), 30), (None, 60)] {
-            let extra: Vec<(&str, &str)> = header.into_iter().collect();
-            let limited =
-                FakeUpstream::start_with_headers(&extra, |_, _| (429, body_for(429))).await;
-            let spare = FakeUpstream::always(200).await;
-            let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
-
-            let before = now_unix();
-            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-                .await
-                .unwrap();
-
-            let until = gw.denials.until("a", before).await.expect("印が付く");
-            assert!(
-                (before + expected..=before + expected + 2).contains(&until),
-                "{expected} 秒ほど空ける: {}",
-                until - before
-            );
-        }
     }
 
     /// 期限が過ぎたら、また試す。通ったら印は消える。
@@ -1264,7 +1394,14 @@ credentials = ["a", "b"]
         let gw = gateway(&two_credentials(&recovered.url, &spare.url)).await;
 
         let past = now_unix() - 1;
-        gw.denials.deny("a", past).await;
+        gw.denials.deny(
+            "a",
+            Denial {
+                until: past,
+                reason: Reason::Limited,
+            },
+            past,
+        );
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
@@ -1272,37 +1409,50 @@ credentials = ["a", "b"]
         assert_eq!(recovered.hits(), 1, "期限切れの印は素通り");
         assert_eq!(spare.hits(), 0);
         assert_eq!(
-            gw.denials.until("a", past - 100).await,
+            gw.denials.get("a", past - 100),
             None,
             "通ったので印そのものが消える"
         );
     }
 
-    /// 全部が断られていても、誰かには聞く。
+    /// どれも断られているなら、誰にも当てずに開く時刻を返す。
     ///
-    /// 印だけを見て即 429 を返すと、実際にはもう空いている経路を自分で
-    /// 閉じたままにする。試すのは期限が最も近い 1 本から。
+    /// 開く時刻を知っていながら実リクエストを当てても、429 を貰い直すために
+    /// 往復を捨てるだけになる。
     #[tokio::test]
-    async fn every_route_denied_still_asks_the_nearest_one() {
+    async fn every_route_denied_is_answered_without_asking() {
         let far = FakeUpstream::always(200).await;
         let near = FakeUpstream::always(200).await;
         let gw = gateway(&two_credentials(&far.url, &near.url)).await;
 
         let now = now_unix();
-        gw.denials.deny("a", now + 1000).await;
-        gw.denials.deny("b", now + 100).await;
+        for (route, until) in [("a", now + 1000), ("b", now + 100)] {
+            gw.denials.deny(
+                route,
+                Denial {
+                    until,
+                    reason: Reason::Limited,
+                },
+                now,
+            );
+        }
 
         let resp = gw
             .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 200);
+        assert_eq!(resp.response.status, 429);
         assert_eq!(
-            (far.hits(), near.hits()),
-            (0, 1),
-            "先に空く見込みの方から聞く"
+            resp.response
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, v)| v.as_str()),
+            Some("100"),
+            "最初に開くのがいつかを伝える"
         );
+        assert_eq!((far.hits(), near.hits()), (0, 0), "どこにも当てない");
     }
 
     /// 待っても直らない断り (401 / 403) では締め出さない。
@@ -1318,11 +1468,142 @@ credentials = ["a", "b"]
                 .unwrap();
 
             assert_eq!(
-                gw.denials.until("a", now_unix()).await,
+                gw.denials.get("a", now_unix()),
                 None,
                 "{status} は時間で空くものではない"
             );
         }
+    }
+
+    /// 上限で締め出した経路は、裏で様子を聞きに行って開いていれば戻す。
+    ///
+    /// 上限は宣言されたリセット時刻より早く開くことがある。実リクエストを
+    /// 当てない以上、聞きに行かなければ開いたことに気づけない。
+    #[tokio::test]
+    async fn a_limited_route_is_probed_in_the_background() {
+        // 聞きに行った分の消費を積めるよう、usage を載せて返す。
+        let reopened = FakeUpstream::start(|_, _| {
+            (
+                200,
+                r#"{"type":"message","content":[],"usage":{"input_tokens":8,"output_tokens":1}}"#
+                    .to_owned(),
+            )
+        })
+        .await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            reopened.url
+        ))
+        .await;
+
+        // 最後に聞いてから間隔ぶん経った状態。期限そのものはまだ先。
+        let now = now_unix();
+        gw.denials.deny(
+            "a",
+            Denial {
+                until: now + 100_000,
+                reason: Reason::Limited,
+            },
+            now - denial::PROBE_INTERVAL,
+        );
+
+        let probing = gw.denials.claim_probe("a", now).expect("間隔は空いている");
+        gw.probe_in_background(probing)
+            .expect("サブスクの認証情報なので聞きに行ける")
+            .await
+            .unwrap();
+
+        assert_eq!(gw.denials.get("a", now), None, "開いていたので印を外す");
+        assert_eq!(reopened.hits(), 1, "聞きに行くのは 1 本だけ");
+        assert!(
+            !gw.stats().in_memory().is_empty(),
+            "聞きに行く実費も集計に積む"
+        );
+    }
+
+    /// まだ塞がっていれば、開く時刻を控え直して締め出しを続ける。
+    #[tokio::test]
+    async fn a_probe_that_is_still_denied_updates_the_deadline() {
+        let reset = (now_unix() + 7200).to_string();
+        let still_limited = FakeUpstream::start_with_headers(
+            &[
+                ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                ("anthropic-ratelimit-unified-5h-reset", &reset),
+            ],
+            |_, _| (429, body_for(429)),
+        )
+        .await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#,
+            still_limited.url
+        ))
+        .await;
+
+        let now = now_unix();
+        gw.denials.deny(
+            "a",
+            Denial {
+                until: now + 100,
+                reason: Reason::Limited,
+            },
+            now - denial::PROBE_INTERVAL,
+        );
+
+        let probing = gw.denials.claim_probe("a", now).expect("間隔は空いている");
+        gw.probe_in_background(probing).unwrap().await.unwrap();
+
+        assert_eq!(
+            gw.denials.get("a", now),
+            Some(Denial {
+                until: reset.parse().unwrap(),
+                reason: Reason::Limited,
+            }),
+            "聞いた結果で開く時刻を引き直す"
+        );
+    }
+
+    /// 転送のついでに、締め出している経路へ聞きに行く役を立てる。
+    #[tokio::test]
+    async fn forwarding_starts_the_probe_for_a_denied_route() {
+        let denied = FakeUpstream::always(200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&denied.url, &spare.url)).await;
+
+        let now = now_unix();
+        gw.denials.deny(
+            "a",
+            Denial {
+                until: now + 100_000,
+                reason: Reason::Limited,
+            },
+            now - denial::PROBE_INTERVAL,
+        );
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(spare.hits(), 1, "実リクエストは断られていない方へ");
+        assert!(
+            gw.denials.claim_probe("a", now).is_none(),
+            "聞きに行く役は転送の側が立てたので、もう空いていない"
+        );
     }
 
     /// 混んでいる (529) 先も次へ回す。
