@@ -117,10 +117,10 @@ pub struct Namespace {
     /// この namespace を使うのに要るトークン。
     ///
     /// クライアントの `Authorization` をこれと突き合わせる。**書かなければ
-    /// 誰も通さない** (DR-0006)。型を `Option` のままにしてあるのは、
-    /// 書き忘れを起動時ではなくアクセス時に弾くため。1 つの namespace の
-    /// 設定漏れで gateway 全体が起動できなくなるより、影響がその namespace
-    /// だけに閉じるほうがよい。
+    /// 誰でも通す** (DR-0006)。手前 (tailnet / リバースプロキシ) で境界を
+    /// 引く運用では、ここで二重に認証を求める意味がないうえ、クライアントに
+    /// トークンを持たせること自体が邪魔になる (Claude Code は
+    /// `ANTHROPIC_AUTH_TOKEN` があるとサブスクとしての振る舞いをやめる)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 
@@ -491,10 +491,10 @@ impl Namespace {
     /// クライアントが名乗ったトークンを検査する。
     ///
     /// `auth_token` を書いていない namespace は、トークンの有無にかかわらず
-    /// 通さない (DR-0006)。書き忘れが穴になるのを無くすため、fail-closed。
+    /// 通す (DR-0006)。境界は手前で引く前提。
     pub fn authorize(&self, presented: Option<&str>) -> Authorization {
         let Some(expected) = &self.auth_token else {
-            return Authorization::NoTokenConfigured;
+            return Authorization::Open;
         };
         // `Bearer xxx` でも `xxx` でも受ける。クライアントによって送り方が違う。
         let matched = presented.is_some_and(|p| {
@@ -511,19 +511,18 @@ impl Namespace {
 
 /// トークン検査の結果。
 ///
-/// bool で返すと「通らなかった理由」が消える。正しいトークンを送っている
-/// 利用者と、そもそも namespace に `auth_token` が書かれていない場合とでは
-/// 打つ手が違うので、呼び出し側が文言を分けられるようにする (DR-0006)。
-/// 列挙にしておくと `match` が網羅を強制するので、拒否の枝を書き落として
-/// fail-open に戻ることもない。
+/// bool で返すと「なぜ通ったか」が消える。トークンが合って通ったのと、
+/// そもそも検査していないのとでは意味が違い、記録に残す価値も違う
+/// (DR-0006)。列挙にしておくと `match` が網羅を強制するので、通す枝と
+/// 拒む枝のどちらも書き落とせない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authorization {
     /// トークンが合っている。
     Accepted,
     /// トークンが違う (名乗っていない場合を含む)。
     WrongToken,
-    /// この namespace に `auth_token` が書かれていない。誰も通さない。
-    NoTokenConfigured,
+    /// この namespace は誰でも通す (`auth_token` を書いていない)。
+    Open,
 }
 
 /// 既定の認証情報の置き場。
@@ -620,21 +619,19 @@ o = "claude-opus-*"
             .expect("この設定には [ns.default] がある")
     }
 
-    /// `auth_token` を書かない namespace は誰も通さない (fail-closed)。
+    /// `auth_token` を書かない namespace は、名乗り方に関わらず誰でも通す。
     ///
-    /// 「書かなければ誰でも通す」だった頃、既定 namespace への書き忘れが
-    /// そのまま公開経路の穴になった。書き忘れが穴にならない側へ倒す
-    /// (DR-0006)。
+    /// 境界は手前 (tailnet / リバースプロキシ) で引く前提 (DR-0006)。
     #[test]
-    fn namespace_without_token_accepts_nobody() {
+    fn namespace_without_token_accepts_everyone() {
         let ns = Namespace::default();
         assert_eq!(ns.auth_token, None, "書いていない状態");
 
         for presented in [None, Some("anything"), Some("Bearer anything"), Some("")] {
             assert_eq!(
                 ns.authorize(presented),
-                Authorization::NoTokenConfigured,
-                "{presented:?} は通さない"
+                Authorization::Open,
+                "{presented:?} も通す"
             );
         }
     }

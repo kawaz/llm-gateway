@@ -145,6 +145,24 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
             "待ち受けを始めます"
         );
 
+        // 誰でも通る面は、起動時に名前を出す。手前で境界を引く運用では正しい
+        // 姿だが、そのつもりが無いまま開いているのが一番危ない。
+        let open: Vec<&str> = gateway
+            .namespace_names()
+            .into_iter()
+            .filter(|name| {
+                gateway
+                    .namespace(name)
+                    .is_some_and(|ns| ns.auth_token.is_none())
+            })
+            .collect();
+        if !open.is_empty() {
+            tracing::info!(
+                namespaces = %open.join(", "),
+                "認証なしで公開しています (手前で境界を引いてください)"
+            );
+        }
+
         // 新しいモデルが出たときに、再起動せずに拾えるようにする。
         let refresher = Arc::clone(&gateway);
         tokio::spawn(async move { refresher.keep_models_fresh().await });

@@ -378,29 +378,22 @@ fn unknown_namespace(name: &str, known: &[&str]) -> Response {
 
 /// トークンを検査して、通さないなら返す応答を作る。
 ///
-/// 文言を分けるのは、送っているトークンが疑わしいのか、gateway 側の設定が
-/// 足りないのかで打つ手が違うから。同じ文言だと、正しいトークンを送っている
-/// 利用者が「合っているはずなのに」で止まる (DR-0006)。
+/// `auth_token` を書いていない namespace は検査せずに通す (DR-0006)。手前で
+/// 境界を引く運用では、ここで二重に認証を求める意味がない。
 fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response> {
     let presented = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    let message = match ns.authorize(presented) {
-        Authorization::Accepted => return None,
-        Authorization::WrongToken => format!("namespace `{name}` のトークンが違います"),
-        Authorization::NoTokenConfigured => format!(
-            "namespace `{name}` に auth_token が設定されていないので、誰も通せません。\
-             設定の `[ns.{name}]` に auth_token を書いてください"
-        ),
-    };
-
-    Some(refused(
-        name,
-        StatusCode::UNAUTHORIZED,
-        "authentication_error",
-        &message,
-    ))
+    match ns.authorize(presented) {
+        Authorization::Accepted | Authorization::Open => None,
+        Authorization::WrongToken => Some(refused(
+            name,
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            &format!("namespace `{name}` のトークンが違います"),
+        )),
+    }
 }
 
 /// 名前の大小を無視して 1 つ引く。
@@ -524,6 +517,52 @@ pub(crate) mod tests {
     }
 
     /// 受け取ったリクエストを覚えておく試験用 upstream。
+    /// 受け取った要求をそのまま覚えておく upstream。
+    ///
+    /// 何が漏れて**いない**かを見るのに使う。「送っていないはず」を確かめるには、
+    /// 実際に届いたバイト列を読む以外にない。
+    pub(crate) async fn recording_upstream() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 65536];
+                    let read = sock.read(&mut buf).await.unwrap_or(0);
+
+                    // 一覧の問い合わせ (discovery) にも答える。答えないと、
+                    // モデルを聞きに行く型の credential で経路が立たない。
+                    let seen_request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                    let body = if seen_request.starts_with("GET /v1/models") {
+                        r#"{"data":[{"id":"m","created_at":"2026-07-24T00:00:00Z"}]}"#
+                    } else {
+                        r#"{"type":"message","content":[]}"#
+                    };
+                    recorder.lock().unwrap().push(seen_request);
+
+                    let head = format!(
+                        "HTTP/1.1 200 X\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), seen)
+    }
+
     pub(crate) async fn fake_upstream(
         respond: impl Fn() -> (u16, String, Vec<(String, String)>) + Send + Sync + 'static,
     ) -> String {
@@ -637,7 +676,7 @@ content-length: {declared}\r\n\r\n{head}"
 
     /// 認証を書いた `[ns.default]` を足して立てる。
     ///
-    /// `auth_token` の無い namespace は誰も通さない (DR-0006) ので、認証以外を
+    /// 認証の有無そのものを見る試験と分けるため、認証以外を
     /// 見る試験でも既定 namespace には token が要る。名乗る側は [`authed`]。
     pub(crate) async fn serve_with_default_ns(config_toml: &str) -> String {
         serve(&format!(
@@ -681,7 +720,7 @@ content-length: {declared}\r\n\r\n{head}"
         format!("http://{addr}")
     }
 
-    fn request_body() -> Value {
+    pub(crate) fn request_body() -> Value {
         json!({
             "model": "m",
             "max_tokens": 8,
@@ -1559,12 +1598,12 @@ models = ["m"]
 
 #[cfg(test)]
 mod e2e_namespace_tests {
-    use super::tests::{TOKEN, authed, captured_logs, serve};
+    use super::tests::{TOKEN, authed, captured_logs, recording_upstream, request_body, serve};
     use serde_json::Value;
 
     /// 2 つの namespace を持つ設定。見えるモデルが違う。
     ///
-    /// `tokenless` は `auth_token` を書き忘れた namespace。誰も通れない。
+    /// `tokenless` は `auth_token` を書かない namespace。誰でも通れる。
     const TWO_NS: &str = r#"
 [credentials.a]
 type = "relay"
@@ -1693,13 +1732,14 @@ auth_token = "secret-token"
         }
     }
 
-    /// `auth_token` を書いていない namespace は誰も通れない (fail-closed)。
+    /// `auth_token` を書いていない namespace は、名乗り方に関わらず通す。
     ///
-    /// 書き忘れが「誰でも通れる穴」になっていた。設定ファイルの外 (前段に
-    /// 公開経路が生えた) で前提が崩れても、書き忘れが穴にならないようにする
+    /// 境界は手前 (tailnet / リバースプロキシ) で引く。クライアントに
+    /// トークンを持たせないためでもある — Claude Code は
+    /// `ANTHROPIC_AUTH_TOKEN` があるとサブスクとしての振る舞いをやめる
     /// (DR-0006)。
     #[tokio::test]
-    async fn namespace_without_token_lets_nobody_in() {
+    async fn namespace_without_token_lets_everyone_in() {
         let base = serve(TWO_NS).await;
         let client = reqwest::Client::new();
 
@@ -1708,58 +1748,122 @@ auth_token = "secret-token"
             .send()
             .await
             .unwrap();
-        assert_eq!(bare.status(), 401, "名乗らない相手も通さない");
+        assert_eq!(bare.status(), 200, "名乗らない相手も通す");
 
-        for value in ["Bearer anything", TOKEN, "secret-token"] {
+        for value in ["Bearer anything", TOKEN, "secret-token", ""] {
             let resp = client
                 .get(format!("{base}/ns-tokenless/v1/models"))
                 .header("authorization", value)
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 401, "{value} でも通らない");
+            assert_eq!(resp.status(), 200, "{value:?} でも通す");
         }
     }
 
-    /// 通さない理由で文言が違う。
+    /// トークンを求める namespace は、間違いをそのまま断る。
     ///
-    /// 同じ文言だと、正しいトークンを送っている利用者が「合っているはずなのに」
-    /// で止まり、原因が gateway 側の設定漏れだと気づけない。
+    /// 隣に認証なしの namespace があっても緩まない。
     #[tokio::test]
-    async fn denial_message_tells_which_problem_it_is() {
+    async fn a_locked_namespace_still_checks_its_token() {
         let base = serve(TWO_NS).await;
         let client = reqwest::Client::new();
 
-        let wrong: Value = client
+        let refused = client
             .get(format!("{base}/ns-locked/v1/models"))
             .header("authorization", "Bearer nope")
             .send()
             .await
-            .unwrap()
-            .json()
-            .await
             .unwrap();
-        let wrong = wrong["error"]["message"].as_str().unwrap().to_owned();
-        assert!(wrong.contains("トークンが違います"), "{wrong}");
+        assert_eq!(refused.status(), 401);
 
-        let unset: Value = client
-            .get(format!("{base}/ns-tokenless/v1/models"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let unset = unset["error"]["message"].as_str().unwrap().to_owned();
+        let message: Value = refused.json().await.unwrap();
+        let message = message["error"]["message"].as_str().unwrap();
+        assert!(message.contains("トークンが違います"), "{message}");
         assert!(
-            unset.contains("auth_token"),
-            "設定側の問題だと分かる文言: {unset}"
+            message.contains("locked"),
+            "どの namespace か分かる: {message}"
         );
-        assert!(
-            unset.contains("tokenless"),
-            "どの namespace か分かる: {unset}"
-        );
-        assert_ne!(wrong, unset, "2 つの理由を同じ文言にしない");
+    }
+
+    /// クライアントが名乗った認証情報を upstream へ渡さない。
+    ///
+    /// 認証なしの namespace では、Claude Code がサブスクの OAuth トークンを
+    /// そのまま送ってくる。これが upstream へ抜けると、こちらが選んだ認証情報
+    /// ではなく**クライアントのアカウント**で課金される。認証を掛けない以上、
+    /// 剥がし漏れは事故に直結する (DR-0006)。
+    #[tokio::test]
+    async fn the_clients_own_credentials_never_reach_upstream() {
+        const LEAKED: &str = "sk-ant-oat01-must-not-leak";
+
+        // 転送先が自分で認証を持つ経路 (relay) と、こちらが認証情報を付ける
+        // 経路 (claude_oauth) の両方を見る。
+        for (kind, declared) in [("relay", "models = [\"m\"]"), ("claude_oauth", "")] {
+            let (upstream, seen) = recording_upstream().await;
+            // 認証を書かない namespace = 誰でも通る面。
+            let base = serve(&format!(
+                r#"
+[credentials.a]
+type = "{kind}"
+url = "{upstream}"
+{declared}
+
+[[ns.open.routing]]
+models = ["m"]
+credentials = ["a"]
+
+[ns.open]
+"#
+            ))
+            .await;
+
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/ns-open/v1/messages"))
+                .header("authorization", format!("Bearer {LEAKED}"))
+                .header("x-api-key", LEAKED)
+                .header("anthropic-version", "2023-06-01")
+                .json(&request_body())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "認証なしの面なので通る ({kind})");
+
+            // 見るのは転送された分だけ (一覧の問い合わせと混ぜない)。
+            let sent = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|req| req.starts_with("POST"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+                .to_lowercase();
+            assert!(!sent.is_empty(), "転送が届いている ({kind})");
+            assert!(
+                !sent.contains(LEAKED),
+                "名乗られた認証情報が漏れている ({kind}):\n{sent}"
+            );
+            assert!(
+                !sent.contains("x-api-key"),
+                "欄ごと落とす ({kind}):\n{sent}"
+            );
+            assert!(
+                sent.contains("anthropic-version: 2023-06-01"),
+                "関係のないヘッダまで落としてはいない ({kind}):\n{sent}"
+            );
+
+            if kind == "claude_oauth" {
+                assert!(
+                    sent.contains("authorization: bearer tok"),
+                    "こちらが選んだ認証情報に差し替わる:\n{sent}"
+                );
+            } else {
+                assert!(
+                    !sent.contains("authorization:"),
+                    "転送先が自分で認証を持つ経路には何も付けない:\n{sent}"
+                );
+            }
+        }
     }
 
     /// `[ns.default]` を書かなければ `/v1/...` は 404。
