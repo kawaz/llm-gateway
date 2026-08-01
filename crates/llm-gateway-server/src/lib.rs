@@ -102,15 +102,24 @@ fn json_utf8(body: impl IntoResponse) -> Response {
 /// 認証は usage / stats と同じ扱い (掛けない)。手前の tailnet の境界を信頼
 /// する。流すのは「いつ・どの会話が・どの経路に当たったか」までで、本文も
 /// トークン数も載せない。
+///
+/// どの生成元からでも読めるようにしておく。主な相手はサーバ同士で話す
+/// ccmsg だが、様子を見るのにブラウザから直接開けると早い。認証を持たない
+/// 口なので、生成元で絞っても守れるものが増えない。
 async fn events<P: Persistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
-) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+) -> impl IntoResponse {
     let watching = gateway.events().subscribe();
 
     let stream = futures_util::stream::unfold(watching, |mut watching| async move {
         loop {
             match watching.recv().await {
-                Ok(event) => return Some((Ok(sse_line(&event)), watching)),
+                Ok(event) => {
+                    return Some((
+                        Ok::<SseEvent, std::convert::Infallible>(sse_line(&event)),
+                        watching,
+                    ));
+                }
                 // 追いつけなかった分は諦めて先へ進む。5 分の残りを数える相手に、
                 // 遅れて届いた開始時刻を渡しても使い道がない。
                 Err(RecvError::Lagged(missed)) => {
@@ -123,7 +132,9 @@ async fn events<P: Persistence + 'static>(
     });
 
     // 何も起きない時間が続いても、経路上の中継に切られないよう合図を送る。
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)))
+    let sse =
+        Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)));
+    ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], sse)
 }
 
 /// 1 件を SSE の 1 通にする。
@@ -718,6 +729,14 @@ credentials = ["a"]
             watching.headers().get("content-type").unwrap(),
             "text/event-stream",
             "SSE として読める形で返す"
+        );
+        assert_eq!(
+            watching
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "*",
+            "様子を見るのにブラウザから直接開ける"
         );
 
         let forwarded = authed(
