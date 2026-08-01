@@ -1,6 +1,6 @@
 ---
 title: local-issue 0.2.12 の close 動作を確認するための検証用 issue
-status: open
+status: resolved
 category: task
 created: 2026-08-02T07:31:12+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-02T07:32:13+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: plugin v0.2.12 の close フロー検証が目的の一時 issue。検証が完了したので閉じる。実課題ではない。"]
 blocked_by:
 origin: 自リポ TODO
 ---
