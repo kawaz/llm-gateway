@@ -182,6 +182,21 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         let flusher = Arc::clone(&gateway);
         let flushing = tokio::spawn(async move { flusher.keep_saving(SAVE_INTERVAL).await });
 
+        // 送り先があるときだけ購読する。Receiver は spawn より先に作り、
+        // 待ち受け開始直後のイベントも取りこぼさない。
+        let webhook = config.webhook.base_url.as_ref().map(|_| {
+            let watching = gateway.events().subscribe();
+            let webhook_config = config.webhook.clone();
+            tokio::spawn(async move {
+                llm_gateway::webhook::keep_sending(
+                    webhook_config,
+                    reqwest::Client::new(),
+                    watching,
+                )
+                .await;
+            })
+        });
+
         let serving = Arc::clone(&gateway);
         let result = axum::serve(listener, llm_gateway_server::router(serving))
             .with_graceful_shutdown(shutdown_signal())
@@ -193,6 +208,10 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         // 重なりを消しておけば「同時に書いたが壊れなかった」に頼らずに済む。
         flushing.abort();
         let _ = flushing.await;
+        if let Some(webhook) = webhook {
+            webhook.abort();
+            let _ = webhook.await;
+        }
 
         // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
         // 直前の分を失わない。

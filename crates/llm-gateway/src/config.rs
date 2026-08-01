@@ -81,6 +81,10 @@ pub struct Config {
     #[serde(default)]
     pub discovery: Discovery,
 
+    /// 起きたことの送り先 (DR-0012)。書かなければ送らない。
+    #[serde(default)]
+    pub webhook: Webhook,
+
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
     /// 何を隠すか・どう振り分けるか・短い名前をどうするかは、使う人ごとに
@@ -209,6 +213,70 @@ impl Default for Server {
 /// 11300 は小文字の `llm` の字形から 113、gateway らしく末尾を 00 にしたもの。
 fn default_listen() -> String {
     "127.0.0.1:11300".to_owned()
+}
+
+/// 起きたことを送る先 (DR-0012)。
+///
+/// 見る側が繋ぎに来る形 (SSE) だと、待ち受けを複数並べたときに**掴んだ 1 つの
+/// 面の分しか見えない**。こちらから送れば、面がいくつあっても同じ受け口に
+/// 集まる。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Webhook {
+    /// 受け口の根。ここに受け取る側が決めたパスを足した先へ送る。
+    ///
+    /// **書かなければ送らない** (機能ごと無効)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// 合言葉を置いたファイル。
+    ///
+    /// 設定に直接書かせないのは、設定ファイルが人の目に触れる場所 (共有した
+    /// 土台・差分・貼り付けたログ) を通りやすいため。
+    #[serde(default = "default_token_file")]
+    pub token_file: PathBuf,
+}
+
+impl Default for Webhook {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            token_file: default_token_file(),
+        }
+    }
+}
+
+impl Webhook {
+    /// 設定された根に、受け取る側が決めたパスを足す。
+    pub fn destination_url(&self) -> std::result::Result<Option<url::Url>, String> {
+        let Some(base) = &self.base_url else {
+            return Ok(None);
+        };
+        let mut url = url::Url::parse(base)
+            .map_err(|e| format!("webhook.base_url が URL ではありません: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("webhook.base_url は http または https にしてください".to_owned());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("webhook.base_url に userinfo は書けません".to_owned());
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("webhook.base_url に query または fragment は書けません".to_owned());
+        }
+        url.path_segments_mut()
+            .map_err(|_| "webhook.base_url を基準 URL として使えません".to_owned())?
+            .pop_if_empty()
+            .push("webhook")
+            .push("llm-gateway");
+        Ok(Some(url))
+    }
+}
+
+/// 既定の合言葉の置き場。受け取る側 (ccmsg) が置く場所に合わせる。
+fn default_token_file() -> PathBuf {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
+        .join("ccmsg")
+        .join("webhook-llm-gateway.token")
 }
 
 /// 認証情報の置き場。
@@ -403,6 +471,7 @@ impl Config {
     /// 起動時に落としておかないと、その規則を最初に踏んだ人が
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
+        self.webhook.destination_url().map_err(Error::Config)?;
         for (name, ns) in &self.namespaces {
             if name.is_empty() {
                 return Err(Error::Config("namespace 名が空です".to_owned()));
@@ -1017,6 +1086,63 @@ credentials = ["a", "typo-here"]
     fn discovery_interval_can_be_set() {
         let c = parse("[discovery]\nrefresh_secs = 300").unwrap();
         assert_eq!(c.discovery.refresh_secs, 300);
+    }
+
+    #[test]
+    fn webhook_is_disabled_by_default() {
+        let c = parse("").unwrap();
+        assert!(c.webhook.base_url.is_none());
+        assert!(
+            c.webhook
+                .token_file
+                .ends_with("ccmsg/webhook-llm-gateway.token")
+        );
+    }
+
+    #[test]
+    fn webhook_destination_and_token_file_can_be_set() {
+        let c = parse(
+            "[webhook]\nbase_url = \"http://127.0.0.1:1234/\"\ntoken_file = \"/tmp/hook.token\"",
+        )
+        .unwrap();
+        assert_eq!(
+            c.webhook.base_url.as_deref(),
+            Some("http://127.0.0.1:1234/")
+        );
+        assert_eq!(c.webhook.token_file, PathBuf::from("/tmp/hook.token"));
+        assert_eq!(
+            c.webhook.destination_url().unwrap().unwrap().as_str(),
+            "http://127.0.0.1:1234/webhook/llm-gateway"
+        );
+    }
+
+    #[test]
+    fn webhook_base_path_is_preserved() {
+        let c = parse("[webhook]\nbase_url = \"https://example.test/hooks\"").unwrap();
+        assert_eq!(
+            c.webhook.destination_url().unwrap().unwrap().as_str(),
+            "https://example.test/hooks/webhook/llm-gateway"
+        );
+    }
+
+    #[test]
+    fn unsafe_webhook_destinations_are_rejected() {
+        for base in [
+            "",
+            "file:///tmp/hook",
+            "https://user@example.test",
+            "https://example.test?target=other",
+            "https://example.test#other",
+        ] {
+            let source = format!("[webhook]\nbase_url = {base:?}");
+            assert!(parse(&source).is_err(), "{base} を受理している");
+        }
+    }
+
+    #[test]
+    fn unknown_webhook_key_is_rejected() {
+        let err = parse("[webhook]\nurl = \"http://127.0.0.1:1234\"").unwrap_err();
+        assert!(err.to_string().contains("url"), "{err}");
     }
 
     #[test]

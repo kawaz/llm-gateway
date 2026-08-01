@@ -1,4 +1,4 @@
-# DR-0012: 転送のたびに起きたことを SSE で流す (/llm-gateway/events)
+# DR-0012: 転送のたびに起きたことをイベントとして配る
 
 - Status: Active
 - Date: 2026-08-01
@@ -37,7 +37,35 @@ gateway は全部のリクエストを仲介しているので、**upstream が�
   自動で繋ぎ直す。WebSocket だと見る側が再接続を書く
 - **中身が見える**。`curl` でそのまま読める形なので、動作確認に道具が要らない
 
+### webhook へ POST する
+
+gateway は設定した `base_url` のパスへ `/webhook/llm-gateway` を足した先へ
+イベントを送る。`base_url` を書かなければ webhook 全体を無効にする。token を
+別の宛先へ送らないよう、scheme は HTTP / HTTPS に限り、userinfo・query・fragment
+を持つ値は起動時に拒否する。stable / unstable のように複数の gateway が同時に
+動く構成でも、それぞれが同じ受け口へ送るため、受け手が特定の gateway へ接続し
+続ける必要がない。SSE は `curl` による確認用として残す。
+
+認証には `Authorization: Bearer <token>` を使う。token は設定値に直接書かず、
+`token_file` の 1 行テキストから起動時に読む。既定は
+`$XDG_DATA_HOME/ccmsg/webhook-llm-gateway.token` (`XDG_DATA_HOME` が無ければ
+`~/.local/share/ccmsg/webhook-llm-gateway.token`)。読めない場合は warning を 1 回
+記録して webhook だけを無効にし、転送は続ける。token の値と応答本文はログへ
+出さない。
+
+短時間に起きたイベントは 200 ms、最大 100 件の窓で配列にまとめる。高頻度時に
+1 件ごとの接続を作らず、画面表示では判別できない遅延に収めるためである。JSON の
+実バイト数でも分割し、1 通を 1 MB 以下にする。単独で 1 MB を超えるイベントはその
+1 件だけを落として warning に残す。
+
+送信は転送処理から切り離し、3 秒で timeout する。204 を受理として扱い、それ以外の
+応答と通信失敗は warning に残す。再送と順序保証は行わない。連続失敗は最初の 1 回
+だけ warning を出し、復帰時に失敗回数を記録する。
+
 ### 流すのは「起きたこと」だけ。状態は持たない
+
+SSE の `data` と webhook の JSON 要素は同じ `Event` 型を使う。webhook は常に配列で
+送る。
 
 1 通の形 (欄の名前が、見る側との契約):
 

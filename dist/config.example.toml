@@ -34,6 +34,12 @@ type = "file"
 # 一覧を取り直す間隔。新しいモデルが出たときに再起動せず拾える。
 refresh_secs = 3600
 
+# リクエストイベントを受け口へ送る。base_url を書かなければ無効。
+# [webhook]
+# base_url = "http://127.0.0.1:11400"
+# 省略時は $XDG_DATA_HOME/ccmsg/webhook-llm-gateway.token
+# token_file = "/path/to/webhook-llm-gateway.token"
+
 # ---------------------------------------------------------------------------
 # 認証情報
 #
