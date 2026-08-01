@@ -53,6 +53,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+mod extends;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -365,10 +367,14 @@ impl CredentialSpec {
 impl Config {
     /// 読み込む。設定に矛盾があればここで弾く。
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| Error::Config(format!("{} を読めません: {e}", path.display())))?;
-        let config: Self = toml::from_str(&raw)
-            .map_err(|e| Error::Config(format!("{} の内容が不正です: {e}", path.display())))?;
+        // 土台 (`extends`) があれば先に畳む (DR-0013)。
+        let merged = extends::resolve(path)?;
+        let config: Self = merged.try_into().map_err(|e| {
+            Error::Config(format!(
+                "{} の内容が不正です: {e} (土台を重ねた後の姿で見ています)",
+                path.display()
+            ))
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -561,6 +567,46 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 土台を重ねた設定が、そのまま読み込めるところまで通る。
+    ///
+    /// 待ち受け先だけが違う 2 台を、同じ中身を書き写さずに用意できる
+    /// (DR-0013)。畳んだ後の姿で項目名の検査まで通ることを、ここで見る。
+    #[test]
+    fn a_config_can_stand_on_another_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("shared.toml"),
+            r#"
+[credentials.a]
+type = "relay"
+url = "http://127.0.0.1:8320"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+
+[ns.default]
+auth_token = "t"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("unstable.toml"),
+            "extends = \"shared.toml\"\n\n[server]\nlisten = \"127.0.0.1:8402\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&dir.path().join("unstable.toml")).unwrap();
+        assert_eq!(config.server.listen, "127.0.0.1:8402", "自分で書いた分");
+        assert_eq!(
+            config.namespace("default").unwrap().auth_token.as_deref(),
+            Some("t"),
+            "土台から来る分"
+        );
+        assert!(config.credentials.contains_key("a"));
+    }
 
     /// 実運用を想定した一式。
     const SAMPLE: &str = r#"
