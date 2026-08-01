@@ -778,11 +778,18 @@ credentials = ["a"]
             "様子を見るのにブラウザから直接開ける"
         );
 
+        // system を積んだ本文。系列の識別子はこの先頭ブロックから作る。
+        let mut body = request_body();
+        body["system"] = json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.0.1"},
+            {"type": "text", "text": "gitStatus: branch main, clean"},
+        ]);
+
         let forwarded = authed(
             reqwest::Client::new()
                 .post(format!("{base}/v1/messages"))
                 .header("X-Claude-Code-Session-Id", "s-1")
-                .json(&request_body()),
+                .json(&body),
         )
         .send()
         .await
@@ -804,6 +811,10 @@ credentials = ["a"]
         assert_eq!(event["status"], 200);
         assert!(event["ts"].as_i64().unwrap() > 0);
         assert!(event["ts_iso"].as_str().unwrap().ends_with('Z'));
+
+        let series = event["prefix"].as_str().expect("系列が分かる");
+        assert_eq!(series.len(), 8, "短い 16 進 1 つ: {series}");
+        assert!(series.chars().all(|c| c.is_ascii_hexdigit()), "{series}");
     }
 
     /// 会話を名乗らないクライアント (curl 等) の分も流す。
@@ -858,6 +869,10 @@ credentials = ["a"]
 
         assert!(event["session_id"].is_null(), "名乗らなければ null");
         assert_eq!(event["status"], 429, "断られたことも知らせ");
+        assert!(
+            event.get("prefix").is_none(),
+            "system を積んでいないので系列も分からない"
+        );
     }
 
     #[tokio::test]

@@ -218,6 +218,7 @@ impl<P: Persistence> Gateway<P> {
             ns: ns_name,
             model: &model,
             session_id: events::session_id(&headers),
+            prefix: events::prefix(&body),
             path,
             query,
             body: &body,
@@ -461,10 +462,13 @@ impl<P: Persistence> Gateway<P> {
         // ので、status で絞らない。
         self.events.publish(events::Event::new(
             now,
-            call.session_id.clone(),
-            call.ns,
-            call.model,
-            route.name(),
+            &events::Origin {
+                session_id: call.session_id.as_deref(),
+                prefix: call.prefix.as_deref(),
+                ns: call.ns,
+                model: call.model,
+                credential: route.name(),
+            },
             resp.status,
         ));
         Ok(resp)
@@ -721,6 +725,8 @@ struct Call<'a> {
     model: &'a str,
     /// クライアントが名乗った会話の id。名乗らない相手もいる。
     session_id: Option<String>,
+    /// 会話系列の識別子。経路を試すたびに作り直さないよう、1 回で取る。
+    prefix: Option<String>,
     path: &'a str,
     query: Option<&'a str>,
     body: &'a Value,
