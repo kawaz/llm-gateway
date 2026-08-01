@@ -28,8 +28,55 @@ kawaz の要望:
 `requests-*` / `tokens-*` のみ)。実測が唯一の根拠なので、予告なく変わる前提で扱う。
 クレジット残の**数値**は取れない (overage の可否という 2 値だけ)。
 
-副作用ゼロで usage だけ返す口は見つかっていない。ヘッダを得るには実リクエストが要る
-(haiku + max_tokens=1 で input 8 / output 1 トークン)。
+ヘッダを得るには実リクエストが要る (haiku + max_tokens=1 で input 8 / output 1
+トークン)。
+
+#### 副作用なしの専用口 (実測 2026-08-01)
+
+`GET https://api.anthropic.com/api/oauth/usage` が、**トークンを使わずに**枠を返す
+(`authorization: Bearer <OAuth token>` / `anthropic-beta: oauth-2025-04-20` /
+`anthropic-version: 2023-06-01`)。ヘッダより広く、モデル別の枠まで載る:
+
+```json
+{"limits": [
+  {"kind": "session",       "percent": 0,   "severity": "normal",   "resets_at": null, "scope": null, "is_active": false},
+  {"kind": "weekly_all",    "percent": 100, "severity": "critical", "resets_at": "...", "scope": null, "is_active": true},
+  {"kind": "weekly_scoped", "percent": 80,  "severity": "warning",  "resets_at": "...",
+   "scope": {"model": {"id": null, "display_name": "Fable"}}, "is_active": false}]}
+```
+
+`limits` を正本にする。`five_hour` / `seven_day` / `seven_day_opus` のような欄も
+並ぶが、中身が `null` の欄が多く、どの枠がどのモデルに掛かるかを持たない。
+
+この口も公開ドキュメントに無い。**読めない応答は「情報なし」に落とし**、
+利用状況の一覧から欄ごと省く (推測で埋めない)。
+
+##### 語の意味は、素直に読むと間違う
+
+同時刻に 3 つの credential を突き合わせた実測 (2026-08-01):
+
+| credential | session | weekly_all | weekly_scoped (Fable) | haiku | fable / opus / sonnet |
+|---|---|---|---|---|---|
+| A | 0 % | **100 % critical / active** | 80 % warning | **200** | 429 |
+| B | 3 % | 35 % normal | **47 % normal / active** | 200 | 429 |
+| C | 0 % | **100 % critical / active** | 57 % normal | 200 | 429 |
+
+読み取れること:
+
+- **`is_active` は「塞がっている」ではない。** B は 47 %・`severity: normal` の枠が
+  `is_active: true`。応答ヘッダの `representative-claim` (今どの窓を見ているか) に
+  近い意味と考えられる
+- **`weekly_all` が 100 % でも credential は死んでいない。** A / C はその状態で
+  haiku に 200 を返す。5 時間 / 7 日の枠を使い切った後も、安い側は通る
+  (ヘッダの `fallback-percentage: 0.5` がこの段に対応するとみられる)
+- **どのモデルが断られるかは、この口からは分からない。** B は全部の枠が
+  `normal` のまま fable / opus / sonnet に 429 を返す
+- **同じ「7 日」でも数字が一致しない。** A のヘッダは同時刻に
+  `7d-utilization: 0.34 / status: allowed`、この口は `seven_day: 100.0`。
+  別の物差しなので、片方をもう片方の代わりにはできない
+
+したがってこの口は**利用状況を見せるため**に使い、**経路を締め出す判断には
+使わない** (DR-0009 の締め出しは、実際に断られた応答だけを根拠にする)。
 
 ### Codex (ChatGPT OAuth)
 
@@ -56,6 +103,13 @@ Anthropic 側 Admin API の対象でもない (AWS Marketplace 課金)。**対�
 
 - `GET /llm-gateway/usage` — credential ごとの利用状況を JSON で返す
   (名前・種別・5h/7d の使用率とリセット時刻・上限フラグ・overage 可否・**取得時刻**)
+- `?refresh=true` のときは専用の口にも聞き、`limits` をそのまま `limits` 欄に
+  載せる。語は upstream のもの (`weekly_scoped` / `percent` / `resets_at`) を
+  そのまま使う — 言い換えると、実物と照らす人が対応表を覚えることになる。
+  聞けなかった credential では**欄ごと出さない** (空配列と区別する)
+- CLI はモデル別の枠 (`scope.model` を持つもの) を表の下に 1 行で出す。
+  5 時間 / 7 日の欄には収まらず、ヘッダにも出てこないので、ここに出さないと
+  利用者から見えない
 - `llm-gateway usage` — 上を叩いて人間向けに整形する CLI サブコマンド。
   server が起きていなければその旨を出す (CLI 単独ではスナップショットを持たない)
 

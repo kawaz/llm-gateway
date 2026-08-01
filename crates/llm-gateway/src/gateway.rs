@@ -15,6 +15,7 @@ use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::denial::{self, Candidates, Denials, Probing, denial_of};
 use crate::error::UpstreamAttempt;
+use crate::limits::{self, Limit};
 use crate::router::{Route, Router};
 use crate::session;
 use crate::stats::Stats;
@@ -449,6 +450,9 @@ impl<P: Persistence> Gateway<P> {
             let support = support_of(spec, snapshot.is_some());
 
             let mut entry = usage::CredentialUsage::new(name, spec.type_name(), support, snapshot);
+            entry.limits = probed
+                .as_ref()
+                .and_then(|p| p.limits.get(name.as_str()).cloned());
             entry.probe_error = probed
                 .as_ref()
                 .and_then(|p| p.errors.get(name.as_str()).cloned());
@@ -470,12 +474,19 @@ impl<P: Persistence> Gateway<P> {
             ..usage::Probe::default()
         };
         let mut errors = std::collections::BTreeMap::new();
+        let mut limits = std::collections::BTreeMap::new();
 
         for (name, spec) in &self.config.credentials {
             // ヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。
             if !matches!(spec, CredentialSpec::ClaudeOauth { .. }) {
                 continue;
             }
+            // 枠を聞くのが先。こちらはトークンを使わないので、この後の
+            // 最小リクエストが失敗しても、枠だけは見えるようにしておく。
+            if let Some(found) = self.ask_limits(name, spec).await {
+                limits.insert(name.clone(), found);
+            }
+
             spent.requests += 1;
             match self.probe_one(name, spec).await {
                 Ok((input, output)) => {
@@ -488,7 +499,27 @@ impl<P: Persistence> Gateway<P> {
                 }
             }
         }
-        Some(Probed { spent, errors })
+        Some(Probed {
+            spent,
+            errors,
+            limits,
+        })
+    }
+
+    /// 1 つの credential の枠を、専用の口に聞く ([`crate::limits`])。
+    ///
+    /// トークンを使わないので、聞くこと自体が枠を減らさない。読めなければ
+    /// `None` を返して先へ進む — 枠が見えないのは不便だが、それで一覧全体を
+    /// 返せなくする理由にはならない。
+    async fn ask_limits(&self, name: &str, spec: &CredentialSpec) -> Option<Vec<Limit>> {
+        let credential = match self.credentials.acquire(&CredentialId::new(name)).await {
+            Ok(credential) => credential,
+            Err(e) => {
+                warn!(credential = %name, %e, "枠を聞くための認証情報を用意できません");
+                return None;
+            }
+        };
+        limits::fetch(&self.http, spec.url(), &credential).await
     }
 
     /// 1 つの credential に投げて、ヘッダを拾う。返すのは消費したトークン。
@@ -710,6 +741,8 @@ pub struct Forwarded {
 struct Probed {
     spent: usage::Probe,
     errors: std::collections::BTreeMap<String, String>,
+    /// 専用の口から聞いた枠。聞けた credential の分だけ入る。
+    limits: std::collections::BTreeMap<String, Vec<Limit>>,
 }
 
 /// この credential の利用状況をどこまで出せるか。
@@ -2545,6 +2578,73 @@ models = ["m"]
                 .all(|c| c.support != crate::usage::Support::Observed),
             "取れない扱いは support の値で分かる"
         );
+        assert!(
+            report.credentials.iter().all(|c| c.limits.is_none()),
+            "聞きに行っていないので枠も無い"
+        );
+    }
+
+    /// 聞きに行くときは、専用の口から枠も取って一覧に載せる。
+    ///
+    /// モデル別の枠 (fable など) は応答ヘッダに出てこないので、この口を
+    /// 通さないと利用状況の一覧からも見えない。
+    #[tokio::test]
+    async fn usage_report_carries_the_scoped_limits() {
+        const LIMITS: &str = r#"{"limits":[
+            {"kind":"weekly_all","percent":100,"severity":"critical",
+             "resets_at":"2026-08-02T08:59:59Z","scope":null,"is_active":true},
+            {"kind":"weekly_scoped","percent":80,"severity":"warning",
+             "resets_at":"2026-08-02T08:59:59Z",
+             "scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":false}]}"#;
+
+        let up = FakeUpstream::start(|_, req| {
+            if req.starts_with("GET /api/oauth/usage") {
+                (200, LIMITS.to_owned())
+            } else {
+                (200, body_for(200))
+            }
+        })
+        .await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{}"
+
+[credentials.relayed]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["m"]
+
+[ns.default]
+"#,
+            up.url
+        ))
+        .await;
+
+        let report = gw.usage_report(true).await;
+        let subscription = report
+            .credentials
+            .iter()
+            .find(|c| c.name == "a")
+            .expect("設定にある");
+        let limits = subscription.limits.as_ref().expect("聞けている");
+
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[1].kind, "weekly_scoped");
+        assert_eq!(
+            limits[1].model.as_deref(),
+            Some("Fable"),
+            "どのモデルの枠かが分かる"
+        );
+        assert_eq!(limits[1].percent, 80.0);
+
+        let other = report
+            .credentials
+            .iter()
+            .find(|c| c.name == "relayed")
+            .expect("設定にある");
+        assert!(other.limits.is_none(), "聞ける相手でなければ欄ごと出さない");
     }
 
     /// プローブが失敗した credential は理由を載せ、他は返す。

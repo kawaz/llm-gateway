@@ -9,6 +9,7 @@
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 //! - [`denial`] 断られた経路をしばらく候補から外す (DR-0009)
 //! - [`relay`] 本文を流し終えた (途切れた) ところの記録
+//! - [`limits`] サブスクの枠を専用の口から聞く (DR-0007)
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
 //! - [`pricing`] モデルごとの単価表。コストは閲覧時に計算する
 
@@ -18,6 +19,7 @@ pub mod credential;
 pub mod denial;
 pub mod discovery;
 pub mod gateway;
+pub mod limits;
 pub mod pattern;
 pub mod pricing;
 pub mod relay;

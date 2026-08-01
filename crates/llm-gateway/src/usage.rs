@@ -32,6 +32,7 @@ use tokio::sync::RwLock;
 
 use crate::credential::CredentialId;
 use crate::credential::time::format_rfc3339;
+use crate::limits::Limit;
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 応答ヘッダから利用状況を読む道具。
@@ -312,6 +313,14 @@ pub struct CredentialUsage {
     pub support: Support,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
+    /// 専用の口から聞いた枠 ([`crate::limits`])。
+    ///
+    /// スナップショットと**別に持つ**。あちらは転送のついでに読んだ応答ヘッダ
+    /// で、こちらは聞きに行った答え。同じ枠を指しているとは限らない (実測
+    /// 2026-08-01: 同時刻に 7 日の枠がヘッダでは 0.34、この口では 100)。
+    /// 聞けなかった credential では欠ける。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Vec<Limit>>,
     /// 能動プローブが失敗した理由。他の credential は巻き添えにしない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_error: Option<String>,
@@ -324,6 +333,7 @@ impl CredentialUsage {
             kind: kind.to_owned(),
             support,
             snapshot,
+            limits: None,
             probe_error: None,
         }
     }

@@ -848,7 +848,33 @@ fn remarks(c: &CredentialUsage) -> Vec<String> {
     if let Some(e) = &c.probe_error {
         lines.push(format!("{}: 取り直せませんでした ({e})", c.name));
     }
+    // モデル別の枠は上の行に出せない (5 時間 / 7 日の欄しかない) うえ、
+    // 応答ヘッダにも現れないので、聞けたときはここに並べる。
+    for limit in c.limits.iter().flatten() {
+        let Some(model) = &limit.model else {
+            continue;
+        };
+        let mut line = format!("{}: {model} の枠は {:.0}%", c.name, limit.percent);
+        if let Some(at) = &limit.resets_at {
+            line.push_str(&format!(" ({} に開きます)", to_the_second(at)));
+        }
+        lines.push(line);
+    }
     lines
+}
+
+/// 端数の秒を落とす。
+///
+/// `2026-08-02T08:59:59.571875+00:00` → `2026-08-02T08:59:59+00:00`。
+/// 6 桁の端数まで読める人はいないので、行を短くする分だけ読みやすい。
+fn to_the_second(at: &str) -> String {
+    let Some(dot) = at.find('.') else {
+        return at.to_owned();
+    };
+    let zone = at[dot..]
+        .find(['+', '-', 'Z'])
+        .map_or(at.len(), |offset| dot + offset);
+    format!("{}{}", &at[..dot], &at[zone..])
 }
 
 /// 端末上の見た目の幅。日本語は 2 桁ぶん取る。
@@ -1467,6 +1493,59 @@ mod tests {
             !out.contains("分前"),
             "取得から間もないので古さは出さない:\n{out}"
         );
+    }
+
+    /// モデル別の枠は、表の下に 1 行で出す。
+    ///
+    /// 5 時間 / 7 日の欄には収まらず、応答ヘッダにも現れないので、ここに
+    /// 出さないと利用者から永久に見えない。
+    #[test]
+    fn a_scoped_limit_gets_its_own_line() {
+        let mut c = observed();
+        c.limits = Some(vec![
+            llm_gateway::limits::Limit {
+                kind: "weekly_all".to_owned(),
+                percent: 100.0,
+                severity: Some("critical".to_owned()),
+                resets_at: Some("2026-08-02T08:59:59.571539+00:00".to_owned()),
+                model: None,
+                model_id: None,
+                is_active: true,
+            },
+            llm_gateway::limits::Limit {
+                kind: "weekly_scoped".to_owned(),
+                percent: 80.0,
+                severity: Some("warning".to_owned()),
+                resets_at: Some("2026-08-02T08:59:59.571875+00:00".to_owned()),
+                model: Some("Fable".to_owned()),
+                model_id: None,
+                is_active: false,
+            },
+        ]);
+
+        let out = render(&report(vec![c]));
+        assert!(out.contains("Fable の枠は 80%"), "{out}");
+        assert!(
+            out.contains("2026-08-02T08:59:59+00:00 に開きます"),
+            "端数の秒は落とす:\n{out}"
+        );
+        assert!(
+            !out.contains("weekly_all"),
+            "モデルの付かない枠は、表の欄と重なるので出さない:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_timestamp_without_a_fraction_is_left_alone() {
+        assert_eq!(
+            to_the_second("2026-08-02T08:59:59Z"),
+            "2026-08-02T08:59:59Z"
+        );
+        assert_eq!(
+            to_the_second("2026-08-02T08:59:59.5Z"),
+            "2026-08-02T08:59:59Z"
+        );
+        assert_eq!(to_the_second("いつか"), "いつか");
     }
 
     /// 取得から 5 分を超えたスナップショットだけ古さを添える。
