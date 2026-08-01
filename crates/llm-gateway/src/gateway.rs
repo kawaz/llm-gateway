@@ -1525,8 +1525,10 @@ credentials = ["a", "b"]
 
         assert_eq!(
             gw.denials.get("a", MODEL, now_unix()),
-            Some(window_closed(reset.parse().unwrap())),
-            "窓が開く時刻まで"
+            Some(window_closed(
+                reset.parse::<i64>().unwrap() + denial::RESET_SLACK
+            )),
+            "窓が開く時刻を、少し過ぎるまで"
         );
     }
 
@@ -1695,7 +1697,9 @@ credentials = ["a"]
 
         assert_eq!(
             gw.denials.get("a", MODEL, now),
-            Some(window_closed(reset.parse().unwrap())),
+            Some(window_closed(
+                reset.parse::<i64>().unwrap() + denial::RESET_SLACK
+            )),
             "聞いた結果で開く時刻を引き直す"
         );
     }

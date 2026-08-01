@@ -32,6 +32,14 @@ const DEFAULT_BACKOFF: i64 = 60;
 /// (時刻の足し算が溢れる、実質永久に閉じる) をそのまま採ると、経路を失う。
 const MAX_BACKOFF: i64 = 7 * 24 * 60 * 60;
 
+/// 枠が開く時刻に足す猶予 (秒)。
+///
+/// 宣言されたリセット時刻ちょうどに使い始めても、**1 分ほど遅れて**実際に
+/// 使えるようになる (kawaz 実測、5 時間の枠で毎回そうなる)。upstream が
+/// 1 分程度の単位で枠を数え直しているとみられる。ちょうどに解放すると、
+/// 直後の 1 本が高い確率で 429 を貰い、その 429 でまた締め出しが伸びる。
+pub const RESET_SLACK: i64 = 60;
+
 /// 締め出し中の経路に、裏で様子を聞きに行く間隔 (秒)。
 ///
 /// 上限のリセット時刻は「遅くともここまでには開く」であって、それより早く
@@ -73,10 +81,10 @@ pub struct Denial {
 
 /// この応答は経路を締め出すか。するならいつまで、どの範囲で。
 ///
-/// - **429 + 塞がっている窓** → その窓が開く時刻まで、credential 全体を
-///   ([`Reason::Limited`] / [`Scope::Everything`])。窓が複数塞がっているなら
-///   **最も遅く開く時刻**まで — 5 時間の窓が開いても、7 日の窓が塞がった
-///   ままなら通らない
+/// - **429 + 塞がっている窓** → その窓が開く時刻 (+ [`RESET_SLACK`]) まで、
+///   credential 全体を ([`Reason::Limited`] / [`Scope::Everything`])。窓が
+///   複数塞がっているなら**最も遅く開く時刻**まで — 5 時間の窓が開いても、
+///   7 日の窓が塞がったままなら通らない
 /// - **429 で窓が読めない / 529** → `retry-after`、無ければ
 ///   [`DEFAULT_BACKOFF`] だけ、頼んだモデルにだけ
 ///   ([`Reason::Busy`] / [`Scope::Model`])
@@ -99,7 +107,8 @@ pub fn denial_of(
         && let Some(reset) = last_reset(headers, now)
     {
         return Some(Denial {
-            until: reset,
+            // 開くと言われた時刻ちょうどではなく、少し待ってから戻す。
+            until: reset + RESET_SLACK,
             reason: Reason::Limited,
             scope: Scope::Everything,
         });
@@ -400,8 +409,25 @@ mod tests {
         h.extend(window("7d", "rejected", NOW + 5000));
         assert_eq!(
             denial_of(429, &h, FABLE, NOW),
-            Some(limited(NOW + 5000)),
+            Some(limited(NOW + 5000 + RESET_SLACK)),
             "窓はアカウントに掛かるので、頼んだモデルには関係しない"
+        );
+    }
+
+    /// 開くと言われた時刻ちょうどには戻さない。
+    ///
+    /// リセット時刻ちょうどに使い始めても 1 分ほど遅れて実際に使えるように
+    /// なる (kawaz 実測)。ちょうどに戻すと、その 1 本が 429 を貰って
+    /// 締め出しが伸びる。
+    #[test]
+    fn the_route_comes_back_a_little_after_the_reset() {
+        let h = window("7d", "rejected", NOW + 5000);
+        let denial = denial_of(429, &h, FABLE, NOW).unwrap();
+        assert_eq!(denial.until, NOW + 5000 + RESET_SLACK);
+        assert!(
+            denial.until > NOW + 5000,
+            "開くと言われた時刻より後に戻す (猶予 {} 秒)",
+            denial.until - (NOW + 5000)
         );
     }
 
@@ -413,7 +439,10 @@ mod tests {
     fn every_rejected_window_must_open() {
         let mut h = window("5h", "rejected", NOW + 100);
         h.extend(window("7d", "rejected", NOW + 5000));
-        assert_eq!(denial_of(429, &h, FABLE, NOW), Some(limited(NOW + 5000)));
+        assert_eq!(
+            denial_of(429, &h, FABLE, NOW),
+            Some(limited(NOW + 5000 + RESET_SLACK))
+        );
     }
 
     /// 開いている窓の時刻は数えない。塞がっている窓だけを見る。
@@ -421,7 +450,10 @@ mod tests {
     fn an_open_window_does_not_extend_the_deadline() {
         let mut h = window("5h", "rejected", NOW + 100);
         h.extend(window("7d", "allowed", NOW + 5000));
-        assert_eq!(denial_of(429, &h, FABLE, NOW), Some(limited(NOW + 100)));
+        assert_eq!(
+            denial_of(429, &h, FABLE, NOW),
+            Some(limited(NOW + 100 + RESET_SLACK))
+        );
     }
 
     /// 遠い開く時刻でも縮めない。開く時刻を知っているならそこまで待つ。
@@ -430,7 +462,7 @@ mod tests {
         let h = window("7d", "rejected", NOW + 400 * 24 * 3600);
         assert_eq!(
             denial_of(429, &h, FABLE, NOW),
-            Some(limited(NOW + 400 * 24 * 3600))
+            Some(limited(NOW + 400 * 24 * 3600 + RESET_SLACK))
         );
     }
 
