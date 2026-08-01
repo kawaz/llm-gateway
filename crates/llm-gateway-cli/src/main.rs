@@ -117,6 +117,17 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
     init_logging();
     let config = load(config_path)?;
 
+    // 待ち受けないと書いてある設定で起動しようとしたら、その場で言う。
+    // 黙って何もせずに終わると、起動したつもりのまま繋がらない原因を
+    // 探すことになる。
+    if config.server.disabled {
+        return Err(format!(
+            "{} は disabled = true です (この設定では待ち受けません)。\
+待ち受けたいなら [server] の disabled を外すか、別の設定を --config で指定してください",
+            config_path.display()
+        ));
+    }
+
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
 
@@ -198,7 +209,7 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     let dir = config.store.resolve_dir();
 
     println!("設定       {}", config_path.display());
-    println!("待ち受け   {}", config.server.listen);
+    println!("待ち受け   {}", listen_line(&config.server));
     println!("認証情報   {}", dir.display());
     println!("認証情報数 {} 件", config.credentials.len());
     println!("namespace  {}", config.namespace_names().join(", "));
@@ -1049,6 +1060,17 @@ fn take_value(
 ///
 /// `-` 始まりも弾く。綴りを間違えたオプションが名前として通ると、意図しない
 /// ファイルに保存される。
+/// `check` に出す待ち受け行。
+///
+/// 待ち受けない設定でも住所は出す。CLI (`usage` / `stats`) の問い合わせ先は
+/// この値で組むので、伏せると「どこへ聞きに行くのか」が見えなくなる。
+fn listen_line(server: &llm_gateway::config::Server) -> String {
+    if server.disabled {
+        return format!("{} (無効: この設定では待ち受けません)", server.listen);
+    }
+    server.listen.clone()
+}
+
 fn check_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.starts_with('-')
     {
@@ -1438,32 +1460,94 @@ mod tests {
     #[test]
     fn listen_address_becomes_a_reachable_url() {
         assert_eq!(
-            usage_url("127.0.0.1:8319", false),
-            "http://127.0.0.1:8319/llm-gateway/usage"
+            usage_url("127.0.0.1:11300", false),
+            "http://127.0.0.1:11300/llm-gateway/usage"
         );
         assert_eq!(
-            usage_url("0.0.0.0:8319", false),
-            "http://127.0.0.1:8319/llm-gateway/usage"
+            usage_url("0.0.0.0:11300", false),
+            "http://127.0.0.1:11300/llm-gateway/usage"
         );
         assert_eq!(
-            usage_url("[::]:8319", false),
-            "http://127.0.0.1:8319/llm-gateway/usage"
+            usage_url("[::]:11300", false),
+            "http://127.0.0.1:11300/llm-gateway/usage"
         );
         assert_eq!(
-            usage_url("[::1]:8319", false),
-            "http://[::1]:8319/llm-gateway/usage"
+            usage_url("[::1]:11300", false),
+            "http://[::1]:11300/llm-gateway/usage"
         );
         assert_eq!(
-            usage_url("127.0.0.1:8319", true),
-            "http://127.0.0.1:8319/llm-gateway/usage?refresh=true"
+            usage_url("127.0.0.1:11300", true),
+            "http://127.0.0.1:11300/llm-gateway/usage?refresh=true"
         );
+    }
+
+    /// 待ち受けない設定で `serve` したら、その場で断る。
+    ///
+    /// 黙って何もせずに終わると、起動したつもりのまま「繋がらない」原因を
+    /// 探すことになる。
+    #[test]
+    fn serving_a_disabled_config_stops_with_a_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dummy.toml");
+        std::fs::write(
+            &path,
+            "[server]\ndisabled = true\nlisten = \"127.0.0.1:11300\"\n",
+        )
+        .unwrap();
+
+        let e = serve(&path).unwrap_err();
+        assert!(e.contains("disabled"), "{e}");
+        assert!(e.contains("dummy.toml"), "どの設定かが分かる: {e}");
+        assert!(e.contains("--config"), "次にどうするかまで言う: {e}");
+    }
+
+    /// 待ち受けない設定でも `check` は通る。無効だとは明示する。
+    #[test]
+    fn checking_a_disabled_config_succeeds_and_says_so() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dummy.toml");
+        // 認証情報の置き場は試験用の空ディレクトリにする (実運用を触らない)。
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\ndisabled = true\nlisten = \"127.0.0.1:11300\"\n\n\
+                 [store]\ntype = \"file\"\ndir = \"{}\"\n",
+                dir.path().join("creds").display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(check(&path).unwrap(), ExitCode::SUCCESS);
+    }
+
+    /// 待ち受け行は、無効かどうかで書き分ける。住所そのものは伏せない。
+    #[test]
+    fn the_listen_line_says_when_it_does_not_listen() {
+        use llm_gateway::config::Server;
+
+        let listening = Server {
+            listen: "127.0.0.1:11300".to_owned(),
+            disabled: false,
+        };
+        assert_eq!(listen_line(&listening), "127.0.0.1:11300");
+
+        let quiet = Server {
+            disabled: true,
+            ..listening
+        };
+        let line = listen_line(&quiet);
+        assert!(
+            line.contains("127.0.0.1:11300"),
+            "問い合わせ先は見える: {line}"
+        );
+        assert!(line.contains("無効"), "{line}");
     }
 
     /// server が居ないときは、次に何を見ればよいかまで言う。
     #[test]
     fn unreachable_server_says_what_to_check() {
-        let message = server_unreachable("127.0.0.1:8319", "connection refused");
-        assert!(message.contains("127.0.0.1:8319"), "{message}");
+        let message = server_unreachable("127.0.0.1:11300", "connection refused");
+        assert!(message.contains("127.0.0.1:11300"), "{message}");
         assert!(message.contains("起動"), "{message}");
         assert!(message.contains("launchctl"), "{message}");
     }
@@ -2013,12 +2097,12 @@ mod tests {
     #[test]
     fn the_usage_url_is_unchanged() {
         assert_eq!(
-            usage_url("127.0.0.1:8319", false),
-            "http://127.0.0.1:8319/llm-gateway/usage"
+            usage_url("127.0.0.1:11300", false),
+            "http://127.0.0.1:11300/llm-gateway/usage"
         );
         assert_eq!(
-            usage_url("127.0.0.1:8319", true),
-            "http://127.0.0.1:8319/llm-gateway/usage?refresh=true"
+            usage_url("127.0.0.1:11300", true),
+            "http://127.0.0.1:11300/llm-gateway/usage?refresh=true"
         );
     }
 

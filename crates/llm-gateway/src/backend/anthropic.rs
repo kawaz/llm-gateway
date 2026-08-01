@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn strips_connection_and_auth_but_keeps_the_rest() {
         let mut h = headers(&[
-            ("Host", "127.0.0.1:8319"),
+            ("Host", "127.0.0.1:11300"),
             ("Connection", "keep-alive"),
             ("Content-Length", "253966"),
             ("Accept-Encoding", "gzip, deflate, br, zstd"),

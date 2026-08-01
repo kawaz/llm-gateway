@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! [server]
-//! listen = "127.0.0.1:8319"
+//! listen = "127.0.0.1:11300"
 //!
 //! [store]
 //! type = "file"
@@ -175,21 +175,40 @@ fn default_refresh_secs() -> u64 {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// 待ち受け先。cpa (8317/8318) と衝突しない番号にする。
+    /// 待ち受け先。
+    ///
+    /// **この設定が指す面の住所**でもある。CLI (`usage` / `stats`) は、
+    /// ここへ問い合わせる。
     #[serde(default = "default_listen")]
     pub listen: String,
+
+    /// この設定では待ち受けない。
+    ///
+    /// `--config` を省いて CLI を使うための設定 (`config.toml`) を置きたい
+    /// ことがある。共通部分を土台にして (DR-0013) `listen` だけ書いておけば、
+    /// `llm-gateway usage` が問い合わせ先を知れる。ただしその設定で
+    /// `serve` を始めると、既に動いている面と待ち受け先を取り合う。
+    ///
+    /// **`listen` の意味は変わらない** — 「どこで待つか」ではなく「どこに
+    /// いるか」を書いた欄として、問い合わせ先の組み立てには使い続ける。
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 impl Default for Server {
     fn default() -> Self {
         Self {
             listen: default_listen(),
+            disabled: false,
         }
     }
 }
 
+/// 既定の待ち受け先。
+///
+/// 11300 は小文字の `llm` の字形から 113、gateway らしく末尾を 00 にしたもの。
 fn default_listen() -> String {
-    "127.0.0.1:8319".to_owned()
+    "127.0.0.1:11300".to_owned()
 }
 
 /// 認証情報の置き場。
@@ -961,8 +980,22 @@ credentials = ["a", "typo-here"]
     #[test]
     fn empty_config_is_valid() {
         let c = parse("").unwrap();
-        assert_eq!(c.server.listen, "127.0.0.1:8319");
+        assert_eq!(c.server.listen, "127.0.0.1:11300", "既定の待ち受け先");
+        assert!(!c.server.disabled, "書かなければ待ち受ける");
         assert!(matches!(c.store, Store::File { dir: None }));
+    }
+
+    /// 待ち受けないと書ける。住所 (`listen`) は書いても書かなくてもよい。
+    ///
+    /// `--config` を省いて CLI を使うための設定に使う (DR-0013)。
+    #[test]
+    fn a_config_can_declare_that_it_does_not_listen() {
+        let c = parse("[server]\ndisabled = true\nlisten = \"127.0.0.1:8402\"").unwrap();
+        assert!(c.server.disabled);
+        assert_eq!(
+            c.server.listen, "127.0.0.1:8402",
+            "問い合わせ先としては残る"
+        );
     }
 
     #[test]

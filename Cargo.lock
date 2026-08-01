@@ -776,6 +776,7 @@ dependencies = [
  "llm-gateway-server",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

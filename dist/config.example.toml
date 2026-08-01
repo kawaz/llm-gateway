@@ -15,7 +15,10 @@
 # 配列は丸ごと置き換わる (routing の並びは意味を持つので混ぜない)。
 
 [server]
-listen = "127.0.0.1:8319"
+listen = "127.0.0.1:11300"
+# この設定では待ち受けない (--config を省いて CLI を使うためのダミー)。
+# listen の値は残るので、llm-gateway usage / stats はそこへ問い合わせる。
+# disabled = true
 
 [store]
 type = "file"
@@ -123,7 +126,7 @@ sonnet = "claude-sonnet-*"
 haiku = "claude-haiku-*"
 
 # 面ごとに分けたいときは namespace を足す。使う credential も絞れる。
-# クライアント側は ANTHROPIC_BASE_URL=http://127.0.0.1:8319/ns-work。
+# クライアント側は ANTHROPIC_BASE_URL=http://127.0.0.1:11300/ns-work。
 #
 # [ns.work]
 # auth_token = "別の乱数"
