@@ -13,6 +13,7 @@
 - [DR-0009](./DR-0009-credential-denial-fallback.md) — 401/403/429/529 はこの経路に断られたとみなして次の経路を試す。全滅時は最後の応答を透過し、affinity は 2xx かつ namespace 単位で覚える
 - [DR-0010](./DR-0010-credential-cross-process-lock.md) — 認証情報の書き換えを `.lock` サイドカーの flock でプロセス間排他し、控えは版 (mtime) の照合で鮮度を保つ
 - [DR-0011](./DR-0011-daily-usage-stats.md) — 応答本文の usage を relay の外の tap で覗き、credential × モデル × 日で積んで writer 毎の日次ファイルに残す (/llm-gateway/stats)
+- [DR-0012](./DR-0012-request-events.md) — 転送のたびに起きたことを SSE で流す (/llm-gateway/events)。prompt cache の 5 分を外から数えられるようにする
 
 ## Archived
 

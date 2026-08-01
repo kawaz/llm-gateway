@@ -15,6 +15,7 @@ use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::denial::{self, Candidates, Denials, Probing, Reason, denial_of};
 use crate::error::UpstreamAttempt;
+use crate::events::{self, Events};
 use crate::limits::{self, Limit};
 use crate::router::{Route, Router};
 use crate::session;
@@ -40,6 +41,8 @@ pub struct Gateway<P: Persistence> {
     stats: Arc<Stats>,
     /// 断られた経路の締め出し。
     denials: Arc<Denials>,
+    /// 転送のたびに起きたことを見ている人へ流す口 (DR-0012)。
+    events: Arc<Events>,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -95,6 +98,7 @@ impl<P: Persistence> Gateway<P> {
                 &config.server.listen,
             )),
             denials: Arc::new(Denials::new()),
+            events: Arc::new(Events::new()),
         })
     }
 
@@ -103,6 +107,13 @@ impl<P: Persistence> Gateway<P> {
     /// 受け取り口が中継に tap を挟むのと、閲覧の口が報告を作るのに使う。
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
+    }
+
+    /// 転送のたびに起きたことを流す口 (DR-0012)。
+    ///
+    /// 配信の口 (`/llm-gateway/events`) がここを見る。
+    pub fn events(&self) -> &Arc<Events> {
+        &self.events
     }
 
     /// 前回落とした分を読み戻す。待ち受けを始める前に 1 回だけ呼ぶ。
@@ -201,6 +212,16 @@ impl<P: Persistence> Gateway<P> {
         }
 
         let session = session::derive(&body, &headers);
+        // 知らせに載せる素性。会話の id はクライアントのヘッダから拾う
+        // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
+        let call = Call {
+            ns: ns_name,
+            model: &model,
+            session_id: events::session_id(&headers),
+            path,
+            query,
+            body: &body,
+        };
         let routes = self
             .router
             .routes_for(ns, ns_name, &model, &session)
@@ -256,7 +277,7 @@ impl<P: Persistence> Gateway<P> {
         // 応答は集計されない (エラーの本文に usage は無い、DR-0011)。
         let mut denied: Option<(forward::Response, Option<CredentialId>)> = None;
         for route in &routes {
-            match self.try_route(route, path, query, &body, &headers).await {
+            match self.try_route(route, &call, &headers).await {
                 Ok(resp) => {
                     // 貼り付けるのは通った経路だけ。断られた先を覚えると、
                     // 次の転送も同じところから始めることになる。
@@ -344,9 +365,7 @@ impl<P: Persistence> Gateway<P> {
     async fn try_route(
         &self,
         route: &Arc<Route>,
-        path: &str,
-        query: Option<&str>,
-        body: &Value,
+        call: &Call<'_>,
         headers: &[(String, String)],
     ) -> std::result::Result<forward::Response, Switch> {
         let credential = match &route.credential {
@@ -370,9 +389,7 @@ impl<P: Persistence> Gateway<P> {
         let mut sending = Headers::new(headers.to_vec());
         let sent = policy.apply_to(&mut sending);
 
-        let resp = self
-            .send(route, credential.as_ref(), path, query, body, sending)
-            .await?;
+        let resp = self.send(route, call, credential.as_ref(), sending).await?;
 
         // beta を載せていないなら、400 の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
@@ -407,7 +424,7 @@ impl<P: Persistence> Gateway<P> {
 
         // 送り直すのは 1 回だけ。これでも 400 ならクライアントへ返す。
         let resp = self
-            .send(route, credential.as_ref(), path, query, body, retrying)
+            .send(route, call, credential.as_ref(), retrying)
             .await?;
         accept_or_switch(resp)
     }
@@ -415,19 +432,17 @@ impl<P: Persistence> Gateway<P> {
     async fn send(
         &self,
         route: &Arc<Route>,
+        call: &Call<'_>,
         credential: Option<&crate::credential::Credential>,
-        path: &str,
-        query: Option<&str>,
-        body: &Value,
         headers: Headers,
     ) -> std::result::Result<forward::Response, Switch> {
         let resp = forward::send(
             &self.http,
             route.provider.as_ref(),
             credential,
-            path,
-            query,
-            body.clone(),
+            call.path,
+            call.query,
+            call.body.clone(),
             headers,
         )
         .await
@@ -436,9 +451,22 @@ impl<P: Persistence> Gateway<P> {
         // 便乗して利用状況を拾う (DR-0007)。読むのはヘッダだけなので、
         // 本文はこの後もそのまま流れる。上限に当たった応答こそ見たいので、
         // status では絞らない。
+        let now = now_unix();
         if let Some(id) = &route.credential {
-            self.usage.observe(id, &resp.headers, now_unix()).await;
+            self.usage.observe(id, &resp.headers, now).await;
         }
+
+        // 見ている人へ知らせる (DR-0012)。upstream がヘッダを返したこの瞬間が、
+        // prompt cache の 5 分が走り始めた時刻に一番近い。断られた応答も流す
+        // ので、status で絞らない。
+        self.events.publish(events::Event::new(
+            now,
+            call.session_id.clone(),
+            call.ns,
+            call.model,
+            route.name(),
+            resp.status,
+        ));
         Ok(resp)
     }
 
@@ -681,6 +709,21 @@ impl<P: Persistence> Gateway<P> {
                 .collect::<String>(),
         })
     }
+}
+
+/// 受けた 1 本の呼び出し。経路を試すたびに要るものをまとめて持ち回る。
+///
+/// 個別の引数で渡していくと、経路を試す関数の引数が増え続ける (どの経路でも
+/// 同じ中身を渡すので、増えるのは呼び出し側の写経だけになる)。
+struct Call<'a> {
+    ns: &'a str,
+    /// 解決後の実モデル名。
+    model: &'a str,
+    /// クライアントが名乗った会話の id。名乗らない相手もいる。
+    session_id: Option<String>,
+    path: &'a str,
+    query: Option<&'a str>,
+    body: &'a Value,
 }
 
 /// プローブが持ち帰ったもの。
@@ -1506,6 +1549,32 @@ credentials = ["a", "b"]
             None,
             "断られていないモデルに印は付かない"
         );
+    }
+
+    /// 経路を切り替えたときは、当たった先ごとに 1 通ずつ流れる。
+    ///
+    /// 5 分を数える相手にとって、意味があるのは**最後に通った先**の時刻。
+    /// 断られた分も混ぜて流し、どれを使うかは見る側が status で決める
+    /// (DR-0012)。
+    #[tokio::test]
+    async fn every_upstream_answer_is_announced() {
+        let limited = FakeUpstream::always(429).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
+
+        let mut watching = gw.events().subscribe();
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        let first = watching.recv().await.unwrap();
+        assert_eq!((first.credential.as_str(), first.status), ("a", 429));
+
+        let second = watching.recv().await.unwrap();
+        assert_eq!((second.credential.as_str(), second.status), ("b", 200));
+        assert_eq!(second.ns, NS);
+        assert_eq!(second.model, "m");
+        assert_eq!(second.session_id, None, "ヘッダを付けていない");
     }
 
     /// 上限のヘッダが載っていれば、窓が開く時刻まで締め出す。

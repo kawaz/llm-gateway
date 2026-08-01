@@ -9,6 +9,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,6 +20,7 @@ use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::time::now_unix;
 use llm_gateway::credential::{CredentialId, Persistence};
 use llm_gateway::{Error, Gateway, relay};
+use tokio::sync::broadcast::error::RecvError;
 
 /// 転送するリクエストの上限。
 ///
@@ -41,6 +43,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/usage", get(usage))
         .route("/llm-gateway/stats", get(stats))
+        .route("/llm-gateway/events", get(events))
         .with_state(gateway)
 }
 
@@ -89,6 +92,52 @@ fn json_utf8(body: impl IntoResponse) -> Response {
         header::HeaderValue::from_static("application/json; charset=utf-8"),
     );
     resp
+}
+
+/// 転送のたびに起きたことを流し続ける (DR-0012)。
+///
+/// SSE で返す。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。
+/// 見ている側が遅れて取りこぼしても、こちらは詰まらない (落として先へ進む)。
+///
+/// 認証は usage / stats と同じ扱い (掛けない)。手前の tailnet の境界を信頼
+/// する。流すのは「いつ・どの会話が・どの経路に当たったか」までで、本文も
+/// トークン数も載せない。
+async fn events<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+) -> Sse<impl futures_util::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let watching = gateway.events().subscribe();
+
+    let stream = futures_util::stream::unfold(watching, |mut watching| async move {
+        loop {
+            match watching.recv().await {
+                Ok(event) => return Some((Ok(sse_line(&event)), watching)),
+                // 追いつけなかった分は諦めて先へ進む。5 分の残りを数える相手に、
+                // 遅れて届いた開始時刻を渡しても使い道がない。
+                Err(RecvError::Lagged(missed)) => {
+                    warn!(missed, "イベントを配りきれませんでした");
+                }
+                // 流す側が畳まれた。gateway が終わるとき以外は起きない。
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    // 何も起きない時間が続いても、経路上の中継に切られないよう合図を送る。
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)))
+}
+
+/// 1 件を SSE の 1 通にする。
+///
+/// 載せるのは自分で組み立てた構造体だけなので、JSON にできない事態は
+/// 起きない。それでも配信を止めないよう、万一のときは空の 1 通を送る。
+fn sse_line(event: &llm_gateway::events::Event) -> SseEvent {
+    SseEvent::default()
+        .event("request")
+        .json_data(event)
+        .unwrap_or_else(|e| {
+            error!(%e, "イベントを JSON にできません");
+            SseEvent::default().comment("unserializable")
+        })
 }
 
 /// 使用量の日次集計を返す (DR-0011)。
@@ -627,6 +676,130 @@ content-length: {declared}\r\n\r\n{head}"
             "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}],
         })
+    }
+
+    /// 転送のたびに、見ている人へ 1 通流れる。
+    ///
+    /// 5 分の残りを数えるのはこの時刻から。SSE の形 (event / data の 2 行) と
+    /// 中身の欄が、見る側の契約になる (DR-0012)。
+    #[tokio::test]
+    async fn a_forward_is_announced_to_watchers() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"type":"message","content":[]}"#.to_owned(),
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        ))
+        .await;
+
+        // 先に見始める。応答のヘッダが返った時点で、もう見る側に回っている。
+        let mut watching = reqwest::Client::new()
+            .get(format!("{base}/llm-gateway/events"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(watching.status(), 200);
+        assert_eq!(
+            watching.headers().get("content-type").unwrap(),
+            "text/event-stream",
+            "SSE として読める形で返す"
+        );
+
+        let forwarded = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("X-Claude-Code-Session-Id", "s-1")
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(forwarded.status(), 200);
+
+        let chunk = watching.chunk().await.unwrap().expect("1 通届く");
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+
+        let (kind, data) = text.trim_end().split_once('\n').expect("2 行");
+        assert_eq!(kind, "event: request");
+        let event: Value =
+            serde_json::from_str(data.strip_prefix("data: ").expect("data 行")).unwrap();
+
+        assert_eq!(event["session_id"], "s-1", "会話が分かる");
+        assert_eq!(event["ns"], "default");
+        assert_eq!(event["model"], "m");
+        assert_eq!(event["credential"], "a");
+        assert_eq!(event["status"], 200);
+        assert!(event["ts"].as_i64().unwrap() > 0);
+        assert!(event["ts_iso"].as_str().unwrap().ends_with('Z'));
+    }
+
+    /// 会話を名乗らないクライアント (curl 等) の分も流す。
+    #[tokio::test]
+    async fn a_request_without_a_session_is_still_announced() {
+        let upstream = fake_upstream(|| {
+            (
+                429,
+                r#"{"type":"error","error":{"message":"nope"}}"#.to_owned(),
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        ))
+        .await;
+
+        let mut watching = reqwest::Client::new()
+            .get(format!("{base}/llm-gateway/events"))
+            .send()
+            .await
+            .unwrap();
+
+        let refused = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), 429);
+
+        let chunk = watching.chunk().await.unwrap().expect("断られた分も流れる");
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("data 行");
+        let event: Value = serde_json::from_str(data).unwrap();
+
+        assert!(event["session_id"].is_null(), "名乗らなければ null");
+        assert_eq!(event["status"], 429, "断られたことも知らせ");
     }
 
     #[tokio::test]
