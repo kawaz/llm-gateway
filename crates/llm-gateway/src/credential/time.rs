@@ -14,15 +14,21 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
 
-    let offset = match b.get(19) {
+    // 小数秒 (`…:59.571539+00:00`) は秒より細かいので捨てる。枠の開く時刻は
+    // マイクロ秒まで返ってくるが、こちらが持つのは秒。
+    let zone = match b.get(19) {
+        Some(b'.') => 20 + b[20..].iter().take_while(|c| c.is_ascii_digit()).count(),
+        _ => 19,
+    };
+
+    let offset = match b.get(zone) {
         None | Some(b'Z') | Some(b'z') => 0,
         Some(&sign @ (b'+' | b'-')) => {
-            let oh = num(20, 22)?;
-            let om = num(23, 25)?;
+            let oh = num(zone + 1, zone + 3)?;
+            let om = num(zone + 4, zone + 6)?;
             let secs = oh * 3600 + om * 60;
             if sign == b'-' { -secs } else { secs }
         }
-        // 小数秒付き (`…:00.123Z`) は今のところ出てこない。
         Some(_) => return None,
     };
 
@@ -173,15 +179,19 @@ mod tests {
 
     #[test]
     fn rejects_unreadable_values() {
-        for bad in [
-            "",
-            "not-a-date",
-            "2026-07",
-            "yesterday",
-            "2026-07-28T02:54:00.5Z",
-        ] {
+        for bad in ["", "not-a-date", "2026-07", "yesterday"] {
             assert_eq!(parse_rfc3339(bad), None, "{bad:?}");
         }
+    }
+
+    /// 枠の開く時刻はマイクロ秒まで返ってくる (DR-0007)。秒より細かい分は捨てる。
+    #[test]
+    fn fractional_seconds_are_dropped() {
+        let utc = parse_rfc3339("2026-08-02T08:59:59Z").unwrap();
+        assert_eq!(parse_rfc3339("2026-08-02T08:59:59.571539+00:00"), Some(utc));
+        assert_eq!(parse_rfc3339("2026-08-02T08:59:59.5Z"), Some(utc));
+        assert_eq!(parse_rfc3339("2026-08-02T17:59:59.571539+09:00"), Some(utc));
+        assert_eq!(parse_rfc3339("2026-08-02T08:59:59.571539"), Some(utc));
     }
 
     #[test]

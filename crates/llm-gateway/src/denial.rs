@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::credential::time::parse_rfc3339;
+use crate::limits::Limit;
 use crate::router::Route;
 use crate::usage::{Snapshot, Window};
 
@@ -64,10 +66,27 @@ pub enum Reason {
 /// 自分で閉じることになる。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Scope {
-    /// この credential の全モデル。アカウント全体に掛かる窓が塞がっている場合。
+    /// この credential の全モデル。アカウント全体に掛かる枠が塞がっている場合。
     Everything,
     /// このモデルを頼んだときだけ。
     Model(String),
+    /// この形に当てはまるモデルだけ (`claude-fable-*` のような glob)。
+    ///
+    /// 枠が「Fable の枠」のようにモデル**群**へ掛かる場合に使う。名前を
+    /// 並べて持たないのは、個別枠が増えたときに設定も実装も直さずに済ませる
+    /// ため (DR-0007)。
+    Models(String),
+}
+
+impl Scope {
+    /// この範囲は、このモデルに効くか。
+    pub fn covers(&self, model: &str) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Model(name) => name == model,
+            Self::Models(pattern) => crate::pattern::matches(pattern, model),
+        }
+    }
 }
 
 /// この経路は、いつまで、どの範囲で断られているか。
@@ -170,22 +189,30 @@ pub enum Candidates {
 
 /// 経路ごとの締め出しの印。
 ///
-/// 鍵は経路の名前 (= 設定に書いた credential の名前)。認証情報を持たない
-/// 経路 (relay) にも 529 は返るので、`CredentialId` ではなく経路の名前で持つ。
+/// 鍵は経路の名前 (= 設定に書いた credential の名前) と範囲の組。認証情報を
+/// 持たない経路 (relay) にも 529 は返るので、`CredentialId` ではなく経路の
+/// 名前で持つ。
 #[derive(Default)]
 pub struct Denials {
-    marks: Mutex<HashMap<Key, Mark>>,
+    marks: Mutex<HashMap<Key, Denial>>,
+    /// 経路ごとの「様子を聞きに行った」記録。
+    ///
+    /// 印とは別に持つ。**印が無い経路にも聞きに行く** (窓を伴わない 429 を
+    /// 受けた直後など) ので、印にぶら下げると聞きに行けない相手ができる。
+    asked: Mutex<HashMap<String, Ask>>,
 }
 
 /// 印の宛先。同じ経路でも、範囲が違えば別の印。
 type Key = (String, Scope);
 
-struct Mark {
-    denial: Denial,
-    /// 最後にこの経路の状態を実際に聞いた時刻。次に様子を聞く時期をここから測る。
-    seen_at: i64,
-    /// いま裏で様子を聞いている最中。同じ相手に一斉に聞きに行かないための札。
-    probing: bool,
+#[derive(Default)]
+struct Ask {
+    /// 最後にこちらから聞きに行った時刻。
+    asked_at: i64,
+    /// 最後にこの経路の状態を知った時刻 (断られた応答を含む)。
+    heard_at: i64,
+    /// いま聞いている最中。同じ相手に一斉に聞きに行かないための札。
+    in_flight: bool,
 }
 
 impl Denials {
@@ -193,45 +220,43 @@ impl Denials {
         Self::default()
     }
 
-    fn marks(&self) -> MutexGuard<'_, HashMap<Key, Mark>> {
+    fn marks(&self) -> MutexGuard<'_, HashMap<Key, Denial>> {
         self.marks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn asked(&self) -> MutexGuard<'_, HashMap<String, Ask>> {
+        self.asked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// 断られたことを控える。
     ///
-    /// 上限 ([`Reason::Limited`]) は上限のヘッダが正本なので、そのまま置く。
+    /// 上限 ([`Reason::Limited`]) は枠の状態が正本なので、そのまま置く。
     /// 混雑 ([`Reason::Busy`]) は当て推量なので、**同じ宛先に先に控えた期限を
-    /// 縮めない** — 60 秒の退避で、読めていた窓の開く時刻を上書きしない。
+    /// 縮めない** — 60 秒の退避で、読めていた枠の開く時刻を上書きしない。
     pub fn deny(&self, route: &str, denial: Denial, now: i64) {
         let mut marks = self.marks();
         // 期限の切れた印を落とす。モデルごとに印が増えるので、掃除しないと
-        // 使われなくなったモデル名が溜まり続ける。聞きに行っている最中の分は
-        // 札の持ち主が居るので残す。
-        marks.retain(|_, m| m.denial.until > now || m.probing);
+        // 使われなくなったモデル名が溜まり続ける。
+        marks.retain(|_, d| d.until > now);
 
         let key = (route.to_owned(), denial.scope.clone());
-        let kept = marks.get(&key);
-        let probing = kept.is_some_and(|m| m.probing);
-        let denial = match kept {
-            Some(m) if denial.reason == Reason::Busy && m.denial.until >= denial.until => {
-                m.denial.clone()
+        let denial = match marks.get(&key) {
+            Some(kept) if denial.reason == Reason::Busy && kept.until >= denial.until => {
+                kept.clone()
             }
             _ => denial,
         };
-        marks.insert(
-            key,
-            Mark {
-                denial,
-                seen_at: now,
-                probing,
-            },
-        );
+        marks.insert(key, denial);
+        drop(marks);
+
+        // 断られたのも「状態を知った」うち。定期の様子見はここから測る。
+        self.asked().entry(route.to_owned()).or_default().heard_at = now;
     }
 
     /// 印を消す。通った (2xx) 経路に対して呼ぶ。
     ///
-    /// このモデルで通ったのだから、そのモデルの印も、credential 全体の印も
-    /// 間違いだったことになる。両方消す。
+    /// このモデルで通ったのだから、**このモデルに効いていた印は全部**間違い
+    /// だったことになる。credential 全体の印も、モデルの形で括った印も消す。
     ///
     /// Design rationale: 裏で聞きに行った結果と、実際の転送の結果が前後する
     /// のを防ぐ仕掛けは置かない。古い観測で誤って印を外しても、次の実
@@ -240,23 +265,25 @@ impl Denials {
     /// 順序を守るための仕掛け (世代番号・観測時刻の比較) を足すと、得られる
     /// ものより仕掛けの複雑さの方が大きい。
     pub fn allow(&self, route: &str, model: &str) {
-        let mut marks = self.marks();
-        marks.remove(&(route.to_owned(), Scope::Everything));
-        marks.remove(&(route.to_owned(), Scope::Model(model.to_owned())));
+        self.marks()
+            .retain(|(name, scope), _| name != route || !scope.covers(model));
+    }
+
+    /// この範囲の印だけを消す。枠が塞がっていないと分かったときに呼ぶ。
+    pub fn clear(&self, route: &str, scope: &Scope) {
+        self.marks().remove(&(route.to_owned(), scope.clone()));
     }
 
     /// この経路をこのモデルで使えるか。断られていれば、その印。
     ///
-    /// credential 全体の印と、このモデルの印のどちらかが生きていれば断られて
-    /// いる。両方あるなら**遅く開く方**を返す — この経路が使えるようになる
-    /// のは両方が開いた時なので、早い方を返すとまだ塞がっている経路を
-    /// 「もう開く」と伝えることになる。
+    /// このモデルに効く印が複数あるなら**遅く開く方**を返す — この経路が
+    /// 使えるようになるのは全部が開いた時なので、早い方を返すとまだ塞がって
+    /// いる経路を「もう開く」と伝えることになる。
     pub fn get(&self, route: &str, model: &str, now: i64) -> Option<Denial> {
-        let marks = self.marks();
-        [Scope::Everything, Scope::Model(model.to_owned())]
-            .into_iter()
-            .filter_map(|scope| marks.get(&(route.to_owned(), scope)))
-            .map(|m| m.denial.clone())
+        self.marks()
+            .iter()
+            .filter(|((name, scope), _)| name == route && scope.covers(model))
+            .map(|(_, denial)| denial.clone())
             .filter(|d| d.until > now)
             .max_by_key(|d| d.until)
     }
@@ -291,41 +318,115 @@ impl Denials {
         }
     }
 
-    /// 様子を聞きに行く役を引き受ける。引き受けられたら札を返す。
+    /// 枠の一覧を聞けたので、この経路の印を引き直す ([`crate::limits`])。
     ///
-    /// 聞きに行くのは、credential 全体を上限で締め出している経路だけ。混雑は
-    /// 開く時刻を持たないので短い退避で足り、定期的に聞いても実費が増える
-    /// だけになる。前に聞いてから [`PROBE_INTERVAL`] 経つまでは引き受けない。
+    /// 使い切った枠 (`percent` が 100 以上) は、開く時刻まで締め出す。
+    /// 使い切っていない枠は、その範囲の印を消す。**`is_active` は見ない** —
+    /// 実測 (2026-08-01) では 47 % の枠が `is_active: true` を返す。あれは
+    /// 「今どの枠を見ているか」であって「塞がっている」ではない。
+    ///
+    /// いつ開くか (`resets_at`) が分からない枠では印を作らない。期限を
+    /// 決められないものを締め出すと、いつ戻すかも決められない。
+    pub fn apply_limits(&self, route: &str, limits: &[Limit], now: i64) {
+        for limit in limits {
+            let scope = scope_of(limit);
+            if limit.percent < EXHAUSTED {
+                self.clear(route, &scope);
+                continue;
+            }
+            let Some(reset) = limit.resets_at.as_deref().and_then(parse_rfc3339) else {
+                continue;
+            };
+            self.deny(
+                route,
+                Denial {
+                    until: reset + RESET_SLACK,
+                    reason: Reason::Limited,
+                    scope,
+                },
+                now,
+            );
+        }
+    }
+
+    /// 定期の様子見の役を引き受ける。引き受けられたら札を返す。
+    ///
+    /// 引き受けるのは、上限で締め出している経路だけ。混雑はいつ空くか
+    /// 分からないので短い退避で足り、定期的に聞いても実費が増えるだけになる。
     pub fn claim_probe(self: &Arc<Self>, route: &str, now: i64) -> Option<Probing> {
-        self.claim(route, now, true)
+        let limited = self
+            .marks()
+            .iter()
+            .any(|((name, _), d)| name == route && d.reason == Reason::Limited && d.until > now);
+        if !limited {
+            return None;
+        }
+        // 直前に断られたばかりなら、その応答が最新の観測。すぐ聞き直さない。
+        let heard_at = self.asked().get(route).map_or(0, |a| a.heard_at);
+        if now - heard_at < PROBE_INTERVAL {
+            return None;
+        }
+        self.claim(route, now, PROBE_INTERVAL)
     }
 
     /// 間隔を待たずに引き受ける。
     ///
-    /// どの経路も断られていて、このリクエストが行き場を失ったときに使う。
-    /// 誰も通せないと分かった今が、状態を確かめる価値の最も高い瞬間なので、
-    /// 次の周期を待つ理由がない。同時に何人も聞きに行かないための札は、
-    /// こちらの経路でも変わらず効く。
-    pub fn claim_probe_now(self: &Arc<Self>, route: &str, now: i64) -> Option<Probing> {
-        self.claim(route, now, false)
+    /// どの経路も断られたとき、または窓を伴わない 429 を受けたときに使う。
+    /// どちらも「今の枠を知りたい」瞬間で、次の周期を待つ理由がない。
+    ///
+    /// それでも [`DEFAULT_BACKOFF`] だけは空ける。窓を伴わない断りはその間
+    /// どうせ締め出されているので、続けて聞いても結果を使う先がない。
+    pub fn claim_ask(self: &Arc<Self>, route: &str, now: i64) -> Option<Probing> {
+        self.claim(route, now, DEFAULT_BACKOFF)
     }
 
-    fn claim(self: &Arc<Self>, route: &str, now: i64, wait_for_interval: bool) -> Option<Probing> {
-        let key = (route.to_owned(), Scope::Everything);
-        let mut marks = self.marks();
-        let mark = marks.get_mut(&key)?;
-        if mark.denial.reason != Reason::Limited || mark.probing {
+    fn claim(self: &Arc<Self>, route: &str, now: i64, interval: i64) -> Option<Probing> {
+        let mut asked = self.asked();
+        let ask = asked.entry(route.to_owned()).or_default();
+        if ask.in_flight || (ask.asked_at != 0 && now - ask.asked_at < interval) {
             return None;
         }
-        if wait_for_interval && now - mark.seen_at < PROBE_INTERVAL {
-            return None;
-        }
-        mark.probing = true;
-        mark.seen_at = now;
+        ask.in_flight = true;
+        ask.asked_at = now;
+        ask.heard_at = now;
         Some(Probing {
             denials: Arc::clone(self),
             route: route.to_owned(),
         })
+    }
+}
+
+/// 使い切ったとみなす使用率。
+const EXHAUSTED: f64 = 100.0;
+
+/// この枠はどの範囲に効くか。
+///
+/// モデルが付かない枠 (`session` / `weekly_all`) はアカウント全体。モデルが
+/// 付く枠 (`weekly_scoped`) はそのモデル群だけ。識別子が返るならそれで
+/// 一致を見て、返らないなら表示名から形を起こす。
+fn scope_of(limit: &Limit) -> Scope {
+    if let Some(id) = &limit.model_id {
+        return Scope::Model(id.clone());
+    }
+    match &limit.model {
+        Some(name) => Scope::Models(pattern_for(name)),
+        None => Scope::Everything,
+    }
+}
+
+/// 表示名からモデルの形を起こす。`Fable` → `claude-fable-*`。
+///
+/// 名前を並べて持たない (`fable` だけ特別扱いする等をしない) のは、個別枠が
+/// 増えたときに実装を直さずに済ませるため。
+fn pattern_for(display_name: &str) -> String {
+    let name = display_name
+        .trim()
+        .to_lowercase()
+        .replace(char::is_whitespace, "-");
+    if name.starts_with("claude") {
+        format!("{name}-*")
+    } else {
+        format!("claude-{name}-*")
     }
 }
 
@@ -348,9 +449,8 @@ impl Probing {
 
 impl Drop for Probing {
     fn drop(&mut self) {
-        let key = (self.route.clone(), Scope::Everything);
-        if let Some(mark) = self.denials.marks().get_mut(&key) {
-            mark.probing = false;
+        if let Some(ask) = self.denials.asked().get_mut(&self.route) {
+            ask.in_flight = false;
         }
     }
 }
@@ -702,45 +802,202 @@ mod tests {
         assert_eq!(d.marks().len(), 1, "生きているのは今付けた 1 つだけ");
     }
 
-    /// 聞きに行っている最中の印は、期限が切れても掃除しない。
+    /// 定期の様子見は、上限で締め出している経路にだけ立てる。
     #[test]
-    fn a_probed_mark_survives_the_sweep() {
-        let d = Arc::new(Denials::new());
-        d.deny("a", limited(NOW + 10), NOW);
-        let held = d.claim_probe_now("a", NOW).expect("引き受けられる");
-
-        let later = NOW + 100;
-        d.deny("b", busy(later + 60, FABLE), later);
-        assert_eq!(d.marks().len(), 2, "札の持ち主が居る分は残す");
-        drop(held);
-    }
-
-    /// 行き場が無くなった時は、間隔を待たずに聞きに行く。
-    #[test]
-    fn an_urgent_claim_skips_the_interval() {
+    fn only_a_limited_route_is_probed_on_a_schedule() {
         let d = Arc::new(Denials::new());
         d.deny("a", limited(NOW + 100_000), NOW);
+        d.deny("b", busy(NOW + 100_000, FABLE), NOW);
 
-        assert!(d.claim_probe("a", NOW).is_none(), "間隔は空いていない");
-        let held = d.claim_probe_now("a", NOW).expect("急ぎなら引き受ける");
+        let later = NOW + PROBE_INTERVAL;
+        assert!(d.claim_probe("a", later).is_some());
         assert!(
-            d.claim_probe_now("a", NOW).is_none(),
-            "急ぎでも、同時に何人も聞きに行かない"
+            d.claim_probe("b", later).is_none(),
+            "いつ空くか分からない相手に定期的に聞いても、実費が増えるだけ"
+        );
+    }
+
+    /// 印が無い経路にも、急ぎなら聞きに行ける。
+    ///
+    /// 窓を伴わない 429 を受けた直後がこれ。印は当て推量の 60 秒しか無く、
+    /// **その中身を確かめるために聞く**。
+    #[test]
+    fn an_urgent_ask_does_not_need_a_mark() {
+        let d = Arc::new(Denials::new());
+        let held = d.claim_ask("a", NOW).expect("印が無くても引き受ける");
+        assert_eq!(held.route(), "a");
+        assert!(
+            d.claim_ask("a", NOW).is_none(),
+            "聞いている最中は誰も割り込まない"
         );
         drop(held);
     }
 
-    /// 急ぎでも、混雑にはやはり聞きに行かない。
+    /// 急ぎでも、続けざまには聞かない。
+    ///
+    /// 窓を伴わない断りはその間どうせ締め出されているので、続けて聞いても
+    /// 結果を使う先がない。
     #[test]
-    fn an_urgent_claim_still_skips_congestion() {
+    fn an_urgent_ask_still_leaves_a_gap() {
         let d = Arc::new(Denials::new());
-        d.deny("a", busy(NOW + 60, FABLE), NOW);
-        assert!(d.claim_probe_now("a", NOW).is_none());
+        drop(d.claim_ask("a", NOW).expect("1 回目"));
+        assert!(d.claim_ask("a", NOW + DEFAULT_BACKOFF - 1).is_none());
+        assert!(d.claim_ask("a", NOW + DEFAULT_BACKOFF).is_some());
     }
 
     #[test]
-    fn an_unmarked_route_is_not_probed() {
+    fn an_unmarked_route_is_not_probed_on_a_schedule() {
         let d = Arc::new(Denials::new());
         assert!(d.claim_probe("a", NOW).is_none());
+    }
+
+    fn limit(kind: &str, percent: f64, model: Option<&str>, resets_at: Option<&str>) -> Limit {
+        Limit {
+            kind: kind.to_owned(),
+            percent,
+            severity: None,
+            resets_at: resets_at.map(str::to_owned),
+            model: model.map(str::to_owned),
+            model_id: None,
+            // 実測どおり、塞がっていない枠でも立つ。判断には使わない。
+            is_active: true,
+        }
+    }
+
+    /// NOW の 5000 秒後。枠の開く時刻は小数秒つきで返ってくる。
+    const RESET_ISO: &str = "2027-01-15T09:23:20.571539+00:00";
+    const RESET: i64 = NOW + 5000;
+
+    /// アカウント全体に掛かる枠を使い切ったら、全モデルを締め出す。
+    #[test]
+    fn an_exhausted_account_limit_closes_every_model() {
+        let d = Denials::new();
+        d.apply_limits(
+            "a",
+            &[limit("weekly_all", 100.0, None, Some(RESET_ISO))],
+            NOW,
+        );
+        for model in [FABLE, HAIKU] {
+            assert_eq!(
+                d.get("a", model, NOW),
+                Some(limited(RESET + RESET_SLACK)),
+                "{model}"
+            );
+        }
+    }
+
+    /// モデル別の枠を使い切ったら、そのモデル群だけを締め出す。
+    #[test]
+    fn an_exhausted_scoped_limit_closes_only_its_models() {
+        let d = Denials::new();
+        d.apply_limits(
+            "a",
+            &[limit(
+                "weekly_scoped",
+                100.0,
+                Some("Fable"),
+                Some(RESET_ISO),
+            )],
+            NOW,
+        );
+        assert_eq!(
+            d.get("a", FABLE, NOW),
+            Some(Denial {
+                until: RESET + RESET_SLACK,
+                reason: Reason::Limited,
+                scope: Scope::Models("claude-fable-*".to_owned()),
+            })
+        );
+        assert_eq!(d.get("a", HAIKU, NOW), None, "他のモデルは巻き込まない");
+    }
+
+    /// 使い切っていない枠は、その範囲の印を消す。
+    #[test]
+    fn a_limit_below_the_line_reopens_its_scope() {
+        let d = Denials::new();
+        let exhausted = [
+            limit("weekly_all", 100.0, None, Some(RESET_ISO)),
+            limit("weekly_scoped", 100.0, Some("Fable"), Some(RESET_ISO)),
+        ];
+        d.apply_limits("a", &exhausted, NOW);
+        assert!(d.get("a", FABLE, NOW).is_some());
+
+        let opened = [
+            limit("weekly_all", 99.9, None, Some(RESET_ISO)),
+            limit("weekly_scoped", 0.0, Some("Fable"), Some(RESET_ISO)),
+        ];
+        d.apply_limits("a", &opened, NOW);
+        assert_eq!(d.get("a", FABLE, NOW), None);
+        assert_eq!(d.get("a", HAIKU, NOW), None);
+    }
+
+    /// 片方だけ開いても、もう片方が塞がっていれば締め出しは残る。
+    #[test]
+    fn reopening_one_scope_leaves_the_other_closed() {
+        let d = Denials::new();
+        d.apply_limits(
+            "a",
+            &[
+                limit("weekly_all", 100.0, None, Some(RESET_ISO)),
+                limit("weekly_scoped", 100.0, Some("Fable"), Some(RESET_ISO)),
+            ],
+            NOW,
+        );
+        d.apply_limits(
+            "a",
+            &[limit("weekly_all", 12.0, None, Some(RESET_ISO))],
+            NOW,
+        );
+
+        assert!(d.get("a", FABLE, NOW).is_some(), "Fable の枠は塞がったまま");
+        assert_eq!(d.get("a", HAIKU, NOW), None, "全体の枠は開いた");
+    }
+
+    /// いつ開くか分からない枠では締め出さない。戻す時刻を決められない。
+    #[test]
+    fn an_exhausted_limit_without_a_reset_is_not_used() {
+        let d = Denials::new();
+        d.apply_limits("a", &[limit("session", 100.0, None, None)], NOW);
+        assert_eq!(d.get("a", FABLE, NOW), None);
+    }
+
+    /// 通ったモデルに効いていた印は、形で括った分も含めて全部消す。
+    #[test]
+    fn success_clears_the_pattern_that_covered_the_model() {
+        let d = Denials::new();
+        d.apply_limits(
+            "a",
+            &[limit(
+                "weekly_scoped",
+                100.0,
+                Some("Fable"),
+                Some(RESET_ISO),
+            )],
+            NOW,
+        );
+        d.allow("a", FABLE);
+        assert_eq!(d.get("a", FABLE, NOW), None);
+    }
+
+    /// 表示名からモデルの形を起こす。名前を並べて持たない。
+    #[test]
+    fn a_display_name_becomes_a_model_pattern() {
+        assert_eq!(pattern_for("Fable"), "claude-fable-*");
+        assert_eq!(pattern_for(" Opus "), "claude-opus-*");
+        assert_eq!(pattern_for("Claude Sonnet"), "claude-sonnet-*");
+        assert!(Scope::Models(pattern_for("Fable")).covers(FABLE));
+        assert!(!Scope::Models(pattern_for("Fable")).covers(HAIKU));
+    }
+
+    /// 識別子が返るなら、それで一致を見る (今の実測では返らない)。
+    #[test]
+    fn an_identifier_is_matched_exactly() {
+        let mut with_id = limit("weekly_scoped", 100.0, Some("Fable"), Some(RESET_ISO));
+        with_id.model_id = Some(FABLE.to_owned());
+
+        let d = Denials::new();
+        d.apply_limits("a", &[with_id], NOW);
+        assert!(d.get("a", FABLE, NOW).is_some());
+        assert_eq!(d.get("a", "claude-fable-6", NOW), None, "完全一致で見る");
     }
 }
