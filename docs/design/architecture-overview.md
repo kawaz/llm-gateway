@@ -226,7 +226,25 @@ capability の非対称は optional 取得 (`fn quota_api(&self) -> Option<&dyn 
 3. **Metering の OpenAI 実装** → usage 形式差の吸収、単価表追加、429 意味論の読み方
 4. **QuotaApi**: OpenAI に相当 API があるか要調査。無ければ None で denial のみ運用
 
-### 7.6 残論点
+### 7.6 composite provider (kawaz 裁定 2026-08-04)
+
+Bedrock は「独自 Auth + 通訳は他 provider へ委譲」の composite preset として表現する
+(DR-0004 の composition provider が小 trait 束で初めて素直に書ける):
+
+```
+BedrockProvider (preset)
+├ Auth     = SigV4 (独自)
+├ Wire     = モデルに応じて Anthropic / OpenAI の Wire へ委譲
+│            + Bedrock 差分の薄い wrapper (model ID 体系の map、
+│              anthropic_version フィールド、エンドポイント形状)
+├ Metering = 委譲先の抽出 + Bedrock 固有ヘッダの差分
+└ QuotaApi = None (枠照会 API が無い)
+```
+
+検証基準: 「Anthropic の Wire を書き直さずに Bedrock が再利用できるか」が
+trait の切り方の試金石 (Gemini 追加より先に手元で試せる)。
+
+### 7.7 残論点
 
 - §5.3 の語彙裁定 (relay→observe は exchange へ吸収、usage→quota、backend trait の
   改名) を新語彙 (ingress/egress/exchange/provider) と整合させて確定する
