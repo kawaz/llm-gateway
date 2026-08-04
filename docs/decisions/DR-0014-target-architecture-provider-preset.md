@@ -27,7 +27,7 @@ OpenAI (Responses API) は認証も枠の概念も応答形式も違う。この
 
 語彙も既に乱れている (`docs/design/architecture-overview.md` §5.2)。特に
 **`provider` が二重定義** — backend trait の名前と、DR-0004 が導入する
-「話す API 名」が衝突している (§5.2-e)。この裁定は codex 対応の実装前に必須。
+「話す API 名」が衝突している (overview §5.2-e)。この裁定は codex 対応の実装前に必須。
 
 境界と IF を先に整理する。骨格の正本は同文書 §7。
 
@@ -49,7 +49,7 @@ OpenAI (Responses API) は認証も枠の概念も応答形式も違う。この
 ingress / egress は**場所**の名前であり、**そこに立つ実装が provider** である。
 
 現 module `relay` は「中継」の名前を持ちながら実体は観測専用という乱れが
-あった (§5.2-a)。これは **exchange に吸収する** — 1 転送の生涯を持つ型に
+あった (overview §5.2-a)。これは **exchange に吸収する** — 1 転送の生涯を持つ型に
 観測フックが掛かる、という形が実体に一致する。
 
 ### 2. provider = 小 trait の束
@@ -104,7 +104,31 @@ Anthropic」— 認証の軸と方言の軸が**直交している実証**であ
 現れたなら、それは provider 固有の知識が core へ漏れている印であり、
 3 つ目の provider を足すときに同じ場所を再び触ることになる。
 
-### 4. 内部正規形 = Anthropic Messages 形式
+### 4. 集計の正規形も core の IO 規約
+
+**トークン集計・料金集計のレコード形も core が規定する。** provider の
+`Metering` は、自方言の usage を**正規レコードへ写像する**責務を負う。
+
+現 `stats` は Anthropic 形のトークン区分 (input / output / cache_creation /
+cache_read) を前提にしている。OpenAI は区分が異なる (reasoning tokens /
+cached input 等)。ここを規約化しないと、provider ごとに集計ファイルの形が
+変わり、日次ファイルを 1 本の writer で書く前提 (本 DR §3 の横断機構) が崩れる。
+
+| 側 | 持つもの |
+|---|---|
+| core | 正規化済み集計レコード — トークン区分の分類学、集計キー (日 × credential × モデル)、単価適用の形 |
+| provider (`Metering`) | 自方言 usage → 正規レコードへの写像 |
+
+- **単価適用の形は現行を維持する。** 読み出し時に USD 換算する
+  (DR-0011 / `pricing` の方針を変えない)
+- **区分が対応しない場合の規則も IF で決める** — 落とす / other に寄せる /
+  新区分を core に追加提案する、のいずれを取るか
+- **正規形は閉じた enum にしない。** トークン区分は provider 追加で増えうる。
+  拡張可能な形にする
+
+分類学の具体形 (どの区分を core が持つか、拡張の表現手段) は**未確定**。
+
+### 5. 内部正規形 = Anthropic Messages 形式
 
 中立 IR は**新設しない**。内部正規形は Anthropic Messages 形式とし、
 egress の `Wire` が方言変換を担う。
@@ -117,7 +141,7 @@ tool use / SSE イベントの対応付け / beta 機能の表現で変換の完
 将来 OpenAI 方言のクライアントを受ける場合に備え、
 **「ingress アダプタ → 正規形」を足す拡張点だけを型で確保**する。実装はしない。
 
-### 5. composite provider (Bedrock)
+### 6. composite provider (Bedrock)
 
 Bedrock は「独自 Auth + 通訳は他 provider へ委譲」の **composite preset** として
 表現する。DR-0004 が置いた composition provider は、小 trait の束になって初めて
@@ -137,14 +161,15 @@ BedrockProvider (preset)
 再利用できるか」。Gemini 追加のような将来の話を待たず、**手元で今すぐ試せる**
 検証である。書き直しが要るなら trait の切り方が間違っている。
 
-### 6. codex 対応の実装部品
+### 7. codex 対応の実装部品
 
 上記骨格への当てはめ。
 
 1. **ChatGPT OAuth (PKCE + refresh)** → `credential/` の Kind 追加 + OpenAI 用 `Auth` 実装
 2. **Responses API egress** → `Wire` の 2 個目の実装 (Messages → Responses 変換、
    SSE 逆変換、effort 変換表を含む)
-3. **Metering の OpenAI 実装** → usage 形式差の吸収、単価表追加、429 意味論の読み方
+3. **Metering の OpenAI 実装** → 自方言 usage → 正規集計レコードへの写像
+   (reasoning tokens / cached input 等の区分差)、単価表追加、429 意味論の読み方
 4. **QuotaApi** → OpenAI に相当 API があるか要調査。無ければ `None` で denial のみ運用
 
 ## Alternatives Considered
@@ -167,25 +192,28 @@ BedrockProvider (preset)
 
 ## Consequences
 
-- `backend/` は egress へ、module `relay` (観測) は exchange へ移る。§5.2 の
+- `backend/` は egress へ、module `relay` (観測) は exchange へ移る。overview §5.2 の
   語彙裁定 (a / e) が構造の変更と同時に消化される
 - `Provider` trait の分解に伴い、`Provider::needs_credential()` の dead code
-  (§6-#6) は分解の過程で消える
+  (overview §6-#6) は分解の過程で消える
 - DR-0004 の credential 3 軸 (`type` / `provider` / 範囲) は、この trait 構成の
   上で意味を持つ。`provider` の値が preset を指し、`type` が `Auth` に渡る
   payload の形を決める
 - 死蔵メタデータ (StoredCredential の priority / disabled / excluded_models、
-  §6-#2) の去就は、状態の所有が provider 側へ移る本再設計の中で決める
+  overview §6-#2) の去就は、状態の所有が provider 側へ移る本再設計の中で決める
+- `stats` の集計レコード形が Anthropic 形の区分から正規形へ変わる。DR-0011 の
+  日次ファイル運用 (writer 毎・日 × credential × モデル) と読み出し時 USD 換算は
+  維持されるが、レコード内のトークン区分の表現は変わる
 - core のテストに provider 名が現れなくなる方向へ寄せる (判定基準の副産物)。
   provider 固有の振る舞いのテストは provider preset 側へ移る
 
 ### やらないこと
 
-- **中立 IR の新設** — §4 のとおり。拡張点を型で確保するに留める
+- **中立 IR の新設** — 本 DR §5 のとおり。拡張点を型で確保するに留める
 - **OpenAI 方言 ingress の実装** — 受ける需要が現れてから
 - **effort 変換表の config 化** — `Wire` 内の定数から始める。調整需要が出てから
   config へ出す
-- **§6 の乖離の一括解消** — 8 件のうち本再設計に統合するのは #1 (DR-0004 未着手) と
+- **overview §6 の乖離の一括解消** — 8 件のうち本再設計に統合するのは #1 (DR-0004 未着手) と
   #2 (死蔵メタデータ) のみ。残りは独立に潰せるので、この再設計を待たせない
 
 ## 未確定
@@ -194,24 +222,29 @@ BedrockProvider (preset)
 
 - **全滅時の自前 429 生成の置き場所**。「候補が空」の判断 = router の責務、と
   置くのが素直だが要確認 (現在は gateway が生成し、events に出ないという
-  別の乖離 §6-#8 も抱えている)
-- **§5.3 の語彙裁定の最終形**。`relay` → observe (本 DR では exchange へ吸収)、
+  別の乖離 overview §6-#8 も抱えている)
+- **overview §5.3 の語彙裁定の最終形**。`relay` → observe (本 DR では exchange へ吸収)、
   `usage` → `quota`、backend trait の改名を、新語彙
   (ingress / egress / exchange / provider) と整合させて確定する必要がある。
-  §5.2 の d / f / g / h / i / j は、この裁定後に機械的に追従できる
+  overview §5.2 の d / f / g / h / i / j は、この裁定後に機械的に追従できる
 - **OpenAI に枠照会 API 相当が存在するか**。存在しなければ `QuotaApi = None` で
   denial のみの運用になる (要調査)
 - **`provider` と `type` の組み合わせ制約を型で表すか実行時検証にするか**
   (DR-0004 から持ち越し)
+- **集計正規形のトークン区分の分類学**。core がどの区分を持つか、拡張可能な形を
+  どう表現するか (閉じた enum にしないことだけが決まっている)、対応しない区分の
+  規則 (落とす / other に寄せる / core への追加提案) のどれを既定にするか
 
 ## 関連
 
 - [DR-0004](./DR-0004-credential-axes.md) — credential の 2 軸分離。**本 DR は
   DR-0004 の 2 軸分離を trait 構成として具体化する** (認証の軸 = `Auth`、
   話す API の軸 = `Wire` + `Metering`)。DR-0004 の composition provider は
-  §5 の composite preset として実装形を得る
+  本 DR §6 の composite preset として実装形を得る
 - [DR-0002](./DR-0002-component-architecture.md) — OpenAI 変換を Phase 2 に
   置いた判断。本 DR はその Phase 2 に入る前の境界整理
 - [DR-0003](./DR-0003-beta-flag-negotiation.md) — beta フラグ学習。provider 固有
   機能の optional 取得の例
+- [DR-0011](./DR-0011-daily-usage-stats.md) — 日次集計。本 DR §4 の正規レコードは
+  この集計キーと単価適用の形を引き継ぐ
 - `docs/design/architecture-overview.md` §7 — 本 DR の骨格の正本 (議論の全文)
