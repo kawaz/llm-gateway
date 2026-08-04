@@ -158,25 +158,70 @@ POST /ns-x/v1/messages
 | 7 | 能動プローブの消費トークンが日次集計に入らない | 意図か漏れか未裁定 |
 | 8 | AllDenied の自前 429 が events に出ない (webhook/SSE から見えない) | イベント網羅性 |
 
-## 7. codex ネイティブ対応を見据えた設計論点
+## 7. 目標アーキテクチャ (2026-08-04 議論で合意した骨格)
 
-背景: codex (ChatGPT OAuth) を relay (cliproxyapi) でなくネイティブ対応する方針
+背景: codex (ChatGPT OAuth) を relay (cliproxyapi) でなくネイティブ対応する
 (kawaz 裁定 2026-08-03。OAuth は gateway が独立ログインで自前保持、`~/.codex/auth.json`
-とは並走しない)。
+とは並走しない)。この対応を「provider が初めて複数になる」契機として、境界と IF を
+先に整理する。
 
-必要部品は 3 つで、置き場所が論点:
+### 7.1 三境界の語彙 (kawaz 裁定 2026-08-04)
 
-1. **ChatGPT OAuth (PKCE + refresh)** → `credential/` の Kind 追加。既存 OAuth 基盤の増分
-2. **Responses API への転送** → backend に 2 個目の API 実装。現 `backend/anthropic/` の
-   命名・trait (`Provider`) が Anthropic 前提なので、DR-0004 の 2 軸
-   (認証方式 × 話す API) をここで実装するのが正道
-3. **Anthropic Messages ↔ Responses API 変換 (SSE 含む)** → 新モジュール。
-   relay 層 (観測) とは独立した「変換層」として backend 側に置くのが統括推し
-   (観測は素通し前提を保ち、変換は backend アダプタの責務とする)
+| 語 | 意味 |
+|---|---|
+| **ingress** | 入口。クライアント方言 (現状 Anthropic Messages のみ) を受けて正規形 + メタ (ns, model, SessionKey, prefix) にする層。現 server の parse/authorize が該当 |
+| **egress** | 出口。正規形を upstream 方言へ変換して送る層 (現 `backend/`) |
+| **exchange** | 1 転送の生涯を持つ型。観測フック (usage 抽出 / stats tap / 節目記録 / events publish) の掛け先。現 `relay` (観測) はここに吸収 |
 
-派生論点:
+相手方の呼称は既存語彙のまま `client` / `upstream` を維持 (レイヤ名と相手方名を分離)。
+ingress/egress は「場所」の名前で、そこに立つ実装が **provider**。
 
-- denial の適用: 429 系の意味論が OpenAI 側で同じか (retry-after / 枠 API の有無)
-- stats/pricing: OpenAI モデルの単価表追加、usage 形式差の吸収
-- limits 相当: OpenAI に非公開枠 API があるか (無ければ denial のみで運用)
-- 語彙: §5.3 の e (provider) を先に裁定しないと config スキーマが決められない
+### 7.2 provider = 小 trait の束 (kawaz 裁定 2026-08-04)
+
+一枚岩の trait でなく、責務ごとの小 trait に割り、provider はその束:
+
+| trait | 責務 (provider 毎に違う「方言」) |
+|---|---|
+| `Auth` | 認証フロー (OAuth PKCE パラメータ・refresh・SigV4 等) |
+| `Wire` | リクエスト変換 + 送信。**パラメータ意味論の変換表を含む** (例: Anthropic の effort/thinking → OpenAI `reasoning.effort`。対応の無いパラメータの取捨も同表) |
+| `Metering` | 応答からの抽出 — 枠ヘッダ → quota スナップショット、本文 usage → トークン数、拒否シグナル (429/retry-after) の読み方、単価表 |
+| `QuotaApi` (optional) | 枠照会 API の叩き方 (Anthropic OAuth のみ存在。Bedrock には無い) |
+
+capability の非対称は optional 取得 (`fn quota_api(&self) -> Option<&dyn QuotaApi>` 的な形)
+で表現する。beta フラグ学習のような provider 固有機能も同様。
+
+小 trait 分割の根拠: 既存の Bedrock が「認証は SigV4 だが方言は Anthropic」という
+組み合わせ = 軸が直交している実証 (DR-0004 の 2 軸分離と同型)。
+
+### 7.3 方言 (dialect) と機構 (mechanism) の分離
+
+provider 側に持たせるのは**方言 = parse/format/変換表**のみ。状態と機構は core に残す:
+
+- core 残留: denial の状態機械 (印の付与/解除/Drop 解除)、stats の集計・永続化、
+  affinity、イベント配信、credential store の排他
+- core は provider が抽出した「正規化済みの値」を受け取るだけ。
+  こうしないと状態管理が provider 実装ごとに複製される
+
+### 7.4 内部正規形
+
+中立 IR は新設しない。**内部正規形 = Anthropic Messages 形式** とし、egress の `Wire` が
+方言変換を担う。理由: クライアントが Claude Code (Anthropic 方言) であり、中立 IR は
+変換の完全性 (tool use / SSE イベント対応付け / beta 機能) で沼る。将来 OpenAI 方言の
+クライアントを受ける場合は「ingress アダプタ → 正規形」を足す拡張点だけ型で確保。
+
+### 7.5 codex 対応の実装部品 (上記骨格への当てはめ)
+
+1. **ChatGPT OAuth (PKCE + refresh)** → `credential/` の Kind 追加 + OpenAI 用 `Auth` 実装
+2. **Responses API egress** → `Wire` の 2 個目の実装 (Messages → Responses 変換、SSE 逆変換、
+   effort 変換表を含む)
+3. **Metering の OpenAI 実装** → usage 形式差の吸収、単価表追加、429 意味論の読み方
+4. **QuotaApi**: OpenAI に相当 API があるか要調査。無ければ None で denial のみ運用
+
+### 7.6 残論点
+
+- §5.3 の語彙裁定 (relay→observe は exchange へ吸収、usage→quota、backend trait の
+  改名) を新語彙 (ingress/egress/exchange/provider) と整合させて確定する
+- 数値 budget → 離散 effort の対応表は egress `Wire` 内の定数から始める
+  (調整需要が出たら config へ出す)
+- §6 の乖離 8 件のうち、DR-0004 未着手 (#1) と死蔵メタデータ (#2) は本再設計に統合。
+  それ以外は独立に潰せる
