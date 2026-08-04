@@ -172,6 +172,15 @@ BedrockProvider (preset)
    (reasoning tokens / cached input 等の区分差)、単価表追加、429 意味論の読み方
 4. **QuotaApi** → OpenAI に相当 API があるか要調査。無ければ `None` で denial のみ運用
 
+### 8. 語彙改名と全滅時 429 の置き場 (kawaz 裁定 2026-08-04, VG-Q1/Q2)
+
+- **`usage.rs` (枠ヘッダ観測) → `quota` に改名**。"usage" の語は token usage (stats) に譲る
+- **`limits` (枠照会) も quota 語彙圏へ寄せる** (`quota::poll` 等、細部は実装時に確定)
+- **config type の `relay` (素通し転送先) は現名のまま残す**
+- **全滅時の自前 429 生成は router の責務** (「候補が空」の判断として)。
+  あわせて events にも出すよう直す (overview §6-#8 の乖離を解消)
+- overview §5.2 の d / f / g / h / i / j はこの裁定に機械的に追従する (裁定不要)
+
 ## Alternatives Considered
 
 **一枚岩の `Provider` trait を維持し、実装を増やす** — Bedrock が既に
@@ -220,15 +229,9 @@ BedrockProvider (preset)
 
 以下は本 DR では確定させない。実装着手前または着手中に別途裁定する。
 
-- **全滅時の自前 429 生成の置き場所**。「候補が空」の判断 = router の責務、と
-  置くのが素直だが要確認 (現在は gateway が生成し、events に出ないという
-  別の乖離 overview §6-#8 も抱えている)
-- **overview §5.3 の語彙裁定の最終形**。`relay` → observe (本 DR では exchange へ吸収)、
-  `usage` → `quota`、backend trait の改名を、新語彙
-  (ingress / egress / exchange / provider) と整合させて確定する必要がある。
-  overview §5.2 の d / f / g / h / i / j は、この裁定後に機械的に追従できる
-- **OpenAI に枠照会 API 相当が存在するか**。存在しなければ `QuotaApi = None` で
-  denial のみの運用になる (要調査)
+- **OpenAI の枠照会 API の実機検証**。静的調査では `GET /backend-api/wham/usage` が
+  存在する (findings 2026-08-04-openai-codex-native-spec)。実アカウントでの応答形式の
+  確認が残る
 - **`provider` と `type` の組み合わせ制約を型で表すか実行時検証にするか**
   (DR-0004 から持ち越し)
 - **集計正規形のトークン区分の分類学**。core がどの区分を持つか、拡張可能な形を

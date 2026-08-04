@@ -20,20 +20,7 @@
 
 ## 裁定待ち
 
-### VG-Q1: 語彙改名の最終形 ([architecture-overview §5.3](./design/architecture-overview.md)、[DR-0014 未確定](./decisions/DR-0014-target-architecture-provider-preset.md))
-
-DR-0014 の新語彙 (ingress/egress/exchange/provider) と整合させる改名。
-統括推しは全部 a。d〜j の機械的追従は裁定不要 (改名確定後に実施)。
-
-- [ ] a1: `usage.rs` (枠ヘッダ観測) → `quota` に改名、"usage" の語は token usage (stats) に譲る
-- [ ] a2: `limits` (枠照会) も quota 語彙圏へ寄せる (`quota::poll` 等、実装時に確定)
-- [ ] a3: config type の `relay` (素通し転送先) は現名のまま残す
-- [ ] b: a1-a3 の代案があればチャットで
-
-### VG-Q2: 全滅時 429 生成の置き場 (DR-0014 未確定)
-
-- [ ] a: router の責務 (「候補が空」の判断として)。events にも出すよう合わせて直す (現状出ない = overview §6-#8)
-- [ ] b: 現状どおり gateway (パイプライン骨格) 側に置く
+（現在なし）
 
 ## 確認待ち
 
