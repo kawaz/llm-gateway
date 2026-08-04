@@ -15,6 +15,7 @@
 - [DR-0011](./DR-0011-daily-usage-stats.md) — 応答本文の usage を relay の外の tap で覗き、credential × モデル × 日で積んで writer 毎の日次ファイルに残す (/llm-gateway/stats)
 - [DR-0012](./DR-0012-request-events.md) — 転送のたびに起きたことを SSE で流す (/llm-gateway/events)。prompt cache の 5 分を外から数えられるようにする
 - [DR-0013](./DR-0013-config-extends.md) — 設定は `extends` で土台の上に重ねる (表は鍵ごとにマージ、配列は置換、消す手段は持たない)
+- [DR-0014](./DR-0014-target-architecture-provider-preset.md) — 目標アーキテクチャ: 三境界 (ingress/egress/exchange) と provider = 小 trait の束 (Auth/Wire/Metering/QuotaApi)。core は provider の名前を 1 つも知らない
 
 ## Archived
 
