@@ -244,7 +244,20 @@ BedrockProvider (preset)
 検証基準: 「Anthropic の Wire を書き直さずに Bedrock が再利用できるか」が
 trait の切り方の試金石 (Gemini 追加より先に手元で試せる)。
 
-### 7.7 残論点
+### 7.7 集計の正規形 (kawaz 指摘 2026-08-04)
+
+トークン集計・料金集計のレコード形も core の IO 規約として固める。
+現 stats は Anthropic 形のトークン区分 (input / output / cache_creation / cache_read)
+を前提にしているが、OpenAI は区分が異なる (reasoning tokens / cached input 等)。
+
+- core が規定: 正規化済み集計レコード (トークン区分の分類学、日×credential×モデルの
+  集計キー、単価適用の形 = 読み出し時 USD 換算は維持)
+- provider の Metering が写像: 自方言の usage → 正規レコード。区分が対応しない場合の
+  規則 (落とす/other に寄せる/新区分を core に追加提案) も IF で決めておく
+- トークン区分は provider 追加で増えうるので、正規形は閉じた enum でなく
+  拡張可能な形にする (詳細は DR 起草時に詰める)
+
+### 7.8 残論点
 
 - §5.3 の語彙裁定 (relay→observe は exchange へ吸収、usage→quota、backend trait の
   改名) を新語彙 (ingress/egress/exchange/provider) と整合させて確定する
