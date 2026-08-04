@@ -193,14 +193,23 @@ capability の非対称は optional 取得 (`fn quota_api(&self) -> Option<&dyn 
 小 trait 分割の根拠: 既存の Bedrock が「認証は SigV4 だが方言は Anthropic」という
 組み合わせ = 軸が直交している実証 (DR-0004 の 2 軸分離と同型)。
 
-### 7.3 方言 (dialect) と機構 (mechanism) の分離
+### 7.3 core = IF 規定、provider = impl の preset (kawaz 裁定 2026-08-04)
 
-provider 側に持たせるのは**方言 = parse/format/変換表**のみ。状態と機構は core に残す:
-
-- core 残留: denial の状態機械 (印の付与/解除/Drop 解除)、stats の集計・永続化、
-  affinity、イベント配信、credential store の排他
-- core は provider が抽出した「正規化済みの値」を受け取るだけ。
-  こうしないと状態管理が provider 実装ごとに複製される
+- **core が持つのは状態機構の IF 規定** (trait と入出力の契約、共通の状態機械型)。
+  denial の印の付け外し・quota スナップショット・metering の抽出結果などの
+  「型と契約」は core が規定する
+- **provider はその IF の provider 毎 impl を preset として束ねて持つ**。
+  per-credential / per-route の状態 (denial の印、quota、beta 学習、枠照会
+  スケジュール) の所有も provider 側。router は各 route に「今使えるか?」と
+  聞くだけ (tell-don't-ask、現在の「core が route 名 String をキーに map を持つ」
+  構造を置き換える)
+- **横断機構のみ core が所有** — ドメインが provider 間比較・全 provider 合流で
+  あるものは定義上 provider の外:
+  - affinity (session → route は provider **間**で選ぶための状態)
+  - event bus (購読者は全 provider のイベントを 1 本のストリームで欲しい。
+    発火は各 provider、bus は 1 個)
+  - stats writer (日次ファイルの writer は 1 本。抽出は provider、書く先は共有)
+- 全滅時の自前 429 生成は「候補が空」の判断 = router の責務に置く (要確認)
 
 ### 7.4 内部正規形
 
