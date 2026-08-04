@@ -1,0 +1,671 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-gateway 全体設計</title>
+<style>
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --surface-2: #eef1f3;
+  --ink: #1b2126;
+  --ink-2: #4a555f;
+  --muted: #6e7a85;
+  --line: #dbe0e5;
+  --line-strong: #c2cad2;
+  --accent: #2c5c7a;
+  --accent-ink: #1f4459;
+  --accent-soft: #e6eef3;
+  --sev-hi: #9c4038;
+  --sev-hi-bg: #f6e9e7;
+  --sev-mid: #7d6224;
+  --sev-mid-bg: #f5efe0;
+  --sev-lo: #5a6570;
+  --sev-lo-bg: #ecedef;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+          "Noto Sans JP", "Yu Gothic", Meiryo, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121619;
+    --surface: #1a1f24;
+    --surface-2: #222930;
+    --ink: #dee4e9;
+    --ink-2: #b0bac3;
+    --muted: #8b96a0;
+    --line: #2a3138;
+    --line-strong: #3a434c;
+    --accent: #79aecb;
+    --accent-ink: #9cc6dd;
+    --accent-soft: #1d2b34;
+    --sev-hi: #d99188;
+    --sev-hi-bg: #2e2020;
+    --sev-mid: #cbae70;
+    --sev-mid-bg: #2b2620;
+    --sev-lo: #9aa5af;
+    --sev-lo-bg: #242a30;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.75;
+  overflow-x: hidden;
+}
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+code {
+  background: var(--surface-2);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+}
+a { color: var(--accent); }
+
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px 96px; }
+
+/* ---------- header ---------- */
+header.page {
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  padding: 44px 0 32px;
+  margin-bottom: 40px;
+}
+header.page h1 {
+  font-size: 27px;
+  letter-spacing: 0.01em;
+  margin: 0 0 10px;
+  font-weight: 650;
+}
+header.page .lede { color: var(--ink-2); max-width: 62ch; margin: 0 0 18px; }
+.meta {
+  display: flex; flex-wrap: wrap; gap: 8px 10px;
+  font-size: 12.5px; color: var(--muted);
+}
+.pill {
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 2px 11px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.pill.now { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- sections ---------- */
+section { margin: 0 0 64px; scroll-margin-top: 16px; }
+.sec-head { border-top: 2px solid var(--ink); padding-top: 12px; margin-bottom: 22px; }
+.sec-num {
+  font-family: var(--mono); font-size: 12px; color: var(--accent);
+  letter-spacing: 0.08em; display: block; margin-bottom: 2px;
+}
+.sec-head h2 { font-size: 20px; margin: 0; font-weight: 640; letter-spacing: 0.01em; }
+.sec-head p { margin: 8px 0 0; color: var(--ink-2); font-size: 14px; max-width: 70ch; }
+h3 {
+  font-size: 15px; font-weight: 640; margin: 32px 0 12px;
+  color: var(--ink);
+}
+h3:first-child { margin-top: 0; }
+
+/* ---------- flow ---------- */
+.flow-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 24px 22px 20px;
+}
+.flow { display: flex; align-items: stretch; gap: 0; min-width: 1000px; }
+.stage { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+.stage-hd {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;
+}
+.stage-hd .owner {
+  display: inline-block; padding: 1px 6px; border-radius: 3px;
+  background: var(--surface-2); color: var(--ink-2);
+}
+.stage-hd .owner.core { background: var(--accent-soft); color: var(--accent-ink); }
+.card {
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  padding: 11px 12px 12px;
+  flex: 1;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.card.core { border-color: var(--accent); }
+.card .title { font-weight: 640; font-size: 13.5px; line-height: 1.4; }
+.card .title .sub { display: block; font-weight: 400; color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+.steps { list-style: none; margin: 0; padding: 0; font-size: 12.5px; line-height: 1.55; }
+.steps li { display: flex; gap: 7px; padding: 2px 0; color: var(--ink-2); }
+.steps .n {
+  flex: none; width: 15px; text-align: right;
+  font-family: var(--mono); font-size: 11px; color: var(--accent); padding-top: 1px;
+}
+.arrow {
+  flex: none; width: 26px; display: flex; align-items: center; justify-content: center;
+  color: var(--line-strong); font-size: 17px; padding-top: 22px;
+}
+.hooks { margin-top: auto; padding-top: 8px; border-top: 1px dashed var(--line-strong); }
+.hook {
+  display: block; font-family: var(--mono); font-size: 11px; line-height: 1.5;
+  color: var(--sev-mid); padding-left: 13px; position: relative;
+}
+.hook::before {
+  content: "◆"; position: absolute; left: 0; font-size: 8px; top: 1px;
+}
+.hooks .lbl {
+  font-family: var(--sans); font-size: 10.5px; letter-spacing: 0.05em;
+  color: var(--muted); text-transform: uppercase; display: block; margin-bottom: 3px;
+}
+.retry {
+  font-size: 11.5px; font-family: var(--mono); color: var(--accent-ink);
+  background: var(--accent-soft); border-radius: 3px; padding: 4px 7px; line-height: 1.45;
+}
+.legend {
+  display: flex; flex-wrap: wrap; gap: 6px 20px; margin-top: 14px;
+  font-size: 12px; color: var(--muted);
+}
+.legend .k { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { width: 11px; height: 11px; border-radius: 2px; border: 1px solid var(--line-strong); display: inline-block; }
+.swatch.core { border-color: var(--accent); background: var(--accent-soft); }
+.swatch.srv { background: var(--surface-2); }
+
+.invariants { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-top: 20px; }
+.inv {
+  border-left: 3px solid var(--accent);
+  background: var(--surface); padding: 11px 14px; border-radius: 0 4px 4px 0;
+  border-top: 1px solid var(--line); border-right: 1px solid var(--line); border-bottom: 1px solid var(--line);
+}
+.inv b { display: block; font-size: 13px; margin-bottom: 2px; }
+.inv span { font-size: 12.5px; color: var(--ink-2); }
+
+/* ---------- criterion callout ---------- */
+.criterion {
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 18px 20px;
+  margin: 24px 0;
+}
+.criterion .k {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--accent-ink); display: block; margin-bottom: 6px;
+}
+.criterion .q { font-size: 18px; font-weight: 650; color: var(--accent-ink); line-height: 1.5; margin: 0 0 8px; }
+.criterion p { margin: 0; font-size: 13px; color: var(--ink-2); }
+
+/* ---------- boundary trio ---------- */
+.trio { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.bx { border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface); padding: 14px 15px; }
+.bx .n { font-family: var(--mono); font-size: 14px; color: var(--accent); font-weight: 600; }
+.bx .d { font-size: 12.5px; color: var(--ink-2); margin-top: 5px; }
+.bx .was { font-size: 11.5px; color: var(--muted); font-family: var(--mono); margin-top: 8px; padding-top: 7px; border-top: 1px dashed var(--line); }
+
+/* ---------- trait cards ---------- */
+.traits { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.tr { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); padding: 13px 14px; }
+.tr .hd { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.tr .hd code { background: none; padding: 0; font-size: 14px; font-weight: 600; color: var(--accent); }
+.tr .opt { font-size: 10.5px; letter-spacing: 0.05em; color: var(--muted); border: 1px solid var(--line-strong); border-radius: 3px; padding: 0 5px; }
+.tr .d { font-size: 12.5px; color: var(--ink-2); }
+
+/* ---------- composite tree ---------- */
+.tree {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.85;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 5px;
+  padding: 16px 18px; overflow-x: auto; white-space: pre; color: var(--ink-2);
+}
+.tree b { color: var(--accent); font-weight: 600; }
+
+.owner-split { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.own { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); padding: 14px 15px; }
+.own h4 { margin: 0 0 8px; font-size: 13px; font-weight: 640; }
+.own ul { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-2); }
+.own li { margin-bottom: 4px; }
+.own.cross { border-color: var(--accent); }
+
+/* ---------- tables ---------- */
+.tbl-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 8px 13px; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th {
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); font-weight: 600; background: var(--surface-2);
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: none; }
+td.mod { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; color: var(--accent-ink); }
+td.id { font-family: var(--mono); font-size: 12px; color: var(--muted); width: 1%; }
+
+.sev {
+  display: inline-block; font-size: 10.5px; letter-spacing: 0.04em; font-weight: 600;
+  border-radius: 3px; padding: 1px 7px; white-space: nowrap;
+}
+.sev.hi { color: var(--sev-hi); background: var(--sev-hi-bg); }
+.sev.mid { color: var(--sev-mid); background: var(--sev-mid-bg); }
+.sev.lo { color: var(--sev-lo); background: var(--sev-lo-bg); }
+
+.norm { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-top: 16px; }
+.nm { border: 1px solid var(--line); border-left: 3px solid var(--sev-hi); border-radius: 0 4px 4px 0; background: var(--surface); padding: 11px 13px; }
+.nm .h { font-size: 12.5px; font-weight: 640; margin-bottom: 3px; }
+.nm .b { font-size: 12.5px; color: var(--ink-2); }
+
+/* ---------- open questions ---------- */
+.oq { list-style: none; margin: 0; padding: 0; counter-reset: oq; }
+.oq li {
+  border: 1px solid var(--line); border-radius: 5px; background: var(--surface);
+  padding: 13px 15px 13px 46px; position: relative; margin-bottom: 10px;
+}
+.oq li::before {
+  counter-increment: oq; content: "?" counter(oq);
+  position: absolute; left: 14px; top: 12px;
+  font-family: var(--mono); font-size: 12px; color: var(--accent); font-weight: 600;
+}
+.oq .h { font-size: 13.5px; font-weight: 640; margin-bottom: 3px; }
+.oq .b { font-size: 12.5px; color: var(--ink-2); }
+
+footer.page {
+  border-top: 1px solid var(--line); padding-top: 18px;
+  font-size: 12px; color: var(--muted);
+}
+footer.page code { font-size: 11.5px; }
+
+@media (max-width: 640px) {
+  body { font-size: 14px; }
+  .wrap { padding: 0 16px 64px; }
+  header.page h1 { font-size: 22px; }
+}
+</style>
+</head>
+<body>
+
+<header class="page">
+  <div class="wrap">
+    <h1>llm-gateway 全体設計</h1>
+    <p class="lede">
+      いま動いている構造 (v0.16.0) と、codex ネイティブ対応を契機に決めた目標骨格 (DR-0014) の 2 部構成。
+      前半は 1 リクエストがどう流れるか、後半は provider が複数になったときに境界をどこへ引くか。
+    </p>
+    <div class="meta">
+      <span class="pill now">現状 v0.16.0 / d68d4494</span>
+      <span class="pill">目標 DR-0014 (Accepted)</span>
+      <span>正本: <code>docs/design/architecture-overview.md</code> ・ <code>docs/decisions/DR-0014-target-architecture-provider-preset.md</code></span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ===== 1. データフロー ===== -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">01 — 現状</span>
+    <h2>リクエスト 1 本のデータフロー</h2>
+    <p><code>POST /ns-x/v1/messages</code> が入ってから応答ストリームが出るまで。◆ は差し込みフック (計 9 箇所)。</p>
+  </div>
+
+  <div class="flow-scroll">
+    <div class="flow">
+
+      <div class="stage">
+        <div class="stage-hd"><span class="owner srv">server</span> ingress</div>
+        <div class="card">
+          <div class="title">受理と認可<span class="sub">parse / authorize</span></div>
+          <ul class="steps">
+            <li><span class="n">①</span><span>本文読み前に通し番号を採番</span></li>
+            <li><span class="n">②</span><span>全読み (64MiB 上限) → JSON parse → ヘッダ収集</span></li>
+            <li><span class="n">③</span><span>ns 判定 → <code>Namespace::authorize</code><br><span style="color:var(--muted)">auth_token 未設定 = Open で通過</span></span></li>
+          </ul>
+          <div class="hooks">
+            <span class="lbl">hook</span>
+            <span class="hook">relay::request_span — 本文読み前</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow">→</div>
+
+      <div class="stage">
+        <div class="stage-hd"><span class="owner core">core</span> router</div>
+        <div class="card core">
+          <div class="title">経路の解決と絞り込み<span class="sub">Gateway::forward</span></div>
+          <ul class="steps">
+            <li><span class="n">④</span><span>モデル解決 (alias なら本文 rewrite) → SessionKey 導出</span></li>
+            <li><span class="n">⑤</span><span><code>routes_for</code>: 可視 credential ∩ ns の優先順 → affinity を先頭へ</span></li>
+            <li><span class="n">⑥</span><span>候補絞り。<b>全滅なら upstream を叩かず 429 自前生成</b></span></li>
+          </ul>
+          <div class="hooks">
+            <span class="lbl">hook</span>
+            <span class="hook">denials.candidates — 経路試行前</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow">→</div>
+
+      <div class="stage" style="flex: 1.35 1 0">
+        <div class="stage-hd"><span class="owner core">core</span> egress — 経路ごとに繰り返し</div>
+        <div class="card core">
+          <div class="title">経路試行<span class="sub">try_route → forward::send</span></div>
+          <ul class="steps">
+            <li><span class="n">⑦</span><span><b>acquire</b> — 期限 300s 前で refresh、single-flight</span></li>
+            <li><span class="n"></span><span><b>beta Policy</b> 適用</span></li>
+            <li><span class="n"></span><span><b>send</b> — strip → authorize → adapt → POST</span></li>
+            <li><span class="n"></span><span><b>判定</b> — 2xx: affinity 記録 + denial 解除 → return<br>401/403/429/529: denial 記録して次へ<br>5xx: 記録なしで次へ</span></li>
+          </ul>
+          <div class="retry">400 + beta なら学習して 1 回だけ再送</div>
+          <div class="hooks">
+            <span class="lbl">hook</span>
+            <span class="hook">beta Policy — 送信直前 + 400 後 1 回</span>
+            <span class="hook">usage.observe / events.publish — ヘッダ受信直後 (status 不問)</span>
+            <span class="hook">denials.deny / allow — status 判定時</span>
+            <span class="hook">probe_in_background — 締め出し検知時</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow">→</div>
+
+      <div class="stage">
+        <div class="stage-hd"><span class="owner srv">server</span> 応答</div>
+        <div class="card">
+          <div class="title">2 層の覗き見<span class="sub">tap / observe</span></div>
+          <ul class="steps">
+            <li><span class="n">⑧</span><span><b>stats::tap</b> (内側) — 本文から Tokens 抽出、送出は Drop 時</span></li>
+            <li><span class="n">⑨</span><span><b>relay::observe</b> (外側) — 節目記録 → <code>Body::from_stream</code></span></li>
+          </ul>
+          <div class="hooks">
+            <span class="lbl">hook</span>
+            <span class="hook">stats::tap — 応答ボディ内側</span>
+            <span class="hook">relay::observe — 応答ボディ外側</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="legend">
+      <span class="k"><span class="swatch srv"></span>server (薄い層)</span>
+      <span class="k"><span class="swatch core"></span>core (全ドメイン)</span>
+      <span class="k">◆ 差し込みフック</span>
+      <span class="k">札を外すのは必ず Drop — RefreshHandoff / Probing / FileGuard</span>
+    </div>
+  </div>
+
+  <div class="invariants">
+    <div class="inv">
+      <b>経路切替はクライアントへ 1 バイト書く前まで</b>
+      <span>ストリーム開始後の upstream 断は救えない。</span>
+    </div>
+    <div class="inv">
+      <b>SSE は中継でなく素通し + 覗き見</b>
+      <span>tap / observe の 2 層。イベント parse は tap の usage 抽出のみ。</span>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 2. 目標アーキテクチャ ===== -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">02 — 目標 (DR-0014)</span>
+    <h2>三境界と provider preset</h2>
+    <p>codex (ChatGPT OAuth) のネイティブ対応で provider が初めて複数になる。Anthropic 方言が構造の各所へ水平に染み込んでいる現状を、境界と IF から整理する。</p>
+  </div>
+
+  <h3>層の名前 3 つ</h3>
+  <div class="trio">
+    <div class="bx">
+      <div class="n">ingress</div>
+      <div class="d">入口。クライアント方言 (現状 Anthropic Messages のみ) を受けて、正規形 + メタ (ns, model, SessionKey, prefix) にする層。</div>
+      <div class="was">現 server の parse / authorize</div>
+    </div>
+    <div class="bx">
+      <div class="n">egress</div>
+      <div class="d">出口。正規形を upstream 方言へ変換して送る層。</div>
+      <div class="was">現 backend/</div>
+    </div>
+    <div class="bx">
+      <div class="n">exchange</div>
+      <div class="d">1 転送の生涯を持つ型。観測フック (usage 抽出 / stats tap / 節目記録 / events publish) の掛け先。</div>
+      <div class="was">現 relay (観測) を吸収</div>
+    </div>
+  </div>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch">
+    相手方の呼称は既存語彙のまま <code>client</code> / <code>upstream</code> を維持する
+    (「入口」と「入ってくる相手」は別の話)。ingress / egress は<b>場所</b>の名前であり、<b>そこに立つ実装が provider</b>。
+  </p>
+
+  <h3>provider = 小 trait の束 (preset)</h3>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch;margin-top:-4px">
+    一枚岩の <code>Provider</code> trait を持たない。分割の根拠は既存実装にある —
+    Bedrock は「認証は SigV4 だが方言は Anthropic」で、認証の軸と方言の軸が<b>直交している実証</b>。
+  </p>
+  <div class="traits">
+    <div class="tr">
+      <div class="hd"><code>Auth</code></div>
+      <div class="d">認証フロー。OAuth PKCE パラメータ・refresh・SigV4 等。</div>
+    </div>
+    <div class="tr">
+      <div class="hd"><code>Wire</code></div>
+      <div class="d">リクエスト変換 + 送信。<b>パラメータ意味論の変換表を含む</b> (例: Anthropic の effort / thinking → OpenAI <code>reasoning.effort</code>。対応の無いパラメータの取捨も同表)。</div>
+    </div>
+    <div class="tr">
+      <div class="hd"><code>Metering</code></div>
+      <div class="d">応答からの抽出 — 枠ヘッダ → quota スナップショット、本文 usage → トークン数、拒否シグナル (429 / retry-after) の読み方、単価表。</div>
+    </div>
+    <div class="tr">
+      <div class="hd"><code>QuotaApi</code><span class="opt">OPTIONAL</span></div>
+      <div class="d">枠照会 API の叩き方。Anthropic OAuth には在り、Bedrock には無い。capability の非対称は <code>Option&lt;&amp;dyn QuotaApi&gt;</code> 的な optional 取得で表し、<b>「無い」を型として示す</b>。</div>
+    </div>
+  </div>
+
+  <h3>composite provider — Bedrock</h3>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch;margin-top:-4px">
+    「独自 Auth + 通訳は他 provider へ委譲」。DR-0004 が置いた composition provider は、小 trait の束になって初めて素直に書ける。
+  </p>
+  <div class="tree"><b>BedrockProvider</b> (preset)
+├ <b>Auth</b>     = SigV4 (独自)
+├ <b>Wire</b>     = モデルに応じて Anthropic / OpenAI の Wire へ委譲
+│            + Bedrock 差分の薄い wrapper (model ID 体系の map、
+│              anthropic_version フィールド、エンドポイント形状)
+├ <b>Metering</b> = 委譲先の抽出 + Bedrock 固有ヘッダの差分
+└ <b>QuotaApi</b> = None (枠照会 API が無い)</div>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch">
+    <b>trait の切り方の試金石</b>: 「Anthropic の <code>Wire</code> を<b>書き直さずに</b> Bedrock が再利用できるか」。
+    Gemini 追加のような将来の話を待たず、手元で今すぐ試せる検証。書き直しが要るなら trait の切り方が間違っている。
+  </p>
+
+  <h3>所有の分担 — core = IF 規定、provider = impl</h3>
+  <div class="owner-split">
+    <div class="own">
+      <h4>provider が所有する状態</h4>
+      <ul>
+        <li>denial の印</li>
+        <li>quota スナップショット</li>
+        <li>beta 学習</li>
+        <li>枠照会スケジュール</li>
+      </ul>
+      <p style="font-size:12.5px;color:var(--ink-2);margin:8px 0 0">
+        router は各 route に「今使えるか?」と聞くだけ (tell-don't-ask)。
+        現在の「core が route 名 String をキーに map を持つ」構造を置き換える。
+      </p>
+    </div>
+    <div class="own cross">
+      <h4>core が所有する横断機構</h4>
+      <ul>
+        <li><b>affinity</b> — session → route は provider <b>間</b>で選ぶための状態</li>
+        <li><b>event bus</b> — 購読者は全 provider のイベントを 1 本のストリームで欲しい。発火は各 provider、bus は 1 個</li>
+        <li><b>stats writer</b> — 日次ファイルの writer は 1 本。抽出は provider、書く先は共有</li>
+      </ul>
+      <p style="font-size:12.5px;color:var(--ink-2);margin:8px 0 0">
+        ドメインが provider 間比較・全 provider 合流であるものは、定義上 provider の外にある。
+      </p>
+    </div>
+  </div>
+
+  <div class="criterion">
+    <span class="k">判定基準 — 設計が達成できたかを測る唯一の基準</span>
+    <p class="q">core のコードに <span class="mono">claude</span> / <span class="mono">openai</span> / <span class="mono">bedrock</span> といった provider 名が 1 つも現れないこと</p>
+    <p>現れたなら、それは provider 固有の知識が core へ漏れている印であり、3 つ目の provider を足すときに同じ場所を再び触ることになる。</p>
+  </div>
+
+  <h3>内部正規形 = Anthropic Messages 形式</h3>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch;margin-top:-4px">
+    中立 IR は<b>新設しない</b>。egress の <code>Wire</code> が方言変換を担う。
+    理由: クライアントが Claude Code (Anthropic 方言) である。中立 IR を挟むと tool use / SSE イベントの対応付け / beta 機能の表現で変換の完全性が沼になり、
+    しかも<b>その苦労は現在の唯一のクライアントには 1 mm も報われない</b> (Anthropic → 中立 → Anthropic の往復が増えるだけ)。
+    将来 OpenAI 方言のクライアントを受ける場合に備え、「ingress アダプタ → 正規形」を足す<b>拡張点だけを型で確保</b>する。実装はしない。
+  </p>
+
+  <h3>集計の正規形も core の IO 規約</h3>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>側</th><th>持つもの</th></tr></thead>
+      <tbody>
+        <tr><td class="mod">core</td><td>正規化済み集計レコード — トークン区分の分類学、集計キー (日 × credential × モデル)、単価適用の形</td></tr>
+        <tr><td class="mod">provider (Metering)</td><td>自方言 usage → 正規レコードへの写像</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p style="font-size:13px;color:var(--ink-2);max-width:72ch">
+    現 <code>stats</code> は Anthropic 形の区分 (input / output / cache_creation / cache_read) 前提だが、OpenAI は区分が異なる (reasoning tokens / cached input 等)。
+    規約化しないと provider ごとに集計ファイルの形が変わり、日次ファイルを 1 本の writer で書く前提が崩れる。
+    単価適用の形は現行維持 (読み出し時 USD 換算)。正規形は<b>閉じた enum にしない</b>。
+  </p>
+
+  <h3>codex 対応の実装部品</h3>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>#</th><th>部品</th><th>骨格への当てはめ</th></tr></thead>
+      <tbody>
+        <tr><td class="id">1</td><td>ChatGPT OAuth (PKCE + refresh)</td><td><code>credential/</code> の Kind 追加 + OpenAI 用 <code>Auth</code> 実装</td></tr>
+        <tr><td class="id">2</td><td>Responses API egress</td><td><code>Wire</code> の 2 個目の実装 (Messages → Responses 変換、SSE 逆変換、effort 変換表)</td></tr>
+        <tr><td class="id">3</td><td>Metering の OpenAI 実装</td><td>自方言 usage → 正規集計レコードへの写像、単価表追加、429 意味論の読み方</td></tr>
+        <tr><td class="id">4</td><td>QuotaApi</td><td>OpenAI に相当 API があるか要調査。無ければ <code>None</code> で denial のみ運用</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ===== 3. モジュール責務 ===== -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">03 — 現状</span>
+    <h2>モジュール責務</h2>
+    <p>3 crate 構成。中心は core の <code>Gateway&lt;P: Persistence&gt;</code> で、HTTP 層と CLI は薄い。core 内はハブ &amp; スポークで、周辺モジュール同士の直接依存は 3 本のみ — それ以外は<b>文字列 (名前) で疎結合</b>。</p>
+  </div>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>モジュール</th><th>責務</th></tr></thead>
+      <tbody>
+        <tr><td class="mod">config (+extends)</td><td>TOML スキーマ・起動時検証。<code>Namespace</code> にモデル→credential 解決と token 検査が同居</td></tr>
+        <tr><td class="mod">router</td><td>catalog を ns で絞り、モデル名 → <code>Vec&lt;Arc&lt;Route&gt;&gt;</code>。session affinity 保持</td></tr>
+        <tr><td class="mod">discovery</td><td>upstream <code>/v1/models</code> の取得と正規化 (Anthropic / Bedrock 差の吸収)、alias 解決</td></tr>
+        <tr><td class="mod">pattern</td><td><code>*</code> のみの glob 照合</td></tr>
+        <tr><td class="mod">credential/</td><td>取得の唯一の窓口 <code>acquire</code>。refresh single-flight、flock (DR-0010)、OAuth login</td></tr>
+        <tr><td class="mod">denial</td><td>断られた経路の一時除外 (DR-0009)。メモリのみ</td></tr>
+        <tr><td class="mod">limits</td><td><code>/api/oauth/usage</code> (非公開 API) で枠取得 (DR-0007)。トークン消費ゼロ</td></tr>
+        <tr><td class="mod">backend/anthropic*</td><td><code>Provider</code> trait (Official / Bedrock / Relay) + HTTP 送信 + beta Policy (DR-0003)</td></tr>
+        <tr><td class="mod">gateway</td><td>1 リクエストを捌く中枢 (forward / try_route / send)、能動プローブ</td></tr>
+        <tr><td class="mod">relay</td><td><b>中継しない。観測のみ</b> (初チャンク / 終端 / 途切れ / 中断の記録)。中継実体は forward.rs</td></tr>
+        <tr><td class="mod">stats</td><td>応答<b>本文</b>の usage を日 × credential × モデルで集計 (DR-0011)</td></tr>
+        <tr><td class="mod">usage</td><td>応答<b>ヘッダ</b>の枠使用率スナップショット (DR-0007)</td></tr>
+        <tr><td class="mod">events → webhook</td><td>転送イベントの broadcast (DR-0012) → 受け口へ POST</td></tr>
+        <tr><td class="mod">session</td><td>affinity キー導出のみ</td></tr>
+        <tr><td class="mod">pricing</td><td>静的単価表。コストは閲覧時計算</td></tr>
+        <tr><td class="mod">persist <span style="color:var(--muted)">(非公開)</span></td><td>tmp→rename・writer 名サニタイズ等の書き込み作法</td></tr>
+        <tr><td class="mod">error <span style="color:var(--muted)">(非公開)</span></td><td>core の Error。HTTP status 変換は server の責務</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ===== 4. 語彙の乱れ ===== -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">04 — 現状</span>
+    <h2>語彙の乱れ</h2>
+    <p>深刻度順、要裁定。<span class="sev hi">要裁定</span> の 3 つが先で、残りはその後に機械的に追従できる。</p>
+  </div>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>#</th><th>乱れ</th><th>内容</th><th>深刻度</th></tr></thead>
+      <tbody>
+        <tr><td class="id">a</td><td class="mod">Relay ×3</td><td>config の type / backend アダプタ / ストリーム観測モジュール。しかも <code>CodexOauth</code> も provider::Relay に流用中。<b>module <code>relay</code> は観測専用なのに名前が「中継」</b></td><td><span class="sev hi">要裁定</span></td></tr>
+        <tr><td class="id">b</td><td class="mod">usage ×3</td><td>usage.rs = 枠ヘッダ / stats の token usage / limits = 照会枠。<b>module 名 usage が token usage を持たない</b></td><td><span class="sev hi">要裁定</span></td></tr>
+        <tr><td class="id">c</td><td class="mod">scope ×3</td><td>denial::Scope / OAuth scope 文字列 / limits 内ローカル。DR-0004 の「範囲」軸に採ると 4 つ目</td><td><span class="sev mid">中</span></td></tr>
+        <tr><td class="id">d</td><td class="mod">denied/denial ×2</td><td>denied_beta (永続・フラグ単位) と Denials (メモリ・経路単位)</td><td><span class="sev mid">中</span></td></tr>
+        <tr><td class="id">e</td><td class="mod">provider ×2</td><td>backend trait vs DR-0004 が導入予定の「話す API 名」。<b>codex 対応の実装前に裁定必須</b></td><td><span class="sev hi">要裁定</span></td></tr>
+        <tr><td class="id">f</td><td class="mod">除外 ×3</td><td>CredentialSpec::exclude (有効) / ns.filter.exclude (有効・階層非対称) / excluded_models (<b>dead</b>)</td><td><span class="sev mid">中</span></td></tr>
+        <tr><td class="id">g</td><td class="mod">型名衝突</td><td>stats::Report vs usage::Report、config::Stats vs stats::Stats</td><td><span class="sev lo">追従</span></td></tr>
+        <tr><td class="id">h</td><td class="mod">probe ×2</td><td>トークン消費する probe (実リクエスト) と消費しない probe (limits 照会)</td><td><span class="sev lo">追従</span></td></tr>
+        <tr><td class="id">i</td><td class="mod">保存動詞</td><td>flush / save / save が不統一</td><td><span class="sev lo">追従</span></td></tr>
+        <tr><td class="id">j</td><td class="mod">models ×4</td><td>照合パターン / 宣言モデル / 可視一覧 / discovery::Model。前 2 者は同じ TOML キー</td><td><span class="sev lo">追従</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>正規化のたたき台</h3>
+  <div class="norm">
+    <div class="nm">
+      <div class="h">relay 問題 (a)</div>
+      <div class="b">module <code>relay</code> → <code>observe</code> (中継の観測が実体)。config type の <code>relay</code> は「素通し転送先」の意味で妥当なので残す。backend の <code>provider::Relay</code> は <code>Passthrough</code> へ。<br><span style="color:var(--muted)">DR-0014 ではこれを exchange へ吸収する形で消化。</span></div>
+    </div>
+    <div class="nm">
+      <div class="h">usage 問題 (b)</div>
+      <div class="b"><code>usage.rs</code> → <code>quota.rs</code> (枠使用率)、"usage" は token usage (stats) に譲る。limits は「照会」なので <code>quota::poll</code> 系へ寄せる案も (b/c まとめて quota 語彙圏に統合)。</div>
+    </div>
+    <div class="nm">
+      <div class="h">provider 問題 (e)</div>
+      <div class="b">backend trait は <code>Backend</code> へ改名し、<code>provider</code> の語は DR-0004 の「話す API」(claude / openai / bedrock) に明け渡す — codex 対応の前提整理。</div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== 5. 未確定 ===== -->
+<section>
+  <div class="sec-head">
+    <span class="sec-num">05 — DR-0014</span>
+    <h2>未確定事項</h2>
+    <p>DR-0014 では確定させない 5 件。実装着手前または着手中に別途裁定する。</p>
+  </div>
+  <ul class="oq">
+    <li>
+      <div class="h">全滅時の自前 429 生成の置き場所</div>
+      <div class="b">「候補が空」の判断 = router の責務、と置くのが素直だが要確認。現在は gateway が生成し、events に出ないという別の乖離も抱えている。</div>
+    </li>
+    <li>
+      <div class="h">語彙裁定の最終形</div>
+      <div class="b"><code>relay</code> → observe (DR-0014 では exchange へ吸収)、<code>usage</code> → <code>quota</code>、backend trait の改名を、新語彙 (ingress / egress / exchange / provider) と整合させて確定する必要がある。§04 の d / f / g / h / i / j はこの裁定後に機械的に追従できる。</div>
+    </li>
+    <li>
+      <div class="h">OpenAI に枠照会 API 相当が存在するか</div>
+      <div class="b">存在しなければ <code>QuotaApi = None</code> で denial のみの運用になる (要調査)。</div>
+    </li>
+    <li>
+      <div class="h"><code>provider</code> と <code>type</code> の組み合わせ制約</div>
+      <div class="b">型で表すか実行時検証にするか (DR-0004 から持ち越し)。</div>
+    </li>
+    <li>
+      <div class="h">集計正規形のトークン区分の分類学</div>
+      <div class="b">core がどの区分を持つか、拡張可能な形をどう表現するか (閉じた enum にしないことだけが決まっている)、対応しない区分の規則 (落とす / other に寄せる / core への追加提案) のどれを既定にするか。</div>
+    </li>
+  </ul>
+</section>
+
+<footer class="page">
+  この HTML は人間向けの全体図。判断の正本は
+  <code>docs/design/architecture-overview.md</code> (現状 §1-6 / 目標 §7) と
+  <code>docs/decisions/DR-0014-target-architecture-provider-preset.md</code>。
+  実コードとの照合は 2026-08-03 時点の main (<code>d68d4494</code>, v0.16.0)。
+</footer>
+
+</div>
+</body>
+</html>
