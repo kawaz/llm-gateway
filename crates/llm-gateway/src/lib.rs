@@ -12,6 +12,7 @@
 //! - [`events`] 転送のたびに起きたことを見ている人へ流す (DR-0012)
 //! - [`webhook`] その知らせを受け口へ送る (DR-0012)
 //! - [`limits`] サブスクの枠を専用の口から聞く (DR-0007)
+//! - [`quota`] 枠ヘッダの観測スナップショット (DR-0007)
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
 //! - [`pricing`] モデルごとの単価表。コストは閲覧時に計算する
 
@@ -25,11 +26,11 @@ pub mod gateway;
 pub mod limits;
 pub mod pattern;
 pub mod pricing;
+pub mod quota;
 pub mod relay;
 pub mod router;
 pub mod session;
 pub mod stats;
-pub mod usage;
 pub mod webhook;
 
 pub use config::Config;

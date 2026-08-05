@@ -177,7 +177,7 @@ type Saved = BTreeMap<String, Snapshot>;
 /// メモリに持ち、変わったぶんを定期的にディスクへ落とす。落とす頻度を上げても
 /// 得るものは無い (観測できるのは通りすがりの分だけで、失っても次のリクエストで
 /// 拾い直せる) ので、日次集計と同じ周回に相乗りする。
-pub struct Usage {
+pub struct QuotaStore {
     latest: RwLock<BTreeMap<CredentialId, Snapshot>>,
     /// 前回落としてから観測があったか。無ければ書かない。
     dirty: AtomicBool,
@@ -191,7 +191,7 @@ pub struct Usage {
     writer: String,
 }
 
-impl Usage {
+impl QuotaStore {
     /// 置き場と書き手の名前を決めて作る。
     ///
     /// 前回の分を読み戻すのは呼び出し側 ([`Self::restore`])。
@@ -382,8 +382,8 @@ mod tests {
     /// 2026-07-29T12:00:00Z
     const NOW: i64 = 1_785_326_400;
 
-    fn usage(dir: &std::path::Path) -> Usage {
-        Usage::new(dir, "8402")
+    fn usage(dir: &std::path::Path) -> QuotaStore {
+        QuotaStore::new(dir, "8402")
     }
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -654,7 +654,7 @@ mod tests {
     async fn another_writers_file_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let other = Usage::new(dir.path(), "8401");
+            let other = QuotaStore::new(dir.path(), "8401");
             other
                 .observe(&CredentialId::new("a"), &unified(), NOW)
                 .await;
@@ -670,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_directory_restores_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let usage = Usage::new(dir.path().join("not-yet"), "8402");
+        let usage = QuotaStore::new(dir.path().join("not-yet"), "8402");
         usage.restore().await;
         assert_eq!(usage.get(&CredentialId::new("a")).await, None);
 
@@ -690,7 +690,7 @@ mod tests {
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, "not a directory").unwrap();
 
-        let usage = Usage::new(&blocked, "8402");
+        let usage = QuotaStore::new(&blocked, "8402");
         usage
             .observe(&CredentialId::new("a"), &unified(), NOW)
             .await;
@@ -708,12 +708,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = CredentialId::new("a");
         {
-            let usage = Usage::new(dir.path(), "127.0.0.1:8402");
+            let usage = QuotaStore::new(dir.path(), "127.0.0.1:8402");
             usage.observe(&id, &unified(), NOW).await;
             usage.save().await.unwrap();
         }
 
-        let usage = Usage::new(dir.path(), "127.0.0.1:8402");
+        let usage = QuotaStore::new(dir.path(), "127.0.0.1:8402");
         usage.restore().await;
         assert!(usage.get(&id).await.is_some());
     }

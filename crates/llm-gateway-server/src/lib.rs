@@ -1324,14 +1324,14 @@ mod usage_tests {
     #[tokio::test]
     async fn a_snapshot_observed_before_the_restart_is_still_listed() {
         use llm_gateway::credential::CredentialId;
-        use llm_gateway::usage::Usage;
+        use llm_gateway::quota::QuotaStore;
 
         let dir = tempfile::tempdir().unwrap();
         let listen = "127.0.0.1:11300";
         // 3 時間前に観測して落とした、前の起動の分。
         let observed_at = 1_785_326_400 - 3 * 3600;
         {
-            let usage = Usage::new(dir.path(), listen);
+            let usage = QuotaStore::new(dir.path(), listen);
             usage
                 .observe(
                     &CredentialId::new("claude-personal"),

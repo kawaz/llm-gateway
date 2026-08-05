@@ -17,10 +17,10 @@ use crate::denial::{self, Candidates, Denials, Probing, Reason, denial_of};
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
 use crate::limits::{self, Limit};
+use crate::quota::{self, QuotaStore};
 use crate::router::{Route, Router};
 use crate::session;
 use crate::stats::Stats;
-use crate::usage::{self, Usage};
 use crate::{Error, Result};
 
 /// 能動プローブに使うモデル。
@@ -37,7 +37,7 @@ pub struct Gateway<P: Persistence> {
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
     /// 裏で様子を聞きに行く仕事と共有する。要求より長生きしうる。
-    usage: Arc<Usage>,
+    usage: Arc<QuotaStore>,
     stats: Arc<Stats>,
     /// 断られた経路の締め出し。
     denials: Arc<Denials>,
@@ -93,7 +93,7 @@ impl<P: Persistence> Gateway<P> {
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
             // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
-            usage: Arc::new(Usage::new(
+            usage: Arc::new(QuotaStore::new(
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
@@ -479,7 +479,7 @@ impl<P: Persistence> Gateway<P> {
     /// `probe` が真なら、先に能動プローブを投げてから作る。既定を便乗のみに
     /// するのは、usage の確認が usage を勝手に消費する構図を避けるため
     /// (DR-0007)。
-    pub async fn usage_report(&self, probe: bool) -> usage::Report {
+    pub async fn usage_report(&self, probe: bool) -> quota::Report {
         let probed = if probe {
             self.probe_usage().await
         } else {
@@ -492,7 +492,7 @@ impl<P: Persistence> Gateway<P> {
             let snapshot = self.usage.get(&id).await;
             let support = support_of(spec, snapshot.is_some());
 
-            let mut entry = usage::CredentialUsage::new(name, spec.type_name(), support, snapshot);
+            let mut entry = quota::CredentialUsage::new(name, spec.type_name(), support, snapshot);
             entry.limits = probed
                 .as_ref()
                 .and_then(|p| p.limits.get(name.as_str()).cloned());
@@ -502,7 +502,7 @@ impl<P: Persistence> Gateway<P> {
             credentials.push(entry);
         }
 
-        let mut report = usage::Report::new(now_unix(), credentials);
+        let mut report = quota::Report::new(now_unix(), credentials);
         report.probe = probed.map(|p| p.spent);
         report
     }
@@ -512,9 +512,9 @@ impl<P: Persistence> Gateway<P> {
     /// 失敗した credential はその理由を控えて先へ進む。1 つの認証切れで
     /// 一覧全体が返らなくなると、確認したかった他の credential まで見えない。
     async fn probe_usage(&self) -> Option<Probed> {
-        let mut spent = usage::Probe {
+        let mut spent = quota::Probe {
             model: PROBE_MODEL.to_owned(),
-            ..usage::Probe::default()
+            ..quota::Probe::default()
         };
         let mut errors = std::collections::BTreeMap::new();
         let mut limits = std::collections::BTreeMap::new();
@@ -655,7 +655,7 @@ impl<P: Persistence> Gateway<P> {
     async fn sound(
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
-        usage: &Usage,
+        usage: &QuotaStore,
         name: &str,
         spec: &CredentialSpec,
     ) -> std::result::Result<Sample, String> {
@@ -783,24 +783,24 @@ pub struct Forwarded {
 
 /// プローブの結果。消費した分と、credential ごとの失敗。
 struct Probed {
-    spent: usage::Probe,
+    spent: quota::Probe,
     errors: std::collections::BTreeMap<String, String>,
     /// 専用の口から聞いた枠。聞けた credential の分だけ入る。
     limits: std::collections::BTreeMap<String, Vec<Limit>>,
 }
 
 /// この credential の利用状況をどこまで出せるか。
-fn support_of(spec: &CredentialSpec, observed: bool) -> usage::Support {
+fn support_of(spec: &CredentialSpec, observed: bool) -> quota::Support {
     if observed {
-        return usage::Support::Observed;
+        return quota::Support::Observed;
     }
     match spec {
-        CredentialSpec::ClaudeOauth { .. } => usage::Support::Unobserved,
+        CredentialSpec::ClaudeOauth { .. } => quota::Support::Unobserved,
         // 使用量は別の IAM アクションで、実行権限しかない API キーでは取れない。
-        CredentialSpec::ClaudeBedrock { .. } => usage::Support::NotApplicable,
+        CredentialSpec::ClaudeBedrock { .. } => quota::Support::NotApplicable,
         // Codex は転送で凌いでいる段階。転送先が返さないものは見えない。
         CredentialSpec::CodexOauth { .. } | CredentialSpec::Relay { .. } => {
-            usage::Support::UpstreamDependent
+            quota::Support::UpstreamDependent
         }
     }
 }
@@ -2684,7 +2684,7 @@ credentials = ["a"]
     /// 種別ごとに、利用状況をどこまで出せるか。
     #[test]
     fn support_depends_on_the_credential_type() {
-        use crate::usage::Support;
+        use crate::quota::Support;
 
         let oauth = CredentialSpec::ClaudeOauth {
             url: "https://api.anthropic.com".to_owned(),
@@ -2751,7 +2751,7 @@ models = ["m"]
             report
                 .credentials
                 .iter()
-                .all(|c| c.support != crate::usage::Support::Observed),
+                .all(|c| c.support != crate::quota::Support::Observed),
             "取れない扱いは support の値で分かる"
         );
         assert!(

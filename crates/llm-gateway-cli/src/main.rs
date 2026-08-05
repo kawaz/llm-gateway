@@ -7,8 +7,8 @@ use std::sync::Arc;
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
+use llm_gateway::quota::{CredentialUsage, Report, Window};
 use llm_gateway::stats::{Counters, Report as StatsReport};
-use llm_gateway::usage::{CredentialUsage, Report, Window};
 use llm_gateway::{Config, Gateway};
 
 const USAGE: &str = "\
@@ -573,10 +573,10 @@ fn render(report: &Report) -> String {
                 }
             }
             None => out.push_str(match c.support {
-                llm_gateway::usage::Support::Unobserved => "unobserved",
-                llm_gateway::usage::Support::NotApplicable => "not_applicable",
-                llm_gateway::usage::Support::UpstreamDependent => "upstream_dependent",
-                llm_gateway::usage::Support::Observed => "-",
+                llm_gateway::quota::Support::Unobserved => "unobserved",
+                llm_gateway::quota::Support::NotApplicable => "not_applicable",
+                llm_gateway::quota::Support::UpstreamDependent => "upstream_dependent",
+                llm_gateway::quota::Support::Observed => "-",
             }),
         }
     }
@@ -1587,8 +1587,8 @@ mod tests {
         CredentialUsage::new(
             "claude-personal",
             "claude_oauth",
-            llm_gateway::usage::Support::Observed,
-            Some(llm_gateway::usage::Snapshot {
+            llm_gateway::quota::Support::Observed,
+            Some(llm_gateway::quota::Snapshot {
                 observed_at: NOW - 120,
                 observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW - 120),
                 five_hour: Some(window(0.71, NOW + 960, "allowed")),
@@ -1702,13 +1702,13 @@ mod tests {
             CredentialUsage::new(
                 "bedrock",
                 "claude_bedrock",
-                llm_gateway::usage::Support::NotApplicable,
+                llm_gateway::quota::Support::NotApplicable,
                 None,
             ),
             CredentialUsage::new(
                 "claude-work",
                 "claude_oauth",
-                llm_gateway::usage::Support::Unobserved,
+                llm_gateway::quota::Support::Unobserved,
                 None,
             ),
         ]));
@@ -1726,7 +1726,7 @@ mod tests {
         let mut hit = observed();
         if let Some(s) = hit.snapshot.as_mut() {
             s.five_hour = Some(window(1.0, NOW + 600, "rejected"));
-            s.overage = Some(llm_gateway::usage::Overage {
+            s.overage = Some(llm_gateway::quota::Overage {
                 status: Some("disabled".to_owned()),
                 disabled_reason: Some("out_of_credits".to_owned()),
             });
@@ -1734,7 +1734,7 @@ mod tests {
         let mut broken = CredentialUsage::new(
             "nowhere",
             "claude_oauth",
-            llm_gateway::usage::Support::Unobserved,
+            llm_gateway::quota::Support::Unobserved,
             None,
         );
         broken.probe_error = Some("繋がりません".to_owned());
@@ -1755,7 +1755,7 @@ mod tests {
     #[test]
     fn probe_cost_is_not_shown() {
         let mut r = report(vec![observed()]);
-        r.probe = Some(llm_gateway::usage::Probe {
+        r.probe = Some(llm_gateway::quota::Probe {
             requests: 2,
             model: "claude-haiku-4-5-20251001".to_owned(),
             input_tokens: 16,
@@ -1776,7 +1776,7 @@ mod tests {
             CredentialUsage::new(
                 "b",
                 "relay",
-                llm_gateway::usage::Support::UpstreamDependent,
+                llm_gateway::quota::Support::UpstreamDependent,
                 None,
             ),
         ]));

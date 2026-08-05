@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::credential::time::parse_rfc3339;
 use crate::limits::Limit;
+use crate::quota::{Snapshot, Window};
 use crate::router::Route;
-use crate::usage::{Snapshot, Window};
 
 /// いつ空くかの手掛かりが何も無いときに空ける間隔 (秒)。
 const DEFAULT_BACKOFF: i64 = 60;
