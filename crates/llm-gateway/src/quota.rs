@@ -35,6 +35,25 @@ use crate::credential::time::format_rfc3339;
 use crate::limits::Limit;
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
+/// provider の枠照会 API から得た枠 1 本。
+///
+/// `kind` とモデル名は upstream の語を保持する。core は期限と適用範囲を扱うが、
+/// provider 固有の分類を別の固定 enum へ写し替えない。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaLimit {
+    pub kind: String,
+    pub percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub is_active: bool,
+}
+
 /// 応答ヘッダから利用状況を読む道具。
 ///
 /// upstream ごとにヘッダの名前も単位も違うので、読み手を並べておいて

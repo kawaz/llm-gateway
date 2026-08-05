@@ -7,45 +7,16 @@
 //! この口は公開ドキュメントに無い。返る形が変われば読めなくなるので、読めない
 //! ものは**情報なし** (`None`) に落とし、gateway の他の動きを巻き込まない。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::credential::Credential;
+pub use crate::quota::QuotaLimit as Limit;
 
 /// 問い合わせを諦めるまで。
 ///
 /// 利用状況の一覧は人が見て待つ画面なので、上限を短く切る。相手が黙っていても
 /// 他の credential の分まで返らなくなることはない。
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// 枠 1 本。
-///
-/// 語は upstream のものをそのまま使う (`session` / `weekly_all` /
-/// `weekly_scoped`)。こちらで言い換えると、実物と照らし合わせる人が
-/// 対応表を覚えることになる。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Limit {
-    /// `session` / `weekly_all` / `weekly_scoped` など。
-    pub kind: String,
-    /// 使用率 (0〜100)。
-    pub percent: f64,
-    /// `normal` / `warning` / `critical` など。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub severity: Option<String>,
-    /// この枠が開く時刻 (RFC 3339)。開く予定が無い枠では欠ける。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<String>,
-    /// 枠が掛かるモデルの表示名 (`Fable` など)。`weekly_scoped` だけが持つ。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// 同じモデルの識別子。実測 (2026-08-01) では常に欠ける。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
-    /// upstream が「今この枠を見ている」と言っている印。
-    ///
-    /// **塞がっているという意味ではない** — 実測 (2026-08-01): 47 % で
-    /// `severity: normal` の枠が `is_active: true` を返す。
-    pub is_active: bool,
-}
 
 /// この credential の枠を聞く。読めなければ `None`。
 pub async fn fetch(

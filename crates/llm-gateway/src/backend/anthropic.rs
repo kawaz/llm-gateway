@@ -5,8 +5,6 @@
 //! (SSE の形式まで同一)、違うのは接続先・認証方式・モデル名・
 //! 受け付ける beta フラグだけだった。
 
-use std::collections::BTreeMap;
-
 use serde_json::Value;
 
 use crate::credential::Credential;
@@ -52,89 +50,7 @@ pub trait Provider: Send + Sync {
     fn adapt(&self, _body: &mut Value, _headers: &mut Headers) {}
 }
 
-/// ヘッダの入れ物。
-///
-/// 名前の大小を無視して引ける必要がある一方、upstream へは受け取ったままの
-/// 表記で送りたい。`HeaderMap` を使わないのは、ここで扱うのが
-/// 「クライアントから来たものを加工して渡す」だけで、型付けの利点が薄いため。
-#[derive(Debug, Clone, Default)]
-pub struct Headers(Vec<(String, String)>);
-
-impl Headers {
-    pub fn new(pairs: Vec<(String, String)>) -> Self {
-        Self(pairs)
-    }
-
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.0
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// 同じ名前があれば置き換え、無ければ足す。
-    pub fn set(&mut self, name: &str, value: impl Into<String>) {
-        match self
-            .0
-            .iter_mut()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        {
-            Some((_, v)) => *v = value.into(),
-            None => self.0.push((name.to_owned(), value.into())),
-        }
-    }
-
-    pub fn remove(&mut self, name: &str) {
-        self.0.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
-    }
-
-    pub fn extend_from(&mut self, extra: &BTreeMap<String, String>) {
-        for (k, v) in extra {
-            self.set(k, v.clone());
-        }
-    }
-
-    /// クライアント由来のヘッダのうち、upstream へ渡さないもの。
-    ///
-    /// 残りは触らない — 何が意味を持つかは upstream が決めることで、
-    /// gateway が判断すると新しいヘッダが増えるたびに落としてしまう。
-    pub fn strip_for_upstream(&mut self) {
-        const DROP: &[&str] = &[
-            // 接続に紐づくもの (hop-by-hop)。
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "host",
-            "content-length",
-            // 認証は upstream ごとに付け直す。
-            "authorization",
-            "x-api-key",
-            // 圧縮は転送側の都合で決める。
-            "accept-encoding",
-            // 手前のプロキシが付けた経路情報。upstream から見れば
-            // この gateway がクライアントなので、こちら側の内部経路
-            // (LAN や tailnet の IP、内向きのホスト名) を渡す理由がない。
-            "x-forwarded-for",
-            "x-forwarded-proto",
-            "x-forwarded-host",
-            "x-forwarded-port",
-            "x-real-ip",
-            "forwarded",
-            "via",
-        ];
-        self.0
-            .retain(|(k, _)| !DROP.iter().any(|d| k.eq_ignore_ascii_case(d)));
-    }
-}
+pub use crate::egress::Headers;
 
 /// ボディの `model` を upstream が求める名前に替える。
 ///
@@ -158,6 +74,7 @@ pub fn model_of(body: &Value) -> Result<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn headers(pairs: &[(&str, &str)]) -> Headers {
         Headers::new(
