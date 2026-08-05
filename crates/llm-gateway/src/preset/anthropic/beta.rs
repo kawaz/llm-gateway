@@ -26,7 +26,7 @@
 
 use std::collections::BTreeSet;
 
-use super::Headers;
+use crate::egress::Headers;
 
 pub const HEADER: &str = "anthropic-beta";
 

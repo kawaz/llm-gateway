@@ -3,9 +3,12 @@
 //! クライアントは Anthropic Messages API を話す。gateway はモデル名から
 //! upstream と認証情報を選び、最小限の加工をして転送する。
 //!
-//! 構成は DR-0002 を参照:
+//! 構成は DR-0002 / DR-0014 を参照:
 //! - [`router`] モデル名 + session キー → (backend, credential) の優先順位
-//! - [`backend`] upstream ごとのアダプタ。Messages API 系はプロバイダで分岐
+//! - [`provider`] provider preset の契約 (Auth / Wire / Metering / QuotaApi)
+//! - [`preset`] その契約の provider ごとの実装。方言と認証を組み合わせて束ねる
+//! - [`egress`] upstream へ出るときの provider-neutral な HTTP の形
+//! - [`backend`] 旧アダプタの呼び出し互換 (実体は [`preset`] へ移った)
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 //! - [`denial`] 断られた経路をしばらく候補から外す (DR-0009)
 //! - [`exchange`] 本文を流し終えた (途切れた) ところの記録
@@ -28,6 +31,7 @@ pub mod gateway;
 pub mod limits;
 pub mod metering;
 pub mod pattern;
+pub mod preset;
 pub mod pricing;
 pub mod provider;
 pub mod quota;

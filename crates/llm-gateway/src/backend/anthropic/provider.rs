@@ -1,26 +1,95 @@
-//! Messages API を話す upstream の実装。
+//! 旧 `Provider` の呼び出しを preset へ橋渡しする (facade)。
 //!
-//! 3 つとも同じ API を話すので、転送とストリーム中継は共通のものを使う。
-//! ここにあるのは接続先・認証方式・リクエストの微調整だけ。
+//! 3 つとも中身は [`Adapter`] 1 つで、違うのは**どう束ねたか**だけ。組み立ての
+//! 判断は [`crate::preset`] 側にあり、ここは名前と引数の形を保つだけ。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::Result;
 use crate::credential::Credential;
-use crate::{Error, Result};
+use crate::preset::{anthropic, bedrock, relay};
+use crate::provider::Preset;
 
-use super::{Headers, Provider, beta, rewrite_model};
+use super::{Headers, Provider, beta};
 
-/// Anthropic 公式。サブスクの OAuth token をそのまま載せる。
+/// preset を旧 `Provider` の呼び口に合わせる。
 ///
-/// リクエストは素通しでよい。偽装も beta の加工も要らないことを実測で
-/// 確認している (system prompt 無しでも 200、クライアントが送る beta も全て通る)。
-pub struct Official {
-    name: String,
-    base_url: String,
-    extra_headers: BTreeMap<String, String>,
+/// `wire` は preset が持つものと同じ実体。ヘッダだけを触る旧 API
+/// ([`Provider::adapt`] / [`Provider::authorize`]) は、直列化前の形で
+/// 呼ばれるのでここから直接届ける。
+pub struct Adapter {
+    preset: Preset,
+    wire: Arc<anthropic::AnthropicWire>,
+    beta_policy: beta::Policy,
 }
+
+impl Adapter {
+    fn name(&self) -> &str {
+        self.preset.name()
+    }
+
+    fn base_url(&self) -> &str {
+        self.wire.base_url()
+    }
+
+    fn authorize(&self, headers: &mut Headers, credential: Option<&Credential>) -> Result<()> {
+        // Auth は直列化済みのリクエストに署名する。ここではまだボディが無いので、
+        // ヘッダだけを預けて戻す。
+        let mut request = crate::egress::UpstreamRequest {
+            url: String::new(),
+            headers: std::mem::take(headers),
+            body: bytes::Bytes::new(),
+        };
+        let applied = self.preset.auth().authorize(credential, &mut request);
+        *headers = request.headers;
+        applied
+    }
+
+    fn adapt(&self, body: &mut Value, headers: &mut Headers) {
+        self.wire.adapt(body, headers);
+    }
+}
+
+/// 3 つの名前は束ね方の違いでしかないので、呼び口の実装は 1 つを配る。
+macro_rules! facade {
+    ($name:ident) => {
+        impl Provider for $name {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+
+            fn base_url(&self) -> &str {
+                self.0.base_url()
+            }
+
+            fn authorize(
+                &self,
+                headers: &mut Headers,
+                credential: Option<&Credential>,
+            ) -> Result<()> {
+                self.0.authorize(headers, credential)
+            }
+
+            fn beta_policy(&self) -> beta::Policy {
+                self.0.beta_policy.clone()
+            }
+
+            fn adapt(&self, body: &mut Value, headers: &mut Headers) {
+                self.0.adapt(body, headers)
+            }
+
+            fn preset(&self) -> &Preset {
+                &self.0.preset
+            }
+        }
+    };
+}
+
+/// Anthropic 公式。
+pub struct Official(Adapter);
 
 impl Official {
     pub fn new(
@@ -28,49 +97,25 @@ impl Official {
         base_url: impl Into<String>,
         extra_headers: BTreeMap<String, String>,
     ) -> Self {
-        Self {
-            name: name.into(),
-            base_url: base_url.into(),
+        let name = name.into();
+        let wire = Arc::new(anthropic::AnthropicWire::new(
+            &name,
+            base_url,
             extra_headers,
-        }
+            BTreeMap::new(),
+        ));
+        Self(Adapter {
+            preset: anthropic::official(&name, Arc::clone(&wire)),
+            wire,
+            beta_policy: beta::Policy::Passthrough,
+        })
     }
 }
 
-impl Provider for Official {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn authorize(&self, headers: &mut Headers, credential: Option<&Credential>) -> Result<()> {
-        let c = credential.ok_or_else(|| Error::Credential {
-            id: self.name.clone(),
-            reason: "認証情報が渡されていません".to_owned(),
-        })?;
-        headers.set("authorization", c.bearer());
-        Ok(())
-    }
-
-    fn adapt(&self, _body: &mut Value, headers: &mut Headers) {
-        headers.extend_from(&self.extra_headers);
-    }
-}
+facade!(Official);
 
 /// Bedrock の Anthropic 互換。
-///
-/// 公式との違いは 3 つ: `x-api-key` で認証する、モデル名が自分の名前空間、
-/// 受け付けない beta フラグがある。
-pub struct Bedrock {
-    name: String,
-    base_url: String,
-    extra_headers: BTreeMap<String, String>,
-    beta_policy: beta::Policy,
-    /// クライアントの名前 → upstream の名前。
-    model_map: BTreeMap<String, String>,
-}
+pub struct Bedrock(Adapter);
 
 impl Bedrock {
     pub fn new(
@@ -80,63 +125,25 @@ impl Bedrock {
         deny_beta: Option<Vec<String>>,
         model_map: BTreeMap<String, String>,
     ) -> Self {
-        let beta_policy = match deny_beta {
-            Some(flags) => beta::Policy::Deny(flags.into_iter().collect()),
-            None => beta::Policy::bedrock(),
-        };
-        Self {
-            name: name.into(),
-            base_url: base_url.into(),
+        let name = name.into();
+        let wire = Arc::new(anthropic::AnthropicWire::new(
+            &name,
+            base_url,
             extra_headers,
-            beta_policy,
             model_map,
-        }
+        ));
+        Self(Adapter {
+            preset: bedrock::preset(&name, Arc::clone(&wire)),
+            wire,
+            beta_policy: bedrock::beta_policy(deny_beta),
+        })
     }
 }
 
-impl Provider for Bedrock {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn authorize(&self, headers: &mut Headers, credential: Option<&Credential>) -> Result<()> {
-        let c = credential.ok_or_else(|| Error::Credential {
-            id: self.name.clone(),
-            reason: "認証情報が渡されていません".to_owned(),
-        })?;
-        headers.set("x-api-key", c.api_key());
-        Ok(())
-    }
-
-    fn beta_policy(&self) -> beta::Policy {
-        self.beta_policy.clone()
-    }
-
-    fn adapt(&self, body: &mut Value, headers: &mut Headers) {
-        if let Some(model) = body.get("model").and_then(Value::as_str)
-            && let Some(upstream) = self.model_map.get(model)
-        {
-            let upstream = upstream.clone();
-            rewrite_model(body, &upstream);
-        }
-
-        headers.extend_from(&self.extra_headers);
-    }
-}
+facade!(Bedrock);
 
 /// 別の gateway へそのまま渡す。
-///
-/// 転送先が認証を持つので、こちらでは何も載せない。移行期に gpt 系を
-/// cpa へ流すために使う。
-pub struct Relay {
-    name: String,
-    base_url: String,
-    extra_headers: BTreeMap<String, String>,
-}
+pub struct Relay(Adapter);
 
 impl Relay {
     pub fn new(
@@ -144,35 +151,22 @@ impl Relay {
         base_url: impl Into<String>,
         extra_headers: BTreeMap<String, String>,
     ) -> Self {
-        Self {
-            name: name.into(),
-            base_url: base_url.into(),
+        let name = name.into();
+        let wire = Arc::new(anthropic::AnthropicWire::new(
+            &name,
+            base_url,
             extra_headers,
-        }
+            BTreeMap::new(),
+        ));
+        Self(Adapter {
+            preset: relay::preset(&name, Arc::clone(&wire)),
+            wire,
+            beta_policy: beta::Policy::Passthrough,
+        })
     }
 }
 
-impl Provider for Relay {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    fn needs_credential(&self) -> bool {
-        false
-    }
-
-    fn authorize(&self, _headers: &mut Headers, _credential: Option<&Credential>) -> Result<()> {
-        Ok(())
-    }
-
-    fn adapt(&self, _body: &mut Value, headers: &mut Headers) {
-        headers.extend_from(&self.extra_headers);
-    }
-}
+facade!(Relay);
 
 #[cfg(test)]
 mod tests {
@@ -240,9 +234,7 @@ extended-cache-ttl-2025-04-11";
     #[test]
     fn bedrock_rewrites_model_name() {
         let mut body = json!({"model": "claude-fable-5", "max_tokens": 8});
-        let mut headers = client_headers();
-
-        bedrock().adapt(&mut body, &mut headers);
+        bedrock().adapt(&mut body, &mut client_headers());
 
         assert_eq!(body["model"], "anthropic.claude-fable-5");
         assert_eq!(body["max_tokens"], 8, "他は触らない");
@@ -312,17 +304,36 @@ extended-cache-ttl-2025-04-11";
 
     #[test]
     fn auth_header_differs_by_provider() {
-        let credential = crate::credential::Credential::for_test("tok");
+        let credential = Credential::for_test("tok");
 
-        let mut h = Headers::default();
-        official().authorize(&mut h, Some(&credential)).unwrap();
-        assert_eq!(h.get("authorization"), Some("Bearer tok"));
-        assert_eq!(h.get("x-api-key"), None);
+        let mut headers = Headers::default();
+        official()
+            .authorize(&mut headers, Some(&credential))
+            .unwrap();
+        assert_eq!(headers.get("authorization"), Some("Bearer tok"));
+        assert_eq!(headers.get("x-api-key"), None);
 
-        let mut h = Headers::default();
-        bedrock().authorize(&mut h, Some(&credential)).unwrap();
-        assert_eq!(h.get("x-api-key"), Some("tok"));
-        assert_eq!(h.get("authorization"), None, "Bearer では 401 になる");
+        let mut headers = Headers::default();
+        bedrock()
+            .authorize(&mut headers, Some(&credential))
+            .unwrap();
+        assert_eq!(headers.get("x-api-key"), Some("tok"));
+        assert_eq!(headers.get("authorization"), None, "Bearer では 401 になる");
+    }
+
+    /// ヘッダだけを預ける橋渡しでも、既に載っている分は失わない。
+    #[test]
+    fn authorize_keeps_the_headers_it_was_given() {
+        let credential = Credential::for_test("tok");
+        let mut headers = client_headers();
+
+        official()
+            .authorize(&mut headers, Some(&credential))
+            .unwrap();
+
+        assert_eq!(headers.get("anthropic-version"), Some("2023-06-01"));
+        assert_eq!(headers.get("anthropic-beta"), Some(CLIENT_BETA));
+        assert_eq!(headers.get("authorization"), Some("Bearer tok"));
     }
 
     /// 認証情報が要るのに渡されなければ、送る前に落とす。
@@ -336,17 +347,16 @@ extended-cache-ttl-2025-04-11";
     #[test]
     fn relay_adds_no_auth() {
         let relay = Relay::new("cpa", "http://127.0.0.1:8317", BTreeMap::new());
-        assert!(!relay.needs_credential());
 
-        let mut h = client_headers();
-        relay.authorize(&mut h, None).unwrap();
-        relay.adapt(&mut json!({"model": "gpt-5.6-sol"}), &mut h);
-        negotiate_beta(&relay, &mut h);
+        let mut headers = client_headers();
+        relay.authorize(&mut headers, None).unwrap();
+        relay.adapt(&mut json!({"model": "gpt-5.6-sol"}), &mut headers);
+        negotiate_beta(&relay, &mut headers);
 
-        assert_eq!(h.get("authorization"), None);
-        assert_eq!(h.get("x-api-key"), None);
+        assert_eq!(headers.get("authorization"), None);
+        assert_eq!(headers.get("x-api-key"), None);
         assert_eq!(
-            h.get("anthropic-beta"),
+            headers.get("anthropic-beta"),
             Some(CLIENT_BETA),
             "転送先が判断するので触らない"
         );
@@ -360,8 +370,29 @@ extended-cache-ttl-2025-04-11";
             "https://api.anthropic.com",
             BTreeMap::from([("x-trace".to_owned(), "on".to_owned())]),
         );
-        let mut h = Headers::default();
-        provider.adapt(&mut json!({}), &mut h);
-        assert_eq!(h.get("x-trace"), Some("on"));
+        let mut headers = Headers::default();
+        provider.adapt(&mut json!({}), &mut headers);
+        assert_eq!(headers.get("x-trace"), Some("on"));
+    }
+
+    /// 名前と接続先は preset / wire から引く (facade は覚え直さない)。
+    #[test]
+    fn name_and_base_url_come_from_the_preset() {
+        assert_eq!(official().name(), "claude-personal");
+        assert_eq!(official().base_url(), "https://api.anthropic.com");
+        assert_eq!(official().preset().name(), "claude-personal");
+    }
+
+    /// 束ね方の違いは capability の有無に出る。
+    #[test]
+    fn only_the_official_preset_can_ask_for_quota() {
+        assert!(official().preset().quota_api().is_some());
+        assert!(bedrock().preset().quota_api().is_none());
+        assert!(
+            Relay::new("cpa", "http://127.0.0.1:8317", BTreeMap::new())
+                .preset()
+                .quota_api()
+                .is_none()
+        );
     }
 }

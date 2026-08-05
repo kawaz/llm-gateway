@@ -1,10 +1,6 @@
-//! upstream との通信。
+//! upstream との通信の呼び出し互換 (facade)。
 //!
-//! アダプタは「どの API を話すか」で分ける。Anthropic Messages API を話す
-//! upstream は転送と SSE 中継の実体を共有し、接続先・認証・リクエストの
-//! 微調整だけを [`AnthropicProvider`] の実装が持つ (DR-0002)。
+//! 実体は [`crate::preset`] の provider preset にある。router と gateway が
+//! preset を直接扱うようになるまで、旧アダプタの名前と引数の形をここが保つ。
 
 pub mod anthropic;
-
-// Phase 2: OpenAI Responses API を話すアダプタ。Messages との相互変換を持つ。
-// pub mod openai;

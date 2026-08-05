@@ -61,6 +61,13 @@ impl Headers {
             .map(|(key, value)| (key.as_str(), value.as_str()))
     }
 
+    /// 受け取った順の組をそのまま見る。
+    ///
+    /// 名前で引く道具を持たない読み手 (ヘッダを総なめする parser) へ渡すため。
+    pub fn as_slice(&self) -> &[(String, String)] {
+        &self.0
+    }
+
     pub fn extend_from(&mut self, extra: &BTreeMap<String, String>) {
         for (key, value) in extra {
             self.set(key, value.clone());

@@ -1,8 +1,9 @@
-//! upstream への転送。
+//! upstream への転送の入口 (facade)。
 //!
-//! ボディは `model` だけ差し替え、あとはそのまま渡す。応答はヘッダを受け取った
-//! 時点で返し、本文はストリームのまま流す — Claude 系は SSE の形式が
-//! upstream 間で同じなので、解釈せずバイト列のまま中継できる。
+//! 組み立てと送信は preset の [`crate::provider::Wire`] が、認証は
+//! [`crate::provider::Auth`] が持つ。ここは呼び出し側が持っている形
+//! (`Value` のボディ + ヘッダの組) を [`EgressRequest`] に載せ替え、返って
+//! きた応答を旧来の形に戻すだけ。
 //!
 //! 要求の側が `Value` を受け取って組み立て直しているのは、ここが経路ごとに
 //! 何度も呼ばれるため。理由は受け取り口 (`llm-gateway-server` の `messages`)
@@ -11,8 +12,9 @@
 use futures_util::StreamExt as _;
 use serde_json::Value;
 
+use crate::Result;
 use crate::credential::Credential;
-use crate::{Error, Result};
+use crate::egress::EgressRequest;
 
 use super::{Headers, Provider};
 
@@ -34,63 +36,40 @@ impl std::fmt::Debug for Response {
 }
 
 /// 応答の本文。
-pub type BodyStream =
-    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes>> + Send>>;
+pub type BodyStream = crate::egress::BodyStream;
 
 /// 転送する。
 ///
 /// 返るのは upstream のヘッダを受け取った時点。本文はまだ流れていないので、
 /// ここまでの失敗なら別の upstream に切り替えられる。
+///
+/// 順は **組み立て → 認証 → 送信**。認証を最後にするのは、載せるものが
+/// 直列化済みのリクエスト全体に掛かりうるため (SigV4 のような署名は、後から
+/// ヘッダやボディが変わると壊れる)。
 pub async fn send(
     http: &reqwest::Client,
     provider: &dyn Provider,
     credential: Option<&Credential>,
     path: &str,
     query: Option<&str>,
-    mut body: Value,
-    mut headers: Headers,
+    body: Value,
+    headers: Headers,
 ) -> Result<Response> {
-    headers.strip_for_upstream();
-    provider.authorize(&mut headers, credential)?;
-    provider.adapt(&mut body, &mut headers);
-
-    let mut url = format!("{}{}", provider.base_url().trim_end_matches('/'), path);
-    if let Some(q) = query.filter(|q| !q.is_empty()) {
-        url.push('?');
-        url.push_str(q);
-    }
-
-    let mut req = http.post(&url).json(&body);
-    for (k, v) in headers.iter() {
-        req = req.header(k, v);
-    }
-
-    let resp = req.send().await.map_err(|e| Error::UpstreamUnreachable {
-        provider: provider.name().to_owned(),
-        source: e,
+    let preset = provider.preset();
+    let mut request = preset.wire().encode(EgressRequest {
+        path: path.to_owned(),
+        query: query.map(str::to_owned),
+        body,
+        headers,
     })?;
+    preset.auth().authorize(credential, &mut request)?;
 
-    let status = resp.status().as_u16();
-    let headers = resp
-        .headers()
-        .iter()
-        .filter(|(k, _)| !is_hop_by_hop(k.as_str()))
-        .filter_map(|(k, v)| {
-            v.to_str()
-                .ok()
-                .map(|v| (k.as_str().to_owned(), v.to_owned()))
-        })
-        .collect();
-
-    let body = resp
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(|e| Error::Config(format!("応答の読み取りが途切れました: {e}"))))
-        .boxed();
+    let resp = preset.wire().send(http, request).await?;
 
     Ok(Response {
-        status,
-        headers,
-        body,
+        status: resp.status,
+        headers: resp.headers.as_slice().to_vec(),
+        body: resp.body,
     })
 }
 
@@ -161,22 +140,6 @@ pub fn should_try_next(status: u16) -> bool {
 /// 応答は捨てずに持ち回る。全部断られたときは、これをそのまま返す。
 pub fn is_route_denial(status: u16) -> bool {
     matches!(status, 401 | 403 | 429 | 529)
-}
-
-fn is_hop_by_hop(name: &str) -> bool {
-    const DROP: &[&str] = &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        // 中継で長さが変わりうるので、こちらで付け直す。
-        "content-length",
-    ];
-    DROP.iter().any(|d| name.eq_ignore_ascii_case(d))
 }
 
 #[cfg(test)]
@@ -255,14 +218,5 @@ mod tests {
             r#"{"error":"invalid beta flag"}"#,
             "読んだ後でも同じ本文を流せる"
         );
-    }
-
-    #[test]
-    fn hop_by_hop_detection_ignores_case() {
-        assert!(is_hop_by_hop("Transfer-Encoding"));
-        assert!(is_hop_by_hop("connection"));
-        assert!(is_hop_by_hop("CONTENT-LENGTH"));
-        assert!(!is_hop_by_hop("content-type"));
-        assert!(!is_hop_by_hop("anthropic-version"));
     }
 }
