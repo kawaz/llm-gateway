@@ -627,9 +627,18 @@ mod tests {
         store.observe(&CredentialId::new("a"), observed(NOW)).await;
         store.save().await.unwrap();
 
+        /// 何も値付けしない役。ここで見たいのは日付の取り違えだけ。
+        struct NoRates;
+
+        impl crate::metering::PricingSource for NoRates {
+            fn pricing(&self, _credential: &str, _model: &str) -> Option<crate::metering::Pricing> {
+                None
+            }
+        }
+
         let stats = crate::stats::Stats::new(dir.path(), "8402");
         assert!(
-            stats.report(0, NOW).days.is_empty(),
+            stats.report(0, NOW, &NoRates).days.is_empty(),
             "利用状況のファイルを日次集計として読まない"
         );
     }

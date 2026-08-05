@@ -16,7 +16,7 @@ use crate::credential::Credential;
 use crate::denial::{Availability, Denial, Probing, RouteState, Scope};
 use crate::egress::{BoxFuture, EgressRequest, Headers, Response, UpstreamRequest};
 use crate::metering::{Pricing, UsageObserver};
-use crate::quota::{QuotaLimit, Snapshot};
+use crate::quota::{QuotaLimit, Snapshot, Support};
 
 /// request-time の認証を適用する。
 ///
@@ -61,7 +61,13 @@ pub trait Metering: Send + Sync {
     fn pricing(&self, model: &str) -> Option<Pricing>;
 }
 
-/// トークンを消費せず quota を問い合わせる任意 capability。
+/// 枠を能動的に確かめる任意 capability。
+///
+/// 確かめ方は 2 通りある。トークンを使わない照会 ([`Self::fetch`]) と、応答
+/// ヘッダに枠を載せさせるための最小リクエスト ([`Self::probe_request`])。
+/// 後者が要るのは、枠ヘッダを得る手立てが実リクエストしかないため (DR-0007)。
+/// 両方を 1 つの capability に収めるのは、どちらも「この upstream に枠という
+/// 概念があり、聞く手立てがある」ことを前提にしているため。
 pub trait QuotaApi: Send + Sync {
     fn fetch<'a>(
         &'a self,
@@ -74,6 +80,21 @@ pub trait QuotaApi: Send + Sync {
     /// `Some` はその範囲を締め出す印、`None` はその範囲を開ける指示。どの枠が
     /// どのモデル群に掛かるかは upstream の語彙の話なので provider が読む。
     fn denials(&self, limits: &[QuotaLimit], now: i64) -> Vec<(Scope, Option<Denial>)>;
+
+    /// 枠ヘッダを引き出すための最小リクエスト。
+    ///
+    /// 何を投げれば消費が最小で済むか (どのモデルに、何を頼むか) は方言の
+    /// 知識なので provider が組む。投げるのは呼び出し側。
+    fn probe_request(&self) -> ProbeRequest;
+}
+
+/// 枠ヘッダを引き出すための 1 本 (DR-0007)。
+#[derive(Debug, Clone)]
+pub struct ProbeRequest {
+    /// 使うモデル。何をどれだけ消費したかの報告に出す。
+    pub model: String,
+    /// 送る中身。正規形のまま渡し、方言への変換は Wire が担う。
+    pub request: EgressRequest,
 }
 
 /// upstream が受け付けない要求ヘッダを、送る前に落として学習する任意 capability。
@@ -101,6 +122,8 @@ pub struct Preset {
     metering: Arc<dyn Metering>,
     quota_api: Option<Arc<dyn QuotaApi>>,
     negotiation: Option<Arc<dyn Negotiation>>,
+    /// まだ何も観測していないときに、枠について言えること。
+    unobserved: Support,
     state: RouteState,
 }
 
@@ -119,12 +142,25 @@ impl Preset {
             metering,
             quota_api: None,
             negotiation: None,
+            // 何も宣言しない経路について言えることは無い。「取れない」と
+            // 断じるのも「まだ観測していない」と言うのも、こちらの推測になる。
+            unobserved: Support::UpstreamDependent,
             state: RouteState::new(),
         }
     }
 
     pub fn with_quota_api(mut self, quota_api: Arc<dyn QuotaApi>) -> Self {
         self.quota_api = Some(quota_api);
+        self
+    }
+
+    /// 観測前に枠について言えることを宣言する。
+    ///
+    /// 「取れるがまだ観測していない」のか「仕組みとして取れない」のかは、
+    /// その upstream を知っている側にしか決められない。閲覧の口はこの値を
+    /// そのまま出す (DR-0007)。
+    pub fn with_quota_support(mut self, unobserved: Support) -> Self {
+        self.unobserved = unobserved;
         self
     }
 
@@ -192,6 +228,22 @@ impl Preset {
     /// 最後に観測した枠。
     pub fn quota(&self) -> Option<Snapshot> {
         self.state.quota()
+    }
+
+    /// この経路の枠について、今どこまで言えるか。
+    ///
+    /// 観測があればそれが答え。無いときに何と言うかは preset の宣言
+    /// ([`Self::with_quota_support`]) に従う。
+    pub fn quota_support(&self) -> Support {
+        match self.quota() {
+            Some(_) => Support::Observed,
+            None => self.unobserved,
+        }
+    }
+
+    /// 枠ヘッダを引き出す最小リクエスト。枠を聞ける経路だけが持つ。
+    pub fn probe_request(&self) -> Option<ProbeRequest> {
+        Some(self.quota_api()?.probe_request())
     }
 
     /// 枠照会 API の答えで印を引き直す。
@@ -342,6 +394,35 @@ mod tests {
         )
     }
 
+    /// 枠を聞ける口を持つ経路。聞いた答えは常に空で、様子見の札の有無だけを見る。
+    struct StubQuotaApi;
+
+    impl QuotaApi for StubQuotaApi {
+        fn fetch<'a>(
+            &'a self,
+            _http: &'a reqwest::Client,
+            _credential: &'a Credential,
+        ) -> BoxFuture<'a, Result<Vec<QuotaLimit>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn denials(&self, _limits: &[QuotaLimit], _now: i64) -> Vec<(Scope, Option<Denial>)> {
+            Vec::new()
+        }
+
+        fn probe_request(&self) -> ProbeRequest {
+            ProbeRequest {
+                model: "probe-model".to_owned(),
+                request: EgressRequest {
+                    path: "/v1/messages".to_owned(),
+                    query: None,
+                    body: serde_json::json!({"model": "probe-model"}),
+                    headers: Headers::default(),
+                },
+            }
+        }
+    }
+
     /// capability を持たない preset は quota_api が `None`。呼んでから未対応を
     /// 返す空実装ではなく、呼び出す能力自体が無いことを型で表す。
     #[test]
@@ -351,6 +432,46 @@ mod tests {
         assert_eq!(preset.name(), "passthrough");
         assert!(preset.quota_api().is_none());
         assert!(preset.negotiation().is_none());
+    }
+
+    /// 枠を聞ける経路だけが、枠ヘッダを引き出す 1 本を組める。
+    ///
+    /// 聞く相手がいない経路で最小リクエストを投げても、消費するだけで何も
+    /// 読めない。「無い」を型で示すので、設定の種別を見る必要もない。
+    #[test]
+    fn only_a_route_that_can_answer_offers_a_probe() {
+        assert!(preset().probe_request().is_none());
+
+        let asking = preset().with_quota_api(Arc::new(StubQuotaApi));
+        let probe = asking.probe_request().expect("聞ける経路は 1 本組める");
+
+        assert_eq!(probe.model, "probe-model");
+        assert_eq!(probe.request.body["model"], "probe-model");
+    }
+
+    /// 観測前に何と言うかは preset が宣言し、観測が付いたらそちらが勝つ。
+    #[test]
+    fn what_can_be_said_about_quota_comes_from_the_route() {
+        let silent = preset();
+        assert_eq!(
+            silent.quota_support(),
+            crate::quota::Support::UpstreamDependent,
+            "宣言の無い経路について言えることは無い"
+        );
+
+        let declared = preset().with_quota_support(crate::quota::Support::NotApplicable);
+        assert_eq!(
+            declared.quota_support(),
+            crate::quota::Support::NotApplicable
+        );
+
+        let headers = Headers::new(vec![("x-used".to_owned(), "0.5".to_owned())]);
+        declared.observe_quota(&headers, NOW).expect("読める");
+        assert_eq!(
+            declared.quota_support(),
+            crate::quota::Support::Observed,
+            "観測できたなら宣言より実測"
+        );
     }
 
     /// UsageObserver は trait object として chunk を受け、終端で結果を返せる。

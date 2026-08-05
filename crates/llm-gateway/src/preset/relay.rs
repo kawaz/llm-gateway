@@ -11,6 +11,7 @@ use crate::credential::Credential;
 use crate::egress::UpstreamRequest;
 use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, beta};
 use crate::provider::{Auth, Preset};
+use crate::quota::Support;
 
 /// 認証を載せない。
 pub struct NoAuth;
@@ -32,6 +33,8 @@ impl Auth for NoAuth {
 pub fn preset(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     Preset::new(name, Arc::new(NoAuth), wire, Arc::new(AnthropicMetering))
         .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
+        // 枠を返すかどうかは転送先次第。こちらからは何とも言えない。
+        .with_quota_support(Support::UpstreamDependent)
 }
 
 #[cfg(test)]
@@ -68,6 +71,7 @@ mod tests {
         assert_eq!(request.headers.get("authorization"), None);
         assert_eq!(request.headers.get("x-api-key"), None);
         assert!(preset.quota_api().is_none(), "枠は転送先が持っている");
+        assert_eq!(preset.quota_support(), Support::UpstreamDependent);
     }
 
     /// beta は転送先が判断するので触らない。

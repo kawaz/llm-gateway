@@ -1939,7 +1939,7 @@ mod tests {
             let mut creds = serde_json::Map::new();
             let mut day_total: Option<f64> = None;
             for (cred, model, c) in *rows {
-                let usd = llm_gateway::pricing::for_model(model).map(|p| p.cost(&c.tokens));
+                let usd = llm_gateway::preset::pricing::for_model(model).map(|p| p.cost(&c.tokens));
                 if let Some(usd) = usd {
                     day_total = Some(day_total.unwrap_or(0.0) + usd);
                 }

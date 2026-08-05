@@ -120,6 +120,21 @@ pub trait UsageObserver: Send {
     fn finish(self: Box<Self>) -> Option<TokenUsage>;
 }
 
+/// 集計の 1 行 (credential × モデル) に当てる単価を答える役。
+///
+/// 記録に残るのはトークン数だけで、USD は**読み出しのたびに**換算する
+/// (DR-0011)。その換算に要る単価を持っているのは、答えた経路の provider
+/// (DR-0014 §4)。集計の器 ([`crate::stats::Stats`]) は単価表を持たず、
+/// この役へ聞く。
+///
+/// 鍵に credential を含めるのは、同じモデル名でも経路によって値付けが違い
+/// うるため。認証情報を持たない経路 ([`crate::stats::NO_CREDENTIAL`]) や
+/// 設定から消えた名前も引かれるので、実装側は「この名前は知らない」を
+/// `None` ではなくモデル名からの解決で埋めてよい。
+pub trait PricingSource {
+    fn pricing(&self, credential: &str, model: &str) -> Option<Pricing>;
+}
+
 /// 合計を足し込むときも同じ丸めを通す。
 pub fn round_usd(usd: f64) -> f64 {
     (usd * 1_000_000.0).round() / 1_000_000.0

@@ -13,28 +13,21 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::backend::anthropic::{Headers, forward, model_of, rewrite_model};
-use crate::config::{Config, CredentialSpec, Namespace};
+use crate::config::{Config, Namespace};
 use crate::credential::time::now_unix;
 use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
 use crate::denial::Probing;
+use crate::egress::{self, EgressRequest, Headers, Response};
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
 use crate::exchange;
-use crate::metering::{TokenKind, TokenUsage, UsageObserver};
-use crate::provider::Preset;
+use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
+use crate::provider::{Preset, ProbeRequest};
 use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Route, Router, Selection};
 use crate::session;
-use crate::stats::Stats;
+use crate::stats::{self, Stats};
 use crate::{Error, Result};
-
-/// 能動プローブに使うモデル。
-///
-/// ヘッダを得るには実リクエストが要る (副作用ゼロで usage だけ返す口は
-/// 見つかっていない、DR-0007)。一番小さいモデルに `max_tokens = 1` で
-/// 投げて、消費を最小にする。
-const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 pub struct Gateway<P: Persistence> {
     config: Config,
@@ -72,8 +65,8 @@ impl<P: Persistence> Gateway<P> {
             // 8 回) だと死んだ接続を掴んだまま 10 分粘ることになる。
             .tcp_keepalive_interval(std::time::Duration::from_secs(10))
             .tcp_keepalive_retries(3)
-            // upstream (api.anthropic.com / bedrock) とは ALPN で h2 に
-            // なる。TCP の keepalive は TLS の下を通るので、中身のバイト数
+            // upstream とは ALPN で h2 になる。
+            // TCP の keepalive は TLS の下を通るので、中身のバイト数
             // でアイドルを測る類の LB からは「無音」のままに見える。h2 の
             // PING は TLS の上に乗るので、そちらにも生きていると伝わり、
             // かつ TCP は生きたまま h2 が応じない状態も掴める。
@@ -112,9 +105,18 @@ impl<P: Persistence> Gateway<P> {
 
     /// 使用量の日次集計。
     ///
-    /// 受け取り口が中継に tap を挟むのと、閲覧の口が報告を作るのに使う。
+    /// 受け取り口が中継に tap を挟むのに使う。閲覧の報告は
+    /// [`Self::stats_report`] から取る。
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
+    }
+
+    /// 日次集計の報告を作る (DR-0011)。
+    ///
+    /// USD は読み出しのたびに換算する。単価を知っているのは答えた経路の
+    /// provider なので、集計の器には引き当て役を渡す (DR-0014 §4)。
+    pub fn stats_report(&self, days: usize, now: i64) -> stats::Report {
+        self.stats.report(days, now, &RoutePricing(&self.router))
     }
 
     /// 転送のたびに起きたことを流す口 (DR-0012)。
@@ -218,22 +220,22 @@ impl<P: Persistence> Gateway<P> {
         mut body: Value,
         headers: Vec<(String, String)>,
     ) -> Result<Forwarded> {
-        let requested = model_of(&body)?.to_owned();
+        let requested = egress::model_of(&body)?.to_owned();
 
         // `opus` のような短い名前は、ここで実際のモデル名に直す。
         // upstream はこの名前を知らないので、ボディも書き換える。
         let model = self.router.resolve(ns, &requested).await;
         if model != requested {
-            rewrite_model(&mut body, &model);
+            egress::rewrite_model(&mut body, &model);
         }
 
         let session = session::derive(&body, &headers);
-        // 知らせに載せる素性。会話の id はクライアントのヘッダから拾う
+        // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
         let call = Call {
             ns: ns_name,
             model: &model,
-            session_id: events::session_id(&headers),
+            session_id: session::declared_id(&headers),
             prefix: events::prefix(&body),
             path,
             query,
@@ -277,7 +279,7 @@ impl<P: Persistence> Gateway<P> {
                     }
                 }
                 return Ok(Forwarded {
-                    response: response.into(),
+                    response,
                     credential: None,
                     model,
                     // 自前で組んだ断りなので、消費したトークンは無い。
@@ -291,7 +293,7 @@ impl<P: Persistence> Gateway<P> {
         // 認証情報を添えて持ち回るのは、どの経路を通って返る応答でも同じ形
         // (応答 + 身元) にするため。使用量の集計に乗るのは 2xx だけで、断られた
         // 応答は集計されない (エラーの本文に usage は無い、DR-0011)。
-        let mut denied: Option<(forward::Response, Option<CredentialId>)> = None;
+        let mut denied: Option<(Response, Option<CredentialId>)> = None;
         for route in &routes {
             match self.try_route(route, &call, &headers).await {
                 Ok(resp) => {
@@ -331,8 +333,9 @@ impl<P: Persistence> Gateway<P> {
                         // 時間が経てば空く断りなら、次のリクエストで同じ壁に
                         // 当たらないよう期限を控える。読み方は provider が持つ。
                         let now = now_unix();
-                        let head = Headers::new(resp.headers.clone());
-                        if let Some(denial) = route.preset.reject(resp.status, &head, &model, now) {
+                        if let Some(denial) =
+                            route.preset.reject(resp.status, &resp.headers, &model, now)
+                        {
                             warn!(
                                 route = route.name(),
                                 status = resp.status,
@@ -389,7 +392,7 @@ impl<P: Persistence> Gateway<P> {
         route: &Arc<Route>,
         call: &Call<'_>,
         headers: &[(String, String)],
-    ) -> std::result::Result<forward::Response, Switch> {
+    ) -> std::result::Result<Response, Switch> {
         let credential = match &route.credential {
             Some(id) => match self.credentials.acquire(id).await {
                 Ok(c) => Some(c),
@@ -424,7 +427,7 @@ impl<P: Persistence> Gateway<P> {
             return accept_or_switch(resp);
         };
 
-        let (resp, raw) = forward::buffer(resp)
+        let (resp, raw) = egress::buffer(resp)
             .await
             .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
@@ -463,22 +466,24 @@ impl<P: Persistence> Gateway<P> {
         call: &Call<'_>,
         credential: Option<&Credential>,
         headers: Headers,
-    ) -> std::result::Result<forward::Response, Switch> {
-        // upstream での名前が違う経路 (Bedrock) にだけ書き換えて送る。
-        // 何という名前で受け付けるかは discovery が答えている。
+    ) -> std::result::Result<Response, Switch> {
+        // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
+        // 送る。何という名前で受け付けるかは discovery が答えている。
         let mut body = call.body.clone();
         if let Some(upstream) = &route.upstream_model {
-            rewrite_model(&mut body, upstream);
+            egress::rewrite_model(&mut body, upstream);
         }
 
-        let resp = forward::send(
+        let resp = egress::send(
             &self.http,
             route.preset.as_ref(),
             credential,
-            call.path,
-            call.query,
-            body,
-            headers,
+            EgressRequest {
+                path: call.path.to_owned(),
+                query: call.query.map(str::to_owned),
+                body,
+                headers,
+            },
         )
         .await
         .map_err(|e| Switch::to_next(e.to_string()))?;
@@ -486,11 +491,10 @@ impl<P: Persistence> Gateway<P> {
         // 便乗して枠を拾う (DR-0007)。読むのはヘッダだけなので、本文はこの後も
         // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
         let now = now_unix();
-        if let Some(id) = &route.credential {
-            let head = Headers::new(resp.headers.clone());
-            if let Some(snapshot) = route.preset.observe_quota(&head, now) {
-                self.usage.observe(id, snapshot).await;
-            }
+        if let Some(id) = &route.credential
+            && let Some(snapshot) = route.preset.observe_quota(&resp.headers, now)
+        {
+            self.usage.observe(id, snapshot).await;
         }
 
         // 見ている人へ知らせる (DR-0012)。upstream がヘッダを返したこの瞬間が、
@@ -518,9 +522,15 @@ impl<P: Persistence> Gateway<P> {
 
         let mut credentials = Vec::new();
         for (name, spec) in &self.config.credentials {
-            // 今の観測を持っているのは経路。置き場はディスクとの出入りを担う。
-            let snapshot = self.router.preset(name).and_then(|preset| preset.quota());
-            let support = support_of(spec, snapshot.is_some());
+            // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
+            // (DR-0014 §3)。置き場はディスクとの出入りだけを担う。
+            let preset = self.router.preset(name);
+            let snapshot = preset.and_then(|preset| preset.quota());
+            let support = preset.map_or(
+                // 経路を組めなかった名前について、こちらから言えることは無い。
+                quota::Support::UpstreamDependent,
+                |preset| preset.quota_support(),
+            );
 
             let mut entry = quota::CredentialUsage::new(name, spec.type_name(), support, snapshot);
             entry.limits = probed
@@ -542,19 +552,16 @@ impl<P: Persistence> Gateway<P> {
     /// 失敗した credential はその理由を控えて先へ進む。1 つの認証切れで
     /// 一覧全体が返らなくなると、確認したかった他の credential まで見えない。
     async fn probe_usage(&self) -> Option<Probed> {
-        let mut spent = quota::Probe {
-            model: PROBE_MODEL.to_owned(),
-            ..quota::Probe::default()
-        };
+        let mut spent = quota::Probe::default();
         let mut errors = std::collections::BTreeMap::new();
         let mut limits = std::collections::BTreeMap::new();
 
         for (name, preset) in self.router.presets() {
             // 枠を聞ける口を持つ経路だけがヘッダも返す (DR-0007)。持たない
-            // 相手は、投げても今の状態が読めない。
-            if preset.quota_api().is_none() {
+            // 相手は、投げても今の状態が読めないので、投げる 1 本も無い。
+            let Some(probe) = preset.probe_request() else {
                 continue;
-            }
+            };
             let id = CredentialId::new(name);
             // 枠を聞くのが先。こちらはトークンを使わないので、この後の
             // 最小リクエストが失敗しても、枠だけは見えるようにしておく。
@@ -563,7 +570,10 @@ impl<P: Persistence> Gateway<P> {
             }
 
             spent.requests += 1;
-            match self.probe_one(&id, preset).await {
+            // 何を投げたかは 1 つだけ載る欄なので、経路ごとに違えば最後のものが
+            // 残る。今は聞ける経路が同じ方言に揃っているので差は出ない。
+            spent.model = probe.model.clone();
+            match self.probe_one(&id, preset, probe).await {
                 Ok((input, output)) => {
                     spent.input_tokens += input;
                     spent.output_tokens += output;
@@ -603,8 +613,9 @@ impl<P: Persistence> Gateway<P> {
         &self,
         id: &CredentialId,
         preset: &Preset,
+        probe: ProbeRequest,
     ) -> std::result::Result<(u64, u64), String> {
-        let sample = self.sound(id, preset).await?;
+        let sample = self.sound(id, preset, probe).await?;
         if sample.status != 200 {
             return Err(format!(
                 "upstream が {} を返しました: {}",
@@ -662,22 +673,24 @@ impl<P: Persistence> Gateway<P> {
                 return;
             };
 
-            let now = now_unix();
-            preset.apply_quota(&limits, now);
+            preset.apply_quota(&limits, now_unix());
             info!(
                 credential = %id,
                 limits = limits.len(),
-                denied = ?preset.availability(PROBE_MODEL, now),
                 "枠を聞いて締め出しを引き直しました"
             );
         })
     }
 
     /// 最小のリクエストを 1 本投げて、返ってきたものを持ち帰る。
+    ///
+    /// 何を投げるかは経路が組んだもの ([`ProbeRequest`]) をそのまま使う。
+    /// ここで本文やヘッダを作ると、方言を 1 つ知っていることになる。
     async fn sound(
         &self,
         id: &CredentialId,
         preset: &Preset,
+        probe: ProbeRequest,
     ) -> std::result::Result<Sample, String> {
         let credential = self
             .credentials
@@ -685,36 +698,18 @@ impl<P: Persistence> Gateway<P> {
             .await
             .map_err(|e| e.to_string())?;
 
-        let body = serde_json::json!({
-            "model": PROBE_MODEL,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}],
-        });
-        let headers = Headers::new(vec![
-            ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
-            ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
-        ]);
-
-        let resp = forward::send(
-            &self.http,
-            preset,
-            Some(&credential),
-            "/v1/messages",
-            None,
-            body,
-            headers,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let resp = egress::send(&self.http, preset, Some(&credential), probe.request)
+            .await
+            .map_err(|e| e.to_string())?;
 
         // 上限に当たった応答にも使用率は載る。状態を見る前に拾っておく。
         let status = resp.status;
-        let head = Headers::new(resp.headers.clone());
-        if let Some(snapshot) = preset.observe_quota(&head, now_unix()) {
+        let content_type = resp.headers.get("content-type").map(str::to_owned);
+        if let Some(snapshot) = preset.observe_quota(&resp.headers, now_unix()) {
             self.usage.observe(id, snapshot).await;
         }
 
-        let raw = forward::collect_body(resp.body)
+        let raw = egress::collect_body(resp.body)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -722,7 +717,7 @@ impl<P: Persistence> Gateway<P> {
         // フィールド名を知っていると、方言ごとに分岐が増える。
         let usage = preset
             .metering()
-            .usage_observer(head.get("content-type"))
+            .usage_observer(content_type.as_deref())
             .and_then(|mut observer| {
                 observer.observe(&raw);
                 observer.finish()
@@ -782,11 +777,11 @@ struct Sample {
 /// 転送した結果。応答と、それを出した経路の身元。
 ///
 /// 身元を応答と別に持つのは、使用量の集計が「どの credential のどのモデルか」で
-/// 束ねるのに対し、[`forward::Response`] は HTTP の応答そのもの (状態・ヘッダ・
-/// 本文) を表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
+/// 束ねるのに対し、[`Response`] は HTTP の応答そのもの (状態・ヘッダ・本文) を
+/// 表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
 /// upstream の応答を表す構造体に溜まっていく (DR-0011)。
 pub struct Forwarded {
-    pub response: forward::Response,
+    pub response: Response,
     /// この応答を出した credential。relay 型のように認証情報を持たない経路は
     /// `None`。
     pub credential: Option<CredentialId>,
@@ -815,14 +810,13 @@ impl std::fmt::Debug for Forwarded {
 /// 読めない content-type かどうかは provider が決める。ここが決めるのは
 /// **2xx だけを覗く**ことだけ — エラーの本文に usage は載らないので、読んでも
 /// 取れないものに層を重ねない (DR-0011)。
-fn usage_observer(preset: &Preset, resp: &forward::Response) -> Option<Box<dyn UsageObserver>> {
+fn usage_observer(preset: &Preset, resp: &Response) -> Option<Box<dyn UsageObserver>> {
     if resp.status / 100 != 2 {
         return None;
     }
-    let headers = Headers::new(resp.headers.clone());
     preset
         .metering()
-        .usage_observer(headers.get("content-type"))
+        .usage_observer(resp.headers.get("content-type"))
 }
 
 /// プローブの結果。消費した分と、credential ごとの失敗。
@@ -833,19 +827,23 @@ struct Probed {
     limits: std::collections::BTreeMap<String, Vec<QuotaLimit>>,
 }
 
-/// この credential の利用状況をどこまで出せるか。
-fn support_of(spec: &CredentialSpec, observed: bool) -> quota::Support {
-    if observed {
-        return quota::Support::Observed;
-    }
-    match spec {
-        CredentialSpec::ClaudeOauth { .. } => quota::Support::Unobserved,
-        // 使用量は別の IAM アクションで、実行権限しかない API キーでは取れない。
-        CredentialSpec::ClaudeBedrock { .. } => quota::Support::NotApplicable,
-        // Codex は転送で凌いでいる段階。転送先が返さないものは見えない。
-        CredentialSpec::CodexOauth { .. } | CredentialSpec::Relay { .. } => {
-            quota::Support::UpstreamDependent
+/// 集計の 1 行の単価を、その行を出した経路へ聞く役。
+///
+/// 単価表は provider の側にあり (DR-0014 §4)、経路を引けるのは router なので、
+/// 両者を繋ぐのがここの仕事になる。
+struct RoutePricing<'a>(&'a Router);
+
+impl PricingSource for RoutePricing<'_> {
+    fn pricing(&self, credential: &str, model: &str) -> Option<Pricing> {
+        if let Some(preset) = self.0.preset(credential) {
+            return preset.metering().pricing(model);
         }
+        // 認証情報を持たない経路 ([`crate::stats::NO_CREDENTIAL`]) や、設定から
+        // 消えた名前の分。どの経路が答えたかは記録に残らないので、そのモデルに
+        // 値を付けられる経路を探す。付けられる経路が 1 つも無ければ欄は出ない。
+        self.0
+            .presets()
+            .find_map(|(_, preset)| preset.metering().pricing(model))
     }
 }
 
@@ -856,7 +854,7 @@ struct Switch {
     ///
     /// 本文は読まずに抱えたまま持ち回る。断られた応答は小さいので、後続を
     /// 試している間コネクションを握っていても割に合う。
-    denial: Option<forward::Response>,
+    denial: Option<Response>,
 }
 
 impl Switch {
@@ -870,18 +868,45 @@ impl Switch {
 }
 
 /// この応答をクライアントへ返すか、別の経路を試すか。
-fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Response, Switch> {
+fn accept_or_switch(resp: Response) -> std::result::Result<Response, Switch> {
     let reason = format!("upstream returned {}", resp.status);
-    if forward::should_try_next(resp.status) {
+    if should_try_next(resp.status) {
         return Err(Switch::to_next(reason));
     }
-    if forward::is_route_denial(resp.status) {
+    if is_route_denial(resp.status) {
         return Err(Switch {
             reason,
             denial: Some(resp),
         });
     }
     Ok(resp)
+}
+
+/// この状態なら別の upstream を試す価値があるか。
+///
+/// 経路が断たれている場合だけ切り替える。応答を持ち回る値打ちのない失敗で、
+/// 中身は捨てる。断られた応答を残したまま切り替えるものは
+/// [`is_route_denial`] が見る。
+fn should_try_next(status: u16) -> bool {
+    // 501 (未実装) は除く。別の経路に替えても実装されていないものは動かない。
+    matches!(status, 500 | 502..=504)
+}
+
+/// この経路には断られたが、別の経路なら通りうるか。
+///
+/// 上限もトークンの有効性も混み具合も、この経路の向こう側 (アカウントと
+/// 宛先) に付く。並んでいる認証情報は別のアカウントで、宛先も分かれているので、
+/// ここが断ったことは次が断ることを意味しない。
+///
+/// - 401 / 403: upstream との認証の話。クライアント側の認証は gateway が
+///   namespace のトークンで別に確かめている
+/// - 429: 上限はアカウント単位
+/// - 529: 宛先の混み具合。宛先が分かれている構成では、片方が詰まっていても
+///   もう片方は空いている (実測 2026-07-29)
+///
+/// 応答は捨てずに持ち回る。全部断られたときは、これをそのまま返す。
+fn is_route_denial(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429 | 529)
 }
 
 #[cfg(test)]
@@ -1136,8 +1161,32 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         })
     }
 
-    async fn body_text(resp: forward::Response) -> String {
-        String::from_utf8(forward::collect_body(resp.body).await.unwrap()).unwrap()
+    async fn body_text(resp: Response) -> String {
+        String::from_utf8(egress::collect_body(resp.body).await.unwrap()).unwrap()
+    }
+
+    /// 経路が断たれた状態だけ次へ回す。
+    #[test]
+    fn switches_only_on_upstream_outage() {
+        for status in [500, 502, 503, 504] {
+            assert!(should_try_next(status), "{status} は経路断とみなす");
+        }
+        assert!(!should_try_next(501), "未実装は別の経路でも未実装");
+        for status in [200, 201, 204, 400, 404, 422] {
+            assert!(!should_try_next(status), "{status} は次を試さない");
+        }
+    }
+
+    /// この経路に断られた分は、経路断とは別に扱う (応答を持ち回る側)。
+    #[test]
+    fn route_denials_are_told_apart_from_outages() {
+        for status in [401, 403, 429, 529] {
+            assert!(is_route_denial(status), "{status} はこの経路が断った");
+            assert!(!should_try_next(status), "{status} は経路断ではない");
+        }
+        for status in [200, 400, 404, 422, 500, 502, 503, 504] {
+            assert!(!is_route_denial(status), "{status} は経路のせいではない");
+        }
     }
 
     #[tokio::test]
@@ -1574,11 +1623,7 @@ credentials = ["a", "b"]
 
         assert_eq!(resp.response.status, 429);
         assert_eq!(
-            resp.response
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
-                .map(|(_, v)| v.as_str()),
+            resp.response.headers.get("retry-after"),
             Some("30"),
             "いつ再開できるかを伝える: {:?}",
             resp.response.headers
@@ -1812,11 +1857,7 @@ credentials = ["a", "b"]
 
         assert_eq!(resp.response.status, 429);
         assert_eq!(
-            resp.response
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
-                .map(|(_, v)| v.as_str()),
+            resp.response.headers.get("retry-after"),
             Some("100"),
             "最初に開くのがいつかを伝える"
         );
@@ -2123,11 +2164,7 @@ credentials = ["a", "b"]
             .unwrap();
 
         assert_eq!(
-            resp.response
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
-                .map(|(_, v)| v.as_str()),
+            resp.response.headers.get("retry-after"),
             Some(denial::PROBE_INTERVAL.to_string().as_str())
         );
     }
@@ -2789,39 +2826,6 @@ advisor-tool-2026-03-01";
         );
     }
 
-    /// 種別ごとに、利用状況をどこまで出せるか。
-    #[test]
-    fn support_depends_on_the_credential_type() {
-        use crate::quota::Support;
-
-        let oauth = CredentialSpec::ClaudeOauth {
-            url: "https://api.anthropic.com".to_owned(),
-            headers: Default::default(),
-            exclude: Vec::new(),
-        };
-        let bedrock = CredentialSpec::ClaudeBedrock {
-            url: "https://bedrock.invalid/anthropic".to_owned(),
-            headers: Default::default(),
-            deny_beta: None,
-            exclude: Vec::new(),
-        };
-        let relay = CredentialSpec::Relay {
-            url: "http://127.0.0.1:8317".to_owned(),
-            headers: Default::default(),
-            models: Vec::new(),
-            exclude: Vec::new(),
-        };
-
-        assert_eq!(support_of(&oauth, false), Support::Unobserved);
-        assert_eq!(support_of(&bedrock, false), Support::NotApplicable);
-        assert_eq!(support_of(&relay, false), Support::UpstreamDependent);
-
-        // 観測できているなら、種別に関わらずその値を出す。
-        for spec in [&oauth, &bedrock, &relay] {
-            assert_eq!(support_of(spec, true), Support::Observed);
-        }
-    }
-
     /// 使っていない credential も名前は出す。
     ///
     /// 消してしまうと「設定にあるが未観測」と「設定に無い」の区別がつかない。
@@ -2986,7 +2990,14 @@ url = "https://bedrock.invalid/anthropic"
         let report = gw.usage_report(true).await;
         let probe = report.probe.expect("投げた記録が残る");
         assert_eq!(probe.requests, 1, "枠を聞ける口を持つのは 1 本だけ");
-        assert_eq!(probe.model, PROBE_MODEL);
+        assert_eq!(
+            probe.model,
+            preset_of(&gw, "nowhere")
+                .probe_request()
+                .expect("枠を聞ける経路")
+                .model,
+            "何を投げたかは経路が決めた通りに出る"
+        );
 
         let by_name = |name: &str| {
             report
@@ -3004,6 +3015,57 @@ url = "https://bedrock.invalid/anthropic"
             by_name("bedrock").probe_error.is_none(),
             "投げていない相手に失敗は書かない"
         );
+    }
+
+    /// 集計の USD は、その行を出した経路の単価で換算する。
+    ///
+    /// 認証情報を持たない経路 (`-`) の行にも額が出る。答えた経路の名前が
+    /// 記録に残らないだけで、そのモデルに値を付けられる経路はいる (DR-0011)。
+    #[tokio::test]
+    async fn the_stats_report_prices_each_row_through_its_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = gateway(&format!(
+            r#"
+[stats]
+dir = "{}"
+
+[credentials.a]
+type = "relay"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5"]
+
+[ns.default]
+"#,
+            dir.path().display()
+        ))
+        .await;
+
+        let now = now_unix();
+        let mut usage = TokenUsage::default();
+        usage.set(TokenKind::input(), 1_000_000);
+        gw.stats().record(now, Some("a"), "claude-opus-5", &usage);
+        gw.stats().record(now, None, "claude-opus-5", &usage);
+        // 単価表に無いモデルは、どの経路に聞いても値が付かない。
+        gw.stats().record(now, Some("a"), "who-knows", &usage);
+
+        let report = gw.stats_report(7, now);
+        let day = report
+            .days
+            .values()
+            .next()
+            .expect("記録した日の分が出ている");
+
+        assert_eq!(day.credentials["a"]["claude-opus-5"].usd, Some(5.0));
+        assert_eq!(
+            day.credentials[crate::stats::NO_CREDENTIAL]["claude-opus-5"].usd,
+            Some(5.0),
+            "持ち主なしの行も、モデルから経路を辿って換算する"
+        );
+        assert_eq!(
+            day.credentials["a"]["who-knows"].usd, None,
+            "推測した額を出さない"
+        );
+        assert_eq!(day.total_usd, Some(10.0), "値の付く行だけの和");
     }
 
     /// 短い名前で指定できる。upstream には実際のモデル名で送る。

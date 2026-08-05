@@ -166,7 +166,7 @@ async fn stats<P: Persistence + 'static>(
         Ok(days) => days,
         Err(message) => return client_error("stats", StatusCode::BAD_REQUEST, &message),
     };
-    json_utf8(Json(gateway.stats().report(days, now_unix())))
+    json_utf8(Json(gateway.stats_report(days, now_unix())))
 }
 
 /// 既定で見せる日数。
@@ -308,7 +308,7 @@ async fn messages<P: Persistence + 'static>(
         Ok(forwarded) => {
             let upstream = forwarded.response;
             let mut resp = Response::builder().status(upstream.status);
-            for (name, value) in &upstream.headers {
+            for (name, value) in upstream.headers.iter() {
                 resp = resp.header(name, value);
             }
 

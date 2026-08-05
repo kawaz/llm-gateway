@@ -1,18 +1,29 @@
-//! upstream へ出るときの provider-neutral な HTTP 契約。
+//! upstream へ出るときの provider-neutral な HTTP 契約と、出口の手順。
 //!
 //! ingress が作った Messages 形式の正規形を [`EgressRequest`] で受け、provider の
 //! [`crate::provider::Wire`] が送信可能な [`UpstreamRequest`] へ変換する。
 //! 署名と実送信は同じ [`bytes::Bytes`] を参照し、JSON の再直列化で内容が変わらない。
+//!
+//! 手順もここが持つ。1 本送る ([`send`])、返ってきた本文を読む
+//! ([`collect_body`] / [`buffer`]) の 3 つは、どの preset を選んでも同じ形に
+//! なる出口の作法で、provider ごとに違うのはその中で呼ばれる Wire と Auth
+//! だけになる。
+//!
+//! 正規形の `model` 欄を読み書きする [`model_of`] / [`rewrite_model`] も
+//! ここに置く。どの名前で呼ぶかは方言ではなく正規形の話 (DR-0014 §5) なので、
+//! 方言の実装に持たせると同じものを preset の数だけ書くことになる。
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
 use serde_json::Value;
 
-use crate::Result;
+use crate::credential::Credential;
+use crate::provider::Preset;
+use crate::{Error, Result};
 
 /// object-safe な非同期 trait method の戻り値。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -142,9 +153,88 @@ impl std::fmt::Debug for Response {
     }
 }
 
+/// 1 本送る。
+///
+/// 返るのは upstream のヘッダを受け取った時点。本文はまだ流れていないので、
+/// ここまでの失敗なら別の upstream に切り替えられる。
+///
+/// 順は **組み立て → 認証 → 送信**。認証を最後にするのは、載せるものが
+/// 直列化済みのリクエスト全体に掛かりうるため (SigV4 のような署名は、後から
+/// ヘッダやボディが変わると壊れる)。
+pub async fn send(
+    http: &reqwest::Client,
+    preset: &Preset,
+    credential: Option<&Credential>,
+    request: EgressRequest,
+) -> Result<Response> {
+    let mut request = preset.wire().encode(request)?;
+    preset.auth().authorize(credential, &mut request)?;
+    preset.wire().send(http, request).await
+}
+
+/// 応答をすべて読む。
+///
+/// 失敗時の本文を見たいときや、ストリームでない応答を扱うときに使う。
+pub async fn collect_body(body: BodyStream) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut body = body;
+    while let Some(chunk) = body.next().await {
+        out.extend_from_slice(&chunk?);
+    }
+    Ok(out)
+}
+
+/// 本文を読んだうえで、まだ読んでいない応答として返し直す。
+///
+/// 失敗の中身を見てから「そのままクライアントへ返す」ことができる。
+/// 読んだら返せない作りだと、中身を見るために応答を捨てる羽目になる。
+/// 呼ぶのは失敗時だけ — 生成中の応答を丸ごと抱えると、その分の遅延と
+/// メモリがそのまま乗る。
+pub async fn buffer(resp: Response) -> Result<(Response, Vec<u8>)> {
+    let Response {
+        status,
+        headers,
+        body,
+    } = resp;
+    let raw = collect_body(body).await?;
+    let replayed = futures_util::stream::once({
+        let raw = raw.clone();
+        async move { Ok(Bytes::from(raw)) }
+    })
+    .boxed();
+
+    Ok((
+        Response {
+            status,
+            headers,
+            body: replayed,
+        },
+        raw,
+    ))
+}
+
+/// 正規形からモデル名を読む。
+pub fn model_of(body: &Value) -> Result<&str> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Config("リクエストに model がありません".to_owned()))
+}
+
+/// 正規形の `model` を、upstream が求める名前に替える。
+///
+/// どの名前を求めるかは discovery が答える (独自の名前空間を付ける upstream が
+/// ある)。正規形が Messages 形式なので、書き換えは 1 欄で済む。
+pub fn rewrite_model(body: &mut Value, upstream_name: &str) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("model".to_owned(), Value::String(upstream_name.to_owned()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn headers(pairs: &[(&str, &str)]) -> Headers {
         Headers::new(
@@ -200,5 +290,62 @@ mod tests {
             body.as_ptr(),
             "clone は同じ領域を共有する"
         );
+    }
+
+    /// 分かれて届いた本文も 1 本に繋がる。
+    #[tokio::test]
+    async fn a_split_body_is_read_whole() {
+        let body: BodyStream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"{\"error\":")),
+            Ok(Bytes::from_static(b"\"invalid beta flag\"}")),
+        ])
+        .boxed();
+
+        assert_eq!(
+            String::from_utf8(collect_body(body).await.unwrap()).unwrap(),
+            r#"{"error":"invalid beta flag"}"#
+        );
+    }
+
+    /// 中身を見た後も、そのままクライアントへ返せる。
+    #[tokio::test]
+    async fn buffered_response_can_still_be_forwarded() {
+        let resp = Response {
+            status: 400,
+            headers: headers(&[("content-type", "application/json")]),
+            body: futures_util::stream::once(async { Ok(Bytes::from_static(b"{\"error\":1}")) })
+                .boxed(),
+        };
+
+        let (resp, raw) = buffer(resp).await.unwrap();
+        assert_eq!(String::from_utf8(raw).unwrap(), r#"{"error":1}"#);
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            resp.headers.get("content-type"),
+            Some("application/json"),
+            "ヘッダは失わない"
+        );
+        assert_eq!(
+            String::from_utf8(collect_body(resp.body).await.unwrap()).unwrap(),
+            r#"{"error":1}"#,
+            "読んだ後でも同じ本文を流せる"
+        );
+    }
+
+    #[test]
+    fn reads_the_model_name() {
+        assert_eq!(model_of(&json!({"model": "m-1"})).unwrap(), "m-1");
+        assert!(model_of(&json!({})).is_err());
+        assert!(model_of(&json!({"model": ""})).is_err());
+        assert!(model_of(&json!({"model": 42})).is_err());
+    }
+
+    #[test]
+    fn the_model_is_rewritten_in_place() {
+        let mut body = json!({"model": "m-1", "max_tokens": 8});
+        rewrite_model(&mut body, "vendor.m-1");
+
+        assert_eq!(body["model"], "vendor.m-1");
+        assert_eq!(body["max_tokens"], 8, "他の項目は触らない");
     }
 }

@@ -15,8 +15,8 @@ use serde::Deserialize;
 use crate::credential::Credential;
 use crate::credential::time::parse_rfc3339;
 use crate::denial::{Denial, RESET_SLACK, Reason, Scope};
-use crate::egress::BoxFuture;
-use crate::provider::QuotaApi;
+use crate::egress::{BoxFuture, EgressRequest, Headers};
+use crate::provider::{ProbeRequest, QuotaApi};
 use crate::quota::QuotaLimit;
 use crate::{Error, Result};
 
@@ -28,6 +28,13 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 使い切ったとみなす使用率。
 const EXHAUSTED: f64 = 100.0;
+
+/// 枠ヘッダを引き出すために投げるモデル。
+///
+/// ヘッダを得るには実リクエストが要る (副作用ゼロで枠だけ返す口は見つかって
+/// いない、DR-0007)。一番小さいモデルに `max_tokens = 1` で投げて、消費を
+/// 最小にする。
+const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// `/api/oauth/usage` で枠を聞く。
 pub struct OauthUsage {
@@ -85,6 +92,30 @@ impl QuotaApi for OauthUsage {
             ));
         }
         entries
+    }
+
+    /// 枠ヘッダを引き出すための最小の 1 本。
+    ///
+    /// 一番小さいモデルに 1 トークンだけ頼む。本文は捨てて構わないので、
+    /// 中身は最短で通る形にする。OAuth の beta フラグを載せるのは、
+    /// 載せないとサブスクの認証が通らないため。
+    fn probe_request(&self) -> ProbeRequest {
+        ProbeRequest {
+            model: PROBE_MODEL.to_owned(),
+            request: EgressRequest {
+                path: "/v1/messages".to_owned(),
+                query: None,
+                body: serde_json::json!({
+                    "model": PROBE_MODEL,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "."}],
+                }),
+                headers: Headers::new(vec![
+                    ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+                    ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
+                ]),
+            },
+        }
     }
 }
 
@@ -273,6 +304,26 @@ mod tests {
 
     fn api() -> OauthUsage {
         OauthUsage::new("https://api.anthropic.com")
+    }
+
+    // ---------- 枠ヘッダを引き出す 1 本 ----------
+
+    /// 投げるのは一番小さいモデルに 1 トークンだけ。
+    ///
+    /// 枠を見るために枠を減らすので、消費は最小にする (DR-0007)。
+    #[test]
+    fn the_probe_asks_for_the_smallest_possible_answer() {
+        let probe = api().probe_request();
+
+        assert_eq!(probe.model, HAIKU, "一番小さいモデル");
+        assert_eq!(probe.request.path, "/v1/messages");
+        assert_eq!(probe.request.body["model"], HAIKU, "本文にも同じ名前");
+        assert_eq!(probe.request.body["max_tokens"], 1);
+        assert_eq!(
+            probe.request.headers.get("anthropic-beta"),
+            Some("oauth-2025-04-20"),
+            "サブスクの認証はこのフラグが要る"
+        );
     }
 
     // ---------- 応答の読み取り ----------

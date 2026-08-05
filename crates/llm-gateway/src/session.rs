@@ -1,6 +1,13 @@
-//! session キーの導出。
+//! 会話の見分け方。入口 (ingress) でクライアントの言い分から起こす。
 //!
-//! 同じ会話を同じ credential に貼り続けるためのキーを、リクエストから作る。
+//! 2 つある。経路を貼り続けるための [`SessionKey`] ([`derive`]) と、
+//! クライアントが自分で名乗った会話の id ([`declared_id`])。前者は名乗らない
+//! 相手にも必ず付く導出値で、後者は名乗った相手にしか無い。知らせ (DR-0012) に
+//! 載せるのは後者 — こちらが本文から起こした鍵を外へ出しても、受け取った側は
+//! 自分の会話と突き合わせられない。
+//!
+//! どちらもクライアント方言の知識なので、ここに集めてある。
+//!
 //! 導出規則は cpa (`sdk/cliproxy/auth/selector.go`) の挙動に合わせてある。
 //! 移行期に cpa と併存させたとき、両者が同じ会話を同じキーとみなすため。
 
@@ -8,6 +15,20 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
 
 use serde_json::Value;
+
+/// クライアントが会話の id を載せてくるリクエストヘッダ。
+///
+/// Claude Code が付ける。付けない相手 (curl 等) もいるので、無ければ
+/// 会話を特定しない扱いにする。
+pub const SESSION_HEADER: &str = "x-claude-code-session-id";
+
+/// クライアントが名乗った会話の id。名乗っていなければ `None`。
+///
+/// [`derive`] が作る [`SessionKey`] とは別物。あちらは経路を貼り続けるために
+/// こちらで起こす鍵で、こちらはクライアント自身の呼び名。
+pub fn declared_id(headers: &[(String, String)]) -> Option<String> {
+    header(headers, SESSION_HEADER).map(str::to_owned)
+}
 
 /// session affinity のキー。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -246,5 +267,44 @@ mod tests {
     #[test]
     fn empty_body_yields_a_key() {
         assert!(derive(&json!({}), &[]).as_str().starts_with("msg:"));
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// 名乗りのヘッダは大文字小文字を問わず読む。相手の書き方に合わせない。
+    #[test]
+    fn the_declared_id_is_read_in_any_case() {
+        for name in [
+            "x-claude-code-session-id",
+            "X-Claude-Code-Session-Id",
+            "X-CLAUDE-CODE-SESSION-ID",
+        ] {
+            assert_eq!(
+                declared_id(&headers(&[(name, "s-1")])),
+                Some("s-1".to_owned()),
+                "{name}"
+            );
+        }
+    }
+
+    /// 名乗らないクライアント (curl 等) もいる。会話を特定しないだけ。
+    #[test]
+    fn a_request_without_the_header_declares_nothing() {
+        assert_eq!(declared_id(&[]), None);
+        assert_eq!(declared_id(&headers(&[("content-type", "json")])), None);
+        assert_eq!(declared_id(&headers(&[(SESSION_HEADER, "  ")])), None);
+    }
+
+    #[test]
+    fn surrounding_space_is_trimmed_from_the_declared_id() {
+        assert_eq!(
+            declared_id(&headers(&[(SESSION_HEADER, " s-1 ")])),
+            Some("s-1".to_owned())
+        );
     }
 }

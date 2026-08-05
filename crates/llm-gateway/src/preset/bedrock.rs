@@ -15,6 +15,7 @@ use crate::credential::Credential;
 use crate::egress::{Headers, UpstreamRequest};
 use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, beta};
 use crate::provider::{Auth, Preset};
+use crate::quota::Support;
 use crate::{Error, Result};
 
 /// Bedrock の認証。API キーを `x-api-key` に載せる。
@@ -73,6 +74,8 @@ pub fn preset(name: &str, wire: Arc<AnthropicWire>, deny_beta: Option<Vec<String
         Arc::new(AnthropicMetering),
     )
     .with_negotiation(Arc::new(BetaFlags::new(policy)))
+    // 使用量は別の IAM アクションで、実行権限しかない API キーでは取れない。
+    .with_quota_support(Support::NotApplicable)
 }
 
 #[cfg(test)]
@@ -189,6 +192,11 @@ extended-cache-ttl-2025-04-11";
     #[test]
     fn has_no_quota_api() {
         assert!(bedrock().quota_api().is_none());
+        assert_eq!(
+            bedrock().quota_support(),
+            Support::NotApplicable,
+            "聞く口が無いのではなく、そもそも取れない"
+        );
     }
 
     /// 認証情報が要るのに渡されなければ、送る前に落とす。

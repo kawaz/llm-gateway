@@ -14,12 +14,6 @@ use tokio::sync::broadcast;
 
 use crate::credential::time::format_rfc3339;
 
-/// 会話の id を載せてくるリクエストヘッダ。
-///
-/// Claude Code が付ける。付けない相手 (curl 等) もいるので、無ければ
-/// 会話を特定しないイベントとして流す。
-pub const SESSION_HEADER: &str = "x-claude-code-session-id";
-
 /// 系列の識別子として出すハッシュの長さ (16 進の桁数)。
 ///
 /// 見分けが付けば足りる。人がログで突き合わせるので、短いほうが読める。
@@ -95,9 +89,8 @@ impl Event {
 /// 見るのは**先頭ブロックだけ**。実測 (451 リクエスト) では、`system` 配列の
 /// 末尾ブロックに `git status` 由来の内容 (コミット一覧・未コミットの
 /// ファイル) が入っていて、リポジトリを触るたびに変わる。全体を見ると、
-/// 同じ系列が別物に分かれる。先頭ブロック
-/// (`x-anthropic-billing-header: cc_version=…` で始まる) は全リクエストで
-/// 同一だった。
+/// 同じ系列が別物に分かれる。クライアントが必ず先頭に置く固定の 1 行
+/// (自分の版を名乗る行) で始まる先頭ブロックは、全リクエストで同一だった。
 ///
 /// **キャッシュに当たる保証ではない** (DR-0012)。upstream の cache は
 /// プレフィックス全体の一致を要るので、末尾が変われば実際には効かない。
@@ -162,29 +155,12 @@ impl Events {
     }
 }
 
-/// リクエストヘッダから会話の id を拾う。無ければ `None`。
-pub fn session_id(headers: &[(String, String)]) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(SESSION_HEADER))
-        .map(|(_, v)| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     const NOW: i64 = 1_800_000_000;
-
-    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect()
-    }
 
     /// 素性を 1 つ組む。試験で変えたい欄だけを書けるようにする。
     fn from(credential: &str) -> Origin<'_> {
@@ -195,38 +171,6 @@ mod tests {
             model: "m",
             credential,
         }
-    }
-
-    /// 大文字小文字は問わない。相手の書き方に合わせない。
-    #[test]
-    fn the_session_header_is_read_in_any_case() {
-        for name in [
-            "x-claude-code-session-id",
-            "X-Claude-Code-Session-Id",
-            "X-CLAUDE-CODE-SESSION-ID",
-        ] {
-            assert_eq!(
-                session_id(&headers(&[(name, "s-1")])),
-                Some("s-1".to_owned()),
-                "{name}"
-            );
-        }
-    }
-
-    /// 付けてこないクライアント (curl 等) もいる。会話を特定しないだけ。
-    #[test]
-    fn a_request_without_the_header_has_no_session() {
-        assert_eq!(session_id(&[]), None);
-        assert_eq!(session_id(&headers(&[("content-type", "json")])), None);
-        assert_eq!(session_id(&headers(&[(SESSION_HEADER, "  ")])), None);
-    }
-
-    #[test]
-    fn surrounding_space_is_trimmed() {
-        assert_eq!(
-            session_id(&headers(&[(SESSION_HEADER, " s-1 ")])),
-            Some("s-1".to_owned())
-        );
     }
 
     /// 誰も見ていなくても、流す側は何も気にしない。

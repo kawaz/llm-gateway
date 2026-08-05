@@ -17,8 +17,6 @@ mod wire;
 
 use std::sync::Arc;
 
-use serde_json::Value;
-
 pub use auth::OauthBearer;
 pub use metering::AnthropicMetering;
 pub use negotiation::BetaFlags;
@@ -26,12 +24,14 @@ pub use quota_api::OauthUsage;
 pub use wire::AnthropicWire;
 
 use crate::provider::Preset;
-use crate::{Error, Result};
+use crate::quota::Support;
 
 /// Anthropic 公式の preset。
 ///
 /// サブスクの OAuth token をそのまま載せ、トークンを消費しない枠照会 API を
 /// 持つ (DR-0007)。beta フラグは公式なら全部通るので、既定は素通し。
+///
+/// 枠は応答ヘッダに載るので、まだ観測が無い状態は「取れるがまだ」と言える。
 pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     let quota_api = OauthUsage::new(wire.base_url());
     Preset::new(
@@ -42,30 +42,12 @@ pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     )
     .with_quota_api(Arc::new(quota_api))
     .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
-}
-
-/// ボディの `model` を upstream が求める名前に替える。
-///
-/// どの名前を求めるかは discovery が答える (Bedrock は `anthropic.` の
-/// 名前空間が付く)。正規形が Messages 形式なので、書き換えは 1 欄で済む。
-pub fn rewrite_model(body: &mut Value, upstream_name: &str) {
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("model".to_owned(), Value::String(upstream_name.to_owned()));
-    }
-}
-
-/// ボディからモデル名を読む。
-pub fn model_of(body: &Value) -> Result<&str> {
-    body.get("model")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Config("リクエストに model がありません".to_owned()))
+    .with_quota_support(Support::Unobserved)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::collections::BTreeMap;
 
     fn wire() -> Arc<AnthropicWire> {
@@ -87,25 +69,10 @@ mod tests {
             preset.negotiation().is_some(),
             "beta の交渉はどの経路でも要る"
         );
-    }
-
-    #[test]
-    fn model_is_rewritten_in_place() {
-        let mut body = json!({"model": "claude-fable-5", "max_tokens": 8});
-        rewrite_model(&mut body, "anthropic.claude-fable-5");
-
-        assert_eq!(body["model"], "anthropic.claude-fable-5");
-        assert_eq!(body["max_tokens"], 8, "他の項目は触らない");
-    }
-
-    #[test]
-    fn reads_model_name() {
         assert_eq!(
-            model_of(&json!({"model": "claude-opus-5"})).unwrap(),
-            "claude-opus-5"
+            preset.quota_support(),
+            Support::Unobserved,
+            "枠は応答ヘッダに載るので、使えば見える"
         );
-        assert!(model_of(&json!({})).is_err());
-        assert!(model_of(&json!({"model": ""})).is_err());
-        assert!(model_of(&json!({"model": 42})).is_err());
     }
 }

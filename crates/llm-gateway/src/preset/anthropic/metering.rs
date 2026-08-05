@@ -91,7 +91,7 @@ impl Metering for AnthropicMetering {
     /// 4 区分をそのまま並べても二重計上にならない。表に無い区分 (provider 固有の
     /// 内訳) は課金へ入らないので、観測値として残したまま合計は動かない。
     fn pricing(&self, model: &str) -> Option<Pricing> {
-        crate::pricing::for_model(model)
+        crate::preset::pricing::for_model(model)
     }
 }
 

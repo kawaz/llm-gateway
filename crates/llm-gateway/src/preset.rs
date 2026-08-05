@@ -9,12 +9,16 @@
 //! ([`relay`])。認証の軸と方言の軸が直交しているので、後の 2 つは Wire を
 //! 書き直さずに設定だけで作れる。
 //!
+//! モデルの単価表 ([`pricing`]) もここに置く。いくら掛かるかは upstream が
+//! 決める事実で、集計の器が持つものではない (DR-0014 §4)。
+//!
 //! **設定の `type` がどの束ね方を指すかを知るのは [`from_spec`] だけ**。
 //! router はここが返した preset を名前で引くだけで、provider の顔ぶれを
 //! 知らずに済む (DR-0014 §3 の判定基準)。
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod pricing;
 pub mod relay;
 
 use std::sync::Arc;
@@ -48,29 +52,64 @@ mod tests {
         toml::from_str(toml).expect("設定として読める")
     }
 
+    fn oauth() -> CredentialSpec {
+        spec(r#"type = "claude_oauth""#)
+    }
+
+    fn bedrock() -> CredentialSpec {
+        spec(
+            r#"type = "claude_bedrock"
+url = "https://bedrock.invalid/anthropic""#,
+        )
+    }
+
+    fn relay() -> CredentialSpec {
+        spec(
+            r#"type = "relay"
+url = "http://127.0.0.1:8317""#,
+        )
+    }
+
     /// 束ね方の違いは capability の有無に出る。
     #[test]
     fn the_config_type_decides_which_capabilities_exist() {
-        let oauth = from_spec("claude-personal", &spec(r#"type = "claude_oauth""#));
-        assert!(oauth.quota_api().is_some(), "枠を聞ける口を持つ");
-
-        let bedrock = from_spec(
-            "bedrock",
-            &spec(
-                r#"type = "claude_bedrock"
-url = "https://bedrock.invalid/anthropic""#,
-            ),
+        assert!(
+            from_spec("claude-personal", &oauth()).quota_api().is_some(),
+            "枠を聞ける口を持つ"
         );
-        assert!(bedrock.quota_api().is_none(), "Bedrock に枠照会 API は無い");
-
-        let relay = from_spec(
-            "cpa",
-            &spec(
-                r#"type = "relay"
-url = "http://127.0.0.1:8317""#,
-            ),
+        assert!(
+            from_spec("bedrock", &bedrock()).quota_api().is_none(),
+            "Bedrock に枠照会 API は無い"
         );
-        assert!(relay.quota_api().is_none(), "枠は転送先が持っている");
+        assert!(
+            from_spec("cpa", &relay()).quota_api().is_none(),
+            "枠は転送先が持っている"
+        );
+    }
+
+    /// 束ね方ごとに、枠について何が言えるかも決まる。
+    ///
+    /// 「取れるがまだ観測していない」「仕組みとして取れない」「転送先次第」は
+    /// upstream の事情なので、閲覧の口ではなく preset が宣言する (DR-0007)。
+    #[test]
+    fn the_config_type_decides_what_can_be_said_about_quota() {
+        use crate::quota::Support;
+
+        assert_eq!(
+            from_spec("claude-personal", &oauth()).quota_support(),
+            Support::Unobserved,
+            "応答ヘッダに載るので、使えば見える"
+        );
+        assert_eq!(
+            from_spec("bedrock", &bedrock()).quota_support(),
+            Support::NotApplicable,
+            "使用量は別の権限で、実行権限しかない鍵では取れない"
+        );
+        assert_eq!(
+            from_spec("cpa", &relay()).quota_support(),
+            Support::UpstreamDependent,
+            "転送先が返さないものは見えない"
+        );
     }
 
     /// 名前と接続先は設定から届く。
