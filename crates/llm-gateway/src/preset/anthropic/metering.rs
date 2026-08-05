@@ -2,17 +2,23 @@
 //!
 //! 枠ヘッダの読み方、断られ方の意味、本文 usage のトークン区分、単価の課金軸は
 //! どれもこの方言の知識なので preset 側が持つ (DR-0014 §4)。core が規定するのは
-//! 写した先の形 ([`crate::metering`]) だけ。
+//! 写した先の形 ([`crate::metering`] / [`crate::quota`] / [`crate::denial`]) だけ。
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::denial::{self, Denial};
+use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, Scope};
 use crate::egress::Headers;
 use crate::metering::{Pricing, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Metering;
-use crate::quota::Snapshot;
+use crate::quota::{Overage, Snapshot, Window};
+
+/// `retry-after` をどこまで信じるか (秒)。
+///
+/// 窓の開く時刻と違い、`retry-after` は根拠を確かめようがない。桁の壊れた値
+/// (時刻の足し算が溢れる、実質永久に閉じる) をそのまま採ると、経路を失う。
+const MAX_BACKOFF: i64 = 7 * 24 * 60 * 60;
 
 /// SSE の 1 イベントをどこまで抱えるか。
 ///
@@ -30,9 +36,24 @@ pub struct AnthropicMetering;
 
 impl Metering for AnthropicMetering {
     fn quota_snapshot(&self, headers: &Headers, observed_at: i64) -> Option<Snapshot> {
-        Snapshot::from_headers(headers.as_slice(), observed_at)
+        read_unified(headers, observed_at)
     }
 
+    /// この応答は経路を締め出すか。するならいつまで、どの範囲で。
+    ///
+    /// - **429 + 塞がっている窓** → その窓が開く時刻 (+ [`RESET_SLACK`]) まで、
+    ///   経路全体を ([`Reason::Limited`] / [`Scope::Everything`])。窓が
+    ///   複数塞がっているなら**最も遅く開く時刻**まで — 5 時間の窓が開いても、
+    ///   7 日の窓が塞がったままなら通らない
+    /// - **429 で窓が読めない / 529** → `retry-after`、無ければ
+    ///   [`DEFAULT_BACKOFF`] だけ、頼んだモデルにだけ
+    ///   ([`Reason::Busy`] / [`Scope::Model`])
+    /// - それ以外の状態 → 締め出さない。401 / 403 は待っても直らないので、
+    ///   時間で空ける印を付ける意味がない
+    ///
+    /// 範囲を応答から決めるのは、**モデル別の制限がヘッダに出てこない**ため
+    /// (実測 2026-07-31、DR-0009)。窓が塞がったという証拠があるときだけ
+    /// 経路全体に広げ、証拠が無いものは頼んだモデルの事情として扱う。
     fn rejection(
         &self,
         status: u16,
@@ -40,7 +61,25 @@ impl Metering for AnthropicMetering {
         model: &str,
         observed_at: i64,
     ) -> Option<Denial> {
-        denial::denial_of(status, headers.as_slice(), model, observed_at)
+        if !matches!(status, 429 | 529) {
+            return None;
+        }
+        if status == 429
+            && let Some(reset) = last_reset(headers, observed_at)
+        {
+            return Some(Denial {
+                // 開くと言われた時刻ちょうどではなく、少し待ってから戻す。
+                until: reset + RESET_SLACK,
+                reason: Reason::Limited,
+                scope: Scope::Everything,
+            });
+        }
+        let after = retry_after(headers).unwrap_or(DEFAULT_BACKOFF);
+        Some(Denial {
+            until: observed_at + after.clamp(0, MAX_BACKOFF),
+            reason: Reason::Busy,
+            scope: Scope::Model(model.to_owned()),
+        })
     }
 
     fn usage_observer(&self, content_type: Option<&str>) -> Option<Box<dyn UsageObserver>> {
@@ -63,6 +102,84 @@ impl Metering for AnthropicMetering {
             ]),
         })
     }
+}
+
+/// `anthropic-ratelimit-unified-*` を読む (実測値は DR-0007)。
+///
+/// undocumented なヘッダなので、読めた分だけ使って残りは `None` にする。
+/// 1 つも読めなければスナップショットを作らない — 空の器を置くと「観測した」
+/// と「まだ観測していない」が区別できなくなる。
+fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
+    let window = |prefix: &str| {
+        let w = Window {
+            utilization: headers
+                .get(&format!("anthropic-ratelimit-unified-{prefix}-utilization"))
+                .and_then(|v| v.trim().parse().ok()),
+            status: headers
+                .get(&format!("anthropic-ratelimit-unified-{prefix}-status"))
+                .map(str::to_owned),
+            ..Window::default()
+        }
+        .with_reset(
+            headers
+                .get(&format!("anthropic-ratelimit-unified-{prefix}-reset"))
+                .and_then(|v| v.trim().parse().ok()),
+        );
+        (!w.is_empty()).then_some(w)
+    };
+
+    let overage = Overage {
+        status: headers
+            .get("anthropic-ratelimit-unified-overage-status")
+            .map(str::to_owned),
+        disabled_reason: headers
+            .get("anthropic-ratelimit-unified-overage-disabled-reason")
+            .map(str::to_owned),
+    };
+
+    Snapshot::new(
+        now,
+        window("5h"),
+        window("7d"),
+        (!overage.is_empty()).then_some(overage),
+    )
+}
+
+/// 塞がっている窓が全部開くのはいつか。
+///
+/// **最も遅い方**を採る。5 時間の窓が開いても、7 日の窓が塞がったままなら
+/// このリクエストは通らない。早い方を採ると、開いていない相手に当てに行って
+/// 429 を貰い直すことになる。
+fn last_reset(headers: &Headers, now: i64) -> Option<i64> {
+    let snapshot = read_unified(headers, now)?;
+    [snapshot.five_hour, snapshot.seven_day]
+        .into_iter()
+        .flatten()
+        .filter(is_rejected)
+        .filter_map(|w| w.reset)
+        // 過ぎている時刻は手掛かりにならない。次の手掛かりへ落とす。
+        .filter(|reset| *reset > now)
+        .max()
+}
+
+/// この窓は塞がっているか。
+///
+/// 通っている側の語 (`allowed`, `allowed_warning`) だけを数え、それ以外を
+/// 塞がっている扱いにする。語彙は公式に記載が無く増えうる (DR-0007) ので、
+/// 知らない語で締め出しを見送ると、印が付かないまま毎回 429 を貰い続ける
+/// 元の状態に戻る。
+fn is_rejected(window: &Window) -> bool {
+    window
+        .status
+        .as_deref()
+        .is_some_and(|s| !s.trim().to_ascii_lowercase().starts_with("allowed"))
+}
+
+/// `retry-after` の秒数。HTTP-date 形式なら読まない (既定へ落とす)。
+fn retry_after(headers: &Headers) -> Option<i64> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// 本文のどの読み方をするか。
@@ -272,6 +389,11 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    const NOW: i64 = 1_800_000_000;
+
+    /// 試験で使うモデル名。実際の運用と同じく、断られ方がモデルで違う。
+    const FABLE: &str = "claude-fable-5";
+
     fn headers(pairs: &[(&str, &str)]) -> Headers {
         Headers::new(
             pairs
@@ -279,6 +401,44 @@ mod tests {
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                 .collect(),
         )
+    }
+
+    /// 1 つの窓を表すヘッダ。
+    fn window(prefix: &str, status: &str, reset: i64) -> Vec<(String, String)> {
+        vec![
+            (
+                format!("anthropic-ratelimit-unified-{prefix}-status"),
+                status.to_owned(),
+            ),
+            (
+                format!("anthropic-ratelimit-unified-{prefix}-reset"),
+                reset.to_string(),
+            ),
+        ]
+    }
+
+    fn windows(pairs: Vec<Vec<(String, String)>>) -> Headers {
+        Headers::new(pairs.into_iter().flatten().collect())
+    }
+
+    fn rejection(status: u16, headers: &Headers, model: &str) -> Option<Denial> {
+        AnthropicMetering.rejection(status, headers, model, NOW)
+    }
+
+    fn limited(until: i64) -> Denial {
+        Denial {
+            until,
+            reason: Reason::Limited,
+            scope: Scope::Everything,
+        }
+    }
+
+    fn busy(until: i64, model: &str) -> Denial {
+        Denial {
+            until,
+            reason: Reason::Busy,
+            scope: Scope::Model(model.to_owned()),
+        }
     }
 
     fn read(content_type: &str, chunks: &[&[u8]]) -> Option<TokenUsage> {
@@ -290,6 +450,284 @@ mod tests {
         }
         observer.finish()
     }
+
+    // ---------- 枠ヘッダ ----------
+
+    /// 実測された unified ヘッダ一式 (DR-0007 の表)。
+    fn unified() -> Headers {
+        headers(&[
+            ("content-type", "application/json"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.71"),
+            ("anthropic-ratelimit-unified-5h-reset", "1785344400"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.3"),
+            ("anthropic-ratelimit-unified-7d-reset", "1785661200"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-overage-status", "disabled"),
+            (
+                "anthropic-ratelimit-unified-overage-disabled-reason",
+                "out_of_credits",
+            ),
+        ])
+    }
+
+    #[test]
+    fn reads_every_unified_field() {
+        let s = AnthropicMetering
+            .quota_snapshot(&unified(), NOW)
+            .expect("読める");
+
+        assert_eq!(s.observed_at, NOW, "取得時刻を必ず付ける");
+
+        let five = s.five_hour.unwrap();
+        assert_eq!(five.utilization, Some(0.71));
+        assert_eq!(five.status.as_deref(), Some("allowed"));
+        assert_eq!(five.reset, Some(1_785_344_400));
+        assert_eq!(
+            five.reset_iso.as_deref(),
+            Some("2026-07-29T17:00:00Z"),
+            "Unix 秒と ISO の両方を出す"
+        );
+
+        let seven = s.seven_day.unwrap();
+        assert_eq!(seven.utilization, Some(0.3));
+        assert_eq!(seven.reset, Some(1_785_661_200));
+
+        let overage = s.overage.unwrap();
+        assert_eq!(overage.status.as_deref(), Some("disabled"));
+        assert_eq!(overage.disabled_reason.as_deref(), Some("out_of_credits"));
+    }
+
+    /// ヘッダ名の大小は問わない (upstream や手前のプロキシで変わりうる)。
+    #[test]
+    fn header_lookup_ignores_case() {
+        let s = AnthropicMetering
+            .quota_snapshot(
+                &headers(&[("Anthropic-RateLimit-Unified-5h-Utilization", "0.5")]),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(s.five_hour.unwrap().utilization, Some(0.5));
+    }
+
+    /// undocumented なヘッダなので、欠けても壊れない。
+    /// 読めた分だけ使い、残りは None のままにする。
+    #[test]
+    fn missing_fields_do_not_break_the_rest() {
+        let s = AnthropicMetering
+            .quota_snapshot(
+                &headers(&[
+                    ("anthropic-ratelimit-unified-5h-utilization", "0.9"),
+                    (
+                        "anthropic-ratelimit-unified-7d-utilization",
+                        "beyond-repair",
+                    ),
+                ]),
+                NOW,
+            )
+            .unwrap();
+
+        let five = s.five_hour.unwrap();
+        assert_eq!(five.utilization, Some(0.9));
+        assert_eq!(five.reset, None, "無いものは None");
+        assert_eq!(five.reset_iso, None);
+        assert!(s.overage.is_none());
+        assert!(
+            s.seven_day.is_none(),
+            "1 つも読めなかった窓は、空の器を置かずに落とす"
+        );
+    }
+
+    /// 枠が 1 つも無い応答からは作らない。
+    ///
+    /// 空のスナップショットを置くと「観測した」と「まだ観測していない」が
+    /// 区別できなくなる。
+    #[test]
+    fn unrelated_response_yields_nothing() {
+        assert!(
+            AnthropicMetering
+                .quota_snapshot(
+                    &headers(&[
+                        ("content-type", "text/event-stream"),
+                        ("anthropic-ratelimit-requests-remaining", "42"),
+                    ]),
+                    NOW,
+                )
+                .is_none()
+        );
+        assert!(
+            AnthropicMetering
+                .quota_snapshot(&Headers::default(), NOW)
+                .is_none()
+        );
+    }
+
+    // ---------- 断られ方 ----------
+
+    /// 塞がっている窓があれば、そこが開く時刻まで経路全体を外す。
+    #[test]
+    fn a_rejected_window_closes_the_whole_route() {
+        let h = windows(vec![
+            window("5h", "allowed", NOW + 100),
+            window("7d", "rejected", NOW + 5000),
+        ]);
+        assert_eq!(
+            rejection(429, &h, FABLE),
+            Some(limited(NOW + 5000 + RESET_SLACK)),
+            "窓はアカウントに掛かるので、頼んだモデルには関係しない"
+        );
+    }
+
+    /// 開くと言われた時刻ちょうどには戻さない。
+    ///
+    /// リセット時刻ちょうどに使い始めても 1 分ほど遅れて実際に使えるように
+    /// なる (kawaz 実測)。ちょうどに戻すと、その 1 本が 429 を貰って
+    /// 締め出しが伸びる。
+    #[test]
+    fn the_route_comes_back_a_little_after_the_reset() {
+        let h = windows(vec![window("7d", "rejected", NOW + 5000)]);
+        let denial = rejection(429, &h, FABLE).unwrap();
+        assert_eq!(denial.until, NOW + 5000 + RESET_SLACK);
+        assert!(
+            denial.until > NOW + 5000,
+            "開くと言われた時刻より後に戻す (猶予 {} 秒)",
+            denial.until - (NOW + 5000)
+        );
+    }
+
+    /// 塞がっている窓が複数あるなら、全部開くまで。
+    ///
+    /// 5 時間の窓が開いても、7 日の窓が塞がったままなら通らない。早い方を
+    /// 採ると、開いていない相手に当てに行って 429 を貰い直すことになる。
+    #[test]
+    fn every_rejected_window_must_open() {
+        let h = windows(vec![
+            window("5h", "rejected", NOW + 100),
+            window("7d", "rejected", NOW + 5000),
+        ]);
+        assert_eq!(
+            rejection(429, &h, FABLE),
+            Some(limited(NOW + 5000 + RESET_SLACK))
+        );
+    }
+
+    /// 開いている窓の時刻は数えない。塞がっている窓だけを見る。
+    #[test]
+    fn an_open_window_does_not_extend_the_deadline() {
+        let h = windows(vec![
+            window("5h", "rejected", NOW + 100),
+            window("7d", "allowed", NOW + 5000),
+        ]);
+        assert_eq!(
+            rejection(429, &h, FABLE),
+            Some(limited(NOW + 100 + RESET_SLACK))
+        );
+    }
+
+    /// 遠い開く時刻でも縮めない。開く時刻を知っているならそこまで待つ。
+    #[test]
+    fn a_distant_reset_is_not_shortened() {
+        let h = windows(vec![window("7d", "rejected", NOW + 400 * 24 * 3600)]);
+        assert_eq!(
+            rejection(429, &h, FABLE),
+            Some(limited(NOW + 400 * 24 * 3600 + RESET_SLACK))
+        );
+    }
+
+    /// 警告つきでも通ってはいる。塞がっている扱いにしない。
+    #[test]
+    fn a_warning_window_is_still_open() {
+        let mut pairs = window("5h", "allowed_warning", NOW + 100);
+        pairs.push(("retry-after".to_owned(), "30".to_owned()));
+        assert_eq!(
+            rejection(429, &Headers::new(pairs), FABLE),
+            Some(busy(NOW + 30, FABLE)),
+            "窓は塞がっていないので、頼んだモデルの事情として短く退避する"
+        );
+    }
+
+    /// 窓が読めない 429 は、頼んだモデルだけを短く外す。
+    ///
+    /// 実測 (2026-07-31): 同じ credential で haiku は 200 (全窓 allowed)、
+    /// fable / opus / sonnet は上限のヘッダを 1 つも載せない 429 を返す。
+    /// モデル別の制限はヘッダに出てこないので、頼んだモデル以外に広げる
+    /// 根拠がない。
+    #[test]
+    fn a_bare_rate_limit_only_closes_the_model_asked_for() {
+        assert_eq!(
+            rejection(429, &Headers::default(), FABLE),
+            Some(busy(NOW + DEFAULT_BACKOFF, FABLE))
+        );
+        assert_eq!(
+            rejection(429, &headers(&[("retry-after", "30")]), FABLE),
+            Some(busy(NOW + 30, FABLE))
+        );
+    }
+
+    /// 529 も宛先とモデルの都合。窓のヘッダが載っていても短い退避のまま。
+    #[test]
+    fn an_overloaded_upstream_only_steps_aside() {
+        let h = windows(vec![window("7d", "rejected", NOW + 5000)]);
+        assert_eq!(
+            rejection(529, &h, FABLE),
+            Some(busy(NOW + DEFAULT_BACKOFF, FABLE))
+        );
+    }
+
+    /// 過ぎた開く時刻は使わない。
+    #[test]
+    fn a_past_reset_is_ignored() {
+        let mut pairs = window("7d", "rejected", NOW - 10);
+        pairs.push(("retry-after".to_owned(), "30".to_owned()));
+        assert_eq!(
+            rejection(429, &Headers::new(pairs), FABLE),
+            Some(busy(NOW + 30, FABLE))
+        );
+    }
+
+    /// 日付形式の `retry-after` は読まない。
+    #[test]
+    fn an_http_date_retry_after_falls_back_to_the_default() {
+        let h = headers(&[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")]);
+        assert_eq!(
+            rejection(529, &h, FABLE),
+            Some(busy(NOW + DEFAULT_BACKOFF, FABLE))
+        );
+    }
+
+    /// 待っても直らない断りは締め出さない。
+    #[test]
+    fn an_auth_failure_is_not_a_cooldown() {
+        for status in [200, 400, 401, 403, 500] {
+            assert_eq!(
+                rejection(status, &Headers::default(), FABLE),
+                None,
+                "{status}"
+            );
+        }
+    }
+
+    /// 桁の壊れた `retry-after` で時刻の足し算を溢れさせない。
+    #[test]
+    fn an_absurd_retry_after_is_clamped() {
+        for value in [i64::MAX.to_string(), "999999999999".to_owned()] {
+            let h = headers(&[("retry-after", &value)]);
+            assert_eq!(
+                rejection(429, &h, FABLE),
+                Some(busy(NOW + MAX_BACKOFF, FABLE)),
+                "{value}"
+            );
+        }
+    }
+
+    /// 負の `retry-after` は 0 扱い。過去の時刻を印にしない。
+    #[test]
+    fn a_negative_retry_after_does_not_look_expired() {
+        let h = headers(&[("retry-after", "-10")]);
+        assert_eq!(rejection(429, &h, FABLE), Some(busy(NOW, FABLE)));
+    }
+
+    // ---------- 本文 usage ----------
 
     /// 累積で届く usage は、最後に見た値が残る。
     #[test]
@@ -382,31 +820,6 @@ mod tests {
     fn gives_up_on_an_endless_event() {
         let flood = vec![b'x'; MAX_SSE_EVENT + 1];
         assert_eq!(read("text/event-stream", &[&flood]), None);
-    }
-
-    /// 枠ヘッダはスナップショットへ、断られ方は締め出しの印へ写す。
-    #[test]
-    fn maps_quota_headers_and_rejections() {
-        let quota = headers(&[
-            ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
-            ("anthropic-ratelimit-unified-5h-status", "allowed"),
-        ]);
-        let snapshot = AnthropicMetering
-            .quota_snapshot(&quota, 1_700_000_000)
-            .expect("読める");
-        assert_eq!(snapshot.five_hour.and_then(|w| w.utilization), Some(0.42));
-
-        assert!(
-            AnthropicMetering
-                .rejection(429, &headers(&[("retry-after", "30")]), "m", 100)
-                .is_some()
-        );
-        assert!(
-            AnthropicMetering
-                .rejection(200, &Headers::default(), "m", 100)
-                .is_none(),
-            "通った応答は締め出さない"
-        );
     }
 
     /// 単価表にあるモデルは 4 区分に値が付き、無いモデルは値付けしない。

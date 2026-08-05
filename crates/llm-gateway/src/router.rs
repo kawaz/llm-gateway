@@ -5,6 +5,10 @@
 //!
 //! 同じ会話は同じ経路に貼り続ける。貼り直すと prompt cache が無駄になり、
 //! upstream から見てアカウントをまたいだ利用にも見える。
+//!
+//! 経路が今使えるかは**経路自身に聞く** (DR-0014 §3)。router は経路の名前を
+//! 鍵にした締め出しの表を持たない — 断られ方の意味を知っているのは provider の
+//! 側で、こちらが要るのは「使えるか」と「駄目なら次はいつか」だけ。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -13,10 +17,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::backend::anthropic::{Bedrock, Official, Provider, Relay};
 use crate::config::{Config, CredentialSpec, Namespace};
-use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
+use crate::credential::{CredentialId, CredentialStore, Persistence};
+use crate::denial::{Availability, PROBE_INTERVAL};
 use crate::discovery::{self, Model};
+use crate::egress::{Headers, Response};
+use crate::events::{self, Events};
+use crate::preset;
+use crate::provider::Preset;
 use crate::session::SessionKey;
 use crate::{Error, Result};
 
@@ -28,24 +36,54 @@ const AFFINITY_TTL: Duration = Duration::from_secs(3600);
 
 /// 1 経路。どの upstream へ、どの認証情報で送るか。
 pub struct Route {
-    pub provider: Arc<dyn Provider>,
+    /// この経路の provider 実装一式と、この経路の状態。
+    pub preset: Arc<Preset>,
     /// 転送先が認証を持つ経路 (relay) では要らない。
     pub credential: Option<CredentialId>,
+    /// upstream での名前がクライアントの名前と違う場合だけ入る。
+    ///
+    /// 何という名前で受け付けるかは discovery が答える (upstream によっては
+    /// 独自の名前空間が付く)。方言の話ではないので Wire は持たない。
+    pub upstream_model: Option<String>,
 }
 
 impl Route {
     /// ログや失敗記録に出す名前。
     pub fn name(&self) -> &str {
-        self.provider.name()
+        self.preset.name()
     }
 }
 
 impl std::fmt::Debug for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Route")
-            .field("provider", &self.provider.name())
+            .field("preset", &self.preset.name())
             .field("credential", &self.credential)
+            .field("upstream_model", &self.upstream_model)
             .finish()
+    }
+}
+
+/// 今このリクエストで試せる経路。
+pub enum Selection {
+    /// 断られていない経路。設定の優先順のまま。
+    Ready(Vec<Arc<Route>>),
+    /// どれも断られている。組み立て済みの応答と、最初に開く時刻。
+    AllDenied {
+        response: Response,
+        /// 最も早く開く経路の時刻 (Unix 秒)。
+        until: i64,
+    },
+}
+
+impl std::fmt::Debug for Selection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(routes) => f.debug_tuple("Ready").field(routes).finish(),
+            Self::AllDenied { until, .. } => {
+                f.debug_struct("AllDenied").field("until", until).finish()
+            }
+        }
     }
 }
 
@@ -59,7 +97,7 @@ struct Catalog {
     /// credential 名 → その credential が扱えるモデル
     /// (クライアント向けの名前 → upstream での名前)。
     ///
-    /// Bedrock は `anthropic.` の名前空間が付くので変換が要る。
+    /// 独自の名前空間を付ける upstream があるので、変換が要る。
     by_credential: BTreeMap<String, BTreeMap<String, String>>,
 }
 
@@ -90,13 +128,21 @@ impl Catalog {
 
 pub struct Router {
     config: Config,
+    /// 設定 1 件につき 1 つ。**経路の状態を持つので作り直さない** —
+    /// リクエストごとに組み直すと、断られた印も枠の観測も毎回消える。
+    presets: BTreeMap<String, Arc<Preset>>,
     catalog: RwLock<Catalog>,
     /// 会話と経路の結びつき。鍵は (namespace 名, 会話)。
     ///
     /// namespace が違えば見えるモデルも経路の順も違うので、会話だけで引くと
     /// 別の namespace の結果が混ざる。同じ本文から derive した会話の鍵は
     /// namespace をまたいでも一致するので、分けないと経路の順が汚れる。
+    ///
+    /// **provider 間で選ぶための状態**なので、経路の側ではなく core が持つ
+    /// (DR-0014 §3 の横断機構)。
     affinity: Mutex<HashMap<(String, SessionKey), Binding>>,
+    /// 起きたことを見ている人へ流す口。全 provider ぶんで 1 本。
+    events: Arc<Events>,
 }
 
 struct Binding {
@@ -107,12 +153,36 @@ struct Binding {
 }
 
 impl Router {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, events: Arc<Events>) -> Self {
+        let presets = config
+            .credentials
+            .iter()
+            .map(|(name, spec)| (name.clone(), Arc::new(preset::from_spec(name, spec))))
+            .collect();
         Self {
             config,
+            presets,
             catalog: RwLock::new(Catalog::default()),
             affinity: Mutex::new(HashMap::new()),
+            events,
         }
+    }
+
+    /// 起きたことを流す口。
+    pub fn events(&self) -> &Arc<Events> {
+        &self.events
+    }
+
+    /// 名前で経路の preset を引く。設定に無ければ `None`。
+    pub fn preset(&self, name: &str) -> Option<&Arc<Preset>> {
+        self.presets.get(name)
+    }
+
+    /// 設定順の (名前, preset)。
+    pub fn presets(&self) -> impl Iterator<Item = (&str, &Arc<Preset>)> {
+        self.presets
+            .iter()
+            .map(|(name, preset)| (name.as_str(), preset))
     }
 
     /// upstream に一覧を聞いて、公開するモデルを組み直す。
@@ -274,42 +344,60 @@ impl Router {
         Ok(routes)
     }
 
+    /// 今このリクエストで試せる経路を選ぶ。
+    ///
+    /// 断られている経路は**外す**。開く時刻を知っていながら実リクエストを
+    /// 当てるのは、分かっている壁にわざわざぶつかりに行くのと同じ。
+    ///
+    /// 全滅なら 429 をここで組む。「候補が空」は経路を選ぶ側の判断なので、
+    /// その答えも選ぶ側が出す (DR-0014 §8)。見ている人にも 1 件流す — upstream
+    /// を叩いていないだけで、クライアントには断りが返っている。`origin` の
+    /// `credential` は呼び出し側が決める (この応答を出したのはどの経路でもない)。
+    pub fn select(
+        &self,
+        routes: &[Arc<Route>],
+        model: &str,
+        now: i64,
+        origin: &events::Origin<'_>,
+    ) -> Selection {
+        let mut ready = Vec::new();
+        let mut opens_at = Vec::new();
+        for route in routes {
+            match route.preset.availability(model, now) {
+                Availability::Ready => ready.push(Arc::clone(route)),
+                Availability::Denied { until } => opens_at.push(until),
+            }
+        }
+        if !ready.is_empty() {
+            return Selection::Ready(ready);
+        }
+
+        // どれも塞がっているなら、最初に開くのがいつかがクライアントの知りたいこと。
+        let until = opens_at.into_iter().min().unwrap_or(now);
+        warn!(
+            model = %model,
+            routes = routes.len(),
+            seconds = until - now,
+            "どの経路も断られています。開く時刻を伝えて返します"
+        );
+        self.events.publish(events::Event::new(now, origin, 429));
+        Selection::AllDenied {
+            response: rate_limited(until - now),
+            until,
+        }
+    }
+
     fn build_route(&self, catalog: &Catalog, name: &str, model: &str) -> Option<Arc<Route>> {
         let spec = self.config.credentials.get(name)?;
-        // upstream での名前が違う場合だけ書き換える。
-        let model_map = match catalog.upstream_name(name, model) {
-            Some(upstream) if upstream != model => {
-                BTreeMap::from([(model.to_owned(), upstream.to_owned())])
-            }
-            _ => BTreeMap::new(),
-        };
-
-        let provider: Arc<dyn Provider> = match spec {
-            CredentialSpec::ClaudeOauth { url, headers, .. } => {
-                Arc::new(Official::new(name, url, headers.clone()))
-            }
-            CredentialSpec::ClaudeBedrock {
-                url,
-                headers,
-                deny_beta,
-                ..
-            } => Arc::new(Bedrock::new(
-                name,
-                url,
-                headers.clone(),
-                deny_beta.clone(),
-                model_map,
-            )),
-            // Responses API への変換は未実装。それまでは転送で凌ぐ。
-            CredentialSpec::CodexOauth { url, headers, .. }
-            | CredentialSpec::Relay { url, headers, .. } => {
-                Arc::new(Relay::new(name, url, headers.clone()))
-            }
-        };
-
+        let preset = self.presets.get(name)?;
         Some(Arc::new(Route {
-            provider,
+            preset: Arc::clone(preset),
             credential: spec.needs_secret().then(|| CredentialId::new(name)),
+            // upstream での名前が違う場合だけ書き換える。
+            upstream_model: catalog
+                .upstream_name(name, model)
+                .filter(|upstream| *upstream != model)
+                .map(str::to_owned),
         }))
     }
 
@@ -349,6 +437,30 @@ impl Router {
                 )
             })
             .collect();
+    }
+}
+
+/// どの経路も断られているときに返す応答。
+///
+/// 開く時刻を知っているのだから、実リクエストを当てて 429 を貰い直す必要は
+/// ない。クライアントが次の一手を決めるのに要るのは状態コードと
+/// `retry-after` で、それはこちらで組み立てられる (DR-0009)。
+///
+/// 待たせる長さは [`PROBE_INTERVAL`] で頭を押さえる。裏で聞きに行った結果、
+/// 宣言されたリセット時刻より早く開くことがある。2 日後と伝えてしまうと、
+/// 早期に開いたことに気づいた側から見て嘘になる。
+fn rate_limited(after: i64) -> Response {
+    let after = after.min(PROBE_INTERVAL);
+    const BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"every route for this model is rate limited or overloaded; see the retry-after header"}}"#;
+    Response {
+        status: 429,
+        headers: Headers::new(vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("retry-after".to_owned(), after.max(1).to_string()),
+        ]),
+        body: Box::pin(futures_util::stream::once(std::future::ready(Ok(
+            bytes::Bytes::from_static(BODY.as_bytes()),
+        )))),
     }
 }
 
@@ -413,12 +525,10 @@ fn resolve_aliases(
     resolved
 }
 
-/// 認証情報を渡す先。gateway が持つ store をそのまま使う。
-pub type Credentials<'a> = &'a dyn Fn(&CredentialId) -> Option<Credential>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
 
     const CONFIG: &str = r#"
 [ns.default.filter]
@@ -470,13 +580,19 @@ models = ["claude-fable-*"]
 credentials = ["bedrock", "oauth-a"]
 "#;
 
+    const NOW: i64 = 1_800_000_000;
+
+    fn build(config: Config) -> Router {
+        Router::new(config, Arc::new(Events::new()))
+    }
+
     /// discovery 済みの状態を作る。
     async fn router() -> Router {
         let config: Config = toml::from_str(CONFIG).unwrap();
         config.validate().unwrap();
-        let r = Router::new(config);
+        let r = build(config);
         r.set_catalog(&[
-            // Bedrock は fable だけ扱い、upstream では名前空間が付く。
+            // Bedrock は fable / sonnet を扱い、upstream では名前空間が付く。
             (
                 "bedrock",
                 &[
@@ -521,6 +637,16 @@ credentials = ["bedrock", "oauth-a"]
 
     fn names(routes: &[Arc<Route>]) -> Vec<&str> {
         routes.iter().map(|r| r.name()).collect()
+    }
+
+    fn origin(model: &str) -> events::Origin<'_> {
+        events::Origin {
+            session_id: None,
+            prefix: None,
+            ns: NS,
+            model,
+            credential: crate::stats::NO_CREDENTIAL,
+        }
     }
 
     #[tokio::test]
@@ -571,27 +697,191 @@ credentials = ["bedrock", "oauth-a"]
     }
 
     /// upstream で名前が違うものだけ書き換える。
+    ///
+    /// 何という名前で受け付けるかは discovery が答えるので、経路に添えて
+    /// 持ち回る (方言の実装は関知しない)。
     #[tokio::test]
-    async fn rewrites_model_name_only_where_needed() {
-        use crate::backend::anthropic::Headers;
-        use serde_json::json;
-
+    async fn carries_the_upstream_model_name_only_where_needed() {
         let r = router().await;
         let routes = r
             .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
             .await
             .unwrap();
 
-        let mut body = json!({"model": "claude-fable-5"});
-        routes[0].provider.adapt(&mut body, &mut Headers::default());
         assert_eq!(
-            body["model"], "anthropic.claude-fable-5",
+            routes[0].upstream_model.as_deref(),
+            Some("anthropic.claude-fable-5"),
             "Bedrock は名前空間つき"
         );
+        assert_eq!(routes[1].upstream_model, None, "公式はそのまま");
+    }
 
-        let mut body = json!({"model": "claude-fable-5"});
-        routes[1].provider.adapt(&mut body, &mut Headers::default());
-        assert_eq!(body["model"], "claude-fable-5", "公式はそのまま");
+    /// 経路は設定 1 件につき 1 つの preset を共有する。
+    ///
+    /// リクエストごとに組み直すと、その経路が覚えた締め出しも枠も毎回消える。
+    #[tokio::test]
+    async fn routes_share_one_persistent_preset_per_credential() {
+        let r = router().await;
+        let s = session("s1");
+
+        let first = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        let again = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+
+        assert!(
+            Arc::ptr_eq(&first[0].preset, &again[0].preset),
+            "同じ実体を配る"
+        );
+        // 別のモデルで引いた経路も、同じ credential なら同じ preset。
+        let other_model = r
+            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first[0].preset, &other_model[0].preset));
+    }
+
+    /// 締め出しの印は経路が持つので、次の routes_for でも生きている。
+    #[tokio::test]
+    async fn a_denial_survives_the_next_lookup() {
+        let r = router().await;
+        let s = session("s1");
+        let routes = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        routes[0]
+            .preset
+            .reject(429, &Headers::default(), "claude-fable-5", NOW)
+            .expect("429 は締め出す");
+
+        let again = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        assert!(matches!(
+            again[0].preset.availability("claude-fable-5", NOW),
+            Availability::Denied { .. }
+        ));
+    }
+
+    /// 断られている経路は候補から外す。
+    #[tokio::test]
+    async fn select_drops_the_denied_routes() {
+        let r = router().await;
+        let routes = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
+            .await
+            .unwrap();
+        routes[0]
+            .preset
+            .reject(429, &Headers::default(), "claude-fable-5", NOW);
+
+        let Selection::Ready(ready) =
+            r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
+        else {
+            panic!("1 本は残る");
+        };
+        assert_eq!(names(&ready), vec!["oauth-a"]);
+    }
+
+    /// 全滅なら router が 429 を組む。開く時刻は最も早いものを伝える。
+    #[tokio::test]
+    async fn every_route_denied_is_answered_by_the_router() {
+        let r = router().await;
+        let model = "claude-fable-5";
+        let routes = r
+            .routes_for(ns(&r), NS, model, &session("s1"))
+            .await
+            .unwrap();
+        for route in &routes {
+            route
+                .preset
+                .reject(429, &Headers::default(), model, NOW)
+                .expect("429 は締め出す");
+        }
+
+        let Selection::AllDenied { response, until } =
+            r.select(&routes, model, NOW, &origin(model))
+        else {
+            panic!("全滅のはず");
+        };
+
+        assert_eq!(response.status, 429);
+        assert_eq!(until, NOW + 60, "最初に開く時刻");
+        assert_eq!(response.headers.get("retry-after"), Some("60"));
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some("application/json")
+        );
+
+        let body = response
+            .body
+            .fold(Vec::new(), |mut acc, chunk| async move {
+                acc.extend_from_slice(&chunk.unwrap());
+                acc
+            })
+            .await;
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .contains("rate_limit_error"),
+            "クライアントが読む形で返す"
+        );
+    }
+
+    /// 自前で返した 429 も、見ている人には 1 件流れる。
+    ///
+    /// upstream を叩いていないだけで、クライアントには断りが返っている。
+    /// 流さないと、webhook や SSE から「返事が消えた」ように見える。
+    #[tokio::test]
+    async fn the_self_made_denial_is_announced_too() {
+        let r = router().await;
+        let model = "claude-fable-5";
+        let routes = r
+            .routes_for(ns(&r), NS, model, &session("s1"))
+            .await
+            .unwrap();
+        for route in &routes {
+            route.preset.reject(429, &Headers::default(), model, NOW);
+        }
+
+        let mut watching = r.events().subscribe();
+        r.select(&routes, model, NOW, &origin(model));
+
+        let event = watching.recv().await.unwrap();
+        assert_eq!(event.status, 429);
+        assert_eq!(event.model, model);
+        assert_eq!(event.ns, NS);
+        assert_eq!(
+            event.credential,
+            crate::stats::NO_CREDENTIAL,
+            "答えたのは gateway 自身で、どの credential でもない"
+        );
+    }
+
+    /// 待たせる長さは、様子を聞きに行く間隔で頭を押さえる。
+    ///
+    /// 宣言されたリセット時刻より早く開くことがあり、その早期回復に気づく
+    /// のは裏で聞きに行った時。2 日後と伝えると、気づいた側から見て嘘になる。
+    #[test]
+    fn the_retry_after_is_capped_at_the_probe_interval() {
+        let resp = rate_limited(2 * 24 * 3600);
+        assert_eq!(
+            resp.headers.get("retry-after"),
+            Some(PROBE_INTERVAL.to_string().as_str())
+        );
+    }
+
+    /// 開く時刻が過ぎていても、0 秒とは伝えない。
+    #[test]
+    fn the_retry_after_is_never_zero() {
+        assert_eq!(rate_limited(0).headers.get("retry-after"), Some("1"));
+        assert_eq!(rate_limited(-10).headers.get("retry-after"), Some("1"));
     }
 
     /// エイリアスは一番新しいものに向く。
@@ -832,7 +1122,7 @@ credentials = ["bedrock", "oauth-a"]
     #[tokio::test]
     async fn empty_catalog_serves_nothing() {
         let config: Config = toml::from_str(CONFIG).unwrap();
-        let r = Router::new(config);
+        let r = build(config);
         assert!(r.models(ns(&r)).await.is_empty());
         assert!(
             r.routes_for(ns(&r), NS, "claude-opus-5", &session("s"))

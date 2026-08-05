@@ -1324,6 +1324,9 @@ mod usage_tests {
     #[tokio::test]
     async fn a_snapshot_observed_before_the_restart_is_still_listed() {
         use llm_gateway::credential::CredentialId;
+        use llm_gateway::egress::Headers;
+        use llm_gateway::preset::anthropic::AnthropicMetering;
+        use llm_gateway::provider::Metering as _;
         use llm_gateway::quota::QuotaStore;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1331,13 +1334,12 @@ mod usage_tests {
         // 3 時間前に観測して落とした、前の起動の分。
         let observed_at = 1_785_326_400 - 3 * 3600;
         {
+            let snapshot = AnthropicMetering
+                .quota_snapshot(&Headers::new(unified_headers()), observed_at)
+                .expect("枠が載っている");
             let usage = QuotaStore::new(dir.path(), listen);
             usage
-                .observe(
-                    &CredentialId::new("claude-personal"),
-                    &unified_headers(),
-                    observed_at,
-                )
+                .observe(&CredentialId::new("claude-personal"), snapshot)
                 .await;
             usage.save().await.unwrap();
         }

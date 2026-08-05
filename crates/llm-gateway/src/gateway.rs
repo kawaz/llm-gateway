@@ -3,22 +3,26 @@
 //! モデル名から経路を選び、上から試して、通ったものの応答をそのまま返す。
 //! 切り替えられるのは**クライアントへ 1 バイトも書く前**まで。応答を流し
 //! 始めた後で upstream が切れても、HTTP のやり直しはできない。
+//!
+//! 経路がどうなっているか (断られた印・枠・様子見) は経路自身が持つ
+//! (DR-0014 §3)。ここに経路の名前を鍵にした表は無く、通った / 断られたを
+//! その経路へ伝えるだけ。
 
 use std::sync::Arc;
 
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::backend::anthropic::{Headers, Official, Provider, beta, forward, model_of};
+use crate::backend::anthropic::{Headers, forward, model_of, rewrite_model};
 use crate::config::{Config, CredentialSpec, Namespace};
 use crate::credential::time::now_unix;
-use crate::credential::{CredentialId, CredentialStore, Persistence};
-use crate::denial::{self, Candidates, Denials, Probing, Reason, denial_of};
+use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
+use crate::denial::Probing;
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
-use crate::limits::{self, Limit};
-use crate::quota::{self, QuotaStore};
-use crate::router::{Route, Router};
+use crate::provider::Preset;
+use crate::quota::{self, QuotaLimit, QuotaStore};
+use crate::router::{Route, Router, Selection};
 use crate::session;
 use crate::stats::Stats;
 use crate::{Error, Result};
@@ -36,12 +40,12 @@ pub struct Gateway<P: Persistence> {
     credentials: CredentialStore<P>,
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
-    /// 裏で様子を聞きに行く仕事と共有する。要求より長生きしうる。
+    /// 枠の観測を再起動を跨いで持つ置き場。裏で走る仕事とも共有する。
     usage: Arc<QuotaStore>,
     stats: Arc<Stats>,
-    /// 断られた経路の締め出し。
-    denials: Arc<Denials>,
     /// 転送のたびに起きたことを見ている人へ流す口 (DR-0012)。
+    ///
+    /// router も同じ口を持つ (自前で返す 429 を流すため)。
     events: Arc<Events>,
 }
 
@@ -80,9 +84,12 @@ impl<P: Persistence> Gateway<P> {
             .build()
             .map_err(|e| Error::Config(format!("HTTP クライアントを作れません: {e}")))?;
 
+        // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
+        let events = Arc::new(Events::new());
+
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
-            router: Router::new(config.clone()),
+            router: Router::new(config.clone(), Arc::clone(&events)),
             // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
             // 共有しても、互いのファイルを書かない (DR-0011)。
             stats: Arc::new(Stats::new(
@@ -97,8 +104,7 @@ impl<P: Persistence> Gateway<P> {
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
-            denials: Arc::new(Denials::new()),
-            events: Arc::new(Events::new()),
+            events,
         })
     }
 
@@ -119,11 +125,19 @@ impl<P: Persistence> Gateway<P> {
     /// 前回落とした分を読み戻す。待ち受けを始める前に 1 回だけ呼ぶ。
     ///
     /// 日次集計を読まずに数え直すと、次の保存で前回までの分を上書きして消す
-    /// (DR-0011)。利用状況を読まないと、再起動のたびに全 credential が未観測へ
+    /// (DR-0011)。枠の観測を読まないと、再起動のたびに全 credential が未観測へ
     /// 戻る (DR-0007)。`now` を受けるのは、読み戻す「当日」を試験から固定するため。
     pub async fn restore(&self, now: i64) {
         self.stats.restore(now);
         self.usage.restore().await;
+
+        // 読み戻した観測は、それを持つべき経路へ渡す。置き場はディスクとの
+        // 出入りを担い、今の値は経路が持つ (DR-0014 §3)。
+        for (name, preset) in self.router.presets() {
+            if let Some(snapshot) = self.usage.get(&CredentialId::new(name)).await {
+                preset.restore_quota(snapshot);
+            }
+        }
     }
 
     /// 変わった分をディスクへ落とす。
@@ -208,7 +222,7 @@ impl<P: Persistence> Gateway<P> {
         // upstream はこの名前を知らないので、ボディも書き換える。
         let model = self.router.resolve(ns, &requested).await;
         if model != requested {
-            crate::backend::anthropic::rewrite_model(&mut body, &model);
+            rewrite_model(&mut body, &model);
         }
 
         let session = session::derive(&body, &headers);
@@ -234,37 +248,34 @@ impl<P: Persistence> Gateway<P> {
         // 開いたことに気づけない。聞き終わるのは待たない — この 1 本を
         // 遅くしてまで待つ価値は無く、結果は次のリクエストが使う。
         for route in &routes {
-            if self.can_probe(route.name())
-                && let Some(probing) = self.denials.claim_probe(route.name(), now)
+            if let Some(id) = &route.credential
+                && let Some(probing) = route.preset.claim_probe(now)
             {
-                let _ = self.probe_in_background(probing);
+                self.probe_in_background(id, &route.preset, probing);
             }
         }
 
-        // 断られている経路は飛ばす。上限に当たった認証情報が先頭にいると、
-        // 印が無ければ全リクエストがそこで 1 往復ぶん無駄になる。
-        let routes = match self.denials.candidates(&routes, &model, now) {
-            Candidates::Ready(ready) => ready,
-            // どれも断られている。開く時刻を知っているのだから、当てに行って
-            // 429 を貰い直す必要はない。同じことを retry-after で伝える。
-            Candidates::AllDenied { until } => {
-                warn!(
-                    model = %model,
-                    routes = routes.len(),
-                    seconds = until - now,
-                    "どの経路も断られています。開く時刻を伝えて返します"
-                );
+        // 断られている経路は飛ばす。全滅なら router が 429 を組んで返す
+        // (「候補が空」は経路を選ぶ側の判断、DR-0014 §8)。
+        let routes = match self.router.select(
+            &routes,
+            &model,
+            now,
+            &call.origin(crate::stats::NO_CREDENTIAL),
+        ) {
+            Selection::Ready(ready) => ready,
+            Selection::AllDenied { response, .. } => {
                 // 行き場を失った今が、状態を確かめる価値の最も高い瞬間。
                 // 次の周期を待たずに聞きに行く。
                 for route in &routes {
-                    if self.can_probe(route.name())
-                        && let Some(probing) = self.denials.claim_ask(route.name(), now)
+                    if let Some(id) = &route.credential
+                        && let Some(probing) = route.preset.claim_ask(now)
                     {
-                        let _ = self.probe_in_background(probing);
+                        self.probe_in_background(id, &route.preset, probing);
                     }
                 }
                 return Ok(Forwarded {
-                    response: rate_limited(until - now),
+                    response: response.into(),
                     credential: None,
                     model,
                 });
@@ -285,10 +296,10 @@ impl<P: Persistence> Gateway<P> {
                     if resp.status / 100 == 2 {
                         self.router.remember(ns_name, &session, &model, route).await;
                         // 通ったなら締め出しの根拠は消えている。
-                        self.denials.allow(route.name(), &model);
+                        route.preset.allow(&model);
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
-                    // まで流れ切ったかどうかは crate::relay が記録する。
+                    // まで流れ切ったかどうかは crate::exchange が記録する。
                     info!(
                         model = %model,
                         route = route.name(),
@@ -309,9 +320,10 @@ impl<P: Persistence> Gateway<P> {
                     });
                     if let Some(resp) = denial {
                         // 時間が経てば空く断りなら、次のリクエストで同じ壁に
-                        // 当たらないよう期限を控える。
+                        // 当たらないよう期限を控える。読み方は provider が持つ。
                         let now = now_unix();
-                        if let Some(denial) = denial_of(resp.status, &resp.headers, &model, now) {
+                        let head = Headers::new(resp.headers.clone());
+                        if let Some(denial) = route.preset.reject(resp.status, &head, &model, now) {
                             warn!(
                                 route = route.name(),
                                 status = resp.status,
@@ -319,17 +331,15 @@ impl<P: Persistence> Gateway<P> {
                                 seconds = denial.until - now,
                                 "この経路を候補から外します"
                             );
-                            let vague = denial.reason == Reason::Busy;
-                            self.denials.deny(route.name(), denial, now);
 
                             // 断られたのに理由が応答に無いなら、枠を聞きに行く。
                             // 当て推量の 60 秒を、どの枠がいつ開くかという
                             // 実際の答えに差し替えられる (DR-0007)。
-                            if vague
-                                && self.can_probe(route.name())
-                                && let Some(probing) = self.denials.claim_ask(route.name(), now)
+                            if denial.reason == crate::denial::Reason::Busy
+                                && let Some(id) = &route.credential
+                                && let Some(probing) = route.preset.claim_ask(now)
                             {
-                                let _ = self.probe_in_background(probing);
+                                self.probe_in_background(id, &route.preset, probing);
                             }
                         }
                         denied = Some((resp, route.credential.clone()));
@@ -382,48 +392,54 @@ impl<P: Persistence> Gateway<P> {
         // upstream の既定に、この認証情報で拒否されたと分かっている分を足す。
         // 同じ upstream でも region や契約で受け付ける beta が違うので、
         // 学習結果は認証情報ごとに持つ (DR-0003)。
-        let mut policy = route.provider.beta_policy();
-        if let Some(c) = &credential {
-            policy.deny_all(c.denied_beta.iter().cloned());
-        }
+        let learned: Vec<String> = credential
+            .as_ref()
+            .map(|c| c.denied_beta.iter().cloned().collect())
+            .unwrap_or_default();
+        let negotiation = route.preset.negotiation();
 
         let mut sending = Headers::new(headers.to_vec());
-        let sent = policy.apply_to(&mut sending);
+        let sent = negotiation
+            .map(|n| n.prepare(&mut sending, &learned))
+            .unwrap_or_default();
 
         let resp = self.send(route, call, credential.as_ref(), sending).await?;
 
-        // beta を載せていないなら、400 の原因は他にある。
+        // 交渉するものを載せていないなら、失敗の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
             return accept_or_switch(resp);
         }
+        let Some(negotiation) = negotiation else {
+            return accept_or_switch(resp);
+        };
 
         let (resp, raw) = forward::buffer(resp)
             .await
             .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
-        if !beta::is_invalid_beta_error(&raw) {
+        let Some(blamed) = negotiation.blame(&raw, &sent) else {
             return accept_or_switch(resp);
-        }
+        };
 
-        let blamed = beta::blamed_flags(&raw, &sent);
         warn!(
             route = route.name(),
             flags = ?blamed,
-            "beta フラグが拒否されました。落として送り直します"
+            "送ったヘッダが拒否されました。落として送り直します"
         );
         if let Some(id) = &route.credential
             && let Err(e) = self.credentials.record_denied_beta(id, &blamed).await
         {
-            // 覚えられなくても転送は続ける。次も同じ 400 を 1 回踏むだけで、
+            // 覚えられなくても転送は続ける。次も同じ失敗を 1 回踏むだけで、
             // ここで諦めるとクライアントには何も返らない。
-            warn!(credential = %id, %e, "拒否された beta フラグを保存できません");
+            warn!(credential = %id, %e, "拒否されたフラグを保存できません");
         }
 
-        policy.deny_all(blamed);
         let mut retrying = Headers::new(headers.to_vec());
-        policy.apply_to(&mut retrying);
+        let mut learned = learned;
+        learned.extend(blamed);
+        negotiation.prepare(&mut retrying, &learned);
 
-        // 送り直すのは 1 回だけ。これでも 400 ならクライアントへ返す。
+        // 送り直すのは 1 回だけ。これでも失敗ならクライアントへ返す。
         let resp = self
             .send(route, call, credential.as_ref(), retrying)
             .await?;
@@ -434,27 +450,36 @@ impl<P: Persistence> Gateway<P> {
         &self,
         route: &Arc<Route>,
         call: &Call<'_>,
-        credential: Option<&crate::credential::Credential>,
+        credential: Option<&Credential>,
         headers: Headers,
     ) -> std::result::Result<forward::Response, Switch> {
+        // upstream での名前が違う経路 (Bedrock) にだけ書き換えて送る。
+        // 何という名前で受け付けるかは discovery が答えている。
+        let mut body = call.body.clone();
+        if let Some(upstream) = &route.upstream_model {
+            rewrite_model(&mut body, upstream);
+        }
+
         let resp = forward::send(
             &self.http,
-            route.provider.as_ref(),
+            route.preset.as_ref(),
             credential,
             call.path,
             call.query,
-            call.body.clone(),
+            body,
             headers,
         )
         .await
         .map_err(|e| Switch::to_next(e.to_string()))?;
 
-        // 便乗して利用状況を拾う (DR-0007)。読むのはヘッダだけなので、
-        // 本文はこの後もそのまま流れる。上限に当たった応答こそ見たいので、
-        // status では絞らない。
+        // 便乗して枠を拾う (DR-0007)。読むのはヘッダだけなので、本文はこの後も
+        // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
         let now = now_unix();
         if let Some(id) = &route.credential {
-            self.usage.observe(id, &resp.headers, now).await;
+            let head = Headers::new(resp.headers.clone());
+            if let Some(snapshot) = route.preset.observe_quota(&head, now) {
+                self.usage.observe(id, snapshot).await;
+            }
         }
 
         // 見ている人へ知らせる (DR-0012)。upstream がヘッダを返したこの瞬間が、
@@ -462,13 +487,7 @@ impl<P: Persistence> Gateway<P> {
         // ので、status で絞らない。
         self.events.publish(events::Event::new(
             now,
-            &events::Origin {
-                session_id: call.session_id.as_deref(),
-                prefix: call.prefix.as_deref(),
-                ns: call.ns,
-                model: call.model,
-                credential: route.name(),
-            },
+            &call.origin(route.name()),
             resp.status,
         ));
         Ok(resp)
@@ -488,8 +507,8 @@ impl<P: Persistence> Gateway<P> {
 
         let mut credentials = Vec::new();
         for (name, spec) in &self.config.credentials {
-            let id = CredentialId::new(name.as_str());
-            let snapshot = self.usage.get(&id).await;
+            // 今の観測を持っているのは経路。置き場はディスクとの出入りを担う。
+            let snapshot = self.router.preset(name).and_then(|preset| preset.quota());
             let support = support_of(spec, snapshot.is_some());
 
             let mut entry = quota::CredentialUsage::new(name, spec.type_name(), support, snapshot);
@@ -507,7 +526,7 @@ impl<P: Persistence> Gateway<P> {
         report
     }
 
-    /// 使用率を取れる credential に、最小のリクエストを 1 本ずつ投げる。
+    /// 枠を聞ける経路に、最小のリクエストを 1 本ずつ投げる。
     ///
     /// 失敗した credential はその理由を控えて先へ進む。1 つの認証切れで
     /// 一覧全体が返らなくなると、確認したかった他の credential まで見えない。
@@ -519,26 +538,28 @@ impl<P: Persistence> Gateway<P> {
         let mut errors = std::collections::BTreeMap::new();
         let mut limits = std::collections::BTreeMap::new();
 
-        for (name, spec) in &self.config.credentials {
-            // ヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。
-            if !matches!(spec, CredentialSpec::ClaudeOauth { .. }) {
+        for (name, preset) in self.router.presets() {
+            // 枠を聞ける口を持つ経路だけがヘッダも返す (DR-0007)。持たない
+            // 相手は、投げても今の状態が読めない。
+            if preset.quota_api().is_none() {
                 continue;
             }
+            let id = CredentialId::new(name);
             // 枠を聞くのが先。こちらはトークンを使わないので、この後の
             // 最小リクエストが失敗しても、枠だけは見えるようにしておく。
-            if let Some(found) = self.ask_limits(name, spec).await {
-                limits.insert(name.clone(), found);
+            if let Some(found) = self.ask_limits(&id, preset).await {
+                limits.insert(name.to_owned(), found);
             }
 
             spent.requests += 1;
-            match self.probe_one(name, spec).await {
+            match self.probe_one(&id, preset).await {
                 Ok((input, output)) => {
                     spent.input_tokens += input;
                     spent.output_tokens += output;
                 }
                 Err(reason) => {
                     warn!(credential = %name, %reason, "利用状況を取りに行けません");
-                    errors.insert(name.clone(), reason);
+                    errors.insert(name.to_owned(), reason);
                 }
             }
         }
@@ -549,29 +570,30 @@ impl<P: Persistence> Gateway<P> {
         })
     }
 
-    /// 1 つの credential の枠を、専用の口に聞く ([`crate::limits`])。
+    /// 1 つの経路の枠を、専用の口に聞く。
     ///
     /// トークンを使わないので、聞くこと自体が枠を減らさない。読めなければ
     /// `None` を返して先へ進む — 枠が見えないのは不便だが、それで一覧全体を
     /// 返せなくする理由にはならない。
-    async fn ask_limits(&self, name: &str, spec: &CredentialSpec) -> Option<Vec<Limit>> {
-        let credential = match self.credentials.acquire(&CredentialId::new(name)).await {
+    async fn ask_limits(&self, id: &CredentialId, preset: &Preset) -> Option<Vec<QuotaLimit>> {
+        let api = preset.quota_api()?;
+        let credential = match self.credentials.acquire(id).await {
             Ok(credential) => credential,
             Err(e) => {
-                warn!(credential = %name, %e, "枠を聞くための認証情報を用意できません");
+                warn!(credential = %id, %e, "枠を聞くための認証情報を用意できません");
                 return None;
             }
         };
-        limits::fetch(&self.http, spec.url(), &credential).await
+        api.fetch(&self.http, &credential).await.ok()
     }
 
-    /// 1 つの credential に投げて、ヘッダを拾う。返すのは消費したトークン。
+    /// 1 つの経路に投げて、ヘッダを拾う。返すのは消費したトークン。
     async fn probe_one(
         &self,
-        name: &str,
-        spec: &CredentialSpec,
+        id: &CredentialId,
+        preset: &Preset,
     ) -> std::result::Result<(u64, u64), String> {
-        let sample = Self::sound(&self.http, &self.credentials, &self.usage, name, spec).await?;
+        let sample = self.sound(id, preset).await?;
         if sample.status != 200 {
             return Err(format!(
                 "upstream が {} を返しました: {}",
@@ -584,21 +606,10 @@ impl<P: Persistence> Gateway<P> {
         ))
     }
 
-    /// この経路には様子を聞きに行けるか。
-    ///
-    /// 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。他の種類は
-    /// 聞いても今の状態が読めないので、役を引き受ける前にここで落とす。
-    fn can_probe(&self, route: &str) -> bool {
-        matches!(
-            self.config.credentials.get(route),
-            Some(CredentialSpec::ClaudeOauth { .. })
-        )
-    }
-
     /// 経路の枠を、裏で聞きに行く。
     ///
-    /// 実リクエストは断られている経路に当てない。代わりに専用の口
-    /// ([`crate::limits`]) に枠を聞き、返ってきた `limits` で印を引き直す。
+    /// 実リクエストは断られている経路に当てない。代わりに枠照会 API
+    /// ([`crate::provider::QuotaApi`]) に聞き、返ってきた枠で印を引き直す。
     /// **トークンを使わない**ので、聞くこと自体が枠を減らさない。
     ///
     /// 要求から切り離した仕事として走らせる。要求は途中で消える (クライアントが
@@ -608,60 +619,60 @@ impl<P: Persistence> Gateway<P> {
     /// 返すのは走らせた仕事。転送の側は待たない (待つと、この 1 本が聞き終わる
     /// まで遅くなる) が、試験は終わりを見届けられる。
     ///
-    /// 札を取る前に [`Self::can_probe`] で相手を選ぶ前提。ここへ来る経路は
-    /// サブスクの認証情報を持つ (この口があるのはそこだけ)。
-    fn probe_in_background(&self, probing: Probing) -> Option<tokio::task::JoinHandle<()>> {
-        let url = self
-            .config
-            .credentials
-            .get(probing.route())?
-            .url()
-            .to_owned();
+    /// 札を取れるのは枠照会 API を持つ経路だけなので、ここへ来る相手には
+    /// 必ず聞く口がある。
+    fn probe_in_background(
+        &self,
+        id: &CredentialId,
+        preset: &Arc<Preset>,
+        probing: Probing,
+    ) -> tokio::task::JoinHandle<()> {
+        let id = id.clone();
+        let preset = Arc::clone(preset);
         let http = self.http.clone();
         let credentials = self.credentials.clone();
-        let denials = Arc::clone(&self.denials);
 
-        Some(tokio::spawn(async move {
+        tokio::spawn(async move {
             // 札は、走り切っても落ちても [`Drop`] で外れる。
-            let name = probing.route().to_owned();
-            let credential = match credentials.acquire(&CredentialId::new(&name)).await {
+            let _probing = probing;
+            let credential = match credentials.acquire(&id).await {
                 Ok(credential) => credential,
                 Err(e) => {
-                    warn!(credential = %name, %e, "枠を聞くための認証情報を用意できません");
+                    warn!(credential = %id, %e, "枠を聞くための認証情報を用意できません");
                     return;
                 }
             };
-            let Some(limits) = limits::fetch(&http, &url, &credential).await else {
+            let Some(api) = preset.quota_api() else {
+                return;
+            };
+            let Ok(limits) = api.fetch(&http, &credential).await else {
                 // 読めなかった。印は据え置き、期限が来たときの実リクエストに
                 // 判断を任せる。
                 return;
             };
 
             let now = now_unix();
-            denials.apply_limits(&name, &limits, now);
+            preset.apply_quota(&limits, now);
             info!(
-                credential = %name,
+                credential = %id,
                 limits = limits.len(),
-                denied = denials.get(&name, PROBE_MODEL, now).is_some(),
+                denied = ?preset.availability(PROBE_MODEL, now),
                 "枠を聞いて締め出しを引き直しました"
             );
-        }))
+        })
     }
 
     /// 最小のリクエストを 1 本投げて、返ってきたものを持ち帰る。
-    ///
-    /// `&self` を取らないのは、要求から切り離した仕事がこの関数だけを持って
-    /// 動くため。Gateway を丸ごと持ち出さずに済む。
     async fn sound(
-        http: &reqwest::Client,
-        credentials: &CredentialStore<P>,
-        usage: &QuotaStore,
-        name: &str,
-        spec: &CredentialSpec,
+        &self,
+        id: &CredentialId,
+        preset: &Preset,
     ) -> std::result::Result<Sample, String> {
-        let id = CredentialId::new(name);
-        let credential = credentials.acquire(&id).await.map_err(|e| e.to_string())?;
-        let provider = Official::new(name, spec.url(), spec.headers().clone());
+        let credential = self
+            .credentials
+            .acquire(id)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let body = serde_json::json!({
             "model": PROBE_MODEL,
@@ -674,8 +685,8 @@ impl<P: Persistence> Gateway<P> {
         ]);
 
         let resp = forward::send(
-            http,
-            &provider as &dyn Provider,
+            &self.http,
+            preset,
             Some(&credential),
             "/v1/messages",
             None,
@@ -687,7 +698,10 @@ impl<P: Persistence> Gateway<P> {
 
         // 上限に当たった応答にも使用率は載る。状態を見る前に拾っておく。
         let status = resp.status;
-        usage.observe(&id, &resp.headers, now_unix()).await;
+        let head = Headers::new(resp.headers.clone());
+        if let Some(snapshot) = preset.observe_quota(&head, now_unix()) {
+            self.usage.observe(id, snapshot).await;
+        }
 
         let raw = forward::collect_body(resp.body)
             .await
@@ -732,6 +746,19 @@ struct Call<'a> {
     body: &'a Value,
 }
 
+impl<'a> Call<'a> {
+    /// 知らせに載せる素性。答えた経路の名前だけが呼び出しごとに変わる。
+    fn origin(&'a self, credential: &'a str) -> events::Origin<'a> {
+        events::Origin {
+            session_id: self.session_id.as_deref(),
+            prefix: self.prefix.as_deref(),
+            ns: self.ns,
+            model: self.model,
+            credential,
+        }
+    }
+}
+
 /// プローブが持ち帰ったもの。
 struct Sample {
     status: u16,
@@ -739,30 +766,6 @@ struct Sample {
     tokens: crate::stats::Tokens,
     /// 本文の頭。断られた理由を説明に使う。
     body: String,
-}
-
-/// どの経路も断られているときに返す応答。
-///
-/// 開く時刻を知っているのだから、実リクエストを当てて 429 を貰い直す必要は
-/// ない。クライアントが次の一手を決めるのに要るのは状態コードと
-/// `retry-after` で、それはこちらで組み立てられる (DR-0009)。
-///
-/// 待たせる長さは [`denial::PROBE_INTERVAL`] で頭を押さえる。裏で聞きに行った
-/// 結果、宣言されたリセット時刻より早く開くことがある。2 日後と伝えてしまうと、
-/// 早期に開いたことに気づいた側から見て嘘になる。
-fn rate_limited(after: i64) -> forward::Response {
-    let after = after.min(denial::PROBE_INTERVAL);
-    const BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"every route for this model is rate limited or overloaded; see the retry-after header"}}"#;
-    forward::Response {
-        status: 429,
-        headers: vec![
-            ("content-type".to_owned(), "application/json".to_owned()),
-            ("retry-after".to_owned(), after.max(1).to_string()),
-        ],
-        body: Box::pin(futures_util::stream::once(std::future::ready(Ok(
-            bytes::Bytes::from_static(BODY.as_bytes()),
-        )))),
-    }
 }
 
 /// 転送した結果。応答と、それを出した経路の身元。
@@ -786,7 +789,7 @@ struct Probed {
     spent: quota::Probe,
     errors: std::collections::BTreeMap<String, String>,
     /// 専用の口から聞いた枠。聞けた credential の分だけ入る。
-    limits: std::collections::BTreeMap<String, Vec<Limit>>,
+    limits: std::collections::BTreeMap<String, Vec<QuotaLimit>>,
 }
 
 /// この credential の利用状況をどこまで出せるか。
@@ -843,10 +846,10 @@ fn accept_or_switch(resp: forward::Response) -> std::result::Result<forward::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::StoredCredential;
     use crate::credential::stored::{OauthTokens, Payload};
     use crate::credential::time::{format_rfc3339, now_unix};
-    use crate::credential::{CredentialId, StoredCredential};
-    use crate::denial::{self, Denial, Reason, Scope};
+    use crate::denial::{self, Availability, Denial, Reason, Scope};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1058,6 +1061,11 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         gw
     }
 
+    /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。
+    fn preset_of<'a, P: Persistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
+        gw.router.preset(name).expect("設定にある")
+    }
+
     /// 転送の試験で使う namespace 名。
     const NS: &str = crate::config::DEFAULT_NAMESPACE;
 
@@ -1069,7 +1077,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     /// 試験のリクエストが名乗るモデル。
     const MODEL: &str = "m";
 
-    /// 窓が塞がっている印 (credential 全体)。
+    /// 窓が塞がっている印 (経路全体)。
     fn window_closed(until: i64) -> Denial {
         Denial {
             until,
@@ -1551,8 +1559,8 @@ credentials = ["a", "b"]
             "fable は 1 回断られたら飛ばすが、haiku は同じ認証情報で試す"
         );
         assert_eq!(
-            gw.denials.get("a", "m-haiku", now_unix()),
-            None,
+            preset_of(&gw, "a").availability("m-haiku", now_unix()),
+            Availability::Ready,
             "断られていないモデルに印は付かない"
         );
     }
@@ -1583,14 +1591,52 @@ credentials = ["a", "b"]
         assert_eq!(second.session_id, None, "ヘッダを付けていない");
     }
 
+    /// 自前で返した 429 も、見ている人には 1 通流れる (DR-0014 §8)。
+    ///
+    /// upstream を叩いていないだけで、クライアントには断りが返っている。
+    /// 流さないと、webhook や SSE から「返事が消えた」ように見える。
+    #[tokio::test]
+    async fn the_self_made_denial_is_announced_too() {
+        let far = FakeUpstream::always(200).await;
+        let near = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&far.url, &near.url)).await;
+
+        let now = now_unix();
+        for route in ["a", "b"] {
+            preset_of(&gw, route).deny(window_closed(now + 100), now);
+        }
+
+        let mut watching = gw.events().subscribe();
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(resp.response.status, 429);
+
+        let event = watching.recv().await.unwrap();
+        assert_eq!(event.status, 429);
+        assert_eq!(event.model, MODEL);
+        assert_eq!(event.ns, NS);
+        assert_eq!(
+            event.credential,
+            crate::stats::NO_CREDENTIAL,
+            "答えたのは gateway 自身で、どの credential でもない"
+        );
+        assert_eq!(
+            (far.hits(), near.hits()),
+            (0, 0),
+            "知らせは流すが、upstream は叩かない"
+        );
+    }
+
     /// 上限のヘッダが載っていれば、窓が開く時刻まで締め出す。
     #[tokio::test]
     async fn the_deadline_comes_from_the_rate_limit_headers() {
-        let reset = (now_unix() + 3600).to_string();
+        let reset = now_unix() + 3600;
         let limited = FakeUpstream::start_with_headers(
             &[
                 ("anthropic-ratelimit-unified-7d-status", "rejected"),
-                ("anthropic-ratelimit-unified-7d-reset", &reset),
+                ("anthropic-ratelimit-unified-7d-reset", &reset.to_string()),
                 // 窓が読めるなら、こちらは見ない。
                 ("retry-after", "5"),
             ],
@@ -1605,10 +1651,10 @@ credentials = ["a", "b"]
             .unwrap();
 
         assert_eq!(
-            gw.denials.get("a", MODEL, now_unix()),
-            Some(window_closed(
-                reset.parse::<i64>().unwrap() + denial::RESET_SLACK
-            )),
+            preset_of(&gw, "a").availability(MODEL, now_unix()),
+            Availability::Denied {
+                until: reset + denial::RESET_SLACK
+            },
             "窓が開く時刻を、少し過ぎるまで"
         );
     }
@@ -1621,7 +1667,7 @@ credentials = ["a", "b"]
         let gw = gateway(&two_credentials(&recovered.url, &spare.url)).await;
 
         let past = now_unix() - 1;
-        gw.denials.deny("a", window_closed(past), past);
+        preset_of(&gw, "a").deny(window_closed(past), past);
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
@@ -1629,8 +1675,8 @@ credentials = ["a", "b"]
         assert_eq!(recovered.hits(), 1, "期限切れの印は素通り");
         assert_eq!(spare.hits(), 0);
         assert_eq!(
-            gw.denials.get("a", MODEL, past - 100),
-            None,
+            preset_of(&gw, "a").availability(MODEL, past - 100),
+            Availability::Ready,
             "通ったので印そのものが消える"
         );
     }
@@ -1647,7 +1693,7 @@ credentials = ["a", "b"]
 
         let now = now_unix();
         for (route, until) in [("a", now + 1000), ("b", now + 100)] {
-            gw.denials.deny(route, window_closed(until), now);
+            preset_of(&gw, route).deny(window_closed(until), now);
         }
 
         let resp = gw
@@ -1681,11 +1727,26 @@ credentials = ["a", "b"]
                 .unwrap();
 
             assert_eq!(
-                gw.denials.get("a", MODEL, now_unix()),
-                None,
+                preset_of(&gw, "a").availability(MODEL, now_unix()),
+                Availability::Ready,
                 "{status} は時間で空くものではない"
             );
         }
+    }
+
+    /// 認証情報を要する経路 1 本だけの設定。
+    fn oauth_config(url: &str) -> String {
+        format!(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+url = "{url}"
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        )
     }
 
     /// 締め出した経路には裏で枠を聞きに行き、開いていれば戻す。
@@ -1705,32 +1766,19 @@ credentials = ["a", "b"]
             (200, OPEN.to_owned())
         })
         .await;
-        let gw = gateway(&format!(
-            r#"
-[credentials.a]
-type = "claude_oauth"
-url = "{}"
-
-[[ns.default.routing]]
-models = ["m"]
-credentials = ["a"]
-"#,
-            reopened.url
-        ))
-        .await;
+        let gw = gateway(&oauth_config(&reopened.url)).await;
 
         let now = now_unix();
-        gw.denials.deny("a", window_closed(now + 100_000), now);
+        preset_of(&gw, "a").deny(window_closed(now + 100_000), now);
 
-        let probing = gw.denials.claim_ask("a", now).expect("札は空いている");
-        gw.probe_in_background(probing)
-            .expect("サブスクの認証情報なので聞きに行ける")
+        let probing = preset_of(&gw, "a").claim_ask(now).expect("札は空いている");
+        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
 
         assert_eq!(
-            gw.denials.get("a", MODEL, now),
-            None,
+            preset_of(&gw, "a").availability(MODEL, now),
+            Availability::Ready,
             "開いていたので印を外す"
         );
         assert_eq!(reopened.forwards(), 0, "転送は 1 本も走らない");
@@ -1746,29 +1794,21 @@ credentials = ["a"]
                "resets_at":"{iso}","scope":null}}]}}"#
         );
         let still_limited = FakeUpstream::start(move |_, _| (200, body.clone())).await;
-        let gw = gateway(&format!(
-            r#"
-[credentials.a]
-type = "claude_oauth"
-url = "{}"
-
-[[ns.default.routing]]
-models = ["m"]
-credentials = ["a"]
-"#,
-            still_limited.url
-        ))
-        .await;
+        let gw = gateway(&oauth_config(&still_limited.url)).await;
 
         let now = now_unix();
-        gw.denials.deny("a", window_closed(now + 100), now);
+        preset_of(&gw, "a").deny(window_closed(now + 100), now);
 
-        let probing = gw.denials.claim_ask("a", now).expect("札は空いている");
-        gw.probe_in_background(probing).unwrap().await.unwrap();
+        let probing = preset_of(&gw, "a").claim_ask(now).expect("札は空いている");
+        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
+            .await
+            .unwrap();
 
         assert_eq!(
-            gw.denials.get("a", MODEL, now),
-            Some(window_closed(reset + denial::RESET_SLACK)),
+            preset_of(&gw, "a").availability(MODEL, now),
+            Availability::Denied {
+                until: reset + denial::RESET_SLACK
+            },
             "聞いた結果で開く時刻を引き直す"
         );
     }
@@ -1787,31 +1827,26 @@ credentials = ["a"]
                  "scope":{{"model":{{"id":null,"display_name":"Fable"}}}}}}]}}"#
         );
         let up = FakeUpstream::start(move |_, _| (200, body.clone())).await;
-        let gw = gateway(&format!(
-            r#"
-[credentials.a]
-type = "claude_oauth"
-url = "{}"
-
-[[ns.default.routing]]
-models = ["m"]
-credentials = ["a"]
-"#,
-            up.url
-        ))
-        .await;
+        let gw = gateway(&oauth_config(&up.url)).await;
 
         let now = now_unix();
-        let probing = gw.denials.claim_ask("a", now).expect("印が無くても聞ける");
-        gw.probe_in_background(probing).unwrap().await.unwrap();
+        let probing = preset_of(&gw, "a")
+            .claim_ask(now)
+            .expect("印が無くても聞ける");
+        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
+            .await
+            .unwrap();
 
         assert!(
-            gw.denials.get("a", "claude-fable-5", now).is_some(),
+            matches!(
+                preset_of(&gw, "a").availability("claude-fable-5", now),
+                Availability::Denied { .. }
+            ),
             "Fable の枠は使い切っている"
         );
         assert_eq!(
-            gw.denials.get("a", "claude-haiku-4-5", now),
-            None,
+            preset_of(&gw, "a").availability("claude-haiku-4-5", now),
+            Availability::Ready,
             "他のモデルは巻き込まない"
         );
     }
@@ -1901,11 +1936,7 @@ credentials = ["a", "b"]
         .await;
 
         let now = now_unix();
-        gw.denials.deny(
-            "a",
-            window_closed(now + 100_000),
-            now - denial::PROBE_INTERVAL,
-        );
+        preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
@@ -1916,10 +1947,10 @@ credentials = ["a", "b"]
         assert_eq!(denied.hits(), 1, "締め出している方へは裏で聞きに行く");
     }
 
-    /// 認証情報の種類によっては聞きに行けない。役も立てない。
+    /// 枠を聞く口を持たない経路には、様子を聞きに行かない。
     ///
-    /// 上限のヘッダを返すのは Anthropic のサブスクだけ (DR-0007)。中継先に
     /// 聞いても今の状態が読めないので、札を取って捨てるより取らない。
+    /// 「無い」は型で表されているので、判定に設定の type を見る必要もない。
     #[tokio::test]
     async fn a_route_that_cannot_answer_is_not_probed() {
         let denied = FakeUpstream::always(200).await;
@@ -1927,11 +1958,7 @@ credentials = ["a", "b"]
         let gw = gateway(&two_credentials(&denied.url, &spare.url)).await;
 
         let now = now_unix();
-        gw.denials.deny(
-            "a",
-            window_closed(now + 100_000),
-            now - denial::PROBE_INTERVAL,
-        );
+        preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
@@ -1939,8 +1966,8 @@ credentials = ["a", "b"]
 
         assert_eq!(denied.hits(), 0, "中継の経路には聞きに行かない");
         assert!(
-            gw.denials.claim_probe("a", now).is_some(),
-            "札は取られていない"
+            preset_of(&gw, "a").claim_probe(now).is_none(),
+            "枠照会 API が無いので役自体を引き受けない"
         );
     }
 
@@ -1950,23 +1977,11 @@ credentials = ["a", "b"]
     #[tokio::test]
     async fn losing_every_route_asks_right_away() {
         let denied = FakeUpstream::always(200).await;
-        let gw = gateway(&format!(
-            r#"
-[credentials.a]
-type = "claude_oauth"
-url = "{}"
-
-[[ns.default.routing]]
-models = ["m"]
-credentials = ["a"]
-"#,
-            denied.url
-        ))
-        .await;
+        let gw = gateway(&oauth_config(&denied.url)).await;
 
         // 今しがた断られたばかり = 間隔はまったく空いていない。
         let now = now_unix();
-        gw.denials.deny("a", window_closed(now + 100_000), now);
+        preset_of(&gw, "a").deny(window_closed(now + 100_000), now);
 
         let resp = gw
             .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
@@ -1990,8 +2005,7 @@ credentials = ["a"]
 
         let now = now_unix();
         for route in ["a", "b"] {
-            gw.denials
-                .deny(route, window_closed(now + 2 * 24 * 3600), now);
+            preset_of(&gw, route).deny(window_closed(now + 2 * 24 * 3600), now);
         }
 
         let resp = gw
@@ -2468,21 +2482,6 @@ advisor-tool-2026-03-01";
         vec![("anthropic-beta".to_owned(), CLIENT_BETA.to_owned())]
     }
 
-    /// 認証情報を要する経路 1 本だけの設定。
-    fn oauth_config(url: &str) -> String {
-        format!(
-            r#"
-[credentials.a]
-type = "claude_oauth"
-url = "{url}"
-
-[[ns.default.routing]]
-models = ["m"]
-credentials = ["a"]
-"#
-        )
-    }
-
     /// beta が原因の 400 は、フラグを落として 1 回だけ送り直す (DR-0003)。
     ///
     /// 拒否された顔ぶれは認証情報に書き戻す。覚えないと毎回 400 を踏む。
@@ -2760,6 +2759,40 @@ models = ["m"]
         );
     }
 
+    /// 転送のついでに読めた枠は、そのまま一覧に出る。
+    ///
+    /// 観測を持つのは経路だが、外から見える形は変わらない (DR-0007)。
+    #[tokio::test]
+    async fn usage_report_shows_what_the_route_observed() {
+        let reset = now_unix() + 3600;
+        let up = FakeUpstream::start_with_headers(
+            &[
+                ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
+                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                ("anthropic-ratelimit-unified-5h-reset", &reset.to_string()),
+            ],
+            |_, _| (200, body_for(200)),
+        )
+        .await;
+        let gw = gateway(&oauth_config(&up.url)).await;
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        let report = gw.usage_report(false).await;
+        let entry = &report.credentials[0];
+        assert_eq!(entry.support, crate::quota::Support::Observed);
+        assert_eq!(
+            entry
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.five_hour.as_ref())
+                .and_then(|w| w.utilization),
+            Some(0.42)
+        );
+    }
+
     /// 聞きに行くときは、専用の口から枠も取って一覧に載せる。
     ///
     /// モデル別の枠 (fable など) は応答ヘッダに出てこないので、この口を
@@ -2843,7 +2876,7 @@ url = "https://bedrock.invalid/anthropic"
 
         let report = gw.usage_report(true).await;
         let probe = report.probe.expect("投げた記録が残る");
-        assert_eq!(probe.requests, 1, "ヘッダを返すのは claude_oauth だけ");
+        assert_eq!(probe.requests, 1, "枠を聞ける口を持つのは 1 本だけ");
         assert_eq!(probe.model, PROBE_MODEL);
 
         let by_name = |name: &str| {

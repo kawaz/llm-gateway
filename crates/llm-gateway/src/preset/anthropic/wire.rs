@@ -1,9 +1,14 @@
 //! Anthropic Messages API への変換と送信。
 //!
-//! 正規形が既に Messages 形式なので、変換は接続先・モデル名・付随ヘッダを
-//! 合わせるだけ。ボディは [`Wire::encode`] で **1 度だけ**直列化し、その
-//! [`Bytes`] を認証と送信が共有する — 認証の後に直列化し直すと、署名した
-//! 中身と送る中身がずれる余地ができる。
+//! 正規形が既に Messages 形式なので、変換は接続先と付随ヘッダを合わせる
+//! だけ。ボディは [`Wire::encode`] で **1 度だけ**直列化し、その [`Bytes`] を
+//! 認証と送信が共有する — 認証の後に直列化し直すと、署名した中身と送る中身が
+//! ずれる余地ができる。
+//!
+//! **モデル名の読み替えはここに無い**。どの名前を upstream が求めるかは
+//! discovery が答えるので、送る本文に載せるのは呼び出し側の仕事
+//! ([`super::rewrite_model`])。方言の話ではないものを方言の実装に持たせると、
+//! 同じ Wire を使う preset ごとに設定を配り直すことになる。
 //!
 //! 応答はヘッダを受け取った時点で返し、本文はストリームのまま流す。Claude 系は
 //! SSE の形式が upstream 間で同じなので、解釈せずバイト列のまま中継できる。
@@ -12,19 +17,15 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use futures_util::StreamExt as _;
-use serde_json::Value;
 
 use crate::egress::{BoxFuture, EgressRequest, Headers, Response, UpstreamRequest};
 use crate::provider::Wire;
 use crate::{Error, Result};
 
-use super::rewrite_model;
-
 /// Messages API への出口。
 ///
-/// upstream ごとに違うのは接続先・モデル ID 体系・付随ヘッダだけなので、
-/// 実装ではなく**設定**として持つ。Bedrock はこの型を書き直さず、値を
-/// 差し替えて使う (DR-0014 §6)。
+/// upstream ごとに違うのは接続先と付随ヘッダだけなので、実装ではなく**設定**
+/// として持つ。Bedrock はこの型を書き直さず、値を差し替えて使う (DR-0014 §6)。
 pub struct AnthropicWire {
     /// 失敗の記録に出す経路の名前。
     name: String,
@@ -32,8 +33,6 @@ pub struct AnthropicWire {
     base_url: String,
     /// 設定で足すヘッダ。
     extra_headers: BTreeMap<String, String>,
-    /// クライアントの名前 → upstream の名前。空なら書き換えない。
-    model_map: BTreeMap<String, String>,
 }
 
 impl AnthropicWire {
@@ -41,32 +40,16 @@ impl AnthropicWire {
         name: impl Into<String>,
         base_url: impl Into<String>,
         extra_headers: BTreeMap<String, String>,
-        model_map: BTreeMap<String, String>,
     ) -> Self {
         Self {
             name: name.into(),
             base_url: base_url.into(),
             extra_headers,
-            model_map,
         }
     }
 
     pub fn base_url(&self) -> &str {
         &self.base_url
-    }
-
-    /// upstream の要求に合わせてボディとヘッダを整える。
-    ///
-    /// 対応表に無いモデルはそのまま送る (勝手に書き換えない)。
-    pub fn adapt(&self, body: &mut Value, headers: &mut Headers) {
-        if let Some(model) = body.get("model").and_then(Value::as_str)
-            && let Some(upstream) = self.model_map.get(model)
-        {
-            let upstream = upstream.clone();
-            rewrite_model(body, &upstream);
-        }
-
-        headers.extend_from(&self.extra_headers);
     }
 
     fn url_for(&self, path: &str, query: Option<&str>) -> String {
@@ -84,12 +67,12 @@ impl Wire for AnthropicWire {
         let EgressRequest {
             path,
             query,
-            mut body,
+            body,
             mut headers,
         } = request;
 
         headers.strip_for_upstream();
-        self.adapt(&mut body, &mut headers);
+        headers.extend_from(&self.extra_headers);
 
         let body = Bytes::from(serde_json::to_vec(&body)?);
         // 直列化した後に載せる。クライアントの申告ではなく、実際に送る形。
@@ -170,7 +153,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     /// Claude Code 2.1.220 が実際に送る beta の束。
     const CLIENT_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,\
@@ -201,25 +184,12 @@ extended-cache-ttl-2025-04-11";
             "claude-personal",
             "https://api.anthropic.com",
             BTreeMap::new(),
-            BTreeMap::new(),
         )
     }
 
-    fn bedrock() -> AnthropicWire {
-        AnthropicWire::new(
-            "bedrock",
-            "https://bedrock-mantle.us-east-1.api.aws/anthropic",
-            BTreeMap::new(),
-            BTreeMap::from([(
-                "claude-fable-5".to_owned(),
-                "anthropic.claude-fable-5".to_owned(),
-            )]),
-        )
-    }
-
-    /// 対応表が空なら、ボディは中身も並びも変えずに送る。
+    /// ボディは中身も並びも変えずに送る。モデル名の読み替えは呼び出し側。
     #[test]
-    fn passes_the_body_through_when_no_model_map() {
+    fn passes_the_body_through() {
         let body = json!({"model": "claude-opus-5", "max_tokens": 8});
         let encoded = official()
             .encode(request(body.clone(), headers(&[])))
@@ -229,26 +199,6 @@ extended-cache-ttl-2025-04-11";
             serde_json::from_slice::<Value>(&encoded.body).unwrap(),
             body
         );
-    }
-
-    /// 対応表にあるモデルだけ upstream の名前空間へ替える。替えないと 404。
-    #[test]
-    fn rewrites_only_mapped_model_names() {
-        let encoded = bedrock()
-            .encode(request(
-                json!({"model": "claude-fable-5", "max_tokens": 8}),
-                headers(&[]),
-            ))
-            .unwrap();
-        let sent: Value = serde_json::from_slice(&encoded.body).unwrap();
-        assert_eq!(sent["model"], "anthropic.claude-fable-5");
-        assert_eq!(sent["max_tokens"], 8, "他は触らない");
-
-        let encoded = bedrock()
-            .encode(request(json!({"model": "claude-opus-5"}), headers(&[])))
-            .unwrap();
-        let sent: Value = serde_json::from_slice(&encoded.body).unwrap();
-        assert_eq!(sent["model"], "claude-opus-5", "表に無いものは触らない");
     }
 
     /// 実クライアントが送るヘッダを通したとき、何が残り何が消えるか。
@@ -294,7 +244,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             encoded.headers.get("anthropic-beta"),
             Some(CLIENT_BETA),
-            "beta の取捨は転送側が決める (DR-0003)。Wire は触らない"
+            "beta の取捨は交渉の担当 (DR-0003)。Wire は触らない"
         );
     }
 
@@ -352,7 +302,6 @@ extended-cache-ttl-2025-04-11";
             "c",
             "https://api.anthropic.com",
             BTreeMap::from([("x-trace".to_owned(), "on".to_owned())]),
-            BTreeMap::new(),
         );
         let encoded = wire
             .encode(request(
@@ -410,12 +359,7 @@ extended-cache-ttl-2025-04-11";
     /// 末尾の `/` が二重にならない。
     #[test]
     fn trims_the_trailing_slash_of_the_base_url() {
-        let wire = AnthropicWire::new(
-            "c",
-            "http://127.0.0.1:8317/",
-            BTreeMap::new(),
-            BTreeMap::new(),
-        );
+        let wire = AnthropicWire::new("c", "http://127.0.0.1:8317/", BTreeMap::new());
         assert_eq!(
             wire.url_for("/v1/messages", None),
             "http://127.0.0.1:8317/v1/messages"

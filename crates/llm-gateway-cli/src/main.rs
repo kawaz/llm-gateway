@@ -1624,7 +1624,7 @@ mod tests {
     fn a_scoped_limit_gets_its_own_line() {
         let mut c = observed();
         c.limits = Some(vec![
-            llm_gateway::limits::Limit {
+            llm_gateway::quota::QuotaLimit {
                 kind: "weekly_all".to_owned(),
                 percent: 100.0,
                 severity: Some("critical".to_owned()),
@@ -1633,7 +1633,7 @@ mod tests {
                 model_id: None,
                 is_active: true,
             },
-            llm_gateway::limits::Limit {
+            llm_gateway::quota::QuotaLimit {
                 kind: "weekly_scoped".to_owned(),
                 percent: 80.0,
                 severity: Some("warning".to_owned()),

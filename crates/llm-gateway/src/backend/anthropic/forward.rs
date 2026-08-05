@@ -15,8 +15,9 @@ use serde_json::Value;
 use crate::Result;
 use crate::credential::Credential;
 use crate::egress::EgressRequest;
+use crate::provider::Preset;
 
-use super::{Headers, Provider};
+use super::Headers;
 
 /// upstream からの応答。本文はまだ読んでいない。
 pub struct Response {
@@ -35,6 +36,20 @@ impl std::fmt::Debug for Response {
     }
 }
 
+/// core の形から、受け取り口が読む形へ。
+///
+/// 違うのはヘッダの入れ物だけ。ヘッダの組をそのまま総なめする読み手
+/// (`llm-gateway-server`) が居るので、その形で渡す。
+impl From<crate::egress::Response> for Response {
+    fn from(resp: crate::egress::Response) -> Self {
+        Self {
+            status: resp.status,
+            headers: resp.headers.as_slice().to_vec(),
+            body: resp.body,
+        }
+    }
+}
+
 /// 応答の本文。
 pub type BodyStream = crate::egress::BodyStream;
 
@@ -48,14 +63,13 @@ pub type BodyStream = crate::egress::BodyStream;
 /// ヘッダやボディが変わると壊れる)。
 pub async fn send(
     http: &reqwest::Client,
-    provider: &dyn Provider,
+    preset: &Preset,
     credential: Option<&Credential>,
     path: &str,
     query: Option<&str>,
     body: Value,
     headers: Headers,
 ) -> Result<Response> {
-    let preset = provider.preset();
     let mut request = preset.wire().encode(EgressRequest {
         path: path.to_owned(),
         query: query.map(str::to_owned),
@@ -64,13 +78,7 @@ pub async fn send(
     })?;
     preset.auth().authorize(credential, &mut request)?;
 
-    let resp = preset.wire().send(http, request).await?;
-
-    Ok(Response {
-        status: resp.status,
-        headers: resp.headers.as_slice().to_vec(),
-        body: resp.body,
-    })
+    Ok(preset.wire().send(http, request).await?.into())
 }
 
 /// 応答をすべて読む。
@@ -191,6 +199,25 @@ mod tests {
         for status in [200, 201, 204] {
             assert!(!should_try_next(status));
         }
+    }
+
+    /// core の応答を受け取り口の形へ移しても、中身は失われない。
+    #[tokio::test]
+    async fn converting_from_the_core_response_keeps_everything() {
+        let core = crate::egress::Response {
+            status: 429,
+            headers: Headers::new(vec![("retry-after".to_owned(), "30".to_owned())]),
+            body: futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"body")) })
+                .boxed(),
+        };
+
+        let resp: Response = core.into();
+        assert_eq!(resp.status, 429);
+        assert_eq!(
+            resp.headers,
+            vec![("retry-after".to_owned(), "30".to_owned())]
+        );
+        assert_eq!(collect_body(resp.body).await.unwrap(), b"body");
     }
 
     /// 中身を見た後も、そのままクライアントへ返せる。

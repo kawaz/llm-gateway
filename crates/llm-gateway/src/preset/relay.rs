@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::credential::Credential;
 use crate::egress::UpstreamRequest;
-use crate::preset::anthropic::{AnthropicMetering, AnthropicWire};
+use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, beta};
 use crate::provider::{Auth, Preset};
 
 /// 認証を載せない。
@@ -27,15 +27,11 @@ impl Auth for NoAuth {
 
 /// 素通しの preset を組む。
 ///
-/// 枠は転送先が持っているので、こちらから聞く口は無い。
+/// 枠は転送先が持っているので、こちらから聞く口は無い。beta の取捨も転送先が
+/// 決めるので、既定は素通し (学習した分だけは落とす)。
 pub fn preset(name: &str, wire: Arc<AnthropicWire>) -> Preset {
-    Preset::new(
-        name,
-        Arc::new(NoAuth),
-        wire,
-        Arc::new(AnthropicMetering),
-        None,
-    )
+    Preset::new(name, Arc::new(NoAuth), wire, Arc::new(AnthropicMetering))
+        .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
 }
 
 #[cfg(test)]
@@ -49,7 +45,6 @@ mod tests {
         Arc::new(AnthropicWire::new(
             "cpa",
             "http://127.0.0.1:8317",
-            BTreeMap::new(),
             BTreeMap::new(),
         ))
     }
@@ -73,5 +68,19 @@ mod tests {
         assert_eq!(request.headers.get("authorization"), None);
         assert_eq!(request.headers.get("x-api-key"), None);
         assert!(preset.quota_api().is_none(), "枠は転送先が持っている");
+    }
+
+    /// beta は転送先が判断するので触らない。
+    #[test]
+    fn leaves_the_beta_flags_to_the_relay_target() {
+        const CLIENT_BETA: &str = "oauth-2025-04-20,claude-code-20250219";
+        let mut headers = Headers::new(vec![("anthropic-beta".to_owned(), CLIENT_BETA.to_owned())]);
+
+        preset("cpa", wire())
+            .negotiation()
+            .expect("学習した分は落とせる")
+            .prepare(&mut headers, &[]);
+
+        assert_eq!(headers.get("anthropic-beta"), Some(CLIENT_BETA));
     }
 }

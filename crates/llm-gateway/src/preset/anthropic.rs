@@ -6,11 +6,12 @@
 //! 1 つなので、公式に効く直しはそのまま両方へ届く。
 //!
 //! 内部正規形が Anthropic Messages 形式 (DR-0014 §5) なので、この Wire の
-//! 変換は「接続先・モデル名・付随ヘッダを合わせる」だけで済む。
+//! 変換は「接続先と付随ヘッダを合わせる」だけで済む。
 
 mod auth;
 pub mod beta;
 mod metering;
+mod negotiation;
 mod quota_api;
 mod wire;
 
@@ -20,6 +21,7 @@ use serde_json::Value;
 
 pub use auth::OauthBearer;
 pub use metering::AnthropicMetering;
+pub use negotiation::BetaFlags;
 pub use quota_api::OauthUsage;
 pub use wire::AnthropicWire;
 
@@ -29,7 +31,7 @@ use crate::{Error, Result};
 /// Anthropic 公式の preset。
 ///
 /// サブスクの OAuth token をそのまま載せ、トークンを消費しない枠照会 API を
-/// 持つ (DR-0007)。
+/// 持つ (DR-0007)。beta フラグは公式なら全部通るので、既定は素通し。
 pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     let quota_api = OauthUsage::new(wire.base_url());
     Preset::new(
@@ -37,14 +39,15 @@ pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
         Arc::new(OauthBearer::new(name)),
         wire,
         Arc::new(AnthropicMetering),
-        Some(Arc::new(quota_api)),
     )
+    .with_quota_api(Arc::new(quota_api))
+    .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
 }
 
 /// ボディの `model` を upstream が求める名前に替える。
 ///
-/// Bedrock は `anthropic.claude-fable-5` を要求し、クライアントが送る
-/// `claude-fable-5` では 404 になる。
+/// どの名前を求めるかは discovery が答える (Bedrock は `anthropic.` の
+/// 名前空間が付く)。正規形が Messages 形式なので、書き換えは 1 欄で済む。
 pub fn rewrite_model(body: &mut Value, upstream_name: &str) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".to_owned(), Value::String(upstream_name.to_owned()));
@@ -70,7 +73,6 @@ mod tests {
             "claude-personal",
             "https://api.anthropic.com",
             BTreeMap::new(),
-            BTreeMap::new(),
         ))
     }
 
@@ -81,6 +83,10 @@ mod tests {
 
         assert_eq!(preset.name(), "claude-personal");
         assert!(preset.quota_api().is_some());
+        assert!(
+            preset.negotiation().is_some(),
+            "beta の交渉はどの経路でも要る"
+        );
     }
 
     #[test]
