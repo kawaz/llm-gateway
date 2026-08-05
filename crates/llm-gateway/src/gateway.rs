@@ -20,6 +20,7 @@ use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
 use crate::denial::Probing;
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
+use crate::exchange;
 use crate::metering::{TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Preset;
 use crate::quota::{self, QuotaLimit, QuotaStore};
@@ -303,11 +304,11 @@ impl<P: Persistence> Gateway<P> {
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::exchange が記録する。
-                    info!(
-                        model = %model,
-                        route = route.name(),
-                        status = resp.status,
-                        "upstream のヘッダを受け取りました"
+                    exchange::record_upstream_headers(
+                        &tracing::Span::current(),
+                        &model,
+                        route.name(),
+                        resp.status,
                     );
                     // 本文 usage の読み方は、答えた provider だけが知っている
                     // (DR-0014 §4)。受け取り口は preset を知らないので、読む役を
@@ -794,7 +795,7 @@ pub struct Forwarded {
     /// この応答の本文から usage を読む役。集計しない応答では `None`。
     ///
     /// 作れるのは応答を出した provider だけなので、応答と一緒に持ち回る。
-    /// 本文へ挟むのは受け取り口 ([`crate::stats::tap`])。
+    /// 本文へ挟むのは受け取り口 ([`crate::exchange::observe`])。
     pub usage: Option<Box<dyn UsageObserver>>,
 }
 

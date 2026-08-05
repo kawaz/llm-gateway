@@ -13,12 +13,12 @@
 //! — 日 × credential × モデルの集計キーと、[`TokenUsage`] の区分ごとの数。
 //! 区分は provider が増やせるので、知らない区分もそのまま積む。
 //!
-//! ## 本文を読むのに、中継は素通しのまま
+//! ## 本文を読むのはここではない
 //!
-//! 転送はバイト列をそのまま流す。そこに usage の解釈を混ぜないため、本文を
-//! 覗くだけの変換層 ([`tap`]) を別に置き、受け取り口で中継の内側に挟む。
-//! 挟んでも流れるバイト列は 1 バイトも変わらない。読む役を持たない応答
-//! (エラー / 読めない content-type) には層を重ねない。
+//! 応答本文を覗いて usage を抽出しつつ流すのは
+//! [`crate::exchange::observe`] の責務 (DR-0014 §1)。ここが持つのは積んだ
+//! 後の置き場 — 書き手 ([`Stats::record`]) と読み手 ([`Stats::report`])
+//! だけで、本文にもストリームにも触れない。
 //!
 //! ## 落ちても失わない
 //!
@@ -37,7 +37,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::credential::time::local_date;
-use crate::metering::{TokenKind, TokenUsage, UsageObserver, round_usd};
+use crate::metering::{TokenKind, TokenUsage, round_usd};
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 認証情報を持たない経路 (relay 型) の記録先。
@@ -147,7 +147,8 @@ pub const MAX_DAYS: usize = 36_500;
 
 /// 日ごと・認証情報ごと・モデルごとに積む器。
 ///
-/// 書き込みは中継の終わり (tap の後始末) から呼ばれる。await できない場所なので
+/// 書き込みは本文観測の終わり ([`crate::exchange::observe`] の後始末) から
+/// 呼ばれる。await できない場所なので
 /// 同期の [`Mutex`] を使う。押さえている間にやるのは足し算だけ。
 pub struct Stats {
     counts: Mutex<ByDate>,
@@ -444,92 +445,6 @@ fn merge_day(into: &mut ByCredential, day: ByCredential) {
 fn read_day(path: &Path) -> std::io::Result<ByCredential> {
     let raw = std::fs::read_to_string(path)?;
     serde_json::from_str(&raw).map_err(std::io::Error::other)
-}
-
-/// 応答の本文を覗いて、使用量を集計に送る。
-///
-/// 流れるバイト列は変えない。読む役 (`observer`) を持たない応答は包まずに返す —
-/// 覗く相手がいないのに層を重ねる意味がない。役を作るのは応答を出した provider
-/// で、どの content-type を読めるかもそちらが決める (DR-0014 §4)。
-///
-/// `at` は観測時刻。日付をこれで決めるので、応答が始まった時刻を渡す
-/// (生成が日を跨いで終わっても、始めた日に付ける)。
-pub fn tap(
-    body: crate::egress::BodyStream,
-    observer: Option<Box<dyn UsageObserver>>,
-    stats: std::sync::Arc<Stats>,
-    at: i64,
-    credential: Option<&str>,
-    model: &str,
-) -> crate::egress::BodyStream {
-    let Some(observer) = observer else {
-        return body;
-    };
-
-    futures_util::StreamExt::boxed(Tap {
-        inner: body,
-        observer: Some(observer),
-        stats,
-        at,
-        credential: credential.map(str::to_owned),
-        model: model.to_owned(),
-    })
-}
-
-/// 覗きながら流すストリーム。
-///
-/// チャンクは触らずそのまま下流へ渡し、控えの側 (observer) だけを進める。
-struct Tap {
-    inner: crate::egress::BodyStream,
-    /// 後始末で `finish` するために `Option` で持つ ([`Drop`] は値を動かせない)。
-    observer: Option<Box<dyn UsageObserver>>,
-    stats: std::sync::Arc<Stats>,
-    at: i64,
-    credential: Option<String>,
-    model: String,
-}
-
-impl futures_util::Stream for Tap {
-    type Item = crate::Result<bytes::Bytes>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use std::task::Poll;
-
-        // 中身は Pin<Box<..>> なので、包んだ側を動かしても差し支えない。
-        let this = self.get_mut();
-        match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                if let Some(observer) = this.observer.as_mut() {
-                    observer.observe(&chunk);
-                }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            other => other,
-        }
-    }
-}
-
-impl Drop for Tap {
-    /// 集計へ送るのはここだけ。
-    ///
-    /// 正常に終わった場合も、クライアントが去って途中で捨てられた場合も同じ道を
-    /// 通る。Drop は 1 度しか走らないので、二重に数える形にならない。途中まで
-    /// 流れた応答は、そこまでに読めた分が入る (`message_start` まで届いていれば
-    /// input は分かる) — 中断した分を丸ごと捨てると、実際に消費した入力が
-    /// 記録から消える。
-    fn drop(&mut self) {
-        let Some(observer) = self.observer.take() else {
-            return;
-        };
-        let Some(usage) = observer.finish() else {
-            return;
-        };
-        self.stats
-            .record(self.at, self.credential.as_deref(), &self.model, &usage);
-    }
 }
 
 /// 閲覧に出す 1 行。トークン数に、その分の USD を添える。
@@ -1368,201 +1283,5 @@ mod tests {
                 "days={days} で当日が消える"
             );
         }
-    }
-
-    // ---------- tap ----------
-    //
-    // 本文の読み方は provider の [`UsageObserver`] が持つので、ここで確かめるのは
-    // 「渡した役に通し、その結果を 1 度だけ記録する」ことと「流れるバイト列を
-    // 変えない」こと。方言ごとの読み取りは preset 側の試験にある。
-
-    use crate::egress::BodyStream;
-    use futures_util::StreamExt as _;
-    use std::sync::Arc;
-
-    /// 試験用の観測役。中身を解釈せず、通ったバイト数を input として数える。
-    struct ByteCounter {
-        seen: u64,
-    }
-
-    impl UsageObserver for ByteCounter {
-        fn observe(&mut self, chunk: &[u8]) {
-            self.seen += chunk.len() as u64;
-        }
-
-        fn finish(self: Box<Self>) -> Option<TokenUsage> {
-            (self.seen > 0).then(|| {
-                let mut usage = TokenUsage::default();
-                usage.set(TokenKind::input(), self.seen);
-                usage
-            })
-        }
-    }
-
-    fn counter() -> Option<Box<dyn UsageObserver>> {
-        Some(Box::new(ByteCounter { seen: 0 }))
-    }
-
-    fn stream_of(chunks: Vec<Vec<u8>>) -> BodyStream {
-        futures_util::stream::iter(chunks.into_iter().map(|c| Ok(bytes::Bytes::from(c)))).boxed()
-    }
-
-    /// tap を通して流し切り、集計に残ったものを返す。
-    async fn drain(
-        chunks: Vec<Vec<u8>>,
-        observer: Option<Box<dyn UsageObserver>>,
-        dir: &Path,
-    ) -> (Vec<u8>, ByDate) {
-        let s = Arc::new(stats(dir));
-        let mut out = Vec::new();
-        {
-            let mut tapped = tap(
-                stream_of(chunks),
-                observer,
-                Arc::clone(&s),
-                NOW,
-                Some("a"),
-                "m",
-            );
-            while let Some(chunk) = tapped.next().await {
-                out.extend_from_slice(&chunk.unwrap());
-            }
-        }
-        (out, s.in_memory())
-    }
-
-    fn only_entry(counts: &ByDate) -> Counters {
-        counts.values().next().expect("1 日分")["a"]["m"].clone()
-    }
-
-    /// 通ったバイト列を変えずに、観測役へ渡す。
-    #[tokio::test]
-    async fn the_body_passes_through_untouched_while_being_observed() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = b"hello, upstream".to_vec();
-        // 1 バイトずつに割って、境目の入りうる位置を一度に試す。
-        let chunks: Vec<Vec<u8>> = body.iter().map(|b| vec![*b]).collect();
-
-        let (out, counts) = drain(chunks, counter(), dir.path()).await;
-
-        assert_eq!(out, body, "1 バイトも変えない");
-        let c = only_entry(&counts);
-        assert_eq!(c.requests, 1);
-        assert_eq!(input_of(&c), body.len() as u64, "全チャンクが役へ届く");
-    }
-
-    /// 読む役が無ければ包まない。素通しで、記録も残らない。
-    #[tokio::test]
-    async fn a_response_without_an_observer_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = b"{\"usage\":{\"input_tokens\":99}}".to_vec();
-
-        let (out, counts) = drain(vec![body.clone()], None, dir.path()).await;
-
-        assert_eq!(out, body);
-        assert!(counts.is_empty(), "{counts:?}");
-    }
-
-    /// 観測役が「読めなかった」と言えば記録しない。
-    ///
-    /// `count_tokens` のような usage を載せない応答がこれ。本数だけ増えると、
-    /// 使っていない日が「使った日」に見える。
-    #[tokio::test]
-    async fn nothing_is_recorded_when_the_observer_found_no_usage() {
-        let dir = tempfile::tempdir().unwrap();
-        // 1 バイトも流れないので ByteCounter は None を返す。
-        let (out, counts) = drain(vec![], counter(), dir.path()).await;
-
-        assert!(out.is_empty());
-        assert!(counts.is_empty(), "{counts:?}");
-    }
-
-    /// 途中で捨てられても、そこまでに読めた分は残る。
-    ///
-    /// クライアントが去った場合がこれ。届いた分の消費は確定しているので、
-    /// 記録から落とすと実際に使った分が消える。
-    #[tokio::test]
-    async fn an_aborted_stream_still_records_what_was_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(stats(dir.path()));
-        {
-            let mut tapped = tap(
-                stream_of(vec![b"12345".to_vec(), b"67890".to_vec()]),
-                counter(),
-                Arc::clone(&s),
-                NOW,
-                Some("a"),
-                "m",
-            );
-            // 1 チャンクだけ読んで捨てる。
-            let _ = tapped.next().await;
-        }
-
-        let c = only_entry(&s.in_memory());
-        assert_eq!(c.requests, 1, "中断も 1 本として数える");
-        assert_eq!(input_of(&c), 5, "そこまでに見えた分だけ");
-    }
-
-    /// 流し切っても記録は 1 度だけ。
-    #[tokio::test]
-    async fn a_completed_stream_is_recorded_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, counts) = drain(vec![b"1234".to_vec()], counter(), dir.path()).await;
-
-        let c = only_entry(&counts);
-        assert_eq!(c.requests, 1);
-        assert_eq!(input_of(&c), 4, "2 倍になっていない");
-    }
-
-    /// upstream が途切れても、そこまでの分は残り、誤りは下流へ伝わる。
-    #[tokio::test]
-    async fn a_failing_stream_keeps_what_it_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(stats(dir.path()));
-
-        let broken: BodyStream = futures_util::stream::iter(vec![
-            Ok(bytes::Bytes::from_static(b"123")),
-            Err(crate::Error::Config("応答の読み取りが途切れました".into())),
-        ])
-        .boxed();
-
-        let mut saw_error = false;
-        {
-            let mut tapped = tap(broken, counter(), Arc::clone(&s), NOW, Some("a"), "m");
-            while let Some(item) = tapped.next().await {
-                if item.is_err() {
-                    saw_error = true;
-                }
-            }
-        }
-
-        assert!(saw_error, "誤りを飲み込まない");
-        assert_eq!(input_of(&only_entry(&s.in_memory())), 3);
-    }
-
-    /// 記録先は渡された credential とモデル、時刻はその応答が始まった時。
-    #[tokio::test]
-    async fn the_record_lands_under_the_route_that_answered() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = Arc::new(stats(dir.path()));
-        {
-            let mut tapped = tap(
-                stream_of(vec![b"12".to_vec()]),
-                counter(),
-                Arc::clone(&s),
-                NOW,
-                None,
-                "claude-opus-5",
-            );
-            while tapped.next().await.is_some() {}
-        }
-
-        let counts = s.in_memory();
-        let day = &counts[&local_date(NOW)];
-        assert_eq!(
-            input_of(&day[NO_CREDENTIAL]["claude-opus-5"]),
-            2,
-            "認証情報を持たない経路は予約名で入る"
-        );
     }
 }

@@ -1,12 +1,21 @@
-//! 応答本文の観測 (exchange の一部)。
+//! 1 転送の生涯を持つ型 (DR-0014 §1)。
+//!
+//! ここが観測フックの掛け先になる。持つのは 3 つ。
+//!
+//! - **request span** ([`request_span`]) — 1 リクエストのログをまとめる目印
+//! - **節目の記録** ([`record_request_body`] / [`record_upstream_headers`]) —
+//!   本文を受け取った時点・upstream のヘッダを受け取った時点というフック
+//! - **応答本文の観測** ([`observe`]) — 流すバイト列はそのままに、usage を
+//!   抽出する役 ([`crate::metering::UsageObserver`]) へ通しつつ、転送の
+//!   終端 (完了・エラー・中断) をログへ残す
 //!
 //! 本文は解釈せずクライアントへ素通しする。素通しするだけだと、流している
-//! 途中で起きたこと (upstream が切れた / クライアントが去った) がどこにも
-//! 残らない。ここで包んで、節目だけを記録する。
+//! 途中で起きたこと (upstream が切れた / クライアントが去った / 消費した
+//! トークン数) がどこにも残らない。ここで包んで、節目と usage の両方を拾う。
 //!
 //! 残す節目は 4 つ。本文を受け取り終えた時点 ([`record_request_body`])、
-//! upstream のヘッダを受け取った時点 ([`crate::gateway`])、最初のチャンクを
-//! 送り出した時点、本文の終端。並べると 1 本のリクエストの時間が
+//! upstream のヘッダを受け取った時点 ([`record_upstream_headers`])、最初の
+//! チャンクを送り出した時点、本文の終端。並べると 1 本のリクエストの時間が
 //! 「受け取り」「生成待ち」「流し切るまで」に分かれるので、途中で止まった
 //! ものがどこで止まったかを切り分けられる。流している最中に詰まった分は
 //! 終端の `max_gap_ms` に出る。
@@ -20,11 +29,22 @@
 //! 「upstream のヘッダを受け取りました」の**行の時刻差**のほうに出る。
 //! どちらに出ているかは、2 つを併せて見ないと分からない。
 //!
+//! ## usage の抽出は本文の観測に相乗りする
+//!
+//! 本文を読む役 ([`crate::metering::UsageObserver`]) を作れるのは応答を
+//! 出した provider だけ (DR-0014 §4)。ここは役を受け取ってチャンクが通る
+//! たびに見せるだけで、中身は解釈しない。終端 (完了・エラー) または Drop
+//! (中断) で役を締め、読めた usage を [`crate::stats::Stats`] へ積む。途中で
+//! 切れても、そこまでに読めた分は記録する — 中断した分を丸ごと捨てると、
+//! 実際に消費した入力が記録から消える。役を持たない応答 (エラー / 読めない
+//! content-type) では usage を積まないだけで、節目のログは変わらず残す。
+//!
 //! 節目のログは対にして読む。同じ gateway を複数のクライアントが共有するので、
 //! 対にできないと「どのリクエストが落ちたか」を後から辿れない。対にするのは
 //! [`request_span`] が振る `req` の番号。
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -36,6 +56,8 @@ use tracing::{Span, error, info, info_span, warn};
 
 use crate::Result;
 use crate::egress::BodyStream;
+use crate::metering::UsageObserver;
+use crate::stats::Stats;
 
 /// リクエストに振る通し番号。
 ///
@@ -70,11 +92,34 @@ pub fn record_request_body(span: &Span, bytes: usize, elapsed: Duration) {
     span.in_scope(|| info!(elapsed_ms = ms, "本文を受け取りました"));
 }
 
-/// 転送するストリームを包んで、終端を記録できるようにする。
+/// upstream からヘッダを受け取った節目を記録する。
 ///
-/// `span` は [`request_span`] が返したもの。転送したバイト数と、ヘッダを
-/// 受け取ってから終端までの時間、途中で最も長く黙り込んだ時間を一緒に残す。
-pub fn observe(body: BodyStream, span: Span) -> BodyObservation {
+/// 本文はまだ流れていない。ここで残しておくと、この後の本文終端までの
+/// 時間が「生成待ち」寄りか「転送」寄りかを、この行と本文終端の行を
+/// 突き合わせて読める (詳しくはモジュール冒頭の「生成待ちはどの行に出るか」)。
+pub fn record_upstream_headers(span: &Span, model: &str, route: &str, status: u16) {
+    span.in_scope(|| {
+        info!(model = %model, route, status, "upstream のヘッダを受け取りました");
+    });
+}
+
+/// 転送するストリームを包んで、usage の抽出と終端の記録を両方受け持たせる。
+///
+/// `span` は [`request_span`] が返したもの。`observer` は応答を出した
+/// provider が作った役 ([`crate::provider::Metering`] 経由、DR-0014 §4) —
+/// 読めない応答では `None` で、その場合 usage は記録されないが、節目の
+/// ログは observer の有無に関わらず残す。`stats` は usage の積み先、
+/// `at` / `credential` / `model` は積むときの鍵になる (`at` は応答が
+/// 始まった時刻。生成が日を跨いで終わっても、始めた日に付ける)。
+pub fn observe(
+    body: BodyStream,
+    observer: Option<Box<dyn UsageObserver>>,
+    stats: Arc<Stats>,
+    at: i64,
+    credential: Option<&str>,
+    model: &str,
+    span: Span,
+) -> BodyObservation {
     BodyObservation {
         inner: body,
         span,
@@ -84,13 +129,19 @@ pub fn observe(body: BodyStream, span: Span) -> BodyObservation {
         max_gap: Duration::ZERO,
         max_gap_at: Duration::ZERO,
         settled: false,
+        observer,
+        stats,
+        at,
+        credential: credential.map(str::to_owned),
+        model: model.to_owned(),
     }
 }
 
-/// 終端を記録するストリーム。
+/// 終端を記録し、usage を抽出しながら流すストリーム。
 ///
-/// SSE のバイト列はここを 1 チャンクずつ通る。通り道でやるのは今の時刻を
-/// 1 度見て、バイト数を足して、無音が最長かを比べるだけ。ログを書くのは
+/// SSE のバイト列はここを 1 チャンクずつ通る。通り道でやるのは、今の時刻を
+/// 1 度見てバイト数を足し無音の最長を比べる (節目の記録) のと、observer に
+/// チャンクを見せる (usage の抽出) だけ。ログを書くのも usage を積むのも
 /// 節目 (最初のチャンク、終端) に限る。
 pub struct BodyObservation {
     inner: BodyStream,
@@ -107,6 +158,15 @@ pub struct BodyObservation {
     max_gap_at: Duration,
     /// 終端を記録済みか。記録しないまま捨てられたら中断とみなす。
     settled: bool,
+    /// 応答から usage を読む役。後始末で `finish` するために `Option` で持つ
+    /// ([`Drop`] は値を動かせない)。読めない応答では最初から `None`。
+    observer: Option<Box<dyn UsageObserver>>,
+    /// 読めた usage の積み先。
+    stats: Arc<Stats>,
+    /// 応答が始まった時刻。集計の日付をこれで決める。
+    at: i64,
+    credential: Option<String>,
+    model: String,
 }
 
 impl BodyObservation {
@@ -134,13 +194,32 @@ impl BodyObservation {
         }
     }
 
-    /// 終端のログに載せる値をまとめて取る。
+    /// 観測役を締めて、読めた usage があれば集計へ渡す。
+    ///
+    /// 呼ばれるのは [`Self::settle`] の中だけ — 終端 (完了・エラー) または
+    /// Drop (中断) の 1 度きり。正常に終わった場合も、クライアントが去って
+    /// 途中で捨てられた場合も同じ道を通る。途中まで流れた応答は、そこまでに
+    /// 読めた分が入る (`message_start` まで届いていれば input は分かる) —
+    /// 中断した分を丸ごと捨てると、実際に消費した入力が記録から消える。
+    fn finish_usage(&mut self) {
+        let Some(observer) = self.observer.take() else {
+            return;
+        };
+        let Some(usage) = observer.finish() else {
+            return;
+        };
+        self.stats
+            .record(self.at, self.credential.as_deref(), &self.model, &usage);
+    }
+
+    /// 終端のログに載せる値をまとめて取り、usage も締める。
     ///
     /// 最後の無音をここで数え切る。チャンクが 1 つも来ていなければ無音は
     /// 存在しないので、`max_gap` は 0 のまま (`bytes` が 0 かどうかで
     /// 「1 つも来なかった」と「詰まらず流れ切った」を見分けられる)。
     fn settle(&mut self) -> (u64, u128, u128, u128) {
         self.note_gap(Instant::now());
+        self.finish_usage();
         (
             self.bytes,
             self.elapsed_ms(),
@@ -169,6 +248,9 @@ impl Stream for BodyObservation {
                 this.note_gap(now);
                 this.last_chunk = Some(now);
                 this.bytes += chunk.len() as u64;
+                if let Some(observer) = this.observer.as_mut() {
+                    observer.observe(&chunk);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -213,7 +295,8 @@ impl Drop for BodyObservation {
         // 終端まで読まれずに捨てられた。クライアントが去った場合がこれに
         // あたる (返す先が消えたので、サーバはストリームを落とす)。
         // 去る直前の無音がそのまま `max_gap_ms` に出る — 黙り込んだのを見て
-        // 切ったのなら、その長さがここに残る。
+        // 切ったのなら、その長さがここに残る。usage もここで締める
+        // ([`Self::finish_usage`]) — ここまでに読めた分は記録に残す。
         let (bytes, ms, gap, gap_at) = self.settle();
         self.span.in_scope(|| {
             warn!(
@@ -231,8 +314,10 @@ impl Drop for BodyObservation {
 mod tests {
     use super::*;
     use crate::Error;
+    use crate::metering::{TokenKind, TokenUsage};
+    use crate::stats::ByDate;
     use futures_util::StreamExt as _;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     /// ログを溜める書き出し先。
     #[derive(Clone, Default)]
@@ -297,6 +382,24 @@ mod tests {
             .boxed()
     }
 
+    /// usage を記録しない、節目ログだけを見る試験用の `observe`。
+    ///
+    /// 積み先の `Stats` は使わないので、置き場ごと使い捨てて構わない
+    /// (observer が無いので [`BodyObservation::finish_usage`] はディスクに
+    /// 触らない)。
+    fn plain(body: BodyStream, span: Span) -> BodyObservation {
+        let dir = tempfile::tempdir().unwrap();
+        observe(
+            body,
+            None,
+            Arc::new(Stats::new(dir.path(), "test")),
+            0,
+            None,
+            "m",
+            span,
+        )
+    }
+
     /// ログの行から `名前=数値` を取り出す。
     fn field(line: &str, name: &str) -> u128 {
         let rest = line
@@ -320,7 +423,7 @@ mod tests {
     #[test]
     fn records_completion_with_byte_count() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"event: message_start\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
@@ -357,6 +460,21 @@ mod tests {
         );
     }
 
+    /// upstream のヘッダを受け取った節目が残る。
+    #[test]
+    fn records_upstream_headers() {
+        let logs = logs_of(|| async {
+            let span = request_span();
+            record_upstream_headers(&span, "claude-opus-5", "anthropic-oauth-a", 200);
+        });
+
+        assert!(logs.contains("upstream のヘッダを受け取りました"), "{logs}");
+        assert!(logs.contains("model=claude-opus-5"), "{logs}");
+        // 文字列フィールドは引用符付きで出る (tracing の既定の書式)。
+        assert!(logs.contains("route=\"anthropic-oauth-a\""), "{logs}");
+        assert!(logs.contains("status=200"), "{logs}");
+    }
+
     /// 本文の大きさは、後から出るログにも付いて回る。
     /// 手前のアクセスログと 1 件ずつ突き合わせるための目印なので、
     /// 終端のログだけを見ても分かる必要がある。
@@ -365,7 +483,7 @@ mod tests {
         let logs = logs_of(|| async {
             let span = request_span();
             record_request_body(&span, 512, Duration::from_millis(1));
-            let mut obs = observe(body(vec![Ok(Bytes::from_static(b"x"))]), span);
+            let mut obs = plain(body(vec![Ok(Bytes::from_static(b"x"))]), span);
             while obs.next().await.is_some() {}
         });
 
@@ -381,7 +499,7 @@ mod tests {
     #[test]
     fn records_when_the_first_chunk_goes_out() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"event: message_start\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
@@ -405,7 +523,7 @@ mod tests {
     #[test]
     fn nothing_is_recorded_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![Err(Error::Config(
                     "応答の読み取りが途切れました".into(),
                 ))]),
@@ -425,7 +543,7 @@ mod tests {
     #[test]
     fn records_the_longest_silence_between_chunks() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 paused_body(vec![
                     (0, b"data: 1\n"),
                     (5, b"data: 2\n"),
@@ -454,7 +572,7 @@ mod tests {
     #[test]
     fn silence_before_an_abort_is_counted() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 paused_body(vec![(0, b"data: 1\n"), (0, b"data: 2\n")]),
                 request_span(),
             );
@@ -478,7 +596,7 @@ mod tests {
     #[test]
     fn no_silence_is_counted_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![Err(Error::Config(
                     "応答の読み取りが途切れました".into(),
                 ))]),
@@ -496,7 +614,7 @@ mod tests {
     #[test]
     fn records_failure_midway() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
                     Err(Error::Config("応答の読み取りが途切れました".into())),
@@ -523,7 +641,7 @@ mod tests {
     #[test]
     fn records_abort_when_dropped_before_the_end() {
         let logs = logs_of(|| async {
-            let mut obs = observe(
+            let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
@@ -542,7 +660,7 @@ mod tests {
     #[test]
     fn completed_stream_is_not_reported_as_aborted() {
         let logs = logs_of(|| async {
-            let mut obs = observe(body(vec![Ok(Bytes::from_static(b"x"))]), request_span());
+            let mut obs = plain(body(vec![Ok(Bytes::from_static(b"x"))]), request_span());
             while obs.next().await.is_some() {}
         });
 
@@ -566,5 +684,220 @@ mod tests {
             .collect();
         assert_eq!(numbers.len(), 2, "{logs}");
         assert_ne!(numbers[0], numbers[1], "番号が使い回されない: {logs}");
+    }
+
+    // ---------- usage の抽出 ----------
+    //
+    // 本文の読み方は provider の [`UsageObserver`] が持つので、ここで確かめる
+    // のは「渡した役に通し、その結果を 1 度だけ記録する」ことと「流れる
+    // バイト列を変えない」こと。方言ごとの読み取りは preset 側の試験にある。
+
+    /// 2026-07-29T12:00:00Z
+    const USAGE_NOW: i64 = 1_785_326_400;
+
+    /// 試験用の観測役。中身を解釈せず、通ったバイト数を input として数える。
+    struct ByteCounter {
+        seen: u64,
+    }
+
+    impl UsageObserver for ByteCounter {
+        fn observe(&mut self, chunk: &[u8]) {
+            self.seen += chunk.len() as u64;
+        }
+
+        fn finish(self: Box<Self>) -> Option<TokenUsage> {
+            (self.seen > 0).then(|| {
+                let mut usage = TokenUsage::default();
+                usage.set(TokenKind::input(), self.seen);
+                usage
+            })
+        }
+    }
+
+    fn counter() -> Option<Box<dyn UsageObserver>> {
+        Some(Box::new(ByteCounter { seen: 0 }))
+    }
+
+    fn stream_of(chunks: Vec<Vec<u8>>) -> BodyStream {
+        body(chunks.into_iter().map(|c| Ok(Bytes::from(c))).collect())
+    }
+
+    fn new_stats() -> Arc<Stats> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(Stats::new(dir.path(), "test"))
+    }
+
+    /// 積んだ input トークン数。1 日分・1 行分しか無い前提で読む。
+    fn only_entry_input(counts: &ByDate) -> u64 {
+        counts.values().next().expect("1 日分")["a"]["m"]
+            .tokens
+            .get(&TokenKind::input())
+            .unwrap_or(0)
+    }
+
+    /// 観測しながら流し切り、下流に出たバイト列を返す。
+    async fn drain(
+        chunks: Vec<Vec<u8>>,
+        observer: Option<Box<dyn UsageObserver>>,
+        stats: &Arc<Stats>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut obs = observe(
+            stream_of(chunks),
+            observer,
+            Arc::clone(stats),
+            USAGE_NOW,
+            Some("a"),
+            "m",
+            request_span(),
+        );
+        while let Some(chunk) = obs.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        out
+    }
+
+    /// 通ったバイト列を変えずに、観測役へ渡す。
+    #[tokio::test]
+    async fn the_body_passes_through_untouched_while_being_observed() {
+        let stats = new_stats();
+        let body = b"hello, upstream".to_vec();
+        // 1 バイトずつに割って、境目の入りうる位置を一度に試す。
+        let chunks: Vec<Vec<u8>> = body.iter().map(|b| vec![*b]).collect();
+
+        let out = drain(chunks, counter(), &stats).await;
+
+        assert_eq!(out, body, "1 バイトも変えない");
+        assert_eq!(
+            only_entry_input(&stats.in_memory()),
+            body.len() as u64,
+            "全チャンクが役へ届く"
+        );
+    }
+
+    /// 読む役が無くても、本文はそのまま流れ、usage は記録しない。
+    #[tokio::test]
+    async fn a_response_without_an_observer_records_no_usage() {
+        let stats = new_stats();
+        let body = b"{\"usage\":{\"input_tokens\":99}}".to_vec();
+
+        let out = drain(vec![body.clone()], None, &stats).await;
+
+        assert_eq!(out, body);
+        assert!(stats.in_memory().is_empty(), "{:?}", stats.in_memory());
+    }
+
+    /// 観測役が「読めなかった」と言えば記録しない。
+    ///
+    /// `count_tokens` のような usage を載せない応答がこれ。本数だけ増えると、
+    /// 使っていない日が「使った日」に見える。
+    #[tokio::test]
+    async fn nothing_is_recorded_when_the_observer_found_no_usage() {
+        let stats = new_stats();
+        // 1 バイトも流れないので ByteCounter は None を返す。
+        let out = drain(vec![], counter(), &stats).await;
+
+        assert!(out.is_empty());
+        assert!(stats.in_memory().is_empty(), "{:?}", stats.in_memory());
+    }
+
+    /// 途中で捨てられても、そこまでに読めた分は残る。
+    ///
+    /// クライアントが去った場合がこれ。届いた分の消費は確定しているので、
+    /// 記録から落とすと実際に使った分が消える。
+    #[tokio::test]
+    async fn an_aborted_stream_still_records_what_was_read() {
+        let stats = new_stats();
+        {
+            let mut obs = observe(
+                stream_of(vec![b"12345".to_vec(), b"67890".to_vec()]),
+                counter(),
+                Arc::clone(&stats),
+                USAGE_NOW,
+                Some("a"),
+                "m",
+                request_span(),
+            );
+            // 1 チャンクだけ読んで捨てる。
+            let _ = obs.next().await;
+        }
+
+        assert_eq!(
+            only_entry_input(&stats.in_memory()),
+            5,
+            "そこまでに見えた分だけ"
+        );
+    }
+
+    /// 流し切っても記録は 1 度だけ。
+    #[tokio::test]
+    async fn a_completed_stream_is_recorded_exactly_once() {
+        let stats = new_stats();
+        let _ = drain(vec![b"1234".to_vec()], counter(), &stats).await;
+
+        let counts = stats.in_memory();
+        let day = counts.values().next().expect("1 日分");
+        assert_eq!(day["a"]["m"].requests, 1);
+        assert_eq!(only_entry_input(&counts), 4, "2 倍になっていない");
+    }
+
+    /// upstream が途切れても、そこまでの分は残り、誤りは下流へ伝わる。
+    #[tokio::test]
+    async fn a_failing_stream_keeps_what_it_read() {
+        let stats = new_stats();
+        let broken = body(vec![
+            Ok(Bytes::from_static(b"123")),
+            Err(Error::Config("応答の読み取りが途切れました".into())),
+        ]);
+
+        let mut saw_error = false;
+        {
+            let mut obs = observe(
+                broken,
+                counter(),
+                Arc::clone(&stats),
+                USAGE_NOW,
+                Some("a"),
+                "m",
+                request_span(),
+            );
+            while let Some(item) = obs.next().await {
+                if item.is_err() {
+                    saw_error = true;
+                }
+            }
+        }
+
+        assert!(saw_error, "誤りを飲み込まない");
+        assert_eq!(only_entry_input(&stats.in_memory()), 3);
+    }
+
+    /// 記録先は渡された credential とモデル、時刻はその応答が始まった時。
+    #[tokio::test]
+    async fn the_record_lands_under_the_route_that_answered() {
+        let stats = new_stats();
+        {
+            let mut obs = observe(
+                stream_of(vec![b"12".to_vec()]),
+                counter(),
+                Arc::clone(&stats),
+                USAGE_NOW,
+                None,
+                "claude-opus-5",
+                request_span(),
+            );
+            while obs.next().await.is_some() {}
+        }
+
+        let counts = stats.in_memory();
+        let day = counts.values().next().expect("1 日分");
+        assert_eq!(
+            day[crate::stats::NO_CREDENTIAL]["claude-opus-5"]
+                .tokens
+                .get(&TokenKind::input())
+                .unwrap_or(0),
+            2,
+            "認証情報を持たない経路は予約名で入る"
+        );
     }
 }

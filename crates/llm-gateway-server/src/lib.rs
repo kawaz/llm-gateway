@@ -312,30 +312,29 @@ async fn messages<P: Persistence + 'static>(
                 resp = resp.header(name, value);
             }
 
-            // 使用量は応答の本文にしか載らないので、中継の内側で覗く
-            // (DR-0011)。覗くだけで、流れるバイト列は変わらない。読む役は
+            // 本文は読まずに流す。SSE はここを通り抜けるだけ。包むのは
+            // 終端 (流し切った / 途切れた / 中断された) を残すためと、
+            // 使用量を覗くため — 応答の本文にしか載らないので、中継の内側で
+            // 覗く (DR-0011)。覗くだけで、流れるバイト列は変わらない。読む役は
             // 答えた provider が作ったものが載っている (DR-0014 §4)。
-            let counted = llm_gateway::stats::tap(
+            resp.body(Body::from_stream(exchange::observe(
                 upstream.body,
                 forwarded.usage,
                 Arc::clone(gateway.stats()),
                 now_unix(),
                 forwarded.credential.as_ref().map(CredentialId::as_str),
                 &forwarded.model,
-            );
-
-            // 本文は読まずに流す。SSE はここを通り抜けるだけ。
-            // 包むのは終端 (流し切った / 途切れた / 中断された) を残すため。
-            resp.body(Body::from_stream(exchange::observe(counted, span.clone())))
-                .unwrap_or_else(|e| {
-                    span.in_scope(|| {
-                        client_error(
-                            &ns_name,
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            &format!("could not build the response: {e}"),
-                        )
-                    })
+                span.clone(),
+            )))
+            .unwrap_or_else(|e| {
+                span.in_scope(|| {
+                    client_error(
+                        &ns_name,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("could not build the response: {e}"),
+                    )
                 })
+            })
         }
         Err(e) => span.in_scope(|| error_response(&ns_name, &e)),
     }
