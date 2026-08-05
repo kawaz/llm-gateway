@@ -1,4 +1,4 @@
-//! 中継の観測。
+//! 応答本文の観測 (exchange の一部)。
 //!
 //! 本文は解釈せずクライアントへ素通しする。素通しするだけだと、流している
 //! 途中で起きたこと (upstream が切れた / クライアントが去った) がどこにも
@@ -70,12 +70,12 @@ pub fn record_request_body(span: &Span, bytes: usize, elapsed: Duration) {
     span.in_scope(|| info!(elapsed_ms = ms, "本文を受け取りました"));
 }
 
-/// 中継するストリームを包んで、終端を記録できるようにする。
+/// 転送するストリームを包んで、終端を記録できるようにする。
 ///
 /// `span` は [`request_span`] が返したもの。転送したバイト数と、ヘッダを
 /// 受け取ってから終端までの時間、途中で最も長く黙り込んだ時間を一緒に残す。
-pub fn observe(body: BodyStream, span: Span) -> Relay {
-    Relay {
+pub fn observe(body: BodyStream, span: Span) -> BodyObservation {
+    BodyObservation {
         inner: body,
         span,
         bytes: 0,
@@ -92,7 +92,7 @@ pub fn observe(body: BodyStream, span: Span) -> Relay {
 /// SSE のバイト列はここを 1 チャンクずつ通る。通り道でやるのは今の時刻を
 /// 1 度見て、バイト数を足して、無音が最長かを比べるだけ。ログを書くのは
 /// 節目 (最初のチャンク、終端) に限る。
-pub struct Relay {
+pub struct BodyObservation {
     inner: BodyStream,
     span: Span,
     bytes: u64,
@@ -109,7 +109,7 @@ pub struct Relay {
     settled: bool,
 }
 
-impl Relay {
+impl BodyObservation {
     fn elapsed_ms(&self) -> u128 {
         self.since_headers.elapsed().as_millis()
     }
@@ -121,7 +121,7 @@ impl Relay {
     /// そこが最も長い無音になる — 停滞を探すのに一番効くのはこの区間。
     ///
     /// ヘッダを受け取ってから最初のチャンクまでは数えない。そこは upstream が
-    /// 返し始めるまでの待ちで、中継の停滞とは別物 (「最初のチャンクを送り
+    /// 返し始めるまでの待ちで、転送の停滞とは別物 (「最初のチャンクを送り
     /// 出しました」の行で見る)。
     fn note_gap(&mut self, at: Instant) {
         let Some(prev) = self.last_chunk else {
@@ -150,7 +150,7 @@ impl Relay {
     }
 }
 
-impl Stream for Relay {
+impl Stream for BodyObservation {
     type Item = Result<Bytes>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -205,7 +205,7 @@ impl Stream for Relay {
     }
 }
 
-impl Drop for Relay {
+impl Drop for BodyObservation {
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -320,14 +320,14 @@ mod tests {
     #[test]
     fn records_completion_with_byte_count() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![
                     Ok(Bytes::from_static(b"event: message_start\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
                 ]),
                 request_span(),
             );
-            while relay.next().await.is_some() {}
+            while obs.next().await.is_some() {}
         });
 
         assert!(logs.contains("本文を転送し終えました"), "{logs}");
@@ -365,8 +365,8 @@ mod tests {
         let logs = logs_of(|| async {
             let span = request_span();
             record_request_body(&span, 512, Duration::from_millis(1));
-            let mut relay = observe(body(vec![Ok(Bytes::from_static(b"x"))]), span);
-            while relay.next().await.is_some() {}
+            let mut obs = observe(body(vec![Ok(Bytes::from_static(b"x"))]), span);
+            while obs.next().await.is_some() {}
         });
 
         let end = logs
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn records_when_the_first_chunk_goes_out() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![
                     Ok(Bytes::from_static(b"event: message_start\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
@@ -389,7 +389,7 @@ mod tests {
                 ]),
                 request_span(),
             );
-            while relay.next().await.is_some() {}
+            while obs.next().await.is_some() {}
         });
 
         let first: Vec<&str> = logs
@@ -405,13 +405,13 @@ mod tests {
     #[test]
     fn nothing_is_recorded_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![Err(Error::Config(
                     "応答の読み取りが途切れました".into(),
                 ))]),
                 request_span(),
             );
-            let _ = relay.next().await;
+            let _ = obs.next().await;
         });
 
         assert!(!logs.contains("最初のチャンク"), "{logs}");
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn records_the_longest_silence_between_chunks() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 paused_body(vec![
                     (0, b"data: 1\n"),
                     (5, b"data: 2\n"),
@@ -435,7 +435,7 @@ mod tests {
                 ]),
                 request_span(),
             );
-            while relay.next().await.is_some() {}
+            while obs.next().await.is_some() {}
         });
 
         let end = line_with(&logs, "本文を転送し終えました");
@@ -454,11 +454,11 @@ mod tests {
     #[test]
     fn silence_before_an_abort_is_counted() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 paused_body(vec![(0, b"data: 1\n"), (0, b"data: 2\n")]),
                 request_span(),
             );
-            let _ = relay.next().await;
+            let _ = obs.next().await;
             // 受け取ったきり黙り込んで、捨てる。
             tokio::time::sleep(Duration::from_millis(80)).await;
         });
@@ -478,13 +478,13 @@ mod tests {
     #[test]
     fn no_silence_is_counted_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![Err(Error::Config(
                     "応答の読み取りが途切れました".into(),
                 ))]),
                 request_span(),
             );
-            let _ = relay.next().await;
+            let _ = obs.next().await;
         });
 
         let broken = line_with(&logs, "転送が途切れました");
@@ -496,14 +496,14 @@ mod tests {
     #[test]
     fn records_failure_midway() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
                     Err(Error::Config("応答の読み取りが途切れました".into())),
                 ]),
                 request_span(),
             );
-            while let Some(item) = relay.next().await {
+            while let Some(item) = obs.next().await {
                 if item.is_err() {
                     break;
                 }
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn records_abort_when_dropped_before_the_end() {
         let logs = logs_of(|| async {
-            let mut relay = observe(
+            let mut obs = observe(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
                     Ok(Bytes::from_static(b"data: {}\n")),
@@ -531,7 +531,7 @@ mod tests {
                 request_span(),
             );
             // 1 つだけ受け取って捨てる。
-            let _ = relay.next().await;
+            let _ = obs.next().await;
         });
 
         assert!(logs.contains("転送が中断されました"), "{logs}");
@@ -542,8 +542,8 @@ mod tests {
     #[test]
     fn completed_stream_is_not_reported_as_aborted() {
         let logs = logs_of(|| async {
-            let mut relay = observe(body(vec![Ok(Bytes::from_static(b"x"))]), request_span());
-            while relay.next().await.is_some() {}
+            let mut obs = observe(body(vec![Ok(Bytes::from_static(b"x"))]), request_span());
+            while obs.next().await.is_some() {}
         });
 
         assert!(!logs.contains("中断"), "{logs}");

@@ -19,7 +19,7 @@ use tracing::{Instrument as _, error, warn};
 use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::time::now_unix;
 use llm_gateway::credential::{CredentialId, Persistence};
-use llm_gateway::{Error, Gateway, relay};
+use llm_gateway::{Error, Gateway, exchange};
 use tokio::sync::broadcast::error::RecvError;
 
 /// 転送するリクエストの上限。
@@ -241,7 +241,7 @@ async fn messages<P: Persistence + 'static>(
     // 節目 (本文を受け取った / ヘッダが返った / 流し始めた / 終端) を
     // 突き合わせられる。番号を振るのは本文を読む前 — 読むのにかかった
     // 時間も、この番号の下に残したい。
-    let span = relay::request_span();
+    let span = exchange::request_span();
     // 断るときのログにも載せるので、経路が決まる前に取り出しておく。
     let ns_name = namespace_of(uri.path()).to_owned();
 
@@ -274,7 +274,7 @@ async fn messages<P: Persistence + 'static>(
     };
     // 大きさは受け取った実バイト数で数える。Content-Length は手前の
     // プロキシが chunked で渡してくると付かないが、こちらは必ず取れる。
-    relay::record_request_body(&span, bytes.len(), receiving.elapsed());
+    exchange::record_request_body(&span, bytes.len(), receiving.elapsed());
 
     let json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -326,7 +326,7 @@ async fn messages<P: Persistence + 'static>(
 
             // 本文は読まずに流す。SSE はここを通り抜けるだけ。
             // 包むのは終端 (流し切った / 途切れた / 中断された) を残すため。
-            resp.body(Body::from_stream(relay::observe(counted, span.clone())))
+            resp.body(Body::from_stream(exchange::observe(counted, span.clone())))
                 .unwrap_or_else(|e| {
                     span.in_scope(|| {
                         client_error(

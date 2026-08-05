@@ -8,7 +8,7 @@
 //! - [`backend`] upstream ごとのアダプタ。Messages API 系はプロバイダで分岐
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
 //! - [`denial`] 断られた経路をしばらく候補から外す (DR-0009)
-//! - [`relay`] 本文を流し終えた (途切れた) ところの記録
+//! - [`exchange`] 本文を流し終えた (途切れた) ところの記録
 //! - [`events`] 転送のたびに起きたことを見ている人へ流す (DR-0012)
 //! - [`webhook`] その知らせを受け口へ送る (DR-0012)
 //! - [`limits`] サブスクの枠を専用の口から聞く (DR-0007)
@@ -22,12 +22,12 @@ pub mod credential;
 pub mod denial;
 pub mod discovery;
 pub mod events;
+pub mod exchange;
 pub mod gateway;
 pub mod limits;
 pub mod pattern;
 pub mod pricing;
 pub mod quota;
-pub mod relay;
 pub mod router;
 pub mod session;
 pub mod stats;
