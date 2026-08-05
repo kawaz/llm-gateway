@@ -35,7 +35,7 @@ use tracing::field::Empty;
 use tracing::{Span, error, info, info_span, warn};
 
 use crate::Result;
-use crate::backend::anthropic::forward::BodyStream;
+use crate::egress::BodyStream;
 
 /// リクエストに振る通し番号。
 ///

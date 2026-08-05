@@ -1,7 +1,7 @@
 //! upstream へ出るときの provider-neutral な HTTP 契約。
 //!
-//! ingress が作った Anthropic Messages 形式の正規形を [`EgressRequest`] で受け、
-//! provider の [`crate::provider::Wire`] が送信可能な [`UpstreamRequest`] へ変換する。
+//! ingress が作った Messages 形式の正規形を [`EgressRequest`] で受け、provider の
+//! [`crate::provider::Wire`] が送信可能な [`UpstreamRequest`] へ変換する。
 //! 署名と実送信は同じ [`bytes::Bytes`] を参照し、JSON の再直列化で内容が変わらない。
 
 use std::collections::BTreeMap;
@@ -105,7 +105,7 @@ impl Headers {
 
 /// ingress から egress へ渡す正規形。
 ///
-/// `body` は Anthropic Messages 形式の `serde_json::Value`。中立 IR は挟まない。
+/// `body` は Messages 形式の `serde_json::Value`。中立 IR は挟まない。
 #[derive(Debug, Clone)]
 pub struct EgressRequest {
     pub path: String,
@@ -173,17 +173,14 @@ mod tests {
             ("Host", "gateway.invalid"),
             ("Authorization", "Bearer client"),
             ("X-Forwarded-For", "192.0.2.1"),
-            ("anthropic-version", "2023-06-01"),
+            ("x-api-version", "2026-01-01"),
             ("user-agent", "client/1"),
         ]);
         headers.strip_for_upstream();
 
         assert_eq!(
             headers.iter().collect::<Vec<_>>(),
-            vec![
-                ("anthropic-version", "2023-06-01"),
-                ("user-agent", "client/1")
-            ]
+            vec![("x-api-version", "2026-01-01"), ("user-agent", "client/1")]
         );
     }
 
