@@ -4,8 +4,6 @@
 //! どれもこの方言の知識なので preset 側が持つ (DR-0014 §4)。core が規定するのは
 //! 写した先の形 ([`crate::metering`] / [`crate::quota`] / [`crate::denial`]) だけ。
 
-use std::collections::BTreeMap;
-
 use serde_json::Value;
 
 use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, Scope};
@@ -89,18 +87,11 @@ impl Metering for AnthropicMetering {
 
     /// 重複しない課金軸を選ぶ。
     ///
-    /// Anthropic の `input_tokens` はキャッシュ分を含まないので、4 区分を
-    /// そのまま並べても二重計上にならない。
+    /// Anthropic の `input_tokens` はキャッシュ分を含まないので、単価表の
+    /// 4 区分をそのまま並べても二重計上にならない。表に無い区分 (provider 固有の
+    /// 内訳) は課金へ入らないので、観測値として残したまま合計は動かない。
     fn pricing(&self, model: &str) -> Option<Pricing> {
-        let rates = crate::pricing::rates_for(model)?;
-        Some(Pricing {
-            rates: BTreeMap::from([
-                (TokenKind::input(), rates.input),
-                (TokenKind::output(), rates.output),
-                (TokenKind::input_cache_creation(), rates.cache_write),
-                (TokenKind::input_cache_read(), rates.cache_read),
-            ]),
-        })
+        crate::pricing::for_model(model)
     }
 }
 
@@ -806,6 +797,122 @@ mod tests {
         );
     }
 
+    /// 累積で届く usage は足さずに置き換える (実測 2026-07-30)。
+    ///
+    /// `message_start` の `output_tokens:1` と `message_delta` の `16` を足すと
+    /// 17 になり、実際より多く数える。
+    #[test]
+    fn a_cumulative_usage_replaces_the_earlier_value() {
+        let usage = read(
+            "text/event-stream",
+            &[
+                b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":18,\"output_tokens\":1}}}\n\n",
+                b"event: message_delta\ndata: {\"usage\":{\"input_tokens\":18,\"output_tokens\":16}}\n\n",
+            ],
+        )
+        .expect("読める");
+
+        assert_eq!(usage.get(&TokenKind::output()), Some(16), "1 + 16 にしない");
+        assert_eq!(
+            usage.get(&TokenKind::input()),
+            Some(18),
+            "同じ値を二重に足さない"
+        );
+    }
+
+    /// 後の usage に載っていない区分は、前に拾った値を保つ。
+    ///
+    /// `message_delta` が一部しか載せない場合に、拾えていた分が消えないように。
+    #[test]
+    fn kinds_absent_from_a_later_usage_are_kept() {
+        let usage = read(
+            "text/event-stream",
+            &[
+                b"data: {\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":900}}\n\n",
+                b"data: {\"usage\":{\"output_tokens\":7}}\n\n",
+            ],
+        )
+        .expect("読める");
+
+        assert_eq!(usage.get(&TokenKind::input()), Some(20));
+        assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(900));
+        assert_eq!(usage.get(&TokenKind::output()), Some(7));
+    }
+
+    /// 数の付いていない値は拾わない。読めた区分だけを残す。
+    #[test]
+    fn non_numeric_usage_values_are_skipped() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"input_tokens":"many","output_tokens":null,
+                "cache_read_input_tokens":5}}"#],
+        )
+        .expect("読めた区分がある");
+
+        assert_eq!(usage.get(&TokenKind::input()), None);
+        assert_eq!(usage.get(&TokenKind::output()), None);
+        assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(5));
+    }
+
+    /// `data:` 以外の行は読まない。
+    ///
+    /// `event:` の行や注釈に usage という語が混ざっても数えない。
+    #[test]
+    fn only_data_lines_are_parsed() {
+        assert_eq!(
+            read(
+                "text/event-stream",
+                &[
+                    b": a comment mentioning usage\nevent: usage\nid: {\"usage\":{\"input_tokens\":999}}\n\n"
+                ],
+            ),
+            None
+        );
+    }
+
+    /// `data:` の後の空白は在っても無くてもよい。
+    #[test]
+    fn a_data_line_without_a_space_is_read() {
+        let usage = read(
+            "text/event-stream",
+            &[b"data:{\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n"],
+        )
+        .expect("読める");
+
+        assert_eq!(usage.get(&TokenKind::output()), Some(5));
+    }
+
+    /// 別のイベントの data 同士は繋がない。
+    ///
+    /// 空行で区切られていれば別の中身。繋ぐと壊れた JSON になって、どちらの
+    /// usage も読めなくなる。
+    #[test]
+    fn data_from_different_events_is_not_joined() {
+        let usage = read(
+            "text/event-stream",
+            &[
+                b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n",
+                b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n",
+            ],
+        )
+        .expect("読める");
+
+        assert_eq!(usage.get(&TokenKind::input()), Some(7), "前のイベントから");
+        assert_eq!(usage.get(&TokenKind::output()), Some(9), "後のイベントから");
+    }
+
+    /// CRLF で区切る upstream でも読める。
+    #[test]
+    fn crlf_line_endings_are_handled() {
+        let usage = read(
+            "text/event-stream",
+            &[b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\r\n\r\n"],
+        )
+        .expect("読める");
+
+        assert_eq!(usage.get(&TokenKind::output()), Some(9));
+    }
+
     /// 1 つも読めなければ「観測なし」を返す (0 と区別する)。
     #[test]
     fn reports_nothing_when_no_usage_appeared() {
@@ -815,11 +922,42 @@ mod tests {
         );
     }
 
+    /// 壊れた本文からは読み取らない (読めないだけで、中継は別の話)。
+    #[test]
+    fn a_broken_body_yields_nothing() {
+        assert_eq!(read("application/json", &[b"{ not json"]), None);
+        assert_eq!(
+            read("text/event-stream", &[b"data: {\"usage\": broken}\n\n"]),
+            None
+        );
+    }
+
     /// 上限を超えた応答は、途中まで読めていても捨てる。
     #[test]
     fn gives_up_on_an_endless_event() {
         let flood = vec![b'x'; MAX_SSE_EVENT + 1];
         assert_eq!(read("text/event-stream", &[&flood]), None);
+    }
+
+    /// 諦めた後に usage が流れてきても拾い直さない。
+    #[test]
+    fn giving_up_is_not_undone_by_a_later_event() {
+        let flood = vec![b'x'; MAX_SSE_EVENT + 1];
+        assert_eq!(
+            read(
+                "text/event-stream",
+                &[&flood, b"\ndata: {\"usage\":{\"output_tokens\":9}}\n\n"],
+            ),
+            None
+        );
+    }
+
+    /// 大きすぎる JSON は抱え込まない。
+    #[test]
+    fn gives_up_on_an_oversized_json_body() {
+        let chunk = vec![b'x'; 1024 * 1024];
+        let chunks: Vec<&[u8]> = (0..5).map(|_| chunk.as_slice()).collect();
+        assert_eq!(read("application/json", &chunks), None);
     }
 
     /// 単価表にあるモデルは 4 区分に値が付き、無いモデルは値付けしない。

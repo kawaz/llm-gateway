@@ -1,5 +1,6 @@
 //! llm-gateway のコマンドライン。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
+use llm_gateway::metering::TokenKind;
 use llm_gateway::quota::{CredentialUsage, Report, Window};
 use llm_gateway::stats::{Counters, Report as StatsReport};
 use llm_gateway::{Config, Gateway};
@@ -617,15 +619,19 @@ fn render_stats(report: &StatsReport) -> String {
         let mut total = Counters::default();
         for models in day.credentials.values() {
             for entry in models.values() {
-                add(&mut total, &entry.counters);
+                total.merge(&entry.counters);
             }
         }
-        add(&mut all_days, &total);
+        all_days.merge(&total);
         lines.push((format!("{date} {TOTAL_LABEL}"), total, day.total_usd));
 
         for (cred, models) in &day.credentials {
             for (model, entry) in models {
-                lines.push((format!("  {cred} {model}"), entry.counters, entry.usd));
+                lines.push((
+                    format!("  {cred} {model}"),
+                    entry.counters.clone(),
+                    entry.usd,
+                ));
             }
         }
     }
@@ -633,14 +639,21 @@ fn render_stats(report: &StatsReport) -> String {
     // 「今月いくら使ったか」を表の下端で読める。
     lines.push((TOTAL_LABEL.to_owned(), all_days, report.total_usd));
 
+    // 列は記録に現れた区分だけ並べる。区分は provider ごとに違うので
+    // (DR-0014 §4)、固定の列を並べると知らない区分が表から消える。
+    let kinds = kinds_of(&lines);
+    let headers: Vec<&str> = std::iter::once(REQUESTS_HEADER)
+        .chain(kinds.iter().map(header_of))
+        .collect();
+
     let label_width = lines.iter().map(|(l, ..)| width(l)).max().unwrap_or(0);
     let cell_width = lines
         .iter()
-        .flat_map(|(_, c, _)| columns(c))
+        .flat_map(|(_, c, _)| columns(c, &kinds))
         .map(|n| thousands(n).len())
         .max()
         .unwrap_or(0)
-        .max(HEADERS.iter().map(|h| h.len()).max().unwrap_or(0));
+        .max(headers.iter().map(|h| h.len()).max().unwrap_or(0));
     let usd_width = lines
         .iter()
         .map(|(.., usd)| usd_cell(*usd).len())
@@ -650,7 +663,7 @@ fn render_stats(report: &StatsReport) -> String {
 
     // 見出しは 1 度だけ。日ごとに挟むと、行数の少ない日ほど見出しで埋まる。
     let mut out = " ".repeat(label_width);
-    for head in HEADERS {
+    for head in &headers {
         out.push_str(&format!(" {head:>cell_width$}"));
     }
     out.push_str(&format!(" {USD_HEADER:>usd_width$}\n"));
@@ -665,7 +678,7 @@ fn render_stats(report: &StatsReport) -> String {
 
         out.push_str(label);
         out.push_str(&" ".repeat(label_width.saturating_sub(width(label))));
-        out.push_str(&row(counters, cell_width));
+        out.push_str(&row(counters, &kinds, cell_width));
         out.push_str(&format!(" {:>usd_width$}\n", usd_cell(*usd)));
     }
     out
@@ -685,34 +698,67 @@ fn usd_cell(usd: Option<f64>) -> String {
 /// 合計行の印。内訳の行と見分けられればよい。
 const TOTAL_LABEL: &str = "total";
 
-/// 集計の並び。表示と見出しでこの順を守る。
-const HEADERS: [&str; 5] = ["reqs", "input", "output", "cache_w", "cache_r"];
+/// 本数の見出し。トークンの区分より前に置く。
+const REQUESTS_HEADER: &str = "reqs";
 
 /// トークン数の右に置く金額の見出し。単位を書くのは、桁だけでは
 /// トークン数と見分けが付かないため。
 const USD_HEADER: &str = "usd";
 
-fn columns(c: &Counters) -> [u64; 5] {
-    [
-        c.requests,
-        c.input_tokens,
-        c.output_tokens,
-        c.cache_creation_input_tokens,
-        c.cache_read_input_tokens,
-    ]
+/// 見慣れた並び。ここに挙げた区分を先にこの順で出し、残りは名前順で続ける。
+///
+/// 並べ替えの都合なので、ここに無い区分も落とさない (落とすと、その provider の
+/// 消費が表から消える)。
+const KIND_ORDER: [&str; 5] = [
+    TokenKind::INPUT_NAME,
+    TokenKind::OUTPUT_NAME,
+    TokenKind::INPUT_CACHE_CREATION_NAME,
+    TokenKind::INPUT_CACHE_READ_NAME,
+    TokenKind::OUTPUT_REASONING_NAME,
+];
+
+/// 表に出す区分を、並べる順で返す。
+fn kinds_of(lines: &[Line]) -> Vec<TokenKind> {
+    let seen: BTreeSet<TokenKind> = lines
+        .iter()
+        .flat_map(|(_, c, _)| c.tokens.tokens.keys().cloned())
+        .collect();
+
+    let mut ordered: Vec<TokenKind> = KIND_ORDER
+        .iter()
+        .map(|name| TokenKind::new(*name))
+        .filter(|kind| seen.contains(kind))
+        .collect();
+    ordered.extend(
+        seen.into_iter()
+            .filter(|kind| !KIND_ORDER.contains(&kind.as_str())),
+    );
+    ordered
 }
 
-fn add(into: &mut Counters, c: &Counters) {
-    into.requests += c.requests;
-    into.input_tokens += c.input_tokens;
-    into.output_tokens += c.output_tokens;
-    into.cache_creation_input_tokens += c.cache_creation_input_tokens;
-    into.cache_read_input_tokens += c.cache_read_input_tokens;
+/// 区分の見出し。桁が広がらないよう、標準区分は短い名前で出す。
+///
+/// 知らない区分は名前をそのまま見出しにする。短縮した名前を勝手に付けると、
+/// どの区分を見ているのか読み手に分からない。
+fn header_of(kind: &TokenKind) -> &str {
+    match kind.as_str() {
+        TokenKind::INPUT_CACHE_CREATION_NAME => "cache_w",
+        TokenKind::INPUT_CACHE_READ_NAME => "cache_r",
+        TokenKind::OUTPUT_REASONING_NAME => "reasoning",
+        other => other,
+    }
+}
+
+/// 1 行に並べる数。先頭は本数、続けて区分ごとのトークン数。
+fn columns(c: &Counters, kinds: &[TokenKind]) -> Vec<u64> {
+    std::iter::once(c.requests)
+        .chain(kinds.iter().map(|kind| c.tokens.get(kind).unwrap_or(0)))
+        .collect()
 }
 
 /// 数を桁揃えで 1 行に並べる。見出しと同じ幅で、先頭に区切りの 1 桁を置く。
-fn row(c: &Counters, cell_width: usize) -> String {
-    columns(c)
+fn row(c: &Counters, kinds: &[TokenKind], cell_width: usize) -> String {
+    columns(c, kinds)
         .iter()
         .map(|n| format!(" {:>cell_width$}", thousands(*n)))
         .collect()
@@ -1872,12 +1918,12 @@ mod tests {
     // ---------- stats (DR-0011) ----------
 
     fn counters(reqs: u64, input: u64, output: u64) -> Counters {
+        let mut tokens = llm_gateway::metering::TokenUsage::default();
+        tokens.set(TokenKind::input(), input);
+        tokens.set(TokenKind::output(), output);
         Counters {
             requests: reqs,
-            input_tokens: input,
-            output_tokens: output,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            tokens,
         }
     }
 
@@ -1893,14 +1939,7 @@ mod tests {
             let mut creds = serde_json::Map::new();
             let mut day_total: Option<f64> = None;
             for (cred, model, c) in *rows {
-                let usd = llm_gateway::pricing::rates_for(model).map(|r| {
-                    r.cost(
-                        c.input_tokens,
-                        c.output_tokens,
-                        c.cache_creation_input_tokens,
-                        c.cache_read_input_tokens,
-                    )
-                });
+                let usd = llm_gateway::pricing::for_model(model).map(|p| p.cost(&c.tokens));
                 if let Some(usd) = usd {
                     day_total = Some(day_total.unwrap_or(0.0) + usd);
                 }
@@ -1951,9 +1990,52 @@ mod tests {
         assert!(out.contains("8,340"), "{out}");
         assert!(out.contains("claude-one"), "内訳に認証情報が出る: {out}");
         assert!(out.contains("claude-opus-5"), "内訳にモデルが出る: {out}");
-        for head in HEADERS {
+        for head in [REQUESTS_HEADER, "input", "output", USD_HEADER] {
             assert!(out.contains(head), "見出し {head} が無い: {out}");
         }
+    }
+
+    /// 記録に現れた区分だけが列になる。使っていない区分で桁を広げない。
+    #[test]
+    fn stats_columns_follow_the_kinds_that_were_recorded() {
+        let out = render_stats(&stats_report(&[(
+            "2026-07-29",
+            &[("a", "claude-opus-5", counters(1, 10, 5))],
+        )]));
+
+        let head = out.lines().next().expect("見出しの行");
+        assert!(head.contains("input") && head.contains("output"), "{out}");
+        assert!(
+            !head.contains("cache_w"),
+            "使っていない区分は出さない: {out}"
+        );
+    }
+
+    /// provider 固有の区分も列になる。潰すと、その消費が表から消える。
+    #[test]
+    fn a_provider_specific_kind_gets_its_own_column() {
+        let mut c = counters(1, 10, 5);
+        c.tokens.set(TokenKind::output_reasoning(), 7);
+        c.tokens.set("provider.batch_prediction", 3);
+
+        let out = render_stats(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
+
+        let head = out.lines().next().expect("見出しの行");
+        assert!(head.contains("reasoning"), "標準区分は短い見出し: {out}");
+        assert!(
+            head.contains("provider.batch_prediction"),
+            "知らない区分は名前のまま出す: {out}"
+        );
+        let row = out
+            .lines()
+            .find(|l| l.starts_with("  a "))
+            .expect("内訳の行");
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            // 認証情報 / モデル / 本数 / input / output / reasoning / 固有区分 / USD
+            ["a", "m", "1", "10", "5", "7", "3", "-"],
+            "{out}"
+        );
     }
 
     /// 単価表に無いモデルの金額欄は `-`。0.0000 と出すと「使ったが安かった」に
@@ -2136,9 +2218,14 @@ mod tests {
     ///
     /// 桁揃えは目で見て決めたもので、崩れても個別の assert には出にくい。
     /// 1 度だけの見出し・日ごとの合計・字下げした内訳・日の間の空行を、
-    /// まとめてここで見張る。
+    /// まとめてここで見張る。1 行にしか出てこない区分 (ここでは cache) も
+    /// 列として立ち、他の行はその欄が 0 になる。
     #[test]
     fn the_table_keeps_its_shape() {
+        let mut cached = counters(12, 98_120, 7_431);
+        cached.tokens.set(TokenKind::input_cache_creation(), 2_000);
+        cached.tokens.set(TokenKind::input_cache_read(), 50_000);
+
         let out = render_stats(&stats_report(&[
             (
                 "2026-07-29",
@@ -2148,7 +2235,7 @@ mod tests {
                         "claude-haiku-4-5",
                         counters(312, 1_204_887, 34_002),
                     ),
-                    ("claude-two", "claude-opus-5", counters(12, 98_120, 7_431)),
+                    ("claude-two", "claude-opus-5", cached),
                 ],
             ),
             (
@@ -2162,11 +2249,11 @@ mod tests {
             "2026-07-30 total                      7     8,120       931         0         0 0.0128\n",
             "  claude-one claude-haiku-4-5         7     8,120       931         0         0 0.0128\n",
             "\n",
-            "2026-07-29 total                    324 1,303,007    41,433         0         0 2.0513\n",
+            "2026-07-29 total                    324 1,303,007    41,433     2,000    50,000 2.0888\n",
             "  claude-one claude-haiku-4-5       312 1,204,887    34,002         0         0 1.3749\n",
-            "  claude-two claude-opus-5           12    98,120     7,431         0         0 0.6764\n",
+            "  claude-two claude-opus-5           12    98,120     7,431     2,000    50,000 0.7139\n",
             "\n",
-            "total                               331 1,311,127    42,364         0         0 2.0640\n",
+            "total                               331 1,311,127    42,364     2,000    50,000 2.1015\n",
         );
         assert_eq!(
             out, expected,

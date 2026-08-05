@@ -313,13 +313,13 @@ async fn messages<P: Persistence + 'static>(
             }
 
             // 使用量は応答の本文にしか載らないので、中継の内側で覗く
-            // (DR-0011)。覗くだけで、流れるバイト列は変わらない。
+            // (DR-0011)。覗くだけで、流れるバイト列は変わらない。読む役は
+            // 答えた provider が作ったものが載っている (DR-0014 §4)。
             let counted = llm_gateway::stats::tap(
                 upstream.body,
+                forwarded.usage,
                 Arc::clone(gateway.stats()),
                 now_unix(),
-                upstream.status,
-                header_value(&upstream.headers, "content-type"),
                 forwarded.credential.as_ref().map(CredentialId::as_str),
                 &forwarded.model,
             );
@@ -394,16 +394,6 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
             &format!("namespace `{name}` のトークンが違います"),
         )),
     }
-}
-
-/// 名前の大小を無視して 1 つ引く。
-///
-/// upstream や手前のプロキシで大小は変わる。
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
 }
 
 fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
@@ -1276,6 +1266,9 @@ mod usage_tests {
     /// 実測された unified ヘッダ (DR-0007 の表)。
     fn unified_headers() -> Vec<(String, String)> {
         vec![
+            // 本文の読み手 (usage の抽出) は content-type で決まる。実機の応答は
+            // 必ず載せてくるので、枠ヘッダの見本にも一緒に入れておく。
+            ("content-type".into(), "application/json".into()),
             (
                 "anthropic-ratelimit-unified-5h-utilization".into(),
                 "0.71".into(),
@@ -2105,10 +2098,17 @@ credentials = ["a"]
         assert_eq!(days.len(), 1, "1 日分: {report}");
         let counters = &days.values().next().unwrap()["credentials"]["-"]["m"];
         assert_eq!(counters["requests"], 1);
-        assert_eq!(counters["input_tokens"], 18);
-        assert_eq!(counters["output_tokens"], 16);
-        assert_eq!(counters["cache_creation_input_tokens"], 2);
-        assert_eq!(counters["cache_read_input_tokens"], 3);
+        // トークンは区分ごとの表で出る (DR-0014 §4 の正規レコード)。
+        assert_eq!(
+            counters["tokens"],
+            json!({
+                "input": 18,
+                "output": 16,
+                "input.cache_creation": 2,
+                "input.cache_read": 3,
+            }),
+            "{report}"
+        );
     }
 
     /// SSE でも集計され、流れるバイト列は変わらない。
@@ -2169,9 +2169,9 @@ credentials = ["a"]
 
         let counters =
             &report["days"].as_object().unwrap().values().next().unwrap()["credentials"]["-"]["m"];
-        assert_eq!(counters["input_tokens"], 30);
+        assert_eq!(counters["tokens"]["input"], 30);
         assert_eq!(
-            counters["output_tokens"], 40,
+            counters["tokens"]["output"], 40,
             "累積の最終値。message_start の 1 を足さない"
         );
     }
@@ -2244,24 +2244,5 @@ credentials = ["a"]
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-    }
-
-    /// content-type は大小を問わず引ける。
-    ///
-    /// upstream や手前のプロキシで綴りが変わる。取り違えると、SSE を覗く側が
-    /// 「知らない形」と判断して集計を丸ごと落とす。
-    #[test]
-    fn the_content_type_is_found_whatever_its_case() {
-        let headers = vec![("Content-Type".to_owned(), "text/event-stream".to_owned())];
-        assert_eq!(
-            header_value(&headers, "content-type"),
-            Some("text/event-stream")
-        );
-        assert_eq!(
-            header_value(&headers, "CONTENT-TYPE"),
-            Some("text/event-stream")
-        );
-        assert_eq!(header_value(&headers, "content-length"), None);
-        assert_eq!(header_value(&[], "content-type"), None);
     }
 }

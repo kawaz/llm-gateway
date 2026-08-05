@@ -5,28 +5,20 @@
 //! 対して、こちらは「いつ・どの認証情報で・どのモデルに・どれだけ使ったか」を
 //! 日ごとに積む。軸が直交しているので別の口にしてある。
 //!
+//! ## 何を読むかは provider、どう積むかは core
+//!
+//! 本文の形も、トークンの区分の呼び名も upstream の方言なので、読むのは
+//! provider の [`crate::provider::Metering`] が作る
+//! [`UsageObserver`] (DR-0014 §4)。ここが持つのは**正規化済みの集計レコード**
+//! — 日 × credential × モデルの集計キーと、[`TokenUsage`] の区分ごとの数。
+//! 区分は provider が増やせるので、知らない区分もそのまま積む。
+//!
 //! ## 本文を読むのに、中継は素通しのまま
 //!
-//! [`crate::relay`] は本文を解釈しない。SSE のバイト列がそのまま通り抜ける
-//! ことが中継の柱なので、そこに usage の解釈を混ぜない。代わりに本文を
+//! 転送はバイト列をそのまま流す。そこに usage の解釈を混ぜないため、本文を
 //! 覗くだけの変換層 ([`tap`]) を別に置き、受け取り口で中継の内側に挟む。
-//! 挟んでも流れるバイト列は 1 バイトも変わらない。
-//!
-//! ## 数え方
-//!
-//! usage の値は**累積 (その応答の現時点での総量)** で届く。実測 (2026-07-30、
-//! claude-haiku-4-5 / max_tokens 16 の streaming) では:
-//!
-//! - `message_start` の `/message/usage`: `input_tokens:18, output_tokens:1`
-//! - `message_delta` の `/usage`: `input_tokens:18, output_tokens:16`
-//!
-//! 差分ではないので、**足さずに後から来た値で置き換える**。足すと
-//! `1 + 16 = 17` になって実際より多く数える。`message_delta` は input と
-//! cache も再掲するため、イベント名で拾う先を決めず「usage が載っていたら、
-//! 載っているフィールドだけ上書き」で扱う。
-//!
-//! 読む単位は行ではなく**イベント**。同じイベントの連続する `data:` 行は改行で
-//! 繋いだものが 1 つの中身なので (SSE の仕様)、空行まで溜めてから解く。
+//! 挟んでも流れるバイト列は 1 バイトも変わらない。読む役を持たない応答
+//! (エラー / 読めない content-type) には層を重ねない。
 //!
 //! ## 落ちても失わない
 //!
@@ -45,6 +37,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::credential::time::local_date;
+use crate::metering::{TokenKind, TokenUsage, UsageObserver, round_usd};
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 認証情報を持たない経路 (relay 型) の記録先。
@@ -53,69 +46,80 @@ use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 /// 合わなくなるため。認証情報の名前と衝突しない語を使う。
 pub const NO_CREDENTIAL: &str = "-";
 
-/// 1 応答から拾ったトークン数。
-///
-/// どれも欠けうる。`count_tokens` のように usage を返さない応答もあるので、
-/// 「載っていなかった」と「0 だった」を [`Option`] で区別する。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Tokens {
-    pub input: Option<u64>,
-    pub output: Option<u64>,
-    pub cache_creation: Option<u64>,
-    pub cache_read: Option<u64>,
-}
-
-impl Tokens {
-    /// 何か 1 つでも拾えたか。1 つも無ければ記録しない。
-    fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// usage オブジェクトに載っている分を取り込む。
-    ///
-    /// 値は累積で届くので**上書き**する (足さない)。載っていないフィールドは
-    /// 前に拾った値を保つ — `message_delta` が一部しか載せない場合に備える。
-    fn absorb(&mut self, usage: &serde_json::Value) {
-        let take = |name: &str, slot: &mut Option<u64>| {
-            if let Some(v) = usage.get(name).and_then(serde_json::Value::as_u64) {
-                *slot = Some(v);
-            }
-        };
-        take("input_tokens", &mut self.input);
-        take("output_tokens", &mut self.output);
-        take("cache_creation_input_tokens", &mut self.cache_creation);
-        take("cache_read_input_tokens", &mut self.cache_read);
-    }
-}
-
 /// 積み上がった数。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+///
+/// ディスクにもこの形で落ちる。トークン数は区分ごとの map で持ち、`requests` と
+/// 並べて `{"requests": 1, "tokens": {"input": 18, ...}}` になる。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Counters {
     pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
+    /// 区分ごとのトークン数。provider 固有の区分もそのまま入る。
+    #[serde(flatten)]
+    pub tokens: TokenUsage,
 }
 
 impl Counters {
     /// 1 応答分を足す。
-    fn add(&mut self, t: &Tokens) {
+    fn add(&mut self, usage: &TokenUsage) {
         self.requests += 1;
-        self.input_tokens += t.input.unwrap_or(0);
-        self.output_tokens += t.output.unwrap_or(0);
-        self.cache_creation_input_tokens += t.cache_creation.unwrap_or(0);
-        self.cache_read_input_tokens += t.cache_read.unwrap_or(0);
+        self.tokens.add_assign(usage);
     }
 
-    /// 別の集計を足し込む。ファイルをまたいで合わせるときに使う。
-    fn merge(&mut self, other: &Self) {
+    /// 別の集計を足し込む。ファイルをまたいで合わせるときや、閲覧側が
+    /// 小計を作るときに使う。
+    pub fn merge(&mut self, other: &Self) {
         self.requests += other.requests;
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
-        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.tokens.add_assign(&other.tokens);
+    }
+}
+
+impl<'de> Deserialize<'de> for Counters {
+    /// 新旧どちらの形でも読む。
+    ///
+    /// 正規形へ移る前 (DR-0011 初版) のファイルは、Anthropic 形の 4 区分を
+    /// `requests` と平らに並べていた。読み込みでだけ受けて正規区分へ写す —
+    /// 書き戻すのは新しい形なので、1 度落とせばそのファイルは移行済みになる。
+    /// 読めなくすると、その日の記録が閲覧から消える (日ごとのファイルが正本で、
+    /// 作り直せない)。
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// ファイルに載りうる鍵を全部受ける器。欠けているものは既定値。
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Stored {
+            requests: u64,
+            tokens: BTreeMap<TokenKind, u64>,
+            input_tokens: u64,
+            output_tokens: u64,
+            cache_creation_input_tokens: u64,
+            cache_read_input_tokens: u64,
+        }
+
+        let stored = Stored::deserialize(deserializer)?;
+        let mut tokens = TokenUsage {
+            tokens: stored.tokens,
+        };
+        for (count, kind) in [
+            (stored.input_tokens, TokenKind::INPUT_NAME),
+            (stored.output_tokens, TokenKind::OUTPUT_NAME),
+            (
+                stored.cache_creation_input_tokens,
+                TokenKind::INPUT_CACHE_CREATION_NAME,
+            ),
+            (
+                stored.cache_read_input_tokens,
+                TokenKind::INPUT_CACHE_READ_NAME,
+            ),
+        ] {
+            // 0 は区分ごと置かない。旧形式は使っていない区分にも 0 を書いて
+            // いたので、そのまま写すと使っていない欄が並ぶ。
+            if count > 0 {
+                *tokens.tokens.entry(TokenKind::new(kind)).or_default() += count;
+            }
+        }
+        Ok(Self {
+            requests: stored.requests,
+            tokens,
+        })
     }
 }
 
@@ -183,8 +187,8 @@ impl Stats {
     /// `at` はイベントを観測した時刻。日付はこの時刻の地方時で決める。日を
     /// 跨いだら新しい日付の欄に積むだけで、落とす側が日ごとのファイルへ
     /// 振り分ける。
-    pub fn record(&self, at: i64, credential: Option<&str>, model: &str, tokens: &Tokens) {
-        if tokens.is_empty() {
+    pub fn record(&self, at: i64, credential: Option<&str>, model: &str, usage: &TokenUsage) {
+        if usage.is_empty() {
             return;
         }
         let date = local_date(at);
@@ -214,7 +218,7 @@ impl Stats {
             .or_default()
             .entry(model.to_owned())
             .or_default()
-            .add(tokens);
+            .add(usage);
         drop(counts);
 
         self.dirty
@@ -442,51 +446,29 @@ fn read_day(path: &Path) -> std::io::Result<ByCredential> {
     serde_json::from_str(&raw).map_err(std::io::Error::other)
 }
 
-/// SSE の 1 イベントをどこまで抱えるか。
-///
-/// 行の途中でチャンクが切れるので行が揃うまで持ち、さらに 1 イベントが複数の
-/// `data:` 行に割れうるのでイベントが閉じるまで持つ。**書きかけの行と、その
-/// イベントで溜めた分の合計**をこの上限で見る。壊れた相手 (改行も空行も返さない
-/// upstream) にメモリを食い潰されないため。実際の `message_start` は 1KB 前後
-/// なので、これでも桁が違う。
-const MAX_SSE_EVENT: usize = 256 * 1024;
-
-/// ストリームでない応答を、集計のためにどこまで抱えるか。
-///
-/// クライアントへはそのまま流れる。抱えるのは覗くための控えだけ。
-const MAX_JSON_BODY: usize = 4 * 1024 * 1024;
-
 /// 応答の本文を覗いて、使用量を集計に送る。
 ///
-/// 流れるバイト列は変えない。集計できない応答 (2xx でない / usage を載せない
-/// content-type) は包まずに返す — 覗く相手がいないのに層を重ねる意味がない。
+/// 流れるバイト列は変えない。読む役 (`observer`) を持たない応答は包まずに返す —
+/// 覗く相手がいないのに層を重ねる意味がない。役を作るのは応答を出した provider
+/// で、どの content-type を読めるかもそちらが決める (DR-0014 §4)。
 ///
 /// `at` は観測時刻。日付をこれで決めるので、応答が始まった時刻を渡す
 /// (生成が日を跨いで終わっても、始めた日に付ける)。
 pub fn tap(
-    body: crate::backend::anthropic::forward::BodyStream,
+    body: crate::egress::BodyStream,
+    observer: Option<Box<dyn UsageObserver>>,
     stats: std::sync::Arc<Stats>,
     at: i64,
-    status: u16,
-    content_type: Option<&str>,
     credential: Option<&str>,
     model: &str,
-) -> crate::backend::anthropic::forward::BodyStream {
-    // エラーの本文に usage は載らない。読んでも取れないものに層を重ねない。
-    if status / 100 != 2 {
-        return body;
-    }
-    let Some(mode) = Mode::of(content_type) else {
+) -> crate::egress::BodyStream {
+    let Some(observer) = observer else {
         return body;
     };
 
     futures_util::StreamExt::boxed(Tap {
         inner: body,
-        mode,
-        held: Vec::new(),
-        event: Vec::new(),
-        given_up: false,
-        tokens: Tokens::default(),
+        observer: Some(observer),
         stats,
         at,
         credential: credential.map(str::to_owned),
@@ -494,144 +476,17 @@ pub fn tap(
     })
 }
 
-/// 本文のどの読み方をするか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// SSE。`data:` の行に usage が現れる。
-    Sse,
-    /// ひとまとまりの JSON。終端で `/usage` を読む。
-    Json,
-}
-
-impl Mode {
-    /// この content-type から usage を読めるか。
-    ///
-    /// 分からない形は読まない。中身を推測して読みに行くと、画像やバイナリを
-    /// JSON として抱え込むことになる。
-    fn of(content_type: Option<&str>) -> Option<Self> {
-        // `application/json; charset=utf-8` のような付属物を落とす。
-        let base = content_type?.split(';').next()?.trim().to_ascii_lowercase();
-        match base.as_str() {
-            "text/event-stream" => Some(Self::Sse),
-            "application/json" => Some(Self::Json),
-            _ => None,
-        }
-    }
-}
-
 /// 覗きながら流すストリーム。
 ///
-/// チャンクは触らずそのまま下流へ渡し、控えの側だけを進める。
+/// チャンクは触らずそのまま下流へ渡し、控えの側 (observer) だけを進める。
 struct Tap {
-    inner: crate::backend::anthropic::forward::BodyStream,
-    mode: Mode,
-    /// 行の途中 (SSE) / 本文の全部 (JSON) を溜める控え。
-    held: Vec<u8>,
-    /// 今のイベントで溜めた `data:` の中身 (SSE)。複数行なら改行で繋いである。
-    event: Vec<u8>,
-    /// 上限を超えたので、この応答の集計をやめた。
-    given_up: bool,
-    tokens: Tokens,
+    inner: crate::egress::BodyStream,
+    /// 後始末で `finish` するために `Option` で持つ ([`Drop`] は値を動かせない)。
+    observer: Option<Box<dyn UsageObserver>>,
     stats: std::sync::Arc<Stats>,
     at: i64,
     credential: Option<String>,
     model: String,
-}
-
-impl Tap {
-    /// 通り過ぎたチャンクを控えに取り込む。
-    fn observe(&mut self, chunk: &[u8]) {
-        if self.given_up {
-            return;
-        }
-        match self.mode {
-            Mode::Sse => self.observe_sse(chunk),
-            Mode::Json => {
-                if self.held.len() + chunk.len() > MAX_JSON_BODY {
-                    self.give_up("応答が大きすぎます");
-                    return;
-                }
-                self.held.extend_from_slice(chunk);
-            }
-        }
-    }
-
-    /// SSE を行に切り、イベントが閉じるところで中身を読む。
-    ///
-    /// チャンクの境目は行の途中に落ちる。揃った行だけを処理し、残りは次の
-    /// チャンクまで持つ。
-    fn observe_sse(&mut self, chunk: &[u8]) {
-        for &b in chunk {
-            if b == b'\n' {
-                let line = std::mem::take(&mut self.held);
-                self.read_sse_line(&line);
-                continue;
-            }
-            // 書きかけの行と、このイベントで溜めた分の合計で見る。
-            if self.held.len() + self.event.len() >= MAX_SSE_EVENT {
-                self.give_up("SSE の 1 イベントが長すぎます");
-                return;
-            }
-            self.held.push(b);
-        }
-    }
-
-    /// SSE の 1 行を処理する。
-    ///
-    /// 空行はイベントの終わり。`data:` の行は中身を溜めるだけで、読むのは
-    /// イベントが閉じたとき — **1 つのイベントの data は複数行に割れてよく、
-    /// その場合は改行で繋いだものが 1 つの中身**になる (SSE の仕様)。行ごとに
-    /// 解こうとすると、そうやって割られた usage を黙って取りこぼす。
-    fn read_sse_line(&mut self, line: &[u8]) {
-        // 行末の `\r` は終端の一部 (CRLF で区切る upstream がある)。
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-
-        if line.is_empty() {
-            self.finish_event();
-            return;
-        }
-        let Some(payload) = line.strip_prefix(b"data:") else {
-            // `event:` / `id:` / 注釈行は読まない。usage を載せるのは data だけ。
-            return;
-        };
-        // コロンの直後の空白 1 つは区切りの一部で、中身には入らない。
-        let payload = payload.strip_prefix(b" ").unwrap_or(payload);
-
-        if !self.event.is_empty() {
-            self.event.push(b'\n');
-        }
-        self.event.extend_from_slice(payload);
-    }
-
-    /// イベントが閉じた。溜めた中身から usage を読む。
-    ///
-    /// JSON として解くのは usage が載っているものだけ。イベントは 1 応答で
-    /// 何十個も流れるので、全部解くと中継の脇で無駄に働くことになる。
-    fn finish_event(&mut self) {
-        let event = std::mem::take(&mut self.event);
-        if !contains(&event, b"\"usage\"") {
-            return;
-        }
-        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&event) else {
-            return;
-        };
-        // `message_start` は `/message/usage`、`message_delta` は `/usage` に
-        // 載せる。イベント名で決め打ちせず、在る方を読む。
-        for pointer in ["/message/usage", "/usage"] {
-            if let Some(usage) = parsed.pointer(pointer) {
-                self.tokens.absorb(usage);
-            }
-        }
-    }
-
-    /// 上限を超えた。この応答の集計は捨てて、素通しに徹する。
-    fn give_up(&mut self, reason: &str) {
-        self.given_up = true;
-        self.held = Vec::new();
-        self.event = Vec::new();
-        self.tokens = Tokens::default();
-        tracing::warn!(reason, model = %self.model, "使用量の集計をやめます");
-    }
 }
 
 impl futures_util::Stream for Tap {
@@ -647,7 +502,9 @@ impl futures_util::Stream for Tap {
         let this = self.get_mut();
         match futures_util::Stream::poll_next(this.inner.as_mut(), cx) {
             Poll::Ready(Some(Ok(chunk))) => {
-                this.observe(&chunk);
+                if let Some(observer) = this.observer.as_mut() {
+                    observer.observe(&chunk);
+                }
                 Poll::Ready(Some(Ok(chunk)))
             }
             other => other,
@@ -664,50 +521,22 @@ impl Drop for Tap {
     /// input は分かる) — 中断した分を丸ごと捨てると、実際に消費した入力が
     /// 記録から消える。
     fn drop(&mut self) {
-        if self.given_up {
+        let Some(observer) = self.observer.take() else {
             return;
-        }
-        match self.mode {
-            // ストリームでない応答は、ここで初めて全体が揃う。
-            Mode::Json => {
-                if !self.held.is_empty()
-                    && let Ok(body) = serde_json::from_slice::<serde_json::Value>(&self.held)
-                    && let Some(usage) = body.pointer("/usage")
-                {
-                    self.tokens.absorb(usage);
-                }
-            }
-            // 終端が空行で閉じられていなければ、最後のイベントが溜まったまま
-            // 残る。書きかけの行も最後の 1 行として扱う。
-            Mode::Sse => {
-                let last = std::mem::take(&mut self.held);
-                if !last.is_empty() {
-                    self.read_sse_line(&last);
-                }
-                self.finish_event();
-            }
-        }
-        self.stats.record(
-            self.at,
-            self.credential.as_deref(),
-            &self.model,
-            &self.tokens,
-        );
+        };
+        let Some(usage) = observer.finish() else {
+            return;
+        };
+        self.stats
+            .record(self.at, self.credential.as_deref(), &self.model, &usage);
     }
-}
-
-/// `needle` を含むか。
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 /// 閲覧に出す 1 行。トークン数に、その分の USD を添える。
 ///
 /// 保存する形 ([`Counters`]) と分けているのは、**ファイルはトークン数だけ**を
 /// 持つため (DR-0011)。単価は改定されるので、閲覧のたびに今の表で計算する。
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Entry {
     #[serde(flatten)]
     pub counters: Counters,
@@ -745,6 +574,9 @@ pub struct Report {
 ///
 /// 合計は「単価が分かる行の和」。分からない行を 0 として混ぜると、
 /// 出ている数字が全体の額に見えてしまう。1 行も出せない日は合計も出さない。
+///
+/// 掛けるのは**単価表に載っている区分だけ**。provider が残した内訳や親区分の
+/// 部分集合は、単価を持たないので合計に重ならない。
 fn price(days: ByDate) -> (BTreeMap<String, Day>, Option<f64>) {
     let mut priced = BTreeMap::new();
     let mut grand: Option<f64> = None;
@@ -754,14 +586,8 @@ fn price(days: ByDate) -> (BTreeMap<String, Day>, Option<f64>) {
         for (credential, models) in creds {
             let mut entries = EntriesByModel::new();
             for (model, counters) in models {
-                let usd = crate::pricing::rates_for(&model).map(|rates| {
-                    rates.cost(
-                        counters.input_tokens,
-                        counters.output_tokens,
-                        counters.cache_creation_input_tokens,
-                        counters.cache_read_input_tokens,
-                    )
-                });
+                let usd =
+                    crate::pricing::for_model(&model).map(|pricing| pricing.cost(&counters.tokens));
                 if let Some(usd) = usd {
                     day.total_usd = Some(day.total_usd.unwrap_or(0.0) + usd);
                 }
@@ -769,14 +595,14 @@ fn price(days: ByDate) -> (BTreeMap<String, Day>, Option<f64>) {
             }
             day.credentials.insert(credential, entries);
         }
-        day.total_usd = day.total_usd.map(crate::pricing::round_usd);
+        day.total_usd = day.total_usd.map(round_usd);
         if let Some(total) = day.total_usd {
             grand = Some(grand.unwrap_or(0.0) + total);
         }
         priced.insert(date, day);
     }
 
-    (priced, grand.map(crate::pricing::round_usd))
+    (priced, grand.map(round_usd))
 }
 
 #[cfg(test)]
@@ -786,12 +612,24 @@ mod tests {
     /// 2026-07-29T12:00:00Z
     const NOW: i64 = 1_785_326_400;
 
-    fn tokens(input: u64, output: u64) -> Tokens {
-        Tokens {
-            input: Some(input),
-            output: Some(output),
-            ..Tokens::default()
-        }
+    fn tokens(input: u64, output: u64) -> TokenUsage {
+        let mut usage = TokenUsage::default();
+        usage.set(TokenKind::input(), input);
+        usage.set(TokenKind::output(), output);
+        usage
+    }
+
+    /// 積んだ区分の数。積んでいなければ 0。
+    fn count(counters: &Counters, kind: TokenKind) -> u64 {
+        counters.tokens.get(&kind).unwrap_or(0)
+    }
+
+    fn input_of(counters: &Counters) -> u64 {
+        count(counters, TokenKind::input())
+    }
+
+    fn output_of(counters: &Counters) -> u64 {
+        count(counters, TokenKind::output())
     }
 
     fn stats(dir: &Path) -> Stats {
@@ -811,8 +649,28 @@ mod tests {
         let day = counts.values().next().expect("1 日分");
         let c = &day["a"]["m"];
         assert_eq!(c.requests, 2, "本数も数える");
-        assert_eq!(c.input_tokens, 13);
-        assert_eq!(c.output_tokens, 6);
+        assert_eq!(input_of(c), 13);
+        assert_eq!(output_of(c), 6);
+    }
+
+    /// provider 固有の区分も、標準区分と同じように積まれる。
+    ///
+    /// 知らない区分を other へ潰すと、その provider の内訳が永久に失われる。
+    #[test]
+    fn a_provider_specific_kind_is_kept_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        let mut usage = tokens(10, 5);
+        usage.set(TokenKind::output_reasoning(), 4);
+        usage.set("provider.batch_prediction", 3);
+        s.record(NOW, Some("a"), "m", &usage);
+        s.record(NOW, Some("a"), "m", &usage);
+
+        let counts = s.in_memory();
+        let c = &counts.values().next().unwrap()["a"]["m"];
+        assert_eq!(count(c, TokenKind::output_reasoning()), 8);
+        assert_eq!(count(c, TokenKind::new("provider.batch_prediction")), 6);
     }
 
     // ---------- コスト換算 (DR-0011 の「表示側で足す」) ----------
@@ -832,7 +690,7 @@ mod tests {
         assert_eq!(models["claude-haiku-4-5"].usd, Some(1.0));
         assert_eq!(models["who-knows"].usd, None, "推測した額を出さない");
         // トークン数はどちらも残る。
-        assert_eq!(models["who-knows"].counters.input_tokens, 1_000_000);
+        assert_eq!(input_of(&models["who-knows"].counters), 1_000_000);
     }
 
     /// 日の合計も全体の合計も、**単価が分かる行だけ**の和。
@@ -866,27 +724,44 @@ mod tests {
         assert_eq!(report.total_usd, None);
     }
 
-    /// 4 つのトークン種別がそれぞれ別の単価で効く。
+    /// 単価表にある区分がそれぞれ別の単価で効く。
     #[test]
     fn each_token_kind_is_priced_separately() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
         // opus-5: input $5 / output $25 / cache write $6.25 / cache read $0.5。
-        s.record(
-            NOW,
-            Some("a"),
-            "claude-opus-5",
-            &Tokens {
-                input: Some(1_000_000),
-                output: Some(1_000_000),
-                cache_creation: Some(1_000_000),
-                cache_read: Some(1_000_000),
-            },
-        );
+        let mut usage = tokens(1_000_000, 1_000_000);
+        usage.set(TokenKind::input_cache_creation(), 1_000_000);
+        usage.set(TokenKind::input_cache_read(), 1_000_000);
+        s.record(NOW, Some("a"), "claude-opus-5", &usage);
 
         let day = &s.report(7, NOW).days[&local_date(NOW)];
         assert_eq!(day.credentials["a"]["claude-opus-5"].usd, Some(36.75));
+    }
+
+    /// 単価を持たない内訳は、残るが課金されない。
+    ///
+    /// provider が親区分の部分集合 (キャッシュの内訳など) を足しても、単価表に
+    /// 無い限り合計は動かない。ここが崩れると二重課金になる。
+    #[test]
+    fn an_unpriced_detail_is_kept_but_not_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        let mut usage = TokenUsage::default();
+        usage.set(TokenKind::input(), 1_000_000);
+        // input の内訳 (単価表に無い)。
+        usage.set("input.ephemeral_1h", 900_000);
+        s.record(NOW, Some("a"), "claude-opus-5", &usage);
+
+        let entry = &s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["claude-opus-5"];
+        assert_eq!(entry.usd, Some(5.0), "input の分だけ。内訳を上乗せしない");
+        assert_eq!(
+            count(&entry.counters, TokenKind::new("input.ephemeral_1h")),
+            900_000,
+            "課金しない内訳も観測値としては残る"
+        );
     }
 
     /// JSON では、値付けできない行に `usd` の鍵自体が出ない。
@@ -904,8 +779,9 @@ mod tests {
         let models = &json["days"][local_date(NOW)]["credentials"]["a"];
         assert!(models["claude-opus-5"].get("usd").is_some());
         assert!(models["who-knows"].get("usd").is_none(), "{models}");
-        // トークン数の鍵は今までどおり平らに並ぶ。
-        assert_eq!(models["who-knows"]["input_tokens"], 10);
+        // トークン数は区分ごとの表として出る。
+        assert_eq!(models["who-knows"]["requests"], 1);
+        assert_eq!(models["who-knows"]["tokens"]["input"], 10);
     }
 
     /// 認証情報とモデルは別々の行になる。
@@ -921,8 +797,8 @@ mod tests {
         let counts = s.in_memory();
         let day = counts.values().next().unwrap();
         assert_eq!(day["a"].len(), 2, "同じ認証情報の 2 モデル");
-        assert_eq!(day["a"]["opus"].input_tokens, 2);
-        assert_eq!(day["b"]["haiku"].input_tokens, 4);
+        assert_eq!(input_of(&day["a"]["opus"]), 2);
+        assert_eq!(input_of(&day["b"]["haiku"]), 4);
     }
 
     /// 認証情報を持たない経路も落とさず記録する。
@@ -935,12 +811,12 @@ mod tests {
 
         let counts = s.in_memory();
         assert_eq!(
-            counts.values().next().unwrap()[NO_CREDENTIAL]["m"].input_tokens,
+            input_of(&counts.values().next().unwrap()[NO_CREDENTIAL]["m"]),
             7
         );
     }
 
-    /// usage が 1 つも載っていなければ記録しない。
+    /// 区分が 1 つも無ければ記録しない。
     ///
     /// `count_tokens` のような応答で本数だけ増えると、使っていない日が
     /// 「使った日」に見える。
@@ -949,7 +825,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "m", &Tokens::default());
+        s.record(NOW, Some("a"), "m", &TokenUsage::default());
 
         assert!(s.in_memory().is_empty());
     }
@@ -977,7 +853,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let before = {
             let s = stats(dir.path());
-            s.record(NOW, Some("a"), "m", &tokens(10, 5));
+            let mut usage = tokens(10, 5);
+            usage.set("provider.batch_prediction", 2);
+            s.record(NOW, Some("a"), "m", &usage);
             s.record(NOW, None, "m", &tokens(1, 2));
             s.flush().unwrap();
             s.in_memory()
@@ -991,7 +869,29 @@ mod tests {
             s.in_memory()
         };
 
-        assert_eq!(after, before, "落とした分がそのまま戻る");
+        assert_eq!(after, before, "落とした分がそのまま戻る (未知の区分も)");
+    }
+
+    /// ディスクに落ちる形は `requests` + 区分ごとの `tokens`。
+    #[test]
+    fn the_saved_shape_is_the_normalized_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+        let mut usage = tokens(18, 16);
+        usage.set(TokenKind::input_cache_read(), 3);
+        s.record(NOW, Some("a"), "m", &usage);
+        s.flush().unwrap();
+
+        let raw = std::fs::read_to_string(s.path_of(&local_date(NOW))).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            saved["a"]["m"],
+            serde_json::json!({
+                "requests": 1,
+                "tokens": {"input": 18, "output": 16, "input.cache_read": 3},
+            }),
+            "{raw}"
+        );
     }
 
     /// 読み戻した分に足し続けられる。
@@ -1017,7 +917,90 @@ mod tests {
         let counts = s.in_memory();
         let c = &counts.values().next().unwrap()["a"]["m"];
         assert_eq!(c.requests, 2, "前回の 1 本に足す");
-        assert_eq!(c.input_tokens, 11);
+        assert_eq!(input_of(c), 11);
+    }
+
+    // ---------- 旧形式の読み込み (DR-0011 初版の 4 フィールド) ----------
+
+    /// 旧形式で書かれた日次ファイルは、正規区分へ写して読む。
+    #[test]
+    fn a_legacy_day_file_is_read_into_normalized_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(format!("{}.8402.json", local_date(NOW))),
+            r#"{"a":{"claude-opus-5":{"requests":2,"input_tokens":18,"output_tokens":16,
+                "cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#,
+        )
+        .unwrap();
+
+        let s = stats(dir.path());
+        s.restore(NOW);
+
+        let counts = s.in_memory();
+        let c = &counts[&local_date(NOW)]["a"]["claude-opus-5"];
+        assert_eq!(c.requests, 2);
+        assert_eq!(input_of(c), 18);
+        assert_eq!(output_of(c), 16);
+        assert_eq!(count(c, TokenKind::input_cache_creation()), 2);
+        assert_eq!(count(c, TokenKind::input_cache_read()), 3);
+    }
+
+    /// 旧形式のファイルに積み足しても、前からあった分は失われない。
+    ///
+    /// 読み戻して積み、落とすと新しい形で書き直される。
+    #[test]
+    fn a_legacy_day_file_can_be_added_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.8402.json", local_date(NOW)));
+        std::fs::write(
+            &path,
+            r#"{"a":{"m":{"requests":1,"input_tokens":10,"output_tokens":5,
+                "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        )
+        .unwrap();
+
+        let s = stats(dir.path());
+        s.restore(NOW);
+        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.flush().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["a"]["m"],
+            serde_json::json!({"requests": 2, "tokens": {"input": 11, "output": 6}}),
+            "使っていなかった区分は 0 のまま並べ直さない"
+        );
+    }
+
+    /// 旧形式由来と新形式由来で、同じトークン数なら同じ USD になる。
+    ///
+    /// 移行の前後で請求額の見え方が変わらないことが、区分を写す規則の
+    /// 正しさの担保になる。
+    #[test]
+    fn legacy_and_normalized_records_cost_the_same() {
+        let dir = tempfile::tempdir().unwrap();
+        // 別 writer のファイルとして旧形式を置く (自分のファイルはメモリが優先)。
+        std::fs::write(
+            dir.path().join(format!("{}.8401.json", local_date(NOW))),
+            r#"{"legacy":{"claude-opus-5":{"requests":1,"input_tokens":1000000,
+                "output_tokens":1000000,"cache_creation_input_tokens":1000000,
+                "cache_read_input_tokens":1000000}}}"#,
+        )
+        .unwrap();
+
+        let s = stats(dir.path());
+        let mut usage = tokens(1_000_000, 1_000_000);
+        usage.set(TokenKind::input_cache_creation(), 1_000_000);
+        usage.set(TokenKind::input_cache_read(), 1_000_000);
+        s.record(NOW, Some("normalized"), "claude-opus-5", &usage);
+
+        let day = &s.report(7, NOW).days[&local_date(NOW)];
+        let legacy = day.credentials["legacy"]["claude-opus-5"].usd;
+        let normalized = day.credentials["normalized"]["claude-opus-5"].usd;
+        assert_eq!(legacy, Some(36.75));
+        assert_eq!(legacy, normalized, "旧形式でも換算は変わらない");
+        assert_eq!(day.total_usd, Some(73.5), "合計は 2 行の和");
     }
 
     /// 日ごとに別のファイルへ落ちる。
@@ -1078,8 +1061,8 @@ mod tests {
         let report = s.report(7, NOW);
         let c = &report.days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "両方の writer を数える");
-        assert_eq!(c.input_tokens, 101);
-        assert_eq!(c.output_tokens, 52);
+        assert_eq!(input_of(c), 101);
+        assert_eq!(output_of(c), 52);
     }
 
     /// 落とした後でも二重に数えない。
@@ -1092,9 +1075,9 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(10, 5));
         s.flush().unwrap();
 
-        let c = s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
+        let c = &s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "1 本のまま");
-        assert_eq!(c.input_tokens, 10);
+        assert_eq!(input_of(c), 10);
     }
 
     /// まだ落としていない分も閲覧に出る。
@@ -1104,8 +1087,8 @@ mod tests {
         let s = stats(dir.path());
         s.record(NOW, Some("a"), "m", &tokens(3, 4));
 
-        let c = s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
-        assert_eq!(c.output_tokens, 4, "保存を待たずに見える");
+        let c = &s.report(7, NOW).days[&local_date(NOW)].credentials["a"]["m"].counters;
+        assert_eq!(output_of(c), 4, "保存を待たずに見える");
     }
 
     /// `days` で直近だけに絞れる。
@@ -1203,58 +1186,6 @@ mod tests {
         assert!(!s.in_memory().is_empty());
     }
 
-    /// usage は累積で届くので、後から来た値で置き換える (実測 2026-07-30)。
-    #[test]
-    fn a_cumulative_usage_replaces_the_earlier_value() {
-        let mut t = Tokens::default();
-        // message_start
-        t.absorb(&serde_json::json!({
-            "input_tokens": 18,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "output_tokens": 1,
-        }));
-        // message_delta (累積の最終値)
-        t.absorb(&serde_json::json!({
-            "input_tokens": 18,
-            "output_tokens": 16,
-        }));
-
-        assert_eq!(t.output, Some(16), "1 + 16 = 17 にしない");
-        assert_eq!(t.input, Some(18), "同じ値を二重に足さない");
-    }
-
-    /// 後の usage に載っていないフィールドは、前に拾った値を保つ。
-    #[test]
-    fn fields_absent_from_a_later_usage_are_kept() {
-        let mut t = Tokens::default();
-        t.absorb(&serde_json::json!({
-            "input_tokens": 20,
-            "cache_read_input_tokens": 900,
-        }));
-        t.absorb(&serde_json::json!({"output_tokens": 7}));
-
-        assert_eq!(t.input, Some(20));
-        assert_eq!(t.cache_read, Some(900));
-        assert_eq!(t.output, Some(7));
-    }
-
-    /// 数の付いていないフィールドは拾わない。
-    #[test]
-    fn non_numeric_usage_values_are_skipped() {
-        let mut t = Tokens::default();
-        t.absorb(&serde_json::json!({
-            "input_tokens": "many",
-            "output_tokens": null,
-            "cache_read_input_tokens": 5,
-        }));
-
-        assert_eq!(t.input, None);
-        assert_eq!(t.output, None);
-        assert_eq!(t.cache_read, Some(5));
-        assert!(!t.is_empty(), "読めた分があれば記録する");
-    }
-
     // ---------- 保存の範囲と直列化 (レビュー指摘 A / B) ----------
 
     /// 読み戻しは直近だけでも、**過去日は閲覧に出る**。
@@ -1283,7 +1214,7 @@ mod tests {
         let report = s.report(0, NOW);
         let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "過去日はファイルから読む");
-        assert_eq!(c.input_tokens, 100);
+        assert_eq!(input_of(c), 100);
     }
 
     /// 読み戻しの範囲外の日へ積んでも、その日のファイルを消さない。
@@ -1307,9 +1238,10 @@ mod tests {
         s.flush().unwrap();
 
         let s = stats(dir.path());
-        let c = s.report(0, NOW).days[&local_date(old)].credentials["a"]["m"].counters;
+        let report = s.report(0, NOW);
+        let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "前からあった 1 本に足す");
-        assert_eq!(c.input_tokens, 101, "上書きで消さない");
+        assert_eq!(input_of(c), 101, "上書きで消さない");
     }
 
     /// 変わった日だけを書き直す。
@@ -1439,64 +1371,56 @@ mod tests {
     }
 
     // ---------- tap ----------
+    //
+    // 本文の読み方は provider の [`UsageObserver`] が持つので、ここで確かめるのは
+    // 「渡した役に通し、その結果を 1 度だけ記録する」ことと「流れるバイト列を
+    // 変えない」こと。方言ごとの読み取りは preset 側の試験にある。
 
-    use crate::backend::anthropic::forward::BodyStream;
+    use crate::egress::BodyStream;
     use futures_util::StreamExt as _;
     use std::sync::Arc;
 
-    /// 実機で観測した SSE (2026-07-30、claude-haiku-4-5 / max_tokens 16)。
-    ///
-    /// 長い行は畳んであるが、usage の値と入れ物の形はそのまま。
-    const REAL_SSE: &str = concat!(
-        "event: message_start\n",
-        r#"data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","#,
-        r#""id":"msg_x","type":"message","role":"assistant","content":[],"usage":{"#,
-        r#""input_tokens":18,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"#,
-        "\"output_tokens\":1,\"service_tier\":\"standard\"}}   }\n",
-        "\n",
-        "event: content_block_start\n",
-        "data: {\"type\":\"content_block_start\",\"index\":0}\n",
-        "\n",
-        "event: ping\n",
-        "data: {\"type\": \"ping\"}\n",
-        "\n",
-        "event: content_block_delta\n",
-        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one"}}"#,
-        "\n\n",
-        "event: message_delta\n",
-        r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"#,
-        r#""input_tokens":18,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"#,
-        "\"output_tokens\":16}        }\n",
-        "\n",
-        "event: message_stop\n",
-        "data: {\"type\":\"message_stop\"   }\n\n",
-    );
+    /// 試験用の観測役。中身を解釈せず、通ったバイト数を input として数える。
+    struct ByteCounter {
+        seen: u64,
+    }
+
+    impl UsageObserver for ByteCounter {
+        fn observe(&mut self, chunk: &[u8]) {
+            self.seen += chunk.len() as u64;
+        }
+
+        fn finish(self: Box<Self>) -> Option<TokenUsage> {
+            (self.seen > 0).then(|| {
+                let mut usage = TokenUsage::default();
+                usage.set(TokenKind::input(), self.seen);
+                usage
+            })
+        }
+    }
+
+    fn counter() -> Option<Box<dyn UsageObserver>> {
+        Some(Box::new(ByteCounter { seen: 0 }))
+    }
 
     fn stream_of(chunks: Vec<Vec<u8>>) -> BodyStream {
         futures_util::stream::iter(chunks.into_iter().map(|c| Ok(bytes::Bytes::from(c)))).boxed()
     }
 
-    /// 1 文字ずつのチャンクに割る。行の途中で必ず切れる形。
-    fn byte_by_byte(text: &str) -> Vec<Vec<u8>> {
-        text.bytes().map(|b| vec![b]).collect()
-    }
-
     /// tap を通して流し切り、集計に残ったものを返す。
     async fn drain(
         chunks: Vec<Vec<u8>>,
-        status: u16,
-        content_type: Option<&str>,
+        observer: Option<Box<dyn UsageObserver>>,
         dir: &Path,
-    ) -> (String, ByDate) {
+    ) -> (Vec<u8>, ByDate) {
         let s = Arc::new(stats(dir));
         let mut out = Vec::new();
         {
             let mut tapped = tap(
                 stream_of(chunks),
+                observer,
                 Arc::clone(&s),
                 NOW,
-                status,
-                content_type,
                 Some("a"),
                 "m",
             );
@@ -1504,265 +1428,90 @@ mod tests {
                 out.extend_from_slice(&chunk.unwrap());
             }
         }
-        (String::from_utf8(out).unwrap(), s.in_memory())
+        (out, s.in_memory())
     }
 
     fn only_entry(counts: &ByDate) -> Counters {
-        counts.values().next().expect("1 日分")["a"]["m"]
+        counts.values().next().expect("1 日分")["a"]["m"].clone()
     }
 
-    /// 実機の SSE から usage を拾う。累積の最終値が入る。
+    /// 通ったバイト列を変えずに、観測役へ渡す。
     #[tokio::test]
-    async fn reads_usage_from_a_real_sse_stream() {
+    async fn the_body_passes_through_untouched_while_being_observed() {
         let dir = tempfile::tempdir().unwrap();
-        let (out, counts) = drain(
-            vec![REAL_SSE.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
+        let body = b"hello, upstream".to_vec();
+        // 1 バイトずつに割って、境目の入りうる位置を一度に試す。
+        let chunks: Vec<Vec<u8>> = body.iter().map(|b| vec![*b]).collect();
 
-        assert_eq!(out, REAL_SSE, "1 バイトも変えない");
+        let (out, counts) = drain(chunks, counter(), dir.path()).await;
+
+        assert_eq!(out, body, "1 バイトも変えない");
         let c = only_entry(&counts);
         assert_eq!(c.requests, 1);
-        assert_eq!(c.input_tokens, 18);
-        assert_eq!(c.output_tokens, 16, "message_start の 1 を足さない");
+        assert_eq!(input_of(&c), body.len() as u64, "全チャンクが役へ届く");
     }
 
-    /// チャンクが行の途中で切れても取りこぼさない。
-    ///
-    /// 1 バイトずつ流すのは、境目の入りうる全ての位置を一度に試すため。
+    /// 読む役が無ければ包まない。素通しで、記録も残らない。
     #[tokio::test]
-    async fn a_line_split_across_chunks_is_still_read() {
+    async fn a_response_without_an_observer_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let (out, counts) = drain(
-            byte_by_byte(REAL_SSE),
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
+        let body = b"{\"usage\":{\"input_tokens\":99}}".to_vec();
 
-        assert_eq!(out, REAL_SSE, "1 バイトも変えない");
-        let c = only_entry(&counts);
-        assert_eq!(c.input_tokens, 18);
-        assert_eq!(c.output_tokens, 16);
-    }
-
-    /// content-type に charset が付いていても読む。
-    #[tokio::test]
-    async fn a_content_type_with_parameters_is_understood() {
-        let dir = tempfile::tempdir().unwrap();
-        let (_, counts) = drain(
-            vec![REAL_SSE.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream; charset=utf-8"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(only_entry(&counts).output_tokens, 16);
-    }
-
-    /// ストリームでない応答は本文の `/usage` を読む。
-    #[tokio::test]
-    async fn reads_usage_from_a_plain_json_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"type":"message","content":[{"type":"text","text":"ok"}],
-            "usage":{"input_tokens":11,"output_tokens":22,
-            "cache_creation_input_tokens":3,"cache_read_input_tokens":4}}"#;
-
-        let (out, counts) = drain(
-            byte_by_byte(body),
-            200,
-            Some("application/json"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, body);
-        let c = only_entry(&counts);
-        assert_eq!(c.input_tokens, 11);
-        assert_eq!(c.output_tokens, 22);
-        assert_eq!(c.cache_creation_input_tokens, 3);
-        assert_eq!(c.cache_read_input_tokens, 4);
-    }
-
-    /// usage を載せない応答は記録しない (`count_tokens` がこれ)。
-    #[tokio::test]
-    async fn a_response_without_usage_leaves_no_trace() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"input_tokens":42}"#;
-
-        let (out, counts) = drain(
-            vec![body.as_bytes().to_vec()],
-            200,
-            Some("application/json"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, body, "本文はそのまま返る");
-        assert!(counts.is_empty(), "本数も増やさない: {counts:?}");
-    }
-
-    /// 2xx でない応答は集計しない。
-    #[tokio::test]
-    async fn an_error_response_is_not_counted() {
-        let dir = tempfile::tempdir().unwrap();
-        // 万一読まれたら気づけるよう、usage の形を持たせておく。
-        let body = r#"{"type":"error","usage":{"input_tokens":99}}"#;
-
-        let (out, counts) = drain(
-            vec![body.as_bytes().to_vec()],
-            429,
-            Some("application/json"),
-            dir.path(),
-        )
-        .await;
+        let (out, counts) = drain(vec![body.clone()], None, dir.path()).await;
 
         assert_eq!(out, body);
         assert!(counts.is_empty(), "{counts:?}");
     }
 
-    /// 知らない content-type は覗かない。
+    /// 観測役が「読めなかった」と言えば記録しない。
+    ///
+    /// `count_tokens` のような usage を載せない応答がこれ。本数だけ増えると、
+    /// 使っていない日が「使った日」に見える。
     #[tokio::test]
-    async fn an_unknown_content_type_passes_through_untouched() {
+    async fn nothing_is_recorded_when_the_observer_found_no_usage() {
         let dir = tempfile::tempdir().unwrap();
-        let body = r#"{"usage":{"input_tokens":99}}"#;
+        // 1 バイトも流れないので ByteCounter は None を返す。
+        let (out, counts) = drain(vec![], counter(), dir.path()).await;
 
-        for content_type in [None, Some("text/plain"), Some("application/octet-stream")] {
-            let (out, counts) = drain(
-                vec![body.as_bytes().to_vec()],
-                200,
-                content_type,
-                dir.path(),
-            )
-            .await;
-            assert_eq!(out, body, "{content_type:?}");
-            assert!(counts.is_empty(), "{content_type:?}: {counts:?}");
-        }
+        assert!(out.is_empty());
+        assert!(counts.is_empty(), "{counts:?}");
     }
 
     /// 途中で捨てられても、そこまでに読めた分は残る。
     ///
-    /// クライアントが去った場合がこれ。`message_start` まで届いていれば入力の
-    /// 消費は確定しているので、記録から落とすと実際に使った分が消える。
+    /// クライアントが去った場合がこれ。届いた分の消費は確定しているので、
+    /// 記録から落とすと実際に使った分が消える。
     #[tokio::test]
     async fn an_aborted_stream_still_records_what_was_read() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(stats(dir.path()));
-
-        // message_start まで流して、残りを読まずに捨てる。
-        let head = REAL_SSE.split("event: content_block_start").next().unwrap();
         {
             let mut tapped = tap(
-                stream_of(vec![head.as_bytes().to_vec()]),
+                stream_of(vec![b"12345".to_vec(), b"67890".to_vec()]),
+                counter(),
                 Arc::clone(&s),
                 NOW,
-                200,
-                Some("text/event-stream"),
                 Some("a"),
                 "m",
             );
+            // 1 チャンクだけ読んで捨てる。
             let _ = tapped.next().await;
         }
 
-        let counts = s.in_memory();
-        let c = only_entry(&counts);
+        let c = only_entry(&s.in_memory());
         assert_eq!(c.requests, 1, "中断も 1 本として数える");
-        assert_eq!(c.input_tokens, 18, "message_start で分かった入力は残る");
-        assert_eq!(c.output_tokens, 1, "そこまでに見えた出力だけ");
+        assert_eq!(input_of(&c), 5, "そこまでに見えた分だけ");
     }
 
-    /// 1 度しか数えない。
-    ///
-    /// 流し切った後に捨てても、終端と Drop で二重に記録しない。
+    /// 流し切っても記録は 1 度だけ。
     #[tokio::test]
     async fn a_completed_stream_is_recorded_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, counts) = drain(
-            vec![REAL_SSE.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
+        let (_, counts) = drain(vec![b"1234".to_vec()], counter(), dir.path()).await;
 
-        assert_eq!(only_entry(&counts).requests, 1);
-        assert_eq!(only_entry(&counts).input_tokens, 18, "2 倍になっていない");
-    }
-
-    /// 改行の来ない長い行は、抱え込まずに諦める。
-    #[tokio::test]
-    async fn an_endless_line_is_given_up_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let flood = vec![b'x'; MAX_SSE_EVENT + 1024];
-
-        let (out, counts) = drain(
-            vec![flood.clone()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out.len(), flood.len(), "本文は最後まで流す");
-        assert!(counts.is_empty(), "その応答の集計は捨てる: {counts:?}");
-    }
-
-    /// 諦めた後も本文は流れ続ける。
-    ///
-    /// 集計を捨てることと、中継を止めることは別。
-    #[tokio::test]
-    async fn giving_up_does_not_stop_the_relay() {
-        let dir = tempfile::tempdir().unwrap();
-        let flood = vec![b'x'; MAX_SSE_EVENT + 1];
-        let tail = REAL_SSE.as_bytes().to_vec();
-
-        let (out, counts) = drain(
-            vec![flood.clone(), tail.clone()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out.len(), flood.len() + tail.len(), "後続も流れる");
-        assert!(counts.is_empty(), "諦めたまま拾い直さない: {counts:?}");
-    }
-
-    /// 大きすぎる JSON も抱え込まない。
-    #[tokio::test]
-    async fn an_oversized_json_body_is_given_up_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let chunk = vec![b'x'; 1024 * 1024];
-        let chunks: Vec<Vec<u8>> = (0..5).map(|_| chunk.clone()).collect();
-        let total: usize = chunks.iter().map(Vec::len).sum();
-
-        let (out, counts) = drain(chunks, 200, Some("application/json"), dir.path()).await;
-
-        assert_eq!(out.len(), total, "本文は最後まで流す");
-        assert!(counts.is_empty(), "{counts:?}");
-    }
-
-    /// 壊れた JSON でも中継は無事。
-    #[tokio::test]
-    async fn a_broken_body_does_not_break_the_relay() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = "{ not json";
-
-        let (out, counts) = drain(
-            vec![body.as_bytes().to_vec()],
-            200,
-            Some("application/json"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, body);
-        assert!(counts.is_empty(), "読めなければ記録しない");
+        let c = only_entry(&counts);
+        assert_eq!(c.requests, 1);
+        assert_eq!(input_of(&c), 4, "2 倍になっていない");
     }
 
     /// upstream が途切れても、そこまでの分は残り、誤りは下流へ伝わる。
@@ -1770,25 +1519,16 @@ mod tests {
     async fn a_failing_stream_keeps_what_it_read() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(stats(dir.path()));
-        let head = REAL_SSE.split("event: content_block_start").next().unwrap();
 
         let broken: BodyStream = futures_util::stream::iter(vec![
-            Ok(bytes::Bytes::from(head.as_bytes().to_vec())),
+            Ok(bytes::Bytes::from_static(b"123")),
             Err(crate::Error::Config("応答の読み取りが途切れました".into())),
         ])
         .boxed();
 
         let mut saw_error = false;
         {
-            let mut tapped = tap(
-                broken,
-                Arc::clone(&s),
-                NOW,
-                200,
-                Some("text/event-stream"),
-                Some("a"),
-                "m",
-            );
+            let mut tapped = tap(broken, counter(), Arc::clone(&s), NOW, Some("a"), "m");
             while let Some(item) = tapped.next().await {
                 if item.is_err() {
                     saw_error = true;
@@ -1797,167 +1537,32 @@ mod tests {
         }
 
         assert!(saw_error, "誤りを飲み込まない");
-        assert_eq!(only_entry(&s.in_memory()).input_tokens, 18);
+        assert_eq!(input_of(&only_entry(&s.in_memory())), 3);
     }
 
-    /// SSE の `data:` 以外の行は読まない。
-    ///
-    /// `event:` の行や注釈に usage という語が混ざっても数えない。
+    /// 記録先は渡された credential とモデル、時刻はその応答が始まった時。
     #[tokio::test]
-    async fn only_data_lines_are_parsed() {
+    async fn the_record_lands_under_the_route_that_answered() {
         let dir = tempfile::tempdir().unwrap();
-        let noise = concat!(
-            ": usage を含むコメント行\n",
-            "event: usage\n",
-            "id: {\"usage\":{\"input_tokens\":999}}\n",
-            "\n",
+        let s = Arc::new(stats(dir.path()));
+        {
+            let mut tapped = tap(
+                stream_of(vec![b"12".to_vec()]),
+                counter(),
+                Arc::clone(&s),
+                NOW,
+                None,
+                "claude-opus-5",
+            );
+            while tapped.next().await.is_some() {}
+        }
+
+        let counts = s.in_memory();
+        let day = &counts[&local_date(NOW)];
+        assert_eq!(
+            input_of(&day[NO_CREDENTIAL]["claude-opus-5"]),
+            2,
+            "認証情報を持たない経路は予約名で入る"
         );
-
-        let (out, counts) = drain(
-            vec![noise.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, noise);
-        assert!(counts.is_empty(), "{counts:?}");
-    }
-
-    /// `data:` の後の空白は在っても無くてもよい。
-    #[tokio::test]
-    async fn a_data_line_without_a_space_is_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let sse = "data:{\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
-
-        let (_, counts) = drain(
-            vec![sse.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(only_entry(&counts).output_tokens, 5);
-    }
-
-    /// 1 つのイベントの data が複数行に割れていても読む。
-    ///
-    /// SSE では同じイベントの連続する `data:` 行を改行で繋いだものが 1 つの
-    /// 中身。行ごとに JSON として解こうとすると、こう割られた usage を黙って
-    /// 取りこぼす。
-    #[tokio::test]
-    async fn a_usage_split_across_data_lines_is_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let sse = concat!(
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\n",
-            "data:  \"usage\":{\"input_tokens\":30,\n",
-            "data:  \"output_tokens\":40}}\n",
-            "\n",
-        );
-
-        let (out, counts) = drain(
-            byte_by_byte(sse),
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, sse, "1 バイトも変えない");
-        let c = only_entry(&counts);
-        assert_eq!(c.input_tokens, 30, "割れた行を繋いで読む");
-        assert_eq!(c.output_tokens, 40);
-    }
-
-    /// 別のイベントの data 同士は繋がない。
-    ///
-    /// 空行で区切られていれば別の中身。繋ぐと壊れた JSON になって、どちらの
-    /// usage も読めなくなる。
-    #[tokio::test]
-    async fn data_from_different_events_is_not_joined() {
-        let dir = tempfile::tempdir().unwrap();
-        let sse = concat!(
-            "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n",
-            "\n",
-            "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n",
-            "\n",
-        );
-
-        let (_, counts) = drain(
-            byte_by_byte(sse),
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        let c = only_entry(&counts);
-        assert_eq!(c.input_tokens, 7, "前のイベントから");
-        assert_eq!(c.output_tokens, 9, "後のイベントから");
-    }
-
-    /// 終端が空行で閉じられていなくても、最後のイベントを読む。
-    #[tokio::test]
-    async fn a_last_event_without_a_blank_line_is_still_read() {
-        let dir = tempfile::tempdir().unwrap();
-        // 空行も末尾の改行も無い。
-        let sse = "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":11}}";
-
-        let (out, counts) = drain(
-            vec![sse.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, sse);
-        assert_eq!(only_entry(&counts).output_tokens, 11);
-    }
-
-    /// 溜め込む量は、書きかけの行とイベントの合計で見る。
-    ///
-    /// 行ごとの上限だけだと、短い data 行を無限に並べられて上限をすり抜ける。
-    #[tokio::test]
-    async fn many_short_data_lines_still_hit_the_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        // 1 行あたり 8 バイト程度で、合計が上限を超えるまで並べる。
-        let line = "data: xx\n";
-        let count = MAX_SSE_EVENT / line.len() + 16;
-        let sse = line.repeat(count);
-
-        let (out, counts) = drain(
-            vec![sse.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out.len(), sse.len(), "本文は最後まで流す");
-        assert!(counts.is_empty(), "溜め込まず諦める: {counts:?}");
-    }
-
-    /// CRLF で区切る upstream でも読める。
-    #[tokio::test]
-    async fn crlf_line_endings_are_handled() {
-        let dir = tempfile::tempdir().unwrap();
-        let sse = "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\r\n\r\n";
-
-        let (out, counts) = drain(
-            vec![sse.as_bytes().to_vec()],
-            200,
-            Some("text/event-stream"),
-            dir.path(),
-        )
-        .await;
-
-        assert_eq!(out, sse, "1 バイトも変えない");
-        assert_eq!(only_entry(&counts).output_tokens, 9);
     }
 }

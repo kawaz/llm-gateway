@@ -20,6 +20,7 @@ use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
 use crate::denial::Probing;
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
+use crate::metering::{TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Preset;
 use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Route, Router, Selection};
@@ -278,6 +279,8 @@ impl<P: Persistence> Gateway<P> {
                     response: response.into(),
                     credential: None,
                     model,
+                    // 自前で組んだ断りなので、消費したトークンは無い。
+                    usage: None,
                 });
             }
         };
@@ -306,10 +309,15 @@ impl<P: Persistence> Gateway<P> {
                         status = resp.status,
                         "upstream のヘッダを受け取りました"
                     );
+                    // 本文 usage の読み方は、答えた provider だけが知っている
+                    // (DR-0014 §4)。受け取り口は preset を知らないので、読む役を
+                    // 応答と一緒に持たせて渡す。
+                    let usage = usage_observer(route.preset.as_ref(), &resp);
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
                         model,
+                        usage,
                     });
                 }
                 Err(Switch { reason, denial }) => {
@@ -362,6 +370,8 @@ impl<P: Persistence> Gateway<P> {
                 response: resp,
                 credential,
                 model,
+                // 断られた応答に usage は載らない (DR-0011)。
+                usage: None,
             });
         }
 
@@ -601,8 +611,8 @@ impl<P: Persistence> Gateway<P> {
             ));
         }
         Ok((
-            sample.tokens.input.unwrap_or(0),
-            sample.tokens.output.unwrap_or(0),
+            sample.usage.get(&TokenKind::input()).unwrap_or(0),
+            sample.usage.get(&TokenKind::output()).unwrap_or(0),
         ))
     }
 
@@ -707,20 +717,20 @@ impl<P: Persistence> Gateway<P> {
             .await
             .map_err(|e| e.to_string())?;
 
-        let spent: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
-        let count = |key: &str| {
-            spent
-                .pointer(&format!("/usage/{key}"))
-                .and_then(Value::as_u64)
-        };
+        // 消費したトークンの読み方も provider が持つ (DR-0014 §4)。ここで
+        // フィールド名を知っていると、方言ごとに分岐が増える。
+        let usage = preset
+            .metering()
+            .usage_observer(head.get("content-type"))
+            .and_then(|mut observer| {
+                observer.observe(&raw);
+                observer.finish()
+            })
+            .unwrap_or_default();
+
         Ok(Sample {
             status,
-            // 出入りだけ見る。プローブは cache を使わないので、他は載らない。
-            tokens: crate::stats::Tokens {
-                input: count("input_tokens"),
-                output: count("output_tokens"),
-                ..Default::default()
-            },
+            usage,
             body: String::from_utf8_lossy(&raw)
                 .chars()
                 .take(200)
@@ -763,7 +773,7 @@ impl<'a> Call<'a> {
 struct Sample {
     status: u16,
     /// 消費したトークン。2xx のときだけ載る。
-    tokens: crate::stats::Tokens,
+    usage: TokenUsage,
     /// 本文の頭。断られた理由を説明に使う。
     body: String,
 }
@@ -774,7 +784,6 @@ struct Sample {
 /// 束ねるのに対し、[`forward::Response`] は HTTP の応答そのもの (状態・ヘッダ・
 /// 本文) を表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
 /// upstream の応答を表す構造体に溜まっていく (DR-0011)。
-#[derive(Debug)]
 pub struct Forwarded {
     pub response: forward::Response,
     /// この応答を出した credential。relay 型のように認証情報を持たない経路は
@@ -782,6 +791,37 @@ pub struct Forwarded {
     pub credential: Option<CredentialId>,
     /// 解決後の実モデル名。短い名前 (`opus`) はここでは解決済み。
     pub model: String,
+    /// この応答の本文から usage を読む役。集計しない応答では `None`。
+    ///
+    /// 作れるのは応答を出した provider だけなので、応答と一緒に持ち回る。
+    /// 本文へ挟むのは受け取り口 ([`crate::stats::tap`])。
+    pub usage: Option<Box<dyn UsageObserver>>,
+}
+
+impl std::fmt::Debug for Forwarded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Forwarded")
+            .field("response", &self.response)
+            .field("credential", &self.credential)
+            .field("model", &self.model)
+            .field("usage", &self.usage.is_some())
+            .finish()
+    }
+}
+
+/// この応答の本文から usage を読む役を作る。
+///
+/// 読めない content-type かどうかは provider が決める。ここが決めるのは
+/// **2xx だけを覗く**ことだけ — エラーの本文に usage は載らないので、読んでも
+/// 取れないものに層を重ねない (DR-0011)。
+fn usage_observer(preset: &Preset, resp: &forward::Response) -> Option<Box<dyn UsageObserver>> {
+    if resp.status / 100 != 2 {
+        return None;
+    }
+    let headers = Headers::new(resp.headers.clone());
+    preset
+        .metering()
+        .usage_observer(headers.get("content-type"))
 }
 
 /// プローブの結果。消費した分と、credential ごとの失敗。
@@ -1127,6 +1167,58 @@ credentials = ["a"]
         assert_eq!(up.hits(), 1);
     }
 
+    /// 通った応答には、本文 usage を読む役が付いてくる。
+    ///
+    /// 役を作れるのは方言を知っている provider だけなので、受け取り口が
+    /// 自前で読む形にはしない (DR-0014 §4)。
+    #[tokio::test]
+    async fn a_successful_response_carries_a_usage_observer() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.response.status, 200);
+        assert!(forwarded.usage.is_some(), "集計する役が付く");
+    }
+
+    /// 断られた応答には役を付けない。エラーの本文に usage は載らない。
+    #[tokio::test]
+    async fn a_denied_response_carries_no_usage_observer() {
+        let up = FakeUpstream::always(429).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.response.status, 429);
+        assert!(forwarded.usage.is_none(), "読んでも取れないものを覗かない");
+    }
+
+    /// 自前で組んだ 429 (全滅) にも役は付かない。upstream を叩いていない。
+    #[tokio::test]
+    async fn the_self_made_denial_carries_no_usage_observer() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+
+        let now = now_unix();
+        preset_of(&gw, "a").deny(window_closed(now + 100), now);
+
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.response.status, 429);
+        assert!(forwarded.usage.is_none());
+        assert_eq!(up.hits(), 0, "叩いていない");
+    }
+
     /// 通った経路の認証情報が応答に付いてくる。使用量をこの鍵で束ねる。
     #[tokio::test]
     async fn a_forwarded_response_names_the_credential_that_answered() {
@@ -1359,6 +1451,22 @@ credentials = ["a", "b"]
     }
 
     /// 2 つの認証情報を並べた設定。
+    /// 1 経路だけの設定。経路の選択が絡まない試験に使う。
+    fn one_credential(url: &str) -> String {
+        format!(
+            r#"
+[credentials.a]
+type = "relay"
+url = "{url}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+credentials = ["a"]
+"#
+        )
+    }
+
     fn two_credentials(first: &str, second: &str) -> String {
         format!(
             r#"
