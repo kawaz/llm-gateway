@@ -1,267 +1,189 @@
-# 全体設計たたき — コンポーネント境界・語彙・IF・データフロー
+# llm-gateway 全体設計 — コンポーネント境界・IF・データフロー
 
-> 状態: **たたき** (議論用ドラフト)。合意後に `docs/DESIGN-ja.md` + 英訳へ昇格し、
-> 人間向け HTML 版を別途生成する。実コードとの照合は 2026-08-03 時点の main
-> (`d68d4494`, v0.16.0)。
+> 状態: 現行実装のコード地図。詳細な設計判断は `docs/decisions/` を正本とする。
 
 ## 1. 全体像
 
-3 crate 構成。中心は core の `Gateway<P: Persistence>` で、HTTP 層と CLI は薄い。
+3 crate 構成。`llm-gateway` がドメインと転送の core、`llm-gateway-server` が
+Anthropic Messages API の HTTP ingress、`llm-gateway-cli` が起動・設定確認・閲覧・
+ログインを担う。
 
 ```
 llm-gateway-cli ──────► llm-gateway-server ──────► llm-gateway (core)
-  引数解析・serve 組立      axum ルート・認証適用・        ルーティング・credential・
-  6 サブコマンド            Error→HTTP status 変換         backend・観測 (全ドメイン)
+  コマンドライン          axum route / ingress          routing / provider 契約と preset /
+  起動と表示              namespace 認可                egress / exchange / 観測と永続化
 ```
 
-core 内はハブ & スポーク: `gateway.rs` がほぼ全モジュールを呼ぶハブで、
-周辺モジュール同士の直接依存は 3 本のみ (limits→credential 型、denial→usage 型、
-router→config→provider 構築)。それ以外は**文字列 (名前) で疎結合**。
+core は provider-neutral な契約と横断機構、provider preset の実装を分離する。
 
 ```
-                    ┌─ config (+ extends)     設定の正本・検証
-                    ├─ router ─ discovery     モデル解決・catalog・affinity
-                    │           pattern
-                    ├─ credential/            取得・refresh・flock・OAuth login
-   gateway ◄────────┤─ backend/anthropic*     Provider trait + 転送 (forward)
-   (ハブ)           ├─ denial ◄─ limits       締め出し・枠照会
-                    ├─ usage / stats          枠ヘッダ観測 / トークン集計
-                    │   └─ persist            共有の書き込み作法
-                    ├─ events ─► webhook      転送イベント broadcast → POST
-                    ├─ session                affinity キー導出
-                    └─ pricing                静的単価表
-   server 側: relay (ストリーム観測) / stats::tap (本文覗き見)
+                              ┌─ config (+ extends)   設定・namespace・検証
+                              ├─ router ─ discovery   model → route、catalog、affinity
+                              │           pattern
+                              ├─ credential/          token 取得・refresh・OAuth・永続化
+                              ├─ provider             Auth / Wire / Metering / capability 契約
+                              ├─ preset/              契約の provider 別実装と組み合わせ
+   gateway ◄─────────────────┤─ egress               正規形 → upstream request → send
+   1 リクエストの司会        ├─ denial               route state の型と状態機械
+                              ├─ quota                枠の正規形・最新値の永続化
+                              ├─ metering ─ stats     token 正規形・単価契約・日次集計
+                              ├─ exchange             1 転送の節目・本文観測・終端
+                              ├─ events ─ webhook     全 route の転送イベント
+                              ├─ session              affinity key の導出
+                              └─ persist              共有の原子的書き込み作法
 ```
 
-### 共有状態 (Gateway が保持、gateway.rs:34-46)
+### 共有状態
 
-| フィールド | 中身 | Arc の理由 |
+| 所有者 | 状態 | 理由 |
 |---|---|---|
-| `config` | `Config` (clone 保持) | — |
-| `router` | catalog: RwLock / affinity: Mutex | — |
-| `credentials` | `CredentialStore<P>` = Arc\<Inner\> | probe タスクへ持ち出す |
-| `usage` `stats` `denials` `events` | 各 Arc | バックグラウンドタスクと共有 |
+| `Gateway` | `Config`, `Router`, `CredentialStore`, HTTP client | リクエスト間で共有する転送基盤 |
+| `Router` | provider preset、model catalog、session affinity、event bus | route 選択と provider 間比較の横断状態 |
+| `Preset` | `RouteState` (denial、quota、probe schedule) | 状態の意味を読む provider と所有者を一致させる |
+| `Gateway` | `QuotaStore`, `Stats`, `Events` | provider を横断して保存・配信する 1 本の器 |
 
-## 2. コンポーネント責務 (現状)
+## 2. コンポーネント責務
 
-| モジュール | 責務 (1 行) |
+| モジュール | 責務 |
 |---|---|
-| `config` (+`extends`) | TOML スキーマ・起動時検証。`Namespace` にモデル→credential 解決と token 検査が同居 |
-| `router` | catalog を ns で絞り、モデル名 → `Vec<Arc<Route>>`。session affinity 保持 |
-| `discovery` | upstream `/v1/models` の取得と正規化 (Anthropic/Bedrock 差の吸収)、alias 解決 |
-| `pattern` | `*` のみの glob 照合 |
-| `credential/` | 取得の唯一の窓口 `acquire`。refresh single-flight、flock (DR-0010)、OAuth login |
-| `denial` | 断られた経路の一時除外 (DR-0009)。メモリのみ |
-| `limits` | `/api/oauth/usage` (非公開 API) で枠取得 (DR-0007)。トークン消費ゼロ |
-| `backend/anthropic*` | `Provider` trait (Official/Bedrock/Relay) + HTTP 送信 + beta Policy (DR-0003) |
-| `gateway` | 1 リクエストを捌く中枢 (forward / try_route / send)、能動プローブ |
-| `relay` | **中継しない。観測のみ** (初チャンク/終端/途切れ/中断の記録)。中継実体は forward.rs |
-| `stats` | 応答**本文**の usage を日×credential×モデルで集計 (DR-0011) |
-| `usage` | 応答**ヘッダ**の枠使用率スナップショット (DR-0007) |
-| `events` → `webhook` | 転送イベントの broadcast (DR-0012) → 受け口へ POST |
-| `session` | affinity キー導出のみ |
-| `pricing` | 静的単価表。コストは閲覧時計算 |
-| `persist` (非公開) | tmp→rename・writer 名サニタイズ等の書き込み作法 |
-| `error` (非公開) | core の Error。HTTP status 変換は server の責務 |
+| `config` / `config::extends` | TOML schema、namespace、routing、起動時検証、設定の継承 |
+| `router` | model catalog と alias を解決し、affinity を加味して `Route` を選ぶ。全滅時の 429 も生成する |
+| `discovery` | upstream のモデル一覧を取得し、client 名と upstream 名の対応へ正規化する |
+| `pattern` | `*` を使う model pattern の照合 |
+| `credential/` | credential 取得の窓口、refresh single-flight、プロセス間 lock、OAuth login |
+| `provider` | `Auth` / `Wire` / `Metering` と optional な `QuotaApi` / `Negotiation`、それらを束ねる `Preset` の契約 |
+| `preset` | provider ごとの契約実装。`anthropic`、Anthropic Wire を再利用する `bedrock`、認証なしの `relay`、単価表を持つ |
+| `egress` | Messages 形式の `EgressRequest`、provider-neutral な HTTP 型、encode → authorize → send の出口手順 |
+| `denial` | 1 route の availability、denial scope、quota、probe schedule を表す状態機構 |
+| `quota` | provider が抽出した枠の正規形、最新 snapshot の保存、利用状況 report |
+| `metering` | 拡張可能な token 区分、usage、pricing、本文 observer の core 契約 |
+| `stats` | usage を日 × credential × model で集計し、閲覧時に provider の単価で USD 換算する |
+| `exchange` | request span、本文受信・upstream header・先頭 chunk・終端を記録し、本文を変えず usage observer へ通す |
+| `gateway` | route 選択、credential 取得、交渉、送信、fallback、quota/event 観測、能動 probe の司会 |
+| `events` / `webhook` | 全 provider の転送イベントを 1 本の bus へ流し、購読先へ送る |
+| `session` | client metadata と header から session affinity key を導出する |
+| `persist` (非公開) | tmp → rename、writer 名の sanitization など共通の書き込み作法 |
+| `error` (非公開) | core error。HTTP status への変換は server が担う |
+
+### provider preset の構成
+
+`Preset` は必須の `Auth` / `Wire` / `Metering` と optional capability を束ねる。
+capability が無いことは空実装でなく `Option` で表す。
+
+| trait | 責務 |
+|---|---|
+| `Auth` | 直列化済み upstream request に request-time 認証を適用する |
+| `Wire` | Messages 正規形を upstream request へ encode し、送信する |
+| `Metering` | quota、拒否、本文 usage、model 単価を provider の応答から読む |
+| `QuotaApi` | 枠照会 API と最小 probe request を提供する |
+| `Negotiation` | upstream が拒否する request header を除去し、失敗応答から学習する |
+
+`preset::from_spec` だけが設定の `type` と preset の対応を知る。router と gateway は
+provider の顔ぶれではなく、組み上がった `Preset` の capability を使う。
 
 ## 3. リクエスト 1 本のデータフロー
 
 ```
 POST /ns-x/v1/messages
-  [server]
-  ① relay::request_span (本文読み前に通し番号)
-  ② 全読み (64MiB 上限) → JSON parse → ヘッダ収集
-  ③ ns 判定 → Namespace::authorize (auth_token 未設定 = Open で通過)
+  [server: ingress]
+  ① exchange::request_span で通し番号を作る
+  ② 本文を 64 MiB 上限で読み、JSON と header を取り出す
+  ③ namespace を解決し、Namespace::authorize で client を認可する
+
   [core: Gateway::forward]
-  ④ モデル解決 (alias なら本文 rewrite) → SessionKey 導出
-  ⑤ routes_for: 可視 credential ∩ ns の優先順 → affinity を先頭へ
-  ⑥ denials.candidates で候補絞り。全滅なら upstream を叩かず 429 自前生成
-  ⑦ 経路ごとに try_route:
-       acquire (期限 300s 前で refresh、single-flight)
-       → beta Policy 適用 → forward::send (strip → authorize → adapt → POST)
-       → usage.observe + events.publish (status 不問)
-       → 400+beta なら学習して 1 回だけ再送
-       → 2xx: affinity 記録 + denial 解除、return
-         401/403/429/529: denial 記録して次へ / 5xx: 記録なしで次へ
-  [server: 応答]
-  ⑧ stats::tap (内側、本文から Tokens 抽出、送出は Drop 時)
-  ⑨ relay::observe (外側、節目記録) → Body::from_stream
+  ④ egress::model_of → router.resolve。alias は Messages 正規形の model を書き換える
+  ⑤ session key と event origin を導出する
+  ⑥ router.routes_for が model を扱える route を設定順に並べ、affinity を先頭へ寄せる
+  ⑦ router.select が route 自身の availability を聞く
+       全 route が denied なら、router が 429 を生成して event bus に発火する
+  ⑧ route ごとに try_route:
+       credential.acquire
+       → Negotiation::prepare
+       → egress::send: Wire::encode → Auth::authorize → Wire::send
+       → Preset::observe_quota + Events::publish
+       → 400 + negotiation blame なら学習して 1 回だけ再送
+       → 2xx: affinity を記録し route の denial を解除、応答を採用
+         401/403/429/529: provider が denial を読み、次の route へ
+         500/502/503/504: route 障害として次の route へ
+
+  [server: response]
+  ⑨ provider の Metering が content-type に応じた UsageObserver を作る
+  ⑩ exchange::observe が本文を変更せず client へ流し、節目と usage を記録する
 ```
 
-不変条件 2 つ:
+不変条件:
 
-- **経路切替はクライアントへ 1 バイト書く前まで**。ストリーム開始後の upstream 断は救えない
-- **SSE は中継でなく素通し + 覗き見** (tap/observe の 2 層)。イベント parse は tap の usage 抽出のみ
+- **route 切替は client へ 1 byte 書く前まで**。stream 開始後の upstream 断は再試行できない
+- **本文は byte stream のまま流す**。方言固有の解釈は provider が作る `UsageObserver` に閉じる
+- **core の汎用 module は provider 名を知らない**。`lib.rs` のテストが production code を走査する
+- **route 固有状態は route が持つ**。router は `Availability` だけを受け取る
 
-## 4. フック・拡張点 (差し込み位置順)
+## 4. 拡張点と責務境界
 
-| 拡張点 | 位置 | 性質 |
+| 拡張点 | 差し込み位置 | 所有者 |
 |---|---|---|
-| `relay::request_span` | 本文読み前 | 通し番号を全ログへ |
-| `denials.candidates` | 経路試行前 | 候補削減。全滅時は 429 自前生成 |
-| beta `Policy` | 送信直前 + 400 後 1 回 | ヘッダ削除。学習は credential に永続 |
-| `usage.observe` / `events.publish` | upstream ヘッダ受信直後 | 読み取りのみ、status 不問 |
-| `denials.deny/allow` | 応答 status 判定時 | 印の付与・解除 |
-| `stats::tap` / `relay::observe` | 応答ボディ内側/外側 | 集計送出は Drop 経由 / 記録のみ |
-| `probe_in_background` | 締め出し検知時 | 非同期 limits 照会 (定期 1h + 429 直後 60s 間隔) |
+| `preset::from_spec` | 起動時の route 構築 | 設定 `type` → preset の組み合わせ |
+| `Auth` | Wire encode 後、送信前 | provider の認証方式 |
+| `Wire` | egress request の変換と送信 | provider の upstream 方言 |
+| `Metering` | response header / body / status の観測 | provider の quota・拒否・usage・pricing |
+| `QuotaApi` | 明示 refresh と denial 後の background probe | 枠照会能力を持つ provider |
+| `Negotiation` | request header の準備と 400 後の学習 | provider 固有の交渉機能 |
+| `Router::select` | route 試行前 | provider 間の候補選択と全滅応答 |
+| `exchange::observe` | 採用した response body | provider-neutral な stream lifecycle と集計への受け渡し |
+| `Events` | upstream header 受信時 / 全滅時 | 全 provider を束ねる横断 bus |
+| `PricingSource` | stats report の生成時 | 集計行を回答 route の単価へ接続する役 |
 
-パターンとして一貫: **札を外すのは必ず Drop** (RefreshHandoff / Probing / FileGuard)。
+内部正規形は Messages 形式の `serde_json::Value` で、中立 IR は置かない。
+`Wire` が upstream 方言への変換を担い、`egress` が正規形共通の model 読み書きと
+HTTP の出口手順を担う。
 
-## 5. 語彙
+集計正規形は `TokenKind(String)` と `BTreeMap<TokenKind, u64>` で拡張可能にする。
+provider が知らない区分も落とさず保持し、料金は `Pricing::rates` に明示された区分だけを
+合計する。親区分と内訳が同居しても、単価表に採らない内訳は二重課金されない。
 
-### 5.1 定義済みの語 (正)
+## 5. 残っている語彙の乱れ
 
-| 語 | 意味 |
-|---|---|
-| `namespace` (`ns`) | 設定上の区画。URL では `ns-` 接頭辞 |
-| `Route` | provider + credential の組。試行の単位 |
-| `CredentialId` | ファイル stem = config キー = route 名 (**等式が暗黙前提**) |
-| `Denial` / `Reason` / `Scope` | 締め出しの印・理由 (Limited/Busy)・範囲 |
-| `Limit` | 枠 1 本 (upstream の語をそのまま) |
-| `SessionKey` / `prefix` | affinity キー / 会話系列識別子 (system 先頭ブロックの hash) |
-
-### 5.2 語彙の乱れ (深刻度順、要裁定)
-
-| # | 乱れ | 内容 |
+| # | 乱れ | 現状 |
 |---|---|---|
-| a | `Relay` ×3 | config の type / backend アダプタ / ストリーム観測モジュール。しかも `CodexOauth` も provider::Relay に流用中。**module `relay` は観測専用なのに名前が「中継」** |
-| b | `usage` ×3 | usage.rs = 枠ヘッダ / stats の token usage / limits = 照会枠。**module 名 usage が token usage を持たない** |
-| c | `scope` ×3 | denial::Scope / OAuth scope 文字列 / limits 内ローカル。DR-0004 の「範囲」軸に採ると 4 つ目 |
-| d | `denied/denial` ×2 系統 | denied_beta (永続・フラグ単位) と Denials (メモリ・経路単位) |
-| e | `provider` ×2 | backend trait vs DR-0004 が導入予定の「話す API 名」。**codex 対応の実装前に裁定必須** |
-| f | 除外 ×3 系統 | CredentialSpec::exclude (有効) / ns.filter.exclude (有効・階層非対称) / excluded_models (**dead**) |
-| g | 型名衝突 | stats::Report vs usage::Report、config::Stats vs stats::Stats |
-| h | `probe` ×2 | トークン消費する probe (実リクエスト) と消費しない probe (limits 照会) |
-| i | 保存動詞 | flush / save / save が不統一 |
-| j | `models` ×4 | 照合パターン / 宣言モデル / 可視一覧 / discovery::Model。前 2 者は同じ TOML キー |
+| a | `usage` | token usage (`metering` / `stats`) と、利用状況 endpoint / CLI (`usage_report`, `/llm-gateway/usage`) が同じ語を使う |
+| b | `scope` | route denial の `Scope` と OAuth / upstream payload の scope が別概念として共存する |
+| c | `denied` / `denial` | `denied_beta` は credential に永続化する header 学習、`Denial` は route の一時状態 |
+| d | report 型 | `quota::Report` と `stats::Report` があり、CLI では alias が必要 |
+| e | `probe` | quota API の非消費照会、最小 request を使う消費 probe、締め出し中の background probe を指す |
+| f | 保存動詞 | `Stats::flush`、`QuotaStore::save`、`Gateway::save` が混在する |
+| g | `models` | 設定 pattern、宣言 model、公開 catalog、`discovery::Model` を同じ語で呼ぶ |
 
-### 5.3 正規化のたたき台 (統括案)
+## 6. 残っている設計と実装の乖離
 
-- **relay 問題 (a)**: module `relay` → `observe` (中継の観測が実体)。config type の `relay` は
-  「素通し転送先」の意味で妥当なので残す。backend の `provider::Relay` は `Passthrough` へ
-- **usage 問題 (b)**: `usage.rs` → `quota.rs` (枠使用率)、"usage" は token usage (stats) に譲る。
-  limits は「照会」なので `quota::poll` 系へ寄せる案も (b/c まとめて quota 語彙圏に統合)
-- **provider 問題 (e)**: backend trait は `Backend` へ改名し、`provider` の語は DR-0004 の
-  「話す API」(claude/openai/bedrock) に明け渡す — codex 対応の前提整理
-- d/f/g/h/i/j は上記 3 つの裁定後に機械的に追従可能
-
-## 6. 設計と実装の乖離 (棚卸しで発見、実機裏取り済み)
-
-| # | 乖離 | 重み |
+| # | 乖離 | 影響 |
 |---|---|---|
-| 1 | DR-0004 (credential 軸分離) が未着手。軸は `type` 1 本のまま | codex 対応の前提 |
-| 2 | StoredCredential の priority/disabled/excluded_models が死蔵 (login は保存し続ける) | 軸再設計の分岐点 |
-| 3 | `auth_token` 未設定 = fail-open (DR-0006 裁定どおり) だが、**config.example.toml が DR 番号引用で逆を断言** | 事故誘発 doc bug |
-| 4 | ns.credentials 外を routing[].credentials が指しても validate が通り、実行時 UnknownModel | validate の穴 |
-| 5 | 「宣言順に試す」doc は **ns.credentials 未指定時のみ**名前順になる (明示指定時は宣言順) | doc 精度 |
-| 6 | `Provider::needs_credential()` は dead code (実体は `needs_secret()`) | 平行 API |
-| 7 | 能動プローブの消費トークンが日次集計に入らない | 意図か漏れか未裁定 |
-| 8 | AllDenied の自前 429 が events に出ない (webhook/SSE から見えない) | イベント網羅性 |
+| 1 | DR-0004 の `provider` / `type` 軸は設定 schema へ未反映で、`preset::from_spec` が `type` から preset 全体を選ぶ | OpenAI preset 導入時の設定表現が未確定 |
+| 2 | `StoredCredential` の `priority` / `disabled` / `excluded_models` は保存・再ログインで維持されるが routing に使われない | 人が編集できる運用 metadata と実行時挙動が一致しない |
+| 3 | `auth_token` 未設定は fail-open だが、`dist/config.example.toml` と `config.rs` の冒頭説明が全拒否と記す | 設定例が実装と DR-0006 に反する |
+| 4 | namespace routing が参照する credential の存在確認が起動時 validation に無い | 誤記が runtime の model 解決失敗として現れる |
+| 5 | 「宣言順」は `BTreeMap` の名前順であり、ファイル上の記述順ではない | 文書上の語と実際の優先順がずれる |
+| 6 | 明示 refresh の最小 request が消費した token は quota report の `probe` には出るが日次 stats へ積まれない | 総使用量と probe 報告が別集計になる |
 
-## 7. 目標アーキテクチャ (2026-08-04 議論で合意した骨格)
+## 7. 今後
 
-背景: codex (ChatGPT OAuth) を relay (cliproxyapi) でなくネイティブ対応する
-(kawaz 裁定 2026-08-03。OAuth は gateway が独立ログインで自前保持、`~/.codex/auth.json`
-とは並走しない)。この対応を「provider が初めて複数になる」契機として、境界と IF を
-先に整理する。
+### Phase 2 — Bedrock を試金石にした完了確認
 
-### 7.1 三境界の語彙 (kawaz 裁定 2026-08-04)
+- Anthropic `Wire` を書き直さず、Bedrock が認証差分だけで再利用できていることを
+  integration test と実運用経路で確認する
+- SigV4 が署名した bytes と実送信 bytes が同一であること、provider-neutral core の
+  名前漏れ検査が十分な範囲を覆うことを確認する
+- P1 で移した route state、quota、exchange、metering の lifecycle を Bedrock 経路で
+  end-to-end に確認する
 
-| 語 | 意味 |
-|---|---|
-| **ingress** | 入口。クライアント方言 (現状 Anthropic Messages のみ) を受けて正規形 + メタ (ns, model, SessionKey, prefix) にする層。現 server の parse/authorize が該当 |
-| **egress** | 出口。正規形を upstream 方言へ変換して送る層 (現 `backend/`) |
-| **exchange** | 1 転送の生涯を持つ型。観測フック (usage 抽出 / stats tap / 節目記録 / events publish) の掛け先。現 `relay` (観測) はここに吸収 |
+### Phase 3 — OpenAI native provider
 
-相手方の呼称は既存語彙のまま `client` / `upstream` を維持 (レイヤ名と相手方名を分離)。
-ingress/egress は「場所」の名前で、そこに立つ実装が **provider**。
+- ChatGPT OAuth の login / refresh lifecycle を `Auth` と credential 層へ追加する
+- Messages → Responses request 変換と Responses SSE → Messages SSE 変換を `Wire` に実装する
+- OpenAI usage / rejection / pricing を `Metering` の正規形へ写す
+- 枠照会 API の実機応答を確認し、`QuotaApi` の有無と設定 `provider` / `type` 制約を確定する
 
-### 7.2 provider = 小 trait の束 (kawaz 裁定 2026-08-04)
+### Phase 4 — 運用完成
 
-一枚岩の trait でなく、責務ごとの小 trait に割り、provider はその束:
-
-| trait | 責務 (provider 毎に違う「方言」) |
-|---|---|
-| `Auth` | 認証フロー (OAuth PKCE パラメータ・refresh・SigV4 等) |
-| `Wire` | リクエスト変換 + 送信。**パラメータ意味論の変換表を含む** (例: Anthropic の effort/thinking → OpenAI `reasoning.effort`。対応の無いパラメータの取捨も同表) |
-| `Metering` | 応答からの抽出 — 枠ヘッダ → quota スナップショット、本文 usage → トークン数、拒否シグナル (429/retry-after) の読み方、単価表 |
-| `QuotaApi` (optional) | 枠照会 API の叩き方 (Anthropic OAuth のみ存在。Bedrock には無い) |
-
-capability の非対称は optional 取得 (`fn quota_api(&self) -> Option<&dyn QuotaApi>` 的な形)
-で表現する。beta フラグ学習のような provider 固有機能も同様。
-
-小 trait 分割の根拠: 既存の Bedrock が「認証は SigV4 だが方言は Anthropic」という
-組み合わせ = 軸が直交している実証 (DR-0004 の 2 軸分離と同型)。
-
-### 7.3 core = IF 規定、provider = impl の preset (kawaz 裁定 2026-08-04)
-
-- **core が持つのは状態機構の IF 規定** (trait と入出力の契約、共通の状態機械型)。
-  denial の印の付け外し・quota スナップショット・metering の抽出結果などの
-  「型と契約」は core が規定する
-- **provider はその IF の provider 毎 impl を preset として束ねて持つ**。
-  per-credential / per-route の状態 (denial の印、quota、beta 学習、枠照会
-  スケジュール) の所有も provider 側。router は各 route に「今使えるか?」と
-  聞くだけ (tell-don't-ask、現在の「core が route 名 String をキーに map を持つ」
-  構造を置き換える)
-- **横断機構のみ core が所有** — ドメインが provider 間比較・全 provider 合流で
-  あるものは定義上 provider の外:
-  - affinity (session → route は provider **間**で選ぶための状態)
-  - event bus (購読者は全 provider のイベントを 1 本のストリームで欲しい。
-    発火は各 provider、bus は 1 個)
-  - stats writer (日次ファイルの writer は 1 本。抽出は provider、書く先は共有)
-- 全滅時の自前 429 生成は「候補が空」の判断 = router の責務に置く (要確認)
-
-### 7.4 内部正規形
-
-中立 IR は新設しない。**内部正規形 = Anthropic Messages 形式** とし、egress の `Wire` が
-方言変換を担う。理由: クライアントが Claude Code (Anthropic 方言) であり、中立 IR は
-変換の完全性 (tool use / SSE イベント対応付け / beta 機能) で沼る。将来 OpenAI 方言の
-クライアントを受ける場合は「ingress アダプタ → 正規形」を足す拡張点だけ型で確保。
-
-### 7.5 codex 対応の実装部品 (上記骨格への当てはめ)
-
-1. **ChatGPT OAuth (PKCE + refresh)** → `credential/` の Kind 追加 + OpenAI 用 `Auth` 実装
-2. **Responses API egress** → `Wire` の 2 個目の実装 (Messages → Responses 変換、SSE 逆変換、
-   effort 変換表を含む)
-3. **Metering の OpenAI 実装** → usage 形式差の吸収、単価表追加、429 意味論の読み方
-4. **QuotaApi**: OpenAI に相当 API があるか要調査。無ければ None で denial のみ運用
-
-### 7.6 composite provider (kawaz 裁定 2026-08-04)
-
-Bedrock は「独自 Auth + 通訳は他 provider へ委譲」の composite preset として表現する
-(DR-0004 の composition provider が小 trait 束で初めて素直に書ける):
-
-```
-BedrockProvider (preset)
-├ Auth     = SigV4 (独自)
-├ Wire     = モデルに応じて Anthropic / OpenAI の Wire へ委譲
-│            + Bedrock 差分の薄い wrapper (model ID 体系の map、
-│              anthropic_version フィールド、エンドポイント形状)
-├ Metering = 委譲先の抽出 + Bedrock 固有ヘッダの差分
-└ QuotaApi = None (枠照会 API が無い)
-```
-
-検証基準: 「Anthropic の Wire を書き直さずに Bedrock が再利用できるか」が
-trait の切り方の試金石 (Gemini 追加より先に手元で試せる)。
-
-### 7.7 集計の正規形 (kawaz 指摘 2026-08-04)
-
-トークン集計・料金集計のレコード形も core の IO 規約として固める。
-現 stats は Anthropic 形のトークン区分 (input / output / cache_creation / cache_read)
-を前提にしているが、OpenAI は区分が異なる (reasoning tokens / cached input 等)。
-
-- core が規定: 正規化済み集計レコード (トークン区分の分類学、日×credential×モデルの
-  集計キー、単価適用の形 = 読み出し時 USD 換算は維持)
-- provider の Metering が写像: 自方言の usage → 正規レコード。区分が対応しない場合の
-  規則 (落とす/other に寄せる/新区分を core に追加提案) も IF で決めておく
-- トークン区分は provider 追加で増えうるので、正規形は閉じた enum でなく
-  拡張可能な形にする (詳細は DR 起草時に詰める)
-
-### 7.8 残論点
-
-- §5.3 の語彙裁定 (relay→observe は exchange へ吸収、usage→quota、backend trait の
-  改名) を新語彙 (ingress/egress/exchange/provider) と整合させて確定する
-- 数値 budget → 離散 effort の対応表は egress `Wire` 内の定数から始める
-  (調整需要が出たら config へ出す)
-- §6 の乖離 8 件のうち、DR-0004 未着手 (#1) と死蔵メタデータ (#2) は本再設計に統合。
-  それ以外は独立に潰せる
+- 残存する §5 の語彙と §6 の乖離を解消する
+- provider 追加時に contract test、preset test、server integration test のどこへ何を書くかを固定する
+- 日次 stats、quota snapshot、event stream、background probe の運用監視と障害時の切り分けを整備する
