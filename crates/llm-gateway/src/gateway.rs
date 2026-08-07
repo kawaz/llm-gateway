@@ -571,21 +571,28 @@ impl<P: Persistence> Gateway<P> {
         let mut limits = std::collections::BTreeMap::new();
 
         for (name, preset) in self.router.presets() {
-            // 枠を聞ける口を持つ経路だけがヘッダも返す (DR-0007)。持たない
-            // 相手は、投げても今の状態が読めないので、投げる 1 本も無い。
-            let Some(probe) = preset.probe_request() else {
+            if preset.quota_api().is_none() {
+                continue;
+            }
+            let Some(credential_name) = self
+                .config
+                .routes
+                .get(name)
+                .and_then(|route| route.credential.as_deref())
+            else {
                 continue;
             };
-            let id = CredentialId::new(name);
+            let id = CredentialId::new(credential_name);
             // 枠を聞くのが先。こちらはトークンを使わないので、この後の
             // 最小リクエストが失敗しても、枠だけは見えるようにしておく。
             if let Some(found) = self.ask_limits(&id, preset).await {
                 limits.insert(name.to_owned(), found);
             }
 
+            let Some(probe) = preset.probe_request() else {
+                continue;
+            };
             spent.requests += 1;
-            // 何を投げたかは 1 つだけ載る欄なので、経路ごとに違えば最後のものが
-            // 残る。今は聞ける経路が同じ方言に揃っているので差は出ない。
             spent.model = probe.model.clone();
             match self.probe_one(&id, preset, probe).await {
                 Ok((input, output)) => {
@@ -593,7 +600,7 @@ impl<P: Persistence> Gateway<P> {
                     spent.output_tokens += output;
                 }
                 Err(reason) => {
-                    warn!(credential = %name, %reason, "利用状況を取りに行けません");
+                    warn!(route = %name, credential = %id, %reason, "利用状況を取りに行けません");
                     errors.insert(name.to_owned(), reason);
                 }
             }
@@ -925,7 +932,7 @@ fn is_route_denial(status: u16) -> bool {
 mod tests {
     use super::*;
     use crate::credential::StoredCredential;
-    use crate::credential::stored::{OauthTokens, Payload};
+    use crate::credential::stored::{CodexTokens, OauthTokens, Payload};
     use crate::credential::time::{format_rfc3339, now_unix};
     use crate::denial::{self, Availability, Denial, Reason, Scope};
     use serde_json::json;
@@ -1096,6 +1103,20 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
             expired: "2099-01-01T00:00:00Z".into(),
             email: "a@b.c".into(),
             extra: Default::default(),
+        }))
+    }
+
+    fn valid_codex_credential() -> StoredCredential {
+        StoredCredential::new(Payload::CodexOauth(CodexTokens {
+            oauth: OauthTokens {
+                access_token: "tok".into(),
+                refresh_token: "rt".into(),
+                expired: "2099-01-01T00:00:00Z".into(),
+                email: "a@b.c".into(),
+                extra: Default::default(),
+            },
+            id_token: None,
+            account_id: Some("acc-1".to_owned()),
         }))
     }
 
@@ -3011,6 +3032,51 @@ models = ["m"]
             .find(|c| c.name == "relayed")
             .expect("設定にある");
         assert!(other.limits.is_none(), "聞ける相手でなければ欄ごと出さない");
+    }
+
+    /// 非消費 quota API を持つ経路は、推論 probe が無くても枠を取得する。
+    #[tokio::test]
+    async fn quota_api_without_a_probe_is_still_queried() {
+        let up = FakeUpstream::start(|_, request| {
+            if request.starts_with("GET /backend-api/wham/usage") {
+                (
+                    200,
+                    r#"{"rate_limit":{"primary_window":{"used_percent":25,"reset_at":1800001000}}}"#
+                        .to_owned(),
+                )
+            } else {
+                (200, r#"{"models":[]}"#.to_owned())
+            }
+        })
+        .await;
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["gpt-5.3-codex"]
+
+[ns.default]
+"#,
+                up.url
+            ),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let report = gw.usage_report(true).await;
+        let entry = report
+            .credentials
+            .iter()
+            .find(|entry| entry.name == "codex")
+            .unwrap();
+        assert_eq!(entry.limits.as_ref().unwrap()[0].percent, 25.0);
+        assert_eq!(report.probe.unwrap().requests, 0, "推論 token は使わない");
     }
 
     /// プローブが失敗した credential は理由を載せ、他は返す。

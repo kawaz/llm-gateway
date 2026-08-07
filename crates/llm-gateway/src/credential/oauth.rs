@@ -625,6 +625,9 @@ impl Drop for Tokens {
     fn drop(&mut self) {
         self.access_token.zeroize();
         self.refresh_token.zeroize();
+        if let Some(id_token) = &mut self.id_token {
+            id_token.zeroize();
+        }
     }
 }
 

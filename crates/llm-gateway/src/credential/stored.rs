@@ -97,6 +97,14 @@ pub struct CodexTokens {
     pub account_id: Option<String>,
 }
 
+impl Drop for CodexTokens {
+    fn drop(&mut self) {
+        if let Some(id_token) = &mut self.id_token {
+            id_token.zeroize();
+        }
+    }
+}
+
 /// API キー認証 (Bedrock)。
 ///
 /// 更新の口が無いので refresh token を持たない。期限が切れたらキーを
