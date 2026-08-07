@@ -91,6 +91,9 @@ pub struct CodexTokens {
     pub oauth: OauthTokens,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
 }
 
@@ -475,6 +478,7 @@ mod tests {
             Payload::ClaudeOauth(oauth_with("at", extra.clone())),
             Payload::CodexOauth(CodexTokens {
                 oauth: oauth("at"),
+                id_token: None,
                 account_id: Some("acc-1".to_owned()),
             }),
             Payload::BedrockApiKey(api_key(extra)),
@@ -510,6 +514,7 @@ mod tests {
 
         let codex = Payload::CodexOauth(CodexTokens {
             oauth: oauth("at"),
+            id_token: None,
             account_id: Some("acc-1".to_owned()),
         });
         assert_eq!(codex.oauth_kind(), Some(Kind::Codex));
@@ -537,6 +542,7 @@ mod tests {
 
         let codex = Payload::CodexOauth(CodexTokens {
             oauth: oauth("at"),
+            id_token: None,
             account_id: None,
         });
         assert_eq!(codex.type_name(), Kind::Codex.config_type());

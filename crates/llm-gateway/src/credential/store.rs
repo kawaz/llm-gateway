@@ -16,7 +16,7 @@ use tokio::sync::{RwLock, broadcast};
 use crate::{Error, Result};
 
 use super::time::{format_rfc3339, parse_rfc3339};
-use super::{CredentialId, Persistence, StoredCredential, oauth};
+use super::{CredentialId, Payload, Persistence, StoredCredential, oauth};
 
 /// 期限のこれだけ手前から更新に入る。
 ///
@@ -409,18 +409,7 @@ impl<P: Persistence> Inner<P> {
 
         let now = self.clock.now_unix();
         let mut next = (*current).clone();
-        if let Some(tokens) = next.payload.oauth_tokens_mut() {
-            tokens.access_token = resp.access_token;
-            // 返らなかった場合は入れ替わっていないとみなし、今の値を残す。
-            if let Some(rt) = resp.refresh_token {
-                tokens.refresh_token = rt;
-            }
-            tokens.expired = format_rfc3339(now + resp.expires_in);
-            if let Some(email) = resp.account.and_then(|a| a.email_address) {
-                tokens.email = email;
-            }
-        }
-        next.last_refresh = format_rfc3339(now);
+        apply_refresh(&mut next, resp, now);
 
         // 保存が先。ここで落ちると新しい token を失うが、控えだけ更新して
         // 保存に失敗するよりはよい (次回起動時に古い token で動こうとして
@@ -438,6 +427,30 @@ impl<P: Persistence> Inner<P> {
             denied_beta: c.denied_beta_at(self.clock.now_unix()),
         }
     }
+}
+
+fn apply_refresh(credential: &mut StoredCredential, response: oauth::RefreshResponse, now: i64) {
+    if let Some(tokens) = credential.payload.oauth_tokens_mut() {
+        if let Some(access_token) = response.access_token {
+            tokens.access_token = access_token;
+        }
+        if let Some(refresh_token) = response.refresh_token {
+            tokens.refresh_token = refresh_token;
+        }
+        if let Some(expires_in) = response.expires_in {
+            tokens.expired = format_rfc3339(now + expires_in);
+        }
+        if let Some(email) = response.account.and_then(|account| account.email_address) {
+            tokens.email = email;
+        }
+    }
+    if let Some(id_token) = response.id_token
+        && let Payload::CodexOauth(tokens) = &mut credential.payload
+    {
+        tokens.account_id = oauth::account_id_from_token(&id_token).or(tokens.account_id.take());
+        tokens.id_token = Some(id_token);
+    }
+    credential.last_refresh = format_rfc3339(now);
 }
 
 /// 切り離した更新の後始末。落ちるときに印を外して結果を配る。
@@ -489,7 +502,7 @@ impl<P: Persistence> Drop for RefreshHandoff<P> {
 mod tests {
     use super::*;
     use crate::credential::file::FileStore;
-    use crate::credential::stored::{ApiKey, OauthTokens, Payload, StoredCredential};
+    use crate::credential::stored::{ApiKey, CodexTokens, OauthTokens, Payload, StoredCredential};
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -520,6 +533,43 @@ mod tests {
             expired: expired.into(),
             extra: Default::default(),
         }))
+    }
+
+    /// ChatGPT refresh は部分応答なので、返らない項目を保存済みの値から消さない。
+    #[test]
+    fn partial_codex_refresh_updates_only_returned_fields() {
+        let mut credential = StoredCredential::new(Payload::CodexOauth(CodexTokens {
+            oauth: OauthTokens {
+                access_token: "at-1".into(),
+                refresh_token: "rt-1".into(),
+                expired: at(60).into(),
+                email: "before@example.com".into(),
+                extra: Default::default(),
+            },
+            id_token: Some("id-1".into()),
+            account_id: Some("acc-1".into()),
+        }));
+        apply_refresh(
+            &mut credential,
+            oauth::RefreshResponse {
+                access_token: Some("at-2".into()),
+                refresh_token: None,
+                id_token: None,
+                expires_in: None,
+                account: None,
+            },
+            NOW,
+        );
+
+        let Payload::CodexOauth(tokens) = credential.payload else {
+            panic!("Codex のまま")
+        };
+        assert_eq!(tokens.oauth.access_token, "at-2");
+        assert_eq!(tokens.oauth.refresh_token, "rt-1");
+        assert_eq!(tokens.oauth.expired, at(60));
+        assert_eq!(tokens.oauth.email, "before@example.com");
+        assert_eq!(tokens.id_token.as_deref(), Some("id-1"));
+        assert_eq!(tokens.account_id.as_deref(), Some("acc-1"));
     }
 
     /// 保存回数と内容を数えるだけの置き場。

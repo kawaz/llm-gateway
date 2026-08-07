@@ -52,11 +52,15 @@ struct RefreshRequest<'a> {
 /// (入れ替わっていないとみなす)。
 #[derive(Debug, Deserialize)]
 pub struct RefreshResponse {
-    pub access_token: String,
+    #[serde(default)]
+    pub access_token: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
-    /// 有効期間 (秒)。Anthropic は 8 時間、ChatGPT は 10 日を返す。
-    pub expires_in: i64,
+    #[serde(default)]
+    pub id_token: Option<String>,
+    /// 有効期間 (秒)。省かれた場合は保存済みの期限を維持する。
+    #[serde(default)]
+    pub expires_in: Option<i64>,
     #[serde(default)]
     pub account: Option<Account>,
 }
@@ -136,6 +140,9 @@ fn refresh_failure_reason(status: u16, body: &str) -> String {
         return "refresh token が既に使用済みです。更新が二重に走った可能性があります。\
 再ログインが必要です"
             .to_owned();
+    }
+    if body.contains("refresh_token_expired") || body.contains("refresh_token_invalidated") {
+        return "refresh token が失効しています。再ログインが必要です".to_owned();
     }
     match status {
         400 | 401 => "refresh token が受け付けられませんでした。再ログインが必要です".to_owned(),
@@ -247,7 +254,7 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
             redirect_path: "/auth/callback",
             // offline_access が refresh token を出させる分。これが無いと
             // 8 時間ごとに人の操作が要る。
-            scope: "openid profile email offline_access",
+            scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
             // 独自パラメータ。id_token に組織情報を載せさせ、Codex CLI 用の
             // 簡易フローに乗る。originator は ChatGPT 経路が要求する値と同じ
             // (DR-0002 の接続仕様)。
@@ -605,6 +612,8 @@ fn html_escape(s: &str) -> String {
 pub struct Tokens {
     pub access_token: String,
     pub refresh_token: String,
+    /// ChatGPT が返す identity token。refresh で部分更新される。
+    pub id_token: Option<String>,
     /// 有効期間 (秒)。
     pub expires_in: i64,
     pub email: Option<String>,
@@ -660,6 +669,12 @@ impl Tokens {
             Kind::Claude => Payload::ClaudeOauth(tokens),
             Kind::Codex => Payload::CodexOauth(CodexTokens {
                 oauth: tokens,
+                id_token: self.id_token.clone().or_else(|| {
+                    previous.and_then(|payload| match payload {
+                        Payload::CodexOauth(tokens) => tokens.id_token.clone(),
+                        _ => None,
+                    })
+                }),
                 account_id: self
                     .account_id
                     .clone()
@@ -850,11 +865,11 @@ async fn exchange_code(
     let parsed: ExchangeResponse = serde_json::from_str(&text).map_err(|e| Error::Login {
         reason: format!("応答の形式が想定と違います: {e}"),
     })?;
-    tokens_from(parsed)
+    tokens_from(kind, parsed)
 }
 
 /// 応答を保存できる形にする。
-fn tokens_from(resp: ExchangeResponse) -> Result<Tokens> {
+fn tokens_from(kind: Kind, resp: ExchangeResponse) -> Result<Tokens> {
     let Some(refresh_token) = resp.refresh_token else {
         return Err(Error::Login {
             reason: "refresh token が返りませんでした。\
@@ -868,15 +883,23 @@ fn tokens_from(resp: ExchangeResponse) -> Result<Tokens> {
         .account
         .and_then(|a| a.email_address)
         .or_else(|| claims.as_ref().and_then(email_of));
+    let account_id = claims.as_ref().and_then(account_id_of);
+    if kind == Kind::Codex && account_id.is_none() {
+        return Err(Error::Login {
+            reason: "ChatGPT の応答にアカウント識別子がありません。認可をやり直してください"
+                .to_owned(),
+        });
+    }
 
     Ok(Tokens {
         access_token: resp.access_token,
         refresh_token,
+        id_token: resp.id_token,
         // 返らなかった場合は期限切れ扱いにする。初回の使用で更新が走るだけで
         // 済み、認可をやり直させずに回復できる。
         expires_in: resp.expires_in.unwrap_or(0),
         email,
-        account_id: claims.as_ref().and_then(account_id_of),
+        account_id,
     })
 }
 
@@ -899,6 +922,10 @@ fn account_id_of(claims: &Value) -> Option<String> {
         .or_else(|| claims.get("chatgpt_account_id"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+pub(crate) fn account_id_from_token(token: &str) -> Option<String> {
+    jwt_claims(token).as_ref().and_then(account_id_of)
 }
 
 fn email_of(claims: &Value) -> Option<String> {
@@ -991,21 +1018,24 @@ mod tests {
             "account": {"email_address": "someone@example.com"}
         }"#;
         let r: RefreshResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(r.access_token, "new-at");
+        assert_eq!(r.access_token.as_deref(), Some("new-at"));
         assert_eq!(r.refresh_token.as_deref(), Some("new-rt"));
-        assert_eq!(r.expires_in, 28_800, "Anthropic は 8 時間");
+        assert_eq!(r.expires_in, Some(28_800), "Anthropic は 8 時間");
         assert_eq!(
             r.account.and_then(|a| a.email_address).as_deref(),
             Some("someone@example.com")
         );
     }
 
-    /// refresh_token が返らない場合もある。その時は入れ替わっていない扱い。
+    /// refresh は返された項目だけを置換するため、全項目を省ける形で読む。
     #[test]
-    fn refresh_token_may_be_absent() {
-        let raw = r#"{"access_token": "new-at", "expires_in": 3600}"#;
-        let r: RefreshResponse = serde_json::from_str(raw).unwrap();
-        assert!(r.refresh_token.is_none());
+    fn refresh_response_is_partial() {
+        let response: RefreshResponse = serde_json::from_str("{}").unwrap();
+        assert!(response.access_token.is_none());
+        assert!(response.refresh_token.is_none());
+        assert!(response.id_token.is_none());
+        assert!(response.expires_in.is_none());
+        assert!(response.account.is_none());
     }
 
     /// 二重更新を踏んだと分かる文言になっているか。
@@ -1110,7 +1140,16 @@ mod tests {
         let q = query_of(&url);
         assert_eq!(q["client_id"], OPENAI_CLIENT_ID);
         assert_eq!(q["redirect_uri"], "http://localhost:1455/auth/callback");
-        assert!(q["scope"].contains("offline_access"), "{}", q["scope"]);
+        for scope in [
+            "openid",
+            "profile",
+            "email",
+            "offline_access",
+            "api.connectors.read",
+            "api.connectors.invoke",
+        ] {
+            assert!(q["scope"].split_whitespace().any(|value| value == scope));
+        }
         assert_eq!(q["id_token_add_organizations"], "true");
         assert_eq!(q["codex_cli_simplified_flow"], "true");
         assert_eq!(q["originator"], "codex_cli_rs");
@@ -1200,7 +1239,7 @@ mod tests {
     }
 
     fn exchange_response(raw: &str) -> Result<Tokens> {
-        tokens_from(serde_json::from_str(raw).unwrap())
+        tokens_from(Kind::Claude, serde_json::from_str(raw).unwrap())
     }
 
     #[test]
@@ -1239,6 +1278,7 @@ mod tests {
         Tokens {
             access_token: "at".into(),
             refresh_token: "rt".into(),
+            id_token: None,
             expires_in: 28_800,
             email: Some("someone@example.com".into()),
             account_id: None,
@@ -1268,6 +1308,7 @@ mod tests {
         let c = Tokens {
             access_token: "at".into(),
             refresh_token: "rt".into(),
+            id_token: None,
             expires_in: 28_800,
             email: None,
             account_id: Some("acc-1".into()),
@@ -1293,6 +1334,7 @@ mod tests {
         let next = Tokens {
             access_token: "at-2".into(),
             refresh_token: "rt-2".into(),
+            id_token: None,
             expires_in: 28_800,
             email: None,
             account_id: None,

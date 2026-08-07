@@ -1312,6 +1312,7 @@ mod tests {
         oauth::Tokens {
             access_token: "at-new".into(),
             refresh_token: "rt-new".into(),
+            id_token: None,
             expires_in: 28_800,
             email: Some("someone@example.com".into()),
             account_id: None,
