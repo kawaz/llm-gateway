@@ -18,6 +18,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod openai;
 pub mod pricing;
 pub mod relay;
 
@@ -30,18 +31,30 @@ use crate::provider::Preset;
 
 /// route と認証情報を provider preset へ組み上げる。
 pub fn from_spec(name: &str, route: &RouteSpec, config: &Config) -> Preset {
-    let wire = Arc::new(AnthropicWire::new(
-        name,
-        route.url(),
-        route.headers().clone(),
-    ));
     match (route.provider, route.credential(config)) {
-        (Provider::Anthropic, Some(CredentialSpec::ClaudeOauth)) => anthropic::official(name, wire),
-        (Provider::Anthropic, Some(CredentialSpec::BedrockApiKey)) => {
-            bedrock::preset(name, wire, route.deny_beta.clone())
+        (Provider::Anthropic, credential) => {
+            let wire = Arc::new(AnthropicWire::new(
+                name,
+                route.url(),
+                route.headers().clone(),
+            ));
+            match credential {
+                Some(CredentialSpec::ClaudeOauth) => anthropic::official(name, wire),
+                Some(CredentialSpec::BedrockApiKey) => {
+                    bedrock::preset(name, wire, route.deny_beta.clone())
+                }
+                None => relay::preset(name, wire),
+                _ => unreachable!("config validation guarantees a supported route composition"),
+            }
         }
-        (Provider::Anthropic, None) => relay::preset(name, wire),
-        (Provider::Openai, Some(CredentialSpec::CodexOauth)) => relay::preset(name, wire),
+        (Provider::Openai, Some(CredentialSpec::CodexOauth)) => {
+            let wire = Arc::new(openai::OpenAiWire::new(
+                name,
+                route.url(),
+                route.headers().clone(),
+            ));
+            openai::chatgpt(name, wire)
+        }
         _ => unreachable!("config validation guarantees a supported route composition"),
     }
 }
