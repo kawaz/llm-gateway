@@ -20,7 +20,8 @@ use crate::quota::{QuotaLimit, Snapshot, Support};
 
 /// request-time の認証を適用する。
 ///
-/// login/refresh lifecycleはP3で追加予定（現状credential/が所有）。
+/// token の取得と更新は [`crate::credential`] が持ち、ここは送信直前の要求へ
+/// 認証方式ごとの header や署名を適用する。
 pub trait Auth: Send + Sync {
     fn authorize(
         &self,
@@ -50,6 +51,7 @@ pub trait Metering: Send + Sync {
         &self,
         status: u16,
         headers: &Headers,
+        body: Option<&[u8]>,
         model: &str,
         observed_at: i64,
     ) -> Option<Denial>;
@@ -85,7 +87,7 @@ pub trait QuotaApi: Send + Sync {
     ///
     /// 何を投げれば消費が最小で済むか (どのモデルに、何を頼むか) は方言の
     /// 知識なので provider が組む。投げるのは呼び出し側。
-    fn probe_request(&self) -> ProbeRequest;
+    fn probe_request(&self) -> Option<ProbeRequest>;
 }
 
 /// 枠ヘッダを引き出すための 1 本 (DR-0007)。
@@ -207,8 +209,15 @@ impl Preset {
     ///
     /// 読み方は provider の [`Metering`] が知っている。返すのは付けた印で、
     /// 呼び出し側が理由と期限をログに出すのに使う。
-    pub fn reject(&self, status: u16, headers: &Headers, model: &str, now: i64) -> Option<Denial> {
-        let denial = self.metering.rejection(status, headers, model, now)?;
+    pub fn reject(
+        &self,
+        status: u16,
+        headers: &Headers,
+        body: Option<&[u8]>,
+        model: &str,
+        now: i64,
+    ) -> Option<Denial> {
+        let denial = self.metering.rejection(status, headers, body, model, now)?;
         self.state.deny(denial.clone(), now);
         Some(denial)
     }
@@ -243,7 +252,7 @@ impl Preset {
 
     /// 枠ヘッダを引き出す最小リクエスト。枠を聞ける経路だけが持つ。
     pub fn probe_request(&self) -> Option<ProbeRequest> {
-        Some(self.quota_api()?.probe_request())
+        self.quota_api()?.probe_request()
     }
 
     /// 枠照会 API の答えで印を引き直す。
@@ -356,6 +365,7 @@ mod tests {
             &self,
             status: u16,
             _headers: &Headers,
+            _body: Option<&[u8]>,
             model: &str,
             observed_at: i64,
         ) -> Option<Denial> {
@@ -410,8 +420,8 @@ mod tests {
             Vec::new()
         }
 
-        fn probe_request(&self) -> ProbeRequest {
-            ProbeRequest {
+        fn probe_request(&self) -> Option<ProbeRequest> {
+            Some(ProbeRequest {
                 model: "probe-model".to_owned(),
                 request: EgressRequest {
                     path: "/v1/messages".to_owned(),
@@ -419,7 +429,7 @@ mod tests {
                     body: serde_json::json!({"model": "probe-model"}),
                     headers: Headers::default(),
                 },
-            }
+            })
         }
     }
 
@@ -491,10 +501,16 @@ mod tests {
         assert_eq!(preset.availability("m", NOW), Availability::Ready);
 
         assert!(
-            preset.reject(200, &Headers::default(), "m", NOW).is_none(),
+            preset
+                .reject(200, &Headers::default(), None, "m", NOW)
+                .is_none(),
             "通った応答は締め出さない"
         );
-        assert!(preset.reject(429, &Headers::default(), "m", NOW).is_some());
+        assert!(
+            preset
+                .reject(429, &Headers::default(), None, "m", NOW)
+                .is_some()
+        );
 
         assert_eq!(
             preset.availability("m", NOW),
@@ -516,7 +532,7 @@ mod tests {
         let one = preset();
         let other = preset();
 
-        one.reject(429, &Headers::default(), "m", NOW);
+        one.reject(429, &Headers::default(), None, "m", NOW);
 
         assert!(matches!(
             one.availability("m", NOW),
@@ -550,7 +566,7 @@ mod tests {
     #[test]
     fn a_route_without_a_quota_api_is_never_probed() {
         let preset = preset();
-        preset.reject(429, &Headers::default(), "m", NOW);
+        preset.reject(429, &Headers::default(), None, "m", NOW);
 
         assert!(preset.claim_ask(NOW).is_none());
         assert!(

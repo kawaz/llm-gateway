@@ -330,12 +330,23 @@ impl<P: Persistence> Gateway<P> {
                         reason,
                     });
                     if let Some(resp) = denial {
+                        let (resp, body) = match egress::buffer(resp).await {
+                            Ok(buffered) => buffered,
+                            Err(error) => {
+                                warn!(route = route.name(), %error, "断られた応答本文を読めません");
+                                continue;
+                            }
+                        };
                         // 時間が経てば空く断りなら、次のリクエストで同じ壁に
                         // 当たらないよう期限を控える。読み方は provider が持つ。
                         let now = now_unix();
-                        if let Some(denial) =
-                            route.preset.reject(resp.status, &resp.headers, &model, now)
-                        {
+                        if let Some(denial) = route.preset.reject(
+                            resp.status,
+                            &resp.headers,
+                            Some(&body),
+                            &model,
+                            now,
+                        ) {
                             warn!(
                                 route = route.name(),
                                 status = resp.status,
@@ -853,10 +864,8 @@ impl PricingSource for RoutePricing<'_> {
 /// 次の経路へ回す理由。
 struct Switch {
     reason: String,
-    /// この経路に断られた応答。次の経路が全滅したときにクライアントへ返す。
-    ///
-    /// 本文は読まずに抱えたまま持ち回る。断られた応答は小さいので、後続を
-    /// 試している間コネクションを握っていても割に合う。
+    /// この経路に断られた応答。本文から provider 固有の期限を読んだ後も、
+    /// 次の経路が全滅したときにクライアントへ返せる形で持ち回る。
     denial: Option<Response>,
 }
 

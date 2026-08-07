@@ -776,7 +776,7 @@ routes = ["bedrock", "oauth-a"]
             .unwrap();
         routes[0]
             .preset
-            .reject(429, &Headers::default(), "claude-fable-5", NOW)
+            .reject(429, &Headers::default(), None, "claude-fable-5", NOW)
             .expect("429 は締め出す");
 
         let again = r
@@ -799,7 +799,7 @@ routes = ["bedrock", "oauth-a"]
             .unwrap();
         routes[0]
             .preset
-            .reject(429, &Headers::default(), "claude-fable-5", NOW);
+            .reject(429, &Headers::default(), None, "claude-fable-5", NOW);
 
         let Selection::Ready(ready) =
             r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
@@ -821,7 +821,7 @@ routes = ["bedrock", "oauth-a"]
         for route in &routes {
             route
                 .preset
-                .reject(429, &Headers::default(), model, NOW)
+                .reject(429, &Headers::default(), None, model, NOW)
                 .expect("429 は締め出す");
         }
 
@@ -867,7 +867,9 @@ routes = ["bedrock", "oauth-a"]
             .await
             .unwrap();
         for route in &routes {
-            route.preset.reject(429, &Headers::default(), model, NOW);
+            route
+                .preset
+                .reject(429, &Headers::default(), None, model, NOW);
         }
 
         let mut watching = r.events().subscribe();

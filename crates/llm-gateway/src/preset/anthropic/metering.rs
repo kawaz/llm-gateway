@@ -56,6 +56,7 @@ impl Metering for AnthropicMetering {
         &self,
         status: u16,
         headers: &Headers,
+        _body: Option<&[u8]>,
         model: &str,
         observed_at: i64,
     ) -> Option<Denial> {
@@ -413,7 +414,7 @@ mod tests {
     }
 
     fn rejection(status: u16, headers: &Headers, model: &str) -> Option<Denial> {
-        AnthropicMetering.rejection(status, headers, model, NOW)
+        AnthropicMetering.rejection(status, headers, None, model, NOW)
     }
 
     fn limited(until: i64) -> Denial {

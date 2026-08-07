@@ -99,8 +99,8 @@ impl QuotaApi for OauthUsage {
     /// 一番小さいモデルに 1 トークンだけ頼む。本文は捨てて構わないので、
     /// 中身は最短で通る形にする。OAuth の beta フラグを載せるのは、
     /// 載せないとサブスクの認証が通らないため。
-    fn probe_request(&self) -> ProbeRequest {
-        ProbeRequest {
+    fn probe_request(&self) -> Option<ProbeRequest> {
+        Some(ProbeRequest {
             model: PROBE_MODEL.to_owned(),
             request: EgressRequest {
                 path: "/v1/messages".to_owned(),
@@ -115,7 +115,7 @@ impl QuotaApi for OauthUsage {
                     ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
                 ]),
             },
-        }
+        })
     }
 }
 
@@ -313,7 +313,7 @@ mod tests {
     /// 枠を見るために枠を減らすので、消費は最小にする (DR-0007)。
     #[test]
     fn the_probe_asks_for_the_smallest_possible_answer() {
-        let probe = api().probe_request();
+        let probe = api().probe_request().expect("最小 request がある");
 
         assert_eq!(probe.model, HAIKU, "一番小さいモデル");
         assert_eq!(probe.request.path, "/v1/messages");
