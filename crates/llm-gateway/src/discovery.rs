@@ -49,21 +49,17 @@ pub async fn fetch(
     let request = match flavor {
         Flavor::Anthropic => {
             let url = format!("{root}/v1/models");
-            let request = http
-                .get(&url)
+            http.get(&url)
                 .header("authorization", credential.bearer())
-                .header("anthropic-version", "2023-06-01");
-            request
+                .header("anthropic-version", "2023-06-01")
         }
         Flavor::Bedrock => {
             // base_url は `…/anthropic` を指しているが、モデル一覧は
             // その隣の `/v1/models` にしかない。
             let url = format!("{}/v1/models", root.trim_end_matches("/anthropic"));
-            let request = http
-                .get(&url)
+            http.get(&url)
                 .header("authorization", format!("Bearer {}", credential.api_key()))
-                .header("anthropic-version", "2023-06-01");
-            request
+                .header("anthropic-version", "2023-06-01")
         }
         Flavor::OpenAiCodex => {
             let url = format!("{root}/models?client_version={}", env!("CARGO_PKG_VERSION"));
@@ -74,11 +70,9 @@ pub async fn fetch(
                     id: credential.id.to_string(),
                     reason: "ChatGPT のアカウント識別子がありません".to_owned(),
                 })?;
-            let request = http
-                .get(&url)
+            http.get(&url)
                 .header("authorization", credential.bearer())
-                .header("chatgpt-account-id", account_id);
-            request
+                .header("chatgpt-account-id", account_id)
         }
     };
 

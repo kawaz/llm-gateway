@@ -1839,9 +1839,11 @@ auth_token = "secret-token"
             ("[credentials.a]\ntype = \"claude_oauth\"\n", true),
         ] {
             let (upstream, seen) = recording_upstream().await;
-            let credential_ref = (!credential.is_empty())
-                .then_some("credential = \"a\"")
-                .unwrap_or("");
+            let credential_ref = if credential.is_empty() {
+                ""
+            } else {
+                "credential = \"a\""
+            };
             // 認証を書かない namespace = 誰でも通る面。
             let base = serve(&format!(
                 r#"

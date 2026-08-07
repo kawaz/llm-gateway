@@ -542,7 +542,7 @@ mod tests {
             oauth: OauthTokens {
                 access_token: "at-1".into(),
                 refresh_token: "rt-1".into(),
-                expired: at(60).into(),
+                expired: at(60),
                 email: "before@example.com".into(),
                 extra: Default::default(),
             },
