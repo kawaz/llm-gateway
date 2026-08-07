@@ -515,7 +515,7 @@ mod tests {
     }
 
     fn api_key_cred(expired: &str) -> StoredCredential {
-        StoredCredential::new(Payload::ClaudeBedrock(ApiKey {
+        StoredCredential::new(Payload::BedrockApiKey(ApiKey {
             api_key: "ak-1".into(),
             expired: expired.into(),
             extra: Default::default(),

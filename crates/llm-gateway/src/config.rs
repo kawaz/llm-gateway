@@ -20,11 +20,19 @@
 //! type = "claude_oauth"
 //!
 //! [credentials.bedrock]
-//! type = "claude_bedrock"
+//! type = "bedrock_api_key"
+//!
+//! [routes.claude-personal]
+//! provider = "anthropic"
+//! credential = "claude-personal"
+//!
+//! [routes.bedrock]
+//! provider = "anthropic"
+//! credential = "bedrock"
 //! url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
 //!
-//! [credentials.cpa]
-//! type = "relay"
+//! [routes.cpa]
+//! provider = "anthropic"
 //! url = "http://127.0.0.1:8317"
 //!
 //! # 何を公開し、どこへ流すかは namespace ごとに書く。`default` は
@@ -39,11 +47,11 @@
 //! # モデルごとに、使う認証情報を優先順に並べる。上から試す。
 //! [[ns.default.routing]]
 //! models = ["claude-fable-*"]
-//! credentials = ["bedrock", "claude-personal"]
+//! routes = ["bedrock", "claude-personal"]
 //!
 //! [[ns.default.routing]]
 //! models = ["gpt-*"]
-//! credentials = ["cpa"]
+//! routes = ["cpa"]
 //! ```
 
 use std::collections::BTreeMap;
@@ -73,6 +81,10 @@ pub struct Config {
     /// 持つと、token の更新が競合するうえ何度もログインが要る。
     #[serde(default)]
     pub credentials: BTreeMap<String, CredentialSpec>,
+
+    /// upstream へ出る経路。認証情報と話す API をここで組み合わせる。
+    #[serde(default)]
+    pub routes: BTreeMap<String, RouteSpec>,
 
     /// upstream への問い合わせ設定。
     ///
@@ -130,11 +142,11 @@ pub struct Namespace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
 
-    /// この namespace で使う認証情報。空なら全部。
+    /// この namespace で使う経路。空なら全部。
     ///
-    /// 面ごとにアカウントを分けたいときに絞る。
+    /// 面ごとに upstream を分けたいときに絞る。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub credentials: Vec<String>,
+    pub routes: Vec<String>,
 }
 
 /// 公開するモデルの絞り込み。
@@ -152,8 +164,8 @@ pub struct Filter {
 pub struct RoutingRule {
     /// 対象のモデル。パターンで書ける。
     pub models: Vec<String>,
-    /// 使う認証情報を優先順に。上から試す。
-    pub credentials: Vec<String>,
+    /// 使う経路を優先順に。上から試す。
+    pub routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -325,130 +337,124 @@ impl Stats {
 
 /// 認証情報 1 件の宣言。
 ///
-/// 秘密そのものはここに書かない。store 側の `<key>.json` が持つ。
-/// ここにあるのは「どう認証して、どこへ繋ぐか」だけ。
+/// 秘密そのものは store 側の `<key>.json` が持つ。ここで決めるのは payload の形と
+/// login / refresh の手順だけで、接続先や話す API は [`RouteSpec`] が持つ。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialSpec {
-    /// Anthropic のサブスク OAuth。`Authorization: Bearer`。
-    ClaudeOauth {
-        #[serde(default = "anthropic_url")]
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-        /// この認証情報で扱わないモデル。全体の `exclude` に足して効く。
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude: Vec<String>,
-    },
-
-    /// Bedrock の Anthropic 互換。`x-api-key`。
-    ///
-    /// upstream が受け付けない beta フラグを落とす。落とす顔ぶれは
-    /// クライアントの更新で変わるので、既定値を上書きできるようにしてある。
-    ClaudeBedrock {
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-        /// 省略時は実測済みの既定リスト。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        deny_beta: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude: Vec<String>,
-    },
-
-    /// ChatGPT のサブスク OAuth。Responses API を話す。
-    CodexOauth {
-        #[serde(default = "chatgpt_url")]
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude: Vec<String>,
-    },
-
-    /// 別の gateway へそのまま渡す。転送先が認証を持つので鍵は要らない。
-    ///
-    /// 転送先の一覧は聞きに行けないので、扱うモデルをここに書く。
-    Relay {
-        url: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        headers: BTreeMap<String, String>,
-        /// 転送するモデル。パターンで書ける。
-        #[serde(default)]
-        models: Vec<String>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        exclude: Vec<String>,
-    },
-}
-
-fn anthropic_url() -> String {
-    "https://api.anthropic.com".to_owned()
-}
-
-fn chatgpt_url() -> String {
-    "https://chatgpt.com/backend-api/codex".to_owned()
+    /// Anthropic のサブスク OAuth。
+    ClaudeOauth,
+    /// ChatGPT のサブスク OAuth。
+    CodexOauth,
+    /// Bedrock の API key。
+    BedrockApiKey,
 }
 
 impl CredentialSpec {
-    /// store から秘密を読む必要があるか。
-    pub fn needs_secret(&self) -> bool {
-        !matches!(self, Self::Relay { .. })
+    /// config.toml と保存 payload に共通する種別名。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeOauth => "claude_oauth",
+            Self::CodexOauth => "codex_oauth",
+            Self::BedrockApiKey => "bedrock_api_key",
+        }
+    }
+}
+
+/// upstream へ出る 1 経路。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteSpec {
+    /// 話す API。Auth は `credential` が指す認証情報の形から独立して選ぶ。
+    pub provider: Provider,
+    /// store から使う認証情報。転送先が認証を持つ経路では省略する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+    /// 接続先。省略時は provider の既定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// upstream が受け付けない beta フラグ。Anthropic 方言だけが使う。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_beta: Option<Vec<String>>,
+    /// discovery できない経路で公開するモデル。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// この経路で扱わないモデル。namespace の exclude に足して効く。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+/// upstream の API 方言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Anthropic,
+    Openai,
+}
+
+impl RouteSpec {
+    pub fn url(&self) -> &str {
+        self.url.as_deref().unwrap_or(match self.provider {
+            Provider::Anthropic => "https://api.anthropic.com",
+            Provider::Openai => "https://chatgpt.com/backend-api/codex",
+        })
     }
 
-    pub fn url(&self) -> &str {
-        match self {
-            Self::ClaudeOauth { url, .. }
-            | Self::ClaudeBedrock { url, .. }
-            | Self::CodexOauth { url, .. }
-            | Self::Relay { url, .. } => url,
-        }
+    pub fn credential<'a>(&self, config: &'a Config) -> Option<&'a CredentialSpec> {
+        self.credential
+            .as_deref()
+            .and_then(|name| config.credentials.get(name))
+    }
+
+    pub fn needs_secret(&self) -> bool {
+        self.credential.is_some()
     }
 
     pub fn headers(&self) -> &BTreeMap<String, String> {
-        match self {
-            Self::ClaudeOauth { headers, .. }
-            | Self::ClaudeBedrock { headers, .. }
-            | Self::CodexOauth { headers, .. }
-            | Self::Relay { headers, .. } => headers,
-        }
+        &self.headers
     }
 
     pub fn exclude(&self) -> &[String] {
-        match self {
-            Self::ClaudeOauth { exclude, .. }
-            | Self::ClaudeBedrock { exclude, .. }
-            | Self::CodexOauth { exclude, .. }
-            | Self::Relay { exclude, .. } => exclude,
-        }
+        &self.exclude
     }
 
-    /// config.toml に書く `type` と同じ語。表示に使う。
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Self::ClaudeOauth { .. } => "claude_oauth",
-            Self::ClaudeBedrock { .. } => "claude_bedrock",
-            Self::CodexOauth { .. } => "codex_oauth",
-            Self::Relay { .. } => "relay",
-        }
-    }
-
-    /// upstream に一覧を聞けるか。聞けないものは設定に書いてもらう。
-    pub fn discovery_flavor(&self) -> Option<crate::discovery::Flavor> {
-        match self {
-            Self::ClaudeOauth { .. } => Some(crate::discovery::Flavor::Anthropic),
-            Self::ClaudeBedrock { .. } => Some(crate::discovery::Flavor::Bedrock),
-            // ChatGPT の Responses API に一覧の口は無い。relay 先も聞けない。
-            Self::CodexOauth { .. } | Self::Relay { .. } => None,
-        }
-    }
-
-    /// 一覧を聞けない upstream で、扱うモデルとして宣言されたもの。
     pub fn declared_models(&self) -> &[String] {
-        match self {
-            Self::Relay { models, .. } => models,
-            _ => &[],
+        &self.models
+    }
+
+    pub fn discovery_flavor(&self, config: &Config) -> Option<crate::discovery::Flavor> {
+        match (self.provider, self.credential(config)) {
+            (Provider::Anthropic, Some(CredentialSpec::ClaudeOauth)) => {
+                Some(crate::discovery::Flavor::Anthropic)
+            }
+            (Provider::Anthropic, Some(CredentialSpec::BedrockApiKey)) => {
+                Some(crate::discovery::Flavor::Bedrock)
+            }
+            (Provider::Anthropic, None) | (Provider::Openai, _) => None,
+            (Provider::Anthropic, Some(CredentialSpec::CodexOauth)) => None,
         }
     }
+}
+
+fn validate_route(name: &str, route: &RouteSpec, config: &Config) -> Result<()> {
+    let credential = route.credential(config);
+    let supported = matches!(
+        (route.provider, credential),
+        (Provider::Anthropic, Some(CredentialSpec::ClaudeOauth))
+            | (Provider::Anthropic, Some(CredentialSpec::BedrockApiKey))
+            | (Provider::Anthropic, None)
+            | (Provider::Openai, Some(CredentialSpec::CodexOauth))
+    );
+    if supported {
+        return Ok(());
+    }
+    let credential_type = credential.map_or("none", CredentialSpec::type_name);
+    Err(Error::Config(format!(
+        "route `{name}` の provider `{:?}` と credential type `{credential_type}` は組み合わせられません",
+        route.provider
+    )))
 }
 
 impl Config {
@@ -472,6 +478,19 @@ impl Config {
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
         self.webhook.destination_url().map_err(Error::Config)?;
+        for (name, route) in &self.routes {
+            if name.is_empty() {
+                return Err(Error::Config("route 名が空です".to_owned()));
+            }
+            if let Some(credential) = &route.credential
+                && !self.credentials.contains_key(credential)
+            {
+                return Err(Error::Config(format!(
+                    "route `{name}` が参照する credential `{credential}` が定義されていません"
+                )));
+            }
+            validate_route(name, route, self)?;
+        }
         for (name, ns) in &self.namespaces {
             if name.is_empty() {
                 return Err(Error::Config("namespace 名が空です".to_owned()));
@@ -482,12 +501,12 @@ impl Config {
     }
 
     fn validate_namespace(&self, ns_name: &str, ns: &Namespace) -> Result<()> {
-        let known = |name: &String| self.credentials.contains_key(name);
+        let known = |name: &String| self.routes.contains_key(name);
 
-        for name in &ns.credentials {
+        for name in &ns.routes {
             if !known(name) {
                 return Err(Error::Config(format!(
-                    "namespace `{ns_name}` が参照する credential `{name}` が定義されていません"
+                    "namespace `{ns_name}` が参照する route `{name}` が定義されていません"
                 )));
             }
         }
@@ -497,16 +516,16 @@ impl Config {
                     "namespace `{ns_name}` の routing[{i}] に models が指定されていません"
                 )));
             }
-            if rule.credentials.is_empty() {
+            if rule.routes.is_empty() {
                 return Err(Error::Config(format!(
-                    "namespace `{ns_name}` の routing[{i}] ({}) に credentials が指定されていません",
+                    "namespace `{ns_name}` の routing[{i}] ({}) に routes が指定されていません",
                     rule.models.join(", ")
                 )));
             }
-            for name in &rule.credentials {
+            for name in &rule.routes {
                 if !known(name) {
                     return Err(Error::Config(format!(
-                        "namespace `{ns_name}` の routing[{i}] ({}) が参照する credential `{name}` が定義されていません",
+                        "namespace `{ns_name}` の routing[{i}] ({}) が参照する route `{name}` が定義されていません",
                         rule.models.join(", ")
                     )));
                 }
@@ -547,36 +566,36 @@ impl Namespace {
         all
     }
 
-    /// このモデルを扱う認証情報を、試す順に返す。
+    /// このモデルを扱う経路を、試す順に返す。
     ///
     /// `routing` の上から照合し、最初に当たった規則を使う。当たらなければ
-    /// この namespace が使える認証情報を宣言順に全部試す。
-    pub fn credentials_for<'a>(&'a self, model: &str, all: &'a Config) -> Vec<&'a str> {
+    /// この namespace が使える経路を宣言順に全部試す。
+    pub fn routes_for<'a>(&'a self, model: &str, all: &'a Config) -> Vec<&'a str> {
         for rule in &self.routing {
             if crate::pattern::matches_any(&rule.models, model) {
-                return rule.credentials.iter().map(String::as_str).collect();
+                return rule.routes.iter().map(String::as_str).collect();
             }
         }
-        self.usable_credentials(all)
+        self.usable_routes(all)
     }
 
-    /// この namespace が使ってよい認証情報。
-    pub fn usable_credentials<'a>(&'a self, all: &'a Config) -> Vec<&'a str> {
-        if self.credentials.is_empty() {
-            return all.credentials.keys().map(String::as_str).collect();
+    /// この namespace が使ってよい経路。
+    pub fn usable_routes<'a>(&'a self, all: &'a Config) -> Vec<&'a str> {
+        if self.routes.is_empty() {
+            return all.routes.keys().map(String::as_str).collect();
         }
-        self.credentials.iter().map(String::as_str).collect()
+        self.routes.iter().map(String::as_str).collect()
     }
 
-    /// この認証情報がこのモデルを扱ってよいか。
-    pub fn allows(&self, credential: &str, model: &str, all: &Config) -> bool {
+    /// この経路がこのモデルを扱ってよいか。
+    pub fn allows(&self, route: &str, model: &str, all: &Config) -> bool {
         if crate::pattern::matches_any(&self.filter.exclude, model) {
             return false;
         }
-        if !self.usable_credentials(all).contains(&credential) {
+        if !self.usable_routes(all).contains(&route) {
             return false;
         }
-        match all.credentials.get(credential) {
+        match all.routes.get(route) {
             Some(spec) => !crate::pattern::matches_any(spec.exclude(), model),
             None => false,
         }
@@ -666,14 +685,14 @@ mod tests {
         std::fs::write(
             dir.path().join("shared.toml"),
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:8320"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 
 [ns.default]
 auth_token = "t"
@@ -693,7 +712,7 @@ auth_token = "t"
             Some("t"),
             "土台から来る分"
         );
-        assert!(config.credentials.contains_key("a"));
+        assert!(config.routes.contains_key("a"));
     }
 
     /// 実運用を想定した一式。
@@ -710,17 +729,33 @@ type = "claude_oauth"
 [credentials.claude-work-a]
 type = "claude_oauth"
 
-# fable 専用のアカウント。
 [credentials.claude-work-b]
 type = "claude_oauth"
-exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
 
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
+
+[routes.claude-work-a]
+provider = "anthropic"
+credential = "claude-work-a"
+
+# fable 専用のアカウント。
+[routes.claude-work-b]
+provider = "anthropic"
+credential = "claude-work-b"
+exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
 
-[credentials.cpa]
-type = "relay"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:8320"
 models = ["gpt-*"]
 
@@ -731,11 +766,11 @@ exclude = ["claude-3-*", "claude-opus-4*", "claude-sonnet-4-*"]
 # fable は Bedrock 優先 (Claude アカウントを消費しない)。
 [[ns.default.routing]]
 models = ["claude-fable-*"]
-credentials = ["bedrock", "claude-work-b", "claude-personal"]
+routes = ["bedrock", "claude-work-b", "claude-personal"]
 
 [[ns.default.routing]]
 models = ["gpt-*"]
-credentials = ["cpa"]
+routes = ["cpa"]
 
 [ns.default.aliases]
 o = "claude-opus-*"
@@ -819,7 +854,8 @@ type = "claude_oauth"
     fn reads_a_full_config() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(c.server.listen, "127.0.0.1:8317");
-        assert_eq!(c.credentials.len(), 5);
+        assert_eq!(c.credentials.len(), 4);
+        assert_eq!(c.routes.len(), 5);
         assert_eq!(ns(&c).routing.len(), 2);
         assert_eq!(c.discovery.refresh_secs, 3600, "既定は 1 時間");
     }
@@ -892,10 +928,10 @@ type = "claude_oauth"
     fn routing_matches_by_pattern() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(
-            ns(&c).credentials_for("claude-fable-5", &c),
+            ns(&c).routes_for("claude-fable-5", &c),
             vec!["bedrock", "claude-work-b", "claude-personal"]
         );
-        assert_eq!(ns(&c).credentials_for("gpt-5.6-sol", &c), vec!["cpa"]);
+        assert_eq!(ns(&c).routes_for("gpt-5.6-sol", &c), vec!["cpa"]);
     }
 
     /// 規則に当たらないモデルは宣言順に試す。
@@ -904,7 +940,7 @@ type = "claude_oauth"
     fn unmatched_models_fall_back_to_declaration_order() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(
-            ns(&c).credentials_for("claude-opus-6", &c),
+            ns(&c).routes_for("claude-opus-6", &c),
             vec![
                 "bedrock",
                 "claude-personal",
@@ -927,23 +963,31 @@ type = "claude_oauth"
 [credentials.b]
 type = "claude_oauth"
 
+[routes.a]
+provider = "anthropic"
+credential = "a"
+
+[routes.b]
+provider = "anthropic"
+credential = "b"
+
 [[ns.default.routing]]
 models = ["claude-opus-5"]
-credentials = ["a"]
+routes = ["a"]
 
 [[ns.default.routing]]
 models = ["claude-*"]
-credentials = ["b"]
+routes = ["b"]
 "#,
         )
         .unwrap();
         assert_eq!(
-            ns(&c).credentials_for("claude-opus-5", &c),
+            ns(&c).routes_for("claude-opus-5", &c),
             vec!["a"],
             "個別指定が先"
         );
         assert_eq!(
-            ns(&c).credentials_for("claude-sonnet-5", &c),
+            ns(&c).routes_for("claude-sonnet-5", &c),
             vec!["b"],
             "後ろの広い規則"
         );
@@ -980,15 +1024,15 @@ opus = "claude-opus-4*"
         use crate::discovery::Flavor;
         let c = parse(SAMPLE).unwrap();
         assert_eq!(
-            c.credentials["claude-personal"].discovery_flavor(),
+            c.routes["claude-personal"].discovery_flavor(&c),
             Some(Flavor::Anthropic)
         );
         assert_eq!(
-            c.credentials["bedrock"].discovery_flavor(),
+            c.routes["bedrock"].discovery_flavor(&c),
             Some(Flavor::Bedrock)
         );
         assert_eq!(
-            c.credentials["cpa"].discovery_flavor(),
+            c.routes["cpa"].discovery_flavor(&c),
             None,
             "転送先には聞けない"
         );
@@ -998,12 +1042,8 @@ opus = "claude-opus-4*"
     #[test]
     fn relay_declares_its_models() {
         let c = parse(SAMPLE).unwrap();
-        assert_eq!(c.credentials["cpa"].declared_models(), ["gpt-*"]);
-        assert!(
-            c.credentials["claude-personal"]
-                .declared_models()
-                .is_empty()
-        );
+        assert_eq!(c.routes["cpa"].declared_models(), ["gpt-*"]);
+        assert!(c.routes["claude-personal"].declared_models().is_empty());
     }
 
     #[test]
@@ -1013,9 +1053,13 @@ opus = "claude-opus-4*"
 [credentials.a]
 type = "claude_oauth"
 
+[routes.a]
+provider = "anthropic"
+credential = "a"
+
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "typo-here"]
+routes = ["a", "typo-here"]
 "#,
         )
         .unwrap_err();
@@ -1024,9 +1068,9 @@ credentials = ["a", "typo-here"]
 
     #[test]
     fn empty_routing_fields_are_rejected() {
-        assert!(parse("[[ns.default.routing]]\nmodels = []\ncredentials = []").is_err());
+        assert!(parse("[[ns.default.routing]]\nmodels = []\nroutes = []").is_err());
         assert!(
-            parse("[[ns.default.routing]]\nmodels = [\"m\"]\ncredentials = []")
+            parse("[[ns.default.routing]]\nmodels = [\"m\"]\nroutes = []")
                 .unwrap_err()
                 .to_string()
                 .contains('m')
@@ -1152,8 +1196,8 @@ credentials = ["a", "typo-here"]
         assert_eq!(ns(&again).routing.len(), ns(&original).routing.len());
         assert_eq!(ns(&again).filter.exclude, ns(&original).filter.exclude);
         assert_eq!(
-            ns(&again).credentials_for("claude-fable-5", &again),
-            ns(&original).credentials_for("claude-fable-5", &original)
+            ns(&again).routes_for("claude-fable-5", &again),
+            ns(&original).routes_for("claude-fable-5", &original)
         );
     }
 }
@@ -1186,14 +1230,17 @@ mod example_tests {
             "雛形どおりに書けば認証がかかる (未設定は全拒否なので、書き方が要る)"
         );
         assert!(
-            config.credentials.values().any(|c| !c.exclude().is_empty()),
+            config
+                .routes
+                .values()
+                .any(|route| !route.exclude().is_empty()),
             "credential ごとの絞り込みの例"
         );
         assert!(
             config
-                .credentials
+                .routes
                 .values()
-                .any(|c| !c.declared_models().is_empty()),
+                .any(|route| !route.declared_models().is_empty()),
             "relay で扱うモデルを宣言する例"
         );
     }

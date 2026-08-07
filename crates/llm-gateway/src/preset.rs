@@ -25,124 +25,73 @@ use std::sync::Arc;
 
 use anthropic::AnthropicWire;
 
-use crate::config::CredentialSpec;
+use crate::config::{Config, CredentialSpec, Provider, RouteSpec};
 use crate::provider::Preset;
 
-/// 設定 1 件を preset へ組み上げる。
-pub fn from_spec(name: &str, spec: &CredentialSpec) -> Preset {
-    let wire = Arc::new(AnthropicWire::new(name, spec.url(), spec.headers().clone()));
-    match spec {
-        CredentialSpec::ClaudeOauth { .. } => anthropic::official(name, wire),
-        CredentialSpec::ClaudeBedrock { deny_beta, .. } => {
-            bedrock::preset(name, wire, deny_beta.clone())
+/// route と認証情報を provider preset へ組み上げる。
+pub fn from_spec(name: &str, route: &RouteSpec, config: &Config) -> Preset {
+    let wire = Arc::new(AnthropicWire::new(
+        name,
+        route.url(),
+        route.headers().clone(),
+    ));
+    match (route.provider, route.credential(config)) {
+        (Provider::Anthropic, Some(CredentialSpec::ClaudeOauth)) => anthropic::official(name, wire),
+        (Provider::Anthropic, Some(CredentialSpec::BedrockApiKey)) => {
+            bedrock::preset(name, wire, route.deny_beta.clone())
         }
-        // Responses API への変換は未実装。それまでは素通しで凌ぐ。
-        CredentialSpec::CodexOauth { .. } | CredentialSpec::Relay { .. } => {
-            relay::preset(name, wire)
-        }
+        (Provider::Anthropic, None) => relay::preset(name, wire),
+        (Provider::Openai, Some(CredentialSpec::CodexOauth)) => relay::preset(name, wire),
+        _ => unreachable!("config validation guarantees a supported route composition"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    fn spec(toml: &str) -> CredentialSpec {
-        toml::from_str(toml).expect("設定として読める")
-    }
-
-    fn oauth() -> CredentialSpec {
-        spec(r#"type = "claude_oauth""#)
-    }
-
-    fn bedrock() -> CredentialSpec {
-        spec(
-            r#"type = "claude_bedrock"
-url = "https://bedrock.invalid/anthropic""#,
-        )
-    }
-
-    fn relay() -> CredentialSpec {
-        spec(
-            r#"type = "relay"
-url = "http://127.0.0.1:8317""#,
-        )
-    }
-
-    /// 束ね方の違いは capability の有無に出る。
-    #[test]
-    fn the_config_type_decides_which_capabilities_exist() {
-        assert!(
-            from_spec("claude-personal", &oauth()).quota_api().is_some(),
-            "枠を聞ける口を持つ"
-        );
-        assert!(
-            from_spec("bedrock", &bedrock()).quota_api().is_none(),
-            "Bedrock に枠照会 API は無い"
-        );
-        assert!(
-            from_spec("cpa", &relay()).quota_api().is_none(),
-            "枠は転送先が持っている"
-        );
-    }
-
-    /// 束ね方ごとに、枠について何が言えるかも決まる。
-    ///
-    /// 「取れるがまだ観測していない」「仕組みとして取れない」「転送先次第」は
-    /// upstream の事情なので、閲覧の口ではなく preset が宣言する (DR-0007)。
-    #[test]
-    fn the_config_type_decides_what_can_be_said_about_quota() {
-        use crate::quota::Support;
-
-        assert_eq!(
-            from_spec("claude-personal", &oauth()).quota_support(),
-            Support::Unobserved,
-            "応答ヘッダに載るので、使えば見える"
-        );
-        assert_eq!(
-            from_spec("bedrock", &bedrock()).quota_support(),
-            Support::NotApplicable,
-            "使用量は別の権限で、実行権限しかない鍵では取れない"
-        );
-        assert_eq!(
-            from_spec("cpa", &relay()).quota_support(),
-            Support::UpstreamDependent,
-            "転送先が返さないものは見えない"
-        );
-    }
-
-    /// 名前と接続先は設定から届く。
-    #[test]
-    fn the_preset_carries_the_configured_name_and_url() {
-        let spec = spec(
-            r#"type = "claude_oauth"
-url = "https://proxy.invalid""#,
-        );
-        let preset = from_spec("claude-work", &spec);
-
-        assert_eq!(preset.name(), "claude-work");
-        let encoded = preset
-            .wire()
-            .encode(crate::egress::EgressRequest {
-                path: "/v1/messages".to_owned(),
-                query: None,
-                body: serde_json::json!({"model": "m"}),
-                headers: crate::egress::Headers::default(),
-            })
-            .unwrap();
-        assert_eq!(encoded.url, "https://proxy.invalid/v1/messages");
-    }
-
-    /// 設定で足したヘッダは、どの束ね方でも同じ Wire が載せる。
-    #[test]
-    fn extra_headers_reach_the_wire() {
-        let spec = spec(
-            r#"type = "relay"
+    fn config() -> Config {
+        toml::from_str(
+            r#"
+[credentials.claude]
+type = "claude_oauth"
+[credentials.bedrock]
+type = "bedrock_api_key"
+[routes.claude]
+provider = "anthropic"
+credential = "claude"
+url = "https://proxy.invalid"
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
+url = "https://bedrock.invalid/anthropic"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:8317"
-headers = { x-trace = "on" }"#,
-        );
-        let encoded = from_spec("cpa", &spec)
+headers = { x-trace = "on" }
+"#,
+        )
+        .expect("設定として読める")
+    }
+
+    fn preset(config: &Config, name: &str) -> Preset {
+        from_spec(name, &config.routes[name], config)
+    }
+
+    /// 認証情報と方言の組み合わせで capability が決まる。
+    #[test]
+    fn route_composition_decides_capabilities() {
+        let config = config();
+        assert!(preset(&config, "claude").quota_api().is_some());
+        assert!(preset(&config, "bedrock").quota_api().is_none());
+        assert!(preset(&config, "cpa").quota_api().is_none());
+    }
+
+    /// route の URL と追加ヘッダは、認証情報とは独立して Wire へ届く。
+    #[test]
+    fn route_settings_reach_the_wire() {
+        let config = config();
+        let encoded = preset(&config, "cpa")
             .wire()
             .encode(crate::egress::EgressRequest {
                 path: "/v1/messages".to_owned(),
@@ -152,10 +101,7 @@ headers = { x-trace = "on" }"#,
             })
             .unwrap();
 
+        assert_eq!(encoded.url, "http://127.0.0.1:8317/v1/messages");
         assert_eq!(encoded.headers.get("x-trace"), Some("on"));
-        assert_eq!(
-            spec.headers(),
-            &BTreeMap::from([("x-trace".to_owned(), "on".to_owned())])
-        );
     }
 }

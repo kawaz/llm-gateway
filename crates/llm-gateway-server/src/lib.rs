@@ -734,14 +734,14 @@ content-length: {declared}\r\n\r\n{head}"
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -820,14 +820,14 @@ credentials = ["a"]
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -877,14 +877,14 @@ credentials = ["a"]
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -925,14 +925,14 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -970,14 +970,14 @@ credentials = ["a"]
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -1030,14 +1030,14 @@ credentials = ["a"]
         let logs = captured_logs();
         let base = serve_with_default_ns(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m", "claude-opus-5", "claude-fable-5"]
 
 [[ns.default.routing]]
 models = ["known"]
-credentials = ["a"]
+routes = ["a"]
 "#,
         )
         .await;
@@ -1082,14 +1082,14 @@ credentials = ["a"]
         let down = fake_upstream(|| (503, "{}".to_owned(), vec![])).await;
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{down}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -1124,14 +1124,14 @@ credentials = ["a"]
 
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -1159,14 +1159,14 @@ credentials = ["a"]
     async fn malformed_json_yields_400() {
         let base = serve_with_default_ns(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m", "claude-opus-5", "claude-fable-5"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
         )
         .await;
@@ -1190,8 +1190,8 @@ credentials = ["a"]
     async fn lists_models() {
         let base = serve_with_default_ns(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-fable-5"]
 
@@ -1230,14 +1230,14 @@ opus = "claude-opus-*"
         let upstream = fake_upstream(|| (200, r#"{"input_tokens":42}"#.to_owned(), vec![])).await;
         let base = serve_with_default_ns(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         ))
         .await;
@@ -1347,6 +1347,10 @@ dir = "{}"
 
 [credentials.claude-personal]
 type = "claude_oauth"
+
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
 url = "https://upstream.invalid"
 "#,
                 dir.path().display()
@@ -1370,11 +1374,15 @@ url = "https://upstream.invalid"
         let base = serve_with_default_ns(
             r#"
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock.invalid/anthropic"
 
-[credentials.cpa]
-type = "relay"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 "#,
@@ -1386,7 +1394,7 @@ models = ["m"]
         assert!(report.get("probe").is_none(), "既定では投げない");
 
         let bedrock = entry(&report, "bedrock");
-        assert_eq!(bedrock["type"], "claude_bedrock");
+        assert_eq!(bedrock["type"], "bedrock_api_key");
         assert_eq!(bedrock["support"], "not_applicable");
         assert!(
             bedrock.get("note").is_none(),
@@ -1417,11 +1425,15 @@ models = ["m"]
             r#"
 [credentials.claude-personal]
 type = "claude_oauth"
+
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
 url = "{upstream}"
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["claude-personal"]
+routes = ["claude-personal"]
 "#
         ))
         .await;
@@ -1474,6 +1486,10 @@ credentials = ["claude-personal"]
             r#"
 [credentials.claude-personal]
 type = "claude_oauth"
+
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
 url = "{upstream}"
 "#
         ))
@@ -1507,10 +1523,18 @@ url = "{upstream}"
             r#"
 [credentials.alive]
 type = "claude_oauth"
+
+[routes.alive]
+provider = "anthropic"
+credential = "alive"
 url = "{upstream}"
 
 [credentials.nowhere]
 type = "claude_oauth"
+
+[routes.nowhere]
+provider = "anthropic"
+credential = "nowhere"
 url = "http://127.0.0.1:9"
 "#
         ))
@@ -1548,6 +1572,10 @@ url = "http://127.0.0.1:9"
             r#"
 [credentials.busy]
 type = "claude_oauth"
+
+[routes.busy]
+provider = "anthropic"
+credential = "busy"
 url = "{upstream}"
 "#
         ))
@@ -1566,8 +1594,8 @@ url = "{upstream}"
     async fn usage_needs_no_token() {
         let base = serve_with_default_ns(
             r#"
-[credentials.cpa]
-type = "relay"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 "#,
@@ -1614,8 +1642,8 @@ mod e2e_namespace_tests {
     ///
     /// `tokenless` は `auth_token` を書かない namespace。誰でも通れる。
     const TWO_NS: &str = r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-fable-5", "gpt-5.6-sol"]
 
@@ -1805,21 +1833,28 @@ auth_token = "secret-token"
     async fn the_clients_own_credentials_never_reach_upstream() {
         const LEAKED: &str = "sk-ant-oat01-must-not-leak";
 
-        // 転送先が自分で認証を持つ経路 (relay) と、こちらが認証情報を付ける
-        // 経路 (claude_oauth) の両方を見る。
-        for (kind, declared) in [("relay", "models = [\"m\"]"), ("claude_oauth", "")] {
+        // 転送先が自分で認証を持つ経路と、こちらが認証情報を付ける経路の両方を見る。
+        for (credential, authenticated) in [
+            ("", false),
+            ("[credentials.a]\ntype = \"claude_oauth\"\n", true),
+        ] {
             let (upstream, seen) = recording_upstream().await;
+            let credential_ref = (!credential.is_empty())
+                .then_some("credential = \"a\"")
+                .unwrap_or("");
             // 認証を書かない namespace = 誰でも通る面。
             let base = serve(&format!(
                 r#"
-[credentials.a]
-type = "{kind}"
+{credential}
+[routes.a]
+provider = "anthropic"
+{credential_ref}
 url = "{upstream}"
-{declared}
+models = ["m"]
 
 [[ns.open.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 
 [ns.open]
 "#
@@ -1835,7 +1870,11 @@ credentials = ["a"]
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 200, "認証なしの面なので通る ({kind})");
+            assert_eq!(
+                resp.status(),
+                200,
+                "認証なしの面なので通る (authenticated={authenticated})"
+            );
 
             // 見るのは転送された分だけ (一覧の問い合わせと混ぜない)。
             let sent = seen
@@ -1847,21 +1886,24 @@ credentials = ["a"]
                 .collect::<Vec<_>>()
                 .join("\n")
                 .to_lowercase();
-            assert!(!sent.is_empty(), "転送が届いている ({kind})");
+            assert!(
+                !sent.is_empty(),
+                "転送が届いている (authenticated={authenticated})"
+            );
             assert!(
                 !sent.contains(LEAKED),
-                "名乗られた認証情報が漏れている ({kind}):\n{sent}"
+                "名乗られた認証情報が漏れている (authenticated={authenticated}):\n{sent}"
             );
             assert!(
                 !sent.contains("x-api-key"),
-                "欄ごと落とす ({kind}):\n{sent}"
+                "欄ごと落とす (authenticated={authenticated}):\n{sent}"
             );
             assert!(
                 sent.contains("anthropic-version: 2023-06-01"),
-                "関係のないヘッダまで落としてはいない ({kind}):\n{sent}"
+                "関係のないヘッダまで落としてはいない (authenticated={authenticated}):\n{sent}"
             );
 
-            if kind == "claude_oauth" {
+            if authenticated {
                 assert!(
                     sent.contains("authorization: bearer tok"),
                     "こちらが選んだ認証情報に差し替わる:\n{sent}"
@@ -1914,8 +1956,8 @@ credentials = ["a"]
     async fn plain_path_works_once_the_default_namespace_exists() {
         let base = super::tests::serve_with_default_ns(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5"]
 "#,
@@ -2057,14 +2099,14 @@ mod stats_tests {
         let base = serve_with_default_ns(&format!(
             r#"
 {}
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             stats_dir(dir.path())
         ))
@@ -2132,14 +2174,14 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         let base = serve_with_default_ns(&format!(
             r#"
 {}
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{upstream}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             stats_dir(dir.path())
         ))

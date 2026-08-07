@@ -242,10 +242,7 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
 
     let mut missing = Vec::new();
     let mut unreadable = Vec::new();
-    for (name, spec) in &config.credentials {
-        if !spec.needs_secret() {
-            continue;
-        }
+    for name in config.credentials.keys() {
         let id = CredentialId::new(name.as_str());
         match store.load(&id) {
             Ok(_) => {}
@@ -1179,9 +1176,9 @@ login して使うのは claude_oauth と codex_oauth だけです"
 /// 設定の宣言に対応する login の種別。login できない種別は `None`。
 fn login_kind_of(spec: &CredentialSpec) -> Option<Kind> {
     match spec {
-        CredentialSpec::ClaudeOauth { .. } => Some(Kind::Claude),
-        CredentialSpec::CodexOauth { .. } => Some(Kind::Codex),
-        CredentialSpec::ClaudeBedrock { .. } | CredentialSpec::Relay { .. } => None,
+        CredentialSpec::ClaudeOauth => Some(Kind::Claude),
+        CredentialSpec::CodexOauth => Some(Kind::Codex),
+        CredentialSpec::BedrockApiKey => None,
     }
 }
 
@@ -1241,7 +1238,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1416,7 +1412,7 @@ mod tests {
     /// login できない種別は、指定できる語を添えて断る。
     #[test]
     fn login_rejects_types_without_an_authorization_flow() {
-        for bad in ["claude_bedrock", "relay", "claude", "oauth"] {
+        for bad in ["bedrock_api_key", "relay", "claude", "oauth"] {
             let err = parse(&["--type", bad, "n"]).unwrap_err();
             assert!(err.contains("claude_oauth"), "{bad} → {err}");
         }
@@ -1453,20 +1449,11 @@ mod tests {
     }
 
     fn claude_oauth() -> CredentialSpec {
-        CredentialSpec::ClaudeOauth {
-            url: "https://api.anthropic.com".to_owned(),
-            headers: BTreeMap::new(),
-            exclude: Vec::new(),
-        }
+        CredentialSpec::ClaudeOauth
     }
 
-    fn relay() -> CredentialSpec {
-        CredentialSpec::Relay {
-            url: "http://127.0.0.1:8317".to_owned(),
-            headers: BTreeMap::new(),
-            models: Vec::new(),
-            exclude: Vec::new(),
-        }
+    fn without_login() -> CredentialSpec {
+        CredentialSpec::BedrockApiKey
     }
 
     /// 宣言が無い名前でも保存はできる (設定を書く前に取れる)。
@@ -1489,7 +1476,7 @@ mod tests {
 
     #[test]
     fn declared_type_without_login_is_refused() {
-        let err = check_declared_type("r", Kind::Claude, Some(&relay())).unwrap_err();
+        let err = check_declared_type("r", Kind::Claude, Some(&without_login())).unwrap_err();
         assert!(err.contains("login"), "{err}");
     }
 
@@ -1747,7 +1734,7 @@ mod tests {
         let out = render(&report(vec![
             CredentialUsage::new(
                 "bedrock",
-                "claude_bedrock",
+                "bedrock_api_key",
                 llm_gateway::quota::Support::NotApplicable,
                 None,
             ),

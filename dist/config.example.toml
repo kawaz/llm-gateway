@@ -11,7 +11,7 @@
 #   extends = "config-shared.toml"   # 相対パスは、このファイルの隣から
 #
 # 土台の上に、このファイルに書いた分が重なる。表は鍵ごとに重なり
-# (credentials.bedrock.exclude だけ書けば type / url は土台のまま)、
+# (routes.bedrock.exclude だけ書けば provider / url は土台のまま)、
 # 配列は丸ごと置き換わる (routing の並びは意味を持つので混ぜない)。
 
 [server]
@@ -44,14 +44,22 @@ refresh_secs = 3600
 # 認証情報
 #
 # キーが store 内のファイル名になる (claude-personal → claude-personal.json)。
-# relay 以外は、そのファイルに token を置く必要がある。
+# ここに宣言した分は、そのファイルに token または API key を置く必要がある。
 # ---------------------------------------------------------------------------
 
 [credentials.claude-personal]
 type = "claude_oauth"
 
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
+
 [credentials.claude-work]
 type = "claude_oauth"
+
+[routes.claude-work]
+provider = "anthropic"
+credential = "claude-work"
 
 # 特定のモデル専用にしたいアカウントは、他を exclude で塞ぐ。
 # ここに書いた分は、上の [filter] に足して効く。
@@ -63,7 +71,11 @@ type = "claude_oauth"
 # 名前の分裂も防げる: Bedrock は claude-haiku-4-5、公式は
 # claude-haiku-4-5-20251001 と名乗るので、両方拾うと別モデルとして並ぶ。
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
 exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
 # 受け付けない beta フラグは既定で落とす。顔ぶれを変えたいときだけ書く。
@@ -71,8 +83,8 @@ exclude = ["claude-opus-*", "claude-sonnet-*", "claude-haiku-*"]
 
 # 別の gateway へ丸ごと渡す。転送先が認証を持つので鍵は要らない。
 # 一覧も聞けないので、扱うモデルをここに書く (これは許可リスト)。
-[credentials.other-gateway]
-type = "relay"
+[routes.other-gateway]
+provider = "anthropic"
 url = "http://127.0.0.1:8320"
 models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
@@ -99,7 +111,7 @@ auth_token = "ここに十分に長い乱数を書く"
 # 公開しないモデル。
 #
 # upstream が返す一覧をそのまま出すと古い世代まで並ぶので、ここで隠す。
-# この namespace の全 credential に効く。
+# この namespace の全 route に効く。
 [ns.default.filter]
 exclude = [
     "claude-3-*",
@@ -109,16 +121,16 @@ exclude = [
 ]
 
 # 振り分け。上から照合し、最初に当たった規則を使う。ここに書かないモデルは、
-# discovery でそれを持っていた credential へ流れる。
+# discovery でそれを持っていた route へ流れる。
 
 # fable は Bedrock 優先。落ちている間だけ OAuth へ回る。
 [[ns.default.routing]]
 models = ["claude-fable-*"]
-credentials = ["bedrock", "claude-work", "claude-personal"]
+routes = ["bedrock", "claude-work", "claude-personal"]
 
 [[ns.default.routing]]
 models = ["gpt-*"]
-credentials = ["other-gateway"]
+routes = ["other-gateway"]
 
 # 短い名前。
 #
@@ -131,9 +143,9 @@ opus = "claude-opus-*"
 sonnet = "claude-sonnet-*"
 haiku = "claude-haiku-*"
 
-# 面ごとに分けたいときは namespace を足す。使う credential も絞れる。
+# 面ごとに分けたいときは namespace を足す。使う route も絞れる。
 # クライアント側は ANTHROPIC_BASE_URL=http://127.0.0.1:11300/ns-work。
 #
 # [ns.work]
 # auth_token = "別の乱数"
-# credentials = ["claude-work"]
+# routes = ["claude-work"]

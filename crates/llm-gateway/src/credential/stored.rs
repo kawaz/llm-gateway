@@ -24,8 +24,7 @@ use super::time::{format_rfc3339, parse_rfc3339};
 /// login で認可を通せる種別。
 ///
 /// 設定ファイルの `type` と保存ファイルの `type` は同じ語を使う。
-/// API キー認証 (`claude_bedrock`) や転送 (`relay`) は認可の流れを持たない
-/// ので、ここには無い。
+/// API キー認証 (`bedrock_api_key`) は認可の流れを持たないので、ここには無い。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Anthropic のサブスク OAuth。
@@ -124,7 +123,7 @@ impl Drop for ApiKey {
 pub enum Payload {
     ClaudeOauth(OauthTokens),
     CodexOauth(CodexTokens),
-    ClaudeBedrock(ApiKey),
+    BedrockApiKey(ApiKey),
 }
 
 impl Payload {
@@ -133,7 +132,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(_) => "claude_oauth",
             Self::CodexOauth(_) => "codex_oauth",
-            Self::ClaudeBedrock(_) => "claude_bedrock",
+            Self::BedrockApiKey(_) => "bedrock_api_key",
         }
     }
 
@@ -142,7 +141,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(_) => Some(Kind::Claude),
             Self::CodexOauth(_) => Some(Kind::Codex),
-            Self::ClaudeBedrock(_) => None,
+            Self::BedrockApiKey(_) => None,
         }
     }
 
@@ -151,7 +150,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(t) => &t.access_token,
             Self::CodexOauth(c) => &c.oauth.access_token,
-            Self::ClaudeBedrock(k) => &k.api_key,
+            Self::BedrockApiKey(k) => &k.api_key,
         }
     }
 
@@ -160,7 +159,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(t) => &t.expired,
             Self::CodexOauth(c) => &c.oauth.expired,
-            Self::ClaudeBedrock(k) => &k.expired,
+            Self::BedrockApiKey(k) => &k.expired,
         }
     }
 
@@ -169,7 +168,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(t) => Some(t),
             Self::CodexOauth(c) => Some(&mut c.oauth),
-            Self::ClaudeBedrock(_) => None,
+            Self::BedrockApiKey(_) => None,
         }
     }
 
@@ -178,7 +177,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(t) => Some(&t.refresh_token),
             Self::CodexOauth(c) => Some(&c.oauth.refresh_token),
-            Self::ClaudeBedrock(_) => None,
+            Self::BedrockApiKey(_) => None,
         }
     }
 
@@ -187,7 +186,7 @@ impl Payload {
         match self {
             Self::ClaudeOauth(t) => &t.email,
             Self::CodexOauth(c) => &c.oauth.email,
-            Self::ClaudeBedrock(_) => "",
+            Self::BedrockApiKey(_) => "",
         }
     }
 
@@ -195,7 +194,7 @@ impl Payload {
     pub fn account_id(&self) -> Option<&str> {
         match self {
             Self::CodexOauth(c) => c.account_id.as_deref(),
-            Self::ClaudeOauth(_) | Self::ClaudeBedrock(_) => None,
+            Self::ClaudeOauth(_) | Self::BedrockApiKey(_) => None,
         }
     }
 }
@@ -260,7 +259,7 @@ impl Serialize for StoredCredential {
         match &self.payload {
             Payload::ClaudeOauth(p) => map.serialize_entry("payload", p)?,
             Payload::CodexOauth(p) => map.serialize_entry("payload", p)?,
-            Payload::ClaudeBedrock(p) => map.serialize_entry("payload", p)?,
+            Payload::BedrockApiKey(p) => map.serialize_entry("payload", p)?,
         }
         map.end()
     }
@@ -478,7 +477,7 @@ mod tests {
                 oauth: oauth("at"),
                 account_id: Some("acc-1".to_owned()),
             }),
-            Payload::ClaudeBedrock(api_key(extra)),
+            Payload::BedrockApiKey(api_key(extra)),
         ];
 
         for payload in payloads {
@@ -516,7 +515,7 @@ mod tests {
         assert_eq!(codex.oauth_kind(), Some(Kind::Codex));
         assert_eq!(codex.account_id(), Some("acc-1"));
 
-        let bedrock = Payload::ClaudeBedrock(api_key(BTreeMap::new()));
+        let bedrock = Payload::BedrockApiKey(api_key(BTreeMap::new()));
         assert_eq!(bedrock.oauth_kind(), None, "更新の口が無い");
         assert_eq!(
             bedrock.refresh_token(),
@@ -542,8 +541,8 @@ mod tests {
         });
         assert_eq!(codex.type_name(), Kind::Codex.config_type());
 
-        let bedrock = Payload::ClaudeBedrock(api_key(BTreeMap::new()));
-        assert_eq!(bedrock.type_name(), "claude_bedrock");
+        let bedrock = Payload::BedrockApiKey(api_key(BTreeMap::new()));
+        assert_eq!(bedrock.type_name(), "bedrock_api_key");
     }
 
     /// 運用の設定は省略できる。payload は省略できない。
@@ -672,7 +671,7 @@ mod tests {
     fn kind_from_config_type() {
         assert_eq!(Kind::from_config_type("claude_oauth"), Some(Kind::Claude));
         assert_eq!(Kind::from_config_type("codex_oauth"), Some(Kind::Codex));
-        for other in ["claude_bedrock", "relay", "claude", "codex", ""] {
+        for other in ["bedrock_api_key", "relay", "claude", "codex", ""] {
             assert_eq!(Kind::from_config_type(other), None, "{other}");
         }
     }

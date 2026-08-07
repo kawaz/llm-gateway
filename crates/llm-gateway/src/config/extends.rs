@@ -117,13 +117,17 @@ mod tests {
 listen = "127.0.0.1:8401"
 
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock.invalid/anthropic"
 exclude = ["claude-opus-*"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["bedrock"]
+routes = ["bedrock"]
 "#;
 
     /// 派生側に書いた分だけが変わり、書いていない分は土台のまま。
@@ -145,7 +149,7 @@ listen = "127.0.0.1:8402"
         let merged = resolve(&at(&dir, "here.toml")).unwrap();
         assert_eq!(merged["server"]["listen"].as_str(), Some("127.0.0.1:8402"));
         assert_eq!(
-            merged["credentials"]["bedrock"]["url"].as_str(),
+            merged["routes"]["bedrock"]["url"].as_str(),
             Some("https://bedrock.invalid/anthropic"),
             "触っていない土台の項目は残る"
         );
@@ -165,24 +169,24 @@ listen = "127.0.0.1:8402"
                 r#"
 extends = "base.toml"
 
-[credentials.bedrock]
+[routes.bedrock]
 exclude = ["*"]
 "#,
             ),
         ]);
 
-        let bedrock = &resolve(&at(&dir, "here.toml")).unwrap()["credentials"]["bedrock"];
+        let route = &resolve(&at(&dir, "here.toml")).unwrap()["routes"]["bedrock"];
         assert_eq!(
-            bedrock["type"].as_str(),
-            Some("claude_bedrock"),
+            route["provider"].as_str(),
+            Some("anthropic"),
             "書いていない項目は土台から来る"
         );
         assert_eq!(
-            bedrock["url"].as_str(),
+            route["url"].as_str(),
             Some("https://bedrock.invalid/anthropic")
         );
         assert_eq!(
-            bedrock["exclude"].as_array().unwrap(),
+            route["exclude"].as_array().unwrap(),
             &[Value::from("*")],
             "書いた項目だけが変わる"
         );
@@ -200,7 +204,7 @@ extends = "base.toml"
 
 [[ns.default.routing]]
 models = ["*"]
-credentials = ["oauth"]
+routes = ["oauth"]
 "#,
             ),
         ]);
@@ -210,7 +214,7 @@ credentials = ["oauth"]
             .unwrap()
             .clone();
         assert_eq!(routing.len(), 1, "土台の規則は残らない: {routing:?}");
-        assert_eq!(routing[0]["credentials"][0].as_str(), Some("oauth"));
+        assert_eq!(routing[0]["routes"][0].as_str(), Some("oauth"));
     }
 
     /// 相対パスは、それを書いたファイルの隣から解く。
@@ -236,7 +240,7 @@ listen = "127.0.0.1:8402"
         assert_eq!(merged["server"]["listen"].as_str(), Some("127.0.0.1:8402"));
         assert_eq!(
             merged["credentials"]["bedrock"]["type"].as_str(),
-            Some("claude_bedrock")
+            Some("bedrock_api_key")
         );
     }
 
@@ -253,7 +257,7 @@ extends = "a.toml"
 [server]
 listen = "127.0.0.1:8402"
 
-[credentials.bedrock]
+[routes.bedrock]
 exclude = ["b が書いた"]
 "#,
             ),
@@ -262,7 +266,7 @@ exclude = ["b が書いた"]
                 r#"
 extends = "b.toml"
 
-[credentials.bedrock]
+[routes.bedrock]
 exclude = ["c が書いた"]
 "#,
             ),
@@ -270,9 +274,7 @@ exclude = ["c が書いた"]
 
         let merged = resolve(&at(&dir, "c.toml")).unwrap();
         assert_eq!(
-            merged["credentials"]["bedrock"]["exclude"]
-                .as_array()
-                .unwrap(),
+            merged["routes"]["bedrock"]["exclude"].as_array().unwrap(),
             &[Value::from("c が書いた")],
             "一番手前が勝つ"
         );
@@ -283,7 +285,7 @@ exclude = ["c が書いた"]
         );
         assert_eq!(
             merged["credentials"]["bedrock"]["type"].as_str(),
-            Some("claude_bedrock"),
+            Some("bedrock_api_key"),
             "一番奥の段も残る"
         );
     }

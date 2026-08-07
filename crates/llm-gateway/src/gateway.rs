@@ -521,7 +521,7 @@ impl<P: Persistence> Gateway<P> {
         };
 
         let mut credentials = Vec::new();
-        for (name, spec) in &self.config.credentials {
+        for (name, route) in &self.config.routes {
             // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
             // (DR-0014 §3)。置き場はディスクとの出入りだけを担う。
             let preset = self.router.preset(name);
@@ -531,8 +531,11 @@ impl<P: Persistence> Gateway<P> {
                 quota::Support::UpstreamDependent,
                 |preset| preset.quota_support(),
             );
+            let credential_type = route
+                .credential(&self.config)
+                .map_or("none", crate::config::CredentialSpec::type_name);
 
-            let mut entry = quota::CredentialUsage::new(name, spec.type_name(), support, snapshot);
+            let mut entry = quota::CredentialUsage::new(name, credential_type, support, snapshot);
             entry.limits = probed
                 .as_ref()
                 .and_then(|p| p.limits.get(name.as_str()).cloned());
@@ -1194,14 +1197,14 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         let up = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             up.url
         ))
@@ -1277,11 +1280,15 @@ credentials = ["a"]
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{}"
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             up.url
         ))
@@ -1308,8 +1315,8 @@ credentials = ["a"]
         let up = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["claude-opus-5"]
 
@@ -1345,14 +1352,14 @@ opus = "claude-opus-*"
         let up = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             up.url
         ))
@@ -1376,14 +1383,14 @@ credentials = ["a"]
         let denying = FakeUpstream::always(429).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             denying.url
         ))
@@ -1406,19 +1413,19 @@ credentials = ["a"]
         let alive = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.down]
-type = "relay"
+[routes.down]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
-[credentials.alive]
-type = "relay"
+[routes.alive]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["down", "alive"]
+routes = ["down", "alive"]
 "#,
             down.url, alive.url
         ))
@@ -1440,19 +1447,19 @@ credentials = ["down", "alive"]
         let alive = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.nowhere]
-type = "relay"
+[routes.nowhere]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
-[credentials.alive]
-type = "relay"
+[routes.alive]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["nowhere", "alive"]
+routes = ["nowhere", "alive"]
 "#,
             alive.url
         ))
@@ -1473,19 +1480,19 @@ credentials = ["nowhere", "alive"]
         let other = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
             up.url, other.url
         ))
@@ -1505,14 +1512,14 @@ credentials = ["a", "b"]
     fn one_credential(url: &str) -> String {
         format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{url}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         )
     }
@@ -1520,19 +1527,19 @@ credentials = ["a"]
     fn two_credentials(first: &str, second: &str) -> String {
         format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{first}"
 models = ["m"]
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{second}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#
         )
     }
@@ -1674,19 +1681,19 @@ credentials = ["a", "b"]
         let spare = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m-fable", "m-haiku"]
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{}"
 models = ["m-fable", "m-haiku"]
 
 [[ns.default.routing]]
 models = ["*"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
             picky.url, spare.url
         ))
@@ -1890,11 +1897,15 @@ credentials = ["a", "b"]
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{url}"
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#
         )
     }
@@ -2027,16 +2038,20 @@ credentials = ["a"]
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{}"
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
             vague.url, spare.url
         ))
@@ -2070,16 +2085,20 @@ credentials = ["a", "b"]
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{}"
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
             denied.url, spare.url
         ))
@@ -2225,14 +2244,14 @@ credentials = ["a", "b"]
         let limited = FakeUpstream::always(429).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
             limited.url
         ))
@@ -2289,19 +2308,19 @@ credentials = ["a"]
         let b = FakeUpstream::always(502).await;
         let gw = gateway(&format!(
             r#"
-[credentials.first]
-type = "relay"
+[routes.first]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
-[credentials.second]
-type = "relay"
+[routes.second]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["first", "second"]
+routes = ["first", "second"]
 "#,
             a.url, b.url
         ))
@@ -2332,19 +2351,19 @@ credentials = ["first", "second"]
         let alive = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.flaky]
-type = "relay"
+[routes.flaky]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
-[credentials.alive]
-type = "relay"
+[routes.alive]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["flaky", "alive"]
+routes = ["flaky", "alive"]
 "#,
             flaky.url, alive.url
         ))
@@ -2375,19 +2394,19 @@ credentials = ["flaky", "alive"]
         let limited = FakeUpstream::always(429).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
             limited.url
         ))
@@ -2422,16 +2441,20 @@ credentials = ["a", "b"]
                 r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{}"
 
-[credentials.b]
-type = "relay"
+[routes.b]
+provider = "anthropic"
 url = "{}"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a", "b"]
+routes = ["a", "b"]
 "#,
                 negotiating.url, spare.url
             ),
@@ -2507,14 +2530,14 @@ credentials = ["a", "b"]
     async fn unknown_model_is_rejected() {
         let gw = gateway(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["known"]
-credentials = ["a"]
+routes = ["a"]
 "#,
         )
         .await;
@@ -2536,14 +2559,14 @@ credentials = ["a"]
     async fn missing_model_is_rejected() {
         let gw = gateway(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
 [[ns.default.routing]]
 models = ["m"]
-credentials = ["a"]
+routes = ["a"]
 "#,
         )
         .await;
@@ -2566,8 +2589,8 @@ credentials = ["a"]
     async fn lists_models_from_credentials() {
         let gw = gateway(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["z-model", "a-model"]
 
@@ -2590,8 +2613,8 @@ models = ["z-model", "a-model"]
 [ns.default.filter]
 exclude = ["claude-opus-4*"]
 
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5", "claude-opus-4-8"]
 
@@ -2836,12 +2859,20 @@ advisor-tool-2026-03-01";
 [credentials.claude-personal]
 type = "claude_oauth"
 
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
+
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock.invalid/anthropic"
 
-[credentials.cpa]
-type = "relay"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
@@ -2931,10 +2962,14 @@ models = ["m"]
             r#"
 [credentials.a]
 type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
 url = "{}"
 
-[credentials.relayed]
-type = "relay"
+[routes.relayed]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["m"]
 
@@ -2976,10 +3011,18 @@ models = ["m"]
             r#"
 [credentials.nowhere]
 type = "claude_oauth"
+
+[routes.nowhere]
+provider = "anthropic"
+credential = "nowhere"
 url = "http://127.0.0.1:9"
 
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock.invalid/anthropic"
 
 [ns.default]
@@ -3029,8 +3072,8 @@ url = "https://bedrock.invalid/anthropic"
 [stats]
 dir = "{}"
 
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "http://127.0.0.1:9"
 models = ["claude-opus-5"]
 
@@ -3074,8 +3117,8 @@ models = ["claude-opus-5"]
         let up = FakeUpstream::always(200).await;
         let gw = gateway(&format!(
             r#"
-[credentials.a]
-type = "relay"
+[routes.a]
+provider = "anthropic"
 url = "{}"
 models = ["claude-opus-5"]
 

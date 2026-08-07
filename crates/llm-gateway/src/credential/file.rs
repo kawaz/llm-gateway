@@ -266,7 +266,7 @@ mod tests {
         let store = FileStore::open(dir.path()).unwrap();
         fs::write(
             dir.path().join("bedrock.json"),
-            r#"{"type":"claude_bedrock","priority":5,
+            r#"{"type":"bedrock_api_key","priority":5,
                 "excluded_models":["claude-opus-*"],
                 "payload":{"api_key":"ak","expired":"2026-08-02T10:08:18+09:00"}}"#,
         )

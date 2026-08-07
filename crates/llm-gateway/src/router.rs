@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::config::{Config, CredentialSpec, Namespace};
+use crate::config::{Config, Namespace, RouteSpec};
 use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::denial::{Availability, PROBE_INTERVAL};
 use crate::discovery::{self, Model};
@@ -98,14 +98,14 @@ struct Catalog {
     /// (クライアント向けの名前 → upstream での名前)。
     ///
     /// 独自の名前空間を付ける upstream があるので、変換が要る。
-    by_credential: BTreeMap<String, BTreeMap<String, String>>,
+    by_route: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Catalog {
     /// この namespace に見せるモデルと、それを扱える credential。
     fn visible(&self, ns: &Namespace, config: &Config) -> BTreeMap<String, Vec<String>> {
         let mut visible: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (credential, models) in &self.by_credential {
+        for (credential, models) in &self.by_route {
             for model in models.keys() {
                 if ns.allows(credential, model, config) {
                     visible
@@ -119,7 +119,7 @@ impl Catalog {
     }
 
     fn upstream_name(&self, credential: &str, model: &str) -> Option<&str> {
-        self.by_credential
+        self.by_route
             .get(credential)?
             .get(model)
             .map(String::as_str)
@@ -155,9 +155,14 @@ struct Binding {
 impl Router {
     pub fn new(config: Config, events: Arc<Events>) -> Self {
         let presets = config
-            .credentials
+            .routes
             .iter()
-            .map(|(name, spec)| (name.clone(), Arc::new(preset::from_spec(name, spec))))
+            .map(|(name, route)| {
+                (
+                    name.clone(),
+                    Arc::new(preset::from_spec(name, route, &config)),
+                )
+            })
             .collect();
         Self {
             config,
@@ -194,40 +199,36 @@ impl Router {
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
     ) {
-        let mut by_credential: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let mut by_route: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let previous = self.catalog.read().await;
 
-        for (name, spec) in &self.config.credentials {
-            let found = match spec.discovery_flavor() {
-                Some(flavor) => match self.discover(http, credentials, name, spec, flavor).await {
+        for (name, route) in &self.config.routes {
+            let found = match route.discovery_flavor(&self.config) {
+                Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
                     Ok(found) => found,
                     Err(e) => {
                         warn!(credential = %name, %e, "一覧を取れません。前回の結果を使います");
-                        previous
-                            .by_credential
-                            .get(name)
-                            .cloned()
-                            .unwrap_or_default()
+                        previous.by_route.get(name).cloned().unwrap_or_default()
                     }
                 },
                 // 聞けない upstream は設定に書かれたものを使う。
-                None => spec
+                None => route
                     .declared_models()
                     .iter()
                     .map(|m| (m.clone(), m.clone()))
                     .collect(),
             };
-            by_credential.insert(name.clone(), found);
+            by_route.insert(name.clone(), found);
         }
         drop(previous);
 
-        let total: usize = by_credential.values().map(BTreeMap::len).sum();
+        let total: usize = by_route.values().map(BTreeMap::len).sum();
         info!(
-            credentials = by_credential.len(),
+            credentials = by_route.len(),
             models = total,
             "モデル一覧を更新しました"
         );
-        *self.catalog.write().await = Catalog { by_credential };
+        *self.catalog.write().await = Catalog { by_route };
     }
 
     /// 1 つの credential に一覧を聞く。
@@ -238,11 +239,18 @@ impl Router {
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
         name: &str,
-        spec: &CredentialSpec,
+        route: &RouteSpec,
         flavor: discovery::Flavor,
     ) -> Result<BTreeMap<String, String>> {
-        let credential = credentials.acquire(&CredentialId::new(name)).await?;
-        let found = discovery::fetch(http, flavor, spec.url(), &credential).await?;
+        let credential_name = route.credential.as_deref().ok_or_else(|| {
+            Error::Config(format!(
+                "route `{name}` には discovery 用 credential がありません"
+            ))
+        })?;
+        let credential = credentials
+            .acquire(&CredentialId::new(credential_name))
+            .await?;
+        let found = discovery::fetch(http, flavor, route.url(), &credential).await?;
         Ok(found.into_iter().map(|m| (m.id, m.upstream_id)).collect())
     }
 
@@ -285,7 +293,7 @@ impl Router {
         let Some(available) = visible.get(&model) else {
             return Vec::new();
         };
-        ns.credentials_for(&model, &self.config)
+        ns.routes_for(&model, &self.config)
             .into_iter()
             .filter(|name| available.iter().any(|a| a == name))
             .map(str::to_owned)
@@ -311,7 +319,7 @@ impl Router {
 
         // 設定の優先順のうち、このモデルを実際に扱えるものだけを残す。
         let ordered: Vec<&str> = ns
-            .credentials_for(model, &self.config)
+            .routes_for(model, &self.config)
             .into_iter()
             .filter(|name| available.iter().any(|a| a == name))
             .collect();
@@ -388,11 +396,11 @@ impl Router {
     }
 
     fn build_route(&self, catalog: &Catalog, name: &str, model: &str) -> Option<Arc<Route>> {
-        let spec = self.config.credentials.get(name)?;
+        let route = self.config.routes.get(name)?;
         let preset = self.presets.get(name)?;
         Some(Arc::new(Route {
             preset: Arc::clone(preset),
-            credential: spec.needs_secret().then(|| CredentialId::new(name)),
+            credential: route.credential.as_deref().map(CredentialId::new),
             // upstream での名前が違う場合だけ書き換える。
             upstream_model: catalog
                 .upstream_name(name, model)
@@ -424,8 +432,8 @@ impl Router {
     /// 引数は「credential → その credential が扱えるモデル
     /// (クライアント向けの名前, upstream での名前)」。
     #[cfg(test)]
-    async fn set_catalog(&self, by_credential: &[(&str, &[(&str, &str)])]) {
-        self.catalog.write().await.by_credential = by_credential
+    async fn set_catalog(&self, by_route: &[(&str, &[(&str, &str)])]) {
+        self.catalog.write().await.by_route = by_route
             .iter()
             .map(|(cred, models)| {
                 (
@@ -535,34 +543,46 @@ mod tests {
 exclude = ["claude-opus-4*"]
 
 [credentials.bedrock]
-type = "claude_bedrock"
+type = "bedrock_api_key"
+
+[routes.bedrock]
+provider = "anthropic"
+credential = "bedrock"
 url = "https://bedrock.invalid/anthropic"
 
 [credentials.oauth-a]
 type = "claude_oauth"
 
+[routes.oauth-a]
+provider = "anthropic"
+credential = "oauth-a"
+
 [credentials.oauth-b]
 type = "claude_oauth"
+
+[routes.oauth-b]
+provider = "anthropic"
+credential = "oauth-b"
 exclude = ["claude-haiku-*"]
 
-[credentials.cpa]
-type = "relay"
+[routes.cpa]
+provider = "anthropic"
 url = "http://127.0.0.1:8320"
 models = ["gpt-5.6-sol"]
 
 [[ns.default.routing]]
 models = ["claude-fable-*"]
-credentials = ["bedrock", "oauth-a"]
+routes = ["bedrock", "oauth-a"]
 
 # 3 本並ぶ経路。前回通った経路を先頭へ寄せたときに、残りの順が
 # 設定のままかを見るために使う。
 [[ns.default.routing]]
 models = ["claude-sonnet-5"]
-credentials = ["bedrock", "oauth-a", "oauth-b"]
+routes = ["bedrock", "oauth-a", "oauth-b"]
 
 [[ns.default.routing]]
 models = ["gpt-*"]
-credentials = ["cpa"]
+routes = ["cpa"]
 
 [ns.default.aliases]
 # 正式な短縮名
@@ -577,7 +597,7 @@ haiku = "claude-haiku"
 # 結びつきが namespace をまたがないことを見るための面。
 [[ns.other.routing]]
 models = ["claude-fable-*"]
-credentials = ["bedrock", "oauth-a"]
+routes = ["bedrock", "oauth-a"]
 "#;
 
     const NOW: i64 = 1_800_000_000;
