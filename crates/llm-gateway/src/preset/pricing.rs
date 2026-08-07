@@ -67,6 +67,22 @@ const fn row(patterns: &'static [&'static str], rates: &'static [(&'static str, 
 ///
 /// 出典と確認日はモデル群ごとに脚注で示す。数字を直したら確認日も直す。
 static TABLE: &[Row] = &[
+    // --- ChatGPT subscription
+    // サブスク経路には request ごとの請求額が無いので参考値は 0。reasoning は
+    // output の内数であり、独立した課金軸へは載せない。
+    // TODO: platform API の課金経路を追加するときは、その preset 専用表へ実単価を置く。
+    row(
+        &[
+            "gpt-5.1",
+            "gpt-5.1-codex-*",
+            "gpt-5.2",
+            "gpt-5.2-codex*",
+            "gpt-5.3-codex*",
+            "gpt-5.4",
+            "codex-*",
+        ],
+        &[(INPUT, 0.0), (OUTPUT, 0.0), (CACHE_READ, 0.0)],
+    ),
     // --- Anthropic (2026-07-31 確認 / claude-api skill の Current Models 表)
     //     cache write = input x1.25 (5m TTL), cache read = input x0.1。
     //     input はキャッシュ分を含まないので、4 区分は重ならない。

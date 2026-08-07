@@ -207,8 +207,19 @@ impl Router {
                 Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
                     Ok(found) => found,
                     Err(e) => {
-                        warn!(credential = %name, %e, "一覧を取れません。前回の結果を使います");
-                        previous.by_route.get(name).cloned().unwrap_or_default()
+                        warn!(route = %name, %e, "一覧を取れません。保存済みまたは設定の一覧を使います");
+                        previous
+                            .by_route
+                            .get(name)
+                            .filter(|models| !models.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                route
+                                    .declared_models()
+                                    .iter()
+                                    .map(|model| (model.clone(), model.clone()))
+                                    .collect()
+                            })
                     }
                 },
                 // 聞けない upstream は設定に書かれたものを使う。

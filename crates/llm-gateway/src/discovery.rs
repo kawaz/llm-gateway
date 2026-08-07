@@ -35,6 +35,8 @@ pub enum Flavor {
     /// Bedrock。`Authorization: Bearer` で OpenAI 互換側の `/v1/models`。
     /// 返る id は `anthropic.claude-opus-5` の形なので接頭辞を剥がす。
     Bedrock,
+    /// ChatGPT Codex backend。account ID と client version を添えて聞く。
+    OpenAiCodex,
 }
 
 pub async fn fetch(
@@ -43,28 +45,44 @@ pub async fn fetch(
     base_url: &str,
     credential: &Credential,
 ) -> Result<Vec<Model>> {
-    let (url, auth) = match flavor {
-        Flavor::Anthropic => (
-            format!("{}/v1/models", base_url.trim_end_matches('/')),
-            ("authorization", credential.bearer()),
-        ),
-        Flavor::Bedrock => (
+    let root = base_url.trim_end_matches('/');
+    let request = match flavor {
+        Flavor::Anthropic => {
+            let url = format!("{root}/v1/models");
+            let request = http
+                .get(&url)
+                .header("authorization", credential.bearer())
+                .header("anthropic-version", "2023-06-01");
+            request
+        }
+        Flavor::Bedrock => {
             // base_url は `…/anthropic` を指しているが、モデル一覧は
             // その隣の `/v1/models` にしかない。
-            format!(
-                "{}/v1/models",
-                base_url
-                    .trim_end_matches('/')
-                    .trim_end_matches("/anthropic")
-            ),
-            ("authorization", format!("Bearer {}", credential.api_key())),
-        ),
+            let url = format!("{}/v1/models", root.trim_end_matches("/anthropic"));
+            let request = http
+                .get(&url)
+                .header("authorization", format!("Bearer {}", credential.api_key()))
+                .header("anthropic-version", "2023-06-01");
+            request
+        }
+        Flavor::OpenAiCodex => {
+            let url = format!("{root}/models?client_version={}", env!("CARGO_PKG_VERSION"));
+            let account_id = credential
+                .account_id
+                .as_deref()
+                .ok_or_else(|| Error::Credential {
+                    id: credential.id.to_string(),
+                    reason: "ChatGPT のアカウント識別子がありません".to_owned(),
+                })?;
+            let request = http
+                .get(&url)
+                .header("authorization", credential.bearer())
+                .header("chatgpt-account-id", account_id);
+            request
+        }
     };
 
-    let resp = http
-        .get(&url)
-        .header(auth.0, auth.1)
-        .header("anthropic-version", "2023-06-01")
+    let resp = request
         .send()
         .await
         .map_err(|e| Error::UpstreamUnreachable {
@@ -90,6 +108,10 @@ pub async fn fetch(
 }
 
 pub fn parse(flavor: Flavor, body: &str) -> Result<Vec<Model>> {
+    if flavor == Flavor::OpenAiCodex {
+        return parse_codex(body);
+    }
+
     #[derive(Deserialize)]
     struct List {
         data: Vec<Entry>,
@@ -123,6 +145,7 @@ pub fn parse(flavor: Flavor, body: &str) -> Result<Vec<Model>> {
                 Some(short) => (short.to_owned(), e.id.clone()),
                 None => continue,
             },
+            Flavor::OpenAiCodex => unreachable!("handled before the shared parser"),
         };
         models.push(Model {
             id,
@@ -135,6 +158,38 @@ pub fn parse(flavor: Flavor, body: &str) -> Result<Vec<Model>> {
     }
 
     models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
+}
+
+fn parse_codex(body: &str) -> Result<Vec<Model>> {
+    #[derive(Deserialize)]
+    struct List {
+        models: Vec<Entry>,
+    }
+    #[derive(Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        slug: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    }
+
+    let list: List = serde_json::from_str(body)?;
+    let mut models = Vec::new();
+    for entry in list.models {
+        let Some(id) = entry.id.or(entry.slug).or(entry.model) else {
+            continue;
+        };
+        models.push(Model {
+            upstream_id: id.clone(),
+            id,
+            created: 0,
+        });
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
     Ok(models)
 }
 
@@ -220,6 +275,24 @@ mod tests {
             "公式は名前をそのまま使う"
         );
         assert!(opus5.created > 0, "created_at から日付が取れる");
+    }
+
+    /// Codex catalog は `models` 配列の slug / id を client と upstream の名前に使う。
+    #[test]
+    fn parses_codex_catalog() {
+        let models = parse(
+            Flavor::OpenAiCodex,
+            r#"{"models":[{"slug":"gpt-5.3-codex"},{"id":"gpt-5.2-codex"},{"model":"codex-mini-latest"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex-mini-latest", "gpt-5.2-codex", "gpt-5.3-codex"]
+        );
+        assert!(models.iter().all(|model| model.id == model.upstream_id));
     }
 
     /// Bedrock は名前空間が付く。クライアントには剥がした名前を見せ、

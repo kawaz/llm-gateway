@@ -432,8 +432,12 @@ impl RouteSpec {
             (Provider::Anthropic, Some(CredentialSpec::BedrockApiKey)) => {
                 Some(crate::discovery::Flavor::Bedrock)
             }
-            (Provider::Anthropic, None) | (Provider::Openai, _) => None,
-            (Provider::Anthropic, Some(CredentialSpec::CodexOauth)) => None,
+            (Provider::Openai, Some(CredentialSpec::CodexOauth)) => {
+                Some(crate::discovery::Flavor::OpenAiCodex)
+            }
+            (Provider::Anthropic, None)
+            | (Provider::Anthropic, Some(CredentialSpec::CodexOauth))
+            | (Provider::Openai, _) => None,
         }
     }
 }

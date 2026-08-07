@@ -61,6 +61,24 @@ type = "claude_oauth"
 provider = "anthropic"
 credential = "claude-work"
 
+[credentials.chatgpt-personal]
+type = "codex_oauth"
+
+[routes.codex-personal]
+provider = "openai"
+credential = "chatgpt-personal"
+# account 別 catalog を取得できないときの固定 fallback。
+models = [
+    "gpt-5.1",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex-mini",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.4",
+]
+
 # 特定のモデル専用にしたいアカウントは、他を exclude で塞ぐ。
 # ここに書いた分は、上の [filter] に足して効く。
 # exclude = ["claude-opus-*", "claude-sonnet-*"]
@@ -130,7 +148,7 @@ routes = ["bedrock", "claude-work", "claude-personal"]
 
 [[ns.default.routing]]
 models = ["gpt-*"]
-routes = ["other-gateway"]
+routes = ["codex-personal", "other-gateway"]
 
 # 短い名前。
 #
