@@ -229,7 +229,7 @@ impl Router {
                     .map(|m| (m.clone(), m.clone()))
                     .collect(),
             };
-            by_route.insert(name.clone(), found);
+            by_route.insert(name.clone(), with_declared_fallback(found, route));
         }
         drop(previous);
 
@@ -468,6 +468,24 @@ impl Router {
 /// 待たせる長さは [`PROBE_INTERVAL`] で頭を押さえる。裏で聞きに行った結果、
 /// 宣言されたリセット時刻より早く開くことがある。2 日後と伝えてしまうと、
 /// 早期に開いたことに気づいた側から見て嘘になる。
+/// 一覧が空だった経路に、設定で宣言されたモデルを充てる。
+///
+/// 一覧が空のアカウントは実在する (Codex の /models が 200 で空を返す)。
+/// 空のまま載せると経路ごと消えて、宣言していても一切選ばれなくなる。
+fn with_declared_fallback(
+    found: BTreeMap<String, String>,
+    route: &crate::config::RouteSpec,
+) -> BTreeMap<String, String> {
+    if !found.is_empty() {
+        return found;
+    }
+    route
+        .declared_models()
+        .iter()
+        .map(|m| (m.clone(), m.clone()))
+        .collect()
+}
+
 fn rate_limited(after: i64) -> Response {
     let after = after.min(PROBE_INTERVAL);
     const BODY: &str = r#"{"type":"error","error":{"type":"rate_limit_error","message":"every route for this model is rate limited or overloaded; see the retry-after header"}}"#;
@@ -1162,5 +1180,26 @@ routes = ["bedrock", "oauth-a"]
                 .await
                 .is_err()
         );
+    }
+
+    /// 一覧が空 (200 で空配列を返すアカウントは実在する) でも、宣言された
+    /// モデルは公開される。宣言も無い経路は空のまま。
+    #[test]
+    fn an_empty_listing_falls_back_to_declared_models() {
+        let config: Config = toml::from_str(CONFIG).unwrap();
+        let declared = &config.routes["cpa"]; // models = ["gpt-5.6-sol"] を宣言
+        let bare = &config.routes["oauth-a"]; // 宣言なし
+
+        let filled = with_declared_fallback(BTreeMap::new(), declared);
+        assert_eq!(
+            filled.get("gpt-5.6-sol").map(String::as_str),
+            Some("gpt-5.6-sol")
+        );
+
+        assert!(with_declared_fallback(BTreeMap::new(), bare).is_empty());
+
+        // 一覧が取れた経路はそのまま。宣言に上書きされない。
+        let found: BTreeMap<_, _> = [("a".to_owned(), "up.a".to_owned())].into();
+        assert_eq!(with_declared_fallback(found.clone(), declared), found);
     }
 }
