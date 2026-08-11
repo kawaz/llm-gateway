@@ -22,7 +22,7 @@
   原因は切る側ではなく**黙る側**で、upstream が 30 秒以上停滞する頻度がその日に跳ねた。
   同日の 529 Overloaded ×32 / 503 ×32 と同根の upstream 品質劣化とみられる。
   cpa 経路の時代にほぼ出ていなかったのも、経路や設定の差ではなく upstream が健全だっただけ
-- 対処: `CLAUDE_STREAM_IDLE_TIMEOUT_MS` (undocumented、バイナリで実在確認) を settings.json の env に設定すると、SSE idle が max(設定値, 5 分) になり、**byte watchdog へのリモート上書きも無効化される**。`API_TIMEOUT_MS` (documented、既定 10 分) も全体上限として併用。2026-07-29 に 3 面 (personal / emeradaco / emrd) へ `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000` / `API_TIMEOUT_MS=1200000` を適用済み。環境変数は起動時固定なので適用後に起動したセッションから有効
+- 対処: `CLAUDE_STREAM_IDLE_TIMEOUT_MS` (undocumented、バイナリで実在確認) を settings.json の env に設定すると、SSE idle が max(設定値, 5 分) になり、**byte watchdog へのリモート上書きも無効化される**。`API_TIMEOUT_MS` (documented、既定 10 分) も全体上限として併用。2026-07-29 に 3 面 (personal / emrd ほか) へ `CLAUDE_STREAM_IDLE_TIMEOUT_MS=600000` / `API_TIMEOUT_MS=1200000` を適用済み。環境変数は起動時固定なので適用後に起動したセッションから有効
 
 ## 実用的な示唆 / ベストプラクティス
 
