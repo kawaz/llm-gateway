@@ -113,10 +113,17 @@ fn messages(value: Option<&Value>) -> Result<Vec<Value>> {
         match role {
             "user" => user_content(content, &mut output)?,
             "assistant" => assistant_content(content, &mut output)?,
-            _ => {
-                return Err(invalid(
-                    "message role は user または assistant にしてください",
-                ));
+            // Claude Code は messages 配列内に system role を混ぜてくる
+            // (Anthropic API の建前上は user/assistant だけだが実在する)。
+            // Responses API の input は system role を持てるので位置を保って写す。
+            "system" => output.push(json!({
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_text(content)?}],
+            })),
+            other => {
+                return Err(invalid(format!(
+                    "unsupported message role `{other}` (only user/assistant/system)"
+                )));
             }
         }
     }
@@ -341,6 +348,27 @@ fn invalid(message: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// messages 配列内の system role は位置を保って system input item に写す
+    /// (Claude Code が実際に送ってくる。実測 2026-08-11)。
+    #[test]
+    fn maps_system_role_message_to_system_input_item() {
+        let converted = convert(json!({
+            "model": "m",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"system","content":[{"type":"text","text":"mid-flight note"}]},
+                {"role":"user","content":"go on"}
+            ]
+        }))
+        .unwrap();
+
+        let input = converted["input"].as_array().unwrap();
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][0]["text"], "mid-flight note");
+        assert_eq!(input.len(), 3);
+    }
 
     /// Claude Code の通常 request に現れる text / tool / sampling を Responses へ写す。
     #[test]
