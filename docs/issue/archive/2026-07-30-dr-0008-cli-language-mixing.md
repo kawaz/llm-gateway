@@ -1,6 +1,6 @@
 ---
 title: CLI の help / error message で日本語と英語が混在している (DR-0008 途中適用)
-status: wip
+status: resolved
 category: task
 created: 2026-07-30T23:19:40+09:00
 last_read: 2026-08-11T23:49:18+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-08-11T23:50:08+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T00:05:43+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: USAGE 全英語化・main.rs/error.rs/config.rs の error/表示メッセージ英語化、just ci 全 pass"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -51,7 +51,10 @@ DR-0008 (`docs/decisions/DR-0008-user-facing-language.md`) より:
 
 ## 受け入れ条件
 
-- [ ] `USAGE` 定数の全コマンド説明・オプション説明が英語に統一されている
-- [ ] `main.rs` 内の error message / 表示メッセージが (ログを除き) 英語に統一
+- [x] `USAGE` 定数の全コマンド説明・オプション説明が英語に統一されている
+- [x] `main.rs` 内の error message / 表示メッセージが (ログを除き) 英語に統一
       されている (DR-0008 の対象外はログのみ)
-- [ ] 該当コマンドを触る際についでに直す運用でよく、必ずしも一括変更でなくてよい
+- [x] 該当コマンドを触る際についでに直す運用でよく、必ずしも一括変更でなくてよい
+
+`error.rs` / `config.rs` も合わせて英語化した。`just ci` 全 pass。core crate
+側に残る日本語 error message は別 issue へ引き継ぐ。
