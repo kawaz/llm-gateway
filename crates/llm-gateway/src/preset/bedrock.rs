@@ -146,21 +146,21 @@ extended-cache-ttl-2025-04-11";
         let via_bedrock = bedrock().wire().encode(request("claude-fable-5")).unwrap();
 
         assert_eq!(
-            via_official.url, "https://api.anthropic.com/v1/messages",
+            via_official.upstream.url, "https://api.anthropic.com/v1/messages",
             "公式はクライアントの名前のまま"
         );
-        assert_eq!(via_bedrock.url, format!("{BASE_URL}/v1/messages"));
+        assert_eq!(via_bedrock.upstream.url, format!("{BASE_URL}/v1/messages"));
 
         let sent =
             |request: &UpstreamRequest| -> Value { serde_json::from_slice(&request.body).unwrap() };
         assert_eq!(
-            sent(&via_official)["model"],
-            sent(&via_bedrock)["model"],
+            sent(&via_official.upstream)["model"],
+            sent(&via_bedrock.upstream)["model"],
             "方言が同じなので、送る本文も同じ (名前の読み替えは Wire の外)"
         );
         assert_eq!(
-            via_official.headers.get("content-type"),
-            via_bedrock.headers.get("content-type")
+            via_official.upstream.headers.get("content-type"),
+            via_bedrock.upstream.headers.get("content-type")
         );
     }
 
@@ -172,20 +172,23 @@ extended-cache-ttl-2025-04-11";
 
         bedrock()
             .auth()
-            .authorize(Some(&credential), &mut with_api_key)
+            .authorize(Some(&credential), &mut with_api_key.upstream)
             .unwrap();
-        assert_eq!(with_api_key.headers.get("x-api-key"), Some("tok"));
+        assert_eq!(with_api_key.upstream.headers.get("x-api-key"), Some("tok"));
         assert_eq!(
-            with_api_key.headers.get("authorization"),
+            with_api_key.upstream.headers.get("authorization"),
             None,
             "Bearer では 401 になる"
         );
 
         let mut with_bearer = wire().encode(request("claude-opus-5")).unwrap();
         OauthBearer::new("claude-personal")
-            .apply(Some(&credential), &mut with_bearer.headers)
+            .apply(Some(&credential), &mut with_bearer.upstream.headers)
             .unwrap();
-        assert_eq!(with_bearer.headers.get("authorization"), Some("Bearer tok"));
+        assert_eq!(
+            with_bearer.upstream.headers.get("authorization"),
+            Some("Bearer tok")
+        );
     }
 
     /// 枠照会 API を持たないことは型で示す (空実装を置かない)。
@@ -205,7 +208,7 @@ extended-cache-ttl-2025-04-11";
         let mut request = wire().encode(request("claude-opus-5")).unwrap();
         assert!(
             ApiKey::new("bedrock")
-                .authorize(None, &mut request)
+                .authorize(None, &mut request.upstream)
                 .is_err()
         );
     }

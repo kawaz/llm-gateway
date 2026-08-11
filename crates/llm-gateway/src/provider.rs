@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::credential::Credential;
 use crate::denial::{Availability, Denial, Probing, RouteState, Scope};
-use crate::egress::{BoxFuture, EgressRequest, Headers, Response, UpstreamRequest};
+use crate::egress::{BoxFuture, EgressRequest, EncodedRequest, Headers, Response, UpstreamRequest};
 use crate::metering::{Pricing, UsageObserver};
 use crate::quota::{QuotaLimit, Snapshot, Support};
 
@@ -32,7 +32,7 @@ pub trait Auth: Send + Sync {
 
 /// 正規形を upstream 方言へ変換して送る。
 pub trait Wire: Send + Sync {
-    fn encode(&self, request: EgressRequest) -> Result<UpstreamRequest>;
+    fn encode(&self, request: EgressRequest) -> Result<EncodedRequest>;
 
     fn send<'a>(
         &'a self,
@@ -320,11 +320,14 @@ mod tests {
     struct StubWire;
 
     impl Wire for StubWire {
-        fn encode(&self, request: EgressRequest) -> Result<UpstreamRequest> {
-            Ok(UpstreamRequest {
-                url: request.path,
-                headers: request.headers,
-                body: bytes::Bytes::from(serde_json::to_vec(&request.body)?),
+        fn encode(&self, request: EgressRequest) -> Result<EncodedRequest> {
+            Ok(EncodedRequest {
+                upstream: UpstreamRequest {
+                    url: request.path,
+                    headers: request.headers,
+                    body: bytes::Bytes::from(serde_json::to_vec(&request.body)?),
+                },
+                response: crate::egress::ResponseMode::Passthrough,
             })
         }
 

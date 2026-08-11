@@ -18,7 +18,9 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use futures_util::StreamExt as _;
 
-use crate::egress::{BoxFuture, EgressRequest, Headers, Response, UpstreamRequest};
+use crate::egress::{
+    BoxFuture, EgressRequest, EncodedRequest, Headers, Response, ResponseMode, UpstreamRequest,
+};
 use crate::provider::Wire;
 use crate::{Error, Result};
 
@@ -63,7 +65,7 @@ impl AnthropicWire {
 }
 
 impl Wire for AnthropicWire {
-    fn encode(&self, request: EgressRequest) -> Result<UpstreamRequest> {
+    fn encode(&self, request: EgressRequest) -> Result<EncodedRequest> {
         let EgressRequest {
             path,
             query,
@@ -78,10 +80,13 @@ impl Wire for AnthropicWire {
         // 直列化した後に載せる。クライアントの申告ではなく、実際に送る形。
         headers.set("content-type", "application/json");
 
-        Ok(UpstreamRequest {
-            url: self.url_for(&path, query.as_deref()),
-            headers,
-            body,
+        Ok(EncodedRequest {
+            upstream: UpstreamRequest {
+                url: self.url_for(&path, query.as_deref()),
+                headers,
+                body,
+            },
+            response: ResponseMode::Passthrough,
         })
     }
 
@@ -196,9 +201,10 @@ extended-cache-ttl-2025-04-11";
             .unwrap();
 
         assert_eq!(
-            serde_json::from_slice::<Value>(&encoded.body).unwrap(),
+            serde_json::from_slice::<Value>(&encoded.upstream.body).unwrap(),
             body
         );
+        assert_eq!(encoded.response, ResponseMode::Passthrough);
     }
 
     /// 実クライアントが送るヘッダを通したとき、何が残り何が消えるか。
@@ -222,7 +228,12 @@ extended-cache-ttl-2025-04-11";
             ))
             .unwrap();
 
-        let names: Vec<&str> = encoded.headers.iter().map(|(key, _)| key).collect();
+        let names: Vec<&str> = encoded
+            .upstream
+            .headers
+            .iter()
+            .map(|(key, _)| key)
+            .collect();
         for gone in [
             "Host",
             "Connection",
@@ -242,7 +253,7 @@ extended-cache-ttl-2025-04-11";
             assert!(names.contains(&kept), "{kept} は残す: {names:?}");
         }
         assert_eq!(
-            encoded.headers.get("anthropic-beta"),
+            encoded.upstream.headers.get("anthropic-beta"),
             Some(CLIENT_BETA),
             "beta の取捨は交渉の担当 (DR-0003)。Wire は触らない"
         );
@@ -271,7 +282,12 @@ extended-cache-ttl-2025-04-11";
             ))
             .unwrap();
 
-        let names: Vec<&str> = encoded.headers.iter().map(|(key, _)| key).collect();
+        let names: Vec<&str> = encoded
+            .upstream
+            .headers
+            .iter()
+            .map(|(key, _)| key)
+            .collect();
         assert_eq!(
             names,
             vec!["anthropic-version", "content-type"],
@@ -291,8 +307,8 @@ extended-cache-ttl-2025-04-11";
             ))
             .unwrap();
 
-        assert_eq!(encoded.headers.get("x-api-key"), None);
-        assert_eq!(encoded.headers.get("authorization"), None);
+        assert_eq!(encoded.upstream.headers.get("x-api-key"), None);
+        assert_eq!(encoded.upstream.headers.get("authorization"), None);
     }
 
     /// 設定で足したヘッダが載る。
@@ -310,8 +326,11 @@ extended-cache-ttl-2025-04-11";
             ))
             .unwrap();
 
-        assert_eq!(encoded.headers.get("x-trace"), Some("on"));
-        assert_eq!(encoded.headers.get("anthropic-version"), Some("2023-06-01"));
+        assert_eq!(encoded.upstream.headers.get("x-trace"), Some("on"));
+        assert_eq!(
+            encoded.upstream.headers.get("anthropic-version"),
+            Some("2023-06-01")
+        );
     }
 
     /// 送る中身が JSON であることは、こちらが決めて申告する。
@@ -325,11 +344,12 @@ extended-cache-ttl-2025-04-11";
             .unwrap();
 
         assert_eq!(
-            encoded.headers.get("Content-Type"),
+            encoded.upstream.headers.get("Content-Type"),
             Some("application/json")
         );
         assert_eq!(
             encoded
+                .upstream
                 .headers
                 .iter()
                 .filter(|(key, _)| key.eq_ignore_ascii_case("content-type"))

@@ -136,6 +136,22 @@ pub struct UpstreamRequest {
     pub body: Bytes,
 }
 
+/// Wire が組み立てた送信内容と、正規形でクライアントへ返す方法。
+#[derive(Debug, Clone)]
+pub struct EncodedRequest {
+    pub upstream: UpstreamRequest,
+    pub response: ResponseMode,
+}
+
+/// upstream 応答をクライアント向けの正規形へ整える方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseMode {
+    /// Wire が返した本文と content-type をそのまま流す。
+    Passthrough,
+    /// 正規形の Messages SSE を単一の Messages JSON に集約する。
+    CollectMessagesSse,
+}
+
 /// upstream からの応答。本文はまだ読んでいない。
 pub struct Response {
     pub status: u16,
@@ -167,9 +183,242 @@ pub async fn send(
     credential: Option<&Credential>,
     request: EgressRequest,
 ) -> Result<Response> {
-    let mut request = preset.wire().encode(request)?;
-    preset.auth().authorize(credential, &mut request)?;
-    preset.wire().send(http, request).await
+    let EncodedRequest {
+        mut upstream,
+        response: response_mode,
+    } = preset.wire().encode(request)?;
+    preset.auth().authorize(credential, &mut upstream)?;
+    let response = preset.wire().send(http, upstream).await?;
+    adapt_response(response, response_mode).await
+}
+
+async fn adapt_response(mut response: Response, mode: ResponseMode) -> Result<Response> {
+    if mode == ResponseMode::Passthrough
+        || !response
+            .headers
+            .get("content-type")
+            .is_some_and(is_event_stream)
+    {
+        return Ok(response);
+    }
+
+    let raw = collect_body(response.body).await?;
+    let body = collect_messages_sse(&raw)?;
+    response.headers.set("content-type", "application/json");
+    response.body = futures_util::stream::once(async move { Ok(Bytes::from(body)) }).boxed();
+    Ok(response)
+}
+
+fn is_event_stream(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn collect_messages_sse(raw: &[u8]) -> Result<Vec<u8>> {
+    let mut collector = MessageCollector::default();
+    let mut data = Vec::new();
+
+    for line in raw.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            if !data.is_empty() {
+                collector.event(&data)?;
+                data.clear();
+            }
+            continue;
+        }
+        let Some(value) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        let value = value.strip_prefix(b" ").unwrap_or(value);
+        if !data.is_empty() {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(value);
+    }
+    if !data.is_empty() {
+        collector.event(&data)?;
+    }
+
+    serde_json::to_vec(&collector.finish()).map_err(Into::into)
+}
+
+#[derive(Default)]
+struct MessageCollector {
+    message: Option<Value>,
+    tool_input: BTreeMap<usize, String>,
+    stopped: bool,
+    error: Option<Value>,
+}
+
+impl MessageCollector {
+    fn event(&mut self, raw: &[u8]) -> Result<()> {
+        let event: Value = serde_json::from_slice(raw)?;
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_start" => self.start_message(&event)?,
+            "content_block_start" => self.start_block(&event),
+            "content_block_delta" => self.apply_delta(&event)?,
+            "content_block_stop" => self.stop_block(&event)?,
+            "message_delta" => self.apply_message_delta(&event),
+            "message_stop" => self.stopped = true,
+            "error" => self.error = Some(event),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn start_message(&mut self, event: &Value) -> Result<()> {
+        let message = event.get("message").ok_or_else(|| {
+            Error::Config("Messages SSE message_start に message がありません".to_owned())
+        })?;
+        let content = message.get("content").and_then(Value::as_array);
+        if !message.is_object() || content.is_none() {
+            return Err(Error::Config(
+                "Messages SSE message_start の message が正しい形ではありません".to_owned(),
+            ));
+        }
+        self.message = Some(message.clone());
+        Ok(())
+    }
+
+    fn start_block(&mut self, event: &Value) {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return;
+        };
+        let Some(block) = event.get("content_block").cloned() else {
+            return;
+        };
+        let index = index as usize;
+        let content = self.content_mut();
+        if content.len() <= index {
+            content.resize(index + 1, Value::Null);
+        }
+        content[index] = block;
+    }
+
+    fn apply_delta(&mut self, event: &Value) -> Result<()> {
+        let index =
+            event.get("index").and_then(Value::as_u64).ok_or_else(|| {
+                Error::Config("Messages SSE delta に index がありません".to_owned())
+            })? as usize;
+        let delta = event.get("delta").unwrap_or(&Value::Null);
+        match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text_delta" => {
+                let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
+                let block = self
+                    .content_mut()
+                    .get_mut(index)
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| {
+                        Error::Config("Messages SSE text delta の block がありません".to_owned())
+                    })?;
+                let current = block
+                    .entry("text")
+                    .or_insert_with(|| Value::String(String::new()));
+                let Value::String(current) = current else {
+                    return Err(Error::Config(
+                        "Messages SSE text block の text が文字列ではありません".to_owned(),
+                    ));
+                };
+                current.push_str(text);
+            }
+            "input_json_delta" => {
+                let partial = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.tool_input.entry(index).or_default().push_str(partial);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn stop_block(&mut self, event: &Value) -> Result<()> {
+        let Some(index) = event.get("index").and_then(Value::as_u64) else {
+            return Ok(());
+        };
+        let index = index as usize;
+        let Some(raw) = self.tool_input.remove(&index) else {
+            return Ok(());
+        };
+        let input: Value = serde_json::from_str(&raw)?;
+        let block = self
+            .content_mut()
+            .get_mut(index)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::Config("Messages SSE tool delta の block がありません".to_owned())
+            })?;
+        block.insert("input".to_owned(), input);
+        Ok(())
+    }
+
+    fn apply_message_delta(&mut self, event: &Value) {
+        let message = self.message_mut();
+        if let Some(delta) = event.get("delta").and_then(Value::as_object) {
+            for key in ["stop_reason", "stop_sequence"] {
+                if let Some(value) = delta.get(key) {
+                    message.insert(key.to_owned(), value.clone());
+                }
+            }
+        }
+        if let Some(usage) = event.get("usage") {
+            message.insert("usage".to_owned(), usage.clone());
+        }
+    }
+
+    fn content_mut(&mut self) -> &mut Vec<Value> {
+        self.message_mut()
+            .entry("content")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("message content は配列として初期化する")
+    }
+
+    fn message_mut(&mut self) -> &mut serde_json::Map<String, Value> {
+        self.message
+            .get_or_insert_with(|| {
+                serde_json::json!({
+                    "id":"msg_unknown",
+                    "type":"message",
+                    "role":"assistant",
+                    "model":"",
+                    "content":[],
+                    "stop_reason":null,
+                    "stop_sequence":null,
+                    "usage":{"input_tokens":0,"output_tokens":0}
+                })
+            })
+            .as_object_mut()
+            .expect("message は object として初期化する")
+    }
+
+    fn finish(self) -> Value {
+        if let Some(error) = self.error {
+            return error;
+        }
+        if !self.stopped {
+            return serde_json::json!({
+                "type":"error",
+                "error":{
+                    "type":"api_error",
+                    "message":"upstream stream ended before message_stop"
+                }
+            });
+        }
+        self.message.unwrap_or_else(|| {
+            serde_json::json!({
+                "type":"error",
+                "error":{
+                    "type":"api_error",
+                    "message":"upstream stream ended without message_start"
+                }
+            })
+        })
+    }
 }
 
 /// 応答をすべて読む。
@@ -347,5 +596,103 @@ mod tests {
 
         assert_eq!(body["model"], "vendor.m-1");
         assert_eq!(body["max_tokens"], 8, "他の項目は触らない");
+    }
+
+    async fn adapted(mode: ResponseMode, chunks: Vec<&'static [u8]>) -> Response {
+        let response = Response {
+            status: 200,
+            headers: headers(&[("content-type", "text/event-stream; charset=utf-8")]),
+            body: futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk))),
+            )
+            .boxed(),
+        };
+        adapt_response(response, mode).await.unwrap()
+    }
+
+    /// 非ストリーム要求では、正規形 SSE の text・tool・usage・終了理由を
+    /// 1 個の正規形 message JSON に組み立てる。chunk 境界は SSE 行と無関係でよい。
+    #[tokio::test]
+    async fn collects_messages_sse_into_one_json_message() {
+        let response = adapted(
+            ResponseMode::CollectMessagesSse,
+            vec![
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"he",
+                b"llo\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"read\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":7}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some("application/json")
+        );
+        let body: Value =
+            serde_json::from_slice(&collect_body(response.body).await.unwrap()).unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["content"][0], json!({"type":"text","text":"hello"}));
+        assert_eq!(
+            body["content"][1],
+            json!({"type":"tool_use","id":"tool_1","name":"read","input":{"path":"a"}})
+        );
+        assert_eq!(body["stop_reason"], "tool_use");
+        assert_eq!(body["usage"], json!({"input_tokens":10,"output_tokens":7}));
+    }
+
+    /// streaming 中の正規形 error は、成功 message と混ぜず同じ error JSON 形で返す。
+    #[tokio::test]
+    async fn collects_an_sse_error_as_json_error() {
+        let response = adapted(
+            ResponseMode::CollectMessagesSse,
+            vec![b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"failed\"}}\n\n"],
+        )
+        .await;
+
+        let body: Value =
+            serde_json::from_slice(&collect_body(response.body).await.unwrap()).unwrap();
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some("application/json")
+        );
+        assert_eq!(
+            body,
+            json!({"type":"error","error":{"type":"api_error","message":"failed"}})
+        );
+    }
+
+    /// `message_stop` の無い切断は、不完全な message を成功扱いせず error JSON にする。
+    #[tokio::test]
+    async fn an_incomplete_sse_becomes_a_json_error() {
+        let response = adapted(
+            ResponseMode::CollectMessagesSse,
+            vec![b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"content\":[]}}\n\n"],
+        )
+        .await;
+
+        let body: Value =
+            serde_json::from_slice(&collect_body(response.body).await.unwrap()).unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    /// stream 要求では正規形 SSE をバッファせず、content-type と本文をそのまま流す。
+    #[tokio::test]
+    async fn passthrough_keeps_messages_sse() {
+        let response = adapted(
+            ResponseMode::Passthrough,
+            vec![b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"],
+        )
+        .await;
+
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some("text/event-stream; charset=utf-8")
+        );
+        assert_eq!(
+            collect_body(response.body).await.unwrap(),
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
     }
 }

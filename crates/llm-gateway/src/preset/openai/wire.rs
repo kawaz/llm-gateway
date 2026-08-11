@@ -4,8 +4,11 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use futures_util::StreamExt as _;
+use serde_json::Value;
 
-use crate::egress::{BoxFuture, EgressRequest, Headers, Response, UpstreamRequest};
+use crate::egress::{
+    BoxFuture, EgressRequest, EncodedRequest, Headers, Response, ResponseMode, UpstreamRequest,
+};
 use crate::provider::Wire;
 use crate::{Error, Result};
 
@@ -40,7 +43,8 @@ impl OpenAiWire {
 }
 
 impl Wire for OpenAiWire {
-    fn encode(&self, request: EgressRequest) -> Result<UpstreamRequest> {
+    fn encode(&self, request: EgressRequest) -> Result<EncodedRequest> {
+        let client_streams = request.body.get("stream").and_then(Value::as_bool) == Some(true);
         let mut headers = request.headers;
         headers.strip_for_upstream();
         headers.extend_from(&self.extra_headers);
@@ -50,10 +54,17 @@ impl Wire for OpenAiWire {
         headers.set("accept", "text/event-stream");
 
         let body = Bytes::from(serde_json::to_vec(&request::convert(request.body)?)?);
-        Ok(UpstreamRequest {
-            url: self.responses_url(),
-            headers,
-            body,
+        Ok(EncodedRequest {
+            upstream: UpstreamRequest {
+                url: self.responses_url(),
+                headers,
+                body,
+            },
+            response: if client_streams {
+                ResponseMode::Passthrough
+            } else {
+                ResponseMode::CollectMessagesSse
+            },
         })
     }
 
@@ -174,16 +185,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            encoded.url,
+            encoded.upstream.url,
             "https://chatgpt.com/backend-api/codex/responses"
         );
-        let body: Value = serde_json::from_slice(&encoded.body).unwrap();
+        let body: Value = serde_json::from_slice(&encoded.upstream.body).unwrap();
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body.get("max_tokens").is_none());
-        assert_eq!(encoded.headers.get("accept"), Some("text/event-stream"));
-        assert_eq!(encoded.headers.get("anthropic-version"), None);
-        assert_eq!(encoded.headers.get("authorization"), None);
+        assert_eq!(
+            encoded.upstream.headers.get("accept"),
+            Some("text/event-stream")
+        );
+        assert_eq!(encoded.upstream.headers.get("anthropic-version"), None);
+        assert_eq!(encoded.upstream.headers.get("authorization"), None);
+        assert_eq!(encoded.response, ResponseMode::CollectMessagesSse);
+    }
+
+    /// upstream は常に SSE だが、client が明示的に `stream:true` を要求した場合だけ
+    /// SSE のまま返す。未指定と false は Anthropic の既定どおり単一 JSON にする。
+    #[test]
+    fn chooses_the_client_response_shape_from_stream() {
+        let wire = OpenAiWire::new("codex", "https://example.invalid", BTreeMap::new());
+        for (stream, expected) in [
+            (None, ResponseMode::CollectMessagesSse),
+            (Some(false), ResponseMode::CollectMessagesSse),
+            (Some(true), ResponseMode::Passthrough),
+        ] {
+            let mut body = json!({"model":"m","max_tokens":8,"messages":[]});
+            if let Some(stream) = stream {
+                body["stream"] = Value::Bool(stream);
+            }
+            let encoded = wire
+                .encode(EgressRequest {
+                    path: "/v1/messages".to_owned(),
+                    query: None,
+                    body,
+                    headers: Headers::default(),
+                })
+                .unwrap();
+
+            assert_eq!(encoded.response, expected, "stream={stream:?}");
+            let upstream: Value = serde_json::from_slice(&encoded.upstream.body).unwrap();
+            assert_eq!(upstream["stream"], true, "upstream は常に SSE");
+        }
     }
 
     /// content-type を名乗らない成功応答も SSE として変換する。

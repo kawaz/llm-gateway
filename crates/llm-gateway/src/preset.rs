@@ -114,7 +114,7 @@ headers = { x-trace = "on" }
             })
             .unwrap();
 
-        assert_eq!(encoded.url, "http://127.0.0.1:8317/v1/messages");
-        assert_eq!(encoded.headers.get("x-trace"), Some("on"));
+        assert_eq!(encoded.upstream.url, "http://127.0.0.1:8317/v1/messages");
+        assert_eq!(encoded.upstream.headers.get("x-trace"), Some("on"));
     }
 }

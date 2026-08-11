@@ -9,6 +9,7 @@ use crate::provider::Metering;
 use crate::quota::{Overage, Snapshot, Window};
 
 const MAX_EVENT: usize = 256 * 1024;
+const MAX_JSON_BODY: usize = 4 * 1024 * 1024;
 const MAX_BACKOFF: i64 = 7 * 24 * 60 * 60;
 
 pub struct OpenAiMetering;
@@ -94,11 +95,15 @@ impl Metering for OpenAiMetering {
     }
 
     fn usage_observer(&self, content_type: Option<&str>) -> Option<Box<dyn UsageObserver>> {
-        let is_sse = content_type?
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-        is_sse.then(|| Box::new(OpenAiUsage::default()) as Box<dyn UsageObserver>)
+        match content_type?.split(';').next().map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("text/event-stream") => {
+                Some(Box::new(OpenAiUsage::default()))
+            }
+            Some(value) if value.eq_ignore_ascii_case("application/json") => {
+                Some(Box::new(OpenAiJsonUsage::default()))
+            }
+            _ => None,
+        }
     }
 
     fn pricing(&self, model: &str) -> Option<Pricing> {
@@ -164,18 +169,8 @@ impl OpenAiUsage {
         let Ok(value) = serde_json::from_slice::<Value>(&event) else {
             return;
         };
-        let Some(usage) = value.get("usage") else {
-            return;
-        };
-        for (field, kind) in [
-            ("input_tokens", TokenKind::INPUT_NAME),
-            ("output_tokens", TokenKind::OUTPUT_NAME),
-            ("cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
-            ("reasoning_output_tokens", TokenKind::OUTPUT_REASONING_NAME),
-        ] {
-            if let Some(count) = usage.get(field).and_then(Value::as_u64) {
-                self.usage.set(kind, count);
-            }
+        if let Some(usage) = value.get("usage") {
+            read_usage(usage, &mut self.usage);
         }
     }
 }
@@ -212,6 +207,50 @@ impl UsageObserver for OpenAiUsage {
         }
         self.finish_event();
         (!self.usage.is_empty()).then_some(self.usage)
+    }
+}
+
+#[derive(Default)]
+struct OpenAiJsonUsage {
+    body: Vec<u8>,
+    given_up: bool,
+}
+
+impl UsageObserver for OpenAiJsonUsage {
+    fn observe(&mut self, chunk: &[u8]) {
+        if self.given_up {
+            return;
+        }
+        if self.body.len() + chunk.len() > MAX_JSON_BODY {
+            self.given_up = true;
+            self.body.clear();
+            tracing::warn!("OpenAI usage JSON が大きすぎるため集計をやめます");
+            return;
+        }
+        self.body.extend_from_slice(chunk);
+    }
+
+    fn finish(self: Box<Self>) -> Option<TokenUsage> {
+        if self.given_up {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(&self.body).ok()?;
+        let mut usage = TokenUsage::default();
+        read_usage(value.get("usage")?, &mut usage);
+        (!usage.is_empty()).then_some(usage)
+    }
+}
+
+fn read_usage(value: &Value, usage: &mut TokenUsage) {
+    for (field, kind) in [
+        ("input_tokens", TokenKind::INPUT_NAME),
+        ("output_tokens", TokenKind::OUTPUT_NAME),
+        ("cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
+        ("reasoning_output_tokens", TokenKind::OUTPUT_REASONING_NAME),
+    ] {
+        if let Some(count) = value.get(field).and_then(Value::as_u64) {
+            usage.set(kind, count);
+        }
     }
 }
 
@@ -267,19 +306,32 @@ mod tests {
         assert_eq!(denial.scope, Scope::Everything);
     }
 
-    /// reasoning は output の内数として保持し、独立した観測区分にも残す。
+    fn assert_all_usage_kinds(usage: &TokenUsage) {
+        assert_eq!(usage.get(&TokenKind::input()), Some(10));
+        assert_eq!(usage.get(&TokenKind::output()), Some(7));
+        assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(3));
+        assert_eq!(usage.get(&TokenKind::output_reasoning()), Some(2));
+    }
+
+    /// reasoning は output の内数として保持し、streaming 応答でも独立した観測区分に残す。
     #[test]
-    fn reads_all_translated_usage_kinds() {
+    fn reads_all_translated_usage_kinds_from_sse() {
         let mut observer = OpenAiMetering
             .usage_observer(Some("text/event-stream"))
             .unwrap();
         observer.observe(br#"data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}
 
 "#);
-        let usage = observer.finish().unwrap();
-        assert_eq!(usage.get(&TokenKind::input()), Some(10));
-        assert_eq!(usage.get(&TokenKind::output()), Some(7));
-        assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(3));
-        assert_eq!(usage.get(&TokenKind::output_reasoning()), Some(2));
+        assert_all_usage_kinds(&observer.finish().unwrap());
+    }
+
+    /// 非ストリーム用に集約された message JSON からも、SSE と同じ usage を読む。
+    #[test]
+    fn reads_all_translated_usage_kinds_from_json() {
+        let mut observer = OpenAiMetering
+            .usage_observer(Some("application/json"))
+            .unwrap();
+        observer.observe(br#"{"type":"message","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}"#);
+        assert_all_usage_kinds(&observer.finish().unwrap());
     }
 }
