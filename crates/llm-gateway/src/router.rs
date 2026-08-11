@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{Config, Namespace, RouteSpec};
+use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::denial::{Availability, PROBE_INTERVAL};
 use crate::discovery::{self, Model};
@@ -304,9 +305,17 @@ impl Router {
         let Some(available) = visible.get(&model) else {
             return Vec::new();
         };
-        ns.routes_for(&model, &self.config)
+        let now = now_unix();
+        ns.route_groups_for(&model, &self.config)
             .into_iter()
-            .filter(|name| available.iter().any(|a| a == name))
+            .flat_map(|group| {
+                let mut equal: Vec<&str> = group
+                    .into_iter()
+                    .filter(|name| available.iter().any(|available| available == name))
+                    .collect();
+                equal.sort_by_key(|name| self.reset_order_key(name, now));
+                equal
+            })
             .map(str::to_owned)
             .collect()
     }
@@ -322,23 +331,35 @@ impl Router {
         model: &str,
         session: &SessionKey,
     ) -> Result<Vec<Arc<Route>>> {
+        self.routes_for_at(ns, ns_name, model, session, now_unix())
+            .await
+    }
+
+    async fn routes_for_at(
+        &self,
+        ns: &Namespace,
+        ns_name: &str,
+        model: &str,
+        session: &SessionKey,
+        now: i64,
+    ) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
         let visible = catalog.visible(ns, &self.config);
         let available = visible
             .get(model)
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
 
-        // 設定の優先順のうち、このモデルを実際に扱えるものだけを残す。
-        let ordered: Vec<&str> = ns
-            .routes_for(model, &self.config)
-            .into_iter()
-            .filter(|name| available.iter().any(|a| a == name))
-            .collect();
-
-        let mut routes: Vec<Arc<Route>> = ordered
-            .iter()
-            .filter_map(|name| self.build_route(&catalog, name, model))
-            .collect();
+        // モデル非対応の経路を除いた後もグループ境界を保ち、同格の中だけを並べ替える。
+        let mut routes = Vec::new();
+        for group in ns.route_groups_for(model, &self.config) {
+            let mut equal: Vec<Arc<Route>> = group
+                .into_iter()
+                .filter(|name| available.iter().any(|available| available == name))
+                .filter_map(|name| self.build_route(&catalog, name, model))
+                .collect();
+            equal.sort_by_key(|route| self.reset_order_key(route.name(), now));
+            routes.extend(equal);
+        }
         drop(catalog);
 
         if routes.is_empty() {
@@ -404,6 +425,16 @@ impl Router {
             response: rate_limited(until - now),
             until,
         }
+    }
+
+    fn reset_order_key(&self, route: &str, now: i64) -> (bool, i64) {
+        self.presets
+            .get(route)
+            .and_then(|preset| preset.quota())
+            .and_then(|snapshot| snapshot.seven_day)
+            .and_then(|window| window.reset)
+            .filter(|reset| *reset > now)
+            .map_or((true, 0), |reset| (false, reset))
     }
 
     fn build_route(&self, catalog: &Catalog, name: &str, model: &str) -> Option<Arc<Route>> {
@@ -601,7 +632,7 @@ models = ["gpt-5.6-sol"]
 
 [[ns.default.routing]]
 models = ["claude-fable-*"]
-routes = ["bedrock", "oauth-a"]
+routes = [["bedrock", "oauth-a"]]
 
 # 3 本並ぶ経路。前回通った経路を先頭へ寄せたときに、残りの順が
 # 設定のままかを見るために使う。
@@ -702,10 +733,84 @@ routes = ["bedrock", "oauth-a"]
     async fn follows_routing_rules() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
+            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
+    }
+
+    fn observe_seven_day_reset(r: &Router, route: &str, reset: i64) {
+        let snapshot = crate::quota::Snapshot::new(
+            NOW,
+            None,
+            Some(crate::quota::Window::default().with_reset(Some(reset))),
+            None,
+        )
+        .unwrap();
+        r.preset(route).unwrap().restore_quota(snapshot);
+    }
+
+    /// 同格グループでは、未来にある 7 日枠 reset が近い経路から試す。
+    #[tokio::test]
+    async fn equal_group_prefers_the_nearest_future_seven_day_reset() {
+        let r = router().await;
+        observe_seven_day_reset(&r, "bedrock", NOW + 200);
+        observe_seven_day_reset(&r, "oauth-a", NOW + 100);
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
+    }
+
+    /// reset が読めない経路は、有効な reset を持つ経路の後ろへ送る。
+    #[tokio::test]
+    async fn equal_group_puts_unknown_reset_after_future_reset() {
+        let r = router().await;
+        observe_seven_day_reset(&r, "oauth-a", NOW + 100);
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
+    }
+
+    /// 現在以前の reset は陳腐化しているため、有効な reset の後ろへ送る。
+    #[tokio::test]
+    async fn equal_group_puts_stale_reset_after_future_reset() {
+        let r = router().await;
+        observe_seven_day_reset(&r, "bedrock", NOW);
+        observe_seven_day_reset(&r, "oauth-a", NOW + 100);
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
+    }
+
+    /// 全経路の reset が不明なら、安定ソートによりグループ内記載順を維持する。
+    #[tokio::test]
+    async fn equal_group_keeps_declared_order_when_all_resets_are_unknown() {
+        let r = router().await;
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
+    }
+
+    /// フラット配列は単独グループ列なので、quota に関係なく従来の優先順を維持する。
+    #[tokio::test]
+    async fn flat_routes_keep_declared_priority_despite_reset_times() {
+        let r = router().await;
+        observe_seven_day_reset(&r, "bedrock", NOW + 200);
+        observe_seven_day_reset(&r, "oauth-a", NOW + 100);
+        observe_seven_day_reset(&r, "oauth-b", NOW + 50);
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["bedrock", "oauth-a", "oauth-b"]);
     }
 
     /// 規則に無いモデルは、扱える credential を宣言順に試す。

@@ -158,14 +158,34 @@ pub struct Filter {
     pub exclude: Vec<String>,
 }
 
+/// 同じ優先度で試す経路。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum RouteGroup {
+    /// 1 経路だけのグループ。従来のフラットな記法。
+    One(String),
+    /// 7 日枠のリセットが近い順に試す同格の経路。
+    Equal(Vec<String>),
+}
+
+impl RouteGroup {
+    fn routes(&self) -> impl Iterator<Item = &str> {
+        match self {
+            Self::One(route) => std::slice::from_ref(route).iter(),
+            Self::Equal(routes) => routes.iter(),
+        }
+        .map(String::as_str)
+    }
+}
+
 /// 1 つの振り分け規則。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingRule {
     /// 対象のモデル。パターンで書ける。
     pub models: Vec<String>,
-    /// 使う経路を優先順に。上から試す。
-    pub routes: Vec<String>,
+    /// 使う経路を優先順に。内側の配列は同格の経路。
+    pub routes: Vec<RouteGroup>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -526,8 +546,18 @@ impl Config {
                     rule.models.join(", ")
                 )));
             }
-            for name in &rule.routes {
-                if !known(name) {
+            if rule
+                .routes
+                .iter()
+                .any(|group| matches!(group, RouteGroup::Equal(routes) if routes.is_empty()))
+            {
+                return Err(Error::Config(format!(
+                    "namespace `{ns_name}` routing[{i}] ({}) contains an empty route group",
+                    rule.models.join(", ")
+                )));
+            }
+            for name in rule.routes.iter().flat_map(RouteGroup::routes) {
+                if !self.routes.contains_key(name) {
                     return Err(Error::Config(format!(
                         "namespace `{ns_name}` routing[{i}] ({}) references route `{name}`, which is not defined",
                         rule.models.join(", ")
@@ -575,12 +605,31 @@ impl Namespace {
     /// `routing` の上から照合し、最初に当たった規則を使う。当たらなければ
     /// この namespace が使える経路を宣言順に全部試す。
     pub fn routes_for<'a>(&'a self, model: &str, all: &'a Config) -> Vec<&'a str> {
+        self.route_groups_for(model, all)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// このモデルを扱う経路を、同格グループの境界を保って返す。
+    pub(crate) fn route_groups_for<'a>(
+        &'a self,
+        model: &str,
+        all: &'a Config,
+    ) -> Vec<Vec<&'a str>> {
         for rule in &self.routing {
             if crate::pattern::matches_any(&rule.models, model) {
-                return rule.routes.iter().map(String::as_str).collect();
+                return rule
+                    .routes
+                    .iter()
+                    .map(|group| group.routes().collect())
+                    .collect();
             }
         }
         self.usable_routes(all)
+            .into_iter()
+            .map(|route| vec![route])
+            .collect()
     }
 
     /// この namespace が使ってよい経路。
@@ -936,6 +985,80 @@ type = "claude_oauth"
             vec!["bedrock", "claude-work-b", "claude-personal"]
         );
         assert_eq!(ns(&c).routes_for("gpt-5.6-sol", &c), vec!["cpa"]);
+    }
+
+    /// フラット配列は全 route が単独グループである従来記法として、そのまま読める。
+    #[test]
+    fn routing_accepts_flat_route_groups() {
+        let c = parse(SAMPLE).unwrap();
+        assert_eq!(
+            ns(&c).route_groups_for("claude-fable-5", &c),
+            vec![
+                vec!["bedrock"],
+                vec!["claude-work-b"],
+                vec!["claude-personal"]
+            ]
+        );
+    }
+
+    /// 内側の配列は同格グループで、外側の文字列は単独グループとして境界を保つ。
+    #[test]
+    fn routing_accepts_equal_route_groups() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+[credentials.b]
+type = "claude_oauth"
+[credentials.c]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[routes.b]
+provider = "anthropic"
+credential = "b"
+[routes.c]
+provider = "anthropic"
+credential = "c"
+[[ns.default.routing]]
+models = ["model"]
+routes = [["a", "b"], "c"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ns(&c).route_groups_for("model", &c),
+            vec![vec!["a", "b"], vec!["c"]]
+        );
+    }
+
+    /// グループの中にグループは書けない。ネストは同格を表す 1 段だけに限定する。
+    #[test]
+    fn routing_rejects_groups_nested_two_levels() {
+        let err = parse(
+            r#"
+[[ns.default.routing]]
+models = ["model"]
+routes = [[["a"]]]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("routes"), "{err}");
+    }
+
+    /// 空の同格グループは候補を持たず設定ミスを隠すため、起動時に拒否する。
+    #[test]
+    fn routing_rejects_empty_route_groups() {
+        let err = parse(
+            r#"
+[[ns.default.routing]]
+models = ["model"]
+routes = [[]]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty route group"), "{err}");
     }
 
     /// 規則に当たらないモデルは宣言順に試す。
