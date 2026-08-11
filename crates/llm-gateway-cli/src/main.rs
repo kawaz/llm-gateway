@@ -14,40 +14,40 @@ use llm_gateway::stats::{Counters, Report as StatsReport};
 use llm_gateway::{Config, Gateway};
 
 const USAGE: &str = "\
-llm-gateway — クライアントに認証を意識させない、薄い LLM proxy
+llm-gateway — a thin LLM proxy that keeps authentication out of the client
 
-使い方:
-  llm-gateway <コマンド> [オプション]
-  llm-gateway login --type <種別> <名前>
+usage:
+  llm-gateway <command> [options]
+  llm-gateway login --type <type> <name>
 
-コマンド:
-  serve       待ち受けを始める
-  check       設定を読んで確かめる (起動はしない)
-  models      設定に書かれているモデルを一覧する
-  usage       認証情報ごとの利用量を一覧する (server に問い合わせる)
+commands:
+  serve       start listening
+  check       read the configuration and verify it (without starting)
+  models      list the models written in the configuration
+  usage       list usage per credential (asks the server)
   stats       list token usage and USD cost per credential x model x day
-  login       ブラウザで認可を通し、認証情報を <名前>.json に保存する
+  login       authorize in a browser and save the credential to <name>.json
 
-オプション:
-  --config <path>   設定ファイル (既定: $XDG_CONFIG_HOME/llm-gateway/config.toml)
-  --help, -h        この説明
-  --version         版を表示
+options:
+  --config <path>   configuration file (default: $XDG_CONFIG_HOME/llm-gateway/config.toml)
+  --help, -h        show this help
+  --version         show the version
 
-usage のオプション:
-  --refresh         使っていない認証情報にも最小のリクエストを投げて取り直す
-                    (確認そのものが利用量を少し消費する)
+usage options:
+  --refresh         also send a minimal request to idle credentials to read them again
+                    (the check itself consumes a little usage)
 
 stats options:
   --days <N>        show the last N days (default: 7, 0 for everything)
 
-login のオプション:
-  --type <種別>     claude_oauth または codex_oauth
-                    (config.toml の [credentials.<名前>] に書く type と同じ語)
+login options:
+  --type <type>     claude_oauth or codex_oauth
+                    (the same word as the type written in [credentials.<name>] of config.toml)
 
-環境変数:
-  LLM_GATEWAY_LOG   ログの詳しさ (既定: info)
-  XDG_CONFIG_HOME   設定の既定の置き場
-  XDG_STATE_HOME    認証情報とログの既定の置き場
+environment variables:
+  LLM_GATEWAY_LOG   log verbosity (default: info)
+  XDG_CONFIG_HOME   default location for the configuration
+  XDG_STATE_HOME    default location for credentials and logs
 ";
 
 /// 使用量の集計と利用状況をディスクへ落とす間隔。
@@ -89,7 +89,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "stats" => stats(rest),
         "login" => login(rest),
         other => Err(format!(
-            "`{other}` というコマンドはありません。`llm-gateway --help` を見てください"
+            "there is no `{other}` command. see `llm-gateway --help`"
         )),
     }
 }
@@ -103,10 +103,10 @@ fn parse_config_path(args: &[String]) -> Result<PathBuf, String> {
         "--config" => it
             .next()
             .map(PathBuf::from)
-            .ok_or_else(|| "--config にパスが指定されていません".to_owned()),
+            .ok_or_else(|| "--config needs a path".to_owned()),
         other => match other.strip_prefix("--config=") {
             Some(path) => Ok(PathBuf::from(path)),
-            None => Err(format!("`{other}` は解釈できません")),
+            None => Err(format!("could not understand `{other}`")),
         },
     }
 }
@@ -124,14 +124,14 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
     // 探すことになる。
     if config.server.disabled {
         return Err(format!(
-            "{} は disabled = true です (この設定では待ち受けません)。\
-待ち受けたいなら [server] の disabled を外すか、別の設定を --config で指定してください",
+            "{} has disabled = true (this configuration does not listen). \
+to listen, remove disabled from [server], or point --config at another configuration",
             config_path.display()
         ));
     }
 
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(async move {
         let dir = config.store.resolve_dir();
@@ -140,7 +140,7 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
 
         let listener = tokio::net::TcpListener::bind(&config.server.listen)
             .await
-            .map_err(|e| format!("{} で待ち受けられません: {e}", config.server.listen))?;
+            .map_err(|e| format!("could not listen on {}: {e}", config.server.listen))?;
 
         // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
         gateway.refresh_models().await;
@@ -203,7 +203,7 @@ fn serve(config_path: &Path) -> Result<ExitCode, String> {
         let result = axum::serve(listener, llm_gateway_server::router(serving))
             .with_graceful_shutdown(shutdown_signal())
             .await
-            .map_err(|e| format!("待ち受けが止まりました: {e}"));
+            .map_err(|e| format!("the server stopped listening: {e}"));
 
         // 定期の保存を先に止めて、終わるのを待つ。待たずに最後の保存へ進むと
         // 2 者が同時に書きうる。書き込み自体も直列化されているが、待つ側で
@@ -229,11 +229,11 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     let config = load(config_path)?;
     let dir = config.store.resolve_dir();
 
-    println!("設定       {}", config_path.display());
-    println!("待ち受け   {}", listen_line(&config.server));
-    println!("認証情報   {}", dir.display());
-    println!("認証情報数 {} 件", config.credentials.len());
-    println!("namespace  {}", config.namespace_names().join(", "));
+    println!("config       {}", config_path.display());
+    println!("listen       {}", listen_line(&config.server));
+    println!("store        {}", dir.display());
+    println!("credentials  {}", config.credentials.len());
+    println!("namespaces   {}", config.namespace_names().join(", "));
 
     // 認証情報が置かれているかは、起動しないと分からない部分。ここで見ておくと
     // 動かしてから 401 で気づく事態を減らせる。
@@ -254,19 +254,19 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     }
 
     if missing.is_empty() && unreadable.is_empty() {
-        println!("\n問題ありません");
+        println!("\nno problems found");
         return Ok(ExitCode::SUCCESS);
     }
 
     if !missing.is_empty() {
-        println!("\n次の認証情報が {} にありません:", dir.display());
+        println!("\nthese credentials are not in {}:", dir.display());
         for name in &missing {
             println!("  {name}.json");
         }
-        println!("  llm-gateway login --type <種別> <名前> で取得できます");
+        println!("  `llm-gateway login --type <type> <name>` obtains them");
     }
     if !unreadable.is_empty() {
-        println!("\n次の認証情報を読めません:");
+        println!("\nthese credentials could not be read:");
         for (name, reason) in &unreadable {
             println!("  {name}: {reason}");
         }
@@ -278,8 +278,8 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
 fn models(config_path: &Path) -> Result<ExitCode, String> {
     let config = load(config_path)?;
 
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(async move {
         let store = FileStore::open(config.store.resolve_dir()).map_err(|e| e.to_string())?;
@@ -317,8 +317,10 @@ fn models(config_path: &Path) -> Result<ExitCode, String> {
         }
 
         if !any {
-            println!("公開できるモデルがありません。");
-            println!("認証情報が置かれているか、exclude で全部隠していないか確認してください。");
+            println!("no models can be served.");
+            println!(
+                "check that credentials are in place, and that exclude is not hiding all of them."
+            );
             return Ok(ExitCode::FAILURE);
         }
         Ok(ExitCode::SUCCESS)
@@ -344,8 +346,8 @@ fn usage(args: &[String]) -> Result<ExitCode, String> {
     let config = load(&config_path)?;
     let url = usage_url(&config.server.listen, refresh);
 
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(async move {
         let resp = reqwest::Client::new()
@@ -358,13 +360,13 @@ fn usage(args: &[String]) -> Result<ExitCode, String> {
         let body = resp
             .text()
             .await
-            .map_err(|e| format!("応答を読めません: {e}"))?;
+            .map_err(|e| format!("could not read the response: {e}"))?;
         if !status.is_success() {
-            return Err(format!("server が {status} を返しました: {body}"));
+            return Err(format!("the server returned {status}: {body}"));
         }
 
-        let report: Report =
-            serde_json::from_str(&body).map_err(|e| format!("応答を解釈できません: {e}"))?;
+        let report: Report = serde_json::from_str(&body)
+            .map_err(|e| format!("could not parse the response: {e}"))?;
         print!("{}", render(&report));
         Ok(ExitCode::SUCCESS)
     })
@@ -380,14 +382,12 @@ fn parse_usage_args(args: &[String]) -> Result<UsageArgs, String> {
             "--refresh" => refresh = true,
             "--config" => {
                 config_path = Some(PathBuf::from(
-                    it.next()
-                        .cloned()
-                        .ok_or("--config にパスが指定されていません")?,
+                    it.next().cloned().ok_or("--config needs a path")?,
                 ));
             }
             other => match other.strip_prefix("--config=") {
                 Some(path) => config_path = Some(PathBuf::from(path)),
-                None => return Err(format!("`{other}` は解釈できません")),
+                None => return Err(format!("could not understand `{other}`")),
             },
         }
     }
@@ -523,8 +523,8 @@ fn other_is_ipv6(host: &str) -> bool {
 
 fn server_unreachable(listen: &str, reason: &str) -> String {
     format!(
-        "{listen} の server に繋がりません ({reason})。\n\
-         起動しているか確認してください (launchctl list | grep llm-gateway、または just status)"
+        "could not reach the server at {listen} ({reason}).\n\
+         check that it is running (launchctl list | grep llm-gateway, or just status)"
     )
 }
 
@@ -922,10 +922,10 @@ fn sgr_reset(color: bool) -> String {
 
 fn elapsed(secs: i64) -> String {
     match secs {
-        s if s < 60 => "たった今".to_owned(),
-        s if s < 3600 => format!("{} 分前", s / 60),
-        s if s < 86_400 => format!("{} 時間前", s / 3600),
-        s => format!("{} 日前", s / 86_400),
+        s if s < 60 => "just now".to_owned(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -937,7 +937,7 @@ fn elapsed(secs: i64) -> String {
 fn remarks(c: &CredentialUsage) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(e) = &c.probe_error {
-        lines.push(format!("{}: 取り直せませんでした ({e})", c.name));
+        lines.push(format!("{}: could not read it again ({e})", c.name));
     }
     // モデル別の枠は上の行に出せない (5 時間 / 7 日の欄しかない) うえ、
     // 応答ヘッダにも現れないので、聞けたときはここに並べる。
@@ -945,9 +945,9 @@ fn remarks(c: &CredentialUsage) -> Vec<String> {
         let Some(model) = &limit.model else {
             continue;
         };
-        let mut line = format!("{}: {model} の枠は {:.0}%", c.name, limit.percent);
+        let mut line = format!("{}: the {model} limit is at {:.0}%", c.name, limit.percent);
         if let Some(at) = &limit.resets_at {
-            line.push_str(&format!(" ({} に開きます)", to_the_second(at)));
+            line.push_str(&format!(" (resets at {})", to_the_second(at)));
         }
         lines.push(line);
     }
@@ -1021,8 +1021,8 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
     let dir = config.store.resolve_dir();
     let id = CredentialId::new(&name);
 
-    let runtime =
-        tokio::runtime::Runtime::new().map_err(|e| format!("ランタイムを作れません: {e}"))?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     runtime.block_on(async move {
         let store = FileStore::open(&dir).map_err(|e| e.to_string())?;
@@ -1031,12 +1031,12 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
         // 取りこぼさない。
         let authorization = oauth::begin(kind).await.map_err(|e| e.to_string())?;
 
-        println!("次の URL をブラウザで開き、許可まで進めてください:");
+        println!("open the following URL in a browser and approve the request:");
         println!();
         println!("  {}", authorization.url());
         println!();
-        println!("許可のあと、token を取得して使えることを確かめてから保存します。");
-        println!("ブラウザの画面はその結果が出るまで待ちます。");
+        println!("after you approve, the token is fetched, checked, and then saved.");
+        println!("the browser page waits until that result is ready.");
         open_browser(authorization.url());
 
         // 交換・確認・保存が全部済んでから、ブラウザにも端末にも結果が出る。
@@ -1046,11 +1046,11 @@ fn login(args: &[String]) -> Result<ExitCode, String> {
             .map_err(|e| e.to_string())?;
 
         println!(
-            "token が使えることを確認し、{} に保存しました",
+            "checked that the token works, and saved it to {}",
             dir.join(format!("{name}.json")).display()
         );
         if !credential.payload.email().is_empty() {
-            println!("アカウント {}", credential.payload.email());
+            println!("account {}", credential.payload.email());
         }
         if declared.is_none() {
             print_config_hint(&name, kind);
@@ -1069,7 +1069,7 @@ fn parse_login_args(args: &[String]) -> Result<LoginArgs, String> {
         let Some(rest) = arg.strip_prefix("--") else {
             if let Some(previous) = name.replace(arg.clone()) {
                 return Err(format!(
-                    "名前が 2 つ指定されています (`{previous}` と `{arg}`)。名前は 1 つだけです"
+                    "two names were given (`{previous}` and `{arg}`). only one name is allowed"
                 ));
             }
             continue;
@@ -1081,20 +1081,19 @@ fn parse_login_args(args: &[String]) -> Result<LoginArgs, String> {
         match key {
             "type" => type_name = Some(take_value(key, inline, &mut it)?),
             "config" => config_path = Some(PathBuf::from(take_value(key, inline, &mut it)?)),
-            other => return Err(format!("`--{other}` は解釈できません")),
+            other => return Err(format!("could not understand `--{other}`")),
         }
     }
 
     let name = name.ok_or(
-        "認証情報の名前が指定されていません。\
-`llm-gateway login --type claude_oauth <名前>` の形で指定します",
+        "no credential name was given. \
+give it as `llm-gateway login --type claude_oauth <name>`",
     )?;
     check_name(&name)?;
 
-    let type_name =
-        type_name.ok_or("--type が指定されていません。claude_oauth か codex_oauth を指定します")?;
+    let type_name = type_name.ok_or("--type is missing. give claude_oauth or codex_oauth")?;
     let kind = Kind::from_config_type(&type_name).ok_or_else(|| {
-        format!("`{type_name}` には login できません。claude_oauth か codex_oauth を指定します")
+        format!("cannot log in to `{type_name}`. give claude_oauth or codex_oauth")
     })?;
 
     Ok(LoginArgs {
@@ -1114,7 +1113,7 @@ fn take_value(
         None => it
             .next()
             .cloned()
-            .ok_or_else(|| format!("--{key} に値が指定されていません")),
+            .ok_or_else(|| format!("--{key} needs a value")),
     }
 }
 
@@ -1128,7 +1127,10 @@ fn take_value(
 /// この値で組むので、伏せると「どこへ聞きに行くのか」が見えなくなる。
 fn listen_line(server: &llm_gateway::config::Server) -> String {
     if server.disabled {
-        return format!("{} (無効: この設定では待ち受けません)", server.listen);
+        return format!(
+            "{} (disabled: this configuration does not listen)",
+            server.listen
+        );
     }
     server.listen.clone()
 }
@@ -1137,8 +1139,8 @@ fn check_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.starts_with('-')
     {
         return Err(format!(
-            "`{name}` は認証情報の名前に使えません。\
-名前はそのまま <名前>.json というファイル名になります"
+            "`{name}` cannot be used as a credential name. \
+the name becomes the file name <name>.json as it is"
         ));
     }
     Ok(())
@@ -1162,13 +1164,13 @@ fn check_declared_type(
     match login_kind_of(spec) {
         Some(declared_kind) if declared_kind == kind => Ok(()),
         Some(declared_kind) => Err(format!(
-            "`{name}` は config.toml では type = \"{t}\" で宣言されています。\
---type {t} を指定するか、別の名前を使ってください",
+            "`{name}` is declared as type = \"{t}\" in config.toml. \
+give --type {t}, or use another name",
             t = declared_kind.config_type()
         )),
         None => Err(format!(
-            "`{name}` は config.toml では login を要さない種別で宣言されています。\
-login して使うのは claude_oauth と codex_oauth だけです"
+            "`{name}` is declared in config.toml as a type that needs no login. \
+only claude_oauth and codex_oauth are used through login"
         )),
     }
 }
@@ -1185,7 +1187,7 @@ fn login_kind_of(spec: &CredentialSpec) -> Option<Kind> {
 /// 保存はできたが設定に宣言が無い状態。次に何を書けばよいか示す。
 fn print_config_hint(name: &str, kind: Kind) {
     println!();
-    println!("`{name}` は config.toml の [credentials] にありません。次を足すと使えます:");
+    println!("`{name}` is not in [credentials] of config.toml. add the following to use it:");
     println!();
     println!("  [credentials.{name}]");
     println!("  type = \"{}\"", kind.config_type());
@@ -1196,10 +1198,10 @@ fn open_browser(url: &str) {
     let outcome = std::process::Command::new("open").arg(url).status();
     let reason = match outcome {
         Ok(status) if status.success() => return,
-        Ok(status) => format!("open が {status} で終わりました"),
+        Ok(status) => format!("open exited with {status}"),
         Err(e) => e.to_string(),
     };
-    eprintln!("ブラウザを開けませんでした ({reason})。上の URL を自分で開いてください");
+    eprintln!("could not open a browser ({reason}). open the URL above yourself");
 }
 
 fn init_logging() {
@@ -1401,13 +1403,13 @@ mod tests {
     #[test]
     fn login_says_what_is_missing() {
         let err = parse(&["--type", "claude_oauth"]).unwrap_err();
-        assert!(err.contains("名前"), "{err}");
+        assert!(err.contains("name"), "{err}");
 
         let err = parse(&["claude-main"]).unwrap_err();
         assert!(err.contains("--type"), "{err}");
 
         let err = parse(&["--type"]).unwrap_err();
-        assert!(err.contains("--type に値"), "{err}");
+        assert!(err.contains("--type needs a value"), "{err}");
     }
 
     /// login できない種別は、指定できる語を添えて断る。
@@ -1429,7 +1431,7 @@ mod tests {
     #[test]
     fn login_rejects_two_names() {
         let err = parse(&["--type", "claude_oauth", "a", "b"]).unwrap_err();
-        assert!(err.contains("1 つ"), "{err}");
+        assert!(err.contains("only one name"), "{err}");
         assert!(
             err.contains("`a`") && err.contains("`b`"),
             "両方を示す: {err}"
@@ -1443,7 +1445,7 @@ mod tests {
         for bad in ["", ".", "..", "../../etc/passwd", "sub/name", "-type"] {
             let err = parse(&["--type", "claude_oauth", bad]).unwrap_err();
             assert!(
-                err.contains("使えません") || err.contains("名前"),
+                err.contains("cannot be used") || err.contains("name"),
                 "{bad} → {err}"
             );
         }
@@ -1593,7 +1595,7 @@ mod tests {
             line.contains("127.0.0.1:11300"),
             "問い合わせ先は見える: {line}"
         );
-        assert!(line.contains("無効"), "{line}");
+        assert!(line.contains("disabled"), "{line}");
     }
 
     /// server が居ないときは、次に何を見ればよいかまで言う。
@@ -1601,7 +1603,7 @@ mod tests {
     fn unreachable_server_says_what_to_check() {
         let message = server_unreachable("127.0.0.1:11300", "connection refused");
         assert!(message.contains("127.0.0.1:11300"), "{message}");
-        assert!(message.contains("起動"), "{message}");
+        assert!(message.contains("running"), "{message}");
         assert!(message.contains("launchctl"), "{message}");
     }
 
@@ -1645,7 +1647,7 @@ mod tests {
         assert!(out.contains("71%/95%/0h16m"), "5h 窓:\n{out}");
         assert!(out.contains("30%/43%/04d00h"), "7d 窓:\n{out}");
         assert!(
-            !out.contains("分前"),
+            !out.contains("ago"),
             "取得から間もないので古さは出さない:\n{out}"
         );
     }
@@ -1679,9 +1681,9 @@ mod tests {
         ]);
 
         let out = render(&report(vec![c]));
-        assert!(out.contains("Fable の枠は 80%"), "{out}");
+        assert!(out.contains("the Fable limit is at 80%"), "{out}");
         assert!(
-            out.contains("2026-08-02T08:59:59+00:00 に開きます"),
+            out.contains("resets at 2026-08-02T08:59:59+00:00"),
             "端数の秒は落とす:\n{out}"
         );
         assert!(
@@ -1711,7 +1713,7 @@ mod tests {
             s.observed_at = NOW - 400;
         }
         let out = render(&report(vec![c]));
-        assert!(out.contains("(6 分前)"), "{out}");
+        assert!(out.contains("(6m ago)"), "{out}");
     }
 
     /// 再起動を跨いで読み戻した値には、それだけの経過が付く。
@@ -1726,7 +1728,7 @@ mod tests {
             s.observed_at = NOW - 3 * 3600;
         }
         let out = render(&report(vec![c]));
-        assert!(out.contains("(3 時間前)"), "{out}");
+        assert!(out.contains("(3h ago)"), "{out}");
     }
 
     /// 未観測・対象外も行として並ぶ (名前ごと消さない)。
@@ -1771,12 +1773,12 @@ mod tests {
             llm_gateway::quota::Support::Unobserved,
             None,
         );
-        broken.probe_error = Some("繋がりません".to_owned());
+        broken.probe_error = Some("connection refused".to_owned());
 
         let out = render(&report(vec![hit, broken]));
-        assert!(!out.contains("rejected です"), "{out}");
+        assert!(!out.contains("rejected"), "{out}");
         assert!(!out.contains("out_of_credits"), "{out}");
-        assert!(out.contains("nowhere: 取り直せませんでした"), "{out}");
+        assert!(out.contains("nowhere: could not read it again"), "{out}");
     }
 
     /// バーの ▀ が上下の行と溶けないよう、credential の間は空行で区切る。
@@ -1799,7 +1801,7 @@ mod tests {
         // 消費報告は出さない (kawaz 裁定)。JSON 側には残る。
         let out = render(&r);
         assert!(!out.contains("claude-haiku-4-5-20251001"), "{out}");
-        assert!(!out.contains("トークン消費"), "{out}");
+        assert!(!out.contains("token"), "{out}");
     }
 
     /// 名前の列幅が揃う。日本語を 1 桁で数えると、名前の長さで崩れる。
@@ -1834,11 +1836,11 @@ mod tests {
 
     #[test]
     fn elapsed_time_is_readable() {
-        assert_eq!(elapsed(0), "たった今");
-        assert_eq!(elapsed(59), "たった今");
-        assert_eq!(elapsed(120), "2 分前");
-        assert_eq!(elapsed(7200), "2 時間前");
-        assert_eq!(elapsed(86_400 * 2), "2 日前");
+        assert_eq!(elapsed(0), "just now");
+        assert_eq!(elapsed(59), "just now");
+        assert_eq!(elapsed(120), "2m ago");
+        assert_eq!(elapsed(7200), "2h ago");
+        assert_eq!(elapsed(86_400 * 2), "2d ago");
     }
 
     #[test]

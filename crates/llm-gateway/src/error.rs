@@ -11,18 +11,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// リクエストされたモデルに対応する経路が設定に無い。
-    #[error("model `{0}` に対応する経路が設定されていません")]
+    #[error("no route configured for model `{0}`")]
     UnknownModel(String),
 
     /// 経路はあるが、全て試して届かなかった。
-    #[error("model `{model}` の経路が全て失敗しました ({} 件試行)", attempts.len())]
+    #[error("all routes for model `{model}` failed ({} attempts)", attempts.len())]
     AllUpstreamsFailed {
         model: String,
         attempts: Vec<UpstreamAttempt>,
     },
 
     /// upstream に届いたが、エラー応答が返った。本文はそのまま渡す。
-    #[error("{provider} が {status} を返しました")]
+    #[error("{provider} returned {status}")]
     UpstreamStatus {
         provider: String,
         status: u16,
@@ -30,7 +30,7 @@ pub enum Error {
     },
 
     /// upstream に届かなかった (接続失敗 / タイムアウト)。
-    #[error("{provider} に接続できません: {source}")]
+    #[error("could not reach {provider}: {source}")]
     UpstreamUnreachable {
         provider: String,
         #[source]
@@ -38,26 +38,26 @@ pub enum Error {
     },
 
     /// 認証情報が見つからない、または使える状態にできなかった。
-    #[error("認証情報 `{id}` を使えません: {reason}")]
+    #[error("could not use credential `{id}`: {reason}")]
     Credential { id: String, reason: String },
 
     /// token のリフレッシュに失敗した。
-    #[error("`{id}` の token 更新に失敗しました: {reason}")]
+    #[error("could not refresh the token for `{id}`: {reason}")]
     Refresh { id: String, reason: String },
 
     /// 認可 (login) が最後まで進まなかった。
     ///
     /// 転送の最中には起きない (CLI からの login でだけ出る)。
-    #[error("認可を完了できませんでした: {reason}")]
+    #[error("could not complete authorization: {reason}")]
     Login { reason: String },
 
-    #[error("設定を読めません: {0}")]
+    #[error("could not read the configuration: {0}")]
     Config(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("JSON を解釈できません: {0}")]
+    #[error("could not parse JSON: {0}")]
     Json(#[from] serde_json::Error),
 }
 

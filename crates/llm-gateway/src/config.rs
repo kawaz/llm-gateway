@@ -264,19 +264,19 @@ impl Webhook {
         let Some(base) = &self.base_url else {
             return Ok(None);
         };
-        let mut url = url::Url::parse(base)
-            .map_err(|e| format!("webhook.base_url が URL ではありません: {e}"))?;
+        let mut url =
+            url::Url::parse(base).map_err(|e| format!("webhook.base_url is not a URL: {e}"))?;
         if !matches!(url.scheme(), "http" | "https") {
-            return Err("webhook.base_url は http または https にしてください".to_owned());
+            return Err("webhook.base_url must be http or https".to_owned());
         }
         if !url.username().is_empty() || url.password().is_some() {
-            return Err("webhook.base_url に userinfo は書けません".to_owned());
+            return Err("webhook.base_url must not contain userinfo".to_owned());
         }
         if url.query().is_some() || url.fragment().is_some() {
-            return Err("webhook.base_url に query または fragment は書けません".to_owned());
+            return Err("webhook.base_url must not contain a query or fragment".to_owned());
         }
         url.path_segments_mut()
-            .map_err(|_| "webhook.base_url を基準 URL として使えません".to_owned())?
+            .map_err(|_| "webhook.base_url cannot be used as a base URL".to_owned())?
             .pop_if_empty()
             .push("webhook")
             .push("llm-gateway");
@@ -456,7 +456,7 @@ fn validate_route(name: &str, route: &RouteSpec, config: &Config) -> Result<()> 
     }
     let credential_type = credential.map_or("none", CredentialSpec::type_name);
     Err(Error::Config(format!(
-        "route `{name}` の provider `{:?}` と credential type `{credential_type}` は組み合わせられません",
+        "route `{name}` cannot combine provider `{:?}` with credential type `{credential_type}`",
         route.provider
     )))
 }
@@ -468,7 +468,7 @@ impl Config {
         let merged = extends::resolve(path)?;
         let config: Self = merged.try_into().map_err(|e| {
             Error::Config(format!(
-                "{} の内容が不正です: {e} (土台を重ねた後の姿で見ています)",
+                "{} is invalid: {e} (seen after merging with its base)",
                 path.display()
             ))
         })?;
@@ -484,20 +484,20 @@ impl Config {
         self.webhook.destination_url().map_err(Error::Config)?;
         for (name, route) in &self.routes {
             if name.is_empty() {
-                return Err(Error::Config("route 名が空です".to_owned()));
+                return Err(Error::Config("route name is empty".to_owned()));
             }
             if let Some(credential) = &route.credential
                 && !self.credentials.contains_key(credential)
             {
                 return Err(Error::Config(format!(
-                    "route `{name}` が参照する credential `{credential}` が定義されていません"
+                    "route `{name}` references credential `{credential}`, which is not defined"
                 )));
             }
             validate_route(name, route, self)?;
         }
         for (name, ns) in &self.namespaces {
             if name.is_empty() {
-                return Err(Error::Config("namespace 名が空です".to_owned()));
+                return Err(Error::Config("namespace name is empty".to_owned()));
             }
             self.validate_namespace(name, ns)?;
         }
@@ -510,26 +510,26 @@ impl Config {
         for name in &ns.routes {
             if !known(name) {
                 return Err(Error::Config(format!(
-                    "namespace `{ns_name}` が参照する route `{name}` が定義されていません"
+                    "namespace `{ns_name}` references route `{name}`, which is not defined"
                 )));
             }
         }
         for (i, rule) in ns.routing.iter().enumerate() {
             if rule.models.is_empty() {
                 return Err(Error::Config(format!(
-                    "namespace `{ns_name}` の routing[{i}] に models が指定されていません"
+                    "namespace `{ns_name}` routing[{i}] does not specify models"
                 )));
             }
             if rule.routes.is_empty() {
                 return Err(Error::Config(format!(
-                    "namespace `{ns_name}` の routing[{i}] ({}) に routes が指定されていません",
+                    "namespace `{ns_name}` routing[{i}] ({}) does not specify routes",
                     rule.models.join(", ")
                 )));
             }
             for name in &rule.routes {
                 if !known(name) {
                     return Err(Error::Config(format!(
-                        "namespace `{ns_name}` の routing[{i}] ({}) が参照する route `{name}` が定義されていません",
+                        "namespace `{ns_name}` routing[{i}] ({}) references route `{name}`, which is not defined",
                         rule.models.join(", ")
                     )));
                 }
