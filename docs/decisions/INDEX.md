@@ -16,6 +16,7 @@
 - [DR-0012](./DR-0012-request-events.md) — 転送のたびに起きたことを SSE で流す (/llm-gateway/events)。prompt cache の 5 分を外から数えられるようにする
 - [DR-0013](./DR-0013-config-extends.md) — 設定は `extends` で土台の上に重ねる (表は鍵ごとにマージ、配列は置換、消す手段は持たない)
 - [DR-0014](./DR-0014-target-architecture-provider-preset.md) — 目標アーキテクチャ: 三境界 (ingress/egress/exchange) と provider = 小 trait の束 (Auth/Wire/Metering/QuotaApi)。core は provider の名前を 1 つも知らない
+- [DR-0015](./DR-0015-routing-priority-and-reset-aware-ordering.md) — routing のネストグループ (同格プール) と 7d リセット期限優先の動的順序。provider 非依存
 
 ## Archived
 
