@@ -20,23 +20,7 @@
 
 ## 裁定待ち
 
-### MP-Q1: claude-emrd 環境の marketplace 同期エラーの対処
-
-**現象**: claude-emrd 環境 (業務面の CLAUDE_CONFIG_DIR) で rules-personal plugin の
-marketplace 同期が `corrupted installLocation` エラーで失敗する
-(2026-08-11 の claude-rules-personal v0.2.14 push 時に発覚)。
-personal 環境は正常。claude-emrd 環境だけ plugin の install 状態メタデータが
-壊れており、新バージョンへの自動更新が効かない = **当該面のセッションが
-古い rules/skills のまま動き続ける**。
-
-**想定される対処**: claude-emrd 環境で
-`claude plugin marketplace remove rules-personal` → 再登録。
-リスクは低い (marketplace 登録のやり直しだけ、rules リポ本体には触らない) が、
-別環境の設定変更なので勝手にやらず裁定待ちにしている。
-
-- [ ] a: 今すぐ直してよい (このセッションが claude-emrd 環境の marketplace を再登録)
-- [ ] b: 次に当該面を使うセッションに任せる (それまで放置)
-- [ ] c: その他 (自由文で)
+（現在なし）
 
 ## 確認待ち
 
