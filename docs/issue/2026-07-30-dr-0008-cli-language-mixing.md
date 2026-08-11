@@ -1,11 +1,11 @@
 ---
 title: CLI の help / error message で日本語と英語が混在している (DR-0008 途中適用)
-status: open
+status: wip
 category: task
 created: 2026-07-30T23:19:40+09:00
 last_read: 2026-08-11T23:49:18+09:00
 open_entered: 2026-07-30T23:19:40+09:00
-wip_entered:
+wip_entered: 2026-08-11T23:50:08+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
