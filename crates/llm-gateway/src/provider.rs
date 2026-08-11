@@ -41,6 +41,26 @@ pub trait Wire: Send + Sync {
     ) -> BoxFuture<'a, Result<Response>>;
 }
 
+/// 本文をクライアントへ流す前に、この経路の応答を採用できるか判定する。
+pub trait ResponseAdmission: Send + Sync {
+    fn admit<'a>(
+        &'a self,
+        response: Response,
+        model: &'a str,
+        observed_at: i64,
+    ) -> BoxFuture<'a, Result<Admission>>;
+}
+
+/// 本文先頭を観測した後の採用判定。
+pub enum Admission {
+    Admitted(Response),
+    Rejected {
+        response: Response,
+        reason: String,
+        denial: Option<Denial>,
+    },
+}
+
 /// 応答から provider 固有の quota・拒否・usage・単価を読む。
 pub trait Metering: Send + Sync {
     /// 応答ヘッダに quota が載っていれば正規スナップショットへ写す。
@@ -122,6 +142,7 @@ pub struct Preset {
     auth: Arc<dyn Auth>,
     wire: Arc<dyn Wire>,
     metering: Arc<dyn Metering>,
+    response_admission: Option<Arc<dyn ResponseAdmission>>,
     quota_api: Option<Arc<dyn QuotaApi>>,
     negotiation: Option<Arc<dyn Negotiation>>,
     /// まだ何も観測していないときに、枠について言えること。
@@ -142,6 +163,7 @@ impl Preset {
             auth,
             wire,
             metering,
+            response_admission: None,
             quota_api: None,
             negotiation: None,
             // 何も宣言しない経路について言えることは無い。「取れない」と
@@ -149,6 +171,14 @@ impl Preset {
             unobserved: Support::UpstreamDependent,
             state: RouteState::new(),
         }
+    }
+
+    pub fn with_response_admission(
+        mut self,
+        response_admission: Arc<dyn ResponseAdmission>,
+    ) -> Self {
+        self.response_admission = Some(response_admission);
+        self
     }
 
     pub fn with_quota_api(mut self, quota_api: Arc<dyn QuotaApi>) -> Self {
@@ -185,6 +215,21 @@ impl Preset {
 
     pub fn metering(&self) -> &dyn Metering {
         self.metering.as_ref()
+    }
+
+    pub async fn admit(&self, response: Response, model: &str, now: i64) -> Result<Admission> {
+        let Some(admission) = self.response_admission.as_deref() else {
+            return Ok(Admission::Admitted(response));
+        };
+        let outcome = admission.admit(response, model, now).await?;
+        if let Admission::Rejected {
+            denial: Some(denial),
+            ..
+        } = &outcome
+        {
+            self.state.deny(denial.clone(), now);
+        }
+        Ok(outcome)
     }
 
     pub fn quota_api(&self) -> Option<&dyn QuotaApi> {

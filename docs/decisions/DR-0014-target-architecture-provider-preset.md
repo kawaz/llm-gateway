@@ -182,6 +182,36 @@ BedrockProvider (preset)
   あわせて events にも出すよう直す (overview §6-#8 の乖離を解消)
 - overview §5.2 の d / f / g / h / i / j はこの裁定に機械的に追従する (裁定不要)
 
+### 9. `ResponseAdmission` — 本文先頭を見てからの採用判定 (実装時に追加、2026-08-11)
+
+HTTP status だけでは判定できない失敗がある。OpenAI の Responses API は一時的な
+混雑を **HTTP 200 のまま本文内の SSE `error` event** で返す。status しか見ないと
+「成功」と誤認して次の経路へ回さず、fallback の機会を逃す。
+
+- **provider の新しい optional capability として `ResponseAdmission` を追加**。
+  `Metering` には**足さない**。Metering の責務は quota・消費 usage・料金の
+  「読み取り」で、`ResponseAdmission` は「この経路を採用してよいか」という
+  転送成立性の判定。混ぜると、accounting を持たない provider が本文の失敗を
+  判定できないという不自然な依存が生まれる
+- **判定は変換後の最初の semantic event 境界まで**。固定バイト数ではなく
+  event の区切りまで読む (JSON 途中では成否を判定できないため)。上限は
+  `Metering` の SSE 解析と同じ `MAX_EVENT` (256 KiB) を流用し、新しい定数は
+  増やさない
+- **経路切替はクライアントへ 1 バイトも書く前まで**という不変条件 (§3 参照) は
+  変わらない。判定は「まだ何も書いていない」区間だけを対象にする。採用後
+  (= クライアントへ送出を始めた後) に届く error は fallback できないので、
+  そのまま流す。この場合の denial 付与は本 DR ではやらない (「採用前判定」と
+  「採用後監視」を同じ capability に同居させると責務とライフサイクルが崩れる)
+- **拒否の分類は provider 内に閉じる**。混雑 (overloaded) は `Denial` を伴う
+  (`Reason::Busy`, `Scope::Model`, 既存の `DEFAULT_BACKOFF` — DR-0009 の契約を
+  再利用し新定数を増やさない)。依頼自体の誤り (invalid_request 等) は別経路に
+  回しても直らないので admitted のまま返す。分類語彙 (`overloaded_error` 等)
+  は provider の語彙であり、core はこれを知らない
+- **時間の上限は設けない**。最初の event を待つ間 upstream が沈黙した場合は、
+  既存の HTTP クライアントの接続/読み取り timeout に委ねる。バイト上限
+  (`MAX_EVENT`) は「異常に大きい先頭 event」に対する保護であり、「応答が
+  遅い」を検知する仕組みではない
+
 ## Alternatives Considered
 
 **一枚岩の `Provider` trait を維持し、実装を増やす** — Bedrock が既に

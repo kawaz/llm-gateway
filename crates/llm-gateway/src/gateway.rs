@@ -17,12 +17,12 @@ use crate::config::{Config, Namespace};
 use crate::credential::time::now_unix;
 use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
 use crate::denial::Probing;
-use crate::egress::{self, EgressRequest, Headers, Response};
+use crate::egress::{self, EgressRequest, Headers, Response, SentResponse};
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
 use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
-use crate::provider::{Preset, ProbeRequest};
+use crate::provider::{Admission, Preset, ProbeRequest};
 use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Route, Router, Selection};
 use crate::session;
@@ -429,6 +429,7 @@ impl<P: Persistence> Gateway<P> {
             .unwrap_or_default();
 
         let resp = self.send(route, call, credential.as_ref(), sending).await?;
+        let resp = self.admit(route, call.model, resp).await?;
 
         // 交渉するものを載せていないなら、失敗の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
@@ -468,7 +469,40 @@ impl<P: Persistence> Gateway<P> {
         let resp = self
             .send(route, call, credential.as_ref(), retrying)
             .await?;
+        let resp = self.admit(route, call.model, resp).await?;
         accept_or_switch(resp)
+    }
+
+    async fn admit(
+        &self,
+        route: &Arc<Route>,
+        model: &str,
+        sent: SentResponse,
+    ) -> std::result::Result<Response, Switch> {
+        let mode = sent.mode;
+        match route
+            .preset
+            .admit(sent.response, model, now_unix())
+            .await
+            .map_err(|e| Switch::to_next(e.to_string()))?
+        {
+            Admission::Admitted(response) => {
+                egress::finish_response(SentResponse { response, mode })
+                    .await
+                    .map_err(|e| Switch::to_next(e.to_string()))
+            }
+            Admission::Rejected {
+                response, reason, ..
+            } => {
+                let response = egress::finish_response(SentResponse { response, mode })
+                    .await
+                    .map_err(|e| Switch::to_next(e.to_string()))?;
+                Err(Switch {
+                    reason,
+                    denial: Some(response),
+                })
+            }
+        }
     }
 
     async fn send(
@@ -477,7 +511,7 @@ impl<P: Persistence> Gateway<P> {
         call: &Call<'_>,
         credential: Option<&Credential>,
         headers: Headers,
-    ) -> std::result::Result<Response, Switch> {
+    ) -> std::result::Result<SentResponse, Switch> {
         // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
         // 送る。何という名前で受け付けるかは discovery が答えている。
         let mut body = call.body.clone();
@@ -503,7 +537,7 @@ impl<P: Persistence> Gateway<P> {
         // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
         let now = now_unix();
         if let Some(id) = &route.credential
-            && let Some(snapshot) = route.preset.observe_quota(&resp.headers, now)
+            && let Some(snapshot) = route.preset.observe_quota(&resp.response.headers, now)
         {
             self.usage.observe(id, snapshot).await;
         }
@@ -514,7 +548,7 @@ impl<P: Persistence> Gateway<P> {
         self.events.publish(events::Event::new(
             now,
             &call.origin(route.name()),
-            resp.status,
+            resp.response.status,
         ));
         Ok(resp)
     }
@@ -719,7 +753,10 @@ impl<P: Persistence> Gateway<P> {
             .await
             .map_err(|e| e.to_string())?;
 
-        let resp = egress::send(&self.http, preset, Some(&credential), probe.request)
+        let sent = egress::send(&self.http, preset, Some(&credential), probe.request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let resp = egress::finish_response(sent)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -986,6 +1023,20 @@ mod tests {
             extra: &[(&str, &str)],
             respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
         ) -> Self {
+            Self::start_with_content_type("application/json", extra, respond).await
+        }
+
+        async fn start_sse(
+            respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
+            Self::start_with_content_type("text/event-stream", &[], respond).await
+        }
+
+        async fn start_with_content_type(
+            content_type: &'static str,
+            extra: &[(&str, &str)],
+            respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
             let extra: Arc<String> =
                 Arc::new(extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1027,7 +1078,7 @@ mod tests {
                         };
 
                         let resp = format!(
-                            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                            "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\n\
 content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
                             body.len()
                         );
@@ -2237,6 +2288,68 @@ routes = ["a", "b"]
         assert_eq!(resp.response.status, 200);
         assert!(body_text(resp.response).await.contains("ok"));
         assert_eq!((crowded.hits(), spare.hits()), (1, 1));
+    }
+
+    /// HTTP 200 でも本文先頭が overloaded なら、1 byte も返す前に次の経路へ回す。
+    ///
+    /// OpenAI Responses API は一時的な混雑を SSE error で返す。status だけで採用すると
+    /// fallback の機会を失うため、provider が最初の event を判定して core へ伝える。
+    #[tokio::test]
+    async fn a_body_level_overload_falls_back_before_streaming() {
+        let crowded = FakeUpstream::start_sse(|_, _| {
+            (
+                200,
+                concat!(
+                    "data: {\"type\":\"error\",\"error\":{\"message\":",
+                    "\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{}}\n\n"
+                )
+                .to_owned(),
+            )
+        })
+        .await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["m"]
+
+[routes.spare]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["codex", "spare"]
+"#,
+                crowded.url, spare.url
+            ),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+        let before = (crowded.hits(), spare.hits());
+
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(resp.response.status, 200);
+        assert!(body_text(resp.response).await.contains("ok"));
+        assert_eq!((crowded.hits() - before.0, spare.hits() - before.1), (1, 1));
+        assert!(matches!(
+            preset_of(&gw, "codex").availability(MODEL, now_unix()),
+            Availability::Denied { .. }
+        ));
     }
 
     /// どの宛先も混んでいたら、最後に見た 529 をそのまま返す。

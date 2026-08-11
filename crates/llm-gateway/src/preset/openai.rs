@@ -1,5 +1,6 @@
 //! OpenAI Responses API を話す preset。
 
+mod admission;
 mod auth;
 mod metering;
 mod quota_api;
@@ -7,6 +8,7 @@ mod request;
 mod response;
 mod wire;
 
+pub use admission::OpenAiResponseAdmission;
 pub use auth::ChatGptBearer;
 pub use metering::OpenAiMetering;
 pub use quota_api::WhamUsage;
@@ -26,6 +28,7 @@ pub fn chatgpt(name: &str, wire: Arc<OpenAiWire>) -> Preset {
         wire,
         Arc::new(OpenAiMetering),
     )
+    .with_response_admission(Arc::new(OpenAiResponseAdmission))
     .with_quota_api(Arc::new(quota))
     .with_quota_support(Support::Unobserved)
 }

@@ -152,6 +152,12 @@ pub enum ResponseMode {
     CollectMessagesSse,
 }
 
+/// upstream から受けた応答と、採用後に適用するクライアント向けの仕上げ。
+pub struct SentResponse {
+    pub response: Response,
+    pub mode: ResponseMode,
+}
+
 /// upstream からの応答。本文はまだ読んでいない。
 pub struct Response {
     pub status: u16,
@@ -182,14 +188,18 @@ pub async fn send(
     preset: &Preset,
     credential: Option<&Credential>,
     request: EgressRequest,
-) -> Result<Response> {
+) -> Result<SentResponse> {
     let EncodedRequest {
         mut upstream,
-        response: response_mode,
+        response: mode,
     } = preset.wire().encode(request)?;
     preset.auth().authorize(credential, &mut upstream)?;
     let response = preset.wire().send(http, upstream).await?;
-    adapt_response(response, response_mode).await
+    Ok(SentResponse { response, mode })
+}
+
+pub async fn finish_response(sent: SentResponse) -> Result<Response> {
+    adapt_response(sent.response, sent.mode).await
 }
 
 async fn adapt_response(mut response: Response, mode: ResponseMode) -> Result<Response> {

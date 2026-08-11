@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::egress::BodyStream;
 use crate::{Error, Result};
 
-const MAX_EVENT: usize = 256 * 1024;
+pub(crate) const MAX_EVENT: usize = 256 * 1024;
 
 pub fn translate(body: BodyStream) -> BodyStream {
     let state = State {
@@ -69,6 +69,7 @@ struct Translator {
     next_index: u64,
     model: String,
     saw_tool: bool,
+    failed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -242,15 +243,23 @@ impl Translator {
                 ));
                 output.push(sse("message_stop", json!({"type":"message_stop"})));
             }
-            "error" | "response.failed" => {
-                let error = event.get("error").unwrap_or(event);
+            "error" | "response.failed" if !self.failed => {
+                self.failed = true;
+                let error = event
+                    .get("error")
+                    .or_else(|| event.pointer("/response/error"))
+                    .unwrap_or(event);
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("OpenAI response failed");
                 output.push(sse(
                     "error",
                     json!({
                         "type":"error",
                         "error":{
-                            "type":"api_error",
-                            "message":error.get("message").and_then(Value::as_str).unwrap_or("OpenAI response failed")
+                            "type":error_type(message),
+                            "message":message
                         }
                     }),
                 ));
@@ -302,6 +311,17 @@ impl Translator {
     }
 }
 
+fn error_type(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("overload") || message.contains("try again later") {
+        "overloaded_error"
+    } else if message.contains("invalid request") || message.contains("invalid_request") {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    }
+}
+
 fn usage(value: Option<&Value>) -> Value {
     let value = value.unwrap_or(&Value::Null);
     json!({
@@ -349,6 +369,19 @@ mod tests {
         assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
         assert!(output.contains("\"cache_read_input_tokens\":3"), "{output}");
         assert!(output.contains("\"reasoning_output_tokens\":2"), "{output}");
+    }
+
+    /// 同じ upstream failure を表す error と response.failed は、クライアントへ 1 件だけ返す。
+    #[tokio::test]
+    async fn emits_one_error_for_a_single_failure() {
+        let output = translated(vec![
+            b"data: {\"type\":\"error\",\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"OpenAI response failed\"}}}\n\n",
+        ])
+        .await;
+
+        assert_eq!(output.matches("event: error").count(), 1, "{output}");
+        assert!(output.contains("\"type\":\"overloaded_error\""), "{output}");
     }
 
     /// chunk が SSE 行の途中で切れてもイベントを失わない。
