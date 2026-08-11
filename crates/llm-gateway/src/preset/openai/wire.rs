@@ -89,9 +89,7 @@ impl Wire for OpenAiWire {
                     })
                     .collect(),
             );
-            let is_sse = headers
-                .get("content-type")
-                .is_some_and(|value| value.split(';').next() == Some("text/event-stream"));
+            let is_sse = is_event_stream(status, headers.get("content-type"));
             let body = response
                 .bytes_stream()
                 .map(|chunk| {
@@ -115,6 +113,22 @@ impl Wire for OpenAiWire {
                 body,
             })
         })
+    }
+}
+
+/// 応答が SSE かどうか。
+///
+/// この Wire は必ず `stream=true` で送るので、成功応答は SSE しかありえない。
+/// content-type だけを見ると判定を外す: Codex backend は SSE を返しながら
+/// content-type を付けない (実測 2026-08-11)。名乗らない成功応答は SSE と見なす。
+/// 失敗応答は JSON なので、そのまま素通しして Metering に読ませる。
+fn is_event_stream(status: u16, content_type: Option<&str>) -> bool {
+    if !(200..300).contains(&status) {
+        return false;
+    }
+    match content_type {
+        None => true,
+        Some(value) => value.split(';').next() == Some("text/event-stream"),
     }
 }
 
@@ -170,5 +184,23 @@ mod tests {
         assert_eq!(encoded.headers.get("accept"), Some("text/event-stream"));
         assert_eq!(encoded.headers.get("anthropic-version"), None);
         assert_eq!(encoded.headers.get("authorization"), None);
+    }
+
+    /// content-type を名乗らない成功応答も SSE として変換する。
+    /// Codex backend は SSE を返しながら content-type を付けない。
+    #[test]
+    fn a_success_without_content_type_is_still_translated() {
+        assert!(is_event_stream(200, None));
+        assert!(is_event_stream(200, Some("text/event-stream")));
+        assert!(is_event_stream(
+            200,
+            Some("text/event-stream; charset=utf-8")
+        ));
+
+        // 失敗応答は JSON。素通しして Metering に読ませる。
+        assert!(!is_event_stream(429, None));
+        assert!(!is_event_stream(400, Some("application/json")));
+        // 成功でも別の型を名乗るなら変換しない。
+        assert!(!is_event_stream(200, Some("application/json")));
     }
 }
