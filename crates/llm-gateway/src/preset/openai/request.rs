@@ -190,10 +190,12 @@ fn assistant_content(value: &Value, output: &mut Vec<Value>) -> Result<()> {
                     output.push(json!({"role": "assistant", "content": parts}));
                     parts = Vec::new();
                 }
+                // item の `id` は送らない。upstream は `fc` 始まりの自前 ID を
+                // 要求するが (実測 2026-08-11: `call_...` を渡すと 400)、
+                // tool_use/tool_result の対応付けは `call_id` だけで足りる。
                 let id = required_str(&block, "id", "tool_use")?;
                 output.push(json!({
                     "type": "function_call",
-                    "id": id,
                     "call_id": id,
                     "name": required_str(&block, "name", "tool_use")?,
                     "arguments": serde_json::to_string(block.get("input").unwrap_or(&Value::Null))?,
