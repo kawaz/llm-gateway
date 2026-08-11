@@ -43,7 +43,10 @@ pub fn convert(body: Value) -> Result<Value> {
     if let Some(choice) = input.get("tool_choice") {
         output.insert("tool_choice".to_owned(), tool_choice(choice)?);
     }
-    if let Some(reasoning) = reasoning(input.get("thinking"))? {
+    if let Some(reasoning) = reasoning(
+        input.get("thinking"),
+        input.get("output_config").and_then(|c| c.get("effort")),
+    )? {
         output.insert("reasoning".to_owned(), reasoning);
     }
 
@@ -278,14 +281,29 @@ fn tool_choice(value: &Value) -> Result<Value> {
     }
 }
 
-fn reasoning(value: Option<&Value>) -> Result<Option<Value>> {
-    let Some(value) = value else {
+/// 思考の深さを Responses API の `reasoning.effort` へ写す。
+///
+/// 深さの指定は 2 通りある。`output_config.effort` は段階を直接名指しするので
+/// そのまま採り、`thinking` しか無ければ形から段階を導く。両方あれば名指しが勝つ。
+/// `thinking: disabled` だけは「考えるな」という別の指示なので、段階の指定に
+/// かかわらず reasoning を送らない。
+fn reasoning(thinking: Option<&Value>, effort: Option<&Value>) -> Result<Option<Value>> {
+    if thinking
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled")
+    {
+        return Ok(None);
+    }
+    if let Some(effort) = effort {
+        return Ok(Some(json!({"effort": named_effort(effort)?})));
+    }
+    let Some(thinking) = thinking else {
         return Ok(None);
     };
-    let effort = match value.get("type").and_then(Value::as_str) {
-        Some("disabled") => return Ok(None),
+    let effort = match thinking.get("type").and_then(Value::as_str) {
         Some("adaptive") => "high",
-        Some("enabled") => match value.get("budget_tokens").and_then(Value::as_u64) {
+        Some("enabled") => match thinking.get("budget_tokens").and_then(Value::as_u64) {
             Some(0..=2048) => "low",
             Some(16000..) => "high",
             _ => "medium",
@@ -293,6 +311,20 @@ fn reasoning(value: Option<&Value>) -> Result<Option<Value>> {
         _ => return Err(invalid("thinking の type を変換できません")),
     };
     Ok(Some(json!({"effort": effort})))
+}
+
+/// 名指しの段階を Responses API の語彙へ。
+///
+/// `max` は Responses API に無いので、いちばん深い `xhigh` に丸める。
+fn named_effort(value: &Value) -> Result<&'static str> {
+    match value.as_str() {
+        Some("low") => Ok("low"),
+        Some("medium") => Ok("medium"),
+        Some("high") => Ok("high"),
+        Some("xhigh") => Ok("xhigh"),
+        Some("max") => Ok("xhigh"),
+        _ => Err(invalid("output_config.effort を変換できません")),
+    }
 }
 
 fn required_str<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str> {
@@ -377,11 +409,63 @@ mod tests {
             (16000, "high"),
         ] {
             assert_eq!(
-                reasoning(Some(&json!({"type":"enabled","budget_tokens":budget})))
-                    .unwrap()
-                    .unwrap()["effort"],
+                reasoning(
+                    Some(&json!({"type":"enabled","budget_tokens":budget})),
+                    None
+                )
+                .unwrap()
+                .unwrap()["effort"],
                 expected
             );
         }
+    }
+
+    /// 名指しの段階 (`output_config.effort`) は形からの推定より優先する。
+    /// `max` は Responses API に無いので `xhigh` に丸める。
+    #[test]
+    fn a_named_effort_wins_over_the_thinking_shape() {
+        for (named, expected) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "xhigh"),
+        ] {
+            // thinking は budget から low になる形。名指しが勝つ。
+            let converted = reasoning(
+                Some(&json!({"type":"enabled","budget_tokens":1024})),
+                Some(&json!(named)),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(converted["effort"], expected);
+        }
+
+        // 名指しだけでも効く。
+        assert_eq!(
+            reasoning(None, Some(&json!("xhigh"))).unwrap().unwrap()["effort"],
+            "xhigh"
+        );
+        // 「考えるな」は段階の指定より強い。
+        assert!(
+            reasoning(Some(&json!({"type":"disabled"})), Some(&json!("high")))
+                .unwrap()
+                .is_none()
+        );
+        // 知らない段階は黙って落とさず弾く。
+        assert!(reasoning(None, Some(&json!("turbo"))).is_err());
+    }
+
+    /// `output_config.effort` を送れば Responses API へ届く。
+    #[test]
+    fn an_output_config_effort_reaches_the_request() {
+        let converted = convert(json!({
+            "model": "gpt-5.6-luna",
+            "max_tokens": 64,
+            "output_config": {"effort": "xhigh"},
+            "messages": [{"role":"user","content":"hi"}],
+        }))
+        .unwrap();
+        assert_eq!(converted["reasoning"]["effort"], "xhigh");
     }
 }
