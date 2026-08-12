@@ -1,11 +1,11 @@
 ---
 title: upstream の本文内エラー透過を適切な HTTP エラーに写像する
-status: open
+status: wip
 category: task
 created: 2026-08-12T11:04:31+09:00
 last_read:
 open_entered: 2026-08-12T11:04:31+09:00
-wip_entered:
+wip_entered: 2026-08-12T11:08:57+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -37,4 +37,4 @@ upstream の本文内エラー透過を適切な HTTP エラーに写像する�
 
 <!-- wip 時のみ -->
 
-- [ ] {次に手を付けるサブタスク}
+- [ ] codex-sol worker に実装委譲
