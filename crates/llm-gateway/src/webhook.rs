@@ -193,7 +193,7 @@ async fn send(
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                "応答がありませんでした (timeout)".to_owned()
+                "no response (timeout)".to_owned()
             } else {
                 e.to_string()
             }
@@ -205,7 +205,7 @@ async fn send(
     }
     // 相手の本文は記録しない。受け口が要求内容を反射する実装でも、
     // Authorization の値をログへ持ち込まないため。
-    Err(format!("{status} が返りました"))
+    Err(format!("received {status}"))
 }
 
 /// 合言葉をファイルから読む。
@@ -216,13 +216,14 @@ fn read_token(path: &Path) -> std::result::Result<String, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let token = raw.trim();
     if token.is_empty() {
-        return Err("中身が空です".to_owned());
+        return Err("content is empty".to_owned());
     }
     if token.contains(['\r', '\n']) {
-        return Err("1 行で書いてください".to_owned());
+        return Err("must be a single line".to_owned());
     }
-    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-        .map_err(|_| "Authorization ヘッダに使えない文字が含まれています".to_owned())?;
+    reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        "contains characters that cannot be used in an Authorization header".to_owned()
+    })?;
     Ok(token.to_owned())
 }
 
@@ -542,7 +543,7 @@ mod tests {
         });
         accepted.acquire().await.unwrap().forget();
         let error = sending.await.unwrap().unwrap_err();
-        assert_eq!(error, "応答がありませんでした (timeout)");
+        assert_eq!(error, "no response (timeout)");
     }
 
     /// 受け口が黙っていても、起きたことを流す側は待たない。

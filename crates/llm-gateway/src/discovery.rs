@@ -68,7 +68,7 @@ pub async fn fetch(
                 .as_deref()
                 .ok_or_else(|| Error::Credential {
                     id: credential.id.to_string(),
-                    reason: "ChatGPT のアカウント識別子がありません".to_owned(),
+                    reason: "no ChatGPT account identifier".to_owned(),
                 })?;
             http.get(&url)
                 .header("authorization", credential.bearer())
@@ -88,7 +88,7 @@ pub async fn fetch(
     let text = resp
         .text()
         .await
-        .map_err(|e| Error::Config(format!("一覧を読めません: {e}")))?;
+        .map_err(|e| Error::Config(format!("could not read the model list: {e}")))?;
 
     if !status.is_success() {
         return Err(Error::UpstreamStatus {

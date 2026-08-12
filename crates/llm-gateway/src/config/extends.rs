@@ -35,24 +35,24 @@ fn layer(path: &Path, referrer: Option<&Path>, visiting: &mut BTreeSet<PathBuf>)
     // 同じファイルを別物と数えると、循環を見逃す。
     let here = path.canonicalize().map_err(|e| match referrer {
         Some(from) => Error::Config(format!(
-            "{} が土台に指した {} を読めません: {e}",
-            from.display(),
-            path.display()
+            "could not read {} (extended by {}): {e}",
+            path.display(),
+            from.display()
         )),
-        None => Error::Config(format!("{} を読めません: {e}", path.display())),
+        None => Error::Config(format!("could not read {}: {e}", path.display())),
     })?;
 
     if !visiting.insert(here.clone()) {
         return Err(Error::Config(format!(
-            "設定の土台が循環しています ({} に戻ってきました)。extends を辿り直してください",
+            "config base is circular (returned to {}). Check the extends chain",
             here.display()
         )));
     }
 
     let raw = std::fs::read_to_string(&here)
-        .map_err(|e| Error::Config(format!("{} を読めません: {e}", here.display())))?;
+        .map_err(|e| Error::Config(format!("could not read {}: {e}", here.display())))?;
     let mut table: Table = toml::from_str(&raw)
-        .map_err(|e| Error::Config(format!("{} の内容が不正です: {e}", here.display())))?;
+        .map_err(|e| Error::Config(format!("{} has invalid content: {e}", here.display())))?;
 
     // 取り出して消す。畳んだ結果に残すと、設定の項目として弾かれる。
     let Some(base) = table.remove("extends") else {
@@ -60,7 +60,7 @@ fn layer(path: &Path, referrer: Option<&Path>, visiting: &mut BTreeSet<PathBuf>)
     };
     let Some(base) = base.as_str() else {
         return Err(Error::Config(format!(
-            "{} の extends はファイルのパス (文字列) で書いてください",
+            "{}'s extends must be a file path (string)",
             here.display()
         )));
     };
@@ -295,7 +295,7 @@ exclude = ["c が書いた"]
     fn a_file_cannot_stand_on_itself() {
         let dir = spread(&[("here.toml", "extends = \"here.toml\"\n")]);
         let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
-        assert!(e.contains("循環"), "{e}");
+        assert!(e.contains("circular"), "{e}");
         assert!(e.contains("here.toml"), "どのファイルかが分かる: {e}");
     }
 
@@ -308,7 +308,7 @@ exclude = ["c が書いた"]
             ("c.toml", "extends = \"a.toml\"\n"),
         ]);
         let e = resolve(&at(&dir, "a.toml")).unwrap_err().to_string();
-        assert!(e.contains("循環"), "{e}");
+        assert!(e.contains("circular"), "{e}");
     }
 
     /// 指した先が無ければ、どのファイルが何を指したかまで言う。
@@ -326,7 +326,7 @@ exclude = ["c が書いた"]
         let dir = spread(&[("here.toml", "extends = 3\n")]);
         let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
         assert!(e.contains("extends"), "{e}");
-        assert!(e.contains("パス"), "{e}");
+        assert!(e.contains("path"), "{e}");
     }
 
     /// 起点そのものが無い場合も読める文言にする。

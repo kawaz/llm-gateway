@@ -59,7 +59,9 @@ impl QuotaApi for WhamUsage {
                 })?;
             let status = response.status();
             let body = response.text().await.map_err(|error| {
-                Error::Config(format!("ChatGPT quota の応答を読めません: {error}"))
+                Error::Config(format!(
+                    "could not read the ChatGPT quota response: {error}"
+                ))
             })?;
             if !status.is_success() {
                 return Err(Error::UpstreamStatus {
@@ -68,8 +70,9 @@ impl QuotaApi for WhamUsage {
                     body: String::new(),
                 });
             }
-            parse(&body)
-                .ok_or_else(|| Error::Config("ChatGPT quota の応答を解釈できません".to_owned()))
+            parse(&body).ok_or_else(|| {
+                Error::Config("could not parse the ChatGPT quota response".to_owned())
+            })
         })
     }
 

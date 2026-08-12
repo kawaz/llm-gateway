@@ -58,7 +58,9 @@ impl QuotaApi for OauthUsage {
         Box::pin(async move {
             fetch(http, &self.base_url, credential)
                 .await
-                .ok_or_else(|| Error::Config("quota の応答を取得または解釈できません".to_owned()))
+                .ok_or_else(|| {
+                    Error::Config("could not fetch or parse the quota response".to_owned())
+                })
         })
     }
 

@@ -7,11 +7,11 @@ use crate::{Error, Result};
 pub fn convert(body: Value) -> Result<Value> {
     let input = body
         .as_object()
-        .ok_or_else(|| invalid("request body は JSON object で指定してください"))?;
+        .ok_or_else(|| invalid("request body must be a JSON object"))?;
     let model = input
         .get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid("model がありません"))?;
+        .ok_or_else(|| invalid("request has no model"))?;
 
     let mut output = Map::new();
     output.insert("model".to_owned(), Value::String(model.to_owned()));
@@ -33,7 +33,7 @@ pub fn convert(body: Value) -> Result<Value> {
     if let Some(tools) = input.get("tools") {
         let tools = tools
             .as_array()
-            .ok_or_else(|| invalid("tools は配列で指定してください"))?;
+            .ok_or_else(|| invalid("tools must be an array"))?;
         output.insert(
             "tools".to_owned(),
             Value::Array(tools.iter().map(tool).collect::<Result<_>>()?),
@@ -81,18 +81,18 @@ fn system_text(value: &Value) -> Result<String> {
             .map(|block| {
                 let kind = block.get("type").and_then(Value::as_str);
                 if kind != Some("text") {
-                    return Err(invalid("system には text block だけを指定できます"));
+                    return Err(invalid("system may only contain text blocks"));
                 }
                 block
                     .get("text")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
-                    .ok_or_else(|| invalid("system text block に text がありません"))
+                    .ok_or_else(|| invalid("system text block has no text"))
             })
             .collect::<Result<Vec<_>>>()
             .map(|parts| parts.join("\n\n")),
         _ => Err(invalid(
-            "system は文字列または text block 配列で指定してください",
+            "system must be a string or an array of text blocks",
         )),
     }
 }
@@ -100,16 +100,16 @@ fn system_text(value: &Value) -> Result<String> {
 fn messages(value: Option<&Value>) -> Result<Vec<Value>> {
     let messages = value
         .and_then(Value::as_array)
-        .ok_or_else(|| invalid("messages は配列で指定してください"))?;
+        .ok_or_else(|| invalid("messages must be an array"))?;
     let mut output = Vec::new();
     for message in messages {
         let role = message
             .get("role")
             .and_then(Value::as_str)
-            .ok_or_else(|| invalid("message に role がありません"))?;
+            .ok_or_else(|| invalid("message has no role"))?;
         let content = message
             .get("content")
-            .ok_or_else(|| invalid("message に content がありません"))?;
+            .ok_or_else(|| invalid("message has no content"))?;
         match role {
             "user" => user_content(content, &mut output)?,
             "assistant" => assistant_content(content, &mut output)?,
@@ -134,9 +134,7 @@ fn blocks(value: &Value) -> Result<Vec<Value>> {
     match value {
         Value::String(text) => Ok(vec![json!({"type": "text", "text": text})]),
         Value::Array(blocks) => Ok(blocks.clone()),
-        _ => Err(invalid(
-            "message content は文字列または配列で指定してください",
-        )),
+        _ => Err(invalid("message content must be a string or an array")),
     }
 }
 
@@ -165,10 +163,10 @@ fn user_content(value: &Value, output: &mut Vec<Value>) -> Result<()> {
             }
             Some(other) => {
                 return Err(invalid(format!(
-                    "user content block `{other}` は変換できません"
+                    "user content block `{other}` cannot be converted"
                 )));
             }
-            None => return Err(invalid("user content block に type がありません")),
+            None => return Err(invalid("user content block has no type")),
         }
     }
     if !parts.is_empty() {
@@ -206,10 +204,10 @@ fn assistant_content(value: &Value, output: &mut Vec<Value>) -> Result<()> {
             }
             Some(other) => {
                 return Err(invalid(format!(
-                    "assistant content block `{other}` は変換できません"
+                    "assistant content block `{other}` cannot be converted"
                 )));
             }
-            None => return Err(invalid("assistant content block に type がありません")),
+            None => return Err(invalid("assistant content block has no type")),
         }
     }
     if !parts.is_empty() {
@@ -222,25 +220,25 @@ fn image_url(block: &Value) -> Result<String> {
     let source = block
         .get("source")
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid("image block に source がありません"))?;
+        .ok_or_else(|| invalid("image block has no source"))?;
     match source.get("type").and_then(Value::as_str) {
         Some("url") => source
             .get("url")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| invalid("image URL がありません")),
+            .ok_or_else(|| invalid("image has no URL")),
         Some("base64") => {
             let media = source
                 .get("media_type")
                 .and_then(Value::as_str)
-                .ok_or_else(|| invalid("base64 image に media_type がありません"))?;
+                .ok_or_else(|| invalid("base64 image has no media_type"))?;
             let data = source
                 .get("data")
                 .and_then(Value::as_str)
-                .ok_or_else(|| invalid("base64 image に data がありません"))?;
+                .ok_or_else(|| invalid("base64 image has no data"))?;
             Ok(format!("data:{media};base64,{data}"))
         }
-        _ => Err(invalid("image source は url または base64 にしてください")),
+        _ => Err(invalid("image source must be url or base64")),
     }
 }
 
@@ -252,14 +250,14 @@ fn tool_result_text(value: Option<&Value>) -> Result<String> {
             .iter()
             .map(|block| {
                 if block.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(invalid("tool_result には text block だけを指定できます"));
+                    return Err(invalid("tool_result may only contain text blocks"));
                 }
                 required_str(block, "text", "tool_result text block").map(str::to_owned)
             })
             .collect::<Result<Vec<_>>>()
             .map(|parts| parts.join("\n")),
         Some(_) => Err(invalid(
-            "tool_result content は文字列または text block 配列にしてください",
+            "tool_result content must be a string or an array of text blocks",
         )),
     }
 }
@@ -268,7 +266,7 @@ fn tool(value: &Value) -> Result<Value> {
     let name = required_str(value, "name", "tool")?;
     let parameters = value
         .get("input_schema")
-        .ok_or_else(|| invalid(format!("tool `{name}` は function tool ではありません")))?;
+        .ok_or_else(|| invalid(format!("tool `{name}` is not a function tool")))?;
     Ok(json!({
         "type": "function",
         "name": name,
@@ -286,7 +284,7 @@ fn tool_choice(value: &Value) -> Result<Value> {
             "type": "function",
             "name": required_str(value, "name", "tool_choice")?,
         })),
-        _ => Err(invalid("tool_choice の type を変換できません")),
+        _ => Err(invalid("tool_choice type cannot be converted")),
     }
 }
 
@@ -317,7 +315,7 @@ fn reasoning(thinking: Option<&Value>, effort: Option<&Value>) -> Result<Option<
             Some(16000..) => "high",
             _ => "medium",
         },
-        _ => return Err(invalid("thinking の type を変換できません")),
+        _ => return Err(invalid("thinking type cannot be converted")),
     };
     Ok(Some(json!({"effort": effort})))
 }
@@ -332,7 +330,7 @@ fn named_effort(value: &Value) -> Result<&'static str> {
         Some("high") => Ok("high"),
         Some("xhigh") => Ok("xhigh"),
         Some("max") => Ok("xhigh"),
-        _ => Err(invalid("output_config.effort を変換できません")),
+        _ => Err(invalid("output_config.effort cannot be converted")),
     }
 }
 
@@ -340,7 +338,7 @@ fn required_str<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a 
     value
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid(format!("{context} に {field} がありません")))
+        .ok_or_else(|| invalid(format!("{context} has no {field}")))
 }
 
 fn invalid(message: impl Into<String>) -> Error {

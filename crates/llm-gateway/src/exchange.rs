@@ -525,7 +525,7 @@ mod tests {
         let logs = logs_of(|| async {
             let mut obs = plain(
                 body(vec![Err(Error::Config(
-                    "応答の読み取りが途切れました".into(),
+                    "response reading was interrupted".into(),
                 ))]),
                 request_span(),
             );
@@ -598,7 +598,7 @@ mod tests {
         let logs = logs_of(|| async {
             let mut obs = plain(
                 body(vec![Err(Error::Config(
-                    "応答の読み取りが途切れました".into(),
+                    "response reading was interrupted".into(),
                 ))]),
                 request_span(),
             );
@@ -617,7 +617,7 @@ mod tests {
             let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
-                    Err(Error::Config("応答の読み取りが途切れました".into())),
+                    Err(Error::Config("response reading was interrupted".into())),
                 ]),
                 request_span(),
             );
@@ -630,7 +630,7 @@ mod tests {
 
         assert!(logs.contains("転送が途切れました"), "{logs}");
         assert!(
-            logs.contains("応答の読み取りが途切れました"),
+            logs.contains("response reading was interrupted"),
             "何が起きたか: {logs}"
         );
         assert!(logs.contains("bytes=9"), "どこまで流したか: {logs}");
@@ -847,7 +847,7 @@ mod tests {
         let stats = new_stats();
         let broken = body(vec![
             Ok(Bytes::from_static(b"123")),
-            Err(Error::Config("応答の読み取りが途切れました".into())),
+            Err(Error::Config("response reading was interrupted".into())),
         ]);
 
         let mut saw_error = false;

@@ -465,10 +465,11 @@ impl Callback {
     /// 受け口の生死を別に見張る必要はない。
     async fn wait(&mut self) -> Result<Handoff> {
         let outcome = match tokio::time::timeout(CALLBACK_TIMEOUT, &mut self.handoff).await {
-            Ok(received) => received.unwrap_or_else(|_| Err("認可の受け口が落ちました".to_owned())),
+            Ok(received) => received
+                .unwrap_or_else(|_| Err("the authorization callback receiver died".to_owned())),
             Err(_) => Err(format!(
-                "{} 秒待っても戻ってきませんでした。\
-ブラウザで許可まで進めてから、もう一度実行してください",
+                "no callback after waiting {} seconds. \
+Approve the request in the browser, then run this again",
                 CALLBACK_TIMEOUT.as_secs()
             )),
         };
@@ -524,14 +525,14 @@ async fn receive(
 
     let Some(tx) = state.sender.lock().await.take() else {
         return axum::response::Html(result_page(&Err(
-            "この認可は受け付け済みです。結果は端末の表示を確認してください".to_owned(),
+            "this authorization was already accepted. Check the terminal for the result".to_owned(),
         )));
     };
 
     let (reply, result) = tokio::sync::oneshot::channel();
     if tx.send(Ok(Handoff { code, reply })).is_err() {
         return axum::response::Html(result_page(&Err(
-            "認可の待ち受けが既に閉じられています。もう一度 login をやり直してください".to_owned(),
+            "the authorization listener has already closed. Run login again".to_owned(),
         )));
     }
 
@@ -539,7 +540,7 @@ async fn receive(
     // その後で失敗しても「認可できました」が残ってしまう。
     let outcome = result
         .await
-        .unwrap_or_else(|_| Err("認可の処理が最後まで進みませんでした".to_owned()));
+        .unwrap_or_else(|_| Err("authorization did not finish processing".to_owned()));
     axum::response::Html(result_page(&outcome))
 }
 
@@ -565,17 +566,17 @@ fn code_from_query(query: Option<&str>, expected_state: &str) -> FinishOutcome<S
 
     if let Some(error) = error {
         let detail = description.unwrap_or(error);
-        return Err(format!("認可が拒否されました: {detail}"));
+        return Err(format!("authorization was denied: {detail}"));
     }
     if state.as_deref() != Some(expected_state) {
         return Err(
-            "戻りの state が送った値と違います。この認可の戻りではないので受け取りません"
+            "the returned state does not match what was sent, so this callback was rejected"
                 .to_owned(),
         );
     }
     match code {
         Some(code) if !code.is_empty() => Ok(code),
-        _ => Err("戻りに認可コードが付いていません".to_owned()),
+        _ => Err("the callback has no authorization code".to_owned()),
     }
 }
 
@@ -1183,7 +1184,7 @@ mod tests {
     fn callback_without_code_is_an_error() {
         for query in ["state=xyz", "state=xyz&code="] {
             let err = code_from_query(Some(query), "xyz").unwrap_err();
-            assert!(err.contains("認可コード"), "{query} → {err}");
+            assert!(err.contains("authorization code"), "{query} → {err}");
         }
     }
 
@@ -1834,7 +1835,7 @@ mod tests {
         );
 
         assert_eq!(result.unwrap(), "at", "1 本目はそのまま通る");
-        assert!(second.contains("受け付け済み"), "{second}");
+        assert!(second.contains("already accepted"), "{second}");
         assert!(first.await.unwrap().contains("認可できました"));
     }
 }

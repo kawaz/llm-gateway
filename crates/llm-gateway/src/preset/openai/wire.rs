@@ -105,7 +105,9 @@ impl Wire for OpenAiWire {
                 .bytes_stream()
                 .map(|chunk| {
                     chunk.map_err(|error| {
-                        Error::Config(format!("Responses 応答の読み取りが途切れました: {error}"))
+                        Error::Config(format!(
+                            "Responses API response reading was interrupted: {error}"
+                        ))
                     })
                 })
                 .boxed();

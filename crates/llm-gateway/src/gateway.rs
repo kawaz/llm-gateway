@@ -78,7 +78,7 @@ impl<P: Persistence> Gateway<P> {
             // 扱いになって別の認証情報へ流れてしまう。
             .http2_keep_alive_while_idle(true)
             .build()
-            .map_err(|e| Error::Config(format!("HTTP クライアントを作れません: {e}")))?;
+            .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
 
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
@@ -694,7 +694,7 @@ impl<P: Persistence> Gateway<P> {
         let sample = self.sound(id, preset, probe).await?;
         if sample.status != 200 {
             return Err(format!(
-                "upstream が {} を返しました: {}",
+                "upstream returned {}: {}",
                 sample.status, sample.body
             ));
         }

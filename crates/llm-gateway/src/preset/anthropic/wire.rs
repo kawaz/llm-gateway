@@ -125,7 +125,9 @@ impl Wire for AnthropicWire {
             let body = resp
                 .bytes_stream()
                 .map(|chunk| {
-                    chunk.map_err(|e| Error::Config(format!("応答の読み取りが途切れました: {e}")))
+                    chunk.map_err(|e| {
+                        Error::Config(format!("response reading was interrupted: {e}"))
+                    })
                 })
                 .boxed();
 
