@@ -1,6 +1,6 @@
 ---
 title: core crate の日本語 error message 残件 (DR-0008 続き)
-status: open
+status: resolved
 category: task
 created: 2026-08-12T00:05:18+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T12:02:03+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:12 files' user-facing error messages translated to English, just ci all pass","done:oauth.rs login-flow message block carved out to a separate issue"]
 blocked_by:
 origin: 自リポ TODO
 ---
