@@ -1,6 +1,6 @@
 ---
 title: upstream の本文内エラー透過を適切な HTTP エラーに写像する
-status: wip
+status: resolved
 category: task
 created: 2026-08-12T11:04:31+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-08-12T11:08:57+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-12T11:50:54+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0014"]
 blocked_by:
 origin: 自リポ TODO
 ---
