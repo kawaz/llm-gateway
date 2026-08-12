@@ -204,9 +204,20 @@ HTTP status だけでは判定できない失敗がある。OpenAI の Responses
   「採用後監視」を同じ capability に同居させると責務とライフサイクルが崩れる)
 - **拒否の分類は provider 内に閉じる**。混雑 (overloaded) は `Denial` を伴う
   (`Reason::Busy`, `Scope::Model`, 既存の `DEFAULT_BACKOFF` — DR-0009 の契約を
-  再利用し新定数を増やさない)。依頼自体の誤り (invalid_request 等) は別経路に
-  回しても直らないので admitted のまま返す。分類語彙 (`overloaded_error` 等)
+  再利用し新定数を増やさない)。分類語彙 (`overloaded_error` 等)
   は provider の語彙であり、core はこれを知らない
+- **本文内エラーは適切な HTTP status へ写像して返す** (2026-08-12 追加)。
+  元 status が 2xx のまま本文内 error だった denial は、全経路が尽きた時に
+  生透過せず、provider が分類した `ClientError` (status + Anthropic error
+  type + upstream の生 message) を Anthropic 形式の error JSON にして返す
+  (overloaded → 529、rate limit → 429、入力起因 (context 超過等) → 400、
+  判別不能 → 502)。200 のまま透過するとクライアントには「壊れた成功応答」
+  に見え、原因が伝わらない (実測 2026-08-12: context 超過の 200 透過が
+  「empty or malformed response」と誤診された)。元から HTTP エラーの denial
+  は従来どおり status・headers (`retry-after` 含む)・本文を生透過する
+  (DR-0009)。依頼自体の誤り (invalid_request 等) もこの写像に乗せるため
+  Rejected 扱いとなり、結果として fallback を試してから 400 で返る —
+  別経路でも直らない無駄打ちだが、経路数は有界で、写像の一貫性を優先した
 - **時間の上限は設けない**。最初の event を待つ間 upstream が沈黙した場合は、
   既存の HTTP クライアントの接続/読み取り timeout に委ねる。バイト上限
   (`MAX_EVENT`) は「異常に大きい先頭 event」に対する保護であり、「応答が

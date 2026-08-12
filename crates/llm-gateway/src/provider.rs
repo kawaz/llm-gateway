@@ -52,12 +52,20 @@ pub trait ResponseAdmission: Send + Sync {
 }
 
 /// 本文先頭を観測した後の採用判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientError {
+    pub status: u16,
+    pub kind: String,
+    pub message: String,
+}
+
 pub enum Admission {
     Admitted(Response),
     Rejected {
         response: Response,
         reason: String,
         denial: Option<Denial>,
+        client_error: Option<ClientError>,
     },
 }
 

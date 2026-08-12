@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{info, warn};
 
@@ -293,7 +294,11 @@ impl<P: Persistence> Gateway<P> {
         // 認証情報を添えて持ち回るのは、どの経路を通って返る応答でも同じ形
         // (応答 + 身元) にするため。使用量の集計に乗るのは 2xx だけで、断られた
         // 応答は集計されない (エラーの本文に usage は無い、DR-0011)。
-        let mut denied: Option<(Response, Option<CredentialId>)> = None;
+        let mut denied: Option<(
+            Response,
+            Option<CredentialId>,
+            Option<crate::provider::ClientError>,
+        )> = None;
         for route in &routes {
             match self.try_route(route, &call, &headers).await {
                 Ok(resp) => {
@@ -323,7 +328,11 @@ impl<P: Persistence> Gateway<P> {
                         usage,
                     });
                 }
-                Err(Switch { reason, denial }) => {
+                Err(Switch {
+                    reason,
+                    denial,
+                    client_error,
+                }) => {
                     warn!(model = %model, route = route.name(), %reason, "経路を切り替えます");
                     attempts.push(UpstreamAttempt {
                         provider: route.name().to_owned(),
@@ -365,7 +374,11 @@ impl<P: Persistence> Gateway<P> {
                                 self.probe_in_background(id, &route.preset, probing);
                             }
                         }
-                        denied = Some((resp, route.credential.clone()));
+                        denied = Some((
+                            resp,
+                            route.credential.clone(),
+                            client_error.map(|error| *error),
+                        ));
                     }
                 }
             }
@@ -374,7 +387,11 @@ impl<P: Persistence> Gateway<P> {
         // 断られた応答を見ていたなら、最後のものをそのまま返す。こちらで
         // 別の状態に置き換えると、`retry-after` のようなクライアントが次の
         // 一手を決める手掛かりまで消える。
-        if let Some((resp, credential)) = denied {
+        if let Some((resp, credential, client_error)) = denied {
+            let resp = match client_error {
+                Some(error) => client_error_response(resp, error)?,
+                None => resp,
+            };
             warn!(
                 model = %model,
                 status = resp.status,
@@ -492,7 +509,10 @@ impl<P: Persistence> Gateway<P> {
                     .map_err(|e| Switch::to_next(e.to_string()))
             }
             Admission::Rejected {
-                response, reason, ..
+                response,
+                reason,
+                client_error,
+                ..
             } => {
                 let response = egress::finish_response(SentResponse { response, mode })
                     .await
@@ -500,6 +520,7 @@ impl<P: Persistence> Gateway<P> {
                 Err(Switch {
                     reason,
                     denial: Some(response),
+                    client_error: client_error.map(Box::new),
                 })
             }
         }
@@ -905,12 +926,27 @@ impl PricingSource for RoutePricing<'_> {
     }
 }
 
+fn client_error_response(
+    mut response: Response,
+    error: crate::provider::ClientError,
+) -> Result<Response> {
+    response.status = error.status;
+    response.headers.set("content-type", "application/json");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "type": "error",
+        "error": {"type": error.kind, "message": error.message}
+    }))?;
+    response.body = futures_util::stream::once(async move { Ok(bytes::Bytes::from(body)) }).boxed();
+    Ok(response)
+}
+
 /// 次の経路へ回す理由。
 struct Switch {
     reason: String,
     /// この経路に断られた応答。本文から provider 固有の期限を読んだ後も、
     /// 次の経路が全滅したときにクライアントへ返せる形で持ち回る。
     denial: Option<Response>,
+    client_error: Option<Box<crate::provider::ClientError>>,
 }
 
 impl Switch {
@@ -919,6 +955,7 @@ impl Switch {
         Self {
             reason,
             denial: None,
+            client_error: None,
         }
     }
 }
@@ -933,6 +970,7 @@ fn accept_or_switch(resp: Response) -> std::result::Result<Response, Switch> {
         return Err(Switch {
             reason,
             denial: Some(resp),
+            client_error: None,
         });
     }
     Ok(resp)
@@ -1485,6 +1523,41 @@ routes = ["a"]
         assert_eq!(resp.response.status, 429);
         assert_eq!(resp.model, "m", "断られた応答にもモデル名は付く");
         assert_eq!(resp.credential, None, "relay 型なので持ち主なし");
+    }
+
+    /// 本文内エラーだけを Anthropic error JSON へ変え、upstream の message は失わない。
+    #[tokio::test]
+    async fn an_in_body_error_becomes_an_anthropic_error_response() {
+        let response = Response {
+            status: 200,
+            headers: Headers::new(vec![(
+                "content-type".to_owned(),
+                "text/event-stream".to_owned(),
+            )]),
+            body: futures_util::stream::empty().boxed(),
+        };
+        let response = client_error_response(
+            response,
+            crate::provider::ClientError {
+                status: 502,
+                kind: "api_error".to_owned(),
+                message: "upstream detail".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 502);
+        assert_eq!(
+            response.headers.get("content-type"),
+            Some("application/json")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&body_text(response).await).unwrap(),
+            serde_json::json!({
+                "type": "error",
+                "error": {"type": "api_error", "message": "upstream detail"}
+            })
+        );
     }
 
     /// 経路が断たれていたら次を試す。

@@ -12,7 +12,7 @@ use serde_json::Value;
 use crate::Result;
 use crate::denial::{DEFAULT_BACKOFF, Denial, Reason, Scope};
 use crate::egress::{BodyStream, Response};
-use crate::provider::{Admission, ResponseAdmission};
+use crate::provider::{Admission, ClientError, ResponseAdmission};
 
 use super::response::MAX_EVENT;
 
@@ -68,9 +68,7 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
     let Some(error) = first_error(&prefix)? else {
         return Ok(Admission::Admitted(response));
     };
-    if error.kind == "invalid_request_error" {
-        return Ok(Admission::Admitted(response));
-    }
+    let client_error = (status / 100 == 2).then(|| classify_client_error(&error));
 
     let denial = (error.kind == "overloaded_error").then(|| Denial {
         until: observed_at + DEFAULT_BACKOFF,
@@ -81,7 +79,30 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
         response,
         reason: error.message,
         denial,
+        client_error,
     })
+}
+
+fn classify_client_error(error: &ErrorEvent) -> ClientError {
+    let kind_lower = error.kind.to_ascii_lowercase();
+    let message_lower = error.message.to_ascii_lowercase();
+    let (status, kind) = if kind_lower.contains("overload") || message_lower.contains("overload") {
+        (529, "overloaded_error")
+    } else if kind_lower.contains("rate_limit") || message_lower.contains("rate limit") {
+        (429, "rate_limit_error")
+    } else if kind_lower.contains("invalid_request")
+        || message_lower.contains("context window")
+        || message_lower.contains("context length")
+    {
+        (400, "invalid_request_error")
+    } else {
+        (502, "api_error")
+    };
+    ClientError {
+        status,
+        kind: kind.to_owned(),
+        message: error.message.clone(),
+    }
 }
 
 fn replay(prefix: Vec<u8>, rest: BodyStream) -> BodyStream {
@@ -232,12 +253,67 @@ mod tests {
 
     /// リクエスト自体の誤りは別経路でも直らないため、fallback せずクライアントへ返す。
     #[tokio::test]
-    async fn admits_a_client_request_error() {
+    async fn rejects_a_client_request_error() {
         let raw = b"event: error\r\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}\r\n\r\n";
         let outcome = admit(response(vec![raw]), "m", 100).await.unwrap();
-        let Admission::Admitted(response) = outcome else {
-            panic!("依頼の誤りはそのまま返す");
+        let Admission::Rejected { client_error, .. } = outcome else {
+            panic!("依頼の誤りは status を補って返す");
         };
+        assert_eq!(client_error.unwrap().status, 400);
+    }
+
+    /// 本文内エラーの意味を Anthropic error type と HTTP status の組へ正規化する。
+    #[test]
+    fn maps_in_body_error_categories() {
+        let cases = [
+            ("overloaded_error", "busy", 529, "overloaded_error"),
+            (
+                "server_error",
+                "rate limit exceeded",
+                429,
+                "rate_limit_error",
+            ),
+            (
+                "invalid_request_error",
+                "context window exceeded",
+                400,
+                "invalid_request_error",
+            ),
+            ("mystery", "upstream detail", 502, "api_error"),
+        ];
+        for (source_kind, message, status, kind) in cases {
+            assert_eq!(
+                classify_client_error(&ErrorEvent {
+                    kind: source_kind.to_owned(),
+                    message: message.to_owned(),
+                }),
+                ClientError {
+                    status,
+                    kind: kind.to_owned(),
+                    message: message.to_owned(),
+                }
+            );
+        }
+    }
+
+    /// 元から HTTP エラーなら status・headers・本文を生透過するため変換情報を付けない。
+    #[tokio::test]
+    async fn leaves_an_http_error_denial_unchanged() {
+        let raw = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        let mut source = response(vec![raw]);
+        source.status = 429;
+        source.headers.set("retry-after", "30");
+        let Admission::Rejected {
+            response,
+            client_error,
+            ..
+        } = admit(source, "m", 100).await.unwrap()
+        else {
+            panic!("HTTP denial は別経路へ回す");
+        };
+        assert_eq!(client_error, None);
+        assert_eq!(response.status, 429);
+        assert_eq!(response.headers.get("retry-after"), Some("30"));
         assert_eq!(body_of(response).await, raw);
     }
 
