@@ -25,7 +25,7 @@ upstream の本文内エラー透過を適切な HTTP エラーに写像する�
 
 ## 背景
 
-改善案: ResponseAdmission が denial と判定した応答を透過する際、判別できた错误種別 (context 超過等) に応じて Anthropic 形式の error JSON + 適切な HTTP status (context 超過なら 400 系) へ写像する。
+改善案: ResponseAdmission が denial と判定した応答を透過する際、判別できたエラー種別 (context 超過等) に応じて Anthropic 形式の error JSON + 適切な HTTP status (context 超過なら 400 系) へ写像する。
 
 関連: DR-0014 §9 (ResponseAdmission)、DR-0009 (denial 透過)。
 
