@@ -3,11 +3,12 @@
 //! 実運用のログから、クライアントが叩くのは 3 つと分かっている:
 //! `POST /v1/messages` / `POST /v1/messages/count_tokens` / `GET /v1/models`。
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +45,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/usage", get(usage))
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
+        .route("/llm-gateway/tap", get(tap))
         .with_state(gateway)
 }
 
@@ -151,6 +153,86 @@ fn sse_line(event: &llm_gateway::events::Event) -> SseEvent {
         })
 }
 
+/// 直接 loopback から接続した購読者へ転送の詳細を流す (DR-0017)。
+async fn tap<P: Persistence + 'static>(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    if !peer.ip().is_loopback()
+        || request.headers().contains_key("forwarded")
+        || request.headers().contains_key("x-forwarded-for")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "tap is available only to direct loopback connections",
+        )
+            .into_response();
+    }
+
+    let options = match tap_options(request.uri().query()) {
+        Ok(options) => options,
+        Err(message) => return client_error("tap", StatusCode::BAD_REQUEST, &message),
+    };
+    let watching = gateway.tap().subscribe(options);
+    let stream = futures_util::stream::unfold(watching, |mut watching| async move {
+        match watching.recv().await {
+            Ok(event) => Some((
+                Ok::<SseEvent, std::convert::Infallible>(tap_line(&event)),
+                watching,
+            )),
+            // tap は現時点の交換を観測する口なので、欠落後に古い列へ復帰しない。
+            Err(RecvError::Lagged(missed)) => {
+                warn!(missed, "tap subscriber lagged; disconnecting");
+                None
+            }
+            Err(RecvError::Closed) => None,
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)))
+        .into_response()
+}
+
+fn tap_line(event: &llm_gateway::tap::Event) -> SseEvent {
+    SseEvent::default().json_data(event).unwrap_or_else(|e| {
+        error!(%e, "tap event could not be serialized");
+        SseEvent::default().comment("unserializable")
+    })
+}
+
+fn tap_options(query: Option<&str>) -> Result<llm_gateway::tap::Options, String> {
+    let mut options = llm_gateway::tap::Options {
+        max_body: llm_gateway::tap::DEFAULT_MAX_BODY,
+        ..Default::default()
+    };
+    let Some(query) = query else {
+        return Ok(options);
+    };
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "include" => {
+                for item in value.split(',').filter(|item| !item.is_empty()) {
+                    match item {
+                        "request_body" => options.request_body = true,
+                        "response_body" => options.response_body = true,
+                        _ => return Err(format!("unknown tap include: {item}")),
+                    }
+                }
+            }
+            "max_body" => {
+                options.max_body = value
+                    .parse()
+                    .map_err(|_| "max_body must be a non-negative integer".to_owned())?;
+            }
+            "" => {}
+            _ => return Err(format!("unknown tap parameter: {key}")),
+        }
+    }
+    Ok(options)
+}
+
 /// 使用量の日次集計を返す (DR-0011)。
 ///
 /// 認証は usage / healthz と同じ扱い (掛けない)。出すのはトークン数だけで、
@@ -230,6 +312,13 @@ fn upstream_path(path: &str) -> &str {
 }
 
 /// namespace の方針を Messages 形式の正規形へ反映する。
+fn request_type(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config::ThinkingDisplay>) {
     let Some(display) = display else {
         return;
@@ -237,16 +326,10 @@ fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config:
     let Some(body) = body.as_object_mut() else {
         return;
     };
-    let type_of = |value: Option<&Value>| {
-        value
-            .and_then(|v| v.get("type"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
     if matches!(
-        type_of(body.get("tool_choice")).as_deref(),
+        request_type(body.get("tool_choice")).as_deref(),
         Some("any" | "tool")
-    ) || type_of(body.get("thinking")).as_deref() == Some("disabled")
+    ) || request_type(body.get("thinking")).as_deref() == Some("disabled")
     {
         return;
     }
@@ -343,23 +426,13 @@ async fn messages<P: Persistence + 'static>(
     if let Some(denied) = span.in_scope(|| rejection(ns, &ns_name, &parts.headers)) {
         return denied;
     }
-    // クライアントが送ってきた thinking 指定の観測 (上書き前の原値)。
-    // display 未指定リクエストがどれだけ居るかを実運用ログで追うため。
-    span.in_scope(|| {
-        let thinking = json.get("thinking");
-        let field = |name: &str| -> &str {
-            thinking
-                .and_then(|t| t.get(name))
-                .and_then(|v| v.as_str())
-                .unwrap_or("-")
-        };
-        tracing::info!(
-            thinking = thinking.is_some(),
-            r#type = field("type"),
-            display = field("display"),
-            "thinking 指定を観測しました"
-        );
-    });
+    // tap に載せる値は gateway が書き換える前の client request から取る。
+    let tap_plan = gateway.tap().capture_plan();
+    let tap_thinking = json.get("thinking").cloned();
+    let tap_tool_choice = request_type(json.get("tool_choice"));
+    let tap_stream = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let tap_request_body =
+        tap_plan.and_then(|plan| llm_gateway::tap::capture(&bytes, plan.request_body));
     apply_thinking_display(&mut json, ns.thinking_display);
 
     let path = upstream_path(uri.path()).to_owned();
@@ -372,6 +445,28 @@ async fn messages<P: Persistence + 'static>(
     {
         Ok(forwarded) => {
             let upstream = forwarded.response;
+            let tap = tap_plan.map(|plan| exchange::TapObservation {
+                tap: Arc::clone(gateway.tap()),
+                response_body_limit: plan.response_body,
+                event: llm_gateway::tap::Event {
+                    ts: now_unix(),
+                    ns: ns_name.clone(),
+                    model: forwarded.model.clone(),
+                    route: forwarded.route.clone(),
+                    status: upstream.status,
+                    thinking: tap_thinking,
+                    tool_choice: tap_tool_choice,
+                    stream: tap_stream,
+                    request_body_size: bytes.len(),
+                    response_body_size: 0,
+                    credential: forwarded
+                        .credential
+                        .as_ref()
+                        .map(|credential| credential.as_str().to_owned()),
+                    request_body: tap_request_body,
+                    response_body: None,
+                },
+            });
             let mut resp = Response::builder().status(upstream.status);
             for (name, value) in upstream.headers.iter() {
                 resp = resp.header(name, value);
@@ -382,15 +477,18 @@ async fn messages<P: Persistence + 'static>(
             // 使用量を覗くため — 応答の本文にしか載らないので、中継の内側で
             // 覗く (DR-0011)。覗くだけで、流れるバイト列は変わらない。読む役は
             // 答えた provider が作ったものが載っている (DR-0014 §4)。
-            resp.body(Body::from_stream(exchange::observe(
-                upstream.body,
-                forwarded.usage,
-                Arc::clone(gateway.stats()),
-                now_unix(),
-                forwarded.credential.as_ref().map(CredentialId::as_str),
-                &forwarded.model,
-                span.clone(),
-            )))
+            resp.body(Body::from_stream(
+                exchange::observe(
+                    upstream.body,
+                    forwarded.usage,
+                    Arc::clone(gateway.stats()),
+                    now_unix(),
+                    forwarded.credential.as_ref().map(CredentialId::as_str),
+                    &forwarded.model,
+                    span.clone(),
+                )
+                .with_tap(tap),
+            ))
             .unwrap_or_else(|e| {
                 span.in_scope(|| {
                     client_error(
@@ -769,7 +867,11 @@ content-length: {declared}\r\n\r\n{head}"
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(gateway)).await;
+            let _ = axum::serve(
+                listener,
+                router(gateway).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
         });
         format!("http://{addr}")
     }
@@ -780,6 +882,132 @@ content-length: {declared}\r\n\r\n{head}"
             "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}],
         })
+    }
+
+    #[test]
+    fn tap_query_selects_bodies_and_limit() {
+        let options = tap_options(Some("include=request_body,response_body&max_body=123")).unwrap();
+        assert!(options.request_body);
+        assert!(options.response_body);
+        assert_eq!(options.max_body, 123);
+
+        let defaults = tap_options(None).unwrap();
+        assert!(!defaults.request_body);
+        assert!(!defaults.response_body);
+        assert_eq!(defaults.max_body, llm_gateway::tap::DEFAULT_MAX_BODY);
+    }
+
+    #[tokio::test]
+    async fn tap_rejects_proxy_headers() {
+        let base = serve("").await;
+        for (name, value) in [
+            ("x-forwarded-for", "127.0.0.1"),
+            ("forwarded", "for=127.0.0.1"),
+        ] {
+            let response = reqwest::Client::new()
+                .get(format!("{base}/llm-gateway/tap"))
+                .header(name, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.text().await.unwrap(),
+                "tap is available only to direct loopback connections"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tap_sends_metadata_and_truncates_bodies_per_subscriber() {
+        let response_body = r#"{"type":"message","content":[]}"#;
+        let upstream = fake_upstream(move || {
+            (
+                200,
+                response_body.to_owned(),
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+            )
+        })
+        .await;
+        let base = serve(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[ns.default]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await;
+        let client = reqwest::Client::new();
+        let mut metadata = client
+            .get(format!("{base}/llm-gateway/tap"))
+            .send()
+            .await
+            .unwrap();
+        let mut bodies = client
+            .get(format!(
+                "{base}/llm-gateway/tap?include=request_body,response_body&max_body=12"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::OK);
+        assert_eq!(bodies.status(), StatusCode::OK);
+
+        let request = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive"},
+            "tool_choice": {"type": "auto"},
+            "stream": false,
+        });
+        let raw_request = serde_json::to_vec(&request).unwrap();
+        let forwarded = client
+            .post(format!("{base}/v1/messages"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forwarded.status(), StatusCode::OK);
+        assert_eq!(forwarded.text().await.unwrap(), response_body);
+
+        let metadata = tap_event(metadata.chunk().await.unwrap().expect("metadata event"));
+        let bodies = tap_event(bodies.chunk().await.unwrap().expect("body event"));
+        for event in [&metadata, &bodies] {
+            assert_eq!(event["ns"], "default");
+            assert_eq!(event["model"], "m");
+            assert_eq!(event["route"], "a");
+            assert_eq!(event["status"], 200);
+            assert_eq!(event["thinking"], json!({"type": "adaptive"}));
+            assert_eq!(event["tool_choice"], "auto");
+            assert_eq!(event["stream"], false);
+            assert_eq!(event["request_body_size"], raw_request.len());
+            assert_eq!(event["response_body_size"], response_body.len());
+            assert_eq!(event["credential"], Value::Null);
+        }
+        assert!(metadata.get("request_body").is_none());
+        assert!(metadata.get("response_body").is_none());
+        assert_eq!(
+            bodies["request_body"].as_str(),
+            Some(String::from_utf8_lossy(&raw_request[..12]).as_ref())
+        );
+        assert_eq!(bodies["response_body"].as_str(), Some(&response_body[..12]));
+    }
+
+    fn tap_event(chunk: impl AsRef<[u8]>) -> Value {
+        let text = String::from_utf8(chunk.as_ref().to_vec()).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line");
+        serde_json::from_str(data).unwrap()
     }
 
     /// 転送のたびに、見ている人へ 1 通流れる。

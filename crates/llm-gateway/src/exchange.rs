@@ -58,6 +58,7 @@ use crate::Result;
 use crate::egress::BodyStream;
 use crate::metering::UsageObserver;
 use crate::stats::Stats;
+use crate::tap::{self, Tap};
 
 /// リクエストに振る通し番号。
 ///
@@ -134,7 +135,16 @@ pub fn observe(
         at,
         credential: credential.map(str::to_owned),
         model: model.to_owned(),
+        tap: None,
+        response_body: Vec::new(),
     }
+}
+
+/// 1 exchange の tap 配信に必要な値。
+pub struct TapObservation {
+    pub tap: Arc<Tap>,
+    pub event: tap::Event,
+    pub response_body_limit: usize,
 }
 
 /// 終端を記録し、usage を抽出しながら流すストリーム。
@@ -167,9 +177,17 @@ pub struct BodyObservation {
     at: i64,
     credential: Option<String>,
     model: String,
+    tap: Option<TapObservation>,
+    response_body: Vec<u8>,
 }
 
 impl BodyObservation {
+    /// tap 購読時だけ応答本文を上限まで控え、交換の終端で 1 件配信する。
+    pub fn with_tap(mut self, tap: Option<TapObservation>) -> Self {
+        self.tap = tap;
+        self
+    }
+
     fn elapsed_ms(&self) -> u128 {
         self.since_headers.elapsed().as_millis()
     }
@@ -220,6 +238,12 @@ impl BodyObservation {
     fn settle(&mut self) -> (u64, u128, u128, u128) {
         self.note_gap(Instant::now());
         self.finish_usage();
+        if let Some(mut observation) = self.tap.take() {
+            observation.event.response_body_size = self.bytes as usize;
+            observation.event.response_body =
+                tap::capture(&self.response_body, observation.response_body_limit);
+            observation.tap.publish(observation.event);
+        }
         (
             self.bytes,
             self.elapsed_ms(),
@@ -248,6 +272,13 @@ impl Stream for BodyObservation {
                 this.note_gap(now);
                 this.last_chunk = Some(now);
                 this.bytes += chunk.len() as u64;
+                if let Some(observation) = this.tap.as_ref()
+                    && this.response_body.len() < observation.response_body_limit
+                {
+                    let remaining = observation.response_body_limit - this.response_body.len();
+                    this.response_body
+                        .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                }
                 if let Some(observer) = this.observer.as_mut() {
                     observer.observe(&chunk);
                 }

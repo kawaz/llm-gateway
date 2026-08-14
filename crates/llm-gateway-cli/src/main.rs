@@ -200,10 +200,14 @@ to listen, remove disabled from [server], or point --config at another configura
         });
 
         let serving = Arc::clone(&gateway);
-        let result = axum::serve(listener, llm_gateway_server::router(serving))
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|e| format!("the server stopped listening: {e}"));
+        let result = axum::serve(
+            listener,
+            llm_gateway_server::router(serving)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| format!("the server stopped listening: {e}"));
 
         // 定期の保存を先に止めて、終わるのを待つ。待たずに最後の保存へ進むと
         // 2 者が同時に書きうる。書き込み自体も直列化されているが、待つ側で
