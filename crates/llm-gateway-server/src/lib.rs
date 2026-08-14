@@ -264,20 +264,15 @@ fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config:
         return;
     }
 
-    match body.get_mut("thinking") {
-        Some(Value::Object(thinking)) => {
-            thinking.insert(
-                "display".to_owned(),
-                Value::String(display.as_str().to_owned()),
-            );
-        }
-        Some(_) => {}
-        None => {
-            body.insert(
-                "thinking".to_owned(),
-                json!({"type": "adaptive", "display": display.as_str()}),
-            );
-        }
+    // thinking 指定が無い request には注入しない。thinking がデフォルト off /
+    // adaptive 非対応のモデル (haiku 4.5 等) で thinking を勝手に有効化したり
+    // 400 (adaptive thinking is not supported) にしたりするため (実測 2026-08-14)。
+    // display の上書きは、クライアントが thinking を使うと明示した request だけ。
+    if let Some(Value::Object(thinking)) = body.get_mut("thinking") {
+        thinking.insert(
+            "display".to_owned(),
+            Value::String(display.as_str().to_owned()),
+        );
     }
 }
 
@@ -939,26 +934,20 @@ routes = ["a"]
         );
     }
 
-    /// 思考指定が無い request に表示方針を適用する場合は、5 系で推奨される
-    /// adaptive thinking を補って Messages 正規形を完成させる。
+    /// 思考指定が無い request には注入しない。thinking がデフォルト off /
+    /// adaptive 非対応のモデルで挙動やコストを勝手に変えないため。
     #[test]
-    fn configured_display_injects_adaptive_thinking_when_absent() {
-        for (display, expected) in [
-            (
-                llm_gateway::config::ThinkingDisplay::Summarized,
-                "summarized",
-            ),
-            (llm_gateway::config::ThinkingDisplay::Omitted, "omitted"),
+    fn configured_display_does_not_inject_when_thinking_absent() {
+        for display in [
+            llm_gateway::config::ThinkingDisplay::Summarized,
+            llm_gateway::config::ThinkingDisplay::Omitted,
         ] {
-            let mut body = json!({"model": "m", "messages": []});
+            let original = json!({"model": "m", "messages": []});
+            let mut body = original.clone();
 
             apply_thinking_display(&mut body, Some(display));
 
-            assert_eq!(
-                body["thinking"],
-                json!({"type": "adaptive", "display": expected}),
-                "{expected}"
-            );
+            assert_eq!(body, original);
         }
     }
 
@@ -1032,7 +1021,11 @@ routes = ["a"]
             Some(json!({"type": "auto"})),
             Some(json!({"type": "none"})),
         ] {
-            let mut body = json!({"model": "m", "messages": []});
+            let mut body = json!({
+                "model": "m",
+                "messages": [],
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+            });
             if let Some(tool_choice) = tool_choice.clone() {
                 body["tool_choice"] = tool_choice;
             }
@@ -1044,7 +1037,7 @@ routes = ["a"]
 
             assert_eq!(
                 body["thinking"],
-                json!({"type": "adaptive", "display": "summarized"})
+                json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})
             );
             assert_eq!(body.get("tool_choice"), tool_choice.as_ref());
         }
@@ -1112,10 +1105,12 @@ routes = ["a"]
         ))
         .await;
 
+        let mut with_thinking = request_body();
+        with_thinking["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
         let response = authed(
             reqwest::Client::new()
                 .post(format!("{base}/v1/messages"))
-                .json(&request_body()),
+                .json(&with_thinking),
         )
         .send()
         .await
@@ -1133,7 +1128,7 @@ routes = ["a"]
         let body: Value = serde_json::from_str(raw_body).expect("upstream body は JSON");
         assert_eq!(
             body["thinking"],
-            json!({"type": "adaptive", "display": "summarized"})
+            json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})
         );
     }
 

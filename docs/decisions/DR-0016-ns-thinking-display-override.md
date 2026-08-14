@@ -21,11 +21,13 @@ subscription OAuth 経由でも server が `display` を尊重することは実
 
 - **namespace 設定に optional な `thinking_display` を追加** (値は
   `"summarized"` / `"omitted"` のみ、他は config validation エラー)
-- 設定された ns への Messages リクエストで:
-  - body に `thinking` object があれば `display` をこの値で上書き
-  - `thinking` が無ければ `{"type": "adaptive", "display": <値>}` を注入
-    (adaptive は 5 系の推奨形。thinking を持たない旧モデルは ns filter で
-    既に隠しているため副作用は実質ない)
+- 設定された ns への Messages リクエストで、body に `thinking` object が
+  あれば `display` をこの値で上書きする。**`thinking` が無い request には
+  注入しない** — thinking がデフォルト off / adaptive 非対応のモデルで
+  thinking を勝手に有効化 (コスト・遅延の変化) したり 400 (`adaptive
+  thinking is not supported on this model`、haiku 4.5 で実測 2026-08-14)
+  にしたりするため。display の上書きは「クライアントが thinking を使うと
+  明示した request」に限る
 - 未設定の ns は従来どおり無改変で透過 (デフォルト挙動の変更はしない)
 - **非互換リクエストには一切触らない** (2026-08-14 追加、実障害起点):
   - **assistant prefill** (messages 末尾が assistant): thinking と全面非互換
