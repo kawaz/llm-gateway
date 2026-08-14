@@ -343,6 +343,23 @@ async fn messages<P: Persistence + 'static>(
     if let Some(denied) = span.in_scope(|| rejection(ns, &ns_name, &parts.headers)) {
         return denied;
     }
+    // クライアントが送ってきた thinking 指定の観測 (上書き前の原値)。
+    // display 未指定リクエストがどれだけ居るかを実運用ログで追うため。
+    span.in_scope(|| {
+        let thinking = json.get("thinking");
+        let field = |name: &str| -> &str {
+            thinking
+                .and_then(|t| t.get(name))
+                .and_then(|v| v.as_str())
+                .unwrap_or("-")
+        };
+        tracing::info!(
+            thinking = thinking.is_some(),
+            r#type = field("type"),
+            display = field("display"),
+            "thinking 指定を観測しました"
+        );
+    });
     apply_thinking_display(&mut json, ns.thinking_display);
 
     let path = upstream_path(uri.path()).to_owned();
