@@ -175,10 +175,12 @@ async fn tap<P: Persistence + 'static>(
         Err(message) => return client_error("tap", StatusCode::BAD_REQUEST, &message),
     };
     let watching = gateway.tap().subscribe(options);
+    // SSE ではなく素の JSONL で返す。dump をそのままパースできる形が用途
+    // (curl でファイルに落として集計) の本体で、SSE の data: 枠は邪魔なだけ。
     let stream = futures_util::stream::unfold(watching, |mut watching| async move {
         match watching.recv().await {
             Ok(event) => Some((
-                Ok::<SseEvent, std::convert::Infallible>(tap_line(&event)),
+                Ok::<axum::body::Bytes, std::convert::Infallible>(tap_line(&event)),
                 watching,
             )),
             // tap は現時点の交換を観測する口なので、欠落後に古い列へ復帰しない。
@@ -189,16 +191,20 @@ async fn tap<P: Persistence + 'static>(
             Err(RecvError::Closed) => None,
         }
     });
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(20)))
+    (
+        [("content-type", "application/x-ndjson; charset=utf-8")],
+        axum::body::Body::from_stream(stream),
+    )
         .into_response()
 }
 
-fn tap_line(event: &llm_gateway::tap::Event) -> SseEvent {
-    SseEvent::default().json_data(event).unwrap_or_else(|e| {
+fn tap_line(event: &llm_gateway::tap::Event) -> axum::body::Bytes {
+    let mut line = serde_json::to_vec(event).unwrap_or_else(|e| {
         error!(%e, "tap event could not be serialized");
-        SseEvent::default().comment("unserializable")
-    })
+        b"{}".to_vec()
+    });
+    line.push(b'\n');
+    axum::body::Bytes::from(line)
 }
 
 fn tap_options(query: Option<&str>) -> Result<llm_gateway::tap::Options, String> {
@@ -1002,12 +1008,13 @@ routes = ["a"]
     }
 
     fn tap_event(chunk: impl AsRef<[u8]>) -> Value {
+        // tap は素の JSONL (1 行 = 1 JSON)。SSE の data: 枠は無い。
         let text = String::from_utf8(chunk.as_ref().to_vec()).unwrap();
-        let data = text
+        let line = text
             .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .expect("SSE data line");
-        serde_json::from_str(data).unwrap()
+            .find(|line| !line.is_empty())
+            .expect("JSONL line");
+        serde_json::from_str(line).unwrap()
     }
 
     /// 転送のたびに、見ている人へ 1 通流れる。
