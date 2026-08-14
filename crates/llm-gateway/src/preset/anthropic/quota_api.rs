@@ -140,7 +140,7 @@ async fn fetch(
     let resp = match resp {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::warn!(credential = %credential.id, %e, "枠を聞きに行けません");
+            tracing::warn!(credential = %credential.id, %e, "cannot query the quota");
             return None;
         }
     };
@@ -148,7 +148,7 @@ async fn fetch(
     let body = match resp.text().await {
         Ok(body) => body,
         Err(e) => {
-            tracing::warn!(credential = %credential.id, %e, "枠の応答を読めません");
+            tracing::warn!(credential = %credential.id, %e, "cannot read the quota response");
             return None;
         }
     };
@@ -203,7 +203,7 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
     let parsed: Response = match serde_json::from_str(body) {
         Ok(parsed) => parsed,
         Err(e) => {
-            tracing::warn!(%e, "枠の形が変わっています");
+            tracing::warn!(%e, "the quota response shape has changed");
             return None;
         }
     };

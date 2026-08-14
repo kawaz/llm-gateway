@@ -25,7 +25,7 @@ impl OauthBearer {
     pub fn apply(&self, credential: Option<&Credential>, headers: &mut Headers) -> Result<()> {
         let credential = credential.ok_or_else(|| Error::Credential {
             id: self.route.clone(),
-            reason: "認証情報が渡されていません".to_owned(),
+            reason: "no credential was provided".to_owned(),
         })?;
         headers.set("authorization", credential.bearer());
         Ok(())

@@ -80,8 +80,8 @@ pub(crate) fn sweep_temporaries(dir: &Path, writer: &str) {
             continue;
         }
         match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(path = %path.display(), "書き損じを片付けました"),
-            Err(e) => tracing::warn!(path = %path.display(), %e, "書き損じを消せません"),
+            Ok(()) => tracing::info!(path = %path.display(), "cleaned up a stray write"),
+            Err(e) => tracing::warn!(path = %path.display(), %e, "cannot remove a stray write"),
         }
     }
 }

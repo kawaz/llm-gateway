@@ -208,7 +208,7 @@ impl Router {
                 Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
                     Ok(found) => found,
                     Err(e) => {
-                        warn!(route = %name, %e, "一覧を取れません。保存済みまたは設定の一覧を使います");
+                        warn!(route = %name, %e, "cannot fetch the model list; using the saved or configured list");
                         previous
                             .by_route
                             .get(name)
@@ -579,7 +579,7 @@ fn resolve_aliases(
                 break None;
             };
             if seen.contains(&cursor) {
-                warn!(alias = %name, "エイリアスが循環しています。この定義は使いません");
+                warn!(alias = %name, "the alias is circular; ignoring this definition");
                 break None;
             }
             seen.push(cursor.clone());

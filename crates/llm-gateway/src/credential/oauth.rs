@@ -110,13 +110,13 @@ pub async fn refresh_at(
         .await
         .map_err(|e| Error::Refresh {
             id: id.to_string(),
-            reason: format!("{url} に接続できません: {e}"),
+            reason: format!("cannot connect to {url}: {e}"),
         })?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Refresh {
         id: id.to_string(),
-        reason: format!("応答を読めません: {e}"),
+        reason: format!("cannot read response: {e}"),
     })?;
 
     if !status.is_success() {
@@ -128,7 +128,7 @@ pub async fn refresh_at(
 
     serde_json::from_str(&text).map_err(|e| Error::Refresh {
         id: id.to_string(),
-        reason: format!("応答の形式が想定と違います: {e}"),
+        reason: format!("response format is not what was expected: {e}"),
     })
 }
 
@@ -137,18 +137,20 @@ pub async fn refresh_at(
 /// 応答本文をそのまま出すと token が混ざる恐れがあるので、状態から言い換える。
 fn refresh_failure_reason(status: u16, body: &str) -> String {
     if body.contains("refresh_token_reused") {
-        return "refresh token が既に使用済みです。更新が二重に走った可能性があります。\
-再ログインが必要です"
+        return "the refresh token has already been used. \
+a refresh may have run twice; you need to log in again"
             .to_owned();
     }
     if body.contains("refresh_token_expired") || body.contains("refresh_token_invalidated") {
-        return "refresh token が失効しています。再ログインが必要です".to_owned();
+        return "the refresh token has expired; you need to log in again".to_owned();
     }
     match status {
-        400 | 401 => "refresh token が受け付けられませんでした。再ログインが必要です".to_owned(),
-        429 => "更新の要求が多すぎます。しばらく待ってから再試行してください".to_owned(),
-        500..=599 => format!("更新先が {status} を返しました。一時的な障害の可能性があります"),
-        _ => format!("更新先が {status} を返しました"),
+        400 | 401 => "the refresh token was rejected; you need to log in again".to_owned(),
+        429 => "too many refresh requests; wait and try again".to_owned(),
+        500..=599 => {
+            format!("the refresh endpoint returned {status}; this may be a transient failure")
+        }
+        _ => format!("the refresh endpoint returned {status}"),
     }
 }
 
@@ -292,7 +294,7 @@ impl Authorization {
     ///
     /// `save` は確認を通った token を保存する処理。**ブラウザに出す画面は
     /// ここまで全部済んでから決まる**。認可コードを受け取った時点で
-    /// 「認可できました」を出すと、その後の交換や保存が失敗しても画面には
+    /// 「Authorization succeeded」を出すと、その後の交換や保存が失敗しても画面には
     /// 成功が残る。
     pub async fn finish<T>(self, save: impl FnOnce(&Tokens) -> Result<T>) -> Result<T> {
         self.finish_with(Endpoints::default(), save).await
@@ -363,9 +365,9 @@ pub async fn begin(kind: Kind) -> Result<Authorization> {
         .await
         .map_err(|e| Error::Login {
             reason: format!(
-                "{} で待ち受けられません: {e}。\
-この戻り先は client_id に登録済みの値なので他のポートでは代用できません。\
-このポートを使っている別のログイン処理 (cpa など) を止めてから、もう一度実行してください",
+                "cannot listen on {}: {e}. \
+This redirect is registered against the client_id, so another port cannot be substituted. \
+Stop whatever else is using this port (e.g. cpa) and run this again",
                 profile.redirect_uri()
             ),
         })?;
@@ -537,7 +539,7 @@ async fn receive(
     }
 
     // 交換・確認・保存が終わるまで待つ。ここで待たずに画面を出すと、
-    // その後で失敗しても「認可できました」が残ってしまう。
+    // その後で失敗しても「Authorization succeeded」が残ってしまう。
     let outcome = result
         .await
         .unwrap_or_else(|_| Err("authorization did not finish processing".to_owned()));
@@ -585,16 +587,16 @@ fn code_from_query(query: Option<&str>, expected_state: &str) -> FinishOutcome<S
 /// 認可コードも token も出さない。画面はブラウザの履歴や共有画面に残る。
 fn result_page(outcome: &FinishOutcome) -> String {
     let body = match outcome {
-        Ok(()) => "<h1>認可できました</h1>\
-<p>token を取得し、使えることを確認して保存しました。この画面は閉じて、端末に戻ってください。</p>"
+        Ok(()) => "<h1>Authorization succeeded</h1>\
+<p>The token was obtained, confirmed to work, and saved. You can close this window and return to the terminal.</p>"
             .to_owned(),
         Err(reason) => format!(
-            "<h1>認可できませんでした</h1><p>{}</p>",
+            "<h1>Authorization failed</h1><p>{}</p>",
             html_escape(reason)
         ),
     };
     format!(
-        "<!doctype html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
 <title>llm-gateway</title></head><body>{body}</body></html>"
     )
 }
@@ -742,7 +744,7 @@ fn login_client() -> Result<reqwest::Client> {
         .timeout(UPSTREAM_TIMEOUT)
         .build()
         .map_err(|e| Error::Login {
-            reason: format!("HTTP クライアントを作れません: {e}"),
+            reason: format!("cannot build an HTTP client: {e}"),
         })
 }
 
@@ -771,12 +773,12 @@ async fn verify(kind: Kind, tokens: &Tokens, url_override: Option<&str>) -> Resu
     }
 
     let resp = request.send().await.map_err(|e| Error::Login {
-        reason: format!("取得した token を確かめられません ({url} に接続できません: {e})"),
+        reason: format!("cannot verify the obtained token (cannot connect to {url}: {e})"),
     })?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Login {
-        reason: format!("取得した token を確かめられません (応答を読めません: {e})"),
+        reason: format!("cannot verify the obtained token (cannot read response: {e})"),
     })?;
 
     if !status.is_success() {
@@ -789,13 +791,13 @@ async fn verify(kind: Kind, tokens: &Tokens, url_override: Option<&str>) -> Resu
         let models =
             crate::discovery::parse(crate::discovery::Flavor::Anthropic, &text).map_err(|e| {
                 Error::Login {
-                    reason: format!("モデル一覧の形式が想定と違います: {e}"),
+                    reason: format!("model list format is not what was expected: {e}"),
                 }
             })?;
         if models.is_empty() {
             return Err(Error::Login {
-                reason: "token は使えますが、このアカウントで使えるモデルが 1 つもありません。\
-サブスクの契約状況を確認してください"
+                reason: "the token works, but this account has no models available. \
+Check the subscription status"
                     .to_owned(),
             });
         }
@@ -810,17 +812,19 @@ async fn verify(kind: Kind, tokens: &Tokens, url_override: Option<&str>) -> Resu
 /// 情報が混ざりうる。
 fn verify_failure_reason(status: u16) -> String {
     match status {
-        401 | 403 => "取得した token が upstream に受け付けられませんでした。\
-認可したアカウントにこのサブスクの利用権があるか確認してから、login をやり直してください"
+        401 | 403 => "the obtained token was rejected by upstream. \
+Check that the authorized account has access to this subscription, then log in again"
             .to_owned(),
-        429 => "確認先が要求の多さを理由に断りました。\
-しばらく待ってから login をやり直してください"
+        429 => "the verification endpoint declined due to too many requests. \
+wait and log in again"
             .to_owned(),
         500..=599 => format!(
-            "確認先が {status} を返しました。一時的な障害の可能性があります。\
-しばらく待ってから login をやり直してください"
+            "the verification endpoint returned {status}; this may be a transient failure. \
+wait and log in again"
         ),
-        other => format!("取得した token を確かめられません (確認先が {other} を返しました)"),
+        other => {
+            format!("cannot verify the obtained token (verification endpoint returned {other})")
+        }
     }
 }
 
@@ -852,12 +856,12 @@ async fn exchange_code(
         ExchangeForm::UrlEncoded => request.form(&body),
     };
     let resp = request.send().await.map_err(|e| Error::Login {
-        reason: format!("{url} に接続できません: {e}"),
+        reason: format!("cannot connect to {url}: {e}"),
     })?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Login {
-        reason: format!("応答を読めません: {e}"),
+        reason: format!("cannot read response: {e}"),
     })?;
 
     if !status.is_success() {
@@ -867,7 +871,7 @@ async fn exchange_code(
     }
 
     let parsed: ExchangeResponse = serde_json::from_str(&text).map_err(|e| Error::Login {
-        reason: format!("応答の形式が想定と違います: {e}"),
+        reason: format!("response format is not what was expected: {e}"),
     })?;
     tokens_from(kind, parsed)
 }
@@ -876,8 +880,8 @@ async fn exchange_code(
 fn tokens_from(kind: Kind, resp: ExchangeResponse) -> Result<Tokens> {
     let Some(refresh_token) = resp.refresh_token else {
         return Err(Error::Login {
-            reason: "refresh token が返りませんでした。\
-これが無いと 8 時間ごとに再ログインが要るので、認可し直してください"
+            reason: "no refresh token was returned. \
+Without it you would need to log in again every 8 hours; re-authorize"
                 .to_owned(),
         });
     };
@@ -890,8 +894,7 @@ fn tokens_from(kind: Kind, resp: ExchangeResponse) -> Result<Tokens> {
     let account_id = claims.as_ref().and_then(account_id_of);
     if kind == Kind::Codex && account_id.is_none() {
         return Err(Error::Login {
-            reason: "ChatGPT の応答にアカウント識別子がありません。認可をやり直してください"
-                .to_owned(),
+            reason: "the ChatGPT response has no account identifier; re-authorize".to_owned(),
         });
     }
 
@@ -900,7 +903,7 @@ fn tokens_from(kind: Kind, resp: ExchangeResponse) -> Result<Tokens> {
         refresh_token,
         id_token: resp.id_token,
         // 返らなかった場合は期限切れ扱いにする。初回の使用で更新が走るだけで
-        // 済み、認可をやり直させずに回復できる。
+        // 済み、認可をlog in againさせずに回復できる。
         expires_in: resp.expires_in.unwrap_or(0),
         email,
         account_id,
@@ -945,18 +948,20 @@ fn email_of(claims: &Value) -> Option<String> {
 /// 文言に出さないための形。
 fn exchange_failure_reason(status: u16, body: &str) -> String {
     let base = match status {
-        400 => "認可コードが受け付けられませんでした。\
-使い切ったか期限切れの可能性があります。もう一度 login をやり直してください"
+        400 => "the authorization code was rejected. \
+It may have been used already or expired; log in again"
             .to_owned(),
-        401 | 403 => "認可が拒否されました。\
-ログインしたアカウントにこのサブスクの利用権があるか確認してください"
+        401 | 403 => "authorization was denied. \
+Check that the logged-in account has access to this subscription"
             .to_owned(),
-        429 => "要求が多すぎます。しばらく待ってから再試行してください".to_owned(),
-        500..=599 => format!("交換先が {status} を返しました。一時的な障害の可能性があります"),
-        other => format!("交換先が {other} を返しました"),
+        429 => "too many requests; wait and try again".to_owned(),
+        500..=599 => {
+            format!("the exchange endpoint returned {status}; this may be a transient failure")
+        }
+        other => format!("the exchange endpoint returned {other}"),
     };
     match oauth_error_detail(body) {
-        Some(detail) => format!("{base} (交換先の応答: {detail})"),
+        Some(detail) => format!("{base} (exchange endpoint response: {detail})"),
         None => base,
     }
 }
@@ -1049,16 +1054,16 @@ mod tests {
             400,
             r#"{"error":"invalid_grant","error_description":"refresh_token_reused"}"#,
         );
-        assert!(reason.contains("二重"), "{reason}");
-        assert!(reason.contains("再ログイン"), "{reason}");
+        assert!(reason.contains("twice"), "{reason}");
+        assert!(reason.contains("log in again"), "{reason}");
     }
 
     /// 一時障害と恒久失敗を言い分ける (再試行してよいかが変わる)。
     #[test]
     fn distinguishes_transient_from_permanent() {
-        assert!(refresh_failure_reason(503, "").contains("一時的"));
-        assert!(refresh_failure_reason(401, "").contains("再ログイン"));
-        assert!(refresh_failure_reason(429, "").contains("待って"));
+        assert!(refresh_failure_reason(503, "").contains("transient"));
+        assert!(refresh_failure_reason(401, "").contains("log in again"));
+        assert!(refresh_failure_reason(429, "").contains("wait"));
     }
 
     /// 応答本文をそのまま埋め込まない (token が混ざりうるため)。
@@ -1086,7 +1091,10 @@ mod tests {
         let a = random_token();
         let b = random_token();
 
-        assert_ne!(a, b, "毎回同じなら state もPKCEも意味がない");
+        assert_ne!(
+            a, b,
+            "if it were the same every time, state and PKCE would be meaningless"
+        );
         assert_eq!(a.len(), 43, "32 バイトを base64url にした長さ");
         assert!(
             a.bytes()
@@ -1303,7 +1311,7 @@ mod tests {
             "now + expires_in"
         );
         assert_eq!(c.last_refresh, "2026-07-27T19:00:00Z");
-        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "既定が入る");
+        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "the default is set");
     }
 
     /// ChatGPT の識別子は codex 側にだけ入る。
@@ -1401,13 +1409,13 @@ mod tests {
         assert_eq!(v["state"], "the-state");
     }
 
-    /// 交換の失敗は、やり直せるものと待つべきものを言い分ける。
+    /// 交換の失敗は、log in againせるものと待つべきものを言い分ける。
     #[test]
     fn exchange_failure_is_actionable() {
-        assert!(exchange_failure_reason(400, "").contains("やり直"));
-        assert!(exchange_failure_reason(403, "").contains("利用権"));
-        assert!(exchange_failure_reason(429, "").contains("待って"));
-        assert!(exchange_failure_reason(503, "").contains("一時的"));
+        assert!(exchange_failure_reason(400, "").contains("log in again"));
+        assert!(exchange_failure_reason(403, "").contains("subscription"));
+        assert!(exchange_failure_reason(429, "").contains("wait"));
+        assert!(exchange_failure_reason(503, "").contains("transient"));
         assert!(exchange_failure_reason(418, "").contains("418"));
     }
 
@@ -1425,17 +1433,17 @@ mod tests {
     #[test]
     fn exchange_failure_without_oauth_shape_is_plain() {
         let reason = exchange_failure_reason(400, "<html>gateway error</html>");
-        assert!(reason.contains("やり直"));
-        assert!(!reason.contains("応答:"), "{reason}");
+        assert!(reason.contains("log in again"));
+        assert!(!reason.contains("response:"), "{reason}");
     }
 
     /// 確認先が断ったら、次に何をすればよいかが分かる文言になる。
     #[test]
     fn verify_failure_is_actionable() {
-        assert!(verify_failure_reason(401).contains("利用権"));
-        assert!(verify_failure_reason(403).contains("やり直"));
-        assert!(verify_failure_reason(429).contains("待って"));
-        assert!(verify_failure_reason(503).contains("一時的"));
+        assert!(verify_failure_reason(401).contains("subscription"));
+        assert!(verify_failure_reason(403).contains("log in again"));
+        assert!(verify_failure_reason(429).contains("wait"));
+        assert!(verify_failure_reason(503).contains("transient"));
         assert!(verify_failure_reason(418).contains("418"));
     }
 
@@ -1571,8 +1579,8 @@ mod tests {
         assert_eq!(saved.into_inner().as_deref(), Some("at"), "保存まで進む");
 
         let page = page.await.unwrap();
-        assert!(page.contains("認可できました"), "{page}");
-        assert!(page.contains("確認して保存"), "{page}");
+        assert!(page.contains("Authorization succeeded"), "{page}");
+        assert!(page.contains("confirmed to work"), "{page}");
     }
 
     /// 画面に認可コードも token も出さない (履歴や共有画面に残る)。
@@ -1627,7 +1635,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(account.as_deref(), Some("acc-1"));
-        assert!(page.await.unwrap().contains("認可できました"));
+        assert!(page.await.unwrap().contains("Authorization succeeded"));
     }
 
     /// state の違う戻りは受け取らず、交換にも進まない。
@@ -1653,7 +1661,7 @@ mod tests {
 
         assert!(err.to_string().contains("state"), "{err}");
         assert!(saved.into_inner().is_none(), "保存まで進まない");
-        assert!(page.await.unwrap().contains("認可できませんでした"));
+        assert!(page.await.unwrap().contains("Authorization failed"));
     }
 
     /// 断られた戻りも、理由付きで終わる (無言で待ち続けない)。
@@ -1710,15 +1718,15 @@ mod tests {
             .to_string();
 
         assert!(!err.contains("leaked-secret-value"), "{err}");
-        assert!(err.contains("やり直"), "{err}");
+        assert!(err.contains("log in again"), "{err}");
         assert!(
             saved.into_inner().is_none(),
             "交換できていないので保存しない"
         );
 
         let page = page.await.unwrap();
-        assert!(page.contains("認可できませんでした"), "{page}");
-        assert!(page.contains("やり直"), "{page}");
+        assert!(page.contains("Authorization failed"), "{page}");
+        assert!(page.contains("log in again"), "{page}");
         assert!(!page.contains("leaked-secret-value"), "{page}");
     }
 
@@ -1750,9 +1758,9 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("受け付けられませんでした"), "{err}");
+        assert!(err.contains("rejected"), "{err}");
         assert!(saved.into_inner().is_none(), "使えない token は保存しない");
-        assert!(page.await.unwrap().contains("認可できませんでした"));
+        assert!(page.await.unwrap().contains("Authorization failed"));
     }
 
     /// モデルが 1 つも見えない token も、使えないものとして断る。
@@ -1773,9 +1781,9 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("モデルが 1 つもありません"), "{err}");
+        assert!(err.contains("no models available"), "{err}");
         assert!(saved.into_inner().is_none());
-        assert!(page.await.unwrap().contains("認可できませんでした"));
+        assert!(page.await.unwrap().contains("Authorization failed"));
     }
 
     /// 保存に失敗したら、画面も失敗になる。
@@ -1792,18 +1800,18 @@ mod tests {
         let err = auth
             .finish_with(upstream.endpoints(), |_| -> Result<()> {
                 Err(Error::Login {
-                    reason: "置き場に書き込めません".to_owned(),
+                    reason: "cannot write to storage".to_owned(),
                 })
             })
             .await
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("置き場に書き込めません"), "{err}");
+        assert!(err.contains("cannot write to storage"), "{err}");
 
         let page = page.await.unwrap();
-        assert!(page.contains("認可できませんでした"), "{page}");
-        assert!(page.contains("置き場に書き込めません"), "{page}");
+        assert!(page.contains("Authorization failed"), "{page}");
+        assert!(page.contains("cannot write to storage"), "{page}");
     }
 
     /// 交換の途中で 2 本目の戻りが来ても、1 本目の処理を壊さない。
@@ -1836,6 +1844,6 @@ mod tests {
 
         assert_eq!(result.unwrap(), "at", "1 本目はそのまま通る");
         assert!(second.contains("already accepted"), "{second}");
-        assert!(first.await.unwrap().contains("認可できました"));
+        assert!(first.await.unwrap().contains("Authorization succeeded"));
     }
 }

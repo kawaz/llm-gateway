@@ -44,7 +44,7 @@ impl QuotaApi for WhamUsage {
                 .as_deref()
                 .ok_or_else(|| Error::Credential {
                     id: credential.id.to_string(),
-                    reason: "ChatGPT のアカウント識別子がありません".to_owned(),
+                    reason: "no ChatGPT account identifier".to_owned(),
                 })?;
             let response = http
                 .get(self.usage_url())

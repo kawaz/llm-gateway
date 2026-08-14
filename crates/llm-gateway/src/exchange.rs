@@ -71,7 +71,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// (ヘッダ受信) と終了 (本文の終端) を突き合わせられる。
 pub fn request_span() -> Span {
     info_span!(
-        "転送",
+        "exchange",
         req = NEXT_ID.fetch_add(1, Ordering::Relaxed),
         // 受け取り終えた時点で [`record_request_body`] が埋める。
         body_bytes = Empty,
@@ -90,7 +90,7 @@ pub fn request_span() -> Span {
 pub fn record_request_body(span: &Span, bytes: usize, elapsed: Duration) {
     span.record("body_bytes", bytes as u64);
     let ms = elapsed.as_millis();
-    span.in_scope(|| info!(elapsed_ms = ms, "本文を受け取りました"));
+    span.in_scope(|| info!(elapsed_ms = ms, "received request body"));
 }
 
 /// upstream からヘッダを受け取った節目を記録する。
@@ -100,7 +100,7 @@ pub fn record_request_body(span: &Span, bytes: usize, elapsed: Duration) {
 /// 突き合わせて読める (詳しくはモジュール冒頭の「生成待ちはどの行に出るか」)。
 pub fn record_upstream_headers(span: &Span, model: &str, route: &str, status: u16) {
     span.in_scope(|| {
-        info!(model = %model, route, status, "upstream のヘッダを受け取りました");
+        info!(model = %model, route, status, "received upstream headers");
     });
 }
 
@@ -267,7 +267,7 @@ impl Stream for BodyObservation {
                     // ここから終端までが流し切るまでの時間。境目はここ。
                     let ms = this.elapsed_ms();
                     this.span
-                        .in_scope(|| info!(elapsed_ms = ms, "最初のチャンクを送り出しました"));
+                        .in_scope(|| info!(elapsed_ms = ms, "sent the first chunk"));
                 }
                 this.note_gap(now);
                 this.last_chunk = Some(now);
@@ -294,7 +294,7 @@ impl Stream for BodyObservation {
                         max_gap_ms = gap,
                         max_gap_at_ms = gap_at,
                         reason = %e,
-                        "転送が途切れました"
+                        "the transfer broke off"
                     );
                 });
                 Poll::Ready(Some(Err(e)))
@@ -308,7 +308,7 @@ impl Stream for BodyObservation {
                         elapsed_ms = ms,
                         max_gap_ms = gap,
                         max_gap_at_ms = gap_at,
-                        "本文を転送し終えました"
+                        "finished transferring the body"
                     );
                 });
                 Poll::Ready(None)
@@ -335,7 +335,7 @@ impl Drop for BodyObservation {
                 elapsed_ms = ms,
                 max_gap_ms = gap,
                 max_gap_at_ms = gap_at,
-                "転送が中断されました (クライアントが切れたとみられます)"
+                "the transfer was aborted (the client appears to have disconnected)"
             );
         });
     }
@@ -464,7 +464,7 @@ mod tests {
             while obs.next().await.is_some() {}
         });
 
-        assert!(logs.contains("本文を転送し終えました"), "{logs}");
+        assert!(logs.contains("finished transferring the body"), "{logs}");
         assert!(
             logs.contains("bytes=30"),
             "転送したバイト数が分かる: {logs}"
@@ -480,7 +480,7 @@ mod tests {
             record_request_body(&span, 1_300_000, Duration::from_millis(42));
         });
 
-        assert!(logs.contains("本文を受け取りました"), "{logs}");
+        assert!(logs.contains("received request body"), "{logs}");
         assert!(
             logs.contains("body_bytes=1300000"),
             "どれだけ受け取ったか: {logs}"
@@ -499,7 +499,7 @@ mod tests {
             record_upstream_headers(&span, "claude-opus-5", "anthropic-oauth-a", 200);
         });
 
-        assert!(logs.contains("upstream のヘッダを受け取りました"), "{logs}");
+        assert!(logs.contains("received upstream headers"), "{logs}");
         assert!(logs.contains("model=claude-opus-5"), "{logs}");
         // 文字列フィールドは引用符付きで出る (tracing の既定の書式)。
         assert!(logs.contains("route=\"anthropic-oauth-a\""), "{logs}");
@@ -520,7 +520,7 @@ mod tests {
 
         let end = logs
             .lines()
-            .find(|l| l.contains("本文を転送し終えました"))
+            .find(|l| l.contains("finished transferring the body"))
             .unwrap_or_else(|| panic!("終端の記録が無い:\n{logs}"));
         assert!(end.contains("body_bytes=512"), "{end}");
     }
@@ -543,7 +543,7 @@ mod tests {
 
         let first: Vec<&str> = logs
             .lines()
-            .filter(|l| l.contains("最初のチャンクを送り出しました"))
+            .filter(|l| l.contains("sent the first chunk"))
             .collect();
         assert_eq!(first.len(), 1, "残すのは最初の 1 回だけ: {logs}");
         assert!(first[0].contains("elapsed_ms="), "{}", first[0]);
@@ -563,8 +563,11 @@ mod tests {
             let _ = obs.next().await;
         });
 
-        assert!(!logs.contains("最初のチャンク"), "{logs}");
-        assert!(logs.contains("転送が途切れました"), "終端は残る: {logs}");
+        assert!(!logs.contains("first chunk"), "{logs}");
+        assert!(
+            logs.contains("the transfer broke off"),
+            "the terminal line remains: {logs}"
+        );
     }
 
     /// チャンクの間で最も長く黙り込んだ時間が残る。
@@ -587,7 +590,7 @@ mod tests {
             while obs.next().await.is_some() {}
         });
 
-        let end = line_with(&logs, "本文を転送し終えました");
+        let end = line_with(&logs, "finished transferring the body");
         let gap = field(end, "max_gap_ms");
         assert!(gap >= 60, "最長の無音を拾う (80ms 空けた): {end}");
 
@@ -612,7 +615,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
         });
 
-        let aborted = line_with(&logs, "転送が中断されました");
+        let aborted = line_with(&logs, "the transfer was aborted");
         assert!(
             field(aborted, "max_gap_ms") >= 60,
             "去る直前の無音が残る: {aborted}"
@@ -636,7 +639,7 @@ mod tests {
             let _ = obs.next().await;
         });
 
-        let broken = line_with(&logs, "転送が途切れました");
+        let broken = line_with(&logs, "the transfer broke off");
         assert_eq!(field(broken, "max_gap_ms"), 0, "{broken}");
         assert_eq!(field(broken, "bytes"), 0, "{broken}");
     }
@@ -659,7 +662,7 @@ mod tests {
             }
         });
 
-        assert!(logs.contains("転送が途切れました"), "{logs}");
+        assert!(logs.contains("the transfer broke off"), "{logs}");
         assert!(
             logs.contains("response reading was interrupted"),
             "何が起きたか: {logs}"
@@ -683,7 +686,7 @@ mod tests {
             let _ = obs.next().await;
         });
 
-        assert!(logs.contains("転送が中断されました"), "{logs}");
+        assert!(logs.contains("the transfer was aborted"), "{logs}");
         assert!(logs.contains("bytes=9"), "どこまで流したか: {logs}");
     }
 
@@ -695,7 +698,7 @@ mod tests {
             while obs.next().await.is_some() {}
         });
 
-        assert!(!logs.contains("中断"), "{logs}");
+        assert!(!logs.contains("aborted"), "{logs}");
     }
 
     /// リクエストごとに番号が変わる。同時に流れていても取り違えない。
@@ -704,13 +707,13 @@ mod tests {
         let logs = logs_of(|| async {
             for _ in 0..2 {
                 let span = request_span();
-                span.in_scope(|| info!("しるし"));
+                span.in_scope(|| info!("marker"));
             }
         });
 
         let numbers: Vec<&str> = logs
             .lines()
-            .filter(|l| l.contains("しるし"))
+            .filter(|l| l.contains("marker"))
             .filter_map(|l| l.split_once("req=").map(|(_, rest)| rest))
             .collect();
         assert_eq!(numbers.len(), 2, "{logs}");

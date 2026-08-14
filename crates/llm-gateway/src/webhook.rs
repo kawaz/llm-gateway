@@ -54,7 +54,7 @@ pub async fn keep_sending(
         Ok(Some(url)) => url,
         Ok(None) => return,
         Err(reason) => {
-            warn!(%reason, "webhook の送り先が不正です。知らせの送信は行いません");
+            warn!(%reason, "the webhook destination is invalid; not sending notifications");
             return;
         }
     };
@@ -67,12 +67,12 @@ pub async fn keep_sending(
             warn!(
                 file = %config.token_file.display(),
                 %reason,
-                "webhook の合言葉を読めません。知らせの送信は行いません"
+                "cannot read the webhook token; not sending notifications"
             );
             return;
         }
     };
-    info!(%url, "起きたことを受け口へ送ります");
+    info!(%url, "sending the event to the endpoint");
 
     // 続けて失敗しているときに、同じ warning を並べない。
     let mut failing = 0u64;
@@ -83,13 +83,13 @@ pub async fn keep_sending(
         };
         let (payloads, oversized) = encode_payloads(&batch);
         if oversized > 0 {
-            warn!(oversized, "1 MB を超えるイベントを webhook へ送れません");
+            warn!(oversized, "cannot send an event over 1 MB to a webhook");
         }
         for payload in payloads {
             match send(&http, &url, &token, payload, TIMEOUT).await {
                 Ok(()) => {
                     if failing > 0 {
-                        info!(failed = failing, "webhook の受け口が戻りました");
+                        info!(failed = failing, "the webhook endpoint recovered");
                         failing = 0;
                     }
                 }
@@ -97,7 +97,7 @@ pub async fn keep_sending(
                     // 最初の 1 回だけ言う。落ちている間は数えるだけにして、
                     // 戻ったときにまとめて報告する。
                     if failing == 0 {
-                        warn!(%url, %reason, "webhook を送れません");
+                        warn!(%url, %reason, "cannot send to the webhook");
                     }
                     failing += 1;
                 }
@@ -118,7 +118,9 @@ async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Opti
         match timeout_at(until, watching.recv()).await {
             Ok(Ok(event)) => batch.push(event),
             // 追いつけなかった分は諦める。送り直す仕組みを持たない。
-            Ok(Err(RecvError::Lagged(missed))) => warn!(missed, "知らせを配りきれませんでした"),
+            Ok(Err(RecvError::Lagged(missed))) => {
+                warn!(missed, "could not deliver all notifications")
+            }
             Ok(Err(RecvError::Closed)) => break,
             // 窓を閉じる。
             Err(_) => break,
@@ -132,7 +134,7 @@ async fn first(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Option
     loop {
         match watching.recv().await {
             Ok(event) => return Some(event),
-            Err(RecvError::Lagged(missed)) => warn!(missed, "知らせを配りきれませんでした"),
+            Err(RecvError::Lagged(missed)) => warn!(missed, "could not deliver all notifications"),
             Err(RecvError::Closed) => return None,
         }
     }
@@ -579,7 +581,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            warn!(%url, %reason, "webhook を送れません");
+            warn!(%url, %reason, "cannot send to the webhook");
         });
 
         assert!(!logs.contains(TOKEN), "合言葉が記録に出ている:\n{logs}");

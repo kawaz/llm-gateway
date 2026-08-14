@@ -200,7 +200,7 @@ fn assistant_content(value: &Value, output: &mut Vec<Value>) -> Result<()> {
                 }));
             }
             Some("thinking" | "redacted_thinking") => {
-                tracing::warn!("履歴中の thinking block を落とします");
+                tracing::warn!("dropping a thinking block from history");
             }
             Some(other) => {
                 return Err(invalid(format!(

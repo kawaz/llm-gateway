@@ -317,7 +317,7 @@ impl MessagesUsage {
         self.held = Vec::new();
         self.event = Vec::new();
         self.usage = TokenUsage::default();
-        tracing::warn!(reason, "使用量の集計をやめます");
+        tracing::warn!(reason, "skipping usage metering");
     }
 }
 

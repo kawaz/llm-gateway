@@ -342,7 +342,7 @@ impl<P: Persistence> Inner<P> {
             // 結果が配られる前に消えた = 更新できたか分からない。
             Err(_) => Err(Error::Refresh {
                 id: id.to_string(),
-                reason: "更新の結果を受け取れませんでした".to_owned(),
+                reason: "did not receive the refresh result".to_owned(),
             }),
         }
     }
@@ -366,8 +366,8 @@ impl<P: Persistence> Inner<P> {
         ) else {
             return Err(Error::Refresh {
                 id: id.to_string(),
-                reason: "OAuth ではないので更新できません。\
-新しいキーを発行して認証情報を保存し直してください"
+                reason: "cannot refresh a non-OAuth credential. \
+Issue a new key and save the credential again"
                     .to_owned(),
             });
         };
@@ -1162,8 +1162,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("OAuth ではない"), "{err}");
-        assert!(err.contains("発行"), "対処を書く: {err}");
+        assert!(err.contains("non-OAuth"), "{err}");
+        assert!(err.contains("Issue"), "gives the fix: {err}");
     }
 
     /// API キーはそのまま渡る (期限を理由に握りつぶさない)。
@@ -1430,7 +1430,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("再ログイン"), "{err}");
+        assert!(err.contains("log in again"), "{err}");
         assert!(store.inner.in_flight().is_empty());
     }
 

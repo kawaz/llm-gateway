@@ -1223,21 +1223,21 @@ async fn shutdown_signal() {
     let mut term = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(%e, "SIGTERM を受け取れません");
+            tracing::warn!(%e, "cannot receive SIGTERM");
             return;
         }
     };
     let mut int = match signal(SignalKind::interrupt()) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(%e, "SIGINT を受け取れません");
+            tracing::warn!(%e, "cannot receive SIGINT");
             return;
         }
     };
 
     tokio::select! {
-        _ = term.recv() => tracing::info!("SIGTERM を受け取りました"),
-        _ = int.recv() => tracing::info!("SIGINT を受け取りました"),
+        _ = term.recv() => tracing::info!("received SIGTERM"),
+        _ = int.recv() => tracing::info!("received SIGINT"),
     }
 }
 

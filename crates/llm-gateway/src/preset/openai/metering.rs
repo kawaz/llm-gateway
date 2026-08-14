@@ -189,7 +189,7 @@ impl UsageObserver for OpenAiUsage {
                 self.held.clear();
                 self.event.clear();
                 self.usage = TokenUsage::default();
-                tracing::warn!("OpenAI usage event が大きすぎるため集計をやめます");
+                tracing::warn!("OpenAI usage event is too large; skipping metering");
                 return;
             } else {
                 self.held.push(byte);
@@ -224,7 +224,7 @@ impl UsageObserver for OpenAiJsonUsage {
         if self.body.len() + chunk.len() > MAX_JSON_BODY {
             self.given_up = true;
             self.body.clear();
-            tracing::warn!("OpenAI usage JSON が大きすぎるため集計をやめます");
+            tracing::warn!("OpenAI usage JSON is too large; skipping metering");
             return;
         }
         self.body.extend_from_slice(chunk);

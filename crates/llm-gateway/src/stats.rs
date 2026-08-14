@@ -268,7 +268,7 @@ impl Stats {
         }
         let days = restored.len();
         *self.counts.lock().unwrap_or_else(|e| e.into_inner()) = restored;
-        tracing::info!(days, "日次集計を読み戻しました");
+        tracing::info!(days, "loaded daily totals from disk");
     }
 
     /// 変わった日だけをディスクへ落とす。変わっていなければ何もしない。
@@ -370,7 +370,7 @@ impl Stats {
                 continue;
             }
             let Ok(day) = read_day(&path) else {
-                tracing::warn!(path = %path.display(), "日次集計を読めません");
+                tracing::warn!(path = %path.display(), "cannot read daily totals");
                 continue;
             };
             merge_day(merged.entry(date).or_default(), day);
@@ -389,7 +389,7 @@ impl Stats {
             Ok(_) => None,
             Err(e) => {
                 // 読めない 1 日分で起動や集計を止めない。
-                tracing::warn!(path = %path.display(), %e, "日次集計を読めません");
+                tracing::warn!(path = %path.display(), %e, "cannot read daily totals");
                 None
             }
         }

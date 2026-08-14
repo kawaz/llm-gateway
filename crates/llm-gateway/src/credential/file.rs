@@ -51,13 +51,13 @@ impl Persistence for FileStore {
         let path = self.path_of(id);
         let raw = fs::read_to_string(&path).map_err(|e| Error::Credential {
             id: id.to_string(),
-            reason: format!("{} を読めません: {e}", path.display()),
+            reason: format!("cannot read {}: {e}", path.display()),
         })?;
         serde_json::from_str(&raw).map_err(|e| Error::Credential {
             id: id.to_string(),
             reason: format!(
-                "{} の形式が想定と違います: {e}。\
-`llm-gateway login` で取り直すか、認証情報を payload に入れた形に直してください",
+                "{} has an unexpected format: {e}. \
+Run `llm-gateway login` again, or fix the file to put credentials in the payload",
                 path.display()
             ),
         })

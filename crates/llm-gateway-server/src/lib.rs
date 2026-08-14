@@ -125,7 +125,7 @@ async fn events<P: Persistence + 'static>(
                 // 追いつけなかった分は諦めて先へ進む。5 分の残りを数える相手に、
                 // 遅れて届いた開始時刻を渡しても使い道がない。
                 Err(RecvError::Lagged(missed)) => {
-                    warn!(missed, "イベントを配りきれませんでした");
+                    warn!(missed, "could not deliver all events");
                 }
                 // 流す側が畳まれた。gateway が終わるとき以外は起きない。
                 Err(RecvError::Closed) => return None,
@@ -148,7 +148,7 @@ fn sse_line(event: &llm_gateway::events::Event) -> SseEvent {
         .event("request")
         .json_data(event)
         .unwrap_or_else(|e| {
-            error!(%e, "イベントを JSON にできません");
+            error!(%e, "cannot serialize the event to JSON");
             SseEvent::default().comment("unserializable")
         })
 }
@@ -538,7 +538,7 @@ fn unknown_namespace(name: &str, known: &[&str]) -> Response {
         name,
         StatusCode::NOT_FOUND,
         &format!(
-            "namespace `{name}` は設定されていません。使えるのは: {}",
+            "namespace `{name}` is not configured. Available: {}",
             known.join(", ")
         ),
     )
@@ -559,7 +559,7 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
             name,
             StatusCode::UNAUTHORIZED,
             "authentication_error",
-            &format!("namespace `{name}` のトークンが違います"),
+            &format!("namespace `{name}` has the wrong token"),
         )),
     }
 }
@@ -621,9 +621,9 @@ fn client_error(ns: &str, status: StatusCode, message: &str) -> Response {
 fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response {
     let status_code = status.as_u16();
     if status.is_server_error() {
-        error!(%ns, status = status_code, %message, "リクエストを処理できません");
+        error!(%ns, status = status_code, %message, "cannot process the request");
     } else {
-        warn!(%ns, status = status_code, %message, "リクエストを断りました");
+        warn!(%ns, status = status_code, %message, "refused the request");
     }
 
     json_utf8((
@@ -1519,7 +1519,7 @@ routes = ["a"]
         let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
         let broken = text
             .lines()
-            .find(|l| l.contains("転送が途切れました"))
+            .find(|l| l.contains("the transfer broke off"))
             .unwrap_or_else(|| panic!("途切れた記録が無い:\n{text}"));
         assert!(broken.contains("bytes="), "どこまで流したか: {broken}");
         assert!(broken.contains("elapsed_ms="), "かかった時間: {broken}");
@@ -1536,7 +1536,8 @@ routes = ["a"]
             .unwrap_or_else(|| panic!("番号が振られていない: {broken}"));
         assert!(
             text.lines()
-                .any(|l| l.contains("ヘッダを受け取りました") && l.contains(&format!("req={req}"))),
+                .any(|l| l.contains("received upstream headers")
+                    && l.contains(&format!("req={req}"))),
             "開始と終了が同じ番号で対になる (req={req}):\n{text}"
         );
     }
@@ -1586,7 +1587,7 @@ routes = ["a"]
         let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
         let refused = text
             .lines()
-            .find(|l| l.contains("リクエストを断りました") && l.contains("no-such-model"))
+            .find(|l| l.contains("refused the request") && l.contains("no-such-model"))
             .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
         assert!(
             refused.contains("ns=default"),
@@ -2270,7 +2271,7 @@ auth_token = "secret-token"
         let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
         let refused = text
             .lines()
-            .find(|l| l.contains("リクエストを断りました") && l.contains("ns=locked"))
+            .find(|l| l.contains("refused the request") && l.contains("ns=locked"))
             .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
         assert!(refused.contains("status=401"), "何を返したか: {refused}");
         assert!(
@@ -2336,7 +2337,7 @@ auth_token = "secret-token"
 
         let message: Value = refused.json().await.unwrap();
         let message = message["error"]["message"].as_str().unwrap();
-        assert!(message.contains("トークンが違います"), "{message}");
+        assert!(message.contains("wrong token"), "{message}");
         assert!(
             message.contains("locked"),
             "どの namespace か分かる: {message}"

@@ -26,15 +26,14 @@ impl Auth for ChatGptBearer {
     ) -> Result<()> {
         let credential = credential.ok_or_else(|| Error::Credential {
             id: self.route.clone(),
-            reason: "ChatGPT の認証情報が渡されていません".to_owned(),
+            reason: "no ChatGPT credential was provided".to_owned(),
         })?;
         let account_id = credential
             .account_id
             .as_deref()
             .ok_or_else(|| Error::Credential {
                 id: credential.id.to_string(),
-                reason: "ChatGPT のアカウント識別子がありません。login をやり直してください"
-                    .to_owned(),
+                reason: "no ChatGPT account identifier; log in again".to_owned(),
             })?;
         request.headers.set("authorization", credential.bearer());
         request.headers.set("chatgpt-account-id", account_id);
@@ -77,6 +76,6 @@ mod tests {
         let error = ChatGptBearer::new("codex")
             .authorize(Some(&Credential::for_test("tok")), &mut request())
             .unwrap_err();
-        assert!(error.to_string().contains("login"), "{error}");
+        assert!(error.to_string().contains("log in again"), "{error}");
     }
 }

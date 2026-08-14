@@ -219,7 +219,7 @@ impl QuotaStore {
         {
             Ok(saved) => saved,
             Err(e) => {
-                tracing::warn!(path = %path.display(), %e, "利用状況を読めません");
+                tracing::warn!(path = %path.display(), %e, "cannot read usage");
                 return;
             }
         };
@@ -232,7 +232,7 @@ impl QuotaStore {
             .into_iter()
             .map(|(name, snapshot)| (CredentialId::new(name), snapshot))
             .collect();
-        tracing::info!(credentials, "利用状況を読み戻しました");
+        tracing::info!(credentials, "loaded usage from disk");
     }
 
     /// 観測があればディスクへ落とす。無ければ何もしない。

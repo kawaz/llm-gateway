@@ -159,10 +159,10 @@ impl<P: Persistence> Gateway<P> {
     /// 落とし損なっても止めない — 次の周回で書き直される。
     pub async fn save(&self) {
         if let Err(e) = self.stats.flush() {
-            tracing::warn!(%e, "日次集計を保存できません");
+            tracing::warn!(%e, "cannot save daily totals");
         }
         if let Err(e) = self.usage.save().await {
-            tracing::warn!(%e, "利用状況を保存できません");
+            tracing::warn!(%e, "cannot save usage");
         }
     }
 
@@ -345,7 +345,7 @@ impl<P: Persistence> Gateway<P> {
                     denial,
                     client_error,
                 }) => {
-                    warn!(model = %model, route = route.name(), %reason, "経路を切り替えます");
+                    warn!(model = %model, route = route.name(), %reason, "switching routes");
                     attempts.push(UpstreamAttempt {
                         provider: route.name().to_owned(),
                         reason,
@@ -354,7 +354,7 @@ impl<P: Persistence> Gateway<P> {
                         let (resp, body) = match egress::buffer(resp).await {
                             Ok(buffered) => buffered,
                             Err(error) => {
-                                warn!(route = route.name(), %error, "断られた応答本文を読めません");
+                                warn!(route = route.name(), %error, "cannot read the refused response body");
                                 continue;
                             }
                         };
@@ -488,7 +488,7 @@ impl<P: Persistence> Gateway<P> {
         {
             // 覚えられなくても転送は続ける。次も同じ失敗を 1 回踏むだけで、
             // ここで諦めるとクライアントには何も返らない。
-            warn!(credential = %id, %e, "拒否されたフラグを保存できません");
+            warn!(credential = %id, %e, "cannot save the denied flag");
         }
 
         let mut retrying = Headers::new(headers.to_vec());
@@ -669,7 +669,7 @@ impl<P: Persistence> Gateway<P> {
                     spent.output_tokens += output;
                 }
                 Err(reason) => {
-                    warn!(route = %name, credential = %id, %reason, "利用状況を取りに行けません");
+                    warn!(route = %name, credential = %id, %reason, "cannot fetch usage");
                     errors.insert(name.to_owned(), reason);
                 }
             }
@@ -691,7 +691,7 @@ impl<P: Persistence> Gateway<P> {
         let credential = match self.credentials.acquire(id).await {
             Ok(credential) => credential,
             Err(e) => {
-                warn!(credential = %id, %e, "枠を聞くための認証情報を用意できません");
+                warn!(credential = %id, %e, "cannot prepare credentials to query the quota");
                 return None;
             }
         };
@@ -750,7 +750,7 @@ impl<P: Persistence> Gateway<P> {
             let credential = match credentials.acquire(&id).await {
                 Ok(credential) => credential,
                 Err(e) => {
-                    warn!(credential = %id, %e, "枠を聞くための認証情報を用意できません");
+                    warn!(credential = %id, %e, "cannot prepare credentials to query the quota");
                     return;
                 }
             };
