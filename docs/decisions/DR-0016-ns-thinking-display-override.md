@@ -27,6 +27,16 @@ subscription OAuth 経由でも server が `display` を尊重することは実
     (adaptive は 5 系の推奨形。thinking を持たない旧モデルは ns filter で
     既に隠しているため副作用は実質ない)
 - 未設定の ns は従来どおり無改変で透過 (デフォルト挙動の変更はしない)
+- **非互換リクエストには一切触らない** (2026-08-14 追加、実障害起点):
+  - **assistant prefill** (messages 末尾が assistant): thinking と全面非互換
+    (公式 docs「You can't pre-fill the assistant response while thinking is
+    on」)。Claude Code の権限判定 classifier が prefill を使っており、初版の
+    無条件注入で classifier が全滅した (実測 2026-08-14 00:15-00:41Z、設定
+    revert で即回復)
+  - **forced tool_choice** (`type: "any"` / `"tool"`): manual thinking
+    (`enabled`) と非互換。adaptive は公式には対応だが、判定を分岐する価値が
+    ない (forced tool 応答に見せる思考は無い) ため一律スキップ
+  - `thinking.type: "disabled"` の明示指定: クライアントの意図を尊重
 - 適用は provider を問わず ingress の正規形 (Anthropic Messages 形) に対して
   行う。OpenAI preset は変換時に thinking を Responses の reasoning へ写す
   既存経路のままで、display は Anthropic 固有フィールドとして変換で落ちる

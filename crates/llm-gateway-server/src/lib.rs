@@ -237,6 +237,32 @@ fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config:
     let Some(body) = body.as_object_mut() else {
         return;
     };
+    let type_of = |value: Option<&Value>| {
+        value
+            .and_then(|v| v.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    if matches!(
+        type_of(body.get("tool_choice")).as_deref(),
+        Some("any" | "tool")
+    ) || type_of(body.get("thinking")).as_deref() == Some("disabled")
+    {
+        return;
+    }
+    // assistant prefill (末尾が assistant メッセージ) は thinking と全面非互換
+    // (公式 docs: You can't pre-fill the assistant response while thinking is on)。
+    // 権限判定 classifier 等が使うため、触ると 400 で全滅する (実測 2026-08-14)。
+    if body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|m| m.last())
+        .and_then(|m| m.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        return;
+    }
 
     match body.get_mut("thinking") {
         Some(Value::Object(thinking)) => {
@@ -934,6 +960,113 @@ routes = ["a"]
                 "{expected}"
             );
         }
+    }
+
+    /// assistant prefill (末尾 assistant) は thinking と全面非互換のため、
+    /// thinking の有無を問わず request 全体を変えない。
+    #[test]
+    fn assistant_prefill_leaves_request_unchanged() {
+        for thinking in [
+            None,
+            Some(json!({"type": "enabled", "budget_tokens": 1024})),
+        ] {
+            let mut original = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "classify this"},
+                    {"role": "assistant", "content": "{\"answer\":"},
+                ],
+            });
+            if let Some(thinking) = thinking {
+                original["thinking"] = thinking;
+            }
+            let mut body = original.clone();
+
+            apply_thinking_display(
+                &mut body,
+                Some(llm_gateway::config::ThinkingDisplay::Summarized),
+            );
+
+            assert_eq!(body, original);
+        }
+    }
+
+    /// forced tool choice は実運用の接続先で thinking と同時指定すると 400 になる。
+    /// `any` / `tool` のどちらも、thinking の有無を問わず request 全体を変えない。
+    #[test]
+    fn forced_tool_choice_leaves_request_unchanged() {
+        for tool_choice in [
+            json!({"type": "any"}),
+            json!({"type": "tool", "name": "classify"}),
+        ] {
+            for thinking in [
+                None,
+                Some(json!({"type": "enabled", "budget_tokens": 1024})),
+            ] {
+                let mut original = json!({
+                    "model": "m",
+                    "messages": [],
+                    "tool_choice": tool_choice,
+                });
+                if let Some(thinking) = thinking {
+                    original["thinking"] = thinking;
+                }
+                let mut body = original.clone();
+
+                apply_thinking_display(
+                    &mut body,
+                    Some(llm_gateway::config::ThinkingDisplay::Summarized),
+                );
+
+                assert_eq!(body, original);
+            }
+        }
+    }
+
+    /// `auto` / `none` / 未指定は tool use を強制しないため、通常の表示方針を
+    /// 適用する。tool_choice の値自体は保持する。
+    #[test]
+    fn non_forced_tool_choice_applies_display() {
+        for tool_choice in [
+            None,
+            Some(json!({"type": "auto"})),
+            Some(json!({"type": "none"})),
+        ] {
+            let mut body = json!({"model": "m", "messages": []});
+            if let Some(tool_choice) = tool_choice.clone() {
+                body["tool_choice"] = tool_choice;
+            }
+
+            apply_thinking_display(
+                &mut body,
+                Some(llm_gateway::config::ThinkingDisplay::Summarized),
+            );
+
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "adaptive", "display": "summarized"})
+            );
+            assert_eq!(body.get("tool_choice"), tool_choice.as_ref());
+        }
+    }
+
+    /// `display` は disabled thinking では API 上無効なので、クライアントが
+    /// 明示的に思考を止めた request は一切変えない。
+    #[test]
+    fn disabled_thinking_leaves_request_unchanged() {
+        let original = json!({
+            "model": "m",
+            "messages": [],
+            "thinking": {"type": "disabled"},
+        });
+        let mut body = original.clone();
+
+        apply_thinking_display(
+            &mut body,
+            Some(llm_gateway::config::ThinkingDisplay::Summarized),
+        );
+
+        assert_eq!(body, original);
     }
 
     /// namespace が表示方針を持たなければ、透過 proxy の既定として request の
