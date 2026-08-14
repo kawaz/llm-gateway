@@ -28,6 +28,7 @@ use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Route, Router, Selection};
 use crate::session;
 use crate::stats::{self, Stats};
+use crate::tap::Tap;
 use crate::{Error, Result};
 
 pub struct Gateway<P: Persistence> {
@@ -43,6 +44,7 @@ pub struct Gateway<P: Persistence> {
     ///
     /// router も同じ口を持つ (自前で返す 429 を流すため)。
     events: Arc<Events>,
+    tap: Arc<Tap>,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -82,6 +84,7 @@ impl<P: Persistence> Gateway<P> {
 
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
+        let tap = Arc::new(Tap::new());
 
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
@@ -101,6 +104,7 @@ impl<P: Persistence> Gateway<P> {
                 &config.server.listen,
             )),
             events,
+            tap,
         })
     }
 
@@ -125,6 +129,11 @@ impl<P: Persistence> Gateway<P> {
     /// 配信の口 (`/llm-gateway/events`) がここを見る。
     pub fn events(&self) -> &Arc<Events> {
         &self.events
+    }
+
+    /// 購読中だけ転送の詳細を流すデバッグ用 tap。
+    pub fn tap(&self) -> &Arc<Tap> {
+        &self.tap
     }
 
     /// 前回落とした分を読み戻す。待ち受けを始める前に 1 回だけ呼ぶ。
@@ -282,6 +291,7 @@ impl<P: Persistence> Gateway<P> {
                 return Ok(Forwarded {
                     response,
                     credential: None,
+                    route: "router".to_owned(),
                     model,
                     // 自前で組んだ断りなので、消費したトークンは無い。
                     usage: None,
@@ -297,6 +307,7 @@ impl<P: Persistence> Gateway<P> {
         let mut denied: Option<(
             Response,
             Option<CredentialId>,
+            String,
             Option<crate::provider::ClientError>,
         )> = None;
         for route in &routes {
@@ -324,6 +335,7 @@ impl<P: Persistence> Gateway<P> {
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
+                        route: route.name().to_owned(),
                         model,
                         usage,
                     });
@@ -377,6 +389,7 @@ impl<P: Persistence> Gateway<P> {
                         denied = Some((
                             resp,
                             route.credential.clone(),
+                            route.name().to_owned(),
                             client_error.map(|error| *error),
                         ));
                     }
@@ -387,7 +400,7 @@ impl<P: Persistence> Gateway<P> {
         // 断られた応答を見ていたなら、最後のものをそのまま返す。こちらで
         // 別の状態に置き換えると、`retry-after` のようなクライアントが次の
         // 一手を決める手掛かりまで消える。
-        if let Some((resp, credential, client_error)) = denied {
+        if let Some((resp, credential, route, client_error)) = denied {
             let resp = match client_error {
                 Some(error) => client_error_response(resp, error)?,
                 None => resp,
@@ -401,6 +414,7 @@ impl<P: Persistence> Gateway<P> {
             return Ok(Forwarded {
                 response: resp,
                 credential,
+                route,
                 model,
                 // 断られた応答に usage は載らない (DR-0011)。
                 usage: None,
@@ -864,6 +878,8 @@ pub struct Forwarded {
     /// この応答を出した credential。relay 型のように認証情報を持たない経路は
     /// `None`。
     pub credential: Option<CredentialId>,
+    /// この応答を出した経路名。
+    pub route: String,
     /// 解決後の実モデル名。短い名前 (`opus`) はここでは解決済み。
     pub model: String,
     /// この応答の本文から usage を読む役。集計しない応答では `None`。
@@ -878,6 +894,7 @@ impl std::fmt::Debug for Forwarded {
         f.debug_struct("Forwarded")
             .field("response", &self.response)
             .field("credential", &self.credential)
+            .field("route", &self.route)
             .field("model", &self.model)
             .field("usage", &self.usage.is_some())
             .finish()
