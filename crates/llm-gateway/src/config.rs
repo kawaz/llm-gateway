@@ -147,6 +147,27 @@ pub struct Namespace {
     /// 面ごとに upstream を分けたいときに絞る。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<String>,
+
+    /// Messages API の思考表示方法を強制する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<ThinkingDisplay>,
+}
+
+/// Messages API の思考表示方法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarized => "summarized",
+            Self::Omitted => "omitted",
+        }
+    }
 }
 
 /// 公開するモデルの絞り込み。
@@ -839,6 +860,31 @@ o = "claude-opus-*"
     pub(super) fn ns(c: &Config) -> &Namespace {
         c.namespace(DEFAULT_NAMESPACE)
             .expect("この設定には [ns.default] がある")
+    }
+
+    /// `thinking_display` は API が受け付ける 2 値だけを設定できる。
+    ///
+    /// 文字列のまま保持せず列挙型に閉じることで、不正値を起動前の設定解析で弾く。
+    #[test]
+    fn thinking_display_accepts_only_supported_values() {
+        for (raw, expected) in [
+            ("summarized", ThinkingDisplay::Summarized),
+            ("omitted", ThinkingDisplay::Omitted),
+        ] {
+            let config = parse(&format!("[ns.default]\nthinking_display = \"{raw}\"\n"))
+                .unwrap_or_else(|e| panic!("{raw} は有効: {e}"));
+            assert_eq!(ns(&config).thinking_display, Some(expected), "{raw}");
+        }
+
+        let error = parse("[ns.default]\nthinking_display = \"visible\"\n")
+            .expect_err("列挙外の値は設定エラー");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant `visible`"), "{message}");
+        assert!(
+            message.contains("summarized"),
+            "許可値を案内する: {message}"
+        );
+        assert!(message.contains("omitted"), "許可値を案内する: {message}");
     }
 
     /// `auth_token` を書かない namespace は、名乗り方に関わらず誰でも通す。

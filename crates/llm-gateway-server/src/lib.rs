@@ -229,6 +229,32 @@ fn upstream_path(path: &str) -> &str {
     }
 }
 
+/// namespace の方針を Messages 形式の正規形へ反映する。
+fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config::ThinkingDisplay>) {
+    let Some(display) = display else {
+        return;
+    };
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+
+    match body.get_mut("thinking") {
+        Some(Value::Object(thinking)) => {
+            thinking.insert(
+                "display".to_owned(),
+                Value::String(display.as_str().to_owned()),
+            );
+        }
+        Some(_) => {}
+        None => {
+            body.insert(
+                "thinking".to_owned(),
+                json!({"type": "adaptive", "display": display.as_str()}),
+            );
+        }
+    }
+}
+
 /// upstream へ渡して、返ってきたものをそのまま返す。
 async fn messages<P: Persistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
@@ -276,7 +302,7 @@ async fn messages<P: Persistence + 'static>(
     // プロキシが chunked で渡してくると付かないが、こちらは必ず取れる。
     exchange::record_request_body(&span, bytes.len(), receiving.elapsed());
 
-    let json: Value = match serde_json::from_slice(&bytes) {
+    let mut json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
             return span.in_scope(|| {
@@ -296,6 +322,7 @@ async fn messages<P: Persistence + 'static>(
     if let Some(denied) = span.in_scope(|| rejection(ns, &ns_name, &parts.headers)) {
         return denied;
     }
+    apply_thinking_display(&mut json, ns.thinking_display);
 
     let path = upstream_path(uri.path()).to_owned();
     let query = uri.query().map(str::to_owned);
@@ -861,6 +888,119 @@ routes = ["a"]
         assert!(
             event.get("prefix").is_none(),
             "system を積んでいないので系列も分からない"
+        );
+    }
+
+    /// 設定された namespace では、クライアントが指定した思考形式を保ちつつ
+    /// 表示方法だけを namespace の方針で上書きする。
+    #[test]
+    fn configured_display_overrides_existing_thinking_object() {
+        let mut body = json!({
+            "model": "m",
+            "messages": [],
+            "thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"},
+        });
+
+        apply_thinking_display(
+            &mut body,
+            Some(llm_gateway::config::ThinkingDisplay::Summarized),
+        );
+
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"}),
+            "display 以外のクライアント指定は保持する"
+        );
+    }
+
+    /// 思考指定が無い request に表示方針を適用する場合は、5 系で推奨される
+    /// adaptive thinking を補って Messages 正規形を完成させる。
+    #[test]
+    fn configured_display_injects_adaptive_thinking_when_absent() {
+        for (display, expected) in [
+            (
+                llm_gateway::config::ThinkingDisplay::Summarized,
+                "summarized",
+            ),
+            (llm_gateway::config::ThinkingDisplay::Omitted, "omitted"),
+        ] {
+            let mut body = json!({"model": "m", "messages": []});
+
+            apply_thinking_display(&mut body, Some(display));
+
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "adaptive", "display": expected}),
+                "{expected}"
+            );
+        }
+    }
+
+    /// namespace が表示方針を持たなければ、透過 proxy の既定として request の
+    /// JSON 値を一切変えない。thinking の有無の両方で同じ契約になる。
+    #[test]
+    fn unconfigured_display_leaves_request_unchanged() {
+        for original in [
+            json!({"model": "m", "messages": []}),
+            json!({
+                "model": "m",
+                "messages": [],
+                "thinking": {"type": "enabled", "display": "omitted"},
+            }),
+        ] {
+            let mut body = original.clone();
+
+            apply_thinking_display(&mut body, None);
+
+            assert_eq!(body, original);
+        }
+    }
+
+    /// namespace の表示方針は、認証と namespace 解決を通った実際の Messages
+    /// ingress で適用し、provider 変換へ渡す正規形に載せる。
+    #[tokio::test]
+    async fn configured_display_reaches_upstream_through_messages_ingress() {
+        let (upstream, seen) = recording_upstream().await;
+        let base = serve(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[ns.default]
+auth_token = "{TOKEN}"
+thinking_display = "summarized"
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await;
+
+        let response = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let requests = seen.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.starts_with("POST /v1/messages"))
+            .expect("Messages request が upstream に届く");
+        let (_, raw_body) = request
+            .split_once("\r\n\r\n")
+            .expect("HTTP header と body が分かれる");
+        let body: Value = serde_json::from_str(raw_body).expect("upstream body は JSON");
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
         );
     }
 
