@@ -12,7 +12,10 @@
 
 ## 決定
 
-- **`GET /llm-gateway/tap`** を追加。SSE で 1 exchange = 1 JSON 行を流す
+- **`GET /llm-gateway/tap`** を追加。素の JSONL (application/x-ndjson) で
+  1 exchange = 1 JSON 行を流す。SSE にしない — dump をそのままパースできる
+  形が用途の本体で、`data:` 枠は邪魔なだけ (events (DR-0012) はブラウザ
+  EventSource 消費者がいるので SSE のまま、こちらは curl 前提)
 - **subscriber が 0 なら一切の追加コストを発生させない** (atomic な購読数で
   gate し、シリアライズ自体をスキップ)。複数 subscriber には全員に配る
   (broadcast)。遅れた subscriber はバッファを溢れさせず切断する
