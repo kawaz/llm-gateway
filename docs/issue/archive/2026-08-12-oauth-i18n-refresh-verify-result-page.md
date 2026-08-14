@@ -1,6 +1,6 @@
 ---
 title: oauth ログインフローの日本語文言残り (DR-0008 続き)
-status: open
+status: resolved
 category: task
 created: 2026-08-12T12:01:39+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-14T16:08:35+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented", "dr/DR-0008"]
 blocked_by:
 origin: 自リポ TODO
 ---
