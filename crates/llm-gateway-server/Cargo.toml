@@ -13,7 +13,7 @@ name = "llm_gateway_server"
 path = "src/lib.rs"
 
 [dependencies]
-llm-gateway = { path = "../llm-gateway", version = "0.20" }
+llm-gateway = { path = "../llm-gateway", version = "0.21" }
 
 axum = { workspace = true }
 tokio = { workspace = true }
