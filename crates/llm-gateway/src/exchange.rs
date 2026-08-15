@@ -435,19 +435,19 @@ mod tests {
     fn field(line: &str, name: &str) -> u128 {
         let rest = line
             .split_once(&format!("{name}="))
-            .unwrap_or_else(|| panic!("{name} が無い: {line}"))
+            .unwrap_or_else(|| panic!("{name} is missing: {line}"))
             .1;
         rest.split(|c: char| !c.is_ascii_digit())
             .next()
             .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("{name} が数値でない: {line}"))
+            .unwrap_or_else(|| panic!("{name} is not a number: {line}"))
     }
 
     /// 終端の行を 1 つ取り出す。
     fn line_with<'a>(logs: &'a str, needle: &str) -> &'a str {
         logs.lines()
             .find(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("`{needle}` の行が無い:\n{logs}"))
+            .unwrap_or_else(|| panic!("no line containing `{needle}`:\n{logs}"))
     }
 
     /// 最後まで流れたら、バイト数と一緒に残る。
@@ -467,9 +467,9 @@ mod tests {
         assert!(logs.contains("finished transferring the body"), "{logs}");
         assert!(
             logs.contains("bytes=30"),
-            "転送したバイト数が分かる: {logs}"
+            "the forwarded byte count is known: {logs}"
         );
-        assert!(logs.contains("elapsed_ms="), "かかった時間が分かる: {logs}");
+        assert!(logs.contains("elapsed_ms="), "the elapsed time is known: {logs}");
     }
 
     /// 受け取った本文の大きさと、受け取りにかかった時間が残る。
@@ -483,11 +483,11 @@ mod tests {
         assert!(logs.contains("received request body"), "{logs}");
         assert!(
             logs.contains("body_bytes=1300000"),
-            "どれだけ受け取ったか: {logs}"
+            "how much was received: {logs}"
         );
         assert!(
             logs.contains("elapsed_ms=42"),
-            "受け取りにかかった時間が分かる: {logs}"
+            "the time spent receiving is known: {logs}"
         );
     }
 
@@ -521,7 +521,7 @@ mod tests {
         let end = logs
             .lines()
             .find(|l| l.contains("finished transferring the body"))
-            .unwrap_or_else(|| panic!("終端の記録が無い:\n{logs}"));
+            .unwrap_or_else(|| panic!("no record of the end:\n{logs}"));
         assert!(end.contains("body_bytes=512"), "{end}");
     }
 
@@ -545,7 +545,7 @@ mod tests {
             .lines()
             .filter(|l| l.contains("sent the first chunk"))
             .collect();
-        assert_eq!(first.len(), 1, "残すのは最初の 1 回だけ: {logs}");
+        assert_eq!(first.len(), 1, "only the first one is kept: {logs}");
         assert!(first[0].contains("elapsed_ms="), "{}", first[0]);
     }
 
@@ -592,11 +592,11 @@ mod tests {
 
         let end = line_with(&logs, "finished transferring the body");
         let gap = field(end, "max_gap_ms");
-        assert!(gap >= 60, "最長の無音を拾う (80ms 空けた): {end}");
+        assert!(gap >= 60, "picks up the longest silence (80ms gap): {end}");
 
         // 3 つ目の前で詰まったので、無音の始まりは 1 つ目と 2 つ目の分だけ後。
         let at = field(end, "max_gap_at_ms");
-        assert!(at < gap, "詰まったのが序盤だと分かる (at={at}, gap={gap})");
+        assert!(at < gap, "the stall is known to be early on (at={at}, gap={gap})");
     }
 
     /// 流れている途中で黙り込んだまま切られたら、その無音が残る。
@@ -618,7 +618,7 @@ mod tests {
         let aborted = line_with(&logs, "the transfer was aborted");
         assert!(
             field(aborted, "max_gap_ms") >= 60,
-            "去る直前の無音が残る: {aborted}"
+            "the silence right before leaving is recorded: {aborted}"
         );
     }
 
@@ -665,9 +665,9 @@ mod tests {
         assert!(logs.contains("the transfer broke off"), "{logs}");
         assert!(
             logs.contains("response reading was interrupted"),
-            "何が起きたか: {logs}"
+            "what happened: {logs}"
         );
-        assert!(logs.contains("bytes=9"), "どこまで流したか: {logs}");
+        assert!(logs.contains("bytes=9"), "how far it streamed: {logs}");
     }
 
     /// 終端まで読まれずに捨てられたら、中断として残る。
@@ -687,7 +687,7 @@ mod tests {
         });
 
         assert!(logs.contains("the transfer was aborted"), "{logs}");
-        assert!(logs.contains("bytes=9"), "どこまで流したか: {logs}");
+        assert!(logs.contains("bytes=9"), "how far it streamed: {logs}");
     }
 
     /// 終端まで流したものを捨てても、中断にはしない。
@@ -717,7 +717,7 @@ mod tests {
             .filter_map(|l| l.split_once("req=").map(|(_, rest)| rest))
             .collect();
         assert_eq!(numbers.len(), 2, "{logs}");
-        assert_ne!(numbers[0], numbers[1], "番号が使い回されない: {logs}");
+        assert_ne!(numbers[0], numbers[1], "the number is not reused: {logs}");
     }
 
     // ---------- usage の抽出 ----------
@@ -763,7 +763,7 @@ mod tests {
 
     /// 積んだ input トークン数。1 日分・1 行分しか無い前提で読む。
     fn only_entry_input(counts: &ByDate) -> u64 {
-        counts.values().next().expect("1 日分")["a"]["m"]
+        counts.values().next().expect("one day's worth")["a"]["m"]
             .tokens
             .get(&TokenKind::input())
             .unwrap_or(0)
@@ -801,11 +801,11 @@ mod tests {
 
         let out = drain(chunks, counter(), &stats).await;
 
-        assert_eq!(out, body, "1 バイトも変えない");
+        assert_eq!(out, body, "not a single byte is changed");
         assert_eq!(
             only_entry_input(&stats.in_memory()),
             body.len() as u64,
-            "全チャンクが役へ届く"
+            "every chunk reaches the sink"
         );
     }
 
@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(
             only_entry_input(&stats.in_memory()),
             5,
-            "そこまでに見えた分だけ"
+            "only what was seen up to that point"
         );
     }
 
@@ -870,9 +870,9 @@ mod tests {
         let _ = drain(vec![b"1234".to_vec()], counter(), &stats).await;
 
         let counts = stats.in_memory();
-        let day = counts.values().next().expect("1 日分");
+        let day = counts.values().next().expect("one day's worth");
         assert_eq!(day["a"]["m"].requests, 1);
-        assert_eq!(only_entry_input(&counts), 4, "2 倍になっていない");
+        assert_eq!(only_entry_input(&counts), 4, "not doubled");
     }
 
     /// upstream が途切れても、そこまでの分は残り、誤りは下流へ伝わる。
@@ -902,7 +902,7 @@ mod tests {
             }
         }
 
-        assert!(saw_error, "誤りを飲み込まない");
+        assert!(saw_error, "the error is not swallowed");
         assert_eq!(only_entry_input(&stats.in_memory()), 3);
     }
 
@@ -924,14 +924,14 @@ mod tests {
         }
 
         let counts = stats.in_memory();
-        let day = counts.values().next().expect("1 日分");
+        let day = counts.values().next().expect("one day's worth");
         assert_eq!(
             day[crate::stats::NO_CREDENTIAL]["claude-opus-5"]
                 .tokens
                 .get(&TokenKind::input())
                 .unwrap_or(0),
             2,
-            "認証情報を持たない経路は予約名で入る"
+            "a route without a credential is recorded under the reserved name"
         );
     }
 }

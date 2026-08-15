@@ -238,7 +238,7 @@ impl Router {
         info!(
             credentials = by_route.len(),
             models = total,
-            "モデル一覧を更新しました"
+            "updated model catalog"
         );
         *self.catalog.write().await = Catalog { by_route };
     }
@@ -256,7 +256,7 @@ impl Router {
     ) -> Result<BTreeMap<String, String>> {
         let credential_name = route.credential.as_deref().ok_or_else(|| {
             Error::Config(format!(
-                "route `{name}` には discovery 用 credential がありません"
+                "route `{name}` has no discovery credential"
             ))
         })?;
         let credential = credentials
@@ -418,7 +418,7 @@ impl Router {
             model = %model,
             routes = routes.len(),
             seconds = until - now,
-            "どの経路も断られています。開く時刻を伝えて返します"
+            "every route is denied; returning the time it reopens"
         );
         self.events.publish(events::Event::new(now, origin, 429));
         Selection::AllDenied {
@@ -708,7 +708,7 @@ routes = ["bedrock", "oauth-a"]
 
     /// 既定の namespace。
     fn ns(r: &Router) -> &Namespace {
-        r.config.namespace(NS).expect("既定は必ずある")
+        r.config.namespace(NS).expect("the default always exists")
     }
 
     fn session(name: &str) -> SessionKey {
@@ -836,7 +836,7 @@ routes = ["bedrock", "oauth-a"]
         assert_eq!(
             names(&got),
             vec!["oauth-a"],
-            "oauth-b は haiku を除外している"
+            "oauth-b excludes haiku"
         );
     }
 
@@ -865,9 +865,9 @@ routes = ["bedrock", "oauth-a"]
         assert_eq!(
             routes[0].upstream_model.as_deref(),
             Some("anthropic.claude-fable-5"),
-            "Bedrock は名前空間つき"
+            "Bedrock is namespaced"
         );
-        assert_eq!(routes[1].upstream_model, None, "公式はそのまま");
+        assert_eq!(routes[1].upstream_model, None, "official stays as-is");
     }
 
     /// 経路は設定 1 件につき 1 つの preset を共有する。
@@ -889,7 +889,7 @@ routes = ["bedrock", "oauth-a"]
 
         assert!(
             Arc::ptr_eq(&first[0].preset, &again[0].preset),
-            "同じ実体を配る"
+            "hands out the same instance"
         );
         // 別のモデルで引いた経路も、同じ credential なら同じ preset。
         let other_model = r
@@ -911,7 +911,7 @@ routes = ["bedrock", "oauth-a"]
         routes[0]
             .preset
             .reject(429, &Headers::default(), None, "claude-fable-5", NOW)
-            .expect("429 は締め出す");
+            .expect("429 is denied");
 
         let again = r
             .routes_for(ns(&r), NS, "claude-fable-5", &s)
@@ -938,7 +938,7 @@ routes = ["bedrock", "oauth-a"]
         let Selection::Ready(ready) =
             r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
         else {
-            panic!("1 本は残る");
+            panic!("one should remain");
         };
         assert_eq!(names(&ready), vec!["oauth-a"]);
     }
@@ -956,17 +956,17 @@ routes = ["bedrock", "oauth-a"]
             route
                 .preset
                 .reject(429, &Headers::default(), None, model, NOW)
-                .expect("429 は締め出す");
+                .expect("429 is denied");
         }
 
         let Selection::AllDenied { response, until } =
             r.select(&routes, model, NOW, &origin(model))
         else {
-            panic!("全滅のはず");
+            panic!("should be all denied");
         };
 
         assert_eq!(response.status, 429);
-        assert_eq!(until, NOW + 60, "最初に開く時刻");
+        assert_eq!(until, NOW + 60, "the earliest reopen time");
         assert_eq!(response.headers.get("retry-after"), Some("60"));
         assert_eq!(
             response.headers.get("content-type"),
@@ -984,7 +984,7 @@ routes = ["bedrock", "oauth-a"]
             String::from_utf8(body)
                 .unwrap()
                 .contains("rate_limit_error"),
-            "クライアントが読む形で返す"
+            "returned in a shape the client can read"
         );
     }
 
@@ -1016,7 +1016,7 @@ routes = ["bedrock", "oauth-a"]
         assert_eq!(
             event.credential,
             crate::stats::NO_CREDENTIAL,
-            "答えたのは gateway 自身で、どの credential でもない"
+            "the gateway itself answered, not any credential"
         );
     }
 
@@ -1089,7 +1089,7 @@ routes = ["bedrock", "oauth-a"]
             .await
             .unwrap();
         assert_eq!(names(&again), vec!["oauth-a", "bedrock"]);
-        assert_eq!(again.len(), 2, "候補は減らさない");
+        assert_eq!(again.len(), 2, "candidates are not reduced");
     }
 
     /// 前回通った経路を先頭へ寄せても、残りは設定の優先順のまま。
@@ -1115,7 +1115,7 @@ routes = ["bedrock", "oauth-a"]
                     .unwrap()
             ),
             vec!["oauth-b", "bedrock", "oauth-a"],
-            "寄せた 1 本以外は動かさない"
+            "only the pinned one is affected"
         );
     }
 
@@ -1137,12 +1137,12 @@ routes = ["bedrock", "oauth-a"]
                     .unwrap()
             ),
             vec!["bedrock", "oauth-a"],
-            "別の会話には効かない"
+            "has no effect on a different conversation"
         );
         assert_eq!(
             names(&r.routes_for(ns(&r), NS, "claude-opus-5", &s).await.unwrap()),
             vec!["oauth-a", "oauth-b"],
-            "別のモデルには効かない"
+            "has no effect on a different model"
         );
     }
 
@@ -1154,7 +1154,7 @@ routes = ["bedrock", "oauth-a"]
     async fn bindings_do_not_cross_namespaces() {
         let r = router().await;
         let s = session("s1");
-        let other = r.config.namespace("other").expect("設定にある");
+        let other = r.config.namespace("other").expect("present in config");
 
         let routes = r
             .routes_for(other, "other", "claude-fable-5", &s)
@@ -1169,7 +1169,7 @@ routes = ["bedrock", "oauth-a"]
                     .unwrap()
             ),
             vec!["oauth-a", "bedrock"],
-            "覚えた面では効く"
+            "applies within the remembered namespace"
         );
         assert_eq!(
             names(
@@ -1178,7 +1178,7 @@ routes = ["bedrock", "oauth-a"]
                     .unwrap()
             ),
             vec!["bedrock", "oauth-a"],
-            "同じ会話の鍵でも、別の面の順は変わらない"
+            "a different namespace's order is unaffected even by the same conversation key"
         );
     }
 
@@ -1216,9 +1216,9 @@ routes = ["bedrock", "oauth-a"]
         assert_eq!(
             r.resolve(ns(&r), "claude-opus").await,
             "claude-opus-5",
-            "一段目"
+            "first hop"
         );
-        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5", "二段目");
+        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5", "second hop");
         assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
         assert_eq!(
             r.resolve(ns(&r), "haiku").await,
@@ -1241,9 +1241,9 @@ routes = ["bedrock", "oauth-a"]
         ]);
 
         let resolved = resolve_aliases(&aliases, &known);
-        assert!(!resolved.contains_key("a"), "循環は落とす");
+        assert!(!resolved.contains_key("a"), "a cycle is dropped");
         assert!(!resolved.contains_key("b"));
-        assert_eq!(resolved["ok"], "claude-opus-5", "他は巻き添えにしない");
+        assert_eq!(resolved["ok"], "claude-opus-5", "others are not caught up in it");
     }
 
     /// どこにも当たらないエイリアスは捨てる (一覧に出さない)。
