@@ -266,9 +266,9 @@ mod tests {
         let opus5 = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
         assert_eq!(
             opus5.upstream_id, "claude-opus-5",
-            "公式は名前をそのまま使う"
+            "official entries use the name as-is"
         );
-        assert!(opus5.created > 0, "created_at から日付が取れる");
+        assert!(opus5.created > 0, "created_at yields a date");
     }
 
     /// Codex catalog は `models` 配列の slug / id を client と upstream の名前に使う。
@@ -304,7 +304,7 @@ mod tests {
         let models = parse(Flavor::Bedrock, BEDROCK_BODY).unwrap();
         assert!(
             !models.iter().any(|m| m.id.contains("gpt")),
-            "OpenAI 系は Anthropic 互換の口では使えない"
+            "OpenAI-family models are unusable through the Anthropic-compatible endpoint"
         );
         assert_eq!(models.len(), 4);
     }
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(
             resolve_alias("claude-opus-*", &models).as_deref(),
             Some("claude-opus-5"),
-            "4-8 や 4-1 ではなく 5"
+            "5, not 4-8 or 4-1"
         );
         assert_eq!(
             resolve_alias("claude-sonnet-*", &models).as_deref(),
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(
             resolve_alias("claude-opus-*", &models).as_deref(),
             Some("claude-opus-6"),
-            "設定を触らずに追随する"
+            "follows along without touching the config"
         );
     }
 
@@ -392,7 +392,7 @@ mod tests {
     fn no_aliases_are_built_in() {
         assert!(
             default_aliases().is_empty(),
-            "コードに既定があると、設定を読んだだけでは何が公開されるか分からない"
+            "with a code default present, reading the config alone doesn't reveal what's exposed"
         );
     }
 

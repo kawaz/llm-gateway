@@ -60,7 +60,7 @@ claude-code-20250219,advisor-tool-2026-03-01";
         let sent = BetaFlags::new(beta::Policy::Passthrough).prepare(&mut sending, &[]);
 
         assert_eq!(sending.get("anthropic-beta"), Some(CLIENT_BETA));
-        assert_eq!(sent.len(), 4, "載せた分を返す: {sent:?}");
+        assert_eq!(sent.len(), 4, "returns what was sent: {sent:?}");
     }
 
     /// 学習済みのフラグは、1 本目から落ちる。
@@ -70,7 +70,7 @@ claude-code-20250219,advisor-tool-2026-03-01";
         let sent = BetaFlags::new(beta::Policy::Passthrough)
             .prepare(&mut sending, &["advisor-tool-2026-03-01".to_owned()]);
 
-        let value = sending.get("anthropic-beta").expect("残るものがある");
+        let value = sending.get("anthropic-beta").expect("something remains");
         assert!(!value.contains("advisor-tool-2026-03-01"), "{value}");
         assert!(value.contains("oauth-2025-04-20"), "{value}");
         assert!(!sent.contains(&"advisor-tool-2026-03-01".to_owned()));
@@ -83,10 +83,10 @@ claude-code-20250219,advisor-tool-2026-03-01";
         BetaFlags::new(beta::Policy::bedrock())
             .prepare(&mut sending, &["claude-code-20250219".to_owned()]);
 
-        let value = sending.get("anthropic-beta").expect("残るものがある");
+        let value = sending.get("anthropic-beta").expect("something remains");
         assert_eq!(
             value, "interleaved-thinking-2025-05-14",
-            "既定で落ちる分と、覚えた分の両方が落ちる"
+            "both the default-dropped and the learned entries are dropped"
         );
     }
 
@@ -115,7 +115,7 @@ claude-code-20250219,advisor-tool-2026-03-01";
                 r#"{"error":{"message":"unsupported beta: advisor-tool-2026-03-01"}}"#,
                 &sent,
             )
-            .expect("交渉のやり直しを求めている");
+            .expect("requests renegotiation");
 
         assert_eq!(blamed, vec!["advisor-tool-2026-03-01"]);
     }
@@ -129,7 +129,7 @@ claude-code-20250219,advisor-tool-2026-03-01";
         let sent = vec!["a".to_owned(), "b".to_owned()];
         let blamed = BetaFlags::new(beta::Policy::Passthrough)
             .blame(r#"{"error":{"message":"invalid beta flag"}}"#, &sent)
-            .expect("交渉のやり直しを求めている");
+            .expect("requests renegotiation");
 
         assert_eq!(blamed, sent);
     }
@@ -144,7 +144,7 @@ claude-code-20250219,advisor-tool-2026-03-01";
         assert_eq!(
             negotiation.blame(r#"{"error":"invalid beta flag"}"#, &[]),
             None,
-            "載せていないものは責められない"
+            "cannot blame what was not sent"
         );
     }
 }

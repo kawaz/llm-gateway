@@ -384,7 +384,7 @@ impl MessageCollector {
             .entry("content")
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
-            .expect("message content は配列として初期化する")
+            .expect("message content is initialized as an array")
     }
 
     fn message_mut(&mut self) -> &mut serde_json::Map<String, Value> {
@@ -402,7 +402,7 @@ impl MessageCollector {
                 })
             })
             .as_object_mut()
-            .expect("message は object として初期化する")
+            .expect("message is initialized as an object")
     }
 
     fn finish(self) -> Value {
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(
             request.body.as_ptr(),
             body.as_ptr(),
-            "clone は同じ領域を共有する"
+            "clone shares the same buffer"
         );
     }
 
@@ -581,12 +581,12 @@ mod tests {
         assert_eq!(
             resp.headers.get("content-type"),
             Some("application/json"),
-            "ヘッダは失わない"
+            "headers are not lost"
         );
         assert_eq!(
             String::from_utf8(collect_body(resp.body).await.unwrap()).unwrap(),
             r#"{"error":1}"#,
-            "読んだ後でも同じ本文を流せる"
+            "the same body can still be streamed after reading it"
         );
     }
 
@@ -604,7 +604,7 @@ mod tests {
         rewrite_model(&mut body, "vendor.m-1");
 
         assert_eq!(body["model"], "vendor.m-1");
-        assert_eq!(body["max_tokens"], 8, "他の項目は触らない");
+        assert_eq!(body["max_tokens"], 8, "other fields are untouched");
     }
 
     async fn adapted(mode: ResponseMode, chunks: Vec<&'static [u8]>) -> Response {

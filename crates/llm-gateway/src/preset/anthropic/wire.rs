@@ -243,7 +243,7 @@ extended-cache-ttl-2025-04-11";
             "Accept-Encoding",
             "Authorization",
         ] {
-            assert!(!names.contains(&gone), "{gone} は落とす: {names:?}");
+            assert!(!names.contains(&gone), "{gone} should be dropped: {names:?}");
         }
         for kept in [
             "anthropic-version",
@@ -252,12 +252,12 @@ extended-cache-ttl-2025-04-11";
             "User-Agent",
             "x-app",
         ] {
-            assert!(names.contains(&kept), "{kept} は残す: {names:?}");
+            assert!(names.contains(&kept), "{kept} should be kept: {names:?}");
         }
         assert_eq!(
             encoded.upstream.headers.get("anthropic-beta"),
             Some(CLIENT_BETA),
-            "beta の取捨は交渉の担当 (DR-0003)。Wire は触らない"
+            "beta selection is negotiation's job (DR-0003); wire leaves it alone"
         );
     }
 
@@ -293,7 +293,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             names,
             vec!["anthropic-version", "content-type"],
-            "経路情報だけ落として残りは触らない: {names:?}"
+            "drops only route information and leaves the rest alone: {names:?}"
         );
     }
 
@@ -357,7 +357,7 @@ extended-cache-ttl-2025-04-11";
                 .filter(|(key, _)| key.eq_ignore_ascii_case("content-type"))
                 .count(),
             1,
-            "二重に載せない"
+            "not added twice"
         );
     }
 
@@ -374,7 +374,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             official().url_for("/v1/messages", Some("")),
             "https://api.anthropic.com/v1/messages",
-            "空の query は付けない"
+            "an empty query is not appended"
         );
     }
 

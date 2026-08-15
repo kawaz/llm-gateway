@@ -257,9 +257,9 @@ mod tests {
         // 地方時で 2026-07-30T00:00:00 になる瞬間 (= UTC の 07-29T15:00:00)。
         let midnight = parse_rfc3339("2026-07-29T15:00:00Z").unwrap();
 
-        assert_eq!(date_at_offset(midnight - 1, offset), "2026-07-29", "1 秒前");
-        assert_eq!(date_at_offset(midnight, offset), "2026-07-30", "ちょうど");
-        assert_eq!(date_at_offset(midnight + 1, offset), "2026-07-30", "1 秒後");
+        assert_eq!(date_at_offset(midnight - 1, offset), "2026-07-29", "1 second before");
+        assert_eq!(date_at_offset(midnight, offset), "2026-07-30", "exactly at");
+        assert_eq!(date_at_offset(midnight + 1, offset), "2026-07-30", "1 second after");
     }
 
     /// epoch より前 (offset で 1970 年より手前に出る) でも崩れない。
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(
             date_at_offset(parse_rfc3339("2028-02-29T00:00:00Z").unwrap(), 0),
             "2028-02-29",
-            "閏日"
+            "leap day"
         );
     }
 
@@ -296,10 +296,10 @@ mod tests {
         let offset = local_offset(now_unix());
         assert!(
             (-12 * 3600..=14 * 3600).contains(&offset),
-            "offset が地方時の範囲外: {offset}"
+            "offset is outside the range of local timezones: {offset}"
         );
         // 15 分刻みでないタイムゾーンは存在しない。
-        assert_eq!(offset % 900, 0, "15 分の倍数でない: {offset}");
+        assert_eq!(offset % 900, 0, "not a multiple of 15 minutes: {offset}");
     }
 
     /// 地方時の日付が形として読める。
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(
             local,
             date_at_offset(now, local_offset(now)),
-            "実機の offset を通している"
+            "goes through the machine's own offset"
         );
     }
 }
