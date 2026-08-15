@@ -1485,6 +1485,21 @@ spend_down_within = "25%"
         assert_eq!(held.reason, crate::denial::Reason::Paced);
     }
 
+    /// 既定は、使い切りの窓の外でも当然そのまま控える。
+    ///
+    /// 4 象限 (窓の内外 × 解放の有無) の残り 1 つ。解放を書かない経路は
+    /// 窓の位置に関係なく階段のままで、`spend_down_release` はここに何の
+    /// 影響も持たない。
+    #[tokio::test]
+    async fn the_default_is_paced_outside_the_window_too() {
+        let r = router().await;
+        let elapsed = WEEK as i64 - (SPEND_DOWN_WINDOW + 3600);
+        observe_usage(&r, "oauth-a", elapsed, 1.0);
+
+        let route = capped_route(&r, PACED_NS, "oauth-a").await;
+        assert!(route.paced_out(NOW).is_some());
+    }
+
     /// 使い切りの幅を書いていない規則では、解放の合図が来ない。
     #[tokio::test]
     async fn releasing_needs_a_spend_down_window_to_react_to() {
