@@ -91,7 +91,7 @@ mod provider_neutrality {
         for name in GENERIC {
             let path = src.join(name);
             let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{} を読めません: {e}", path.display()));
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
             // 試験の手前までが「動く側」。試験を持たない module は全部が対象。
             let production = match text.find("#[cfg(test)]") {
@@ -111,7 +111,7 @@ mod provider_neutrality {
 
         assert!(
             leaks.is_empty(),
-            "core が provider の名前を知っています (DR-0014 §3):\n{}",
+            "core knows provider names (DR-0014 §3):\n{}",
             leaks.join("\n")
         );
     }
@@ -124,7 +124,7 @@ mod provider_neutrality {
     fn every_listed_module_exists() {
         let src = src();
         for name in GENERIC {
-            assert!(src.join(name).is_file(), "{name} が見つかりません");
+            assert!(src.join(name).is_file(), "{name} not found");
         }
     }
 }

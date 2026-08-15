@@ -19,7 +19,7 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     };
 
     let parts: Vec<&str> = tail_patterns.split('*').collect();
-    let (last, middle) = parts.split_last().expect("split は必ず 1 要素以上返す");
+    let (last, middle) = parts.split_last().expect("split always returns at least one element");
 
     // 中間の断片は、順に現れればよい。
     for part in middle {
@@ -120,10 +120,10 @@ mod tests {
             "claude-opus-4-1-20250805",
             "claude-sonnet-4-6",
         ] {
-            assert!(matches_any(&excluded, hidden), "{hidden} は隠す");
+            assert!(matches_any(&excluded, hidden), "{hidden} should be hidden");
         }
         for shown in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
-            assert!(!matches_any(&excluded, shown), "{shown} は出す");
+            assert!(!matches_any(&excluded, shown), "{shown} should be shown");
         }
     }
 

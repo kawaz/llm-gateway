@@ -216,7 +216,7 @@ mod tests {
         events.publish(Event::new(NOW + 1, &from("b"), 200));
 
         let got = watching.recv().await.unwrap();
-        assert_eq!(got.ts, NOW + 1, "見始めた後の分だけ");
+        assert_eq!(got.ts, NOW + 1, "only events after the subscription started");
     }
 
     /// 断られた応答も流す。上限に当たったことも、見ている側には知らせ。
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(json["status"], 200);
         assert!(
             json.get("prefix").is_none(),
-            "系列が分からなければ欄ごと出さない"
+            "omits the field entirely when the series is unknown"
         );
 
         let in_series = Event::new(

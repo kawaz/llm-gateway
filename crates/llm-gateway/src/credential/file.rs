@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(
             ids.iter().map(CredentialId::as_str).collect::<Vec<_>>(),
             vec!["a", "b"],
-            "json 以外は拾わず、名前順に並ぶ"
+            "picks up only json, sorted by name"
         );
     }
 
@@ -244,7 +244,7 @@ mod tests {
         let err = store.load(&CredentialId::new("nope")).unwrap_err();
         assert!(
             err.to_string().contains("nope"),
-            "どれが無いのか分かる: {err}"
+            "identifies which one is missing: {err}"
         );
     }
 
@@ -316,6 +316,6 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "本人以外に読ませない");
+        assert_eq!(mode, 0o600, "not readable by anyone else");
     }
 }
