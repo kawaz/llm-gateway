@@ -84,7 +84,7 @@ url = "http://127.0.0.1:8317"
 headers = { x-trace = "on" }
 "#,
         )
-        .expect("設定として読める")
+        .expect("config should parse")
     }
 
     fn preset(config: &Config, name: &str) -> Preset {

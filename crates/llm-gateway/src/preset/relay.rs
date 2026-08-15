@@ -73,7 +73,7 @@ mod tests {
 
         assert_eq!(request.upstream.headers.get("authorization"), None);
         assert_eq!(request.upstream.headers.get("x-api-key"), None);
-        assert!(preset.quota_api().is_none(), "枠は転送先が持っている");
+        assert!(preset.quota_api().is_none(), "quota is owned by the relay target");
         assert_eq!(preset.quota_support(), Support::UpstreamDependent);
     }
 
@@ -85,7 +85,7 @@ mod tests {
 
         preset("cpa", wire())
             .negotiation()
-            .expect("学習した分は落とせる")
+            .expect("learned entries can be dropped")
             .prepare(&mut headers, &[]);
 
         assert_eq!(headers.get("anthropic-beta"), Some(CLIENT_BETA));

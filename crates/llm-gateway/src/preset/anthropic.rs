@@ -67,12 +67,12 @@ mod tests {
         assert!(preset.quota_api().is_some());
         assert!(
             preset.negotiation().is_some(),
-            "beta の交渉はどの経路でも要る"
+            "beta negotiation is required on every route"
         );
         assert_eq!(
             preset.quota_support(),
             Support::Unobserved,
-            "枠は応答ヘッダに載るので、使えば見える"
+            "quota rides on the response headers, so using it makes it visible"
         );
     }
 }

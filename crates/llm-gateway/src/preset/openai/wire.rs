@@ -228,7 +228,7 @@ mod tests {
 
             assert_eq!(encoded.response, expected, "stream={stream:?}");
             let upstream: Value = serde_json::from_slice(&encoded.upstream.body).unwrap();
-            assert_eq!(upstream["stream"], true, "upstream は常に SSE");
+            assert_eq!(upstream["stream"], true, "upstream is always SSE");
         }
     }
 

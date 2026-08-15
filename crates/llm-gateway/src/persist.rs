@@ -137,8 +137,8 @@ mod tests {
 
         assert!(!mine.exists());
         assert!(!also_mine.exists());
-        assert!(theirs.exists(), "他の writer の書きかけは触らない");
-        assert!(finished.exists(), "書き上がりは消さない");
+        assert!(theirs.exists(), "does not touch another writer's in-progress file");
+        assert!(finished.exists(), "does not remove a finished file");
     }
 
     /// 置き場が無くても落ちない (まだ 1 度も書いていない状態)。

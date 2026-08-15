@@ -65,7 +65,7 @@ pub fn convert(body: Value) -> Result<Value> {
         if input.contains_key(key) {
             tracing::warn!(
                 parameter = key,
-                "Codex backend へ送れないパラメータを落とします"
+                "dropping parameter not supported by the Codex backend"
             );
         }
     }

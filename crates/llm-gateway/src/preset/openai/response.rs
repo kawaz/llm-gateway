@@ -88,7 +88,7 @@ impl Translator {
             } else {
                 if self.held.len() + self.event.len() >= MAX_EVENT {
                     return Err(Error::Config(
-                        "Responses SSE event が大きすぎます".to_owned(),
+                        "Responses SSE event is too large".to_owned(),
                     ));
                 }
                 self.held.push(byte);
@@ -202,7 +202,7 @@ impl Translator {
                     Some(Block::Tool(index)) => index,
                     _ => {
                         return Err(Error::Config(
-                            "tool 引数が tool item より先に届きました".to_owned(),
+                            "tool arguments arrived before the tool item".to_owned(),
                         ));
                     }
                 };

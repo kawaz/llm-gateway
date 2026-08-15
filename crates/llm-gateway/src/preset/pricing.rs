@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(
             p.cost(&usage(TokenKind::output_reasoning(), 1_000_000)),
             0.0,
-            "reasoning は output に含めて請求されるので別立てにしない"
+            "reasoning is billed as part of output, not separately"
         );
     }
 

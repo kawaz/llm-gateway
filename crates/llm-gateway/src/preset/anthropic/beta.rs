@@ -160,7 +160,7 @@ extended-cache-ttl-2025-04-11";
     /// Bedrock が受け付ける 4 つだけが残る。
     #[test]
     fn bedrock_keeps_only_accepted_flags() {
-        let got = Policy::bedrock().apply(OBSERVED).expect("4 つ残るはず");
+        let got = Policy::bedrock().apply(OBSERVED).expect("4 should remain");
         assert_eq!(
             got,
             "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,\
@@ -237,7 +237,7 @@ context-management-2025-06-27,claude-code-20250219"
         policy.deny_all(["some-future-flag-2027-01-01".to_owned()]);
 
         let kept = policy.apply(OBSERVED).unwrap();
-        assert!(!kept.contains("oauth-2025-04-20"), "既定の分は落ちたまま");
+        assert!(!kept.contains("oauth-2025-04-20"), "the default entry stays dropped");
         assert!(kept.contains("context-management-2025-06-27"));
 
         let mut passthrough = Policy::Passthrough;

@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(
             request.body.as_ptr(),
             before.as_ptr(),
-            "同じ領域を送る (直列化し直さない)"
+            "sends the same buffer (no re-serialization)"
         );
     }
 }

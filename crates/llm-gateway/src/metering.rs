@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(
             usage.get(&TokenKind::new("provider.batch_prediction")),
             Some(3),
-            "未知の区分も other へ潰さない"
+            "unknown categories are not collapsed into other"
         );
     }
 
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(
             usage.get(&TokenKind::new("input.cached_detail")),
             Some(900_000),
-            "課金しない内訳も観測値としては保持する"
+            "non-billed breakdowns are still kept as observed values"
         );
     }
 
