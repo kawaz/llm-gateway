@@ -469,7 +469,10 @@ mod tests {
             logs.contains("bytes=30"),
             "the forwarded byte count is known: {logs}"
         );
-        assert!(logs.contains("elapsed_ms="), "the elapsed time is known: {logs}");
+        assert!(
+            logs.contains("elapsed_ms="),
+            "the elapsed time is known: {logs}"
+        );
     }
 
     /// 受け取った本文の大きさと、受け取りにかかった時間が残る。
@@ -596,7 +599,10 @@ mod tests {
 
         // 3 つ目の前で詰まったので、無音の始まりは 1 つ目と 2 つ目の分だけ後。
         let at = field(end, "max_gap_at_ms");
-        assert!(at < gap, "the stall is known to be early on (at={at}, gap={gap})");
+        assert!(
+            at < gap,
+            "the stall is known to be early on (at={at}, gap={gap})"
+        );
     }
 
     /// 流れている途中で黙り込んだまま切られたら、その無音が残る。

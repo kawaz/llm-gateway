@@ -243,7 +243,10 @@ extended-cache-ttl-2025-04-11";
             "Accept-Encoding",
             "Authorization",
         ] {
-            assert!(!names.contains(&gone), "{gone} should be dropped: {names:?}");
+            assert!(
+                !names.contains(&gone),
+                "{gone} should be dropped: {names:?}"
+            );
         }
         for kept in [
             "anthropic-version",

@@ -1576,7 +1576,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "at");
-        assert_eq!(saved.into_inner().as_deref(), Some("at"), "proceeds all the way to saving");
+        assert_eq!(
+            saved.into_inner().as_deref(),
+            Some("at"),
+            "proceeds all the way to saving"
+        );
 
         let page = page.await.unwrap();
         assert!(page.contains("Authorization succeeded"), "{page}");
@@ -1759,7 +1763,10 @@ mod tests {
             .to_string();
 
         assert!(err.contains("rejected"), "{err}");
-        assert!(saved.into_inner().is_none(), "an unusable token is not saved");
+        assert!(
+            saved.into_inner().is_none(),
+            "an unusable token is not saved"
+        );
         assert!(page.await.unwrap().contains("Authorization failed"));
     }
 

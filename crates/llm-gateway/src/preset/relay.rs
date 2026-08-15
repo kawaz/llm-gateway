@@ -73,7 +73,10 @@ mod tests {
 
         assert_eq!(request.upstream.headers.get("authorization"), None);
         assert_eq!(request.upstream.headers.get("x-api-key"), None);
-        assert!(preset.quota_api().is_none(), "quota is owned by the relay target");
+        assert!(
+            preset.quota_api().is_none(),
+            "quota is owned by the relay target"
+        );
         assert_eq!(preset.quota_support(), Support::UpstreamDependent);
     }
 

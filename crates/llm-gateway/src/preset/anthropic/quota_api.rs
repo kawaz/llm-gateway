@@ -319,7 +319,10 @@ mod tests {
 
         assert_eq!(probe.model, HAIKU, "the smallest model");
         assert_eq!(probe.request.path, "/v1/messages");
-        assert_eq!(probe.request.body["model"], HAIKU, "same name in the body too");
+        assert_eq!(
+            probe.request.body["model"], HAIKU,
+            "same name in the body too"
+        );
         assert_eq!(probe.request.body["max_tokens"], 1);
         assert_eq!(
             probe.request.headers.get("anthropic-beta"),
@@ -338,7 +341,10 @@ mod tests {
         assert_eq!(limits[1].percent, 100.0);
         assert_eq!(limits[1].severity.as_deref(), Some("critical"));
         assert!(limits[1].is_active);
-        assert_eq!(limits[1].model, None, "an overall limit has no model attached");
+        assert_eq!(
+            limits[1].model, None,
+            "an overall limit has no model attached"
+        );
     }
 
     /// モデル別の枠は、掛かる相手の名前を持つ。応答ヘッダには出てこない情報。
@@ -348,7 +354,10 @@ mod tests {
         let scoped = &limits[2];
         assert_eq!(scoped.kind, "weekly_scoped");
         assert_eq!(scoped.model.as_deref(), Some("Fable"));
-        assert_eq!(scoped.model_id, None, "no identifier is returned when observed");
+        assert_eq!(
+            scoped.model_id, None,
+            "no identifier is returned when observed"
+        );
         assert_eq!(
             scoped.resets_at.as_deref(),
             Some("2026-08-02T08:59:59.571875+00:00")
@@ -470,7 +479,10 @@ mod tests {
 
         let entries = api().denials(&[with_id], NOW);
         assert_eq!(entries[0].0, Scope::Model(FABLE.to_owned()));
-        assert!(!entries[0].0.covers("claude-fable-6"), "matched by exact equality");
+        assert!(
+            !entries[0].0.covers("claude-fable-6"),
+            "matched by exact equality"
+        );
     }
 
     // ---------- 通信 ----------

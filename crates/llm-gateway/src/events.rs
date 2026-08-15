@@ -216,7 +216,11 @@ mod tests {
         events.publish(Event::new(NOW + 1, &from("b"), 200));
 
         let got = watching.recv().await.unwrap();
-        assert_eq!(got.ts, NOW + 1, "only events after the subscription started");
+        assert_eq!(
+            got.ts,
+            NOW + 1,
+            "only events after the subscription started"
+        );
     }
 
     /// 断られた応答も流す。上限に当たったことも、見ている側には知らせ。

@@ -360,7 +360,11 @@ mod tests {
         let state = RouteState::new();
         state.deny(limited(NOW + 10), NOW);
         assert_eq!(state.denial(FABLE, NOW), Some(limited(NOW + 10)));
-        assert_eq!(state.denial(FABLE, NOW + 10), None, "the deadline is exclusive");
+        assert_eq!(
+            state.denial(FABLE, NOW + 10),
+            None,
+            "the deadline is exclusive"
+        );
     }
 
     /// 使えるかどうかは、印の中身を配らずに答える。

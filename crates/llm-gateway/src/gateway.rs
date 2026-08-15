@@ -1308,11 +1308,20 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     #[test]
     fn switches_only_on_upstream_outage() {
         for status in [500, 502, 503, 504] {
-            assert!(should_try_next(status), "{status} is treated as a route denial");
+            assert!(
+                should_try_next(status),
+                "{status} is treated as a route denial"
+            );
         }
-        assert!(!should_try_next(501), "not-implemented is not-implemented on another route too");
+        assert!(
+            !should_try_next(501),
+            "not-implemented is not-implemented on another route too"
+        );
         for status in [200, 201, 204, 400, 404, 422] {
-            assert!(!should_try_next(status), "{status} does not try the next route");
+            assert!(
+                !should_try_next(status),
+                "{status} does not try the next route"
+            );
         }
     }
 
@@ -1324,7 +1333,10 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
             assert!(!should_try_next(status), "{status} is not a route denial");
         }
         for status in [200, 400, 404, 422, 500, 502, 503, 504] {
-            assert!(!is_route_denial(status), "{status} is not the route's fault");
+            assert!(
+                !is_route_denial(status),
+                "{status} is not the route's fault"
+            );
         }
     }
 
@@ -1386,7 +1398,10 @@ routes = ["a"]
             .unwrap();
 
         assert_eq!(forwarded.response.status, 429);
-        assert!(forwarded.usage.is_none(), "does not peek at what cannot be read anyway");
+        assert!(
+            forwarded.usage.is_none(),
+            "does not peek at what cannot be read anyway"
+        );
     }
 
     /// 自前で組んだ 429 (全滅) にも役は付かない。upstream を叩いていない。
@@ -1538,7 +1553,10 @@ routes = ["a"]
             .unwrap();
 
         assert_eq!(resp.response.status, 429);
-        assert_eq!(resp.model, "m", "the model name is attached to a denial too");
+        assert_eq!(
+            resp.model, "m",
+            "the model name is attached to a denial too"
+        );
         assert_eq!(resp.credential, None, "no owner since it's a relay type");
     }
 
@@ -2103,7 +2121,9 @@ routes = ["a"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now);
 
-        let probing = preset_of(&gw, "a").claim_ask(now).expect("the token is available");
+        let probing = preset_of(&gw, "a")
+            .claim_ask(now)
+            .expect("the token is available");
         gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
@@ -2131,7 +2151,9 @@ routes = ["a"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100), now);
 
-        let probing = preset_of(&gw, "a").claim_ask(now).expect("the token is available");
+        let probing = preset_of(&gw, "a")
+            .claim_ask(now)
+            .expect("the token is available");
         gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
@@ -2232,7 +2254,10 @@ routes = ["a", "b"]
             .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        assert_eq!(resp.response.status, 200, "the real request goes to the next route");
+        assert_eq!(
+            resp.response.status, 200,
+            "the real request goes to the next route"
+        );
 
         // 転送の 1 本と、その後の問い合わせ。
         vague.next_request().await;
@@ -2284,7 +2309,11 @@ routes = ["a", "b"]
 
         assert_eq!(spare.hits(), 1, "the real request goes to the undenied one");
         denied.next_request().await;
-        assert_eq!(denied.hits(), 1, "the denied one is probed in the background");
+        assert_eq!(
+            denied.hits(),
+            1,
+            "the denied one is probed in the background"
+        );
     }
 
     /// 枠を聞く口を持たない経路には、様子を聞きに行かない。
@@ -2328,9 +2357,16 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "the real request is not routed there");
+        assert_eq!(
+            resp.response.status, 429,
+            "the real request is not routed there"
+        );
         denied.next_request().await;
-        assert_eq!(denied.hits(), 1, "a single probe fires without waiting out the interval");
+        assert_eq!(
+            denied.hits(),
+            1,
+            "a single probe fires without waiting out the interval"
+        );
     }
 
     /// 待たせる長さは、様子を聞きに行く間隔で頭を押さえる。
@@ -2530,7 +2566,10 @@ routes = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "not overwritten by a route denial");
+        assert_eq!(
+            resp.response.status, 429,
+            "not overwritten by a route denial"
+        );
         assert_eq!((limited.hits(), down.hits()), (1, 1));
     }
 
@@ -2650,7 +2689,10 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "not overwritten by an unreachable target");
+        assert_eq!(
+            resp.response.status, 429,
+            "not overwritten by an unreachable target"
+        );
         assert!(body_text(resp.response).await.contains("status 429"));
         assert_eq!(limited.hits(), 1);
     }
@@ -2700,7 +2742,10 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 200, "skips the denied one and the next succeeds");
+        assert_eq!(
+            resp.response.status, 200,
+            "skips the denied one and the next succeeds"
+        );
         assert_eq!(negotiating.forwards(), 2, "resent only once");
         assert_eq!(spare.hits(), 1);
     }
@@ -2747,7 +2792,11 @@ routes = ["a", "b"]
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        assert_eq!((limited.hits(), spare.hits()), (1, 1), "denied, then moved on");
+        assert_eq!(
+            (limited.hits(), spare.hits()),
+            (1, 1),
+            "denied, then moved on"
+        );
 
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
@@ -2905,7 +2954,10 @@ advisor-tool-2026-03-01";
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 200, "returns the result after dropping and resending");
+        assert_eq!(
+            resp.response.status, 200,
+            "returns the result after dropping and resending"
+        );
         assert_eq!(up.hits(), 2, "resent only once");
 
         let sent = up.requests();
@@ -3234,7 +3286,10 @@ models = ["m"]
             .iter()
             .find(|c| c.name == "relayed")
             .expect("present in config");
-        assert!(other.limits.is_none(), "the field is omitted entirely when unqueryable");
+        assert!(
+            other.limits.is_none(),
+            "the field is omitted entirely when unqueryable"
+        );
     }
 
     /// 非消費 quota API を持つ経路は、推論 probe が無くても枠を取得する。
@@ -3279,7 +3334,11 @@ models = ["gpt-5.3-codex"]
             .find(|entry| entry.name == "codex")
             .unwrap();
         assert_eq!(entry.limits.as_ref().unwrap()[0].percent, 25.0);
-        assert_eq!(report.probe.unwrap().requests, 0, "does not spend reasoning tokens");
+        assert_eq!(
+            report.probe.unwrap().requests,
+            0,
+            "does not spend reasoning tokens"
+        );
     }
 
     /// プローブが失敗した credential は理由を載せ、他は返す。

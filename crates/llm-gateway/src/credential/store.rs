@@ -964,7 +964,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(server.hits(), 1, "the refresh target is hit only once");
         assert_eq!(ahead_token, "Bearer at-1");
-        assert_eq!(behind_token, ahead_token, "the waiting side gets the same token too");
+        assert_eq!(
+            behind_token, ahead_token,
+            "the waiting side gets the same token too"
+        );
         assert_eq!(
             *log.lock().unwrap(),
             [
@@ -1026,7 +1029,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         record.await.unwrap().unwrap();
 
         let saved = FileStore::open(dir.path()).unwrap().load(&id).unwrap();
-        assert_eq!(saved.payload.secret(), "at-1", "the refresh result is saved");
+        assert_eq!(
+            saved.payload.secret(),
+            "at-1",
+            "the refresh result is saved"
+        );
         assert!(
             saved.denied_beta.contains_key("advisor-tool-2026-03-01"),
             "the waiting side's learned data is kept too"
@@ -1128,7 +1135,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1)))
         );
         assert!(store.inner.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS))));
-        assert!(store.inner.needs_refresh(&cred(&at(0))), "exactly at expiry");
+        assert!(
+            store.inner.needs_refresh(&cred(&at(0))),
+            "exactly at expiry"
+        );
         assert!(store.inner.needs_refresh(&cred(&at(-1))), "already expired");
     }
 
@@ -1217,7 +1227,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
 
         assert!(got.denied_beta.contains("fresh"));
-        assert!(!got.denied_beta.contains("old"), "an expired one is retried");
+        assert!(
+            !got.denied_beta.contains("old"),
+            "an expired one is retried"
+        );
     }
 
     /// 同時に来た要求が更新を重ねない。
@@ -1244,7 +1257,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             }
         }
 
-        assert_eq!(failures, 8, "everyone fails because the refresh target is unreachable");
+        assert_eq!(
+            failures, 8,
+            "everyone fails because the refresh target is unreachable"
+        );
         assert!(
             store.inner.in_flight().is_empty(),
             "a leftover in-progress mark makes every later attempt wait forever"

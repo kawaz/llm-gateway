@@ -632,7 +632,10 @@ mod tests {
         let day = &s.report(7, NOW, &Rates).days[&local_date(NOW)];
         let models = &day.credentials["a"];
         assert_eq!(models["m-cheap"].usd, Some(1.0));
-        assert_eq!(models["who-knows"].usd, None, "does not emit a guessed amount");
+        assert_eq!(
+            models["who-knows"].usd, None,
+            "does not emit a guessed amount"
+        );
         // トークン数はどちらも残る。
         assert_eq!(input_of(&models["who-knows"].counters), 1_000_000);
     }
@@ -738,7 +741,11 @@ mod tests {
         s.record(NOW, Some("a"), "m-rich", &usage);
 
         let entry = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
-        assert_eq!(entry.usd, Some(5.0), "only the input portion; breakdowns are not stacked on top");
+        assert_eq!(
+            entry.usd,
+            Some(5.0),
+            "only the input portion; breakdowns are not stacked on top"
+        );
         assert_eq!(
             count(&entry.counters, TokenKind::new("input.ephemeral_1h")),
             900_000,
@@ -851,7 +858,10 @@ mod tests {
             s.in_memory()
         };
 
-        assert_eq!(after, before, "dropped fields come back as-is (including unknown categories)");
+        assert_eq!(
+            after, before,
+            "dropped fields come back as-is (including unknown categories)"
+        );
     }
 
     /// ディスクに落ちる形は `requests` + 区分ごとの `tokens`。
@@ -981,7 +991,10 @@ mod tests {
         let legacy = day.credentials["legacy"]["m-rich"].usd;
         let normalized = day.credentials["normalized"]["m-rich"].usd;
         assert_eq!(legacy, Some(36.75));
-        assert_eq!(legacy, normalized, "the conversion is unchanged for the legacy format too");
+        assert_eq!(
+            legacy, normalized,
+            "the conversion is unchanged for the legacy format too"
+        );
         assert_eq!(day.total_usd, Some(73.5), "the total is the sum of 2 rows");
     }
 
@@ -1001,7 +1014,10 @@ mod tests {
         names.sort();
         assert_eq!(names.len(), 2, "{names:?}");
         for name in &names {
-            assert!(name.ends_with(".8402.json"), "includes the writer's name: {name}");
+            assert!(
+                name.ends_with(".8402.json"),
+                "includes the writer's name: {name}"
+            );
         }
         assert!(
             !names.iter().any(|n| n.contains("tmp")),
@@ -1082,7 +1098,12 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(2, 2));
 
         let recent = s.report(7, NOW, &Rates);
-        assert_eq!(recent.days.len(), 1, "10 days ago is excluded: {:?}", recent.days);
+        assert_eq!(
+            recent.days.len(),
+            1,
+            "10 days ago is excluded: {:?}",
+            recent.days
+        );
         assert!(recent.days.contains_key(&local_date(NOW)));
 
         let all = s.report(0, NOW, &Rates);

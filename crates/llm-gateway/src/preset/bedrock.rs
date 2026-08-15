@@ -252,7 +252,13 @@ extended-cache-ttl-2025-04-11";
             .prepare(&mut headers, &[]);
 
         let kept = headers.get("anthropic-beta").unwrap();
-        assert!(!kept.contains("claude-code-20250219"), "the specified entry is dropped");
-        assert!(kept.contains("oauth-2025-04-20"), "the default list is not used");
+        assert!(
+            !kept.contains("claude-code-20250219"),
+            "the specified entry is dropped"
+        );
+        assert!(
+            kept.contains("oauth-2025-04-20"),
+            "the default list is not used"
+        );
     }
 }

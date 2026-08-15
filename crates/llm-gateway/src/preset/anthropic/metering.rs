@@ -813,7 +813,11 @@ mod tests {
         )
         .expect("readable");
 
-        assert_eq!(usage.get(&TokenKind::output()), Some(16), "not summed as 1 + 16");
+        assert_eq!(
+            usage.get(&TokenKind::output()),
+            Some(16),
+            "not summed as 1 + 16"
+        );
         assert_eq!(
             usage.get(&TokenKind::input()),
             Some(18),
@@ -898,8 +902,16 @@ mod tests {
         )
         .expect("readable");
 
-        assert_eq!(usage.get(&TokenKind::input()), Some(7), "from the earlier event");
-        assert_eq!(usage.get(&TokenKind::output()), Some(9), "from the later event");
+        assert_eq!(
+            usage.get(&TokenKind::input()),
+            Some(7),
+            "from the earlier event"
+        );
+        assert_eq!(
+            usage.get(&TokenKind::output()),
+            Some(9),
+            "from the later event"
+        );
     }
 
     /// CRLF で区切る upstream でも読める。

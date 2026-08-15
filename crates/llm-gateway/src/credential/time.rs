@@ -257,9 +257,17 @@ mod tests {
         // 地方時で 2026-07-30T00:00:00 になる瞬間 (= UTC の 07-29T15:00:00)。
         let midnight = parse_rfc3339("2026-07-29T15:00:00Z").unwrap();
 
-        assert_eq!(date_at_offset(midnight - 1, offset), "2026-07-29", "1 second before");
+        assert_eq!(
+            date_at_offset(midnight - 1, offset),
+            "2026-07-29",
+            "1 second before"
+        );
         assert_eq!(date_at_offset(midnight, offset), "2026-07-30", "exactly at");
-        assert_eq!(date_at_offset(midnight + 1, offset), "2026-07-30", "1 second after");
+        assert_eq!(
+            date_at_offset(midnight + 1, offset),
+            "2026-07-30",
+            "1 second after"
+        );
     }
 
     /// epoch より前 (offset で 1970 年より手前に出る) でも崩れない。

@@ -414,7 +414,11 @@ mod tests {
         let sent: Vec<Event> = serde_json::from_str(body).expect("sent as an array");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].credential, "claude-kawazzz");
-        assert_eq!(sent[0].prefix.as_deref(), Some("2cf24dba"), "same shape as SSE");
+        assert_eq!(
+            sent[0].prefix.as_deref(),
+            Some("2cf24dba"),
+            "same shape as SSE"
+        );
         task.abort();
     }
 
@@ -450,7 +454,11 @@ mod tests {
         let sent: Vec<Event> = serde_json::from_str(body).unwrap();
 
         assert_eq!(sent.len(), 10, "10 items arrive in a single delivery");
-        assert_eq!(receiver.deliveries().len(), 1, "only a single connection too");
+        assert_eq!(
+            receiver.deliveries().len(),
+            1,
+            "only a single connection too"
+        );
         task.abort();
     }
 
@@ -584,7 +592,10 @@ mod tests {
             warn!(%url, %reason, "cannot send to the webhook");
         });
 
-        assert!(!logs.contains(TOKEN), "the secret token appears in the logs:\n{logs}");
+        assert!(
+            !logs.contains(TOKEN),
+            "the secret token appears in the logs:\n{logs}"
+        );
         assert!(logs.contains("webhook"), "nothing was logged:\n{logs}");
     }
 

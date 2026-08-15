@@ -19,7 +19,9 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     };
 
     let parts: Vec<&str> = tail_patterns.split('*').collect();
-    let (last, middle) = parts.split_last().expect("split always returns at least one element");
+    let (last, middle) = parts
+        .split_last()
+        .expect("split always returns at least one element");
 
     // 中間の断片は、順に現れればよい。
     for part in middle {

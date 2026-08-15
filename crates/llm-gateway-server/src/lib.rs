@@ -1085,7 +1085,11 @@ routes = ["a"]
         .unwrap();
         assert_eq!(forwarded.status(), 200);
 
-        let chunk = watching.chunk().await.unwrap().expect("one delivery arrives");
+        let chunk = watching
+            .chunk()
+            .await
+            .unwrap()
+            .expect("one delivery arrives");
         let text = String::from_utf8(chunk.to_vec()).unwrap();
 
         let (kind, data) = text.trim_end().split_once('\n').expect("2 lines");
@@ -1148,7 +1152,11 @@ routes = ["a"]
         .unwrap();
         assert_eq!(refused.status(), 429);
 
-        let chunk = watching.chunk().await.unwrap().expect("a denial is streamed too");
+        let chunk = watching
+            .chunk()
+            .await
+            .unwrap()
+            .expect("a denial is streamed too");
         let text = String::from_utf8(chunk.to_vec()).unwrap();
         let data = text
             .lines()
@@ -1470,7 +1478,11 @@ routes = ["a"]
             resp.headers().get("content-type").unwrap(),
             "text/event-stream"
         );
-        assert_eq!(resp.text().await.unwrap(), sse, "not a single byte is changed");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            sse,
+            "not a single byte is changed"
+        );
     }
 
     /// 中継の途中で upstream が切れたら、ログに残る。
@@ -1589,11 +1601,11 @@ routes = ["a"]
             .lines()
             .find(|l| l.contains("refused the request") && l.contains("no-such-model"))
             .unwrap_or_else(|| panic!("no record of the denial:\n{text}"));
+        assert!(refused.contains("ns=default"), "which namespace: {refused}");
         assert!(
-            refused.contains("ns=default"),
-            "which namespace: {refused}"
+            refused.contains("status=404"),
+            "what was returned: {refused}"
         );
-        assert!(refused.contains("status=404"), "what was returned: {refused}");
         assert!(refused.contains("req="), "which request: {refused}");
     }
 
@@ -1881,7 +1893,10 @@ url = "https://upstream.invalid"
         .await;
 
         let c = entry(&get(&base, "/llm-gateway/usage").await, "claude-personal").clone();
-        assert_eq!(c["support"], "observed", "does not revert to unobserved: {c}");
+        assert_eq!(
+            c["support"], "observed",
+            "does not revert to unobserved: {c}"
+        );
         assert_eq!(c["snapshot"]["5h"]["utilization"], 0.71);
         assert_eq!(
             c["snapshot"]["observed_at"], observed_at,
@@ -1925,7 +1940,10 @@ models = ["m"]
         let cpa = entry(&report, "cpa");
         assert_eq!(cpa["support"], "upstream_dependent");
         assert!(cpa.get("note").is_none());
-        assert!(cpa.get("snapshot").is_none(), "nothing is present when unobserved");
+        assert!(
+            cpa.get("snapshot").is_none(),
+            "nothing is present when unobserved"
+        );
     }
 
     /// 転送のついでに読んだ値が出る。追加の API コールは要らない。
@@ -2103,7 +2121,10 @@ url = "{upstream}"
         .await;
 
         let c = entry(&get(&base, "/llm-gateway/usage?refresh=true").await, "busy").clone();
-        assert_eq!(c["support"], "observed", "the headers are read even on a 429");
+        assert_eq!(
+            c["support"], "observed",
+            "the headers are read even on a 429"
+        );
         assert!(
             c["probe_error"].as_str().unwrap().contains("429"),
             "the failure is not hidden either: {c}"
@@ -2150,7 +2171,10 @@ models = ["m"]
         for off in [None, Some(""), Some("refresh=false"), Some("refresh=0")] {
             assert!(!wants_refresh(off), "{off:?}");
         }
-        assert!(!wants_refresh(Some("refresh")), "a valueless flag is treated as absent");
+        assert!(
+            !wants_refresh(Some("refresh")),
+            "a valueless flag is treated as absent"
+        );
     }
 }
 
@@ -2273,7 +2297,10 @@ auth_token = "secret-token"
             .lines()
             .find(|l| l.contains("refused the request") && l.contains("ns=locked"))
             .unwrap_or_else(|| panic!("no record of the denial:\n{text}"));
-        assert!(refused.contains("status=401"), "what was returned: {refused}");
+        assert!(
+            refused.contains("status=401"),
+            "what was returned: {refused}"
+        );
         assert!(
             !refused.contains("secret-token"),
             "the token is not written: {refused}"
@@ -2306,7 +2333,11 @@ auth_token = "secret-token"
             .send()
             .await
             .unwrap();
-        assert_eq!(bare.status(), 200, "an unidentified caller is allowed through too");
+        assert_eq!(
+            bare.status(),
+            200,
+            "an unidentified caller is allowed through too"
+        );
 
         for value in ["Bearer anything", TOKEN, "secret-token", ""] {
             let resp = client
@@ -2471,7 +2502,10 @@ routes = ["a"]
             .await
             .unwrap();
         let msg = body["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("default"), "identifies which namespace is missing: {msg}");
+        assert!(
+            msg.contains("default"),
+            "identifies which namespace is missing: {msg}"
+        );
     }
 
     /// `[ns.default]` を書けば `/v1/...` が使える。
@@ -2795,7 +2829,11 @@ routes = ["a"]
             requested_days(Some(&format!("days={}", usize::MAX))),
             Ok(max)
         );
-        assert_eq!(requested_days(Some("days=36500")), Ok(max), "the limit itself");
+        assert_eq!(
+            requested_days(Some("days=36500")),
+            Ok(max),
+            "the limit itself"
+        );
     }
 
     /// 極端な日数でも 200 が返る (落ちない)。

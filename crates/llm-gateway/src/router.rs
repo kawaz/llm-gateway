@@ -254,11 +254,10 @@ impl Router {
         route: &RouteSpec,
         flavor: discovery::Flavor,
     ) -> Result<BTreeMap<String, String>> {
-        let credential_name = route.credential.as_deref().ok_or_else(|| {
-            Error::Config(format!(
-                "route `{name}` has no discovery credential"
-            ))
-        })?;
+        let credential_name = route
+            .credential
+            .as_deref()
+            .ok_or_else(|| Error::Config(format!("route `{name}` has no discovery credential")))?;
         let credential = credentials
             .acquire(&CredentialId::new(credential_name))
             .await?;
@@ -833,11 +832,7 @@ routes = ["bedrock", "oauth-a"]
             .routes_for(ns(&r), NS, "claude-haiku-4-5-20251001", &session("s1"))
             .await
             .unwrap();
-        assert_eq!(
-            names(&got),
-            vec!["oauth-a"],
-            "oauth-b excludes haiku"
-        );
+        assert_eq!(names(&got), vec!["oauth-a"], "oauth-b excludes haiku");
     }
 
     #[tokio::test]
@@ -1218,7 +1213,11 @@ routes = ["bedrock", "oauth-a"]
             "claude-opus-5",
             "first hop"
         );
-        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5", "second hop");
+        assert_eq!(
+            r.resolve(ns(&r), "opus").await,
+            "claude-opus-5",
+            "second hop"
+        );
         assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
         assert_eq!(
             r.resolve(ns(&r), "haiku").await,
@@ -1243,7 +1242,10 @@ routes = ["bedrock", "oauth-a"]
         let resolved = resolve_aliases(&aliases, &known);
         assert!(!resolved.contains_key("a"), "a cycle is dropped");
         assert!(!resolved.contains_key("b"));
-        assert_eq!(resolved["ok"], "claude-opus-5", "others are not caught up in it");
+        assert_eq!(
+            resolved["ok"], "claude-opus-5",
+            "others are not caught up in it"
+        );
     }
 
     /// どこにも当たらないエイリアスは捨てる (一覧に出さない)。

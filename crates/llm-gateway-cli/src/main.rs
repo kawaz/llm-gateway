@@ -1494,7 +1494,10 @@ mod tests {
     #[test]
     fn usage_takes_refresh_and_config() {
         let plain = usage_args(&[]).unwrap();
-        assert!(!plain.refresh, "not fired by default (does not consume usage)");
+        assert!(
+            !plain.refresh,
+            "not fired by default (does not consume usage)"
+        );
         assert_eq!(plain.config_path, Config::default_path());
 
         let refreshing = usage_args(&["--refresh", "--config", "/tmp/c.toml"]).unwrap();
@@ -1980,10 +1983,19 @@ mod tests {
 
         assert!(out.contains("2026-07-29"), "{out}");
         // 合計は 4 本 / input 51,200 / output 8,340。
-        assert!(out.contains("51,200"), "the total with thousands separators: {out}");
+        assert!(
+            out.contains("51,200"),
+            "the total with thousands separators: {out}"
+        );
         assert!(out.contains("8,340"), "{out}");
-        assert!(out.contains("claude-one"), "the credential appears in the breakdown: {out}");
-        assert!(out.contains("claude-opus-5"), "the model appears in the breakdown: {out}");
+        assert!(
+            out.contains("claude-one"),
+            "the credential appears in the breakdown: {out}"
+        );
+        assert!(
+            out.contains("claude-opus-5"),
+            "the model appears in the breakdown: {out}"
+        );
         for head in [REQUESTS_HEADER, "input", "output", USD_HEADER] {
             assert!(out.contains(head), "missing header {head}: {out}");
         }
@@ -2015,7 +2027,10 @@ mod tests {
         let out = render_stats(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
 
         let head = out.lines().next().expect("a header line");
-        assert!(head.contains("reasoning"), "a standard category gets a short header: {out}");
+        assert!(
+            head.contains("reasoning"),
+            "a standard category gets a short header: {out}"
+        );
         assert!(
             head.contains("provider.batch_prediction"),
             "an unknown category is shown by its raw name: {out}"
@@ -2091,8 +2106,14 @@ mod tests {
     fn empty_stats_say_why() {
         let out = render_stats(&stats_report(&[]));
         assert!(out.contains("No usage recorded yet"), "{out}");
-        assert!(out.contains("gateway"), "points to what to check next: {out}");
-        assert!(out.contains("stats directory"), "shows the location too: {out}");
+        assert!(
+            out.contains("gateway"),
+            "points to what to check next: {out}"
+        );
+        assert!(
+            out.contains("stats directory"),
+            "shows the location too: {out}"
+        );
     }
 
     /// 認証情報を持たない経路は予約名で出る。
@@ -2128,7 +2149,11 @@ mod tests {
     fn stats_takes_a_day_count() {
         assert_eq!(parse_stats(&["--days", "30"]).unwrap().days, 30);
         assert_eq!(parse_stats(&["--days=1"]).unwrap().days, 1);
-        assert_eq!(parse_stats(&["--days", "0"]).unwrap().days, 0, "0 means all time");
+        assert_eq!(
+            parse_stats(&["--days", "0"]).unwrap().days,
+            0,
+            "0 means all time"
+        );
     }
 
     #[test]

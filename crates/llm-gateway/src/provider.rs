@@ -509,7 +509,9 @@ mod tests {
         assert!(preset().probe_request().is_none());
 
         let asking = preset().with_quota_api(Arc::new(StubQuotaApi));
-        let probe = asking.probe_request().expect("a probeable route can be built");
+        let probe = asking
+            .probe_request()
+            .expect("a probeable route can be built");
 
         assert_eq!(probe.model, "probe-model");
         assert_eq!(probe.request.body["model"], "probe-model");

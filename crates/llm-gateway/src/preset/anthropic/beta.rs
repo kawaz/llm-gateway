@@ -237,7 +237,10 @@ context-management-2025-06-27,claude-code-20250219"
         policy.deny_all(["some-future-flag-2027-01-01".to_owned()]);
 
         let kept = policy.apply(OBSERVED).unwrap();
-        assert!(!kept.contains("oauth-2025-04-20"), "the default entry stays dropped");
+        assert!(
+            !kept.contains("oauth-2025-04-20"),
+            "the default entry stays dropped"
+        );
         assert!(kept.contains("context-management-2025-06-27"));
 
         let mut passthrough = Policy::Passthrough;

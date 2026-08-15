@@ -477,7 +477,10 @@ mod tests {
         store.restore().await;
 
         let restored = store.get(&id).await.expect("can be reloaded");
-        assert_eq!(restored.observed_at, NOW, "the observed time is restored too");
+        assert_eq!(
+            restored.observed_at, NOW,
+            "the observed time is restored too"
+        );
         assert_eq!(restored.observed_at_iso, "2026-07-29T12:00:00Z");
         assert_eq!(restored.five_hour.unwrap().utilization, Some(0.71));
         assert_eq!(

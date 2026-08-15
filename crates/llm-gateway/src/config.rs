@@ -780,7 +780,10 @@ auth_token = "t"
         .unwrap();
 
         let config = Config::load(&dir.path().join("unstable.toml")).unwrap();
-        assert_eq!(config.server.listen, "127.0.0.1:8402", "what it wrote itself");
+        assert_eq!(
+            config.server.listen, "127.0.0.1:8402",
+            "what it wrote itself"
+        );
         assert_eq!(
             config.namespace("default").unwrap().auth_token.as_deref(),
             Some("t"),
@@ -884,7 +887,10 @@ o = "claude-opus-*"
             message.contains("summarized"),
             "lists the accepted values: {message}"
         );
-        assert!(message.contains("omitted"), "lists the accepted values: {message}");
+        assert!(
+            message.contains("omitted"),
+            "lists the accepted values: {message}"
+        );
     }
 
     /// `auth_token` を書かない namespace は、名乗り方に関わらず誰でも通す。
@@ -1266,7 +1272,10 @@ routes = ["a", "typo-here"]
     #[test]
     fn empty_config_is_valid() {
         let c = parse("").unwrap();
-        assert_eq!(c.server.listen, "127.0.0.1:11300", "the default listen address");
+        assert_eq!(
+            c.server.listen, "127.0.0.1:11300",
+            "the default listen address"
+        );
         assert!(!c.server.disabled, "listens when unwritten");
         assert!(matches!(c.store, Store::File { dir: None }));
     }
@@ -1392,12 +1401,20 @@ mod example_tests {
         );
         let raw = std::fs::read_to_string(path).expect("dist/config.example.toml is required");
         let config: Config = toml::from_str(&raw).expect("the template is broken");
-        config.validate().expect("a reference in the template is broken");
+        config
+            .validate()
+            .expect("a reference in the template is broken");
 
         // 使い方を示す要素が一通り入っているか。
-        assert!(!ns(&config).filter.exclude.is_empty(), "an example of hiding");
+        assert!(
+            !ns(&config).filter.exclude.is_empty(),
+            "an example of hiding"
+        );
         assert!(!ns(&config).routing.is_empty(), "an example of routing");
-        assert!(!ns(&config).aliases.is_empty(), "an example of a short name");
+        assert!(
+            !ns(&config).aliases.is_empty(),
+            "an example of a short name"
+        );
         assert!(
             ns(&config).auth_token.is_some(),
             "following the template as-is enables auth (unset means deny-all, so the example is needed)"
@@ -1429,6 +1446,9 @@ mod example_tests {
             "/../../dist/config.example.toml"
         );
         let raw = std::fs::read_to_string(path).unwrap();
-        assert!(!raw.contains("[models."), "a legacy-format model definition remains");
+        assert!(
+            !raw.contains("[models."),
+            "a legacy-format model definition remains"
+        );
     }
 }

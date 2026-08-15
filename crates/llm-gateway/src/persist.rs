@@ -137,7 +137,10 @@ mod tests {
 
         assert!(!mine.exists());
         assert!(!also_mine.exists());
-        assert!(theirs.exists(), "does not touch another writer's in-progress file");
+        assert!(
+            theirs.exists(),
+            "does not touch another writer's in-progress file"
+        );
         assert!(finished.exists(), "does not remove a finished file");
     }
 

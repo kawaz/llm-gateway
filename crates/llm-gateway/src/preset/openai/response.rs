@@ -87,9 +87,7 @@ impl Translator {
                 output.extend(self.line(&line)?);
             } else {
                 if self.held.len() + self.event.len() >= MAX_EVENT {
-                    return Err(Error::Config(
-                        "Responses SSE event is too large".to_owned(),
-                    ));
+                    return Err(Error::Config("Responses SSE event is too large".to_owned()));
                 }
                 self.held.push(byte);
             }

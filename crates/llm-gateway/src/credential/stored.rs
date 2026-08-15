@@ -596,7 +596,10 @@ mod tests {
         let err = serde_json::from_str::<StoredCredential>(raw)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("claude_oauth"), "shows the accepted term: {err}");
+        assert!(
+            err.contains("claude_oauth"),
+            "shows the accepted term: {err}"
+        );
     }
 
     fn with_denied(flag: &str, at: i64, expires_ms: u64) -> StoredCredential {
