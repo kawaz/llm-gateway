@@ -403,7 +403,7 @@ async fn messages<P: Persistence + 'static>(
                 client_error(
                     &ns_name,
                     StatusCode::BAD_REQUEST,
-                    &format!("本文を読めません: {e}"),
+                    &format!("cannot read the body: {e}"),
                 )
             });
         }
@@ -419,7 +419,7 @@ async fn messages<P: Persistence + 'static>(
                 client_error(
                     &ns_name,
                     StatusCode::BAD_REQUEST,
-                    &format!("JSON として読めません: {e}"),
+                    &format!("cannot be read as JSON: {e}"),
                 )
             });
         }
@@ -597,7 +597,7 @@ fn error_response(ns: &str, e: &Error) -> Response {
         Error::AllUpstreamsFailed { model, attempts } => {
             let detail: Vec<String> = attempts.iter().map(ToString::to_string).collect();
             format!(
-                "model `{model}` の経路が全て失敗しました: {}",
+                "all routes for model `{model}` failed: {}",
                 detail.join(" / ")
             )
         }
@@ -1056,7 +1056,7 @@ routes = ["a"]
         assert_eq!(
             watching.headers().get("content-type").unwrap(),
             "text/event-stream",
-            "SSE として読める形で返す"
+            "returns in a shape readable as SSE"
         );
         assert_eq!(
             watching
@@ -1064,7 +1064,7 @@ routes = ["a"]
                 .get("access-control-allow-origin")
                 .unwrap(),
             "*",
-            "様子を見るのにブラウザから直接開ける"
+            "can be opened directly from a browser to watch"
         );
 
         // system を積んだ本文。系列の識別子はこの先頭ブロックから作る。
@@ -1085,15 +1085,15 @@ routes = ["a"]
         .unwrap();
         assert_eq!(forwarded.status(), 200);
 
-        let chunk = watching.chunk().await.unwrap().expect("1 通届く");
+        let chunk = watching.chunk().await.unwrap().expect("one delivery arrives");
         let text = String::from_utf8(chunk.to_vec()).unwrap();
 
-        let (kind, data) = text.trim_end().split_once('\n').expect("2 行");
+        let (kind, data) = text.trim_end().split_once('\n').expect("2 lines");
         assert_eq!(kind, "event: request");
         let event: Value =
-            serde_json::from_str(data.strip_prefix("data: ").expect("data 行")).unwrap();
+            serde_json::from_str(data.strip_prefix("data: ").expect("a data line")).unwrap();
 
-        assert_eq!(event["session_id"], "s-1", "会話が分かる");
+        assert_eq!(event["session_id"], "s-1", "the conversation is known");
         assert_eq!(event["ns"], "default");
         assert_eq!(event["model"], "m");
         assert_eq!(event["credential"], "a");
@@ -1101,8 +1101,8 @@ routes = ["a"]
         assert!(event["ts"].as_i64().unwrap() > 0);
         assert!(event["ts_iso"].as_str().unwrap().ends_with('Z'));
 
-        let series = event["prefix"].as_str().expect("系列が分かる");
-        assert_eq!(series.len(), 8, "短い 16 進 1 つ: {series}");
+        let series = event["prefix"].as_str().expect("the series is known");
+        assert_eq!(series.len(), 8, "a single short hex string: {series}");
         assert!(series.chars().all(|c| c.is_ascii_hexdigit()), "{series}");
     }
 
@@ -1148,19 +1148,19 @@ routes = ["a"]
         .unwrap();
         assert_eq!(refused.status(), 429);
 
-        let chunk = watching.chunk().await.unwrap().expect("断られた分も流れる");
+        let chunk = watching.chunk().await.unwrap().expect("a denial is streamed too");
         let text = String::from_utf8(chunk.to_vec()).unwrap();
         let data = text
             .lines()
             .find_map(|line| line.strip_prefix("data: "))
-            .expect("data 行");
+            .expect("a data line");
         let event: Value = serde_json::from_str(data).unwrap();
 
-        assert!(event["session_id"].is_null(), "名乗らなければ null");
-        assert_eq!(event["status"], 429, "断られたことも知らせ");
+        assert!(event["session_id"].is_null(), "null when not identified");
+        assert_eq!(event["status"], 429, "the denial is reported too");
         assert!(
             event.get("prefix").is_none(),
-            "system を積んでいないので系列も分からない"
+            "no system prompt was attached, so the series is unknown"
         );
     }
 
@@ -1182,7 +1182,7 @@ routes = ["a"]
         assert_eq!(
             body["thinking"],
             json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"}),
-            "display 以外のクライアント指定は保持する"
+            "a client setting other than display is preserved"
         );
     }
 
@@ -1373,11 +1373,11 @@ routes = ["a"]
         let request = requests
             .iter()
             .find(|request| request.starts_with("POST /v1/messages"))
-            .expect("Messages request が upstream に届く");
+            .expect("the Messages request reaches upstream");
         let (_, raw_body) = request
             .split_once("\r\n\r\n")
-            .expect("HTTP header と body が分かれる");
-        let body: Value = serde_json::from_str(raw_body).expect("upstream body は JSON");
+            .expect("the HTTP header and body are split");
+        let body: Value = serde_json::from_str(raw_body).expect("the upstream body is JSON");
         assert_eq!(
             body["thinking"],
             json!({"type": "enabled", "budget_tokens": 1024, "display": "summarized"})
@@ -1422,7 +1422,7 @@ routes = ["a"]
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/json",
-            "upstream のヘッダを引き継ぐ"
+            "carries over the upstream headers"
         );
         assert!(resp.text().await.unwrap().contains("ok"));
     }
@@ -1470,7 +1470,7 @@ routes = ["a"]
             resp.headers().get("content-type").unwrap(),
             "text/event-stream"
         );
-        assert_eq!(resp.text().await.unwrap(), sse, "1 バイトも変えない");
+        assert_eq!(resp.text().await.unwrap(), sse, "not a single byte is changed");
     }
 
     /// 中継の途中で upstream が切れたら、ログに残る。
@@ -1510,22 +1510,22 @@ routes = ["a"]
         .send()
         .await
         .unwrap();
-        assert_eq!(resp.status(), 200, "ヘッダは通る");
+        assert_eq!(resp.status(), 200, "the headers pass through");
 
         // 本文はここで途切れる。クライアントが受け取り損ねた時点では、
         // 中継側は既に記録を終えている (記録してから先へ渡すため)。
-        assert!(resp.text().await.is_err(), "本文は最後まで来ない");
+        assert!(resp.text().await.is_err(), "the body never arrives in full");
 
         let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
         let broken = text
             .lines()
             .find(|l| l.contains("the transfer broke off"))
-            .unwrap_or_else(|| panic!("途切れた記録が無い:\n{text}"));
-        assert!(broken.contains("bytes="), "どこまで流したか: {broken}");
-        assert!(broken.contains("elapsed_ms="), "かかった時間: {broken}");
+            .unwrap_or_else(|| panic!("no record of the interruption:\n{text}"));
+        assert!(broken.contains("bytes="), "how far it streamed: {broken}");
+        assert!(broken.contains("elapsed_ms="), "the elapsed time: {broken}");
         assert!(
             broken.contains("body_bytes="),
-            "受け取った本文の大きさ (手前のアクセスログと突き合わせる): {broken}"
+            "the size of the received body (cross-checked with the upstream access log): {broken}"
         );
 
         // span には番号の後ろに他の値も並ぶので、番号はそこで切る。
@@ -1533,12 +1533,12 @@ routes = ["a"]
             .split_once("req=")
             .and_then(|(_, rest)| rest.split([',', '}']).next())
             .map(str::to_owned)
-            .unwrap_or_else(|| panic!("番号が振られていない: {broken}"));
+            .unwrap_or_else(|| panic!("no number was assigned: {broken}"));
         assert!(
             text.lines()
                 .any(|l| l.contains("received upstream headers")
                     && l.contains(&format!("req={req}"))),
-            "開始と終了が同じ番号で対になる (req={req}):\n{text}"
+            "the start and end are paired by the same number (req={req}):\n{text}"
         );
     }
 
@@ -1588,13 +1588,13 @@ routes = ["a"]
         let refused = text
             .lines()
             .find(|l| l.contains("refused the request") && l.contains("no-such-model"))
-            .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
+            .unwrap_or_else(|| panic!("no record of the denial:\n{text}"));
         assert!(
             refused.contains("ns=default"),
-            "どの namespace か: {refused}"
+            "which namespace: {refused}"
         );
-        assert!(refused.contains("status=404"), "何を返したか: {refused}");
-        assert!(refused.contains("req="), "どの要求か: {refused}");
+        assert!(refused.contains("status=404"), "what was returned: {refused}");
+        assert!(refused.contains("req="), "which request: {refused}");
     }
 
     /// 経路が全滅したら 503。どこで何が起きたかを返す。
@@ -1627,8 +1627,8 @@ routes = ["a"]
         assert_eq!(resp.status(), 503);
         let body: Value = resp.json().await.unwrap();
         let msg = body["error"]["message"].as_str().unwrap();
-        assert!(msg.contains('a'), "どの経路が駄目だったか: {msg}");
-        assert!(msg.contains("503"), "何が起きたか: {msg}");
+        assert!(msg.contains('a'), "which route failed: {msg}");
+        assert!(msg.contains("503"), "what happened: {msg}");
     }
 
     /// upstream の 4xx はそのまま返す (gateway が握り潰さない)。
@@ -1672,7 +1672,7 @@ routes = ["a"]
                 .await
                 .unwrap()
                 .contains("max_tokens is required"),
-            "upstream の説明をそのまま渡す"
+            "passes the upstream explanation through as-is"
         );
     }
 
@@ -1741,7 +1741,7 @@ opus = "claude-opus-*"
         assert_eq!(
             ids,
             vec!["claude-fable-5", "claude-opus-5", "fable", "opus"],
-            "実際のモデル名と、短い名前の両方を出す"
+            "emits both the actual model name and the short name"
         );
     }
 
@@ -1827,7 +1827,7 @@ mod usage_tests {
             .unwrap()
             .iter()
             .find(|c| c["name"] == name)
-            .unwrap_or_else(|| panic!("{name} が一覧にない: {report}"))
+            .unwrap_or_else(|| panic!("{name} is not in the list: {report}"))
     }
 
     /// 前の起動で観測した分が、再起動しても一覧に出る (DR-0007)。
@@ -1849,7 +1849,7 @@ mod usage_tests {
         {
             let snapshot = AnthropicMetering
                 .quota_snapshot(&Headers::new(unified_headers()), observed_at)
-                .expect("枠が載っている");
+                .expect("a limit is present");
             let usage = QuotaStore::new(dir.path(), listen);
             usage
                 .observe(&CredentialId::new("claude-personal"), snapshot)
@@ -1881,11 +1881,11 @@ url = "https://upstream.invalid"
         .await;
 
         let c = entry(&get(&base, "/llm-gateway/usage").await, "claude-personal").clone();
-        assert_eq!(c["support"], "observed", "未観測に戻さない: {c}");
+        assert_eq!(c["support"], "observed", "does not revert to unobserved: {c}");
         assert_eq!(c["snapshot"]["5h"]["utilization"], 0.71);
         assert_eq!(
             c["snapshot"]["observed_at"], observed_at,
-            "取得時刻は観測した当時のまま (読み戻した時刻に付け替えない): {c}"
+            "the fetch time stays as originally observed (not replaced by the reload time): {c}"
         );
     }
 
@@ -1912,20 +1912,20 @@ models = ["m"]
 
         let report = get(&base, "/llm-gateway/usage").await;
         assert!(report["generated_at"].as_i64().unwrap() > 1_700_000_000);
-        assert!(report.get("probe").is_none(), "既定では投げない");
+        assert!(report.get("probe").is_none(), "not fired by default");
 
         let bedrock = entry(&report, "bedrock");
         assert_eq!(bedrock["type"], "bedrock_api_key");
         assert_eq!(bedrock["support"], "not_applicable");
         assert!(
             bedrock.get("note").is_none(),
-            "理由の文章は出さない: {bedrock}"
+            "the reason text is omitted: {bedrock}"
         );
 
         let cpa = entry(&report, "cpa");
         assert_eq!(cpa["support"], "upstream_dependent");
         assert!(cpa.get("note").is_none());
-        assert!(cpa.get("snapshot").is_none(), "未観測に中身は無い");
+        assert!(cpa.get("snapshot").is_none(), "nothing is present when unobserved");
     }
 
     /// 転送のついでに読んだ値が出る。追加の API コールは要らない。
@@ -1981,13 +1981,13 @@ routes = ["claude-personal"]
         assert_eq!(s["5h"]["reset"], 1_785_344_400_i64);
         assert_eq!(
             s["5h"]["reset_iso"], "2026-07-29T17:00:00Z",
-            "Unix 秒と ISO の両方を出す"
+            "emits both Unix seconds and ISO"
         );
         assert_eq!(s["7d"]["utilization"], 0.3);
         assert_eq!(s["overage"]["disabled_reason"], "out_of_credits");
         assert!(
             s["observed_at"].as_i64().unwrap() > 1_700_000_000,
-            "いつ観測したかが分かる: {s}"
+            "shows when it was observed: {s}"
         );
     }
 
@@ -2020,11 +2020,11 @@ url = "{upstream}"
         let probe = &report["probe"];
         assert_eq!(probe["requests"], 1);
         assert_eq!(probe["model"], "claude-haiku-4-5-20251001");
-        assert_eq!(probe["input_tokens"], 8, "確認そのものが消費した分");
+        assert_eq!(probe["input_tokens"], 8, "what the probe itself consumed");
         assert_eq!(probe["output_tokens"], 1);
 
         let c = entry(&report, "claude-personal");
-        assert_eq!(c["support"], "observed", "投げた結果が反映される");
+        assert_eq!(c["support"], "observed", "the probe result is reflected");
         assert!(c.get("probe_error").is_none());
     }
 
@@ -2072,7 +2072,7 @@ url = "http://127.0.0.1:9"
         assert_eq!(dead["support"], "unobserved");
         assert!(
             !dead["probe_error"].as_str().unwrap().is_empty(),
-            "何が起きたか書いてある: {dead}"
+            "describes what happened: {dead}"
         );
     }
 
@@ -2103,10 +2103,10 @@ url = "{upstream}"
         .await;
 
         let c = entry(&get(&base, "/llm-gateway/usage?refresh=true").await, "busy").clone();
-        assert_eq!(c["support"], "observed", "429 でもヘッダは読む");
+        assert_eq!(c["support"], "observed", "the headers are read even on a 429");
         assert!(
             c["probe_error"].as_str().unwrap().contains("429"),
-            "失敗したことも隠さない: {c}"
+            "the failure is not hidden either: {c}"
         );
     }
 
@@ -2150,7 +2150,7 @@ models = ["m"]
         for off in [None, Some(""), Some("refresh=false"), Some("refresh=0")] {
             assert!(!wants_refresh(off), "{off:?}");
         }
-        assert!(!wants_refresh(Some("refresh")), "値なしは付いていない扱い");
+        assert!(!wants_refresh(Some("refresh")), "a valueless flag is treated as absent");
     }
 }
 
@@ -2211,20 +2211,20 @@ auth_token = "secret-token"
         assert!(personal.contains(&"claude-fable-5".to_owned()));
         assert!(
             !personal.iter().any(|m| m.starts_with("gpt-")),
-            "personal は gpt を隠している: {personal:?}"
+            "personal hides gpt: {personal:?}"
         );
         assert!(
             personal.contains(&"opus".to_owned()),
-            "エイリアスも namespace ごと"
+            "aliases are per namespace too"
         );
 
         let work = ids(&base, "/ns-work/v1/models").await;
         assert!(work.contains(&"gpt-5.6-sol".to_owned()));
         assert!(
             !work.contains(&"claude-fable-5".to_owned()),
-            "work は fable を隠している: {work:?}"
+            "work hides fable: {work:?}"
         );
-        assert!(!work.contains(&"opus".to_owned()), "エイリアスは共有しない");
+        assert!(!work.contains(&"opus".to_owned()), "aliases are not shared");
     }
 
     /// 設定していない namespace は 404。使えるものを教える。
@@ -2240,7 +2240,7 @@ auth_token = "secret-token"
         let body: Value = resp.json().await.unwrap();
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("nope"), "{msg}");
-        assert!(msg.contains("personal"), "使えるものを挙げる: {msg}");
+        assert!(msg.contains("personal"), "lists what's available: {msg}");
     }
 
     /// トークンを設定した namespace は、合っていないと通さない。
@@ -2258,7 +2258,7 @@ auth_token = "secret-token"
             .send()
             .await
             .unwrap();
-        assert_eq!(without.status(), 401, "トークン無しは通さない");
+        assert_eq!(without.status(), 401, "no token means denied");
 
         let wrong = client
             .get(format!("{base}/ns-locked/v1/models"))
@@ -2272,11 +2272,11 @@ auth_token = "secret-token"
         let refused = text
             .lines()
             .find(|l| l.contains("refused the request") && l.contains("ns=locked"))
-            .unwrap_or_else(|| panic!("断った記録が無い:\n{text}"));
-        assert!(refused.contains("status=401"), "何を返したか: {refused}");
+            .unwrap_or_else(|| panic!("no record of the denial:\n{text}"));
+        assert!(refused.contains("status=401"), "what was returned: {refused}");
         assert!(
             !refused.contains("secret-token"),
-            "トークンは書かない: {refused}"
+            "the token is not written: {refused}"
         );
 
         for value in ["Bearer secret-token", "secret-token"] {
@@ -2286,7 +2286,7 @@ auth_token = "secret-token"
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(ok.status(), 200, "{value} は通す");
+            assert_eq!(ok.status(), 200, "{value} is allowed through");
         }
     }
 
@@ -2306,7 +2306,7 @@ auth_token = "secret-token"
             .send()
             .await
             .unwrap();
-        assert_eq!(bare.status(), 200, "名乗らない相手も通す");
+        assert_eq!(bare.status(), 200, "an unidentified caller is allowed through too");
 
         for value in ["Bearer anything", TOKEN, "secret-token", ""] {
             let resp = client
@@ -2315,7 +2315,7 @@ auth_token = "secret-token"
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), 200, "{value:?} でも通す");
+            assert_eq!(resp.status(), 200, "{value:?} is allowed through too");
         }
     }
 
@@ -2340,7 +2340,7 @@ auth_token = "secret-token"
         assert!(message.contains("wrong token"), "{message}");
         assert!(
             message.contains("locked"),
-            "どの namespace か分かる: {message}"
+            "identifies which namespace: {message}"
         );
     }
 
@@ -2396,7 +2396,7 @@ routes = ["a"]
             assert_eq!(
                 resp.status(),
                 200,
-                "認証なしの面なので通る (authenticated={authenticated})"
+                "passes through since it's an unauthenticated surface (authenticated={authenticated})"
             );
 
             // 見るのは転送された分だけ (一覧の問い合わせと混ぜない)。
@@ -2411,30 +2411,30 @@ routes = ["a"]
                 .to_lowercase();
             assert!(
                 !sent.is_empty(),
-                "転送が届いている (authenticated={authenticated})"
+                "the forward arrived (authenticated={authenticated})"
             );
             assert!(
                 !sent.contains(LEAKED),
-                "名乗られた認証情報が漏れている (authenticated={authenticated}):\n{sent}"
+                "the presented credential leaked through (authenticated={authenticated}):\n{sent}"
             );
             assert!(
                 !sent.contains("x-api-key"),
-                "欄ごと落とす (authenticated={authenticated}):\n{sent}"
+                "the field is dropped entirely (authenticated={authenticated}):\n{sent}"
             );
             assert!(
                 sent.contains("anthropic-version: 2023-06-01"),
-                "関係のないヘッダまで落としてはいない (authenticated={authenticated}):\n{sent}"
+                "an unrelated header is not dropped (authenticated={authenticated}):\n{sent}"
             );
 
             if authenticated {
                 assert!(
                     sent.contains("authorization: bearer tok"),
-                    "こちらが選んだ認証情報に差し替わる:\n{sent}"
+                    "replaced with the credential we chose:\n{sent}"
                 );
             } else {
                 assert!(
                     !sent.contains("authorization:"),
-                    "転送先が自分で認証を持つ経路には何も付けない:\n{sent}"
+                    "nothing is added for a relay route that owns its own auth:\n{sent}"
                 );
             }
         }
@@ -2471,7 +2471,7 @@ routes = ["a"]
             .await
             .unwrap();
         let msg = body["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("default"), "どの namespace が無いのか: {msg}");
+        assert!(msg.contains("default"), "identifies which namespace is missing: {msg}");
     }
 
     /// `[ns.default]` を書けば `/v1/...` が使える。
@@ -2490,7 +2490,7 @@ models = ["claude-opus-5"]
         assert_eq!(
             ids(&base, "/v1/models").await,
             ids(&base, "/ns-default/v1/models").await,
-            "`/v1/...` は `/ns-default/...` と同じもの"
+            "`/v1/...` is the same as `/ns-default/...`"
         );
         assert!(
             ids(&base, "/v1/models")
@@ -2521,7 +2521,7 @@ models = ["claude-opus-5"]
         let resp = reqwest::get(format!("{base}/ns-locked/llm-gateway/healthz"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), 404, "namespace 付きでは生やさない");
+        assert_eq!(resp.status(), 404, "not conjured when a namespace is given");
     }
 }
 
@@ -2658,8 +2658,8 @@ routes = ["a"]
             .await
             .unwrap();
 
-        let days = report["days"].as_object().expect("日ごとの表");
-        assert_eq!(days.len(), 1, "1 日分: {report}");
+        let days = report["days"].as_object().expect("a per-day table");
+        assert_eq!(days.len(), 1, "one day's worth: {report}");
         let counters = &days.values().next().unwrap()["credentials"]["-"]["m"];
         assert_eq!(counters["requests"], 1);
         // トークンは区分ごとの表で出る (DR-0014 §4 の正規レコード)。
@@ -2722,7 +2722,7 @@ routes = ["a"]
         .await
         .unwrap();
 
-        assert_eq!(body, sse, "覗いても 1 バイトも変えない");
+        assert_eq!(body, sse, "not a single byte changes even while observed");
 
         let report: Value = reqwest::get(format!("{base}/llm-gateway/stats"))
             .await
@@ -2736,7 +2736,7 @@ routes = ["a"]
         assert_eq!(counters["tokens"]["input"], 30);
         assert_eq!(
             counters["tokens"]["output"], 40,
-            "累積の最終値。message_start の 1 を足さない"
+            "the final cumulative value; the message_start's 1 is not added"
         );
     }
 
@@ -2754,7 +2754,7 @@ routes = ["a"]
         assert!(report["days"].as_object().unwrap().is_empty(), "{report}");
         assert!(
             report["generated_at_iso"].is_string(),
-            "いつ作ったか: {report}"
+            "when it was created: {report}"
         );
     }
 
@@ -2795,7 +2795,7 @@ routes = ["a"]
             requested_days(Some(&format!("days={}", usize::MAX))),
             Ok(max)
         );
-        assert_eq!(requested_days(Some("days=36500")), Ok(max), "上限そのもの");
+        assert_eq!(requested_days(Some("days=36500")), Ok(max), "the limit itself");
     }
 
     /// 極端な日数でも 200 が返る (落ちない)。
