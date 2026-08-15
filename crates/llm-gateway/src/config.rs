@@ -780,11 +780,11 @@ auth_token = "t"
         .unwrap();
 
         let config = Config::load(&dir.path().join("unstable.toml")).unwrap();
-        assert_eq!(config.server.listen, "127.0.0.1:8402", "自分で書いた分");
+        assert_eq!(config.server.listen, "127.0.0.1:8402", "what it wrote itself");
         assert_eq!(
             config.namespace("default").unwrap().auth_token.as_deref(),
             Some("t"),
-            "土台から来る分"
+            "what comes from the base"
         );
         assert!(config.routes.contains_key("a"));
     }
@@ -859,7 +859,7 @@ o = "claude-opus-*"
     /// 既定の namespace。`/v1/...` が解決される先。
     pub(super) fn ns(c: &Config) -> &Namespace {
         c.namespace(DEFAULT_NAMESPACE)
-            .expect("この設定には [ns.default] がある")
+            .expect("this config has [ns.default]")
     }
 
     /// `thinking_display` は API が受け付ける 2 値だけを設定できる。
@@ -872,19 +872,19 @@ o = "claude-opus-*"
             ("omitted", ThinkingDisplay::Omitted),
         ] {
             let config = parse(&format!("[ns.default]\nthinking_display = \"{raw}\"\n"))
-                .unwrap_or_else(|e| panic!("{raw} は有効: {e}"));
+                .unwrap_or_else(|e| panic!("{raw} should be valid: {e}"));
             assert_eq!(ns(&config).thinking_display, Some(expected), "{raw}");
         }
 
         let error = parse("[ns.default]\nthinking_display = \"visible\"\n")
-            .expect_err("列挙外の値は設定エラー");
+            .expect_err("an out-of-enum value is a config error");
         let message = error.to_string();
         assert!(message.contains("unknown variant `visible`"), "{message}");
         assert!(
             message.contains("summarized"),
-            "許可値を案内する: {message}"
+            "lists the accepted values: {message}"
         );
-        assert!(message.contains("omitted"), "許可値を案内する: {message}");
+        assert!(message.contains("omitted"), "lists the accepted values: {message}");
     }
 
     /// `auth_token` を書かない namespace は、名乗り方に関わらず誰でも通す。
@@ -893,13 +893,13 @@ o = "claude-opus-*"
     #[test]
     fn namespace_without_token_accepts_everyone() {
         let ns = Namespace::default();
-        assert_eq!(ns.auth_token, None, "書いていない状態");
+        assert_eq!(ns.auth_token, None, "the unwritten state");
 
         for presented in [None, Some("anything"), Some("Bearer anything"), Some("")] {
             assert_eq!(
                 ns.authorize(presented),
                 Authorization::Open,
-                "{presented:?} も通す"
+                "{presented:?} passes too"
             );
         }
     }
@@ -924,7 +924,7 @@ o = "claude-opus-*"
         assert_eq!(
             ns.authorize(None),
             Authorization::WrongToken,
-            "名乗らないのは不一致と同じ扱い"
+            "not identifying is treated the same as a mismatch"
         );
     }
 
@@ -945,7 +945,7 @@ type = "claude_oauth"
         assert_eq!(
             c.namespace_names(),
             vec!["personal"],
-            "書いた分しか公開しない"
+            "only what was written is exposed"
         );
     }
 
@@ -956,7 +956,7 @@ type = "claude_oauth"
         assert_eq!(c.credentials.len(), 4);
         assert_eq!(c.routes.len(), 5);
         assert_eq!(ns(&c).routing.len(), 2);
-        assert_eq!(c.discovery.refresh_secs, 3600, "既定は 1 時間");
+        assert_eq!(c.discovery.refresh_secs, 3600, "default is 1 hour");
     }
 
     /// モデル一覧を手で書かない。upstream に聞くので、設定にあるのは
@@ -987,13 +987,13 @@ type = "claude_oauth"
         ] {
             assert!(
                 !ns(&c).allows("claude-personal", hidden, &c),
-                "{hidden} は隠す"
+                "{hidden} is hidden"
             );
         }
         for shown in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
             assert!(
                 ns(&c).allows("claude-personal", shown, &c),
-                "{shown} は出す"
+                "{shown} is shown"
             );
         }
     }
@@ -1004,15 +1004,15 @@ type = "claude_oauth"
         let c = parse(SAMPLE).unwrap();
         assert!(
             !ns(&c).allows("claude-work-b", "claude-opus-5", &c),
-            "fable 専用なので opus は扱わない"
+            "fable-only, so opus is not handled"
         );
         assert!(
             ns(&c).allows("claude-work-b", "claude-fable-5", &c),
-            "fable は扱う"
+            "fable is handled"
         );
         assert!(
             ns(&c).allows("claude-personal", "claude-opus-5", &c),
-            "他の credential には影響しない"
+            "has no effect on other credentials"
         );
     }
 
@@ -1121,7 +1121,7 @@ routes = [[]]
                 "claude-work-b",
                 "cpa"
             ],
-            "宣言順 (BTreeMap なので名前順)"
+            "declaration order (name order, since it's a BTreeMap)"
         );
     }
 
@@ -1157,12 +1157,12 @@ routes = ["b"]
         assert_eq!(
             ns(&c).routes_for("claude-opus-5", &c),
             vec!["a"],
-            "個別指定が先"
+            "a specific entry comes first"
         );
         assert_eq!(
             ns(&c).routes_for("claude-sonnet-5", &c),
             vec!["b"],
-            "後ろの広い規則"
+            "a broader rule comes after"
         );
     }
 
@@ -1175,7 +1175,7 @@ routes = ["b"]
         let empty = parse("[ns.default]").unwrap();
         assert!(
             ns(&empty).resolved_aliases().is_empty(),
-            "書かなければ 1 つも無い"
+            "none at all when unwritten"
         );
     }
 
@@ -1207,7 +1207,7 @@ opus = "claude-opus-4*"
         assert_eq!(
             c.routes["cpa"].discovery_flavor(&c),
             None,
-            "転送先には聞けない"
+            "cannot be queried on a relay target"
         );
     }
 
@@ -1266,8 +1266,8 @@ routes = ["a", "typo-here"]
     #[test]
     fn empty_config_is_valid() {
         let c = parse("").unwrap();
-        assert_eq!(c.server.listen, "127.0.0.1:11300", "既定の待ち受け先");
-        assert!(!c.server.disabled, "書かなければ待ち受ける");
+        assert_eq!(c.server.listen, "127.0.0.1:11300", "the default listen address");
+        assert!(!c.server.disabled, "listens when unwritten");
         assert!(matches!(c.store, Store::File { dir: None }));
     }
 
@@ -1280,7 +1280,7 @@ routes = ["a", "typo-here"]
         assert!(c.server.disabled);
         assert_eq!(
             c.server.listen, "127.0.0.1:8402",
-            "問い合わせ先としては残る"
+            "still remains as a queryable target"
         );
     }
 
@@ -1352,7 +1352,7 @@ routes = ["a", "typo-here"]
             "https://example.test#other",
         ] {
             let source = format!("[webhook]\nbase_url = {base:?}");
-            assert!(parse(&source).is_err(), "{base} を受理している");
+            assert!(parse(&source).is_err(), "{base} was accepted");
         }
     }
 
@@ -1390,31 +1390,31 @@ mod example_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../dist/config.example.toml"
         );
-        let raw = std::fs::read_to_string(path).expect("dist/config.example.toml が要る");
-        let config: Config = toml::from_str(&raw).expect("雛形が壊れている");
-        config.validate().expect("雛形の参照が壊れている");
+        let raw = std::fs::read_to_string(path).expect("dist/config.example.toml is required");
+        let config: Config = toml::from_str(&raw).expect("the template is broken");
+        config.validate().expect("a reference in the template is broken");
 
         // 使い方を示す要素が一通り入っているか。
-        assert!(!ns(&config).filter.exclude.is_empty(), "隠し方の例");
-        assert!(!ns(&config).routing.is_empty(), "振り分けの例");
-        assert!(!ns(&config).aliases.is_empty(), "短い名前の例");
+        assert!(!ns(&config).filter.exclude.is_empty(), "an example of hiding");
+        assert!(!ns(&config).routing.is_empty(), "an example of routing");
+        assert!(!ns(&config).aliases.is_empty(), "an example of a short name");
         assert!(
             ns(&config).auth_token.is_some(),
-            "雛形どおりに書けば認証がかかる (未設定は全拒否なので、書き方が要る)"
+            "following the template as-is enables auth (unset means deny-all, so the example is needed)"
         );
         assert!(
             config
                 .routes
                 .values()
                 .any(|route| !route.exclude().is_empty()),
-            "credential ごとの絞り込みの例"
+            "an example of a per-credential restriction"
         );
         assert!(
             config
                 .routes
                 .values()
                 .any(|route| !route.declared_models().is_empty()),
-            "relay で扱うモデルを宣言する例"
+            "an example of declaring the models a relay handles"
         );
     }
 
@@ -1429,6 +1429,6 @@ mod example_tests {
             "/../../dist/config.example.toml"
         );
         let raw = std::fs::read_to_string(path).unwrap();
-        assert!(!raw.contains("[models."), "旧形式のモデル定義が残っている");
+        assert!(!raw.contains("[models."), "a legacy-format model definition remains");
     }
 }
