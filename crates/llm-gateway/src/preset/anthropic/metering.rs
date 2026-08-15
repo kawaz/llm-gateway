@@ -235,7 +235,7 @@ impl MessagesUsage {
             }
             // 書きかけの行と、このイベントで溜めた分の合計で見る。
             if self.held.len() + self.event.len() >= MAX_SSE_EVENT {
-                self.give_up("SSE の 1 イベントが長すぎます");
+                self.give_up("a single SSE event is too long");
                 return;
             }
             self.held.push(b);
@@ -330,7 +330,7 @@ impl UsageObserver for MessagesUsage {
             Mode::Sse => self.observe_sse(chunk),
             Mode::Json => {
                 if self.held.len() + chunk.len() > MAX_JSON_BODY {
-                    self.give_up("応答が大きすぎます");
+                    self.give_up("response is too large");
                     return;
                 }
                 self.held.extend_from_slice(chunk);
@@ -436,7 +436,7 @@ mod tests {
     fn read(content_type: &str, chunks: &[&[u8]]) -> Option<TokenUsage> {
         let mut observer = AnthropicMetering
             .usage_observer(Some(content_type))
-            .expect("読める形");
+            .expect("a readable shape");
         for chunk in chunks {
             observer.observe(chunk);
         }
@@ -467,9 +467,9 @@ mod tests {
     fn reads_every_unified_field() {
         let s = AnthropicMetering
             .quota_snapshot(&unified(), NOW)
-            .expect("読める");
+            .expect("readable");
 
-        assert_eq!(s.observed_at, NOW, "取得時刻を必ず付ける");
+        assert_eq!(s.observed_at, NOW, "the observed time is always attached");
 
         let five = s.five_hour.unwrap();
         assert_eq!(five.utilization, Some(0.71));
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(
             five.reset_iso.as_deref(),
             Some("2026-07-29T17:00:00Z"),
-            "Unix 秒と ISO の両方を出す"
+            "emits both Unix seconds and ISO"
         );
 
         let seven = s.seven_day.unwrap();
@@ -521,12 +521,12 @@ mod tests {
 
         let five = s.five_hour.unwrap();
         assert_eq!(five.utilization, Some(0.9));
-        assert_eq!(five.reset, None, "無いものは None");
+        assert_eq!(five.reset, None, "a missing value is None");
         assert_eq!(five.reset_iso, None);
         assert!(s.overage.is_none());
         assert!(
             s.seven_day.is_none(),
-            "1 つも読めなかった窓は、空の器を置かずに落とす"
+            "a window that could not be read at all is dropped rather than left empty"
         );
     }
 
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(
             rejection(429, &h, FABLE),
             Some(limited(NOW + 5000 + RESET_SLACK)),
-            "窓はアカウントに掛かるので、頼んだモデルには関係しない"
+            "the window applies to the account, unrelated to the requested model"
         );
     }
 
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(denial.until, NOW + 5000 + RESET_SLACK);
         assert!(
             denial.until > NOW + 5000,
-            "開くと言われた時刻より後に戻す (猶予 {} 秒)",
+            "resumes after the announced reopen time (grace of {} seconds)",
             denial.until - (NOW + 5000)
         );
     }
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(
             rejection(429, &Headers::new(pairs), FABLE),
             Some(busy(NOW + 30, FABLE)),
-            "窓は塞がっていないので、頼んだモデルの事情として短く退避する"
+            "the window is not blocked, so it backs off briefly as the requested model's own issue"
         );
     }
 
@@ -731,7 +731,7 @@ mod tests {
                 b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":7}}\n\n",
             ],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::input()), Some(10));
         assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(3));
@@ -745,7 +745,7 @@ mod tests {
             "text/event-stream",
             &[b"data: {\"usage\":{\"input_", b"tokens\":42}}", b"\n\n"],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::input()), Some(42));
     }
@@ -757,7 +757,7 @@ mod tests {
             "text/event-stream",
             &[b"data: {\"usage\":\ndata: {\"output_tokens\":5}}\n\n"],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::output()), Some(5));
     }
@@ -769,7 +769,7 @@ mod tests {
             "text/event-stream",
             &[b"data: {\"usage\":{\"output_tokens\":9}}"],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::output()), Some(9));
     }
@@ -781,7 +781,7 @@ mod tests {
             "application/json; charset=utf-8",
             &[br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":2}}"#],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::input()), Some(1));
         assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(2));
@@ -811,13 +811,13 @@ mod tests {
                 b"event: message_delta\ndata: {\"usage\":{\"input_tokens\":18,\"output_tokens\":16}}\n\n",
             ],
         )
-        .expect("読める");
+        .expect("readable");
 
-        assert_eq!(usage.get(&TokenKind::output()), Some(16), "1 + 16 にしない");
+        assert_eq!(usage.get(&TokenKind::output()), Some(16), "not summed as 1 + 16");
         assert_eq!(
             usage.get(&TokenKind::input()),
             Some(18),
-            "同じ値を二重に足さない"
+            "the same value is not double-counted"
         );
     }
 
@@ -833,7 +833,7 @@ mod tests {
                 b"data: {\"usage\":{\"output_tokens\":7}}\n\n",
             ],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::input()), Some(20));
         assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(900));
@@ -848,7 +848,7 @@ mod tests {
             &[br#"{"usage":{"input_tokens":"many","output_tokens":null,
                 "cache_read_input_tokens":5}}"#],
         )
-        .expect("読めた区分がある");
+        .expect("a readable category exists");
 
         assert_eq!(usage.get(&TokenKind::input()), None);
         assert_eq!(usage.get(&TokenKind::output()), None);
@@ -878,7 +878,7 @@ mod tests {
             "text/event-stream",
             &[b"data:{\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n"],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::output()), Some(5));
     }
@@ -896,10 +896,10 @@ mod tests {
                 b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":9}}\n\n",
             ],
         )
-        .expect("読める");
+        .expect("readable");
 
-        assert_eq!(usage.get(&TokenKind::input()), Some(7), "前のイベントから");
-        assert_eq!(usage.get(&TokenKind::output()), Some(9), "後のイベントから");
+        assert_eq!(usage.get(&TokenKind::input()), Some(7), "from the earlier event");
+        assert_eq!(usage.get(&TokenKind::output()), Some(9), "from the later event");
     }
 
     /// CRLF で区切る upstream でも読める。
@@ -909,7 +909,7 @@ mod tests {
             "text/event-stream",
             &[b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\r\n\r\n"],
         )
-        .expect("読める");
+        .expect("readable");
 
         assert_eq!(usage.get(&TokenKind::output()), Some(9));
     }
@@ -966,14 +966,14 @@ mod tests {
     fn prices_only_known_models() {
         let pricing = AnthropicMetering
             .pricing("claude-opus-5")
-            .expect("表にある");
+            .expect("present in the table");
         for kind in [
             TokenKind::input(),
             TokenKind::output(),
             TokenKind::input_cache_creation(),
             TokenKind::input_cache_read(),
         ] {
-            assert!(pricing.rates.contains_key(&kind), "{kind} の単価がない");
+            assert!(pricing.rates.contains_key(&kind), "no rate for {kind}");
         }
 
         assert!(AnthropicMetering.pricing("no-such-model").is_none());
