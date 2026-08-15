@@ -373,7 +373,7 @@ impl<P: Persistence> Gateway<P> {
                                 status = resp.status,
                                 reason = ?denial.reason,
                                 seconds = denial.until - now,
-                                "この経路を候補から外します"
+                                "excluding this route from candidates"
                             );
 
                             // 断られたのに理由が応答に無いなら、枠を聞きに行く。
@@ -409,7 +409,7 @@ impl<P: Persistence> Gateway<P> {
                 model = %model,
                 status = resp.status,
                 routes = routes.len(),
-                "経路を使い切りました。最後に断られた応答をそのまま返します"
+                "exhausted all routes; returning the last denial as-is"
             );
             return Ok(Forwarded {
                 response: resp,
@@ -481,7 +481,7 @@ impl<P: Persistence> Gateway<P> {
         warn!(
             route = route.name(),
             flags = ?blamed,
-            "送ったヘッダが拒否されました。落として送り直します"
+            "the sent header was rejected; dropping it and retrying"
         );
         if let Some(id) = &route.credential
             && let Err(e) = self.credentials.record_denied_beta(id, &blamed).await
@@ -767,7 +767,7 @@ impl<P: Persistence> Gateway<P> {
             info!(
                 credential = %id,
                 limits = limits.len(),
-                "枠を聞いて締め出しを引き直しました"
+                "queried quota and recalculated the denial"
             );
         })
     }
@@ -1153,7 +1153,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
 
         /// 次の要求が届くまで待つ。
         async fn next_request(&self) {
-            self.arrived.acquire().await.expect("閉じない").forget();
+            self.arrived.acquire().await.expect("never closes").forget();
         }
 
         fn hits(&self) -> usize {
@@ -1268,7 +1268,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
 
     /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。
     fn preset_of<'a, P: Persistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
-        gw.router.preset(name).expect("設定にある")
+        gw.router.preset(name).expect("present in config")
     }
 
     /// 転送の試験で使う namespace 名。
@@ -1276,7 +1276,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
 
     /// 既定の namespace。
     fn ns<P: Persistence>(gw: &Gateway<P>) -> &Namespace {
-        gw.namespace(NS).expect("既定は必ずある")
+        gw.namespace(NS).expect("the default always exists")
     }
 
     /// 試験のリクエストが名乗るモデル。
@@ -1308,11 +1308,11 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     #[test]
     fn switches_only_on_upstream_outage() {
         for status in [500, 502, 503, 504] {
-            assert!(should_try_next(status), "{status} は経路断とみなす");
+            assert!(should_try_next(status), "{status} is treated as a route denial");
         }
-        assert!(!should_try_next(501), "未実装は別の経路でも未実装");
+        assert!(!should_try_next(501), "not-implemented is not-implemented on another route too");
         for status in [200, 201, 204, 400, 404, 422] {
-            assert!(!should_try_next(status), "{status} は次を試さない");
+            assert!(!should_try_next(status), "{status} does not try the next route");
         }
     }
 
@@ -1320,11 +1320,11 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     #[test]
     fn route_denials_are_told_apart_from_outages() {
         for status in [401, 403, 429, 529] {
-            assert!(is_route_denial(status), "{status} はこの経路が断った");
-            assert!(!should_try_next(status), "{status} は経路断ではない");
+            assert!(is_route_denial(status), "{status} was denied by this route");
+            assert!(!should_try_next(status), "{status} is not a route denial");
         }
         for status in [200, 400, 404, 422, 500, 502, 503, 504] {
-            assert!(!is_route_denial(status), "{status} は経路のせいではない");
+            assert!(!is_route_denial(status), "{status} is not the route's fault");
         }
     }
 
@@ -1371,7 +1371,7 @@ routes = ["a"]
             .unwrap();
 
         assert_eq!(forwarded.response.status, 200);
-        assert!(forwarded.usage.is_some(), "集計する役が付く");
+        assert!(forwarded.usage.is_some(), "a metering role is attached");
     }
 
     /// 断られた応答には役を付けない。エラーの本文に usage は載らない。
@@ -1386,7 +1386,7 @@ routes = ["a"]
             .unwrap();
 
         assert_eq!(forwarded.response.status, 429);
-        assert!(forwarded.usage.is_none(), "読んでも取れないものを覗かない");
+        assert!(forwarded.usage.is_none(), "does not peek at what cannot be read anyway");
     }
 
     /// 自前で組んだ 429 (全滅) にも役は付かない。upstream を叩いていない。
@@ -1405,7 +1405,7 @@ routes = ["a"]
 
         assert_eq!(forwarded.response.status, 429);
         assert!(forwarded.usage.is_none());
-        assert_eq!(up.hits(), 0, "叩いていない");
+        assert_eq!(up.hits(), 0, "not hit");
     }
 
     /// 通った経路の認証情報が応答に付いてくる。使用量をこの鍵で束ねる。
@@ -1439,7 +1439,7 @@ routes = ["a"]
         assert_eq!(
             resp.credential.as_ref().map(CredentialId::as_str),
             Some("a"),
-            "どの認証情報が答えたか"
+            "which credential answered"
         );
     }
 
@@ -1478,7 +1478,7 @@ opus = "claude-opus-*"
         assert_eq!(resp.response.status, 200);
         assert_eq!(
             resp.model, "claude-opus-5",
-            "短い名前ではなく解決後のモデル名"
+            "the resolved model name, not the short name"
         );
     }
 
@@ -1538,8 +1538,8 @@ routes = ["a"]
             .unwrap();
 
         assert_eq!(resp.response.status, 429);
-        assert_eq!(resp.model, "m", "断られた応答にもモデル名は付く");
-        assert_eq!(resp.credential, None, "relay 型なので持ち主なし");
+        assert_eq!(resp.model, "m", "the model name is attached to a denial too");
+        assert_eq!(resp.credential, None, "no owner since it's a relay type");
     }
 
     /// 本文内エラーだけを Anthropic error JSON へ変え、upstream の message は失わない。
@@ -1608,8 +1608,8 @@ routes = ["down", "alive"]
             .unwrap();
 
         assert_eq!(resp.response.status, 200);
-        assert_eq!(down.hits(), 1, "先に試す");
-        assert_eq!(alive.hits(), 1, "落ちていたので次へ");
+        assert_eq!(down.hits(), 1, "tried first");
+        assert_eq!(alive.hits(), 1, "moved on since it was down");
     }
 
     /// 繋がらない先も飛ばす。
@@ -1675,7 +1675,7 @@ routes = ["a", "b"]
             .unwrap();
 
         assert_eq!(resp.response.status, 400);
-        assert_eq!(other.hits(), 0, "次を試さない");
+        assert_eq!(other.hits(), 0, "does not try the next one");
     }
 
     /// 2 つの認証情報を並べた設定。
@@ -1775,10 +1775,10 @@ routes = ["a", "b"]
             .unwrap();
 
         assert_eq!(resp.response.status, 429);
-        assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
+        assert_eq!((first.hits(), last.hits()), (1, 1), "both are tried");
         assert!(
             body_text(resp.response).await.contains("the last one"),
-            "最後に断られた応答の本文がそのまま返る"
+            "the body of the last denial is returned as-is"
         );
     }
 
@@ -1803,7 +1803,7 @@ routes = ["a", "b"]
         assert_eq!(
             resp.response.headers.get("retry-after"),
             Some("30"),
-            "いつ再開できるかを伝える: {:?}",
+            "tells when it can resume: {:?}",
             resp.response.headers
         );
     }
@@ -1829,7 +1829,7 @@ routes = ["a", "b"]
         assert_eq!(
             (limited.hits(), spare.hits()),
             (1, 2),
-            "2 回目は上限に当たった先を叩かない"
+            "the second time does not hit the one that hit its limit"
         );
     }
 
@@ -1888,12 +1888,12 @@ routes = ["a", "b"]
         assert_eq!(
             (picky.hits(), spare.hits()),
             (2, 2),
-            "fable は 1 回断られたら飛ばすが、haiku は同じ認証情報で試す"
+            "fable is skipped after one denial, but haiku still tries the same credential"
         );
         assert_eq!(
             preset_of(&gw, "a").availability("m-haiku", now_unix()),
             Availability::Ready,
-            "断られていないモデルに印は付かない"
+            "an undenied model gets no mark"
         );
     }
 
@@ -1920,7 +1920,7 @@ routes = ["a", "b"]
         assert_eq!((second.credential.as_str(), second.status), ("b", 200));
         assert_eq!(second.ns, NS);
         assert_eq!(second.model, "m");
-        assert_eq!(second.session_id, None, "ヘッダを付けていない");
+        assert_eq!(second.session_id, None, "no header attached");
     }
 
     /// 自前で返した 429 も、見ている人には 1 通流れる (DR-0014 §8)。
@@ -1952,12 +1952,12 @@ routes = ["a", "b"]
         assert_eq!(
             event.credential,
             crate::stats::NO_CREDENTIAL,
-            "答えたのは gateway 自身で、どの credential でもない"
+            "the gateway itself answered, not any credential"
         );
         assert_eq!(
             (far.hits(), near.hits()),
             (0, 0),
-            "知らせは流すが、upstream は叩かない"
+            "the event is published, but upstream is not hit"
         );
     }
 
@@ -1987,7 +1987,7 @@ routes = ["a", "b"]
             Availability::Denied {
                 until: reset + denial::RESET_SLACK
             },
-            "窓が開く時刻を、少し過ぎるまで"
+            "until just past the window's reopen time"
         );
     }
 
@@ -2004,12 +2004,12 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(recovered.hits(), 1, "期限切れの印は素通り");
+        assert_eq!(recovered.hits(), 1, "an expired mark is passed through");
         assert_eq!(spare.hits(), 0);
         assert_eq!(
             preset_of(&gw, "a").availability(MODEL, past - 100),
             Availability::Ready,
-            "通ったので印そのものが消える"
+            "the mark itself is cleared since it succeeded"
         );
     }
 
@@ -2037,9 +2037,9 @@ routes = ["a", "b"]
         assert_eq!(
             resp.response.headers.get("retry-after"),
             Some("100"),
-            "最初に開くのがいつかを伝える"
+            "tells when the earliest one reopens"
         );
-        assert_eq!((far.hits(), near.hits()), (0, 0), "どこにも当てない");
+        assert_eq!((far.hits(), near.hits()), (0, 0), "hits neither");
     }
 
     /// 待っても直らない断り (401 / 403) では締め出さない。
@@ -2057,7 +2057,7 @@ routes = ["a", "b"]
             assert_eq!(
                 preset_of(&gw, "a").availability(MODEL, now_unix()),
                 Availability::Ready,
-                "{status} は時間で空くものではない"
+                "{status} does not clear over time"
             );
         }
     }
@@ -2093,7 +2093,7 @@ routes = ["a"]
         let reopened = FakeUpstream::start(|_, req| {
             assert!(
                 req.starts_with("GET /api/oauth/usage"),
-                "枠を聞くだけで、実弾は撃たない: {req}"
+                "only queries quota, no real request is fired: {req}"
             );
             (200, OPEN.to_owned())
         })
@@ -2103,7 +2103,7 @@ routes = ["a"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now);
 
-        let probing = preset_of(&gw, "a").claim_ask(now).expect("札は空いている");
+        let probing = preset_of(&gw, "a").claim_ask(now).expect("the token is available");
         gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
@@ -2111,9 +2111,9 @@ routes = ["a"]
         assert_eq!(
             preset_of(&gw, "a").availability(MODEL, now),
             Availability::Ready,
-            "開いていたので印を外す"
+            "cleared the mark since it was open"
         );
-        assert_eq!(reopened.forwards(), 0, "転送は 1 本も走らない");
+        assert_eq!(reopened.forwards(), 0, "not a single forward is made");
     }
 
     /// まだ使い切っていれば、開く時刻を控え直して締め出しを続ける。
@@ -2131,7 +2131,7 @@ routes = ["a"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100), now);
 
-        let probing = preset_of(&gw, "a").claim_ask(now).expect("札は空いている");
+        let probing = preset_of(&gw, "a").claim_ask(now).expect("the token is available");
         gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
@@ -2141,7 +2141,7 @@ routes = ["a"]
             Availability::Denied {
                 until: reset + denial::RESET_SLACK
             },
-            "聞いた結果で開く時刻を引き直す"
+            "the reopen time is recalculated from the probe result"
         );
     }
 
@@ -2164,7 +2164,7 @@ routes = ["a"]
         let now = now_unix();
         let probing = preset_of(&gw, "a")
             .claim_ask(now)
-            .expect("印が無くても聞ける");
+            .expect("can probe even without a mark");
         gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
             .await
             .unwrap();
@@ -2174,12 +2174,12 @@ routes = ["a"]
                 preset_of(&gw, "a").availability("claude-fable-5", now),
                 Availability::Denied { .. }
             ),
-            "Fable の枠は使い切っている"
+            "Fable's quota is exhausted"
         );
         assert_eq!(
             preset_of(&gw, "a").availability("claude-haiku-4-5", now),
             Availability::Ready,
-            "他のモデルは巻き込まない"
+            "other models are not swept in"
         );
     }
 
@@ -2232,7 +2232,7 @@ routes = ["a", "b"]
             .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        assert_eq!(resp.response.status, 200, "実リクエストは次の経路へ");
+        assert_eq!(resp.response.status, 200, "the real request goes to the next route");
 
         // 転送の 1 本と、その後の問い合わせ。
         vague.next_request().await;
@@ -2242,7 +2242,7 @@ routes = ["a", "b"]
                 .requests()
                 .iter()
                 .any(|req| req.starts_with("GET /api/oauth/usage")),
-            "断られた理由を聞きに行く: {:?}",
+            "probes for the reason it was denied: {:?}",
             vague.requests()
         );
     }
@@ -2282,9 +2282,9 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(spare.hits(), 1, "実リクエストは断られていない方へ");
+        assert_eq!(spare.hits(), 1, "the real request goes to the undenied one");
         denied.next_request().await;
-        assert_eq!(denied.hits(), 1, "締め出している方へは裏で聞きに行く");
+        assert_eq!(denied.hits(), 1, "the denied one is probed in the background");
     }
 
     /// 枠を聞く口を持たない経路には、様子を聞きに行かない。
@@ -2304,10 +2304,10 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(denied.hits(), 0, "中継の経路には聞きに行かない");
+        assert_eq!(denied.hits(), 0, "a relay route is not probed");
         assert!(
             preset_of(&gw, "a").claim_probe(now).is_none(),
-            "枠照会 API が無いので役自体を引き受けない"
+            "does not take on the probe role at all, since there is no quota API"
         );
     }
 
@@ -2328,9 +2328,9 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "実リクエストは当てない");
+        assert_eq!(resp.response.status, 429, "the real request is not routed there");
         denied.next_request().await;
-        assert_eq!(denied.hits(), 1, "間隔を待たずに 1 本だけ聞きに行く");
+        assert_eq!(denied.hits(), 1, "a single probe fires without waiting out the interval");
     }
 
     /// 待たせる長さは、様子を聞きに行く間隔で頭を押さえる。
@@ -2464,10 +2464,10 @@ routes = ["codex", "spare"]
             .unwrap();
 
         assert_eq!(resp.response.status, 529);
-        assert_eq!((first.hits(), last.hits()), (1, 1), "どちらも試す");
+        assert_eq!((first.hits(), last.hits()), (1, 1), "both are tried");
         assert!(
             body_text(resp.response).await.contains("the last one"),
-            "最後に見た応答の本文がそのまま返る"
+            "the body of the last one seen is returned as-is"
         );
     }
 
@@ -2497,7 +2497,7 @@ routes = ["a"]
 
         assert_eq!(resp.response.status, 429);
         assert!(body_text(resp.response).await.contains("status 429"));
-        assert_eq!(limited.hits(), 1, "同じ先へ送り直さない");
+        assert_eq!(limited.hits(), 1, "not resent to the same target");
     }
 
     /// 経路断の次で断られたら、断られた応答を返す。
@@ -2530,7 +2530,7 @@ routes = ["a"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "経路断で塗り替えない");
+        assert_eq!(resp.response.status, 429, "not overwritten by a route denial");
         assert_eq!((limited.hits(), down.hits()), (1, 1));
     }
 
@@ -2565,11 +2565,11 @@ routes = ["first", "second"]
             .unwrap_err();
 
         let msg = err.to_string();
-        assert!(msg.contains('m'), "どのモデルか: {msg}");
-        assert!(msg.contains('2'), "何件試したか: {msg}");
+        assert!(msg.contains('m'), "which model: {msg}");
+        assert!(msg.contains('2'), "how many were tried: {msg}");
 
         let Error::AllUpstreamsFailed { attempts, .. } = err else {
-            panic!("全経路失敗のはず");
+            panic!("should be all routes failed");
         };
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].provider, "first");
@@ -2615,7 +2615,7 @@ routes = ["flaky", "alive"]
         assert_eq!(
             (flaky.hits(), alive.hits()),
             (1, 2),
-            "復帰した先より、通った先を優先する"
+            "a route that succeeded is preferred over one that recovered"
         );
     }
 
@@ -2650,7 +2650,7 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 429, "繋がらない先で塗り替えない");
+        assert_eq!(resp.response.status, 429, "not overwritten by an unreachable target");
         assert!(body_text(resp.response).await.contains("status 429"));
         assert_eq!(limited.hits(), 1);
     }
@@ -2700,8 +2700,8 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 200, "断られた先を飛ばして次が通る");
-        assert_eq!(negotiating.forwards(), 2, "送り直すのは 1 回だけ");
+        assert_eq!(resp.response.status, 200, "skips the denied one and the next succeeds");
+        assert_eq!(negotiating.forwards(), 2, "resent only once");
         assert_eq!(spare.hits(), 1);
     }
 
@@ -2730,7 +2730,7 @@ routes = ["a", "b"]
         assert_eq!(up.hits(), 2);
         assert!(
             body_text(resp.response).await.contains("after the retry"),
-            "送り直した側の応答が返る"
+            "the resent side's response is returned"
         );
     }
 
@@ -2747,7 +2747,7 @@ routes = ["a", "b"]
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        assert_eq!((limited.hits(), spare.hits()), (1, 1), "断られて次へ");
+        assert_eq!((limited.hits(), spare.hits()), (1, 1), "denied, then moved on");
 
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
@@ -2755,7 +2755,7 @@ routes = ["a", "b"]
         assert_eq!(
             (limited.hits(), spare.hits()),
             (1, 2),
-            "覚えるのは通った先だけ"
+            "only the successful target is remembered"
         );
     }
 
@@ -2834,7 +2834,7 @@ models = ["z-model", "a-model"]
         assert_eq!(
             gw.models(ns(&gw)).await,
             vec!["a-model", "z-model"],
-            "名前順に並ぶ"
+            "sorted by name"
         );
     }
 
@@ -2859,7 +2859,7 @@ opus = "claude-opus-*"
         assert_eq!(
             gw.models(ns(&gw)).await,
             vec!["claude-opus-5", "opus"],
-            "隠した 4-8 は出ない。opus はエイリアス"
+            "the hidden 4-8 is absent; opus is an alias"
         );
 
         let err = gw
@@ -2905,18 +2905,18 @@ advisor-tool-2026-03-01";
             .await
             .unwrap();
 
-        assert_eq!(resp.response.status, 200, "落として送り直した結果が返る");
-        assert_eq!(up.hits(), 2, "送り直すのは 1 回だけ");
+        assert_eq!(resp.response.status, 200, "returns the result after dropping and resending");
+        assert_eq!(up.hits(), 2, "resent only once");
 
         let sent = up.requests();
         assert!(
             sent[0].contains("anthropic-beta"),
-            "1 本目はそのまま送る: {}",
+            "the first attempt is sent as-is: {}",
             sent[0]
         );
         assert!(
             !sent[1].to_lowercase().contains("anthropic-beta"),
-            "2 本目は落として送る: {}",
+            "the second attempt is sent with it dropped: {}",
             sent[1]
         );
 
@@ -2924,7 +2924,7 @@ advisor-tool-2026-03-01";
         for flag in CLIENT_BETA.split(',') {
             assert!(
                 learned.denied_beta.contains_key(flag),
-                "名前が分からないので送った分を覚える: {:?}",
+                "the name is unknown, so what was sent is remembered: {:?}",
                 learned.denied_beta
             );
         }
@@ -2933,10 +2933,10 @@ advisor-tool-2026-03-01";
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
             .await
             .unwrap();
-        assert_eq!(up.hits(), 3, "2 度目は 1 本で済む");
+        assert_eq!(up.hits(), 3, "the second time takes only one attempt");
         assert!(
             !up.requests()[2].to_lowercase().contains("anthropic-beta"),
-            "覚えた分を載せ直さない: {}",
+            "a remembered entry is not re-added: {}",
             up.requests()[2]
         );
     }
@@ -2956,16 +2956,16 @@ advisor-tool-2026-03-01";
             .unwrap();
 
         assert_eq!(resp.response.status, 200);
-        assert_eq!(up.hits(), 1, "400 を踏まずに済む");
+        assert_eq!(up.hits(), 1, "avoids hitting the 400 at all");
 
         let sent = &up.requests()[0];
         assert!(
             sent.contains("oauth-2025-04-20") && sent.contains("claude-code-20250219"),
-            "拒否されていない分は残す: {sent}"
+            "an unrejected entry is kept: {sent}"
         );
         assert!(
             !sent.contains("advisor-tool-2026-03-01"),
-            "覚えた分だけ落とす: {sent}"
+            "only the remembered entry is dropped: {sent}"
         );
     }
 
@@ -2989,7 +2989,7 @@ advisor-tool-2026-03-01";
 
         assert!(
             up.requests()[0].contains("advisor-tool-2026-03-01"),
-            "24 時間経ったものは通してみる: {}",
+            "an entry past 24 hours is retried: {}",
             up.requests()[0]
         );
     }
@@ -3009,12 +3009,12 @@ advisor-tool-2026-03-01";
         assert_eq!(resp.response.status, 400);
         assert!(
             body_text(resp.response).await.contains("status 400"),
-            "本文を読んだ後もそのまま返す"
+            "returned as-is even after the body was read"
         );
-        assert_eq!(up.hits(), 1, "送り直さない");
+        assert_eq!(up.hits(), 1, "not resent");
         assert!(
             store.saved().denied_beta.is_empty(),
-            "beta のせいでないなら覚えない"
+            "not remembered when it wasn't beta's fault"
         );
     }
 
@@ -3042,11 +3042,11 @@ advisor-tool-2026-03-01";
         assert_eq!(
             learned.denied_beta.keys().collect::<Vec<_>>(),
             vec!["advisor-tool-2026-03-01"],
-            "通るフラグを巻き添えにしない"
+            "a passing flag is not caught up in it"
         );
         assert!(
             up.requests()[1].contains("claude-code-20250219"),
-            "残りは載せたまま送り直す: {}",
+            "resent with the rest still attached: {}",
             up.requests()[1]
         );
     }
@@ -3071,14 +3071,14 @@ advisor-tool-2026-03-01";
         assert_eq!(
             reloaded.denied_beta_at(now_unix()).len(),
             3,
-            "読み直しても落とす対象のまま: {json}"
+            "still marked for dropping after reload: {json}"
         );
         assert!(
             reloaded
                 .denied_beta
                 .values()
                 .all(|t| t == &format_rfc3339(crate::credential::time::parse_rfc3339(t).unwrap())),
-            "時刻は RFC 3339 で書く: {json}"
+            "the time is written as RFC 3339: {json}"
         );
     }
 
@@ -3118,21 +3118,21 @@ models = ["m"]
         let names: Vec<&str> = report.credentials.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["bedrock", "claude-personal", "cpa"]);
 
-        assert!(report.probe.is_none(), "既定では投げない");
+        assert!(report.probe.is_none(), "not fired by default");
         assert!(
             report.credentials.iter().all(|c| c.snapshot.is_none()),
-            "転送していないので未観測"
+            "unobserved since nothing was forwarded"
         );
         assert!(
             report
                 .credentials
                 .iter()
                 .all(|c| c.support != crate::quota::Support::Observed),
-            "取れない扱いは support の値で分かる"
+            "an unobtainable state is reflected in the support value"
         );
         assert!(
             report.credentials.iter().all(|c| c.limits.is_none()),
-            "聞きに行っていないので枠も無い"
+            "no limit since it was never queried"
         );
     }
 
@@ -3217,15 +3217,15 @@ models = ["m"]
             .credentials
             .iter()
             .find(|c| c.name == "a")
-            .expect("設定にある");
-        let limits = subscription.limits.as_ref().expect("聞けている");
+            .expect("present in config");
+        let limits = subscription.limits.as_ref().expect("was queried");
 
         assert_eq!(limits.len(), 2);
         assert_eq!(limits[1].kind, "weekly_scoped");
         assert_eq!(
             limits[1].model.as_deref(),
             Some("Fable"),
-            "どのモデルの枠かが分かる"
+            "identifies which model the limit is for"
         );
         assert_eq!(limits[1].percent, 80.0);
 
@@ -3233,8 +3233,8 @@ models = ["m"]
             .credentials
             .iter()
             .find(|c| c.name == "relayed")
-            .expect("設定にある");
-        assert!(other.limits.is_none(), "聞ける相手でなければ欄ごと出さない");
+            .expect("present in config");
+        assert!(other.limits.is_none(), "the field is omitted entirely when unqueryable");
     }
 
     /// 非消費 quota API を持つ経路は、推論 probe が無くても枠を取得する。
@@ -3279,7 +3279,7 @@ models = ["gpt-5.3-codex"]
             .find(|entry| entry.name == "codex")
             .unwrap();
         assert_eq!(entry.limits.as_ref().unwrap()[0].percent, 25.0);
-        assert_eq!(report.probe.unwrap().requests, 0, "推論 token は使わない");
+        assert_eq!(report.probe.unwrap().requests, 0, "does not spend reasoning tokens");
     }
 
     /// プローブが失敗した credential は理由を載せ、他は返す。
@@ -3309,15 +3309,15 @@ url = "https://bedrock.invalid/anthropic"
         .await;
 
         let report = gw.usage_report(true).await;
-        let probe = report.probe.expect("投げた記録が残る");
-        assert_eq!(probe.requests, 1, "枠を聞ける口を持つのは 1 本だけ");
+        let probe = report.probe.expect("a probe record remains");
+        assert_eq!(probe.requests, 1, "only one has a queryable quota endpoint");
         assert_eq!(
             probe.model,
             preset_of(&gw, "nowhere")
                 .probe_request()
-                .expect("枠を聞ける経路")
+                .expect("a route with a queryable quota")
                 .model,
-            "何を投げたかは経路が決めた通りに出る"
+            "what was sent reflects exactly what the route decided"
         );
 
         let by_name = |name: &str| {
@@ -3325,16 +3325,16 @@ url = "https://bedrock.invalid/anthropic"
                 .credentials
                 .iter()
                 .find(|c| c.name == name)
-                .expect("設定にある")
+                .expect("present in config")
                 .clone()
         };
         assert!(
             by_name("nowhere").probe_error.is_some(),
-            "繋がらなかった理由を載せる"
+            "includes the reason it was unreachable"
         );
         assert!(
             by_name("bedrock").probe_error.is_none(),
-            "投げていない相手に失敗は書かない"
+            "a failure is not recorded for a target that was never probed"
         );
     }
 
@@ -3374,19 +3374,19 @@ models = ["claude-opus-5"]
             .days
             .values()
             .next()
-            .expect("記録した日の分が出ている");
+            .expect("the recorded day's entry is present");
 
         assert_eq!(day.credentials["a"]["claude-opus-5"].usd, Some(5.0));
         assert_eq!(
             day.credentials[crate::stats::NO_CREDENTIAL]["claude-opus-5"].usd,
             Some(5.0),
-            "持ち主なしの行も、モデルから経路を辿って換算する"
+            "an ownerless row is still converted by tracing the route from the model"
         );
         assert_eq!(
             day.credentials["a"]["who-knows"].usd, None,
-            "推測した額を出さない"
+            "does not emit a guessed amount"
         );
-        assert_eq!(day.total_usd, Some(10.0), "値の付く行だけの和");
+        assert_eq!(day.total_usd, Some(10.0), "the sum of only the priced rows");
     }
 
     /// 短い名前で指定できる。upstream には実際のモデル名で送る。
@@ -3409,7 +3409,7 @@ opus = "claude-opus-*"
 
         assert!(
             gw.models(ns(&gw)).await.contains(&"opus".to_owned()),
-            "一覧に短い名前も出る"
+            "the short name appears in the listing too"
         );
 
         let resp = gw
