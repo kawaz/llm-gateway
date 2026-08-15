@@ -590,9 +590,9 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(3, 1));
 
         let counts = s.in_memory();
-        let day = counts.values().next().expect("1 日分");
+        let day = counts.values().next().expect("one day's worth");
         let c = &day["a"]["m"];
-        assert_eq!(c.requests, 2, "本数も数える");
+        assert_eq!(c.requests, 2, "the count is tallied too");
         assert_eq!(input_of(c), 13);
         assert_eq!(output_of(c), 6);
     }
@@ -632,7 +632,7 @@ mod tests {
         let day = &s.report(7, NOW, &Rates).days[&local_date(NOW)];
         let models = &day.credentials["a"];
         assert_eq!(models["m-cheap"].usd, Some(1.0));
-        assert_eq!(models["who-knows"].usd, None, "推測した額を出さない");
+        assert_eq!(models["who-knows"].usd, None, "does not emit a guessed amount");
         // トークン数はどちらも残る。
         assert_eq!(input_of(&models["who-knows"].counters), 1_000_000);
     }
@@ -690,7 +690,7 @@ mod tests {
 
         let report = s.report(7, NOW, &Rates);
         assert_eq!(report.days[&local_date(NOW)].total_usd, Some(6.0));
-        assert_eq!(report.total_usd, Some(6.0), "全体も同じ和");
+        assert_eq!(report.total_usd, Some(6.0), "the total is the same sum");
     }
 
     /// 1 行も値付けできない日は、合計の欄ごと出さない。
@@ -738,11 +738,11 @@ mod tests {
         s.record(NOW, Some("a"), "m-rich", &usage);
 
         let entry = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
-        assert_eq!(entry.usd, Some(5.0), "input の分だけ。内訳を上乗せしない");
+        assert_eq!(entry.usd, Some(5.0), "only the input portion; breakdowns are not stacked on top");
         assert_eq!(
             count(&entry.counters, TokenKind::new("input.ephemeral_1h")),
             900_000,
-            "課金しない内訳も観測値としては残る"
+            "non-billed breakdowns are still kept as observed values"
         );
     }
 
@@ -778,7 +778,7 @@ mod tests {
 
         let counts = s.in_memory();
         let day = counts.values().next().unwrap();
-        assert_eq!(day["a"].len(), 2, "同じ認証情報の 2 モデル");
+        assert_eq!(day["a"].len(), 2, "2 models under the same credential");
         assert_eq!(input_of(&day["a"]["opus"]), 2);
         assert_eq!(input_of(&day["b"]["haiku"]), 4);
     }
@@ -823,9 +823,9 @@ mod tests {
         s.record(NOW + 2 * 86_400, Some("a"), "m", &tokens(2, 2));
 
         let counts = s.in_memory();
-        assert_eq!(counts.len(), 2, "2 日分に分かれる: {counts:?}");
+        assert_eq!(counts.len(), 2, "split into 2 days: {counts:?}");
         for day in counts.values() {
-            assert_eq!(day["a"]["m"].requests, 1, "日を跨いで混ざらない");
+            assert_eq!(day["a"]["m"].requests, 1, "not mixed across days");
         }
     }
 
@@ -846,12 +846,12 @@ mod tests {
         // 再起動に相当する。
         let after = {
             let s = stats(dir.path());
-            assert!(s.in_memory().is_empty(), "読み戻す前は空");
+            assert!(s.in_memory().is_empty(), "empty before reloading");
             s.restore(NOW);
             s.in_memory()
         };
 
-        assert_eq!(after, before, "落とした分がそのまま戻る (未知の区分も)");
+        assert_eq!(after, before, "dropped fields come back as-is (including unknown categories)");
     }
 
     /// ディスクに落ちる形は `requests` + 区分ごとの `tokens`。
@@ -898,7 +898,7 @@ mod tests {
         s.restore(NOW);
         let counts = s.in_memory();
         let c = &counts.values().next().unwrap()["a"]["m"];
-        assert_eq!(c.requests, 2, "前回の 1 本に足す");
+        assert_eq!(c.requests, 2, "adds to the previous one");
         assert_eq!(input_of(c), 11);
     }
 
@@ -951,7 +951,7 @@ mod tests {
         assert_eq!(
             saved["a"]["m"],
             serde_json::json!({"requests": 2, "tokens": {"input": 11, "output": 6}}),
-            "使っていなかった区分は 0 のまま並べ直さない"
+            "an unused category is not reordered while staying at 0"
         );
     }
 
@@ -981,8 +981,8 @@ mod tests {
         let legacy = day.credentials["legacy"]["m-rich"].usd;
         let normalized = day.credentials["normalized"]["m-rich"].usd;
         assert_eq!(legacy, Some(36.75));
-        assert_eq!(legacy, normalized, "旧形式でも換算は変わらない");
-        assert_eq!(day.total_usd, Some(73.5), "合計は 2 行の和");
+        assert_eq!(legacy, normalized, "the conversion is unchanged for the legacy format too");
+        assert_eq!(day.total_usd, Some(73.5), "the total is the sum of 2 rows");
     }
 
     /// 日ごとに別のファイルへ落ちる。
@@ -1001,11 +1001,11 @@ mod tests {
         names.sort();
         assert_eq!(names.len(), 2, "{names:?}");
         for name in &names {
-            assert!(name.ends_with(".8402.json"), "書き手の名前が入る: {name}");
+            assert!(name.ends_with(".8402.json"), "includes the writer's name: {name}");
         }
         assert!(
             !names.iter().any(|n| n.contains("tmp")),
-            "一時ファイルを残さない: {names:?}"
+            "no temp file is left behind: {names:?}"
         );
     }
 
@@ -1022,7 +1022,7 @@ mod tests {
 
         s.flush().unwrap();
         let second = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(first, second, "2 度目は触らない");
+        assert_eq!(first, second, "the second time is untouched");
     }
 
     /// 別 writer のファイルも足して見せる。
@@ -1042,7 +1042,7 @@ mod tests {
 
         let report = s.report(7, NOW, &Rates);
         let c = &report.days[&local_date(NOW)].credentials["a"]["m"].counters;
-        assert_eq!(c.requests, 2, "両方の writer を数える");
+        assert_eq!(c.requests, 2, "counts both writers");
         assert_eq!(input_of(c), 101);
         assert_eq!(output_of(c), 52);
     }
@@ -1058,7 +1058,7 @@ mod tests {
         s.flush().unwrap();
 
         let c = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
-        assert_eq!(c.requests, 1, "1 本のまま");
+        assert_eq!(c.requests, 1, "stays at one");
         assert_eq!(input_of(c), 10);
     }
 
@@ -1070,7 +1070,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(3, 4));
 
         let c = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
-        assert_eq!(output_of(c), 4, "保存を待たずに見える");
+        assert_eq!(output_of(c), 4, "visible without waiting for a save");
     }
 
     /// `days` で直近だけに絞れる。
@@ -1082,11 +1082,11 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(2, 2));
 
         let recent = s.report(7, NOW, &Rates);
-        assert_eq!(recent.days.len(), 1, "10 日前は入らない: {:?}", recent.days);
+        assert_eq!(recent.days.len(), 1, "10 days ago is excluded: {:?}", recent.days);
         assert!(recent.days.contains_key(&local_date(NOW)));
 
         let all = s.report(0, NOW, &Rates);
-        assert_eq!(all.days.len(), 2, "0 なら絞らない");
+        assert_eq!(all.days.len(), 2, "0 means no filtering");
     }
 
     /// 今日を 1 日と数える。
@@ -1124,7 +1124,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
 
         let report = s.report(7, NOW, &Rates);
-        assert_eq!(report.days.len(), 1, "自分の分だけ: {:?}", report.days);
+        assert_eq!(report.days.len(), 1, "only its own: {:?}", report.days);
     }
 
     #[test]
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(names.len(), 1);
         assert!(
             date_of_file(&names[0]).is_some(),
-            "日付が読み出せる名前になる: {}",
+            "becomes a name the date can be read from: {}",
             names[0]
         );
         // 書いたものを自分で読み戻せる。
@@ -1190,12 +1190,12 @@ mod tests {
         s.restore(NOW);
         assert!(
             !s.in_memory().contains_key(&local_date(old)),
-            "10 日前はメモリに載せない"
+            "10 days ago is not loaded into memory"
         );
 
         let report = s.report(0, NOW, &Rates);
         let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
-        assert_eq!(c.requests, 1, "過去日はファイルから読む");
+        assert_eq!(c.requests, 1, "a past day is read from the file");
         assert_eq!(input_of(c), 100);
     }
 
@@ -1222,8 +1222,8 @@ mod tests {
         let s = stats(dir.path());
         let report = s.report(0, NOW, &Rates);
         let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
-        assert_eq!(c.requests, 2, "前からあった 1 本に足す");
-        assert_eq!(input_of(c), 101, "上書きで消さない");
+        assert_eq!(c.requests, 2, "adds to the one already there");
+        assert_eq!(input_of(c), 101, "not erased by the overwrite");
     }
 
     /// 変わった日だけを書き直す。
@@ -1249,7 +1249,7 @@ mod tests {
         s.flush().unwrap();
 
         let after = std::fs::metadata(&old_path).unwrap().modified().unwrap();
-        assert_eq!(before, after, "変わっていない日は触らない");
+        assert_eq!(before, after, "an unchanged day is untouched");
 
         // 当日側は更新されている。
         let today = read_day(&s.path_of(&local_date(NOW))).unwrap();
@@ -1266,7 +1266,7 @@ mod tests {
 
         let s = Stats::new(&blocked, "8402");
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
-        assert!(s.flush().is_err(), "書けないので失敗する");
+        assert!(s.flush().is_err(), "fails because it cannot write");
 
         // 目印が残っているので、書ける状態になれば落ちる。
         std::fs::remove_file(&blocked).unwrap();
@@ -1329,10 +1329,10 @@ mod tests {
 
         stats(dir.path()).restore(NOW);
 
-        assert!(!mine.exists(), "自分の書き損じは消す");
+        assert!(!mine.exists(), "removes its own failed write");
         assert!(
             theirs.exists(),
-            "他の writer の一時ファイルは触らない (書いている途中かもしれない)"
+            "does not touch another writer's temp file (it may still be in progress)"
         );
     }
 
@@ -1347,7 +1347,7 @@ mod tests {
             let report = s.report(days, NOW, &Rates);
             assert!(
                 report.days.contains_key(&local_date(NOW)),
-                "days={days} で当日が消える"
+                "today disappears with days={days}"
             );
         }
     }
