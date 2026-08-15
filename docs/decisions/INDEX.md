@@ -20,6 +20,7 @@
 - [DR-0016](./DR-0016-ns-thinking-display-override.md) — ns 単位の thinking.display 強制上書き (CC #49268 の workaround、opt-in)
 - [DR-0017](./DR-0017-debug-tap-endpoint.md) — デバッグ用 tap endpoint (購読時のみ動く観測口、本文 opt-in、loopback 直結限定)
 - [DR-0018](./DR-0018-spend-down-priority.md) — リセット間際の枠を優先して使い切る (`spend_down_within`、最長周期枠のみ、affinity が上位)
+- [DR-0019](./DR-0019-pace-cap.md) — 借りる枠は経過した時間ぶんまで (`pace_cap` の階段予算、按分線を超えたら次段まで控える)
 
 ## Archived
 
