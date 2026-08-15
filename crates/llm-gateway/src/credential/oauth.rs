@@ -1029,7 +1029,7 @@ mod tests {
         let r: RefreshResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(r.access_token.as_deref(), Some("new-at"));
         assert_eq!(r.refresh_token.as_deref(), Some("new-rt"));
-        assert_eq!(r.expires_in, Some(28_800), "Anthropic は 8 時間");
+        assert_eq!(r.expires_in, Some(28_800), "Anthropic uses 8 hours");
         assert_eq!(
             r.account.and_then(|a| a.email_address).as_deref(),
             Some("someone@example.com")
@@ -1095,7 +1095,7 @@ mod tests {
             a, b,
             "if it were the same every time, state and PKCE would be meaningless"
         );
-        assert_eq!(a.len(), 43, "32 バイトを base64url にした長さ");
+        assert_eq!(a.len(), 43, "length of 32 bytes base64url-encoded");
         assert!(
             a.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     fn query_of(url: &str) -> std::collections::HashMap<String, String> {
-        let query = url.split_once('?').expect("query がある").1;
+        let query = url.split_once('?').expect("has a query").1;
         url::form_urlencoded::parse(query.as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect()
@@ -1266,7 +1266,7 @@ mod tests {
         assert_eq!(t.refresh_token, "rt");
         assert_eq!(t.expires_in, 28_800);
         assert_eq!(t.email.as_deref(), Some("someone@example.com"));
-        assert!(t.account_id.is_none(), "Claude 側は account_id を持たない");
+        assert!(t.account_id.is_none(), "the Claude side has no account_id");
     }
 
     /// refresh token が無いと 8 時間で使えなくなる。保存する前に止める。
@@ -1353,19 +1353,19 @@ mod tests {
         }
         .to_stored_at(Kind::Claude, Some(&base), NOW + 60);
 
-        assert_eq!(next.payload.secret(), "at-2", "token は入れ替わる");
+        assert_eq!(next.payload.secret(), "at-2", "the token is swapped");
         assert_eq!(next.priority, 20);
         assert!(next.disabled);
         assert_eq!(next.excluded_models, vec!["claude-opus-*"]);
         assert_eq!(next.denied_beta_expires_ms, 3_600_000);
         assert!(
             next.denied_beta.contains_key("advisor-tool-2026-03-01"),
-            "upstream の観測結果は認可と無関係なので残す"
+            "upstream observations are unrelated to auth, so they are kept"
         );
         assert_eq!(
             next.payload.email(),
             "someone@example.com",
-            "分からなかった項目で既存の値を消さない"
+            "an unknown field does not clear an existing value"
         );
     }
 
@@ -1385,7 +1385,7 @@ mod tests {
         let json = serde_json::to_value(&next).unwrap();
         assert!(
             json["payload"].get("id_token").is_none(),
-            "前回の残骸を持ち回らない: {json}"
+            "does not carry over leftovers from before: {json}"
         );
     }
 
@@ -1534,7 +1534,7 @@ mod tests {
         tokio::spawn(async move {
             match reqwest::get(url).await {
                 Ok(resp) => resp.text().await.unwrap_or_default(),
-                Err(e) => panic!("戻り先を叩けません: {e}"),
+                Err(e) => panic!("cannot reach the return destination: {e}"),
             }
         })
     }
@@ -1576,7 +1576,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "at");
-        assert_eq!(saved.into_inner().as_deref(), Some("at"), "保存まで進む");
+        assert_eq!(saved.into_inner().as_deref(), Some("at"), "proceeds all the way to saving");
 
         let page = page.await.unwrap();
         assert!(page.contains("Authorization succeeded"), "{page}");
@@ -1660,7 +1660,7 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("state"), "{err}");
-        assert!(saved.into_inner().is_none(), "保存まで進まない");
+        assert!(saved.into_inner().is_none(), "does not proceed to saving");
         assert!(page.await.unwrap().contains("Authorization failed"));
     }
 
@@ -1721,7 +1721,7 @@ mod tests {
         assert!(err.contains("log in again"), "{err}");
         assert!(
             saved.into_inner().is_none(),
-            "交換できていないので保存しない"
+            "not saved because the exchange did not complete"
         );
 
         let page = page.await.unwrap();
@@ -1759,7 +1759,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("rejected"), "{err}");
-        assert!(saved.into_inner().is_none(), "使えない token は保存しない");
+        assert!(saved.into_inner().is_none(), "an unusable token is not saved");
         assert!(page.await.unwrap().contains("Authorization failed"));
     }
 
@@ -1842,7 +1842,7 @@ mod tests {
             finished
         );
 
-        assert_eq!(result.unwrap(), "at", "1 本目はそのまま通る");
+        assert_eq!(result.unwrap(), "at", "the first one passes through as-is");
         assert!(second.contains("already accepted"), "{second}");
         assert!(first.await.unwrap().contains("Authorization succeeded"));
     }

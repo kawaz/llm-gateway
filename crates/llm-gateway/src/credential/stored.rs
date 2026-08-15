@@ -457,12 +457,12 @@ mod tests {
                 "denied_beta",
                 "payload",
             ],
-            "並びごと固定する:\n{json}"
+            "the field order is fixed:\n{json}"
         );
 
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "claude_oauth");
-        assert_eq!(v["excluded_models"][0], "claude-opus-*", "ハイフンでない");
+        assert_eq!(v["excluded_models"][0], "claude-opus-*", "not a hyphen");
         assert_eq!(v["denied_beta_expires_ms"], 86_400_000);
         assert_eq!(
             v["denied_beta"]["advisor-tool-2026-03-01"],
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(v["payload"]["email"], "someone@example.com");
         assert!(
             v["payload"].get("account_id").is_none(),
-            "claude 側は account_id を持たない: {json}"
+            "the claude side has no account_id: {json}"
         );
     }
 
@@ -518,7 +518,7 @@ mod tests {
         let claude = Payload::ClaudeOauth(oauth("at"));
         assert_eq!(claude.oauth_kind(), Some(Kind::Claude));
         assert_eq!(claude.refresh_token(), Some("rt"));
-        assert_eq!(claude.account_id(), None, "claude に account_id は無い");
+        assert_eq!(claude.account_id(), None, "claude has no account_id");
 
         let codex = Payload::CodexOauth(CodexTokens {
             oauth: oauth("at"),
@@ -529,11 +529,11 @@ mod tests {
         assert_eq!(codex.account_id(), Some("acc-1"));
 
         let bedrock = Payload::BedrockApiKey(api_key(BTreeMap::new()));
-        assert_eq!(bedrock.oauth_kind(), None, "更新の口が無い");
+        assert_eq!(bedrock.oauth_kind(), None, "no refresh mechanism");
         assert_eq!(
             bedrock.refresh_token(),
             None,
-            "OAuth ではないので refresh token を持たない"
+            "not OAuth, so it has no refresh token"
         );
         assert_eq!(bedrock.secret(), "ak");
         assert_eq!(bedrock.email(), "");
@@ -571,7 +571,7 @@ mod tests {
         assert!(!c.disabled);
         assert!(c.excluded_models.is_empty());
         assert!(c.denied_beta.is_empty());
-        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "既定は 24 時間");
+        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "default is 24 hours");
 
         let err = serde_json::from_str::<StoredCredential>(r#"{"type": "claude_oauth"}"#)
             .unwrap_err()
@@ -596,7 +596,7 @@ mod tests {
         let err = serde_json::from_str::<StoredCredential>(raw)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("claude_oauth"), "指定できる語を示す: {err}");
+        assert!(err.contains("claude_oauth"), "shows the accepted term: {err}");
     }
 
     fn with_denied(flag: &str, at: i64, expires_ms: u64) -> StoredCredential {
@@ -627,11 +627,11 @@ mod tests {
         let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
         assert!(
             c.denies_beta("advisor-tool-2026-03-01", NOW + 86_399),
-            "24 時間未満はまだ落とす"
+            "still dropped under 24 hours"
         );
         assert!(
             !c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400),
-            "24 時間経ったら試す"
+            "retried once 24 hours pass"
         );
         assert!(!c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400 * 30));
     }
@@ -641,10 +641,10 @@ mod tests {
     fn interval_is_configurable() {
         let c = with_denied("f", NOW, 3_600_000);
         assert!(c.denies_beta("f", NOW + 3599));
-        assert!(!c.denies_beta("f", NOW + 3600), "1 時間で試し直す");
+        assert!(!c.denies_beta("f", NOW + 3600), "retried after 1 hour");
 
         let never = with_denied("f", NOW, 0);
-        assert!(!never.denies_beta("f", NOW), "0 なら毎回試す");
+        assert!(!never.denies_beta("f", NOW), "with 0, retried every time");
     }
 
     /// 時刻が読めない記録は落とさない (書き損じで機能を永久に失わない)。
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(denied, BTreeSet::from(["fresh".to_owned()]));
         assert!(
             c.denied_beta.contains_key("old"),
-            "期限切れの記録自体は消さない"
+            "an expired record itself is not removed"
         );
     }
 
@@ -676,7 +676,7 @@ mod tests {
         let mut c = with_denied("f", NOW, DAY_MS);
         c.record_denied_beta(&["f".to_owned()], NOW + 86_400 * 3);
 
-        assert_eq!(c.denied_beta.len(), 1, "重複して増えない");
+        assert_eq!(c.denied_beta.len(), 1, "does not grow on duplicates");
         assert!(c.denies_beta("f", NOW + 86_400 * 3));
     }
 

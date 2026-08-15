@@ -151,11 +151,11 @@ listen = "127.0.0.1:8402"
         assert_eq!(
             merged["routes"]["bedrock"]["url"].as_str(),
             Some("https://bedrock.invalid/anthropic"),
-            "触っていない土台の項目は残る"
+            "untouched base entries remain"
         );
         assert!(
             merged.get("extends").is_none(),
-            "重ね終わったら、指示そのものは残さない"
+            "once merged, the directive itself is not kept"
         );
     }
 
@@ -179,7 +179,7 @@ exclude = ["*"]
         assert_eq!(
             route["provider"].as_str(),
             Some("anthropic"),
-            "書いていない項目は土台から来る"
+            "an unwritten field comes from the base"
         );
         assert_eq!(
             route["url"].as_str(),
@@ -188,7 +188,7 @@ exclude = ["*"]
         assert_eq!(
             route["exclude"].as_array().unwrap(),
             &[Value::from("*")],
-            "書いた項目だけが変わる"
+            "only the written field changes"
         );
     }
 
@@ -213,7 +213,7 @@ routes = ["oauth"]
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(routing.len(), 1, "土台の規則は残らない: {routing:?}");
+        assert_eq!(routing.len(), 1, "base rules do not survive: {routing:?}");
         assert_eq!(routing[0]["routes"][0].as_str(), Some("oauth"));
     }
 
@@ -276,17 +276,17 @@ exclude = ["c が書いた"]
         assert_eq!(
             merged["routes"]["bedrock"]["exclude"].as_array().unwrap(),
             &[Value::from("c が書いた")],
-            "一番手前が勝つ"
+            "the closest one wins"
         );
         assert_eq!(
             merged["server"]["listen"].as_str(),
             Some("127.0.0.1:8402"),
-            "途中の段が書いた分も効く"
+            "what an intermediate layer wrote still applies"
         );
         assert_eq!(
             merged["credentials"]["bedrock"]["type"].as_str(),
             Some("bedrock_api_key"),
-            "一番奥の段も残る"
+            "the outermost layer also survives"
         );
     }
 
@@ -296,7 +296,7 @@ exclude = ["c が書いた"]
         let dir = spread(&[("here.toml", "extends = \"here.toml\"\n")]);
         let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
         assert!(e.contains("circular"), "{e}");
-        assert!(e.contains("here.toml"), "どのファイルかが分かる: {e}");
+        assert!(e.contains("here.toml"), "identifies which file: {e}");
     }
 
     /// 遠回りの循環も止める。
@@ -316,8 +316,8 @@ exclude = ["c が書いた"]
     fn a_missing_base_says_who_pointed_where() {
         let dir = spread(&[("here.toml", "extends = \"nowhere.toml\"\n")]);
         let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
-        assert!(e.contains("here.toml"), "指した側: {e}");
-        assert!(e.contains("nowhere.toml"), "指された先: {e}");
+        assert!(e.contains("here.toml"), "the pointing side: {e}");
+        assert!(e.contains("nowhere.toml"), "the pointed-to target: {e}");
     }
 
     /// パスでない extends は、その場で言う。

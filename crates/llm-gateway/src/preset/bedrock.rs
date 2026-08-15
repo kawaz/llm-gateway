@@ -126,7 +126,7 @@ extended-cache-ttl-2025-04-11";
                 preset.wire() as *const dyn Wire as *const (),
                 Arc::as_ptr(&wire) as *const (),
             ),
-            "preset が持つ Wire が、渡したものと別の実体になっている"
+            "the Wire held by the preset is a different instance from the one passed in"
         );
     }
 
@@ -147,7 +147,7 @@ extended-cache-ttl-2025-04-11";
 
         assert_eq!(
             via_official.upstream.url, "https://api.anthropic.com/v1/messages",
-            "公式はクライアントの名前のまま"
+            "official keeps the client's name as-is"
         );
         assert_eq!(via_bedrock.upstream.url, format!("{BASE_URL}/v1/messages"));
 
@@ -156,7 +156,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             sent(&via_official.upstream)["model"],
             sent(&via_bedrock.upstream)["model"],
-            "方言が同じなので、送る本文も同じ (名前の読み替えは Wire の外)"
+            "same dialect, so the same body is sent (name remapping happens outside Wire)"
         );
         assert_eq!(
             via_official.upstream.headers.get("content-type"),
@@ -178,7 +178,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             with_api_key.upstream.headers.get("authorization"),
             None,
-            "Bearer では 401 になる"
+            "Bearer results in a 401"
         );
 
         let mut with_bearer = wire().encode(request("claude-opus-5")).unwrap();
@@ -198,7 +198,7 @@ extended-cache-ttl-2025-04-11";
         assert_eq!(
             bedrock().quota_support(),
             Support::NotApplicable,
-            "聞く口が無いのではなく、そもそも取れない"
+            "not that there's no endpoint to ask, it's simply unobtainable"
         );
     }
 
@@ -219,17 +219,17 @@ extended-cache-ttl-2025-04-11";
         let mut headers = Headers::new(vec![("anthropic-beta".to_owned(), CLIENT_BETA.to_owned())]);
         bedrock()
             .negotiation()
-            .expect("beta の交渉を持つ")
+            .expect("has beta negotiation")
             .prepare(&mut headers, &[]);
 
-        let kept = headers.get("anthropic-beta").expect("残るものがある");
+        let kept = headers.get("anthropic-beta").expect("something remains");
         for gone in [
             "oauth-2025-04-20",
             "prompt-caching-scope-2026-01-05",
             "advisor-tool-2026-03-01",
             "extended-cache-ttl-2025-04-11",
         ] {
-            assert!(!kept.contains(gone), "{gone} は落とす: {kept}");
+            assert!(!kept.contains(gone), "{gone} should be dropped: {kept}");
         }
         for stays in [
             "interleaved-thinking-2025-05-14",
@@ -237,7 +237,7 @@ extended-cache-ttl-2025-04-11";
             "context-management-2025-06-27",
             "claude-code-20250219",
         ] {
-            assert!(kept.contains(stays), "{stays} は残す: {kept}");
+            assert!(kept.contains(stays), "{stays} should be kept: {kept}");
         }
     }
 
@@ -248,11 +248,11 @@ extended-cache-ttl-2025-04-11";
         let mut headers = Headers::new(vec![("anthropic-beta".to_owned(), CLIENT_BETA.to_owned())]);
         overridden
             .negotiation()
-            .expect("beta の交渉を持つ")
+            .expect("has beta negotiation")
             .prepare(&mut headers, &[]);
 
         let kept = headers.get("anthropic-beta").unwrap();
-        assert!(!kept.contains("claude-code-20250219"), "指定した分は落ちる");
-        assert!(kept.contains("oauth-2025-04-20"), "既定リストは使わない");
+        assert!(!kept.contains("claude-code-20250219"), "the specified entry is dropped");
+        assert!(kept.contains("oauth-2025-04-20"), "the default list is not used");
     }
 }
