@@ -155,7 +155,7 @@ to listen, remove disabled from [server], or point --config at another configura
             credentials = %dir.display(),
             stats = %config.stats.resolve_dir().display(),
             namespaces = gateway.namespace_names().len(),
-            "待ち受けを始めます"
+            "listening"
         );
 
         // 誰でも通る面は、起動時に名前を出す。手前で境界を引く運用では正しい
@@ -172,7 +172,7 @@ to listen, remove disabled from [server], or point --config at another configura
         if !open.is_empty() {
             tracing::info!(
                 namespaces = %open.join(", "),
-                "認証なしで公開しています (手前で境界を引いてください)"
+                "exposed without authentication (put a boundary in front of it)"
             );
         }
 
@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(
             disk.steps(),
             vec!["lock", "load", "store", "unlock"],
-            "土台を読む前に締め出し、書き終えてから手放す"
+            "blocked before reading the base, released after writing"
         );
     }
 
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(err.contains("only one name"), "{err}");
         assert!(
             err.contains("`a`") && err.contains("`b`"),
-            "両方を示す: {err}"
+            "shows both: {err}"
         );
     }
 
@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn usage_takes_refresh_and_config() {
         let plain = usage_args(&[]).unwrap();
-        assert!(!plain.refresh, "既定では投げない (利用量を消費しない)");
+        assert!(!plain.refresh, "not fired by default (does not consume usage)");
         assert_eq!(plain.config_path, Config::default_path());
 
         let refreshing = usage_args(&["--refresh", "--config", "/tmp/c.toml"]).unwrap();
@@ -1556,8 +1556,8 @@ mod tests {
 
         let e = serve(&path).unwrap_err();
         assert!(e.contains("disabled"), "{e}");
-        assert!(e.contains("dummy.toml"), "どの設定かが分かる: {e}");
-        assert!(e.contains("--config"), "次にどうするかまで言う: {e}");
+        assert!(e.contains("dummy.toml"), "identifies which config: {e}");
+        assert!(e.contains("--config"), "tells what to do next: {e}");
     }
 
     /// 待ち受けない設定でも `check` は通る。無効だとは明示する。
@@ -1597,7 +1597,7 @@ mod tests {
         let line = listen_line(&quiet);
         assert!(
             line.contains("127.0.0.1:11300"),
-            "問い合わせ先は見える: {line}"
+            "the endpoint is visible: {line}"
         );
         assert!(line.contains("disabled"), "{line}");
     }
@@ -1648,11 +1648,11 @@ mod tests {
     fn renders_percentages_and_time_left() {
         let out = render(&report(vec![observed()]));
 
-        assert!(out.contains("71%/95%/0h16m"), "5h 窓:\n{out}");
-        assert!(out.contains("30%/43%/04d00h"), "7d 窓:\n{out}");
+        assert!(out.contains("71%/95%/0h16m"), "5h window:\n{out}");
+        assert!(out.contains("30%/43%/04d00h"), "7d window:\n{out}");
         assert!(
             !out.contains("ago"),
-            "取得から間もないので古さは出さない:\n{out}"
+            "just fetched, so no staleness is shown:\n{out}"
         );
     }
 
@@ -1688,11 +1688,11 @@ mod tests {
         assert!(out.contains("the Fable limit is at 80%"), "{out}");
         assert!(
             out.contains("resets at 2026-08-02T08:59:59+00:00"),
-            "端数の秒は落とす:\n{out}"
+            "fractional seconds are dropped:\n{out}"
         );
         assert!(
             !out.contains("weekly_all"),
-            "モデルの付かない枠は、表の欄と重なるので出さない:\n{out}"
+            "a model-less limit is omitted since it overlaps the table column:\n{out}"
         );
     }
 
@@ -1980,12 +1980,12 @@ mod tests {
 
         assert!(out.contains("2026-07-29"), "{out}");
         // 合計は 4 本 / input 51,200 / output 8,340。
-        assert!(out.contains("51,200"), "3 桁区切りの合計: {out}");
+        assert!(out.contains("51,200"), "the total with thousands separators: {out}");
         assert!(out.contains("8,340"), "{out}");
-        assert!(out.contains("claude-one"), "内訳に認証情報が出る: {out}");
-        assert!(out.contains("claude-opus-5"), "内訳にモデルが出る: {out}");
+        assert!(out.contains("claude-one"), "the credential appears in the breakdown: {out}");
+        assert!(out.contains("claude-opus-5"), "the model appears in the breakdown: {out}");
         for head in [REQUESTS_HEADER, "input", "output", USD_HEADER] {
-            assert!(out.contains(head), "見出し {head} が無い: {out}");
+            assert!(out.contains(head), "missing header {head}: {out}");
         }
     }
 
@@ -1997,11 +1997,11 @@ mod tests {
             &[("a", "claude-opus-5", counters(1, 10, 5))],
         )]));
 
-        let head = out.lines().next().expect("見出しの行");
+        let head = out.lines().next().expect("a header line");
         assert!(head.contains("input") && head.contains("output"), "{out}");
         assert!(
             !head.contains("cache_w"),
-            "使っていない区分は出さない: {out}"
+            "an unused category is omitted: {out}"
         );
     }
 
@@ -2014,16 +2014,16 @@ mod tests {
 
         let out = render_stats(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
 
-        let head = out.lines().next().expect("見出しの行");
-        assert!(head.contains("reasoning"), "標準区分は短い見出し: {out}");
+        let head = out.lines().next().expect("a header line");
+        assert!(head.contains("reasoning"), "a standard category gets a short header: {out}");
         assert!(
             head.contains("provider.batch_prediction"),
-            "知らない区分は名前のまま出す: {out}"
+            "an unknown category is shown by its raw name: {out}"
         );
         let row = out
             .lines()
             .find(|l| l.starts_with("  a "))
-            .expect("内訳の行");
+            .expect("a breakdown line");
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
             // 認証情報 / モデル / 本数 / input / output / reasoning / 固有区分 / USD
@@ -2047,7 +2047,7 @@ mod tests {
         let unpriced = out
             .lines()
             .find(|l| l.contains("who-knows"))
-            .expect("内訳の行");
+            .expect("a breakdown line");
         assert!(unpriced.trim_end().ends_with('-'), "{out}");
         // 合計は値付けできた分だけ ($5)。
         assert!(out.contains("5.0000"), "{out}");
@@ -2061,9 +2061,9 @@ mod tests {
             ("2026-07-30", &[("a", "m", counters(1, 2, 2))]),
         ]));
 
-        let newest = out.find("2026-07-30").expect("新しい日");
-        let oldest = out.find("2026-07-28").expect("古い日");
-        assert!(newest < oldest, "新しい日が先: {out}");
+        let newest = out.find("2026-07-30").expect("the newer day");
+        let oldest = out.find("2026-07-28").expect("the older day");
+        assert!(newest < oldest, "the newer day comes first: {out}");
     }
 
     /// 桁は全日で揃える。日ごとに幅が変わると縦に読めない。
@@ -2081,7 +2081,7 @@ mod tests {
             .map(|l| l.find(|c: char| c.is_ascii_digit() || c == ',').unwrap())
             .collect();
         assert_eq!(starts.len(), 2, "{out}");
-        assert_eq!(starts[0], starts[1], "桁が揃う: {out}");
+        assert_eq!(starts[0], starts[1], "columns line up: {out}");
     }
 
     /// 記録が無ければ、何をすれば出るのかを言う。
@@ -2091,8 +2091,8 @@ mod tests {
     fn empty_stats_say_why() {
         let out = render_stats(&stats_report(&[]));
         assert!(out.contains("No usage recorded yet"), "{out}");
-        assert!(out.contains("gateway"), "次に見る所を示す: {out}");
-        assert!(out.contains("stats directory"), "置き場も示す: {out}");
+        assert!(out.contains("gateway"), "points to what to check next: {out}");
+        assert!(out.contains("stats directory"), "shows the location too: {out}");
     }
 
     /// 認証情報を持たない経路は予約名で出る。
@@ -2128,7 +2128,7 @@ mod tests {
     fn stats_takes_a_day_count() {
         assert_eq!(parse_stats(&["--days", "30"]).unwrap().days, 30);
         assert_eq!(parse_stats(&["--days=1"]).unwrap().days, 1);
-        assert_eq!(parse_stats(&["--days", "0"]).unwrap().days, 0, "0 は全期間");
+        assert_eq!(parse_stats(&["--days", "0"]).unwrap().days, 0, "0 means all time");
     }
 
     #[test]
@@ -2204,8 +2204,8 @@ mod tests {
     /// help に stats が並ぶ。
     #[test]
     fn help_mentions_stats() {
-        assert!(USAGE.contains("stats"), "コマンド一覧に無い");
-        assert!(USAGE.contains("--days"), "オプションの説明が無い");
+        assert!(USAGE.contains("stats"), "missing from the command list");
+        assert!(USAGE.contains("--days"), "missing the option description");
     }
 
     /// 表の形を丸ごと固定する。
@@ -2251,7 +2251,7 @@ mod tests {
         );
         assert_eq!(
             out, expected,
-            "\n--- 実際 ---\n{out}--- 期待 ---\n{expected}"
+            "\n--- actual ---\n{out}--- expected ---\n{expected}"
         );
     }
 }
