@@ -41,7 +41,7 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
         if let Some(end) = event_end(&prefix) {
             if end > MAX_EVENT {
                 return Err(crate::Error::Config(
-                    "OpenAI 応答の先頭 event が大きすぎます".to_owned(),
+                    "OpenAI response leading event is too large".to_owned(),
                 ));
             }
             let remainder = prefix.split_off(end);
@@ -50,7 +50,7 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
         }
         if prefix.len() > MAX_EVENT {
             return Err(crate::Error::Config(
-                "OpenAI 応答の先頭 event が大きすぎます".to_owned(),
+                "OpenAI response leading event is too large".to_owned(),
             ));
         }
         let Some(chunk) = body.next().await else {
@@ -204,7 +204,7 @@ mod tests {
             .await
             .unwrap();
         let Admission::Admitted(response) = outcome else {
-            panic!("正常 event は採用する");
+            panic!("a normal event is accepted");
         };
         assert_eq!(
             body_of(response).await,
@@ -219,7 +219,7 @@ mod tests {
         let later = b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"late\"}}\n\n";
         let outcome = admit(response(vec![first, later]), "m", 100).await.unwrap();
         let Admission::Admitted(response) = outcome else {
-            panic!("送出開始後の error では切り替えない");
+            panic!("does not switch on an error after emission started");
         };
         assert_eq!(body_of(response).await, [first.as_slice(), later].concat());
     }
@@ -238,7 +238,7 @@ mod tests {
         .await
         .unwrap();
         let Admission::Rejected { denial, reason, .. } = outcome else {
-            panic!("混雑は別経路へ回す");
+            panic!("congestion is routed elsewhere");
         };
         assert_eq!(reason, "busy");
         assert_eq!(
@@ -257,7 +257,7 @@ mod tests {
         let raw = b"event: error\r\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad request\"}}\r\n\r\n";
         let outcome = admit(response(vec![raw]), "m", 100).await.unwrap();
         let Admission::Rejected { client_error, .. } = outcome else {
-            panic!("依頼の誤りは status を補って返す");
+            panic!("a request error returns with the status filled in");
         };
         assert_eq!(client_error.unwrap().status, 400);
     }
@@ -309,7 +309,7 @@ mod tests {
             ..
         } = admit(source, "m", 100).await.unwrap()
         else {
-            panic!("HTTP denial は別経路へ回す");
+            panic!("HTTP denial is routed elsewhere");
         };
         assert_eq!(client_error, None);
         assert_eq!(response.status, 429);
@@ -342,7 +342,7 @@ mod tests {
             let Admission::Rejected { denial, reason, .. } =
                 admit(response, &model, 100).await.unwrap()
             else {
-                panic!("混雑は拒否する");
+                panic!("congestion is denied");
             };
             assert_eq!(reason, format!("busy-{index}"));
             assert_eq!(denial.unwrap().scope, Scope::Model(model));

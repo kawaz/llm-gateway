@@ -509,7 +509,7 @@ mod tests {
         assert!(preset().probe_request().is_none());
 
         let asking = preset().with_quota_api(Arc::new(StubQuotaApi));
-        let probe = asking.probe_request().expect("聞ける経路は 1 本組める");
+        let probe = asking.probe_request().expect("a probeable route can be built");
 
         assert_eq!(probe.model, "probe-model");
         assert_eq!(probe.request.body["model"], "probe-model");
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(
             silent.quota_support(),
             crate::quota::Support::UpstreamDependent,
-            "宣言の無い経路について言えることは無い"
+            "nothing can be said about an undeclared route"
         );
 
         let declared = preset().with_quota_support(crate::quota::Support::NotApplicable);
@@ -532,11 +532,11 @@ mod tests {
         );
 
         let headers = Headers::new(vec![("x-used".to_owned(), "0.5".to_owned())]);
-        declared.observe_quota(&headers, NOW).expect("読める");
+        declared.observe_quota(&headers, NOW).expect("readable");
         assert_eq!(
             declared.quota_support(),
             crate::quota::Support::Observed,
-            "観測できたなら宣言より実測"
+            "observed value wins over declared when observable"
         );
     }
 
@@ -560,7 +560,7 @@ mod tests {
             preset
                 .reject(200, &Headers::default(), None, "m", NOW)
                 .is_none(),
-            "通った応答は締め出さない"
+            "a passed response is not admission-denied"
         );
         assert!(
             preset
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(
             preset.availability("other", NOW),
             Availability::Ready,
-            "頼んだモデルの事情として扱う"
+            "treated as the requested model's own situation"
         );
 
         preset.allow("m");
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(
             other.availability("m", NOW),
             Availability::Ready,
-            "同じ名前でも別の経路"
+            "same name, different route"
         );
     }
 
@@ -609,12 +609,12 @@ mod tests {
 
         assert!(
             preset.observe_quota(&Headers::new(vec![]), NOW).is_none(),
-            "載っていない応答は観測にしない"
+            "a response without the header is not treated as observed"
         );
         assert_eq!(preset.quota(), None);
 
         let headers = Headers::new(vec![("x-used".to_owned(), "0.5".to_owned())]);
-        let snapshot = preset.observe_quota(&headers, NOW).expect("読める");
+        let snapshot = preset.observe_quota(&headers, NOW).expect("readable");
         assert_eq!(preset.quota(), Some(snapshot));
     }
 

@@ -156,7 +156,7 @@ async fn fetch(
         tracing::warn!(
             credential = %credential.id,
             status = status.as_u16(),
-            "枠を聞けませんでした"
+            "failed to query quota"
         );
         return None;
     }
@@ -315,16 +315,16 @@ mod tests {
     /// 枠を見るために枠を減らすので、消費は最小にする (DR-0007)。
     #[test]
     fn the_probe_asks_for_the_smallest_possible_answer() {
-        let probe = api().probe_request().expect("最小 request がある");
+        let probe = api().probe_request().expect("a minimal request exists");
 
-        assert_eq!(probe.model, HAIKU, "一番小さいモデル");
+        assert_eq!(probe.model, HAIKU, "the smallest model");
         assert_eq!(probe.request.path, "/v1/messages");
-        assert_eq!(probe.request.body["model"], HAIKU, "本文にも同じ名前");
+        assert_eq!(probe.request.body["model"], HAIKU, "same name in the body too");
         assert_eq!(probe.request.body["max_tokens"], 1);
         assert_eq!(
             probe.request.headers.get("anthropic-beta"),
             Some("oauth-2025-04-20"),
-            "サブスクの認証はこのフラグが要る"
+            "subscription auth requires this flag"
         );
     }
 
@@ -332,13 +332,13 @@ mod tests {
 
     #[test]
     fn reads_every_limit() {
-        let limits = parse(SAMPLE).expect("知っている形");
+        let limits = parse(SAMPLE).expect("a known shape");
         assert_eq!(limits.len(), 3);
         assert_eq!(limits[1].kind, "weekly_all");
         assert_eq!(limits[1].percent, 100.0);
         assert_eq!(limits[1].severity.as_deref(), Some("critical"));
         assert!(limits[1].is_active);
-        assert_eq!(limits[1].model, None, "全体の枠にモデルは付かない");
+        assert_eq!(limits[1].model, None, "an overall limit has no model attached");
     }
 
     /// モデル別の枠は、掛かる相手の名前を持つ。応答ヘッダには出てこない情報。
@@ -348,7 +348,7 @@ mod tests {
         let scoped = &limits[2];
         assert_eq!(scoped.kind, "weekly_scoped");
         assert_eq!(scoped.model.as_deref(), Some("Fable"));
-        assert_eq!(scoped.model_id, None, "実測では識別子は返らない");
+        assert_eq!(scoped.model_id, None, "no identifier is returned when observed");
         assert_eq!(
             scoped.resets_at.as_deref(),
             Some("2026-08-02T08:59:59.571875+00:00")
@@ -381,7 +381,7 @@ mod tests {
         let json = serde_json::to_value(&limits).unwrap();
         assert_eq!(json[1]["kind"], "weekly_all");
         assert_eq!(json[2]["model"], "Fable");
-        assert!(json[0].get("resets_at").is_none(), "null は出さない");
+        assert!(json[0].get("resets_at").is_none(), "null is omitted");
         assert!(json[0].get("model").is_none());
     }
 
@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(*scope, Scope::Models("claude-fable-*".to_owned()));
         assert_eq!(denial.as_ref().unwrap().until, RESET + RESET_SLACK);
         assert!(scope.covers(FABLE));
-        assert!(!scope.covers(HAIKU), "他のモデルは巻き込まない");
+        assert!(!scope.covers(HAIKU), "does not sweep in other models");
     }
 
     /// 使い切っていない枠は、その範囲を開ける指示になる。
@@ -470,7 +470,7 @@ mod tests {
 
         let entries = api().denials(&[with_id], NOW);
         assert_eq!(entries[0].0, Scope::Model(FABLE.to_owned()));
-        assert!(!entries[0].0.covers("claude-fable-6"), "完全一致で見る");
+        assert!(!entries[0].0.covers("claude-fable-6"), "matched by exact equality");
     }
 
     // ---------- 通信 ----------
