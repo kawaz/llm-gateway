@@ -19,6 +19,7 @@
 - [DR-0015](./DR-0015-routing-priority-and-reset-aware-ordering.md) — routing のネストグループ (同格プール) と 7d リセット期限優先の動的順序。provider 非依存
 - [DR-0016](./DR-0016-ns-thinking-display-override.md) — ns 単位の thinking.display 強制上書き (CC #49268 の workaround、opt-in)
 - [DR-0017](./DR-0017-debug-tap-endpoint.md) — デバッグ用 tap endpoint (購読時のみ動く観測口、本文 opt-in、loopback 直結限定)
+- [DR-0018](./DR-0018-spend-down-priority.md) — リセット間際の枠を優先して使い切る (`spend_down_within`、最長周期枠のみ、affinity が上位)
 
 ## Archived
 
