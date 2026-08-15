@@ -52,6 +52,9 @@ toml = { version = "1", default-features = false, features = [
     "serde",
 ] }
 thiserror = "2"
+# 設定に書く残り時間 (`40h`) の読み書き。自前で書くと `1d 2h` のような
+# 複合表記の扱いが設定ごとにぶれる。
+humantime = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 # 秘密の Drop 時消去。cache-warden と同じ選択。

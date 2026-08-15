@@ -56,6 +56,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -207,6 +208,92 @@ pub struct RoutingRule {
     pub models: Vec<String>,
     /// 使う経路を優先順に。内側の配列は同格の経路。
     pub routes: Vec<RouteGroup>,
+    /// リセットがこれだけ手前まで迫った経路を先頭へ繰り上げる (DR-0018)。
+    ///
+    /// 書かなければ繰り上げない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_down_within: Option<SpendDown>,
+}
+
+/// 使い切りに入る手前の幅。
+///
+/// 窓長に対する割合でも、絶対時間でも書ける。割合は窓長にスケールするので、
+/// 周期の違う credential を 1 つの規則で扱える (DR-0018 §1)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpendDown {
+    /// 窓長に対する割合 (0.0〜1.0)。
+    Ratio(f64),
+    /// 窓長に依らない絶対の残り時間 (秒)。
+    Absolute(u64),
+}
+
+impl SpendDown {
+    /// この窓長のとき、リセットまで残り何秒で繰り上げに入るか。
+    pub fn threshold_for(self, window_seconds: u64) -> i64 {
+        let seconds = match self {
+            Self::Ratio(ratio) => (window_seconds as f64 * ratio) as u64,
+            Self::Absolute(seconds) => seconds,
+        };
+        seconds.min(i64::MAX as u64) as i64
+    }
+}
+
+impl std::str::FromStr for SpendDown {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if let Some(percent) = text.strip_suffix('%') {
+            let percent: f64 = percent.trim().parse().map_err(|_| {
+                Error::Config(format!("`{text}` is not a percentage such as `25%`"))
+            })?;
+            if !(0.0..=100.0).contains(&percent) {
+                return Err(Error::Config(format!(
+                    "`{text}` is outside the 0%-100% range"
+                )));
+            }
+            return Ok(Self::Ratio(percent / 100.0));
+        }
+        let duration = humantime::parse_duration(text).map_err(|_| {
+            Error::Config(format!(
+                "`{text}` is neither a percentage (`25%`) nor a duration (`40h`)"
+            ))
+        })?;
+        Ok(Self::Absolute(duration.as_secs()))
+    }
+}
+
+impl std::fmt::Display for SpendDown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ratio(ratio) => write!(f, "{}%", ratio * 100.0),
+            Self::Absolute(seconds) => {
+                write!(
+                    f,
+                    "{}",
+                    humantime::format_duration(Duration::from_secs(*seconds))
+                )
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SpendDown {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for SpendDown {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -638,19 +725,33 @@ impl Namespace {
         model: &str,
         all: &'a Config,
     ) -> Vec<Vec<&'a str>> {
-        for rule in &self.routing {
-            if crate::pattern::matches_any(&rule.models, model) {
-                return rule
-                    .routes
-                    .iter()
-                    .map(|group| group.routes().collect())
-                    .collect();
-            }
+        match self.rule_for(model) {
+            Some(rule) => rule
+                .routes
+                .iter()
+                .map(|group| group.routes().collect())
+                .collect(),
+            None => self
+                .usable_routes(all)
+                .into_iter()
+                .map(|route| vec![route])
+                .collect(),
         }
-        self.usable_routes(all)
-            .into_iter()
-            .map(|route| vec![route])
-            .collect()
+    }
+
+    /// このモデルに当たる振り分け規則。当たらなければ無い。
+    fn rule_for(&self, model: &str) -> Option<&RoutingRule> {
+        self.routing
+            .iter()
+            .find(|rule| crate::pattern::matches_any(&rule.models, model))
+    }
+
+    /// このモデルで使い切りの繰り上げに入る手前の幅 (DR-0018)。
+    ///
+    /// 規則に当たらないモデル (= 宣言順に全部試す退化形) では繰り上げない。
+    /// 順序を書いていない相手の順序を動かす理由がない。
+    pub fn spend_down_for(&self, model: &str) -> Option<SpendDown> {
+        self.rule_for(model)?.spend_down_within
     }
 
     /// この namespace が使ってよい経路。
@@ -1083,6 +1184,72 @@ routes = [["a", "b"], "c"]
             ns(&c).route_groups_for("model", &c),
             vec![vec!["a", "b"], vec!["c"]]
         );
+    }
+
+    // ---------- 使い切りの閾値 (DR-0018) ----------
+
+    /// 割合は窓長に掛ける係数として読む。`25%` は 7d 枠なら 42 時間。
+    #[test]
+    fn spend_down_reads_a_percentage_against_the_window() {
+        let within: SpendDown = "25%".parse().unwrap();
+        assert_eq!(within, SpendDown::Ratio(0.25));
+
+        const WEEK: u64 = 7 * 24 * 60 * 60;
+        assert_eq!(within.threshold_for(WEEK), 42 * 60 * 60);
+        // 同じ設定でも、窓が短ければ閾値も短くなる。
+        assert_eq!(within.threshold_for(5 * 60 * 60), 75 * 60);
+    }
+
+    /// 絶対時間は窓長に関係なく同じ幅になる。
+    #[test]
+    fn spend_down_reads_an_absolute_duration() {
+        let within: SpendDown = "40h".parse().unwrap();
+        assert_eq!(within, SpendDown::Absolute(40 * 60 * 60));
+        assert_eq!(within.threshold_for(7 * 24 * 60 * 60), 40 * 60 * 60);
+        assert_eq!(within.threshold_for(5 * 60 * 60), 40 * 60 * 60);
+
+        // humantime の複合表記も読める。
+        assert_eq!(
+            "2d 6h".parse::<SpendDown>().unwrap(),
+            SpendDown::Absolute((2 * 24 + 6) * 60 * 60)
+        );
+    }
+
+    /// 割合でも時間でもない書き方は、設定を読んだ時点で拒否する。
+    #[test]
+    fn spend_down_rejects_anything_else() {
+        for text in ["25x", "%", "", "twenty-five percent", "-1%", "101%", "40"] {
+            assert!(text.parse::<SpendDown>().is_err(), "{text}");
+        }
+    }
+
+    /// 規則に書けば読め、書かなければ繰り上げない。
+    #[test]
+    fn spend_down_is_read_per_routing_rule() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[[ns.default.routing]]
+models = ["spent-*"]
+routes = ["a"]
+spend_down_within = "25%"
+[[ns.default.routing]]
+models = ["plain-*"]
+routes = ["a"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ns(&c).spend_down_for("spent-1"),
+            Some(SpendDown::Ratio(0.25))
+        );
+        assert_eq!(ns(&c).spend_down_for("plain-1"), None);
+        // どの規則にも当たらないモデルは、順序を書いていないので動かさない。
+        assert_eq!(ns(&c).spend_down_for("other"), None);
     }
 
     /// グループの中にグループは書けない。ネストは同格を表す 1 段だけに限定する。
