@@ -167,6 +167,55 @@ impl Snapshot {
         })
     }
 
+    /// 枠照会 API の答えから、窓の姿を起こす (DR-0019 §5)。
+    ///
+    /// 使うのは**経路全体に掛かる枠** (`model` が付かないもの) のうち、周期を
+    /// 申告しているものだけ。モデル別の枠は経路全体の消費を表さないので、
+    /// ここでは読まない。どの枠がどの範囲に掛かるかは `model` 欄に出ている
+    /// ので、provider 固有の分類を知らなくても選り分けられる。
+    ///
+    /// 周期が一番長いものを長周期の欄に、それより短いものを短周期の欄に置く。
+    /// 1 本も無ければ `None`。
+    pub fn from_limits(limits: &[QuotaLimit], observed_at: i64) -> Option<Self> {
+        let mut windows: Vec<&QuotaLimit> = limits
+            .iter()
+            .filter(|limit| limit.model.is_none() && limit.model_id.is_none())
+            .filter(|limit| limit.window_seconds.is_some())
+            .collect();
+        windows.sort_by_key(|limit| limit.window_seconds);
+
+        let window = |limit: &QuotaLimit| {
+            Window {
+                utilization: Some(limit.percent / 100.0),
+                status: None,
+                ..Window::default()
+            }
+            .with_reset(
+                limit
+                    .resets_at
+                    .as_deref()
+                    .and_then(crate::credential::time::parse_rfc3339),
+            )
+            .with_window_seconds(limit.window_seconds)
+        };
+        let longest = windows.pop()?;
+        Self::new(
+            observed_at,
+            windows.pop().map(window),
+            Some(window(longest)),
+            None,
+        )
+    }
+
+    /// 上限の判定に使える窓を持っているか (DR-0019 §4)。
+    ///
+    /// 周期・リセット時刻・使用率が揃って初めて「どれだけ使ったか」が言える。
+    pub fn has_usable_window(&self, now: i64) -> bool {
+        self.longest_window().is_some_and(|window| {
+            window.utilization.is_some() && window.reset.is_some_and(|reset| reset > now)
+        })
+    }
+
     /// 周期が一番長い窓。周期を申告していない窓は候補にしない (DR-0018 §2)。
     ///
     /// 欄の並び (`5h` → `7d`) ではなく周期の長さで選ぶ。provider によって
@@ -430,6 +479,87 @@ mod tests {
     fn an_empty_reading_is_not_an_observation() {
         assert_eq!(Snapshot::new(NOW, None, None, None), None);
         assert!(Snapshot::new(NOW, Some(Window::default()), None, None).is_some());
+    }
+
+    // ---------- 枠照会の答えから起こす (DR-0019 §5) ----------
+
+    const WEEK: u64 = 7 * 24 * 60 * 60;
+    const FIVE_HOURS: u64 = 5 * 60 * 60;
+
+    fn limit(kind: &str, percent: f64, window_seconds: Option<u64>) -> QuotaLimit {
+        QuotaLimit {
+            kind: kind.to_owned(),
+            percent,
+            severity: None,
+            resets_at: Some(crate::credential::time::format_rfc3339(NOW + 1000)),
+            model: None,
+            model_id: None,
+            window_seconds,
+            is_active: true,
+        }
+    }
+
+    /// 周期の長い枠を長周期の欄へ、短い方を短周期の欄へ置く。
+    #[test]
+    fn the_queried_limits_become_windows() {
+        let s = Snapshot::from_limits(
+            &[
+                limit("session", 20.0, Some(FIVE_HOURS)),
+                limit("weekly_all", 65.0, Some(WEEK)),
+            ],
+            NOW,
+        )
+        .expect("both are readable");
+
+        assert_eq!(s.five_hour.as_ref().unwrap().utilization, Some(0.2));
+        let weekly = s.longest_window().expect("the weekly window");
+        assert_eq!(weekly.utilization, Some(0.65));
+        assert_eq!(weekly.window_seconds, Some(WEEK));
+        assert_eq!(weekly.reset, Some(NOW + 1000));
+    }
+
+    /// モデル別の枠は経路全体の消費を表さないので読まない。
+    #[test]
+    fn a_model_scoped_limit_is_not_used() {
+        let mut scoped = limit("weekly_scoped", 90.0, Some(WEEK));
+        scoped.model = Some("Fable".to_owned());
+
+        let s = Snapshot::from_limits(
+            &[scoped.clone(), limit("weekly_all", 10.0, Some(WEEK))],
+            NOW,
+        )
+        .expect("the account-wide limit is readable");
+        assert_eq!(s.longest_window().unwrap().utilization, Some(0.1));
+
+        assert_eq!(
+            Snapshot::from_limits(&[scoped], NOW),
+            None,
+            "nothing account-wide was returned"
+        );
+    }
+
+    /// 周期を言ってこない枠は使えない。どの窓の話か決められない。
+    #[test]
+    fn a_limit_without_a_period_is_not_used() {
+        assert_eq!(
+            Snapshot::from_limits(&[limit("session", 20.0, None)], NOW),
+            None
+        );
+        assert_eq!(Snapshot::from_limits(&[], NOW), None);
+    }
+
+    /// 判定に使えるのは、周期・リセット・使用率が揃った窓だけ。
+    #[test]
+    fn a_window_is_usable_only_when_it_is_complete() {
+        let s = Snapshot::from_limits(&[limit("weekly_all", 65.0, Some(WEEK))], NOW).unwrap();
+        assert!(s.has_usable_window(NOW));
+        assert!(
+            !s.has_usable_window(NOW + 2000),
+            "a reset already past says nothing about now"
+        );
+
+        let no_period = Snapshot::new(NOW, None, Some(Window::default()), None).unwrap();
+        assert!(!no_period.has_usable_window(NOW));
     }
 
     /// 取得時刻は Unix 秒と ISO の両方を出す。

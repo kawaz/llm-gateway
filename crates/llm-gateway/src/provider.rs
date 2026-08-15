@@ -309,11 +309,24 @@ impl Preset {
     }
 
     /// 枠照会 API の答えで印を引き直す。
+    ///
+    /// 通りすがりの観測が無い / 使える窓を持たない経路では、聞けた答えから
+    /// スナップショットも起こす (DR-0019 §6)。**あるものは上書きしない** —
+    /// ヘッダと枠照会は同じ枠について違う値を返すことがあり (DR-0007)、
+    /// 転送のたびに更新されるヘッダ側の方が新しい。ここで埋めるのは、
+    /// 埋めないと誰も何も知らないままになる穴だけ。
     pub fn apply_quota(&self, limits: &[QuotaLimit], now: i64) {
         let Some(api) = self.quota_api() else {
             return;
         };
         self.state.apply(&api.denials(limits, now), now);
+
+        let known = self
+            .quota()
+            .is_some_and(|snapshot| snapshot.has_usable_window(now));
+        if !known && let Some(snapshot) = Snapshot::from_limits(limits, now) {
+            self.state.observe_quota(snapshot);
+        }
     }
 
     /// 定期の様子見の役を引き受ける。
@@ -618,6 +631,71 @@ mod tests {
         let headers = Headers::new(vec![("x-used".to_owned(), "0.5".to_owned())]);
         let snapshot = preset.observe_quota(&headers, NOW).expect("readable");
         assert_eq!(preset.quota(), Some(snapshot));
+    }
+
+    /// 通りすがりに何も読めていない経路は、聞けた答えで枠を埋める (DR-0019 §5)。
+    #[test]
+    fn an_unobserved_route_is_filled_from_what_it_was_told() {
+        let preset = preset().with_quota_api(Arc::new(StubQuotaApi));
+        assert_eq!(preset.quota(), None);
+
+        preset.apply_quota(&[weekly(0.3, NOW + 1000)], NOW);
+
+        let window = preset.quota().expect("filled in").longest_window().cloned();
+        let window = window.expect("the weekly window");
+        assert_eq!(window.utilization, Some(0.003));
+        assert_eq!(window.reset, Some(NOW + 1000));
+        assert_eq!(window.window_seconds, Some(WEEK));
+    }
+
+    /// 応答ヘッダで読めているものは上書きしない。
+    ///
+    /// 同じ枠にヘッダと枠照会が違う値を返す実測がある (DR-0007)。転送のたびに
+    /// 更新されるヘッダ側を残す。
+    #[test]
+    fn a_route_that_already_knows_its_quota_keeps_what_it_read() {
+        let preset = preset().with_quota_api(Arc::new(StubQuotaApi));
+        let observed = crate::quota::Snapshot::new(
+            NOW,
+            None,
+            Some(
+                crate::quota::Window {
+                    utilization: Some(0.34),
+                    ..crate::quota::Window::default()
+                }
+                .with_reset(Some(NOW + 1000))
+                .with_window_seconds(Some(WEEK)),
+            ),
+            None,
+        )
+        .unwrap();
+        preset.restore_quota(observed);
+
+        preset.apply_quota(&[weekly(100.0, NOW + 1000)], NOW);
+
+        assert_eq!(
+            preset
+                .quota()
+                .and_then(|s| s.longest_window().and_then(|w| w.utilization)),
+            Some(0.34),
+            "the header wins over the queried answer"
+        );
+    }
+
+    const WEEK: u64 = 7 * 24 * 60 * 60;
+
+    /// 経路全体に掛かる週次の枠 1 本。
+    fn weekly(percent: f64, resets_at: i64) -> QuotaLimit {
+        QuotaLimit {
+            kind: "weekly_all".to_owned(),
+            percent,
+            severity: None,
+            resets_at: Some(crate::credential::time::format_rfc3339(resets_at)),
+            model: None,
+            model_id: None,
+            window_seconds: Some(WEEK),
+            is_active: true,
+        }
     }
 
     /// 枠照会 API が無ければ、様子見の札も取らない。
