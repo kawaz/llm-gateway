@@ -360,7 +360,7 @@ mod tests {
         let state = RouteState::new();
         state.deny(limited(NOW + 10), NOW);
         assert_eq!(state.denial(FABLE, NOW), Some(limited(NOW + 10)));
-        assert_eq!(state.denial(FABLE, NOW + 10), None, "期限は含まない");
+        assert_eq!(state.denial(FABLE, NOW + 10), None, "the deadline is exclusive");
     }
 
     /// 使えるかどうかは、印の中身を配らずに答える。
@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(
             state.availability(FABLE, NOW + 5000),
             Availability::Ready,
-            "期限が過ぎたらまた試す"
+            "retried once the deadline passes"
         );
     }
 
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(
             state.denial(HAIKU, NOW),
             Some(limited(NOW + 5000)),
-            "別の範囲の印なので、窓の期限はそのまま残る"
+            "a mark for a different scope, so the window deadline is unchanged"
         );
     }
 
@@ -457,12 +457,12 @@ mod tests {
         assert_eq!(
             state.denial(FABLE, NOW),
             Some(busy(NOW + 5000, FABLE)),
-            "窓が先に開いても、モデルの印が残っていれば使えない"
+            "even if the window opens first, a remaining model mark still blocks use"
         );
         assert_eq!(
             state.denial(HAIKU, NOW),
             Some(limited(NOW + 100)),
-            "そのモデルの印が無い側は窓だけ見る"
+            "without a mark for that model, only the window is checked"
         );
     }
 
@@ -478,7 +478,7 @@ mod tests {
 
         let later = NOW + 61;
         state.deny(busy(later + 60, "m4"), later);
-        assert_eq!(state.marks().len(), 1, "生きているのは今付けた 1 つだけ");
+        assert_eq!(state.marks().len(), 1, "only the one just set is alive");
     }
 
     /// 枠を聞いた結果は、範囲ごとに印を付けたり外したりする。
@@ -504,10 +504,10 @@ mod tests {
         assert!(state.denial(HAIKU, NOW).is_some());
 
         state.apply(&[(Scope::Everything, None)], NOW);
-        assert_eq!(state.denial(HAIKU, NOW), None, "全体の枠は開いた");
+        assert_eq!(state.denial(HAIKU, NOW), None, "the overall quota opened");
         assert!(
             state.denial(FABLE, NOW).is_some(),
-            "指示のなかった範囲は触らない"
+            "an unmentioned scope is untouched"
         );
     }
 
@@ -515,7 +515,7 @@ mod tests {
     #[test]
     fn the_route_keeps_the_quota_it_saw() {
         let state = RouteState::new();
-        assert_eq!(state.quota(), None, "観測前は何も無い");
+        assert_eq!(state.quota(), None, "nothing before observation");
 
         let snapshot = Snapshot::new(
             NOW,
@@ -526,7 +526,7 @@ mod tests {
             None,
             None,
         )
-        .expect("読めた分がある");
+        .expect("something was read");
         state.observe_quota(snapshot.clone());
         assert_eq!(state.quota(), Some(snapshot));
     }
@@ -540,15 +540,15 @@ mod tests {
         let later = NOW + PROBE_INTERVAL;
         let held = state
             .claim_probe(later)
-            .expect("間隔が空いていれば引き受ける");
+            .expect("claims when the interval has elapsed");
         assert!(
             state.claim_probe(later).is_none(),
-            "聞いている最中は誰も割り込まない"
+            "no one interrupts while a probe is in flight"
         );
         drop(held);
         assert!(
             state.claim_probe(later + PROBE_INTERVAL).is_some(),
-            "札を外したら、次の周期でまた引き受けられる"
+            "once the mark is released, it can be claimed again next cycle"
         );
     }
 
@@ -568,7 +568,7 @@ mod tests {
         busy_route.deny(busy(NOW + 100_000, FABLE), NOW);
         assert!(
             busy_route.claim_probe(NOW + PROBE_INTERVAL).is_none(),
-            "いつ空くか分からない相手に定期的に聞いても、実費が増えるだけ"
+            "polling a target with an unknown reopen time only adds real cost"
         );
     }
 
@@ -579,10 +579,10 @@ mod tests {
     #[test]
     fn an_urgent_ask_does_not_need_a_mark() {
         let state = RouteState::new();
-        let held = state.claim_ask(NOW).expect("印が無くても引き受ける");
+        let held = state.claim_ask(NOW).expect("claims even without a mark");
         assert!(
             state.claim_ask(NOW).is_none(),
-            "聞いている最中は誰も割り込まない"
+            "no one interrupts while a probe is in flight"
         );
         drop(held);
     }
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn an_urgent_ask_still_leaves_a_gap() {
         let state = RouteState::new();
-        drop(state.claim_ask(NOW).expect("1 回目"));
+        drop(state.claim_ask(NOW).expect("first time"));
         assert!(state.claim_ask(NOW + DEFAULT_BACKOFF - 1).is_none());
         assert!(state.claim_ask(NOW + DEFAULT_BACKOFF).is_some());
     }

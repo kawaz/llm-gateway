@@ -150,7 +150,7 @@ fn encode_payloads(events: &[Event]) -> (Vec<Vec<u8>>, usize) {
     let mut oversized = 0usize;
 
     for event in events {
-        let encoded = serde_json::to_vec(event).expect("Event は JSON に変換できる");
+        let encoded = serde_json::to_vec(event).expect("Event converts to JSON");
         if encoded.len() + 2 > MAX_PAYLOAD {
             oversized += 1;
             continue;
@@ -303,7 +303,7 @@ mod tests {
         }
 
         async fn next_delivery(&self) {
-            self.arrived.acquire().await.expect("閉じない").forget();
+            self.arrived.acquire().await.expect("never closes").forget();
         }
 
         fn deliveries(&self) -> Vec<String> {
@@ -407,14 +407,14 @@ mod tests {
         assert!(
             delivered.contains(&format!("authorization: Bearer {TOKEN}"))
                 || delivered.contains(&format!("Authorization: Bearer {TOKEN}")),
-            "Bearer 認証がありません"
+            "missing Bearer authentication"
         );
 
-        let body = delivered.split("\r\n\r\n").nth(1).expect("本文");
-        let sent: Vec<Event> = serde_json::from_str(body).expect("配列で送る");
+        let body = delivered.split("\r\n\r\n").nth(1).expect("body");
+        let sent: Vec<Event> = serde_json::from_str(body).expect("sent as an array");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].credential, "claude-kawazzz");
-        assert_eq!(sent[0].prefix.as_deref(), Some("2cf24dba"), "SSE と同じ形");
+        assert_eq!(sent[0].prefix.as_deref(), Some("2cf24dba"), "same shape as SSE");
         task.abort();
     }
 
@@ -446,11 +446,11 @@ mod tests {
 
         receiver.next_delivery().await;
         let body = receiver.deliveries().remove(0);
-        let body = body.split("\r\n\r\n").nth(1).expect("本文");
+        let body = body.split("\r\n\r\n").nth(1).expect("body");
         let sent: Vec<Event> = serde_json::from_str(body).unwrap();
 
-        assert_eq!(sent.len(), 10, "10 件が 1 通で届く");
-        assert_eq!(receiver.deliveries().len(), 1, "接続も 1 本だけ");
+        assert_eq!(sent.len(), 10, "10 items arrive in a single delivery");
+        assert_eq!(receiver.deliveries().len(), 1, "only a single connection too");
         task.abort();
     }
 
@@ -463,13 +463,13 @@ mod tests {
 
         let (payloads, oversized) = encode_payloads(&events);
         assert_eq!(oversized, 0);
-        assert!(payloads.len() > 1, "1 MB を超える塊は分割する");
+        assert!(payloads.len() > 1, "a chunk over 1 MB is split");
         assert!(payloads.iter().all(|payload| payload.len() <= MAX_PAYLOAD));
         let delivered = payloads
             .iter()
             .map(|payload| serde_json::from_slice::<Vec<Event>>(payload).unwrap().len())
             .sum::<usize>();
-        assert_eq!(delivered, 100, "分割してもイベントを落とさない");
+        assert_eq!(delivered, 100, "no events are dropped even when split");
     }
 
     /// 1 件だけで上限を超えるものは送らない。
@@ -512,7 +512,7 @@ mod tests {
             assert_eq!(
                 receiver.deliveries().len(),
                 2,
-                "{status} が返っても次を送る"
+                "still sends the next one even after {status}"
             );
             task.abort();
         }
@@ -584,8 +584,8 @@ mod tests {
             warn!(%url, %reason, "cannot send to the webhook");
         });
 
-        assert!(!logs.contains(TOKEN), "合言葉が記録に出ている:\n{logs}");
-        assert!(logs.contains("webhook"), "何も記録されていない:\n{logs}");
+        assert!(!logs.contains(TOKEN), "the secret token appears in the logs:\n{logs}");
+        assert!(logs.contains("webhook"), "nothing was logged:\n{logs}");
     }
 
     /// 合言葉のファイルは、前後の空白を落として読む。

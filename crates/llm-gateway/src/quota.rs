@@ -389,7 +389,7 @@ mod tests {
                 disabled_reason: Some("out_of_credits".to_owned()),
             }),
         )
-        .expect("読めた分がある")
+        .expect("something was read")
     }
 
     /// 1 つも読めなければスナップショットにしない。
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(
             s.five_hour.unwrap().reset_iso.as_deref(),
             Some("2026-07-29T17:00:00Z"),
-            "窓のリセット時刻も同じ形で出す"
+            "the window reset time is emitted in the same shape"
         );
     }
 
@@ -420,7 +420,7 @@ mod tests {
         let store = store(dir.path());
         let id = CredentialId::new("claude-personal");
 
-        assert_eq!(store.get(&id).await, None, "使う前は未観測");
+        assert_eq!(store.get(&id).await, None, "unobserved before use");
 
         store.observe(&id, observed(NOW)).await;
         assert_eq!(store.get(&id).await.unwrap().observed_at, NOW);
@@ -473,11 +473,11 @@ mod tests {
 
         // 再起動に相当する。
         let store = store(dir.path());
-        assert_eq!(store.get(&id).await, None, "読み戻す前は未観測");
+        assert_eq!(store.get(&id).await, None, "unobserved before reload");
         store.restore().await;
 
-        let restored = store.get(&id).await.expect("読み戻せる");
-        assert_eq!(restored.observed_at, NOW, "取得時刻も戻る");
+        let restored = store.get(&id).await.expect("can be reloaded");
+        assert_eq!(restored.observed_at, NOW, "the observed time is restored too");
         assert_eq!(restored.observed_at_iso, "2026-07-29T12:00:00Z");
         assert_eq!(restored.five_hour.unwrap().utilization, Some(0.71));
         assert_eq!(
@@ -493,11 +493,11 @@ mod tests {
         let store = store(dir.path());
 
         store.save().await.unwrap();
-        assert!(!store.path().exists(), "空のファイルを置かない");
+        assert!(!store.path().exists(), "does not leave an empty file");
 
         store.observe(&CredentialId::new("a"), observed(NOW)).await;
         store.save().await.unwrap();
-        assert!(store.path().exists(), "観測したら書く");
+        assert!(store.path().exists(), "writes once observed");
     }
 
     /// 変わっていなければ書き直さない。
@@ -511,7 +511,7 @@ mod tests {
         let first = std::fs::metadata(store.path()).unwrap().modified().unwrap();
         store.save().await.unwrap();
         let second = std::fs::metadata(store.path()).unwrap().modified().unwrap();
-        assert_eq!(first, second, "2 度目は触らない");
+        assert_eq!(first, second, "the second time is untouched");
     }
 
     /// 壊れたファイルがあっても起動は続く。
@@ -577,7 +577,7 @@ mod tests {
 
         let store = QuotaStore::new(&blocked, "8402");
         store.observe(&CredentialId::new("a"), observed(NOW)).await;
-        assert!(store.save().await.is_err(), "書けないので失敗する");
+        assert!(store.save().await.is_err(), "fails because it cannot write");
 
         // 目印が残っているので、書ける状態になれば落ちる。
         std::fs::remove_file(&blocked).unwrap();
@@ -612,8 +612,8 @@ mod tests {
 
         store(dir.path()).restore().await;
 
-        assert!(!mine.exists(), "自分の書き損じは消す");
-        assert!(theirs.exists(), "他の writer の一時ファイルは触らない");
+        assert!(!mine.exists(), "removes its own failed write");
+        assert!(theirs.exists(), "does not touch another writer's temp file");
     }
 
     /// 日次集計と同じ置き場に置いても、互いのファイルを取り違えない。
@@ -639,7 +639,7 @@ mod tests {
         let stats = crate::stats::Stats::new(dir.path(), "8402");
         assert!(
             stats.report(0, NOW, &NoRates).days.is_empty(),
-            "利用状況のファイルを日次集計として読まない"
+            "does not read the usage file as a daily aggregate"
         );
     }
 
@@ -652,8 +652,8 @@ mod tests {
         assert_eq!(json["name"], "claude-work");
         assert_eq!(json["type"], "claude_oauth");
         assert_eq!(json["support"], "unobserved");
-        assert!(json.get("note").is_none(), "理由の文章は出さない");
-        assert!(json.get("snapshot").is_none(), "無い値は出さない");
+        assert!(json.get("note").is_none(), "the reason text is omitted");
+        assert!(json.get("snapshot").is_none(), "a missing value is omitted");
     }
 
     /// JSON の形。CLI はこれを読んで整形する。
@@ -672,7 +672,7 @@ mod tests {
 
         assert_eq!(json["generated_at"], NOW);
         assert_eq!(json["generated_at_iso"], "2026-07-29T12:00:00Z");
-        assert!(json.get("probe").is_none(), "プローブ無しなら出さない");
+        assert!(json.get("probe").is_none(), "omitted without a probe");
 
         let c = &json["credentials"][0];
         assert_eq!(c["support"], "observed");
