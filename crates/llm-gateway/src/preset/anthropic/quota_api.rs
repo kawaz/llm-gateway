@@ -214,6 +214,7 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
             .map(|e| {
                 let model = e.scope.and_then(|s| s.model);
                 QuotaLimit {
+                    window_seconds: super::window_seconds(&e.kind),
                     kind: e.kind,
                     percent: e.percent,
                     severity: e.severity,
@@ -299,6 +300,7 @@ mod tests {
             resets_at: resets_at.map(str::to_owned),
             model: model.map(str::to_owned),
             model_id: None,
+            window_seconds: crate::preset::anthropic::window_seconds(kind),
             // 実測どおり、塞がっていない枠でも立つ。判断には使わない。
             is_active: true,
         }
@@ -362,6 +364,32 @@ mod tests {
             scoped.resets_at.as_deref(),
             Some("2026-08-02T08:59:59.571875+00:00")
         );
+    }
+
+    /// 枠の周期は `kind` から起こす。応答に長さの数値は載らない (DR-0018 §6)。
+    #[test]
+    fn each_limit_carries_the_period_its_kind_implies() {
+        let limits = parse(SAMPLE).unwrap();
+        assert_eq!(limits[0].window_seconds, Some(5 * 60 * 60), "session");
+        assert_eq!(
+            limits[1].window_seconds,
+            Some(7 * 24 * 60 * 60),
+            "weekly_all"
+        );
+        assert_eq!(
+            limits[2].window_seconds,
+            Some(7 * 24 * 60 * 60),
+            "weekly_scoped: same period, narrower scope"
+        );
+    }
+
+    /// 知らない呼び名の枠は周期を推測しない。
+    #[test]
+    fn an_unknown_kind_has_no_period() {
+        let limits =
+            parse(r#"{"limits": [{"kind": "brand_new", "percent": 1, "is_active": false}]}"#)
+                .unwrap();
+        assert_eq!(limits[0].window_seconds, None);
     }
 
     /// 知らない形は情報なしに落とす。読めないものを推測で埋めない。

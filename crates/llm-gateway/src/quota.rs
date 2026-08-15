@@ -55,6 +55,13 @@ pub struct QuotaLimit {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// この枠が回る周期の長さ (秒)。
+    ///
+    /// 「5h の枠か 7d の枠か」を core が欄名で当てずに済ませるためのもの
+    /// (DR-0018 §6)。どの周期かを知っているのは provider なので、読めた
+    /// provider だけが入れる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
     pub is_active: bool,
 }
 
@@ -76,6 +83,12 @@ pub struct Window {
     /// 同じ時刻の ISO 8601 表記。人が読む側で変換し直さずに済む。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_iso: Option<String>,
+    /// この窓が回る周期の長さ (秒)。
+    ///
+    /// 窓を周期の長さで比べるために使う (DR-0018 §2)。欄名 (`5h` / `7d`) は
+    /// provider によって指すものが違うので、期間そのものを持たせる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_seconds: Option<u64>,
 }
 
 impl Window {
@@ -88,6 +101,12 @@ impl Window {
     pub fn with_reset(mut self, reset: Option<i64>) -> Self {
         self.reset = reset;
         self.reset_iso = reset.map(format_rfc3339);
+        self
+    }
+
+    /// この窓が回る周期を入れる。
+    pub fn with_window_seconds(mut self, seconds: Option<u64>) -> Self {
+        self.window_seconds = seconds;
         self
     }
 }
@@ -146,6 +165,18 @@ impl Snapshot {
             seven_day,
             overage,
         })
+    }
+
+    /// 周期が一番長い窓。周期を申告していない窓は候補にしない (DR-0018 §2)。
+    ///
+    /// 欄の並び (`5h` → `7d`) ではなく周期の長さで選ぶ。provider によって
+    /// どちらの欄が長周期かが違う。
+    pub fn longest_window(&self) -> Option<&Window> {
+        [self.five_hour.as_ref(), self.seven_day.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.window_seconds.is_some())
+            .max_by_key(|window| window.window_seconds)
     }
 }
 

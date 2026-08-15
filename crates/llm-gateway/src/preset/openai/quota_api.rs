@@ -123,6 +123,9 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
         used_percent: f64,
         #[serde(default)]
         reset_at: Option<i64>,
+        /// この窓が回る周期 (秒)。upstream が数値で返してくれる。
+        #[serde(default)]
+        limit_window_seconds: Option<u64>,
     }
 
     let parsed: Response = serde_json::from_str(body).ok()?;
@@ -141,6 +144,7 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
             resets_at: window.reset_at.map(format_rfc3339),
             model: None,
             model_id: None,
+            window_seconds: window.limit_window_seconds,
             is_active: true,
         });
     }
@@ -163,6 +167,20 @@ mod tests {
         assert_eq!(limits[0].percent, 25.0);
         assert_eq!(limits[1].severity.as_deref(), Some("critical"));
         assert!(limits[1].resets_at.is_some());
+    }
+
+    /// 周期は upstream が秒で返してくるので、そのまま持つ (DR-0018 §6)。
+    #[test]
+    fn each_window_carries_its_declared_length() {
+        let limits = parse(
+            r#"{"rate_limit":{"primary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_at":1800001000},"secondary_window":{"used_percent":10,"reset_at":1800005000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(limits[0].window_seconds, Some(5 * 60 * 60));
+        assert_eq!(
+            limits[1].window_seconds, None,
+            "not declared, so not guessed"
+        );
     }
 
     /// 専用 quota endpoint があるので、枠確認のための推論 request は作らない。

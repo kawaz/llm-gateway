@@ -26,6 +26,26 @@ pub use wire::AnthropicWire;
 use crate::provider::Preset;
 use crate::quota::Support;
 
+/// 枠の呼び名から、その枠が回る周期 (秒) を起こす (DR-0018 §6)。
+///
+/// Anthropic は窓の長さを数値では返さない。返るのは呼び名だけで、応答ヘッダ
+/// なら欄名 (`...-5h-...` / `...-7d-...`)、枠照会 API なら `kind`
+/// (`session` / `weekly_all` / `weekly_scoped`) がそれにあたる。周期が
+/// 呼び名に埋まっているのはこの provider の事情なので、対応表はここに閉じる。
+///
+/// 知らない呼び名は `None`。推測で周期を埋めると、使い切りの判定 (DR-0018)
+/// が誤った窓長を基準にしてしまう。
+fn window_seconds(kind: &str) -> Option<u64> {
+    const HOUR: u64 = 60 * 60;
+    match kind {
+        "5h" | "session" => Some(5 * HOUR),
+        "7d" => Some(7 * 24 * HOUR),
+        // 週次の枠は掛かる範囲 (全体 / モデル別) が違うだけで、周期は同じ。
+        kind if kind.starts_with("weekly") => Some(7 * 24 * HOUR),
+        _ => None,
+    }
+}
+
 /// Anthropic 公式の preset。
 ///
 /// サブスクの OAuth token をそのまま載せ、トークンを消費しない枠照会 API を

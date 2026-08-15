@@ -32,7 +32,12 @@ impl Metering for OpenAiMetering {
                 ..Window::default()
             }
             .with_reset(reset);
-            (!window.is_empty()).then_some(window)
+            // 周期は分で返る。中身が 1 つも読めなかった窓を「観測した」に
+            // 変えないよう、空判定の後に付ける。
+            let minutes = header_i64(headers, &format!("x-codex-{name}-window-minutes"));
+            (!window.is_empty()).then(|| {
+                window.with_window_seconds(minutes.filter(|m| *m > 0).map(|m| m as u64 * 60))
+            })
         };
         let reached = headers
             .get("x-codex-rate-limit-reached-type")
@@ -288,6 +293,52 @@ mod tests {
             snapshot.seven_day.unwrap().status.as_deref(),
             Some("rejected")
         );
+    }
+
+    /// 窓の周期は分で返るので秒へ直す (DR-0018 §6)。
+    ///
+    /// codex では周期の長い方が `secondary` なので、欄名では長短を決められない。
+    #[test]
+    fn each_window_declares_how_long_it_runs() {
+        let snapshot = OpenAiMetering
+            .quota_snapshot(
+                &headers(&[
+                    ("x-codex-primary-used-percent", "71"),
+                    ("x-codex-primary-window-minutes", "300"),
+                    ("x-codex-secondary-used-percent", "10"),
+                    ("x-codex-secondary-reset-at", "1800005000"),
+                    ("x-codex-secondary-window-minutes", "10080"),
+                ]),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot.five_hour.as_ref().unwrap().window_seconds,
+            Some(5 * 60 * 60)
+        );
+        assert_eq!(
+            snapshot.longest_window().and_then(|w| w.reset),
+            Some(1_800_005_000),
+            "the weekly window is the longest one"
+        );
+    }
+
+    /// 周期を言ってこないなら空のまま。0 分のような値も使わない。
+    #[test]
+    fn a_window_without_a_declared_length_stays_unknown() {
+        let snapshot = OpenAiMetering
+            .quota_snapshot(
+                &headers(&[
+                    ("x-codex-primary-used-percent", "71"),
+                    ("x-codex-secondary-used-percent", "10"),
+                    ("x-codex-secondary-window-minutes", "0"),
+                ]),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(snapshot.five_hour.as_ref().unwrap().window_seconds, None);
+        assert_eq!(snapshot.seven_day.as_ref().unwrap().window_seconds, None);
+        assert!(snapshot.longest_window().is_none());
     }
 
     /// 429 body の reset は Retry-After が無くても route 全体の期限になる。

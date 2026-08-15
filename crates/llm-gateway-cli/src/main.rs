@@ -1623,6 +1623,7 @@ mod tests {
             status: Some(status.to_owned()),
             reset: Some(reset),
             reset_iso: Some(llm_gateway::credential::time::format_rfc3339(reset)),
+            window_seconds: None,
         }
     }
 
@@ -1674,6 +1675,7 @@ mod tests {
                 resets_at: Some("2026-08-02T08:59:59.571539+00:00".to_owned()),
                 model: None,
                 model_id: None,
+                window_seconds: Some(7 * 24 * 60 * 60),
                 is_active: true,
             },
             llm_gateway::quota::QuotaLimit {
@@ -1683,6 +1685,7 @@ mod tests {
                 resets_at: Some("2026-08-02T08:59:59.571875+00:00".to_owned()),
                 model: Some("Fable".to_owned()),
                 model_id: None,
+                window_seconds: Some(7 * 24 * 60 * 60),
                 is_active: false,
             },
         ]);

@@ -117,7 +117,10 @@ fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
                 .get(&format!("anthropic-ratelimit-unified-{prefix}-reset"))
                 .and_then(|v| v.trim().parse().ok()),
         );
-        (!w.is_empty()).then_some(w)
+        // 周期は欄名そのものが答えなので、読めなくても付けられる。ただし
+        // 中身が 1 つも読めなかった窓を「観測した」に変えないよう、空判定の
+        // 後に付ける。
+        (!w.is_empty()).then(|| w.with_window_seconds(super::window_seconds(prefix)))
     };
 
     let overage = Overage {
@@ -488,6 +491,38 @@ mod tests {
         let overage = s.overage.unwrap();
         assert_eq!(overage.status.as_deref(), Some("disabled"));
         assert_eq!(overage.disabled_reason.as_deref(), Some("out_of_credits"));
+    }
+
+    /// 窓の周期は欄名から起こす。upstream は長さを数値で返さない (DR-0018 §6)。
+    #[test]
+    fn each_window_declares_how_long_it_runs() {
+        let s = AnthropicMetering
+            .quota_snapshot(&unified(), NOW)
+            .expect("readable");
+
+        assert_eq!(
+            s.five_hour.as_ref().unwrap().window_seconds,
+            Some(5 * 60 * 60)
+        );
+        assert_eq!(
+            s.seven_day.as_ref().unwrap().window_seconds,
+            Some(7 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            s.longest_window().and_then(|w| w.reset),
+            s.seven_day.as_ref().unwrap().reset,
+            "the weekly window is the longest one"
+        );
+    }
+
+    /// 中身が 1 つも読めなかった窓は、周期だけを理由に「観測した」へ変えない。
+    #[test]
+    fn a_window_with_no_readable_field_stays_absent() {
+        let s = AnthropicMetering.quota_snapshot(
+            &headers(&[("anthropic-ratelimit-unified-7d-utilization", "0.3")]),
+            NOW,
+        );
+        assert!(s.unwrap().five_hour.is_none());
     }
 
     /// ヘッダ名の大小は問わない (upstream や手前のプロキシで変わりうる)。
