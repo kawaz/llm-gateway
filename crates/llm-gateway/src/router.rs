@@ -54,6 +54,11 @@ pub struct Route {
     /// 効いてしまう。ここは 1 リクエストぶんの組み立て結果なので、書いた
     /// 規則のとおりにだけ効く。
     pub pace_cap: Option<config::PaceCap>,
+    /// この規則の使い切り繰り上げの幅 (DR-0018)。書いていなければ無い。
+    ///
+    /// 順序を決めるのに使うほか、`pace_cap.spend_down_release` が立っている
+    /// 経路では**上限を解放する合図**にもなる (DR-0019 §7)。
+    pub spend_down_within: Option<config::WindowSpan>,
 }
 
 impl Route {
@@ -75,6 +80,12 @@ impl Route {
     /// 効いてしまう (借りる側で締めた上限が、貸す側の面まで止める)。
     pub fn paced_out(&self, now: i64) -> Option<Denial> {
         let cap = self.pace_cap?;
+        // 使い切りに入った経路は、そう書いてあれば階段を解放する (DR-0019 §7)。
+        // 保護と使い切りのどちらを採るかは credential ごとに違うので、
+        // 選べるようにしてある。既定は保護 (解放しない)。
+        if cap.spend_down_release && self.spend_down_reset(now).is_some() {
+            return None;
+        }
         let hold = |until| {
             Some(Denial {
                 until,
@@ -100,6 +111,20 @@ impl Route {
     /// が枠を聞き直す合図に使う。
     pub fn needs_quota(&self, now: i64) -> bool {
         self.pace_cap.is_some() && self.pace_state(now).is_none()
+    }
+
+    /// 使い切りの繰り上げ窓に入っているか。入っていれば、そのリセット時刻
+    /// (DR-0018 §3)。
+    ///
+    /// 判定に使うのは上限と同じ最長周期窓。リセット時刻か窓長が読めない
+    /// 経路は繰り上げない — 観測できていない相手を推測で動かさない。
+    fn spend_down_reset(&self, now: i64) -> Option<i64> {
+        let within = self.spend_down_within?;
+        let snapshot = self.preset.quota()?;
+        let window = snapshot.longest_window()?;
+        let length = window.window_seconds?;
+        let reset = window.reset.filter(|reset| *reset > now)?;
+        (reset - now <= within.seconds_in(length)).then_some(reset)
     }
 
     /// 上限の判定に要る、最長周期窓の今の姿。読めなければ `None`。
@@ -439,8 +464,8 @@ impl Router {
         }
 
         // リセットが迫っている経路を、グループ境界を越えて先頭へ (DR-0018)。
-        if let Some(within) = ns.spend_down_for(model) {
-            self.spend_down(&mut routes, within, now);
+        if ns.spend_down_for(model).is_some() {
+            self.spend_down(&mut routes, now);
         }
 
         // 前回通った経路を先頭へ。落ちていても他を試せるよう、候補は減らさない。
@@ -523,14 +548,14 @@ impl Router {
     ///
     /// 静的順・同格グループの並びは、繰り上がらなかった経路の間では保たれる。
     /// 繰り上げた分どうしはリセットが近い順。
-    fn spend_down(&self, routes: &mut Vec<Arc<Route>>, within: config::WindowSpan, now: i64) {
+    fn spend_down(&self, routes: &mut Vec<Arc<Route>>, now: i64) {
         let mut promoted: Vec<(i64, Arc<Route>)> = Vec::new();
         let mut rest = Vec::with_capacity(routes.len());
         for route in routes.drain(..) {
             // 上限で外れる経路は昇格の対象にもしない (DR-0019 §8)。使えない
             // 経路を先頭へ寄せても、順序が 1 つ無駄になるだけ。
             let capped = route.paced_out(now).is_some();
-            match self.spend_down_reset(route.name(), within, now) {
+            match route.spend_down_reset(now) {
                 Some(reset) if !capped => promoted.push((reset, route)),
                 _ => rest.push(route),
             }
@@ -542,18 +567,6 @@ impl Router {
         promoted.sort_by_key(|(reset, _)| *reset);
         routes.extend(promoted.into_iter().map(|(_, route)| route));
         routes.extend(rest);
-    }
-
-    /// この経路が使い切りの対象なら、そのリセット時刻。
-    ///
-    /// 見るのは**周期が一番長い窓だけ** (DR-0018 §2)。窓長かリセット時刻が
-    /// 取れない経路は対象にしない — 観測できていない相手を推測で繰り上げない。
-    fn spend_down_reset(&self, route: &str, within: config::WindowSpan, now: i64) -> Option<i64> {
-        let snapshot = self.presets.get(route)?.quota()?;
-        let window = snapshot.longest_window()?;
-        let length = window.window_seconds?;
-        let reset = window.reset.filter(|reset| *reset > now)?;
-        (reset - now <= within.seconds_in(length)).then_some(reset)
     }
 
     fn reset_order_key(&self, route: &str, now: i64) -> (bool, i64) {
@@ -579,6 +592,7 @@ impl Router {
             preset: Arc::clone(preset),
             credential: route.credential.as_deref().map(CredentialId::new),
             pace_cap: ns.pace_cap_for(model, name),
+            spend_down_within: ns.spend_down_for(model),
             // upstream での名前が違う場合だけ書き換える。
             upstream_model: catalog
                 .upstream_name(name, model)
@@ -822,6 +836,16 @@ routes = [{ route = "oauth-a", pace_cap = { ratio = "100%", step = "1d" } }]
 models = ["claude-sonnet-5"]
 routes = [
     ["bedrock", { route = "oauth-a", pace_cap = { ratio = "100%", step = "1d" } }],
+    "oauth-b",
+]
+spend_down_within = "25%"
+
+# 使い切りに入ったら階段を解放する面 (DR-0019 §7)。同じ使用率・同じ
+# リセットでも、flag の有無で最終段の扱いが変わることを見る。
+[[ns.paced-release.routing]]
+models = ["claude-sonnet-5"]
+routes = [
+    { route = "oauth-a", pace_cap = { ratio = "100%", step = "1d", spend_down_release = true } },
     "oauth-b",
 ]
 spend_down_within = "25%"
@@ -1396,6 +1420,82 @@ spend_down_within = "25%"
         // 按分線を超えると、繰り上げの対象から外れて元の位置へ戻る。
         observe_usage(&r, "oauth-b", 6 * DAY, 1.0);
         assert_eq!(order(&r, ns).await, "bedrock,oauth-b");
+    }
+
+    // ---------- 使い切りに入ったら解放する (DR-0019 §7) ----------
+
+    /// 上限つきの経路 1 本を、指定の面から取り出す。
+    async fn capped_route(r: &Router, ns_name: &str, route: &str) -> Arc<Route> {
+        let ns = r.config.namespace(ns_name).expect("declared in CONFIG");
+        r.routes_for_at(ns, ns_name, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name() == route)
+            .expect("in this namespace")
+    }
+
+    /// 7d 窓の 25 % = 42 時間。使い切りの繰り上げ窓はここから内側。
+    const SPEND_DOWN_WINDOW: i64 = 42 * 60 * 60;
+
+    /// 解放を書いた経路は、使い切りに入れば按分線を超えていても通る。
+    #[tokio::test]
+    async fn a_releasing_route_is_freed_once_spend_down_starts() {
+        let r = router().await;
+        // リセットまで残り 41 時間 = 繰り上げ窓の内側。使い切ってよい頃合い。
+        let elapsed = WEEK as i64 - (SPEND_DOWN_WINDOW - 3600);
+        observe_usage(&r, "oauth-a", elapsed, 1.0);
+
+        let route = capped_route(&r, "paced-release", "oauth-a").await;
+        assert_eq!(
+            route.paced_out(NOW),
+            None,
+            "the staircase is released inside the spend-down window"
+        );
+    }
+
+    /// 使い切りの窓に入るまでは、解放を書いていても階段のまま。
+    #[tokio::test]
+    async fn a_releasing_route_is_still_paced_before_the_window() {
+        let r = router().await;
+        // 残り 43 時間 = 繰り上げ窓の外側。
+        let elapsed = WEEK as i64 - (SPEND_DOWN_WINDOW + 3600);
+        observe_usage(&r, "oauth-a", elapsed, 1.0);
+
+        let route = capped_route(&r, "paced-release", "oauth-a").await;
+        assert!(
+            route.paced_out(NOW).is_some(),
+            "outside the window the cap still applies"
+        );
+    }
+
+    /// 既定 (解放を書かない) では、使い切りに入っても最終段のまま据え置く。
+    ///
+    /// 段は floor で数えるので最後の端数は解放されず、使われないままリセットで
+    /// 消える。それが貸し手の枠を守るということ (DR-0019 §7)。
+    #[tokio::test]
+    async fn the_default_keeps_protecting_through_the_last_step() {
+        let r = router().await;
+        let elapsed = WEEK as i64 - (SPEND_DOWN_WINDOW - 3600);
+        observe_usage(&r, "oauth-a", elapsed, 1.0);
+
+        // 同じ使用率・同じリセットでも、解放を書いていない面では控えたまま。
+        let route = capped_route(&r, PACED_NS, "oauth-a").await;
+        let held = route.paced_out(NOW).expect("still capped");
+        assert_eq!(held.reason, crate::denial::Reason::Paced);
+    }
+
+    /// 使い切りの幅を書いていない規則では、解放の合図が来ない。
+    #[tokio::test]
+    async fn releasing_needs_a_spend_down_window_to_react_to() {
+        let r = router().await;
+        let elapsed = WEEK as i64 - 3600;
+        observe_usage(&r, "oauth-a", elapsed, 1.0);
+
+        // paced 面には spend_down_within が無い。リセット直前でも解放しない。
+        let route = capped_route(&r, PACED_NS, "oauth-a").await;
+        assert!(route.spend_down_reset(NOW).is_none());
+        assert!(route.paced_out(NOW).is_some());
     }
 
     /// 規則に無いモデルは、扱える credential を宣言順に試す。

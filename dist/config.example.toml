@@ -179,6 +179,14 @@ routes = ["codex-personal", "other-gateway"]
 # 上限を書いた経路は、枠が読めない間は通さない (どれだけ使ったか分からない
 # まま通すと、上限を書いていないのと同じになる)。その間は枠照会 API を
 # 蹴って埋めにいく。
+#
+# spend_down_release = true にすると、同じ規則の spend_down_within の窓に
+# 入った時点で階段を解放し、リセットまでに残りを使い切らせる。リセット曜日が
+# 都合のよい credential (週末に回るもの等) 向け。
+#
+# 既定 (false) では最終段の端数が解放されないまま蒸発する。それが保護に
+# あたる — 貸し手が使うかもしれない枠を最後まで食い尽くさない。共有の
+# credential を借りている経路はこちらのまま。
 [[ns.default.routing]]
 models = ["claude-opus-*"]
 routes = [

@@ -304,6 +304,17 @@ pub struct PaceCap {
     /// 時刻を先に言える。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<WindowSpan>,
+    /// 使い切りの繰り上げ窓に入ったら、階段を解放するか (既定 `false`)。
+    ///
+    /// `true` にすると、同じ規則の `spend_down_within` の窓に入った時点で
+    /// 上限の判定をやめ、リセットまでに残りを使い切らせる。リセット曜日が
+    /// 都合のよい credential (週末に回るもの等) で選ぶ。
+    ///
+    /// 既定の `false` では最終段の端数が解放されないまま蒸発する。それが
+    /// **保護**にあたる — 貸し手が営業時間中に使うかもしれない枠を、借り手が
+    /// 最後まで食い尽くさない (DR-0019 §7)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spend_down_release: bool,
 }
 
 /// `step` を書かなかったときの刻み (窓長に対する割合)。
@@ -1548,6 +1559,39 @@ routes = [
         assert_eq!(ns(&c).pace_cap_for("other", "a"), None);
     }
 
+    /// 解放は書いたときだけ立つ。既定は保護 (解放しない)。
+    #[test]
+    fn releasing_at_spend_down_is_opt_in() {
+        let c = capped();
+        assert!(
+            !ns(&c)
+                .pace_cap_for("model", "a")
+                .unwrap()
+                .spend_down_release,
+            "not written, so the cap holds to the end"
+        );
+
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[[ns.default.routing]]
+models = ["model"]
+routes = [{ route = "a", pace_cap = { spend_down_release = true } }]
+spend_down_within = "25%"
+"#,
+        )
+        .unwrap();
+        let cap = ns(&c).pace_cap_for("model", "a").unwrap();
+        assert!(cap.spend_down_release);
+        // 他の欄は既定のまま書かずに済む。
+        assert_eq!(cap.ratio, None);
+        assert_eq!(cap.step, None);
+    }
+
     /// 何も書かない上限は「按分線ちょうど / 窓長の 1/14 刻み」。
     #[test]
     fn an_empty_pace_cap_uses_the_defaults() {
@@ -1563,6 +1607,7 @@ routes = [
     fn the_budget_grows_only_at_step_boundaries() {
         let cap = PaceCap {
             ratio: None,
+            spend_down_release: false,
             step: Some(WindowSpan::Absolute(24 * 60 * 60)),
         };
         const DAY: i64 = 24 * 60 * 60;
@@ -1587,6 +1632,7 @@ routes = [
         const DAY: i64 = 24 * 60 * 60;
         let cap = |ratio: &str| PaceCap {
             ratio: Some(ratio.parse().unwrap()),
+            spend_down_release: false,
             step: Some(WindowSpan::Absolute(DAY as u64)),
         };
         let on_pace = cap("100%").budget(WEEK, 3 * DAY).allowed;
@@ -1616,6 +1662,7 @@ routes = [
     fn a_percentage_step_scales_to_the_window() {
         let cap = PaceCap {
             ratio: None,
+            spend_down_release: false,
             step: Some(WindowSpan::Ratio("25%".parse().unwrap())),
         };
         // 7d 窓の 25 % = 42 時間ごと。
@@ -1628,6 +1675,7 @@ routes = [
     fn the_budget_stops_at_the_end_of_the_window() {
         let cap = PaceCap {
             ratio: None,
+            spend_down_release: false,
             step: Some(WindowSpan::Ratio("50%".parse().unwrap())),
         };
         assert_eq!(cap.budget(WEEK, WEEK as i64 * 2).allowed, 1.0);
