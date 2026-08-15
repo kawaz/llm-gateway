@@ -181,22 +181,228 @@ pub struct Filter {
 }
 
 /// 同じ優先度で試す経路。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RouteGroup {
-    /// 1 経路だけのグループ。従来のフラットな記法。
-    One(String),
+    /// 1 経路だけのグループ。
+    One(RouteEntry),
     /// 7 日枠のリセットが近い順に試す同格の経路。
-    Equal(Vec<String>),
+    Equal(Vec<RouteEntry>),
+}
+
+/// 配列なら同格グループ、それ以外は 1 経路。
+///
+/// Design rationale: `#[serde(untagged)]` で書けるが、それだと中で起きた
+/// 失敗が全部「どの変種にも当てはまらない」に潰れる。設定の書き損じは人が
+/// 直すものなので、`step` が読めないのか経路名が抜けているのかが分かる
+/// 必要がある。形を先に見てから 1 つの変種へ落とす。
+impl<'de> Deserialize<'de> for RouteGroup {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = toml::Value::deserialize(deserializer)?;
+        if let toml::Value::Array(items) = value {
+            return items
+                .into_iter()
+                .map(|item| RouteEntry::from_value(item).map_err(serde::de::Error::custom))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map(Self::Equal);
+        }
+        RouteEntry::from_value(value)
+            .map(Self::One)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl RouteGroup {
-    fn routes(&self) -> impl Iterator<Item = &str> {
+    fn entries(&self) -> impl Iterator<Item = &RouteEntry> {
         match self {
-            Self::One(route) => std::slice::from_ref(route).iter(),
-            Self::Equal(routes) => routes.iter(),
+            Self::One(entry) => std::slice::from_ref(entry).iter(),
+            Self::Equal(entries) => entries.iter(),
         }
-        .map(String::as_str)
+    }
+
+    fn routes(&self) -> impl Iterator<Item = &str> {
+        self.entries().map(RouteEntry::name)
+    }
+}
+
+/// 経路 1 本の書き方。名前だけでも、属性を付けた table でもよい。
+///
+/// DR-0015 が「グループ位置に table も書ける形を後から**追加**できる」と
+/// した枠 — 文字列と table は形が重ならないので、既存の書き方はそのまま
+/// 読める。**同格グループの中でも同じように書ける** (DR-0019 §1)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum RouteEntry {
+    /// 名前だけ。
+    Named(String),
+    /// 属性を付けた 1 経路。
+    Attributed(Box<AttributedRoute>),
+}
+
+impl RouteEntry {
+    /// 文字列なら名前だけ、table なら属性つき。
+    fn from_value(value: toml::Value) -> Result<Self> {
+        match value {
+            toml::Value::String(name) => Ok(Self::Named(name)),
+            toml::Value::Table(_) => value
+                .try_into()
+                .map(|route| Self::Attributed(Box::new(route)))
+                .map_err(|e| Error::Config(format!("this route is not readable: {e}"))),
+            other => Err(Error::Config(format!(
+                "a route is written as a name or a table, but this is {}",
+                other.type_str()
+            ))),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Named(name) => name,
+            Self::Attributed(route) => &route.route,
+        }
+    }
+
+    fn pace_cap(&self) -> Option<PaceCap> {
+        match self {
+            Self::Named(_) => None,
+            Self::Attributed(route) => route.pace_cap,
+        }
+    }
+}
+
+/// 属性を付けて書いた 1 経路。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttributedRoute {
+    /// 経路の名前。
+    pub route: String,
+    /// 経過ぶんを超えて使わせない上限 (DR-0019)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pace_cap: Option<PaceCap>,
+}
+
+/// 経過した時間ぶんを超えて枠を使わせない上限 (DR-0019)。
+///
+/// 窓の頭から測った経過を `step` 刻みの階段にし、その段まで使ってよい割合を
+/// 予算にする。予算を超えた経路は**次の段に上がるまで**候補から外れる。
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaceCap {
+    /// 経過ぶんのうち使ってよい割合。既定は `"100%"` (按分線ちょうど)。
+    ///
+    /// **按分線を超える値は書けない** (`0%`〜`100%`)。この上限は借りる側が
+    /// 貸す側のペースに食い込まないためのもので、先食いを許す方向は目的に
+    /// 反する。`"80%"` のように手前で締める方向だけ書ける。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<Share>,
+    /// 予算が増える刻み。既定は窓長の 1/14 (7 日枠なら 12 時間)。
+    ///
+    /// 刻まずに経過そのものを使うと予算が連続的に増え、上限際の経路が
+    /// 「わずかに許可されては即使い切る」を繰り返す。段にすると、次に開く
+    /// 時刻を先に言える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<WindowSpan>,
+}
+
+/// `step` を書かなかったときの刻み (窓長に対する割合)。
+///
+/// 7 日枠で 12 時間。1 日 2 段なら、遅れを取り戻す粒度としても、無駄な
+/// 締め出しを避ける粗さとしても実用的な範囲に収まる。
+const DEFAULT_STEP: WindowSpan = WindowSpan::Ratio(Share(1.0 / 14.0));
+
+/// 今この時点で使ってよい量と、それが次に増える時。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    /// 使ってよい割合 (使用率と同じ 0.0〜1.0 の尺度)。
+    pub allowed: f64,
+    /// 次に予算が増える時刻 (窓の頭からの経過秒)。
+    pub next_step_at: i64,
+}
+
+impl PaceCap {
+    /// 窓の頭から `elapsed` 秒の時点での予算。
+    ///
+    /// 予算 = (階段まで下ろした経過 / 窓長) × `ratio`。経過そのものではなく
+    /// 段で測るので、同じ段にいる間は予算が動かない。
+    pub fn budget(self, window_seconds: u64, elapsed: i64) -> Budget {
+        let step = self.step.unwrap_or(DEFAULT_STEP).seconds_in(window_seconds);
+        // 刻みが窓より細かく丸められて 0 になっても、段の概念は保つ。
+        let step = step.max(1);
+        let elapsed = elapsed.clamp(0, window_seconds as i64);
+        let steps = elapsed / step;
+        let ratio = self.ratio.unwrap_or_default().as_fraction();
+        Budget {
+            allowed: (steps * step) as f64 / window_seconds as f64 * ratio,
+            next_step_at: (steps + 1).saturating_mul(step),
+        }
+    }
+}
+
+/// `"100%"` の形で書く割合。0 % 〜 100 % だけ。
+///
+/// 設定に出てくる割合はすべてこの書式にしてある。素の小数と混在すると、
+/// 読むたびに単位を確かめることになる。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Share(f64);
+
+impl Share {
+    /// 0.0〜1.0 の小数として使う。
+    pub fn as_fraction(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for Share {
+    /// 書かなければ按分線ちょうど (`"100%"`)。
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+impl std::str::FromStr for Share {
+    type Err = Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let text = text.trim();
+        let percent: f64 = text
+            .strip_suffix('%')
+            .ok_or_else(|| Error::Config(format!("`{text}` is not a percentage such as `100%`")))?
+            .trim()
+            .parse()
+            .map_err(|_| Error::Config(format!("`{text}` is not a percentage such as `100%`")))?;
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(Error::Config(format!(
+                "`{text}` is outside the 0%-100% range"
+            )));
+        }
+        Ok(Self(percent / 100.0))
+    }
+}
+
+impl std::fmt::Display for Share {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}%", self.0 * 100.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Share {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Share {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -212,47 +418,41 @@ pub struct RoutingRule {
     ///
     /// 書かなければ繰り上げない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spend_down_within: Option<SpendDown>,
+    pub spend_down_within: Option<WindowSpan>,
 }
 
-/// 使い切りに入る手前の幅。
+/// 枠の窓に対して測る幅。
 ///
 /// 窓長に対する割合でも、絶対時間でも書ける。割合は窓長にスケールするので、
-/// 周期の違う credential を 1 つの規則で扱える (DR-0018 §1)。
+/// 周期の違う credential を 1 つの規則で扱える (DR-0018 §1)。使い切りの
+/// 手前の幅 (`spend_down_within`) と、予算が増える刻み (`pace_cap.step`) が
+/// 同じ「窓に対する幅」なので、書き方も 1 つにしてある。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SpendDown {
-    /// 窓長に対する割合 (0.0〜1.0)。
-    Ratio(f64),
-    /// 窓長に依らない絶対の残り時間 (秒)。
+pub enum WindowSpan {
+    /// 窓長に対する割合。
+    Ratio(Share),
+    /// 窓長に依らない絶対の秒数。
     Absolute(u64),
 }
 
-impl SpendDown {
-    /// この窓長のとき、リセットまで残り何秒で繰り上げに入るか。
-    pub fn threshold_for(self, window_seconds: u64) -> i64 {
+impl WindowSpan {
+    /// この窓長で測ったときの秒数。
+    pub fn seconds_in(self, window_seconds: u64) -> i64 {
         let seconds = match self {
-            Self::Ratio(ratio) => (window_seconds as f64 * ratio) as u64,
+            Self::Ratio(ratio) => (window_seconds as f64 * ratio.as_fraction()) as u64,
             Self::Absolute(seconds) => seconds,
         };
         seconds.min(i64::MAX as u64) as i64
     }
 }
 
-impl std::str::FromStr for SpendDown {
+impl std::str::FromStr for WindowSpan {
     type Err = Error;
 
     fn from_str(text: &str) -> Result<Self> {
         let text = text.trim();
-        if let Some(percent) = text.strip_suffix('%') {
-            let percent: f64 = percent.trim().parse().map_err(|_| {
-                Error::Config(format!("`{text}` is not a percentage such as `25%`"))
-            })?;
-            if !(0.0..=100.0).contains(&percent) {
-                return Err(Error::Config(format!(
-                    "`{text}` is outside the 0%-100% range"
-                )));
-            }
-            return Ok(Self::Ratio(percent / 100.0));
+        if text.ends_with('%') {
+            return Ok(Self::Ratio(text.parse()?));
         }
         let duration = humantime::parse_duration(text).map_err(|_| {
             Error::Config(format!(
@@ -263,10 +463,10 @@ impl std::str::FromStr for SpendDown {
     }
 }
 
-impl std::fmt::Display for SpendDown {
+impl std::fmt::Display for WindowSpan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ratio(ratio) => write!(f, "{}%", ratio * 100.0),
+            Self::Ratio(ratio) => write!(f, "{ratio}"),
             Self::Absolute(seconds) => {
                 write!(
                     f,
@@ -278,7 +478,7 @@ impl std::fmt::Display for SpendDown {
     }
 }
 
-impl<'de> Deserialize<'de> for SpendDown {
+impl<'de> Deserialize<'de> for WindowSpan {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
@@ -287,7 +487,7 @@ impl<'de> Deserialize<'de> for SpendDown {
     }
 }
 
-impl Serialize for SpendDown {
+impl Serialize for WindowSpan {
     fn serialize<S: serde::Serializer>(
         &self,
         serializer: S,
@@ -672,6 +872,24 @@ impl Config {
                     )));
                 }
             }
+            // 上限は同格グループの中にも書けるので、全要素を見る。
+            for entry in rule.routes.iter().flat_map(RouteGroup::entries) {
+                let Some(step) = entry.pace_cap().and_then(|cap| cap.step) else {
+                    continue;
+                };
+                // 窓長は実行時にしか分からないので、割合指定は 0 でないこと
+                // しか見られない。絶対指定は書かれた値をそのまま見る。
+                let never_grows = match step {
+                    WindowSpan::Absolute(seconds) => seconds == 0,
+                    WindowSpan::Ratio(share) => share.as_fraction() == 0.0,
+                };
+                if never_grows {
+                    return Err(Error::Config(format!(
+                        "namespace `{ns_name}` routing[{i}] route `{}` has a pace_cap step of zero; the budget would never grow",
+                        entry.name()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -750,8 +968,21 @@ impl Namespace {
     ///
     /// 規則に当たらないモデル (= 宣言順に全部試す退化形) では繰り上げない。
     /// 順序を書いていない相手の順序を動かす理由がない。
-    pub fn spend_down_for(&self, model: &str) -> Option<SpendDown> {
+    pub fn spend_down_for(&self, model: &str) -> Option<WindowSpan> {
         self.rule_for(model)?.spend_down_within
+    }
+
+    /// このモデルをこの経路へ流すときの消費上限 (DR-0019)。
+    ///
+    /// 書いていない経路には上限がない。同じ経路でも、規則ごとに (= モデル群
+    /// ごとに、namespace ごとに) 違う上限を書ける。
+    pub fn pace_cap_for(&self, model: &str, route: &str) -> Option<PaceCap> {
+        self.rule_for(model)?
+            .routes
+            .iter()
+            .flat_map(RouteGroup::entries)
+            .find(|entry| entry.name() == route)?
+            .pace_cap()
     }
 
     /// この namespace が使ってよい経路。
@@ -1191,27 +1422,27 @@ routes = [["a", "b"], "c"]
     /// 割合は窓長に掛ける係数として読む。`25%` は 7d 枠なら 42 時間。
     #[test]
     fn spend_down_reads_a_percentage_against_the_window() {
-        let within: SpendDown = "25%".parse().unwrap();
-        assert_eq!(within, SpendDown::Ratio(0.25));
+        let within: WindowSpan = "25%".parse().unwrap();
+        assert_eq!(within, WindowSpan::Ratio("25%".parse().unwrap()));
 
         const WEEK: u64 = 7 * 24 * 60 * 60;
-        assert_eq!(within.threshold_for(WEEK), 42 * 60 * 60);
+        assert_eq!(within.seconds_in(WEEK), 42 * 60 * 60);
         // 同じ設定でも、窓が短ければ閾値も短くなる。
-        assert_eq!(within.threshold_for(5 * 60 * 60), 75 * 60);
+        assert_eq!(within.seconds_in(5 * 60 * 60), 75 * 60);
     }
 
     /// 絶対時間は窓長に関係なく同じ幅になる。
     #[test]
     fn spend_down_reads_an_absolute_duration() {
-        let within: SpendDown = "40h".parse().unwrap();
-        assert_eq!(within, SpendDown::Absolute(40 * 60 * 60));
-        assert_eq!(within.threshold_for(7 * 24 * 60 * 60), 40 * 60 * 60);
-        assert_eq!(within.threshold_for(5 * 60 * 60), 40 * 60 * 60);
+        let within: WindowSpan = "40h".parse().unwrap();
+        assert_eq!(within, WindowSpan::Absolute(40 * 60 * 60));
+        assert_eq!(within.seconds_in(7 * 24 * 60 * 60), 40 * 60 * 60);
+        assert_eq!(within.seconds_in(5 * 60 * 60), 40 * 60 * 60);
 
         // humantime の複合表記も読める。
         assert_eq!(
-            "2d 6h".parse::<SpendDown>().unwrap(),
-            SpendDown::Absolute((2 * 24 + 6) * 60 * 60)
+            "2d 6h".parse::<WindowSpan>().unwrap(),
+            WindowSpan::Absolute((2 * 24 + 6) * 60 * 60)
         );
     }
 
@@ -1219,7 +1450,7 @@ routes = [["a", "b"], "c"]
     #[test]
     fn spend_down_rejects_anything_else() {
         for text in ["25x", "%", "", "twenty-five percent", "-1%", "101%", "40"] {
-            assert!(text.parse::<SpendDown>().is_err(), "{text}");
+            assert!(text.parse::<WindowSpan>().is_err(), "{text}");
         }
     }
 
@@ -1245,11 +1476,202 @@ routes = ["a"]
         .unwrap();
         assert_eq!(
             ns(&c).spend_down_for("spent-1"),
-            Some(SpendDown::Ratio(0.25))
+            Some(WindowSpan::Ratio("25%".parse().unwrap()))
         );
         assert_eq!(ns(&c).spend_down_for("plain-1"), None);
         // どの規則にも当たらないモデルは、順序を書いていないので動かさない。
         assert_eq!(ns(&c).spend_down_for("other"), None);
+    }
+
+    // ---------- 消費の上限 (DR-0019) ----------
+
+    const WEEK: u64 = 7 * 24 * 60 * 60;
+
+    fn capped() -> Config {
+        parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+[credentials.b]
+type = "claude_oauth"
+[credentials.c]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[routes.b]
+provider = "anthropic"
+credential = "b"
+[routes.c]
+provider = "anthropic"
+credential = "c"
+[[ns.default.routing]]
+models = ["model"]
+routes = [
+    { route = "a", pace_cap = { ratio = "100%", step = "12h" } },
+    ["b", { route = "c", pace_cap = { ratio = "80%" } }],
+]
+"#,
+        )
+        .unwrap()
+    }
+
+    /// table で書いた要素も、文字列で書いた要素と同じ位置を占める。
+    ///
+    /// 同格グループの中に混ぜても、グループの境界は変わらない。
+    #[test]
+    fn routing_accepts_attributed_routes_anywhere_a_name_goes() {
+        let c = capped();
+        assert_eq!(
+            ns(&c).route_groups_for("model", &c),
+            vec![vec!["a"], vec!["b", "c"]]
+        );
+        assert_eq!(ns(&c).routes_for("model", &c), vec!["a", "b", "c"]);
+    }
+
+    /// 上限は経路ごと。同格グループの中に書いた分も読める (DR-0019 §1)。
+    #[test]
+    fn pace_cap_is_read_per_route_including_inside_groups() {
+        let c = capped();
+        let outer = ns(&c).pace_cap_for("model", "a").expect("written");
+        assert_eq!(outer.ratio, Some("100%".parse().unwrap()));
+        assert_eq!(outer.step, Some(WindowSpan::Absolute(12 * 60 * 60)));
+
+        let inner = ns(&c)
+            .pace_cap_for("model", "c")
+            .expect("written in a group");
+        assert_eq!(inner.ratio, Some("80%".parse().unwrap()));
+        assert_eq!(inner.step, None, "the default step applies");
+
+        assert_eq!(ns(&c).pace_cap_for("model", "b"), None);
+        // 規則に当たらないモデルには上限がない。
+        assert_eq!(ns(&c).pace_cap_for("other", "a"), None);
+    }
+
+    /// 何も書かない上限は「按分線ちょうど / 窓長の 1/14 刻み」。
+    #[test]
+    fn an_empty_pace_cap_uses_the_defaults() {
+        let cap = PaceCap::default();
+        // 7d 窓なら 12 時間ごと。
+        assert_eq!(cap.budget(WEEK, 0).next_step_at, 12 * 60 * 60);
+        // 半分まで経てば半分。ratio 100% なので按分線ちょうど。
+        assert_eq!(cap.budget(WEEK, WEEK as i64 / 2).allowed, 0.5);
+    }
+
+    /// 予算は段の上でだけ増える。同じ段にいる間は動かない。
+    #[test]
+    fn the_budget_grows_only_at_step_boundaries() {
+        let cap = PaceCap {
+            ratio: None,
+            step: Some(WindowSpan::Absolute(24 * 60 * 60)),
+        };
+        const DAY: i64 = 24 * 60 * 60;
+
+        // 1 日目の途中はまだ 0 段目。使ってよい量はゼロ。
+        let start = cap.budget(WEEK, DAY - 1);
+        assert_eq!(start.allowed, 0.0);
+        assert_eq!(start.next_step_at, DAY, "the budget grows one day in");
+
+        // 2 日目に入ると 1 日ぶん = 1/7。
+        let second = cap.budget(WEEK, DAY);
+        assert!((second.allowed - 1.0 / 7.0).abs() < 1e-9);
+        assert_eq!(second.next_step_at, 2 * DAY);
+
+        // 2 日目のどこにいても同じ予算。
+        assert_eq!(cap.budget(WEEK, 2 * DAY - 1), second);
+    }
+
+    /// ratio は予算を丸ごと絞る。按分線より手前で締める方向にだけ効く。
+    #[test]
+    fn the_ratio_tightens_the_whole_budget() {
+        const DAY: i64 = 24 * 60 * 60;
+        let cap = |ratio: &str| PaceCap {
+            ratio: Some(ratio.parse().unwrap()),
+            step: Some(WindowSpan::Absolute(DAY as u64)),
+        };
+        let on_pace = cap("100%").budget(WEEK, 3 * DAY).allowed;
+        let tighter = cap("80%").budget(WEEK, 3 * DAY).allowed;
+
+        assert!((on_pace - 3.0 / 7.0).abs() < 1e-9, "the elapsed share");
+        assert!((tighter - on_pace * 0.8).abs() < 1e-9);
+        // 段の位置は ratio に影響されない。
+        assert_eq!(
+            cap("100%").budget(WEEK, 3 * DAY).next_step_at,
+            cap("80%").budget(WEEK, 3 * DAY).next_step_at
+        );
+    }
+
+    /// 按分線を超える貸し出しは書けない。仕事枠の保護が目的なので。
+    #[test]
+    fn a_ratio_above_the_pace_line_is_rejected() {
+        for text in ["120%", "101%", "-1%", "1.0", "abc", ""] {
+            assert!(text.parse::<Share>().is_err(), "{text}");
+        }
+        assert_eq!("0%".parse::<Share>().unwrap().as_fraction(), 0.0);
+        assert_eq!("100%".parse::<Share>().unwrap().as_fraction(), 1.0);
+    }
+
+    /// step を割合で書くと、窓長に合わせて刻みが変わる。
+    #[test]
+    fn a_percentage_step_scales_to_the_window() {
+        let cap = PaceCap {
+            ratio: None,
+            step: Some(WindowSpan::Ratio("25%".parse().unwrap())),
+        };
+        // 7d 窓の 25 % = 42 時間ごと。
+        assert_eq!(cap.budget(WEEK, 0).next_step_at, 42 * 60 * 60);
+        assert_eq!(cap.budget(WEEK, 42 * 60 * 60).allowed, 0.25);
+    }
+
+    /// 窓を出た経過は窓の端で止める。予算が ratio を超えて伸びない。
+    #[test]
+    fn the_budget_stops_at_the_end_of_the_window() {
+        let cap = PaceCap {
+            ratio: None,
+            step: Some(WindowSpan::Ratio("50%".parse().unwrap())),
+        };
+        assert_eq!(cap.budget(WEEK, WEEK as i64 * 2).allowed, 1.0);
+        assert_eq!(cap.budget(WEEK, -100).allowed, 0.0);
+    }
+
+    /// 予算が増えない書き方 (刻み 0) は、設定を読んだ時点で拒否する。
+    #[test]
+    fn a_pace_cap_that_never_grows_is_rejected() {
+        for step in ["\"0%\"", "\"0s\""] {
+            let err = parse(&format!(
+                r#"
+[credentials.a]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[[ns.default.routing]]
+models = ["model"]
+routes = [{{ route = "a", pace_cap = {{ step = {step} }} }}]
+"#
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("never grow"), "{step}: {err}");
+        }
+    }
+
+    /// 割合として書けない ratio は、設定を読んだ時点で拒否する。
+    #[test]
+    fn a_ratio_outside_the_range_is_rejected_in_the_config() {
+        let err = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+[routes.a]
+provider = "anthropic"
+credential = "a"
+[[ns.default.routing]]
+models = ["model"]
+routes = [{ route = "a", pace_cap = { ratio = "120%" } }]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("0%-100%"), "{err}");
     }
 
     /// グループの中にグループは書けない。ネストは同格を表す 1 段だけに限定する。

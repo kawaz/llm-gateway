@@ -269,6 +269,12 @@ impl<P: Persistence> Gateway<P> {
             }
         }
 
+        // 上限を書いた経路の枠が読めていないなら、**判定の前に**聞いておく
+        // (DR-0019 §6)。読めないままだとその経路は通らず、通らなければ応答
+        // ヘッダも読めない (= 一度も貸せないまま閉じ続ける)。枠照会は
+        // トークンを消費しないので、ここで待つ価値がある。
+        self.fill_quota_for_capped(&routes, now).await;
+
         // 断られている経路は飛ばす。全滅なら router が 429 を組んで返す
         // (「候補が空」は経路を選ぶ側の判断、DR-0014 §8)。
         let routes = match self.router.select(
@@ -679,6 +685,41 @@ impl<P: Persistence> Gateway<P> {
             errors,
             limits,
         })
+    }
+
+    /// 上限を書いた経路のうち、枠が読めていないものを聞いて埋める。
+    ///
+    /// **答えを待つ**。裏で聞いて次のリクエストに回すと、その 1 本は上限を
+    /// 判定できないまま外れる。枠照会はトークンを消費しない (DR-0007) ので、
+    /// 待っても失うのは往復ぶんの時間だけ。
+    ///
+    /// 聞く相手がいない経路 (枠照会 API を持たない provider) は、ここを
+    /// 素通りしてスナップショット頼みになる。それでも読めなければ、上限の
+    /// 判定ができないまま外れる (DR-0019 §6 の安全側)。
+    ///
+    /// 札 ([`Preset::claim_ask`]) を取れたものだけ聞くので、答えが返らない
+    /// 相手に毎リクエスト当たり続けることはない。
+    async fn fill_quota_for_capped(&self, routes: &[Arc<Route>], now: i64) {
+        for route in routes {
+            if !route.needs_quota(now) {
+                continue;
+            }
+            let Some(id) = &route.credential else {
+                continue;
+            };
+            let Some(_probing) = route.preset.claim_ask(now) else {
+                continue;
+            };
+            let Some(limits) = self.ask_limits(id, &route.preset).await else {
+                continue;
+            };
+            route.preset.apply_quota(&limits, now_unix());
+            info!(
+                credential = %id,
+                limits = limits.len(),
+                "queried quota before judging the pace cap"
+            );
+        }
     }
 
     /// 1 つの経路の枠を、専用の口に聞く。

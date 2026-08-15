@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::config::{self, Config, Namespace, RouteSpec};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
-use crate::denial::{Availability, PROBE_INTERVAL};
+use crate::denial::{Availability, Denial, PROBE_INTERVAL, Reason, Scope};
 use crate::discovery::{self, Model};
 use crate::egress::{Headers, Response};
 use crate::events::{self, Events};
@@ -46,6 +46,14 @@ pub struct Route {
     /// 何という名前で受け付けるかは discovery が答える (upstream によっては
     /// 独自の名前空間が付く)。方言の話ではないので Wire は持たない。
     pub upstream_model: Option<String>,
+    /// 借りてよいのは経過した時間ぶんまで、という上限 (DR-0019)。
+    /// 書いていなければ無い。
+    ///
+    /// **経路 (preset) ではなくここが持つ**。同じ credential でも namespace や
+    /// モデル群が変われば上限は変わるので、経路の状態に混ぜると面をまたいで
+    /// 効いてしまう。ここは 1 リクエストぶんの組み立て結果なので、書いた
+    /// 規則のとおりにだけ効く。
+    pub pace_cap: Option<config::PaceCap>,
 }
 
 impl Route {
@@ -53,6 +61,71 @@ impl Route {
     pub fn name(&self) -> &str {
         self.preset.name()
     }
+
+    /// 按分線を超えて使ったか。超えていれば、次に予算が増えるまでの控え。
+    ///
+    /// 見るのは**周期が一番長い窓**だけ (DR-0018 §2 と同じ理由 — 数時間で
+    /// 回る窓に借用の話は無い)。窓長・リセット時刻・使用率のどれかが読めない
+    /// 場合は**通さない**: 上限を書いた経路は「どれだけ使ったか分かっている
+    /// こと」が前提で、分からないまま通すと上限を書いていないのと同じになる
+    /// (DR-0019 §5)。
+    ///
+    /// 返すのは断りの形 ([`Denial`]) だが、**経路には控えない**。上限は
+    /// namespace × モデル群ごとに違うので、経路の状態に置くと面をまたいで
+    /// 効いてしまう (借りる側で締めた上限が、貸す側の面まで止める)。
+    pub fn paced_out(&self, now: i64) -> Option<Denial> {
+        let cap = self.pace_cap?;
+        let hold = |until| {
+            Some(Denial {
+                until,
+                reason: Reason::Paced,
+                scope: Scope::Everything,
+            })
+        };
+        let Some(state) = self.pace_state(now) else {
+            // 読めないので、次にいつ開くとも言えない。短く閉じて、その間に
+            // 枠を聞き直す猶予を作る。
+            return hold(now + crate::denial::DEFAULT_BACKOFF);
+        };
+        let budget = cap.budget(state.window_seconds, state.elapsed);
+        if state.utilization <= budget.allowed {
+            return None;
+        }
+        hold(state.window_started_at + budget.next_step_at)
+    }
+
+    /// 上限を判定したいのに枠が読めていない経路か (DR-0019 §5)。
+    ///
+    /// この状態の経路は通さないので、放っておくと閉じたままになる。呼び出し側
+    /// が枠を聞き直す合図に使う。
+    pub fn needs_quota(&self, now: i64) -> bool {
+        self.pace_cap.is_some() && self.pace_state(now).is_none()
+    }
+
+    /// 上限の判定に要る、最長周期窓の今の姿。読めなければ `None`。
+    fn pace_state(&self, now: i64) -> Option<PaceState> {
+        let snapshot = self.preset.quota()?;
+        let window = snapshot.longest_window()?;
+        let window_seconds = window.window_seconds?;
+        let reset = window.reset.filter(|reset| *reset > now)?;
+        Some(PaceState {
+            window_seconds,
+            window_started_at: reset - window_seconds as i64,
+            elapsed: window_seconds as i64 - (reset - now),
+            utilization: window.utilization?,
+        })
+    }
+}
+
+/// 最長周期窓の今の姿 (上限の判定に使う分だけ)。
+struct PaceState {
+    window_seconds: u64,
+    /// 窓の頭の時刻 (Unix 秒)。
+    window_started_at: i64,
+    /// 窓の頭からの経過 (秒)。
+    elapsed: i64,
+    /// 使用率 (0.0〜1.0)。
+    utilization: f64,
 }
 
 impl std::fmt::Debug for Route {
@@ -354,7 +427,7 @@ impl Router {
             let mut equal: Vec<Arc<Route>> = group
                 .into_iter()
                 .filter(|name| available.iter().any(|available| available == name))
-                .filter_map(|name| self.build_route(&catalog, name, model))
+                .filter_map(|name| self.build_route(&catalog, ns, name, model))
                 .collect();
             equal.sort_by_key(|route| self.reset_order_key(route.name(), now));
             routes.extend(equal);
@@ -393,6 +466,10 @@ impl Router {
     /// 断られている経路は**外す**。開く時刻を知っていながら実リクエストを
     /// 当てるのは、分かっている壁にわざわざぶつかりに行くのと同じ。
     ///
+    /// 消費の上限 (DR-0019) に達した経路も同じように外す。upstream はまだ
+    /// 通すが、通させたくないのはこちらの都合 — 断られたのと区別する必要が
+    /// あるのは記録の側だけで、選ぶ側から見ればどちらも「今は使わない」。
+    ///
     /// 全滅なら 429 をここで組む。「候補が空」は経路を選ぶ側の判断なので、
     /// その答えも選ぶ側が出す (DR-0014 §8)。見ている人にも 1 件流す — upstream
     /// を叩いていないだけで、クライアントには断りが返っている。`origin` の
@@ -407,6 +484,17 @@ impl Router {
         let mut ready = Vec::new();
         let mut opens_at = Vec::new();
         for route in routes {
+            if let Some(held) = route.paced_out(now) {
+                info!(
+                    route = route.name(),
+                    model = %model,
+                    reason = ?held.reason,
+                    seconds = held.until - now,
+                    "route is ahead of its pace; holding it until the budget grows"
+                );
+                opens_at.push(held.until);
+                continue;
+            }
             match route.preset.availability(model, now) {
                 Availability::Ready => ready.push(Arc::clone(route)),
                 Availability::Denied { until } => opens_at.push(until),
@@ -435,13 +523,16 @@ impl Router {
     ///
     /// 静的順・同格グループの並びは、繰り上がらなかった経路の間では保たれる。
     /// 繰り上げた分どうしはリセットが近い順。
-    fn spend_down(&self, routes: &mut Vec<Arc<Route>>, within: config::SpendDown, now: i64) {
+    fn spend_down(&self, routes: &mut Vec<Arc<Route>>, within: config::WindowSpan, now: i64) {
         let mut promoted: Vec<(i64, Arc<Route>)> = Vec::new();
         let mut rest = Vec::with_capacity(routes.len());
         for route in routes.drain(..) {
+            // 上限で外れる経路は昇格の対象にもしない (DR-0019 §8)。使えない
+            // 経路を先頭へ寄せても、順序が 1 つ無駄になるだけ。
+            let capped = route.paced_out(now).is_some();
             match self.spend_down_reset(route.name(), within, now) {
-                Some(reset) => promoted.push((reset, route)),
-                None => rest.push(route),
+                Some(reset) if !capped => promoted.push((reset, route)),
+                _ => rest.push(route),
             }
         }
         if promoted.is_empty() {
@@ -457,12 +548,12 @@ impl Router {
     ///
     /// 見るのは**周期が一番長い窓だけ** (DR-0018 §2)。窓長かリセット時刻が
     /// 取れない経路は対象にしない — 観測できていない相手を推測で繰り上げない。
-    fn spend_down_reset(&self, route: &str, within: config::SpendDown, now: i64) -> Option<i64> {
+    fn spend_down_reset(&self, route: &str, within: config::WindowSpan, now: i64) -> Option<i64> {
         let snapshot = self.presets.get(route)?.quota()?;
         let window = snapshot.longest_window()?;
         let length = window.window_seconds?;
         let reset = window.reset.filter(|reset| *reset > now)?;
-        (reset - now <= within.threshold_for(length)).then_some(reset)
+        (reset - now <= within.seconds_in(length)).then_some(reset)
     }
 
     fn reset_order_key(&self, route: &str, now: i64) -> (bool, i64) {
@@ -475,12 +566,19 @@ impl Router {
             .map_or((true, 0), |reset| (false, reset))
     }
 
-    fn build_route(&self, catalog: &Catalog, name: &str, model: &str) -> Option<Arc<Route>> {
+    fn build_route(
+        &self,
+        catalog: &Catalog,
+        ns: &Namespace,
+        name: &str,
+        model: &str,
+    ) -> Option<Arc<Route>> {
         let route = self.config.routes.get(name)?;
         let preset = self.presets.get(name)?;
         Some(Arc::new(Route {
             preset: Arc::clone(preset),
             credential: route.credential.as_deref().map(CredentialId::new),
+            pace_cap: ns.pace_cap_for(model, name),
             // upstream での名前が違う場合だけ書き換える。
             upstream_model: catalog
                 .upstream_name(name, model)
@@ -702,6 +800,40 @@ routes = ["bedrock", "oauth-a"]
 [[ns.spend.routing]]
 models = ["claude-sonnet-5"]
 routes = ["bedrock", "oauth-a", "oauth-b"]
+spend_down_within = "25%"
+
+# 消費の上限 (DR-0019) を見るための面。oauth-a にだけ上限を掛け、
+# 上限に当たったときに oauth-b へ落ちることを見る。
+[[ns.paced.routing]]
+models = ["claude-sonnet-5"]
+routes = [
+    { route = "oauth-a", pace_cap = { ratio = "100%", step = "1d" } },
+    "oauth-b",
+]
+
+# 逃げ場が無い面。上限に当たった経路しか無いときの答えを見る。
+[[ns.paced-only.routing]]
+models = ["claude-sonnet-5"]
+routes = [{ route = "oauth-a", pace_cap = { ratio = "100%", step = "1d" } }]
+
+# 同格グループの中に上限を書いた面 (DR-0019 §1)。使い切りの繰り上げも
+# 効かせて、上限で外れた経路が昇格しないことを見る (DR-0019 §8)。
+[[ns.paced-group.routing]]
+models = ["claude-sonnet-5"]
+routes = [
+    ["bedrock", { route = "oauth-a", pace_cap = { ratio = "100%", step = "1d" } }],
+    "oauth-b",
+]
+spend_down_within = "25%"
+
+# 上限つきの経路を後ろに置いた面。使い切りの繰り上げが効く配置なので、
+# 「上限で外れる経路は昇格しない」が順序に出る (DR-0019 §8)。
+[[ns.paced-order.routing]]
+models = ["claude-sonnet-5"]
+routes = [
+    "bedrock",
+    { route = "oauth-b", pace_cap = { ratio = "100%", step = "1d" } },
+]
 spend_down_within = "25%"
 "#;
 
@@ -1016,6 +1148,254 @@ spend_down_within = "25%"
             vec!["bedrock", "oauth-b", "oauth-a"],
             "affinity takes the front; the promotion still applies to the rest"
         );
+    }
+
+    // ---------- 消費の上限 (DR-0019) ----------
+
+    /// 上限を設定してある面。
+    const PACED_NS: &str = "paced";
+    const DAY: i64 = 24 * 60 * 60;
+
+    fn paced_ns(r: &Router) -> &Namespace {
+        r.config.namespace(PACED_NS).expect("declared in CONFIG")
+    }
+
+    /// 窓の頭から `elapsed` 経ち、`utilization` まで使った状態にする。
+    fn observe_usage(r: &Router, route: &str, elapsed: i64, utilization: f64) {
+        let window = crate::quota::Window {
+            utilization: Some(utilization),
+            ..crate::quota::Window::default()
+        }
+        .with_reset(Some(NOW + WEEK as i64 - elapsed))
+        .with_window_seconds(Some(WEEK));
+        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        r.preset(route).unwrap().restore_quota(snapshot);
+    }
+
+    /// 上限を見たうえで今使える経路。
+    async fn paced_ready(r: &Router) -> Vec<String> {
+        let routes = r
+            .routes_for_at(
+                paced_ns(r),
+                PACED_NS,
+                "claude-sonnet-5",
+                &session("s1"),
+                NOW,
+            )
+            .await
+            .unwrap();
+        match r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5")) {
+            Selection::Ready(ready) => ready.iter().map(|r| r.name().to_owned()).collect(),
+            Selection::AllDenied { .. } => Vec::new(),
+        }
+    }
+
+    /// 経過ぶんに収まっている経路はそのまま使える。
+    #[tokio::test]
+    async fn a_route_within_its_pace_stays_available() {
+        let r = router().await;
+        // 3 日経って 3/7 弱。予算 (3/7) に届いていない。
+        observe_usage(&r, "oauth-a", 3 * DAY, 3.0 / 7.0 - 0.01);
+        observe_usage(&r, "oauth-b", 3 * DAY, 0.99);
+        assert_eq!(paced_ready(&r).await, ["oauth-a", "oauth-b"]);
+    }
+
+    /// 経過ぶんを超えて使った経路は候補から外れ、上限の無い経路へ落ちる。
+    #[tokio::test]
+    async fn a_route_over_its_pace_is_held_back() {
+        let r = router().await;
+        // 3 日で 5/7 まで使った。予算は 3/7 なので使い過ぎ。
+        observe_usage(&r, "oauth-a", 3 * DAY, 5.0 / 7.0);
+        observe_usage(&r, "oauth-b", 3 * DAY, 5.0 / 7.0);
+        assert_eq!(
+            paced_ready(&r).await,
+            ["oauth-b"],
+            "the capped route steps aside; the uncapped one does not"
+        );
+    }
+
+    /// 外した経路が戻るのは次の段。予算が増えるまで開かない。
+    #[tokio::test]
+    async fn a_held_route_reopens_at_the_next_step() {
+        let r = router().await;
+        let routes = r
+            .routes_for_at(
+                paced_ns(&r),
+                PACED_NS,
+                "claude-sonnet-5",
+                &session("s1"),
+                NOW,
+            )
+            .await
+            .unwrap();
+        let capped = routes.iter().find(|r| r.name() == "oauth-a").unwrap();
+
+        // 3 日と半日経過。次の段は 4 日目の頭なので、あと半日。
+        observe_usage(&r, "oauth-a", 3 * DAY + DAY / 2, 1.0);
+        let held = capped.paced_out(NOW).expect("over its pace");
+        assert_eq!(held.until, NOW + DAY / 2);
+        assert_eq!(held.reason, crate::denial::Reason::Paced);
+    }
+
+    /// 窓の頭では予算がまだ無い。1 段目に上がるまで一切使わせない。
+    #[tokio::test]
+    async fn nothing_may_be_spent_before_the_first_step() {
+        let r = router().await;
+        observe_usage(&r, "oauth-a", 60, 0.001);
+        observe_usage(&r, "oauth-b", 60, 0.001);
+        assert_eq!(paced_ready(&r).await, ["oauth-b"]);
+    }
+
+    /// 上限を書いていない面では、同じ使用率でも素通しする。
+    #[tokio::test]
+    async fn an_uncapped_namespace_ignores_the_usage() {
+        let r = router().await;
+        observe_usage(&r, "oauth-a", 60, 1.0);
+        let routes = r
+            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        let Selection::Ready(ready) = r.select(&routes, "claude-sonnet-5", NOW, &origin("m"))
+        else {
+            panic!("nothing is denied without a cap");
+        };
+        assert_eq!(names(&ready), vec!["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 枠が読めない上限つき経路は通さず、聞き直しの合図を立てる。
+    #[tokio::test]
+    async fn a_capped_route_with_no_quota_is_closed_and_asks() {
+        let r = router().await;
+        observe_usage(&r, "oauth-b", 3 * DAY, 0.1);
+        let routes = r
+            .routes_for_at(
+                paced_ns(&r),
+                PACED_NS,
+                "claude-sonnet-5",
+                &session("s1"),
+                NOW,
+            )
+            .await
+            .unwrap();
+
+        let capped = routes.iter().find(|r| r.name() == "oauth-a").unwrap();
+        assert!(capped.needs_quota(NOW), "nothing is known about its usage");
+        assert_eq!(
+            capped.paced_out(NOW).map(|held| held.until),
+            Some(NOW + crate::denial::DEFAULT_BACKOFF),
+            "closed briefly, long enough to ask"
+        );
+        assert_eq!(paced_ready(&r).await, ["oauth-b"]);
+
+        // 上限を書いていない経路は、枠が読めなくても聞き直しの対象ではない。
+        let plain = routes.iter().find(|r| r.name() == "oauth-b").unwrap();
+        assert!(!plain.needs_quota(NOW));
+    }
+
+    /// 使用率だけ読めても、いつ回る窓か分からなければ判定できない。
+    #[tokio::test]
+    async fn a_capped_route_without_a_window_length_is_closed() {
+        let r = router().await;
+        let window = crate::quota::Window {
+            utilization: Some(0.1),
+            ..crate::quota::Window::default()
+        }
+        .with_reset(Some(NOW + WEEK as i64));
+        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        r.preset("oauth-a").unwrap().restore_quota(snapshot);
+        observe_usage(&r, "oauth-b", 3 * DAY, 0.1);
+
+        assert_eq!(paced_ready(&r).await, ["oauth-b"]);
+    }
+
+    /// 全部が上限に当たったら、既存の全滅の答え (429) がそのまま出る。
+    #[tokio::test]
+    async fn all_routes_held_back_answer_like_any_other_denial() {
+        let r = router().await;
+        observe_usage(&r, "oauth-a", 3 * DAY, 1.0);
+
+        const ONLY_NS: &str = "paced-only";
+        let ns = r.config.namespace(ONLY_NS).expect("declared in CONFIG");
+        let routes = r
+            .routes_for_at(ns, ONLY_NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&routes), vec!["oauth-a"], "no fallback exists");
+        let Selection::AllDenied { until, .. } =
+            r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
+        else {
+            panic!("the only route is over its pace");
+        };
+        assert_eq!(until, NOW + DAY, "reopens when the next step arrives");
+    }
+
+    /// 予算ちょうどまでは使ってよい。超えたぶんだけが外れる。
+    #[tokio::test]
+    async fn spending_exactly_the_budget_is_still_allowed() {
+        let r = router().await;
+        observe_usage(&r, "oauth-b", 3 * DAY, 0.1);
+
+        // 3 日ぶんの予算ちょうど。
+        observe_usage(&r, "oauth-a", 3 * DAY, 3.0 / 7.0);
+        assert_eq!(paced_ready(&r).await, ["oauth-a", "oauth-b"]);
+
+        // ほんの少し超えると外れる。
+        observe_usage(&r, "oauth-a", 3 * DAY, 3.0 / 7.0 + 1e-6);
+        assert_eq!(paced_ready(&r).await, ["oauth-b"]);
+    }
+
+    /// 同格グループの中に書いた上限も効く (DR-0019 §1)。
+    #[tokio::test]
+    async fn a_pace_cap_inside_an_equal_group_applies() {
+        let r = router().await;
+        const GROUP_NS: &str = "paced-group";
+        let ns = r.config.namespace(GROUP_NS).expect("declared in CONFIG");
+
+        // グループの相手 (bedrock) と外の経路は素通し。oauth-a だけ使い過ぎ。
+        observe_usage(&r, "bedrock", 3 * DAY, 1.0);
+        observe_usage(&r, "oauth-b", 3 * DAY, 1.0);
+        observe_usage(&r, "oauth-a", 3 * DAY, 1.0);
+
+        let routes = r
+            .routes_for_at(ns, GROUP_NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        let Selection::Ready(ready) =
+            r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
+        else {
+            panic!("the uncapped routes are still available");
+        };
+        assert_eq!(
+            names(&ready),
+            vec!["bedrock", "oauth-b"],
+            "only the capped member of the group steps aside"
+        );
+    }
+
+    /// 上限で外れる経路は、使い切りの繰り上げ対象にもならない (DR-0019 §8)。
+    #[tokio::test]
+    async fn a_capped_out_route_is_not_promoted_by_spend_down() {
+        let r = router().await;
+        const ORDER_NS: &str = "paced-order";
+        let ns = r.config.namespace(ORDER_NS).expect("declared in CONFIG");
+        async fn order(r: &Router, ns: &Namespace) -> String {
+            names(
+                &r.routes_for_at(ns, "paced-order", "claude-sonnet-5", &session("s1"), NOW)
+                    .await
+                    .unwrap(),
+            )
+            .join(",")
+        }
+
+        // oauth-b のリセットは間近 (残り 1 日 = 7d 窓の 25 % 以内)。
+        // 按分線に収まっているうちは、使い切りのために先頭へ繰り上がる。
+        observe_usage(&r, "bedrock", 0, 0.0);
+        observe_usage(&r, "oauth-b", 6 * DAY, 6.0 / 7.0);
+        assert_eq!(order(&r, ns).await, "oauth-b,bedrock");
+
+        // 按分線を超えると、繰り上げの対象から外れて元の位置へ戻る。
+        observe_usage(&r, "oauth-b", 6 * DAY, 1.0);
+        assert_eq!(order(&r, ns).await, "bedrock,oauth-b");
     }
 
     /// 規則に無いモデルは、扱える credential を宣言順に試す。
