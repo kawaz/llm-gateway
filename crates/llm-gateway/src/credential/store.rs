@@ -562,7 +562,7 @@ mod tests {
         );
 
         let Payload::CodexOauth(tokens) = credential.payload else {
-            panic!("Codex のまま")
+            panic!("stays Codex")
         };
         assert_eq!(tokens.oauth.access_token, "at-2");
         assert_eq!(tokens.oauth.refresh_token, "rt-1");
@@ -625,7 +625,7 @@ mod tests {
             let n = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
             assert!(
                 n != self.panic_at.load(Ordering::SeqCst),
-                "試験用: {n} 回目の読み出しで落ちる"
+                "test-only: fails on read attempt {n}"
             );
             let mut swap = self.swap.lock().unwrap();
             if let Some((at, next)) = swap.as_ref()
@@ -791,7 +791,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 Hold::Until(gate) => {
                     gate.send_replace(true);
                 }
-                Hold::For(_) => panic!("時間で待つサーバに release は無い"),
+                Hold::For(_) => panic!("a time-based wait server has no release"),
             }
         }
     }
@@ -959,12 +959,12 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let behind_token = second
             .await
             .unwrap()
-            .expect("負けた側も失敗しない")
+            .expect("the losing side does not fail either")
             .bearer();
 
-        assert_eq!(server.hits(), 1, "更新先を叩くのは 1 回だけ");
+        assert_eq!(server.hits(), 1, "the refresh target is hit only once");
         assert_eq!(ahead_token, "Bearer at-1");
-        assert_eq!(behind_token, ahead_token, "待たされた側も同じ token を得る");
+        assert_eq!(behind_token, ahead_token, "the waiting side gets the same token too");
         assert_eq!(
             *log.lock().unwrap(),
             [
@@ -976,7 +976,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 "behind holds",
                 "behind frees",
             ],
-            "後発が掴めるのは先行が書き終えて手放した後"
+            "a latecomer can claim only after the first writer finishes and releases"
         );
     }
 
@@ -1026,10 +1026,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         record.await.unwrap().unwrap();
 
         let saved = FileStore::open(dir.path()).unwrap().load(&id).unwrap();
-        assert_eq!(saved.payload.secret(), "at-1", "更新の結果が残る");
+        assert_eq!(saved.payload.secret(), "at-1", "the refresh result is saved");
         assert!(
             saved.denied_beta.contains_key("advisor-tool-2026-03-01"),
-            "待たされた側の学習も残る"
+            "the waiting side's learned data is kept too"
         );
         assert_eq!(
             *log.lock().unwrap(),
@@ -1043,7 +1043,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 "record writes",
                 "record frees",
             ],
-            "覚える側は更新が書き終えるまで土台を読まない"
+            "the recorder does not read the base until the refresh finishes writing"
         );
     }
 
@@ -1070,14 +1070,14 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
             .await
-            .expect("次の要求が待ちっぱなしにならない")
-            .expect("更新は最後まで走っている");
+            .expect("the next request does not hang forever")
+            .expect("the refresh is still running");
 
         assert_eq!(got.bearer(), "Bearer at-1");
-        assert_eq!(server.hits(), 1, "同じ refresh token で 2 度叩かない");
+        assert_eq!(server.hits(), 1, "the same refresh token is not hit twice");
         assert!(
             store.inner.in_flight().is_empty(),
-            "進行中の印が残っていると次回以降が永久に待つ"
+            "a leftover in-progress mark makes every later attempt wait forever"
         );
     }
 
@@ -1114,7 +1114,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(
             store.inner.persistence.stores.load(Ordering::SeqCst),
             0,
-            "まだ有効なら更新しない"
+            "not refreshed while still valid"
         );
     }
 
@@ -1128,8 +1128,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1)))
         );
         assert!(store.inner.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS))));
-        assert!(store.inner.needs_refresh(&cred(&at(0))), "期限ちょうど");
-        assert!(store.inner.needs_refresh(&cred(&at(-1))), "切れている");
+        assert!(store.inner.needs_refresh(&cred(&at(0))), "exactly at expiry");
+        assert!(store.inner.needs_refresh(&cred(&at(-1))), "already expired");
     }
 
     /// 期限が壊れていても更新に走らない。refresh token を無駄に使わない。
@@ -1190,7 +1190,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(
             saved.denied_beta.get("advisor-tool-2026-03-01").unwrap(),
             &format_rfc3339(NOW),
-            "確認した時刻を一緒に残す"
+            "the checked time is recorded alongside it"
         );
         assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
     }
@@ -1217,7 +1217,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
 
         assert!(got.denied_beta.contains("fresh"));
-        assert!(!got.denied_beta.contains("old"), "期限切れは試してみる側");
+        assert!(!got.denied_beta.contains("old"), "an expired one is retried");
     }
 
     /// 同時に来た要求が更新を重ねない。
@@ -1244,10 +1244,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             }
         }
 
-        assert_eq!(failures, 8, "更新先に繋がらないので全員失敗する");
+        assert_eq!(failures, 8, "everyone fails because the refresh target is unreachable");
         assert!(
             store.inner.in_flight().is_empty(),
-            "進行中の印が残っていると次回以降が永久に待つ"
+            "a leftover in-progress mark makes every later attempt wait forever"
         );
     }
 
@@ -1260,7 +1260,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         let got = store.acquire(&id).await.unwrap();
 
-        assert_eq!(got.bearer(), "Bearer at-1", "新しい token が返る");
+        assert_eq!(got.bearer(), "Bearer at-1", "the new token is returned");
         assert_eq!(server.hits(), 1);
         assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
 
@@ -1269,12 +1269,12 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(
             saved.payload.refresh_token(),
             Some("rt-1"),
-            "入れ替わった refresh token を保存する"
+            "the rotated refresh token is saved"
         );
         assert_eq!(
             saved.payload.expired(),
             format_rfc3339(NOW + 28_800),
-            "期限は expires_in から引き直す"
+            "the deadline is recomputed from expires_in"
         );
         assert_eq!(saved.last_refresh, format_rfc3339(NOW));
     }
@@ -1298,18 +1298,18 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         let mut tokens = Vec::new();
         for t in tasks {
-            tokens.push(t.await.unwrap().expect("全員成功する").bearer());
+            tokens.push(t.await.unwrap().expect("everyone succeeds").bearer());
         }
 
-        assert_eq!(server.hits(), 1, "更新先を叩くのは 1 回だけ");
+        assert_eq!(server.hits(), 1, "the refresh target is hit only once");
         assert_eq!(
             store.inner.persistence.stores.load(Ordering::SeqCst),
             1,
-            "保存も 1 回だけ"
+            "saved only once too"
         );
         assert!(
             tokens.iter().all(|t| *t == tokens[0]),
-            "全員が同じ token を受け取る: {tokens:?}"
+            "everyone receives the same token: {tokens:?}"
         );
     }
 
@@ -1324,7 +1324,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let second = store.acquire(&id).await.unwrap();
 
         assert_eq!(first.bearer(), second.bearer());
-        assert_eq!(server.hits(), 1, "2 回目は更新しない");
+        assert_eq!(server.hits(), 1, "not refreshed a second time");
     }
 
     /// 失敗しても進行中の印は消える (消えないと以後の更新が止まる)。
@@ -1354,22 +1354,22 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         let failed = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
             .await
-            .expect("落ちた更新を待ち続けない")
+            .expect("does not keep waiting on a failed refresh")
             .unwrap_err()
             .to_string();
 
         assert!(failed.contains("unexpectedly"), "{failed}");
-        assert_eq!(server.hits(), 0, "更新先へ行く前に落ちている");
+        assert_eq!(server.hits(), 0, "fails before reaching the refresh target");
         assert!(
             store.inner.in_flight().is_empty(),
-            "印が残ると次回以降が永久に待つ"
+            "a leftover mark makes every later attempt wait forever"
         );
 
         // 次の要求は普通に更新できる (道を塞いだままにしない)。
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire(&id))
             .await
-            .expect("次の要求も待ちっぱなしにならない")
-            .expect("更新に入り直せる");
+            .expect("the next request does not hang forever either")
+            .expect("can re-enter the refresh");
 
         assert_eq!(got.bearer(), "Bearer at-1");
         assert_eq!(server.hits(), 1);
@@ -1390,7 +1390,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
 
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
-        assert_eq!(server.hits(), 0, "更新先を叩かない");
+        assert_eq!(server.hits(), 0, "does not hit the refresh target");
         assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
     }
 
@@ -1408,11 +1408,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
 
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
-        assert_eq!(server.hits(), 1, "断られるまでは 1 回試している");
+        assert_eq!(server.hits(), 1, "tried once before being denied");
         assert_eq!(
             store.inner.persistence.stores.load(Ordering::SeqCst),
             0,
-            "拾っただけなので自分では書かない"
+            "merely observed, so it does not write it back itself"
         );
     }
 
@@ -1454,7 +1454,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(
             saved.payload.secret(),
             "at-elsewhere",
-            "別のプロセスの更新を消さない"
+            "does not clobber another process's refresh"
         );
         assert!(saved.denied_beta.contains_key("advisor-tool-2026-03-01"));
     }
