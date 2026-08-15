@@ -145,6 +145,19 @@ exclude = [
 [[ns.default.routing]]
 models = ["claude-fable-*"]
 routes = ["bedrock", "claude-work", "claude-personal"]
+# リセットが迫った枠を先に使い切る (DR-0018)。未消費分はリセットで消えるので、
+# 閾値内に入った credential を優先順の先頭へ繰り上げる。
+#
+# 割合で書くと、その credential の**最長周期の枠**の窓長に掛かる
+# (7d 枠なら "25%" = 42 時間手前から)。credential ごとに周期が違っても
+# 1 つの規則で書ける。
+#
+# 絶対時間 (humantime 形式) でも書ける。窓長に関係なく同じ幅になる。
+#   spend_down_within = "40h"
+#
+# 書かなければ繰り上げない。会話の途中で credential は切り替わらない
+# (session affinity の方が強い) ので、効くのは会話の切れ目から。
+spend_down_within = "25%"
 
 [[ns.default.routing]]
 models = ["gpt-*"]

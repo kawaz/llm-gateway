@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::config::{Config, Namespace, RouteSpec};
+use crate::config::{self, Config, Namespace, RouteSpec};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialStore, Persistence};
 use crate::denial::{Availability, PROBE_INTERVAL};
@@ -365,6 +365,11 @@ impl Router {
             return Err(Error::UnknownModel(model.to_owned()));
         }
 
+        // リセットが迫っている経路を、グループ境界を越えて先頭へ (DR-0018)。
+        if let Some(within) = ns.spend_down_for(model) {
+            self.spend_down(&mut routes, within, now);
+        }
+
         // 前回通った経路を先頭へ。落ちていても他を試せるよう、候補は減らさない。
         let mut affinity = self.affinity.lock().await;
         let now = Instant::now();
@@ -424,6 +429,40 @@ impl Router {
             response: rate_limited(until - now),
             until,
         }
+    }
+
+    /// リセットが閾値まで迫った経路を先頭へ寄せる (DR-0018 §3)。
+    ///
+    /// 静的順・同格グループの並びは、繰り上がらなかった経路の間では保たれる。
+    /// 繰り上げた分どうしはリセットが近い順。
+    fn spend_down(&self, routes: &mut Vec<Arc<Route>>, within: config::SpendDown, now: i64) {
+        let mut promoted: Vec<(i64, Arc<Route>)> = Vec::new();
+        let mut rest = Vec::with_capacity(routes.len());
+        for route in routes.drain(..) {
+            match self.spend_down_reset(route.name(), within, now) {
+                Some(reset) => promoted.push((reset, route)),
+                None => rest.push(route),
+            }
+        }
+        if promoted.is_empty() {
+            *routes = rest;
+            return;
+        }
+        promoted.sort_by_key(|(reset, _)| *reset);
+        routes.extend(promoted.into_iter().map(|(_, route)| route));
+        routes.extend(rest);
+    }
+
+    /// この経路が使い切りの対象なら、そのリセット時刻。
+    ///
+    /// 見るのは**周期が一番長い窓だけ** (DR-0018 §2)。窓長かリセット時刻が
+    /// 取れない経路は対象にしない — 観測できていない相手を推測で繰り上げない。
+    fn spend_down_reset(&self, route: &str, within: config::SpendDown, now: i64) -> Option<i64> {
+        let snapshot = self.presets.get(route)?.quota()?;
+        let window = snapshot.longest_window()?;
+        let length = window.window_seconds?;
+        let reset = window.reset.filter(|reset| *reset > now)?;
+        (reset - now <= within.threshold_for(length)).then_some(reset)
     }
 
     fn reset_order_key(&self, route: &str, now: i64) -> (bool, i64) {
@@ -657,6 +696,13 @@ haiku = "claude-haiku"
 [[ns.other.routing]]
 models = ["claude-fable-*"]
 routes = ["bedrock", "oauth-a"]
+
+# 使い切りの繰り上げ (DR-0018) を見るための面。優先順は静的で、
+# 昇格が起きたときだけ並びが変わる。
+[[ns.spend.routing]]
+models = ["claude-sonnet-5"]
+routes = ["bedrock", "oauth-a", "oauth-b"]
+spend_down_within = "25%"
 "#;
 
     const NOW: i64 = 1_800_000_000;
@@ -810,6 +856,166 @@ routes = ["bedrock", "oauth-a"]
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    // ---------- 使い切りの繰り上げ (DR-0018) ----------
+
+    const WEEK: u64 = 7 * 24 * 60 * 60;
+    /// 7d 窓の 25 % = 42 時間。閾値の内と外はこの値をまたぐかで決まる。
+    const QUARTER_OF_A_WEEK: i64 = 42 * 60 * 60;
+    /// 使い切りを設定してある面。
+    const SPEND_NS: &str = "spend";
+
+    fn spend_ns(r: &Router) -> &Namespace {
+        r.config.namespace(SPEND_NS).expect("declared in CONFIG")
+    }
+
+    /// 周期と reset を申告した窓を 1 つ持たせる。
+    fn observe_window(r: &Router, route: &str, window_seconds: Option<u64>, reset: Option<i64>) {
+        let window = crate::quota::Window::default()
+            .with_reset(reset)
+            .with_window_seconds(window_seconds);
+        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        r.preset(route).unwrap().restore_quota(snapshot);
+    }
+
+    async fn spend_order(r: &Router) -> Vec<String> {
+        r.routes_for_at(
+            spend_ns(r),
+            SPEND_NS,
+            "claude-sonnet-5",
+            &session("s1"),
+            NOW,
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|route| route.name().to_owned())
+        .collect()
+    }
+
+    /// 閾値内にリセットが迫った経路は、静的順を飛び越えて先頭へ来る。
+    #[tokio::test]
+    async fn spend_down_promotes_a_route_whose_window_is_about_to_reset() {
+        let r = router().await;
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + QUARTER_OF_A_WEEK - 1));
+        assert_eq!(spend_order(&r).await, ["oauth-b", "bedrock", "oauth-a"]);
+    }
+
+    /// 閾値の外なら静的順のまま。繰り上げは「間際」に限る。
+    #[tokio::test]
+    async fn spend_down_leaves_a_distant_reset_alone() {
+        let r = router().await;
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + QUARTER_OF_A_WEEK + 1));
+        assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 複数が閾値内なら、リセットが近い方から使い切る。
+    #[tokio::test]
+    async fn spend_down_orders_promotions_by_the_nearest_reset() {
+        let r = router().await;
+        observe_window(&r, "bedrock", Some(WEEK), Some(NOW + 3600));
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + 600));
+        assert_eq!(spend_order(&r).await, ["oauth-b", "bedrock", "oauth-a"]);
+    }
+
+    /// 割合は窓長に掛かる。5 時間しか回らない窓では 25 % も 1 時間 15 分。
+    #[tokio::test]
+    async fn spend_down_scales_a_percentage_to_the_window_length() {
+        let r = router().await;
+        const FIVE_HOURS: u64 = 5 * 60 * 60;
+        // 7d 窓なら余裕で閾値内だが、5h 窓の 25 % (75 分) には届かない。
+        observe_window(&r, "oauth-b", Some(FIVE_HOURS), Some(NOW + 76 * 60));
+        assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
+
+        observe_window(&r, "oauth-b", Some(FIVE_HOURS), Some(NOW + 74 * 60));
+        assert_eq!(spend_order(&r).await, ["oauth-b", "bedrock", "oauth-a"]);
+    }
+
+    /// 見るのは周期が一番長い窓だけ。短い窓の間際は繰り上げの理由にしない。
+    #[tokio::test]
+    async fn spend_down_looks_only_at_the_longest_window() {
+        let r = router().await;
+        let snapshot = crate::quota::Snapshot::new(
+            NOW,
+            // 5h 窓はもうすぐ回るが、これは数時間で戻るので蒸発の損が無い。
+            Some(
+                crate::quota::Window::default()
+                    .with_reset(Some(NOW + 60))
+                    .with_window_seconds(Some(5 * 60 * 60)),
+            ),
+            Some(
+                crate::quota::Window::default()
+                    .with_reset(Some(NOW + QUARTER_OF_A_WEEK + 1))
+                    .with_window_seconds(Some(WEEK)),
+            ),
+            None,
+        )
+        .unwrap();
+        r.preset("oauth-b").unwrap().restore_quota(snapshot);
+
+        assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 窓長かリセット時刻が取れない経路は動かさない。推測で順位を上げない。
+    #[tokio::test]
+    async fn spend_down_skips_a_route_it_cannot_read() {
+        let r = router().await;
+        // 周期は分かるが、いつ回るか分からない。
+        observe_window(&r, "oauth-a", Some(WEEK), None);
+        // すぐ回ると分かるが、それが何日周期の枠か分からない。
+        observe_window(&r, "oauth-b", None, Some(NOW + 60));
+        assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 過ぎたリセット時刻は陳腐化した観測なので、繰り上げの根拠にしない。
+    #[tokio::test]
+    async fn spend_down_ignores_a_reset_already_past() {
+        let r = router().await;
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW));
+        assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 設定に書かない面では、リセットが間際でも順序は動かない。
+    #[tokio::test]
+    async fn spend_down_does_nothing_without_the_setting() {
+        let r = router().await;
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + 60));
+        let got = r
+            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+        assert_eq!(names(&got), vec!["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 会話に貼り付いた経路の方が繰り上げより強い。
+    ///
+    /// 途中で credential が変わると prompt cache が切れる。使い切りで拾う枠
+    /// より、積み直しの消費の方が大きい (DR-0018 §3)。
+    #[tokio::test]
+    async fn session_affinity_outranks_the_spend_down_promotion() {
+        let r = router().await;
+        let session = session("s1");
+        // bedrock に貼り付いた会話を作る。
+        let routes = r
+            .routes_for_at(spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
+            .await
+            .unwrap();
+        r.remember(SPEND_NS, &session, "claude-sonnet-5", &routes[0])
+            .await;
+        assert_eq!(routes[0].name(), "bedrock");
+
+        // その後 oauth-b のリセットが間際になっても、先頭は貼り付いた方のまま。
+        observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + 60));
+        let got = r
+            .routes_for_at(spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&got),
+            vec!["bedrock", "oauth-b", "oauth-a"],
+            "affinity takes the front; the promotion still applies to the rest"
+        );
     }
 
     /// 規則に無いモデルは、扱える credential を宣言順に試す。
