@@ -20,7 +20,23 @@
 
 ## 裁定待ち
 
-（現在なし）
+### EV-Q1: events への denial Reason の載せ方
+
+[issue 2026-08-16-events](issue/2026-08-16-events.md) の設計裁定。現状、他経路が生きている時の個別経路 denial (Limited/Busy/Paced) は events に一切現れない (ログのみ)。全滅時のみ `status=429, credential="-"` の合成 event が 1 件出る。
+
+- [ ] a: **転送結果 event に `skipped` 欄を追加 (統括推し)** — 選定時に外した経路を `[{credential, reason}]` で載せる。1 リクエスト = 1 event を維持しつつ「なぜその経路が使われなかったか」が全経路分見える。全滅 429 event にも同欄で全経路の理由が載る。optional 欄追加なので既存購読者 (ccmsg) は無変更で動く (prefix 追加の前例と同型)
+- [ ] b: 全滅時 429 event にのみ `reason` を足す (最小) — 個別スキップの痕跡は依然残らず、issue の動機 (pace_cap で外れた経路の可視化) を満たさない
+- [ ] c: denial ごとに独立 event を発行 — 経路数ぶん event 本数が増え、現行 Event の「応答 1 件」意味論とも合わない
+
+### EV-Q2: usage への denial 状態の載せ方
+
+usage は upstream 枠スナップショットがドメインで、denial は gateway 自身の判定 (出自が別)。履歴カウンタは現構造に無く新設が要る。
+
+- [ ] a: **`CredentialUsage` に現在の denial 状態 `denial: {reason, until}` (optional 欄) を追加 (統括推し)** — 「今この経路が使われない理由」が usage で見える。既存 `RouteState::denial()` から読むだけで実装でき、`probe_error` と並ぶ粒度で自然。締め出し中でなければ欄ごと省略
+- [ ] b: 回数カウンタも積算して載せる — RouteState への構造変更が要り、要求 (Reason の判別可能性) を超える
+- [ ] c: usage には載せない (events のみ) — 受け入れ条件「events/usage の出力に」を満たさなくなるので issue の書き換えが要る
+
+補足: 記録形式は新規 DR (DR-0020) として起草予定 (events/usage 両スキーマに跨るため DR-0012 追補でなく独立 DR、統括判断)。
 
 ## 確認待ち
 
