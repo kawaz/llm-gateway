@@ -165,8 +165,11 @@ impl std::fmt::Debug for Route {
 
 /// 今このリクエストで試せる経路。
 pub enum Selection {
-    /// 断られていない経路。設定の優先順のまま。
-    Ready(Vec<Arc<Route>>),
+    /// 断られていない経路と、選定時に外した経路。設定の優先順のまま。
+    Ready {
+        routes: Vec<Arc<Route>>,
+        skipped: Vec<events::Skipped>,
+    },
     /// どれも断られている。組み立て済みの応答と、最初に開く時刻。
     AllDenied {
         response: Response,
@@ -178,7 +181,11 @@ pub enum Selection {
 impl std::fmt::Debug for Selection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Ready(routes) => f.debug_tuple("Ready").field(routes).finish(),
+            Self::Ready { routes, skipped } => f
+                .debug_struct("Ready")
+                .field("routes", routes)
+                .field("skipped", skipped)
+                .finish(),
             Self::AllDenied { until, .. } => {
                 f.debug_struct("AllDenied").field("until", until).finish()
             }
@@ -507,6 +514,7 @@ impl Router {
         origin: &events::Origin<'_>,
     ) -> Selection {
         let mut ready = Vec::new();
+        let mut skipped = Vec::new();
         let mut opens_at = Vec::new();
         for route in routes {
             if let Some(held) = route.paced_out(now) {
@@ -517,16 +525,29 @@ impl Router {
                     seconds = held.until - now,
                     "route is ahead of its pace; holding it until the budget grows"
                 );
+                skipped.push(events::Skipped {
+                    credential: route.name().to_owned(),
+                    reason: held.reason,
+                });
                 opens_at.push(held.until);
                 continue;
             }
             match route.preset.availability(model, now) {
                 Availability::Ready => ready.push(Arc::clone(route)),
-                Availability::Denied { until } => opens_at.push(until),
+                Availability::Denied { until, reason } => {
+                    skipped.push(events::Skipped {
+                        credential: route.name().to_owned(),
+                        reason,
+                    });
+                    opens_at.push(until);
+                }
             }
         }
         if !ready.is_empty() {
-            return Selection::Ready(ready);
+            return Selection::Ready {
+                routes: ready,
+                skipped,
+            };
         }
 
         // どれも塞がっているなら、最初に開くのがいつかがクライアントの知りたいこと。
@@ -537,7 +558,8 @@ impl Router {
             seconds = until - now,
             "every route is denied; returning the time it reopens"
         );
-        self.events.publish(events::Event::new(now, origin, 429));
+        self.events
+            .publish(events::Event::with_skipped(now, origin, 429, skipped));
         Selection::AllDenied {
             response: rate_limited(until - now),
             until,
@@ -1209,7 +1231,7 @@ spend_down_within = "25%"
             .await
             .unwrap();
         match r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5")) {
-            Selection::Ready(ready) => ready.iter().map(|r| r.name().to_owned()).collect(),
+            Selection::Ready { routes, .. } => routes.iter().map(|r| r.name().to_owned()).collect(),
             Selection::AllDenied { .. } => Vec::new(),
         }
     }
@@ -1231,10 +1253,31 @@ spend_down_within = "25%"
         // 3 日で 5/7 まで使った。予算は 3/7 なので使い過ぎ。
         observe_usage(&r, "oauth-a", 3 * DAY, 5.0 / 7.0);
         observe_usage(&r, "oauth-b", 3 * DAY, 5.0 / 7.0);
+        let routes = r
+            .routes_for_at(
+                paced_ns(&r),
+                PACED_NS,
+                "claude-sonnet-5",
+                &session("s1"),
+                NOW,
+            )
+            .await
+            .unwrap();
+        let Selection::Ready {
+            routes: ready,
+            skipped,
+        } = r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
+        else {
+            panic!("the uncapped route remains available");
+        };
+        assert_eq!(names(&ready), vec!["oauth-b"]);
         assert_eq!(
-            paced_ready(&r).await,
-            ["oauth-b"],
-            "the capped route steps aside; the uncapped one does not"
+            skipped,
+            vec![events::Skipped {
+                credential: "oauth-a".to_owned(),
+                reason: Reason::Paced,
+            }],
+            "the event can distinguish a voluntary pace hold from an upstream denial"
         );
     }
 
@@ -1279,11 +1322,15 @@ spend_down_within = "25%"
             .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
-        let Selection::Ready(ready) = r.select(&routes, "claude-sonnet-5", NOW, &origin("m"))
+        let Selection::Ready {
+            routes: ready,
+            skipped,
+        } = r.select(&routes, "claude-sonnet-5", NOW, &origin("m"))
         else {
             panic!("nothing is denied without a cap");
         };
         assert_eq!(names(&ready), vec!["bedrock", "oauth-a", "oauth-b"]);
+        assert!(skipped.is_empty(), "no route is excluded without a cap");
     }
 
     /// 枠が読めない上限つき経路は通さず、聞き直しの合図を立てる。
@@ -1384,7 +1431,7 @@ spend_down_within = "25%"
             .routes_for_at(ns, GROUP_NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
-        let Selection::Ready(ready) =
+        let Selection::Ready { routes: ready, .. } =
             r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
         else {
             panic!("the uncapped routes are still available");
@@ -1631,12 +1678,22 @@ spend_down_within = "25%"
             .preset
             .reject(429, &Headers::default(), None, "claude-fable-5", NOW);
 
-        let Selection::Ready(ready) =
-            r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
+        let Selection::Ready {
+            routes: ready,
+            skipped,
+        } = r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
         else {
             panic!("one should remain");
         };
         assert_eq!(names(&ready), vec!["oauth-a"]);
+        assert_eq!(
+            skipped,
+            vec![events::Skipped {
+                credential: "bedrock".to_owned(),
+                reason: Reason::Busy,
+            }],
+            "the selected event can explain which route was excluded and why"
+        );
     }
 
     /// 全滅なら router が 429 を組む。開く時刻は最も早いものを伝える。
@@ -1713,6 +1770,17 @@ spend_down_within = "25%"
             event.credential,
             crate::stats::NO_CREDENTIAL,
             "the gateway itself answered, not any credential"
+        );
+        assert_eq!(
+            event.skipped,
+            routes
+                .iter()
+                .map(|route| events::Skipped {
+                    credential: route.name().to_owned(),
+                    reason: Reason::Busy,
+                })
+                .collect::<Vec<_>>(),
+            "the synthetic event explains every route that made the request impossible"
         );
     }
 

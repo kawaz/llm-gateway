@@ -23,6 +23,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use serde::{Deserialize, Serialize};
+
 use crate::quota::Snapshot;
 
 /// いつ空くかの手掛かりが何も無いときに空ける間隔 (秒)。
@@ -44,7 +46,8 @@ pub const RESET_SLACK: i64 = 60;
 pub const PROBE_INTERVAL: i64 = 60 * 60;
 
 /// 断られた理由。空ける長さと、様子を聞きに行くかが変わる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Reason {
     /// 上限に当たった。いつ開くかが分かっている。
     Limited,
@@ -85,6 +88,14 @@ impl Scope {
             Self::Models(pattern) => crate::pattern::matches(pattern, model),
         }
     }
+
+    fn output_order(&self) -> (u8, &str) {
+        match self {
+            Self::Everything => (0, ""),
+            Self::Model(name) => (1, name),
+            Self::Models(pattern) => (2, pattern),
+        }
+    }
 }
 
 /// この経路は、いつまで、どの範囲で断られているか。
@@ -105,8 +116,8 @@ pub struct Denial {
 pub enum Availability {
     /// 今すぐ試せる。
     Ready,
-    /// この時刻 (Unix 秒) までは断られている。
-    Denied { until: i64 },
+    /// この時刻 (Unix 秒) までは、この理由で断られている。
+    Denied { until: i64, reason: Reason },
 }
 
 /// 1 経路の状態。断られた印・枠のスナップショット・様子見の予定。
@@ -208,11 +219,24 @@ impl RouteState {
             .max_by_key(|d| d.until)
     }
 
+    /// 現在有効な印を、出力が安定する順で列挙する。
+    pub fn denials(&self, now: i64) -> Vec<Denial> {
+        let mut denials: Vec<_> = self
+            .marks()
+            .values()
+            .filter(|denial| denial.until > now)
+            .cloned()
+            .collect();
+        denials.sort_by(|a, b| a.scope.output_order().cmp(&b.scope.output_order()));
+        denials
+    }
+
     /// このモデルを今この経路へ流せるか。
     pub fn availability(&self, model: &str, now: i64) -> Availability {
         match self.denial(model, now) {
             Some(denial) => Availability::Denied {
                 until: denial.until,
+                reason: denial.reason,
             },
             None => Availability::Ready,
         }
@@ -372,6 +396,30 @@ mod tests {
         );
     }
 
+    /// usage はモデルを指定せず、現在有効な印をスコープごとに全部出す。
+    /// 期限切れは現在状態ではなく、HashMap の順序は公開出力へ漏らさない。
+    #[test]
+    fn active_denials_are_listed_in_stable_scope_order() {
+        let state = RouteState::new();
+        state.deny(busy(NOW + 30, HAIKU), NOW);
+        state.deny(limited(NOW + 10), NOW);
+        state.deny(busy(NOW + 20, FABLE), NOW);
+
+        assert_eq!(
+            state.denials(NOW),
+            vec![
+                limited(NOW + 10),
+                busy(NOW + 20, FABLE),
+                busy(NOW + 30, HAIKU),
+            ]
+        );
+        assert_eq!(
+            state.denials(NOW + 20),
+            vec![busy(NOW + 30, HAIKU)],
+            "deadlines are exclusive and expired marks are not current state"
+        );
+    }
+
     /// 使えるかどうかは、印の中身を配らずに答える。
     #[test]
     fn availability_answers_without_handing_out_the_mark() {
@@ -381,7 +429,10 @@ mod tests {
         state.deny(limited(NOW + 5000), NOW);
         assert_eq!(
             state.availability(FABLE, NOW),
-            Availability::Denied { until: NOW + 5000 }
+            Availability::Denied {
+                until: NOW + 5000,
+                reason: Reason::Limited,
+            }
         );
         assert_eq!(
             state.availability(FABLE, NOW + 5000),

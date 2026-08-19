@@ -361,6 +361,16 @@ pub enum Support {
     UpstreamDependent,
 }
 
+/// gateway が現在控えている締め出し状態。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialDenial {
+    pub reason: crate::denial::Reason,
+    pub until: i64,
+    /// モデル単位の印が効く対象。経路全体の印では欄ごと出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// credential 1 件分の報告。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialUsage {
@@ -371,6 +381,9 @@ pub struct CredentialUsage {
     pub support: Support,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
+    /// gateway が現在控えている締め出し。無ければ欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denials: Vec<CredentialDenial>,
     /// 枠照会 API ([`crate::provider::QuotaApi`]) から聞いた枠。
     ///
     /// スナップショットと**別に持つ**。あちらは転送のついでに読んだ応答ヘッダ
@@ -391,6 +404,7 @@ impl CredentialUsage {
             kind: kind.to_owned(),
             support,
             snapshot,
+            denials: Vec::new(),
             limits: None,
             probe_error: None,
         }

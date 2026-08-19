@@ -277,13 +277,13 @@ impl<P: Persistence> Gateway<P> {
 
         // 断られている経路は飛ばす。全滅なら router が 429 を組んで返す
         // (「候補が空」は経路を選ぶ側の判断、DR-0014 §8)。
-        let routes = match self.router.select(
+        let (routes, skipped) = match self.router.select(
             &routes,
             &model,
             now,
             &call.origin(crate::stats::NO_CREDENTIAL),
         ) {
-            Selection::Ready(ready) => ready,
+            Selection::Ready { routes, skipped } => (routes, skipped),
             Selection::AllDenied { response, .. } => {
                 // 行き場を失った今が、状態を確かめる価値の最も高い瞬間。
                 // 次の周期を待たずに聞きに行く。
@@ -317,7 +317,7 @@ impl<P: Persistence> Gateway<P> {
             Option<crate::provider::ClientError>,
         )> = None;
         for route in &routes {
-            match self.try_route(route, &call, &headers).await {
+            match self.try_route(route, &call, &headers, &skipped).await {
                 Ok(resp) => {
                     // 貼り付けるのは通った経路だけ。断られた先を覚えると、
                     // 次の転送も同じところから始めることになる。
@@ -440,6 +440,7 @@ impl<P: Persistence> Gateway<P> {
         route: &Arc<Route>,
         call: &Call<'_>,
         headers: &[(String, String)],
+        skipped: &[events::Skipped],
     ) -> std::result::Result<Response, Switch> {
         let credential = match &route.credential {
             Some(id) => match self.credentials.acquire(id).await {
@@ -465,7 +466,9 @@ impl<P: Persistence> Gateway<P> {
             .map(|n| n.prepare(&mut sending, &learned))
             .unwrap_or_default();
 
-        let resp = self.send(route, call, credential.as_ref(), sending).await?;
+        let resp = self
+            .send(route, call, credential.as_ref(), sending, skipped)
+            .await?;
         let resp = self.admit(route, call.model, resp).await?;
 
         // 交渉するものを載せていないなら、失敗の原因は他にある。
@@ -504,7 +507,7 @@ impl<P: Persistence> Gateway<P> {
 
         // 送り直すのは 1 回だけ。これでも失敗ならクライアントへ返す。
         let resp = self
-            .send(route, call, credential.as_ref(), retrying)
+            .send(route, call, credential.as_ref(), retrying, skipped)
             .await?;
         let resp = self.admit(route, call.model, resp).await?;
         accept_or_switch(resp)
@@ -552,6 +555,7 @@ impl<P: Persistence> Gateway<P> {
         call: &Call<'_>,
         credential: Option<&Credential>,
         headers: Headers,
+        skipped: &[events::Skipped],
     ) -> std::result::Result<SentResponse, Switch> {
         // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
         // 送る。何という名前で受け付けるかは discovery が答えている。
@@ -586,10 +590,11 @@ impl<P: Persistence> Gateway<P> {
         // 見ている人へ知らせる (DR-0012)。upstream がヘッダを返したこの瞬間が、
         // prompt cache の 5 分が走り始めた時刻に一番近い。断られた応答も流す
         // ので、status で絞らない。
-        self.events.publish(events::Event::new(
+        self.events.publish(events::Event::with_skipped(
             now,
             &call.origin(route.name()),
             resp.response.status,
+            skipped.to_vec(),
         ));
         Ok(resp)
     }
@@ -606,6 +611,7 @@ impl<P: Persistence> Gateway<P> {
             None
         };
 
+        let now = now_unix();
         let mut credentials = Vec::new();
         for (name, route) in &self.config.routes {
             // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
@@ -622,6 +628,19 @@ impl<P: Persistence> Gateway<P> {
                 .map_or("none", crate::config::CredentialSpec::type_name);
 
             let mut entry = quota::CredentialUsage::new(name, credential_type, support, snapshot);
+            entry.denials = preset
+                .into_iter()
+                .flat_map(|preset| preset.denials(now))
+                .map(|denial| quota::CredentialDenial {
+                    reason: denial.reason,
+                    until: denial.until,
+                    model: match denial.scope {
+                        crate::denial::Scope::Everything => None,
+                        crate::denial::Scope::Model(model)
+                        | crate::denial::Scope::Models(model) => Some(model),
+                    },
+                })
+                .collect();
             entry.limits = probed
                 .as_ref()
                 .and_then(|p| p.limits.get(name.as_str()).cloned());
@@ -1982,6 +2001,38 @@ routes = ["a", "b"]
         assert_eq!(second.session_id, None, "no header attached");
     }
 
+    /// 選定前から締め出されていた経路は upstream へ当てず、実際に答えた経路の
+    /// event に理由を同梱する。別 event にすると 1 リクエスト = 1 event の意味が
+    /// 崩れるため、選定結果の補足として同じ event に載せる。
+    #[tokio::test]
+    async fn a_previously_denied_route_is_explained_by_the_forwarded_event() {
+        let skipped = FakeUpstream::always(200).await;
+        let selected = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&skipped.url, &selected.url)).await;
+        let now = now_unix();
+        preset_of(&gw, "a").deny(window_closed(now + 100), now);
+
+        let mut watching = gw.events().subscribe();
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+
+        let event = watching.recv().await.unwrap();
+        assert_eq!((event.credential.as_str(), event.status), ("b", 200));
+        assert_eq!(
+            event.skipped,
+            vec![events::Skipped {
+                credential: "a".to_owned(),
+                reason: Reason::Limited,
+            }]
+        );
+        assert_eq!(
+            (skipped.hits(), selected.hits()),
+            (0, 1),
+            "the excluded route is reported without being contacted"
+        );
+    }
+
     /// 自前で返した 429 も、見ている人には 1 通流れる (DR-0014 §8)。
     ///
     /// upstream を叩いていないだけで、クライアントには断りが返っている。
@@ -2044,7 +2095,8 @@ routes = ["a", "b"]
         assert_eq!(
             preset_of(&gw, "a").availability(MODEL, now_unix()),
             Availability::Denied {
-                until: reset + denial::RESET_SLACK
+                until: reset + denial::RESET_SLACK,
+                reason: Reason::Limited,
             },
             "until just past the window's reopen time"
         );
@@ -2202,7 +2254,8 @@ routes = ["a"]
         assert_eq!(
             preset_of(&gw, "a").availability(MODEL, now),
             Availability::Denied {
-                until: reset + denial::RESET_SLACK
+                until: reset + denial::RESET_SLACK,
+                reason: Reason::Limited,
             },
             "the reopen time is recalculated from the probe result"
         );
@@ -3226,6 +3279,49 @@ models = ["m"]
         assert!(
             report.credentials.iter().all(|c| c.limits.is_none()),
             "no limit since it was never queried"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(
+            json["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|credential| credential.get("denials").is_none()),
+            "credentials without a current denial omit the field entirely"
+        );
+    }
+
+    /// usage は現在有効な印を失わずに列挙する。経路全体の印は `model` を持たず、
+    /// モデル単位の印だけが対象を名乗る。同じ credential に両方が生きられるため、
+    /// 単一値へ畳まず配列で出す。
+    #[tokio::test]
+    async fn usage_report_lists_current_denials_with_their_scope() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+        let now = now_unix();
+        let preset = preset_of(&gw, "a");
+        preset.deny(window_closed(now + 300), now);
+        preset.deny(
+            Denial {
+                until: now + 60,
+                reason: Reason::Busy,
+                scope: Scope::Model("m-fable".to_owned()),
+            },
+            now,
+        );
+
+        let report = gw.usage_report(false).await;
+        let entry = report
+            .credentials
+            .iter()
+            .find(|entry| entry.name == "a")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(entry).unwrap()["denials"],
+            json!([
+                {"reason": "limited", "until": now + 300},
+                {"reason": "busy", "until": now + 60, "model": "m-fable"},
+            ])
         );
     }
 

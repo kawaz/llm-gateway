@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::credential::time::format_rfc3339;
+use crate::denial::Reason;
 
 /// 系列の識別子として出すハッシュの長さ (16 進の桁数)。
 ///
@@ -24,6 +25,13 @@ const PREFIX_DIGITS: usize = 8;
 /// 見ている人が遅れた分はここを溢れて落ちる。大きくしても「古い開始時刻が
 /// まとめて届く」だけで、数え直す相手の役には立たない。
 const BACKLOG: usize = 256;
+
+/// 経路選定で外した経路と、その理由。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skipped {
+    pub credential: String,
+    pub reason: Reason,
+}
 
 /// upstream が応答を返した、という知らせ。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +52,9 @@ pub struct Event {
     /// この会話系列の識別子 ([`prefix`])。取れなければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// 経路選定で外した経路。無ければ欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Skipped>,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -68,6 +79,10 @@ pub struct Origin<'a> {
 
 impl Event {
     pub fn new(ts: i64, origin: &Origin<'_>, status: u16) -> Self {
+        Self::with_skipped(ts, origin, status, Vec::new())
+    }
+
+    pub fn with_skipped(ts: i64, origin: &Origin<'_>, status: u16, skipped: Vec<Skipped>) -> Self {
         Self {
             ts,
             ts_iso: format_rfc3339(ts),
@@ -77,6 +92,7 @@ impl Event {
             credential: origin.credential.to_owned(),
             status,
             prefix: origin.prefix.map(str::to_owned),
+            skipped,
         }
     }
 }
@@ -323,6 +339,39 @@ mod tests {
         assert!(
             json.get("prefix").is_none(),
             "omits the field entirely when the series is unknown"
+        );
+        assert!(
+            json.get("skipped").is_none(),
+            "omits the field entirely when every route was eligible"
+        );
+
+        let skipped = Event::with_skipped(
+            NOW,
+            &from("a"),
+            200,
+            vec![
+                Skipped {
+                    credential: "limited-route".to_owned(),
+                    reason: Reason::Limited,
+                },
+                Skipped {
+                    credential: "busy-route".to_owned(),
+                    reason: Reason::Busy,
+                },
+                Skipped {
+                    credential: "paced-route".to_owned(),
+                    reason: Reason::Paced,
+                },
+            ],
+        );
+        assert_eq!(
+            serde_json::to_value(&skipped).unwrap()["skipped"],
+            json!([
+                {"credential": "limited-route", "reason": "limited"},
+                {"credential": "busy-route", "reason": "busy"},
+                {"credential": "paced-route", "reason": "paced"},
+            ]),
+            "each internal reason has one stable lowercase output word"
         );
 
         let in_series = Event::new(

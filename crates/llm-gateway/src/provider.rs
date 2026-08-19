@@ -287,6 +287,11 @@ impl Preset {
         self.state.observe_quota(snapshot);
     }
 
+    /// 現在有効な締め出しの印。
+    pub fn denials(&self, now: i64) -> Vec<Denial> {
+        self.state.denials(now)
+    }
+
     /// 最後に観測した枠。
     pub fn quota(&self) -> Option<Snapshot> {
         self.state.quota()
@@ -585,7 +590,10 @@ mod tests {
 
         assert_eq!(
             preset.availability("m", NOW),
-            Availability::Denied { until: NOW + 60 }
+            Availability::Denied {
+                until: NOW + 60,
+                reason: Reason::Busy,
+            }
         );
         assert_eq!(
             preset.availability("other", NOW),
