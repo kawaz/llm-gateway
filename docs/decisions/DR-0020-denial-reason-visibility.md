@@ -1,4 +1,4 @@
-# DR-0020: 外した理由を出力に載せる (events の `skipped` / usage の `denial`)
+# DR-0020: 外した理由を出力に載せる (events の `skipped` / usage の `denials`)
 
 - Status: Accepted
 - Date: 2026-08-19
@@ -66,13 +66,21 @@ upstream に断られた (`Limited` / `Busy`) のかの区別は、pace_cap の�
   "type": "oauth",
   "support": "observed",
   "snapshot": { "…": "…" },
-  "denial": { "reason": "limited", "until": 1755510000 }
+  "denials": [
+    { "reason": "limited", "until": 1755510000 },
+    { "reason": "busy", "until": 1755506000, "model": "claude-fable-5" }
+  ]
 }
 ```
 
-- 値は `RouteState::denial()` (`denial.rs:202`) を読むだけ。usage は元々
+- **配列で持つ**。締め出しの印はスコープ付き (`Everything` / モデル単位) で
+  同一 credential に複数同時に存在しうる (`Busy` はモデル単位が普通)。
+  1 件に潰すと「fable だけ焼かれている」が「credential 全体が閉じている」に
+  見える誤読を作る。モデル軸の情報を配列で並べるのは `limits` と同じ形
+- モデル単位の印は `model` 欄を持ち、`Everything` の印は `model` 欄を省略する
+- 値は経路の状態が持つ有効な印をそのまま列挙する。usage は元々
   「今どうなっているか」を出す口なので、締め出しも今の状態として並ぶ
-- 締め出し中でなければ **欄ごと省略**する
+- 締め出しが 1 つも無ければ **欄ごと省略**する
 - **`Snapshot` の中ではなく `CredentialUsage` の直下に置く**。snapshot は
   upstream が返した枠の写しで、出所は upstream にある。締め出しは gateway
   自身の判定 (しかも `Paced` は upstream が関与していない) なので、出所の
@@ -115,7 +123,7 @@ DR-0017 は「events は恒常消費者を持つ公開契約で、フィール�
 - **理由を tap (DR-0017) だけに出す**: tap は見ている時だけ動く揮発的な口。
   pace_cap の効き方は後から振り返って設定を詰めたいものなので、恒常的に
   流れる events に載っている必要がある
-- **`denial` を `Snapshot` の中に入れる**: upstream 由来の枠の写しに、
+- **`denials` を `Snapshot` の中に入れる**: upstream 由来の枠の写しに、
   gateway 自身の判定が混ざる。`Paced` に至っては upstream が一切関与して
   いない値で、出所の異なるものを同じ入れ物に置くと読む側が区別できない
 - **denial の履歴カウンタを usage に持つ**: usage は今の状態を出す口で、
@@ -135,6 +143,8 @@ DR-0017 は「events は恒常消費者を持つ公開契約で、フィール�
   要る。集めた一覧を `Event` まで運ぶ経路 (`Event::new` の引数を増やすか
   `Origin` を広げるか) は実装側の判断でよい
 - `gateway.rs`: 転送結果の emit (`gateway.rs:589-593`) に一覧を渡す。
-  `usage_report` (`gateway.rs:602`) で `CredentialUsage` に `denial` を詰める
-- `quota.rs`: `CredentialUsage` に `denial` 欄を足す
-- `denial.rs`: `RouteState::denial()` はそのまま使う (変更不要)
+  `usage_report` (`gateway.rs:602`) で `CredentialUsage` に `denials` を詰める
+- `quota.rs`: `CredentialUsage` に `denials` 欄を足す
+- `denial.rs`: `RouteState::denial(model)` はモデル必須で単一の答えしか返さない
+  ため、有効な印をスコープ付きで列挙する読み口の追加が要る (印の内部表現は
+  変えない)
