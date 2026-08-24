@@ -23,6 +23,10 @@
 - [DR-0019](./DR-0019-pace-cap.md) — 借りる枠は経過した時間ぶんまで (`pace_cap` の階段予算、按分線を超えたら次段まで控える)
 - [DR-0020](./DR-0020-denial-reason-visibility.md) — 外した理由を出力に載せる (events に `skipped`、usage に現在の `denials`。optional 追加のみ)
 
+## Proposed
+
+- [DR-0021](./DR-0021-upstream-service-status.md) — upstream の公式状態と gateway の実測状態を `/llm-gateway/status` で一括表示し、529 時に background refresh する
+
 ## Archived
 
 <!-- 現役の文脈を汚す古い DR は decisions/archive/ に退避し、ここに記載 -->
