@@ -1,11 +1,11 @@
 ---
 title: upstream LLM service の状態を統一 API で一括表示する
-status: open
+status: wip
 category: request
 created: 2026-08-24T16:10:46+09:00
 last_read:
 open_entered: 2026-08-24T16:10:46+09:00
-wip_entered:
+wip_entered: 2026-08-25T13:43:38+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
