@@ -76,6 +76,10 @@ pub struct Config {
     #[serde(default)]
     pub stats: Stats,
 
+    /// upstream service status の取得と観測。
+    #[serde(default)]
+    pub status: StatusConfig,
+
     /// 認証情報の宣言。キーが store 内のファイル名 (`<key>.json`) になる。
     ///
     /// **全 namespace で共有する。** 同じアカウントを namespace ごとに
@@ -700,6 +704,103 @@ impl CredentialSpec {
     }
 }
 
+/// upstream service status の設定。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    #[serde(default = "default_status_refresh_interval", with = "human_duration")]
+    pub refresh_interval: Duration,
+    #[serde(default = "default_status_stale_after", with = "human_duration")]
+    pub stale_after: Duration,
+    #[serde(default = "default_status_observation_ttl", with = "human_duration")]
+    pub observation_ttl: Duration,
+    #[serde(
+        default = "default_status_failure_refresh_cooldown",
+        with = "human_duration"
+    )]
+    pub failure_refresh_cooldown: Duration,
+    #[serde(default = "default_status_request_timeout", with = "human_duration")]
+    pub request_timeout: Duration,
+    #[serde(default)]
+    pub sources: BTreeMap<String, StatusSourceSpec>,
+}
+impl Default for StatusConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval: default_status_refresh_interval(),
+            stale_after: default_status_stale_after(),
+            observation_ttl: default_status_observation_ttl(),
+            failure_refresh_cooldown: default_status_failure_refresh_cooldown(),
+            request_timeout: default_status_request_timeout(),
+            sources: BTreeMap::new(),
+        }
+    }
+}
+fn default_status_refresh_interval() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_status_stale_after() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_status_observation_ttl() -> Duration {
+    Duration::from_secs(300)
+}
+fn default_status_failure_refresh_cooldown() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_status_request_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StatusSourceSpec {
+    StatuspageV2 {
+        summary_url: url::Url,
+        incidents_url: url::Url,
+        page_url: url::Url,
+        #[serde(default)]
+        components: Vec<String>,
+    },
+    Link {
+        page_url: url::Url,
+    },
+}
+impl StatusSourceSpec {
+    pub fn page_url(&self) -> &url::Url {
+        match self {
+            Self::StatuspageV2 { page_url, .. } | Self::Link { page_url } => page_url,
+        }
+    }
+    fn urls(&self) -> Vec<&url::Url> {
+        match self {
+            Self::StatuspageV2 {
+                summary_url,
+                incidents_url,
+                page_url,
+                ..
+            } => vec![summary_url, incidents_url, page_url],
+            Self::Link { page_url } => vec![page_url],
+        }
+    }
+}
+
+mod human_duration {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Duration,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&humantime::format_duration(*value).to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Duration, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        humantime::parse_duration(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// upstream へ出る 1 経路。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -712,6 +813,9 @@ pub struct RouteSpec {
     /// 接続先。省略時は provider の既定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// 公式状態を取得する status source。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_source: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     /// upstream が受け付けない beta フラグ。Anthropic 方言だけが使う。
@@ -821,6 +925,18 @@ impl Config {
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
         self.webhook.destination_url().map_err(Error::Config)?;
+        for (name, source) in &self.status.sources {
+            if name.is_empty() {
+                return Err(Error::Config("status source name is empty".to_owned()));
+            }
+            for url in source.urls() {
+                if url.scheme() != "https" {
+                    return Err(Error::Config(format!(
+                        "status source `{name}` URL must use HTTPS: {url}"
+                    )));
+                }
+            }
+        }
         for (name, route) in &self.routes {
             if name.is_empty() {
                 return Err(Error::Config("route name is empty".to_owned()));
@@ -830,6 +946,13 @@ impl Config {
             {
                 return Err(Error::Config(format!(
                     "route `{name}` references credential `{credential}`, which is not defined"
+                )));
+            }
+            if let Some(source) = &route.status_source
+                && !self.status.sources.contains_key(source)
+            {
+                return Err(Error::Config(format!(
+                    "route `{name}` references status source `{source}`, which is not defined"
                 )));
             }
             validate_route(name, route, self)?;
