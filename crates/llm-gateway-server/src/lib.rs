@@ -43,6 +43,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/usage", get(usage))
+        .route("/llm-gateway/status", get(status))
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/tap", get(tap))
@@ -79,6 +80,15 @@ async fn usage<P: Persistence + 'static>(
 ) -> Response {
     let refresh = wants_refresh(request.uri().query());
     json_utf8(Json(gateway.usage_report(refresh).await))
+}
+
+/// configured upstream の公式状態と実測状態を返す。
+async fn status<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let refresh = wants_refresh(request.uri().query());
+    json_utf8(Json(gateway.status_report(refresh).await))
 }
 
 /// 自前の JSON 応答に文字コードを明示する。

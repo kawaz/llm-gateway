@@ -11,6 +11,7 @@ use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential,
 use llm_gateway::metering::TokenKind;
 use llm_gateway::quota::{CredentialUsage, Report, Window};
 use llm_gateway::stats::{Counters, Report as StatsReport};
+use llm_gateway::status::Report as StatusReport;
 use llm_gateway::{Config, Gateway};
 
 const USAGE: &str = "\
@@ -25,6 +26,7 @@ commands:
   check       read the configuration and verify it (without starting)
   models      list the models written in the configuration
   usage       list usage per credential (asks the server)
+  status      show configured upstream service status (asks the server)
   stats       list token usage and USD cost per credential x model x day
   login       authorize in a browser and save the credential to <name>.json
 
@@ -32,6 +34,9 @@ options:
   --config <path>   configuration file (default: $XDG_CONFIG_HOME/llm-gateway/config.toml)
   --help, -h        show this help
   --version         show the version
+
+status options:
+  --refresh         refresh official sources before showing the report
 
 usage options:
   --refresh         also send a minimal request to idle credentials to read them again
@@ -86,6 +91,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         "check" => check(&parse_config_path(rest)?),
         "models" => models(&parse_config_path(rest)?),
         "usage" => usage(rest),
+        "status" => status(rest),
         "stats" => stats(rest),
         "login" => login(rest),
         other => Err(format!(
@@ -149,6 +155,7 @@ to listen, remove disabled from [server], or point --config at another configura
         gateway
             .restore(llm_gateway::credential::time::now_unix())
             .await;
+        gateway.start_status();
 
         tracing::info!(
             listen = %config.server.listen,
@@ -331,6 +338,47 @@ fn models(config_path: &Path) -> Result<ExitCode, String> {
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StatusArgs {
+    refresh: bool,
+    config_path: PathBuf,
+}
+
+fn status(args: &[String]) -> Result<ExitCode, String> {
+    let parsed = parse_status_args(args)?;
+    let config = load(&parsed.config_path)?;
+    let url = status_url(&config.server.listen, parsed.refresh);
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    runtime.block_on(async move {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| server_unreachable(&config.server.listen, &e.to_string()))?;
+        let code = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("could not read the response: {e}"))?;
+        if !code.is_success() {
+            return Err(format!("the server returned {code}: {body}"));
+        }
+        let report: StatusReport = serde_json::from_str(&body)
+            .map_err(|e| format!("could not parse the response: {e}"))?;
+        print!("{}", render_status(&report));
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn parse_status_args(args: &[String]) -> Result<StatusArgs, String> {
+    let usage = parse_usage_args(args)?;
+    Ok(StatusArgs {
+        refresh: usage.refresh,
+        config_path: usage.config_path,
+    })
+}
+
 /// `usage` に渡された内容。
 #[derive(Debug, PartialEq, Eq)]
 struct UsageArgs {
@@ -497,6 +545,11 @@ fn take_days(value: Option<&str>) -> Result<usize, String> {
 /// 設定の `listen` は待ち受け側の書き方なので、どこからでも受ける指定
 /// (`0.0.0.0` / `::`) をそのまま宛先にはできない。手元から叩く前提で
 /// loopback に読み替える。
+fn status_url(listen: &str, refresh: bool) -> String {
+    let query = if refresh { "?refresh=true" } else { "" };
+    format!("{}{query}", gateway_url(listen, "status"))
+}
+
 fn usage_url(listen: &str, refresh: bool) -> String {
     let query = if refresh { "?refresh=true" } else { "" };
     format!("{}{query}", gateway_url(listen, "usage"))
@@ -534,6 +587,41 @@ fn server_unreachable(listen: &str, reason: &str) -> String {
 
 /// 人が読む形に整える。claude-statusline の 5h/7d バー表示 (`dualBar` /
 /// `dualInfo`) を Rust に移植し、1 credential 1 行で並べる。
+fn render_status(report: &StatusReport) -> String {
+    let mut out = String::from("SERVICE     STATUS    OFFICIAL         OBSERVED   UPDATED\n");
+    for service in &report.services {
+        let official = format!("{:?}", service.official.state)
+            .to_lowercase()
+            .replace('_', " ");
+        let observed = format!("{:?}", service.observed.state).to_lowercase();
+        let updated = service
+            .official
+            .observed_at
+            .or(service.observed.observed_at)
+            .map(|at| format!("{} ago", elapsed(report.generated_at.saturating_sub(at))))
+            .unwrap_or_else(|| "-".to_owned());
+        let stale = if service.official.stale { " stale" } else { "" };
+        out.push_str(&format!(
+            "{:<11} {:<9} {:<16} {:<10} {}{}\n",
+            service.name,
+            format!("{:?}", service.severity).to_uppercase(),
+            official,
+            observed,
+            updated,
+            stale
+        ));
+    }
+    for service in &report.services {
+        for incident in &service.official.incidents {
+            out.push_str(&format!(
+                "\n{}: {}\n  {}\n",
+                service.name, incident.name, incident.url
+            ));
+        }
+    }
+    out
+}
+
 fn render(report: &Report) -> String {
     let now = report.generated_at;
     let color = color_enabled();

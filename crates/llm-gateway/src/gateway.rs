@@ -45,6 +45,7 @@ pub struct Gateway<P: Persistence> {
     /// router も同じ口を持つ (自前で返す 429 を流すため)。
     events: Arc<Events>,
     tap: Arc<Tap>,
+    status: crate::status::Manager,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -105,6 +106,7 @@ impl<P: Persistence> Gateway<P> {
             )),
             events,
             tap,
+            status: crate::status::Manager::new(config),
         })
     }
 
@@ -326,6 +328,13 @@ impl<P: Persistence> Gateway<P> {
                         // 通ったなら締め出しの根拠は消えている。
                         route.preset.allow(&model);
                     }
+                    if resp.status / 100 == 2 {
+                        self.status.observe_success(route.name()).await;
+                    } else if resp.status == 529 {
+                        self.status
+                            .observe_failure(route.name(), "upstream_http", Some(529))
+                            .await;
+                    }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::exchange が記録する。
                     exchange::record_upstream_headers(
@@ -534,9 +543,17 @@ impl<P: Persistence> Gateway<P> {
             Admission::Rejected {
                 response,
                 reason,
+                denial,
                 client_error,
-                ..
             } => {
+                if denial
+                    .as_ref()
+                    .is_some_and(|denial| denial.reason == crate::denial::Reason::Busy)
+                {
+                    self.status
+                        .observe_failure(route.name(), "busy", None)
+                        .await;
+                }
                 let response = egress::finish_response(SentResponse { response, mode })
                     .await
                     .map_err(|e| Switch::to_next(e.to_string()))?;
@@ -564,7 +581,7 @@ impl<P: Persistence> Gateway<P> {
             egress::rewrite_model(&mut body, upstream);
         }
 
-        let resp = egress::send(
+        let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
             credential,
@@ -576,7 +593,15 @@ impl<P: Persistence> Gateway<P> {
             },
         )
         .await
-        .map_err(|e| Switch::to_next(e.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.status
+                    .observe_failure(route.name(), "transport", None)
+                    .await;
+                return Err(Switch::to_next(error.to_string()));
+            }
+        };
 
         // 便乗して枠を拾う (DR-0007)。読むのはヘッダだけなので、本文はこの後も
         // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
@@ -597,6 +622,19 @@ impl<P: Persistence> Gateway<P> {
             skipped.to_vec(),
         ));
         Ok(resp)
+    }
+
+    /// upstream service 状態の収集を開始する。
+    pub fn start_status(&self) {
+        self.status.start();
+    }
+
+    /// upstream service 状態を返す。refresh 時だけ取得完了を待つ。
+    pub async fn status_report(&self, refresh: bool) -> crate::status::Report {
+        if refresh {
+            self.status.refresh_all().await;
+        }
+        self.status.report().await
     }
 
     /// credential ごとの利用状況。
