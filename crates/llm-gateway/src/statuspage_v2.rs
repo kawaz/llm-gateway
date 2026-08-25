@@ -144,6 +144,9 @@ impl StatusSource for Adapter {
                 state: normalize(&c.status),
             })
             .collect();
+        if !components.is_empty() && selected.is_empty() {
+            return Err("configured components not found".into());
+        }
         let state = selected
             .iter()
             .map(|c| c.state)
@@ -259,13 +262,13 @@ mod tests {
     #[tokio::test]
     async fn unknown_status_is_preserved_as_unknown() {
         let base = server(
-            summary("new_state"),
+            br#"{"status":{"indicator":"new_state"},"components":[]}"#.to_vec(),
             br#"{"incidents":[]}"#.to_vec(),
             Duration::ZERO,
         )
         .await;
         let snapshot = Adapter::new(Duration::from_secs(1))
-            .fetch(&spec(&base, &["Missing"]))
+            .fetch(&spec(&base, &[]))
             .await
             .unwrap();
         assert_eq!(snapshot.state, OfficialState::Unknown);
@@ -369,6 +372,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["api"]
         );
+    }
+
+    /// component filter に一致しない page 全体の major outage は選択対象の障害とみなさず、取得エラーにする。
+    #[tokio::test]
+    async fn missing_configured_components_reject_page_indicator_fallback() {
+        let base = server(summary("major"), incidents("ok"), Duration::ZERO).await;
+        let error = match Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &["Missing"]))
+            .await
+        {
+            Ok(_) => panic!("a non-intersecting component filter must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "configured components not found");
     }
 
     /// latest update は UTF-8 を壊さず 4 KiB 以下へ切り詰める。

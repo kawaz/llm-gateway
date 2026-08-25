@@ -217,50 +217,58 @@ impl Manager {
         let Some(source) = self.inner.sources.get(name) else {
             return Err(format!("unknown status source: {name}"));
         };
-        let rx = {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let start = {
             let mut st = source.state.lock().await;
+            st.waiters.push(tx);
             if st.refreshing {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                st.waiters.push(tx);
-                Some(rx)
+                false
             } else {
                 st.refreshing = true;
-                None
+                true
             }
         };
-        if let Some(rx) = rx {
-            return tokio::time::timeout(self.inner.config.request_timeout, rx)
-                .await
-                .map_err(|_| "status refresh timed out".to_owned())?
-                .map_err(|_| "status refresh was cancelled".to_owned())?;
+        if start {
+            let this = self.clone();
+            let name = name.to_owned();
+            tokio::spawn(async move {
+                let source = this
+                    .inner
+                    .sources
+                    .get(&name)
+                    .expect("the source exists for the lifetime of the manager");
+                let result = match &source.spec {
+                    StatusSourceSpec::StatuspageV2 { .. } => {
+                        use crate::statuspage_v2::StatusSource as _;
+                        crate::statuspage_v2::Adapter::new(this.inner.config.request_timeout)
+                            .fetch(&source.spec)
+                            .await
+                    }
+                    StatusSourceSpec::Link { .. } => Ok(Snapshot {
+                        at: now_unix(),
+                        state: OfficialState::Unknown,
+                        components: vec![],
+                        incidents: vec![],
+                    }),
+                };
+                let mut st = source.state.lock().await;
+                match &result {
+                    Ok(v) => {
+                        st.snapshot = Some(v.clone());
+                        st.error = None;
+                    }
+                    Err(e) => st.error = Some(e.clone()),
+                }
+                st.refreshing = false;
+                for tx in st.waiters.drain(..) {
+                    let _ = tx.send(result.clone().map(|_| ()));
+                }
+            });
         }
-        let result = match &source.spec {
-            StatusSourceSpec::StatuspageV2 { .. } => {
-                use crate::statuspage_v2::StatusSource as _;
-                crate::statuspage_v2::Adapter::new(self.inner.config.request_timeout)
-                    .fetch(&source.spec)
-                    .await
-            }
-            StatusSourceSpec::Link { .. } => Ok(Snapshot {
-                at: now_unix(),
-                state: OfficialState::Unknown,
-                components: vec![],
-                incidents: vec![],
-            }),
-        };
-        let mut st = source.state.lock().await;
-        match &result {
-            Ok(v) => {
-                st.snapshot = Some(v.clone());
-                st.error = None;
-            }
-            Err(e) => st.error = Some(e.clone()),
-        }
-        st.refreshing = false;
-        for tx in st.waiters.drain(..) {
-            let _ = tx.send(result.clone().map(|_| ()));
-        }
-        result.map(|_| ())
+        tokio::time::timeout(self.inner.config.request_timeout, rx)
+            .await
+            .map_err(|_| "status refresh timed out".to_owned())?
+            .map_err(|_| "status refresh was cancelled".to_owned())?
     }
     pub async fn observe_success(&self, route: &str) {
         self.inner
@@ -652,6 +660,126 @@ models = ["m"]
             hits.load(Ordering::SeqCst),
             2,
             "one summary and one incidents request form the single fetch"
+        );
+    }
+
+    /// configured component が summary に無い場合は page 全体の障害を流用せず、unknown と取得エラーを公開する。
+    #[tokio::test]
+    async fn missing_configured_components_report_unknown_with_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0; 1024];
+                    let count = stream.read(&mut request).await.unwrap();
+                    let path = String::from_utf8_lossy(&request[..count]);
+                    let body = if path.starts_with("GET /summary ") {
+                        r#"{"status":{"indicator":"major"},"components":[]}"#
+                    } else {
+                        r#"{"incidents":[]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let m = manager(&format!(
+            r#"
+[status.sources.provider]
+type = "statuspage_v2"
+summary_url = "{base}/summary"
+incidents_url = "{base}/incidents"
+page_url = "{base}/"
+components = ["API"]
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#
+        ));
+
+        assert_eq!(
+            m.refresh("provider").await,
+            Err("configured components not found".into())
+        );
+        let official = &m.report().await.services[0].official;
+        assert_eq!(official.state, OfficialState::Unknown);
+        assert_eq!(
+            official.error.as_deref(),
+            Some("configured components not found")
+        );
+    }
+
+    /// refresh 呼び出し元が中断されても独立した fetch は完走し、refreshing を解除して後続へ結果を渡す。
+    #[tokio::test]
+    async fn cancelled_refresh_leader_does_not_poison_single_flight() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_arrived = arrived.clone();
+        let server_release = release.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let arrived = server_arrived.clone();
+                let release = server_release.clone();
+                tokio::spawn(async move {
+                    let mut request = [0; 1024];
+                    let count = stream.read(&mut request).await.unwrap();
+                    let path = String::from_utf8_lossy(&request[..count]);
+                    let body = if path.starts_with("GET /summary ") {
+                        r#"{"status":{"indicator":"none"},"components":[]}"#
+                    } else {
+                        r#"{"incidents":[]}"#
+                    };
+                    arrived.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let m = manager(&format!(
+            r#"
+[status.sources.provider]
+type = "statuspage_v2"
+summary_url = "{base}/summary"
+incidents_url = "{base}/incidents"
+page_url = "{base}/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#
+        ));
+
+        let leader = {
+            let m = m.clone();
+            tokio::spawn(async move { m.refresh("provider").await })
+        };
+        arrived.acquire_many(2).await.unwrap().forget();
+        leader.abort();
+        release.add_permits(2);
+
+        assert_eq!(m.refresh("provider").await, Ok(()));
+        assert_eq!(
+            m.report().await.services[0].official.state,
+            OfficialState::Operational
         );
     }
 

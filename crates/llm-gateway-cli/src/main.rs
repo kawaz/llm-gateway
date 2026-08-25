@@ -587,12 +587,22 @@ fn server_unreachable(listen: &str, reason: &str) -> String {
 
 /// 人が読む形に整える。claude-statusline の 5h/7d バー表示 (`dualBar` /
 /// `dualInfo`) を Rust に移植し、1 credential 1 行で並べる。
+fn official_state_label(state: llm_gateway::status::OfficialState) -> &'static str {
+    use llm_gateway::status::OfficialState;
+    match state {
+        OfficialState::Operational => "operational",
+        OfficialState::Degraded => "degraded",
+        OfficialState::PartialOutage => "partial outage",
+        OfficialState::MajorOutage => "major outage",
+        OfficialState::Maintenance => "maintenance",
+        OfficialState::Unknown => "unknown",
+    }
+}
+
 fn render_status(report: &StatusReport) -> String {
     let mut out = String::from("SERVICE     STATUS    OFFICIAL         OBSERVED   UPDATED\n");
     for service in &report.services {
-        let official = format!("{:?}", service.official.state)
-            .to_lowercase()
-            .replace('_', " ");
+        let official = official_state_label(service.official.state);
         let observed = format!("{:?}", service.observed.state).to_lowercase();
         let updated = service
             .official
@@ -2438,6 +2448,19 @@ mod tests {
         assert!(
             out.contains("Provider    OK        operational      unknown"),
             "{out}"
+        );
+    }
+
+    /// 複数語の公式状態は enum の Debug 表現で連結せず、利用者向けに空白で区切る。
+    #[test]
+    fn official_state_formatter_separates_multiword_states() {
+        assert_eq!(
+            official_state_label(llm_gateway::status::OfficialState::PartialOutage),
+            "partial outage"
+        );
+        assert_eq!(
+            official_state_label(llm_gateway::status::OfficialState::MajorOutage),
+            "major outage"
         );
     }
 
