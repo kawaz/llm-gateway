@@ -1,6 +1,6 @@
 ---
 title: upstream LLM service の状態を統一 API で一括表示する
-status: wip
+status: resolved
 category: request
 created: 2026-08-24T16:10:46+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-08-25T13:43:38+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-25T14:56:39+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0021","implemented","done:実装単位1-5+テスト(just ci green、fable5-high レビューのC1/M1/M2修正込み)","handoff:claude-cmux-msg/docs/issue/2026-08-25-llm-gateway-status-integration.md (単位6 ccmsg handoff)","issue:2026-08-25-status-api-minor-findings (minor指摘7件)","done:両gateway v0.25.1稼働・実機status/smoke確認済み"]
 blocked_by:
 origin: ユーザ要望
 ---
