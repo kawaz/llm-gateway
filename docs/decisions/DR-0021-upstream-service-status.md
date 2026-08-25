@@ -1,6 +1,6 @@
 # DR-0021: upstream の公式状態と実測状態を `/llm-gateway/status` で一括表示する
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-24
 
 ## 背景
