@@ -4,15 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{Config, StatusConfig, StatusSourceSpec};
 use crate::credential::time::now_unix;
-
-const MAX_BODY: usize = 1024 * 1024;
-const MAX_UPDATE: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,15 +130,15 @@ struct SourceState {
     snapshot: Option<Snapshot>,
     error: Option<String>,
     refreshing: bool,
-    waiters: Vec<tokio::sync::oneshot::Sender<()>>,
+    waiters: Vec<tokio::sync::oneshot::Sender<Result<(), String>>>,
     last_failure_trigger: Option<Instant>,
 }
 #[derive(Clone)]
-struct Snapshot {
-    at: i64,
-    state: OfficialState,
-    components: Vec<Component>,
-    incidents: Vec<Incident>,
+pub(crate) struct Snapshot {
+    pub(crate) at: i64,
+    pub(crate) state: OfficialState,
+    pub(crate) components: Vec<Component>,
+    pub(crate) incidents: Vec<Incident>,
 }
 #[derive(Default, Clone)]
 struct Observation {
@@ -207,18 +203,19 @@ impl Manager {
         self.inner
             .sources
             .iter()
-            .filter_map(|(name, source)| {
-                matches!(source.spec, StatusSourceSpec::StatuspageV2 { .. }).then(|| name.clone())
-            })
+            .filter(|(_, source)| matches!(source.spec, StatusSourceSpec::StatuspageV2 { .. }))
+            .map(|(name, _)| name.clone())
             .collect()
     }
     fn refresh_background(&self, name: String) {
         let s = self.clone();
-        tokio::spawn(async move { s.refresh(&name).await });
+        tokio::spawn(async move {
+            let _ = s.refresh(&name).await;
+        });
     }
-    async fn refresh(&self, name: &str) {
+    async fn refresh(&self, name: &str) -> Result<(), String> {
         let Some(source) = self.inner.sources.get(name) else {
-            return;
+            return Err(format!("unknown status source: {name}"));
         };
         let rx = {
             let mut st = source.state.lock().await;
@@ -232,25 +229,38 @@ impl Manager {
             }
         };
         if let Some(rx) = rx {
-            let _ = tokio::time::timeout(self.inner.config.request_timeout, rx).await;
-            return;
+            return tokio::time::timeout(self.inner.config.request_timeout, rx)
+                .await
+                .map_err(|_| "status refresh timed out".to_owned())?
+                .map_err(|_| "status refresh was cancelled".to_owned())?;
         }
-        if matches!(source.spec, StatusSourceSpec::Link { .. }) {
-            return;
-        }
-        let result = fetch(&source.spec, self.inner.config.request_timeout).await;
-        let mut st = source.state.lock().await;
-        match result {
-            Ok(v) => {
-                st.snapshot = Some(v);
-                st.error = None
+        let result = match &source.spec {
+            StatusSourceSpec::StatuspageV2 { .. } => {
+                use crate::statuspage_v2::StatusSource as _;
+                crate::statuspage_v2::Adapter::new(self.inner.config.request_timeout)
+                    .fetch(&source.spec)
+                    .await
             }
-            Err(e) => st.error = Some(e),
+            StatusSourceSpec::Link { .. } => Ok(Snapshot {
+                at: now_unix(),
+                state: OfficialState::Unknown,
+                components: vec![],
+                incidents: vec![],
+            }),
         };
+        let mut st = source.state.lock().await;
+        match &result {
+            Ok(v) => {
+                st.snapshot = Some(v.clone());
+                st.error = None;
+            }
+            Err(e) => st.error = Some(e.clone()),
+        }
         st.refreshing = false;
         for tx in st.waiters.drain(..) {
-            let _ = tx.send(());
+            let _ = tx.send(result.clone().map(|_| ()));
         }
+        result.map(|_| ())
     }
     pub async fn observe_success(&self, route: &str) {
         self.inner
@@ -455,172 +465,4 @@ fn official_from(
             }),
         },
     }
-}
-
-#[derive(Deserialize)]
-struct Summary {
-    status: RawStatus,
-    components: Vec<RawComponent>,
-}
-#[derive(Deserialize)]
-struct RawStatus {
-    indicator: String,
-}
-#[derive(Deserialize)]
-struct RawComponent {
-    id: String,
-    name: String,
-    status: String,
-}
-#[derive(Deserialize)]
-struct Incidents {
-    incidents: Vec<RawIncident>,
-}
-#[derive(Deserialize)]
-struct RawIncident {
-    id: String,
-    name: String,
-    status: String,
-    impact: String,
-    created_at: String,
-    updated_at: String,
-    shortlink: String,
-    #[serde(default)]
-    incident_updates: Vec<Update>,
-    #[serde(default)]
-    components: Vec<RawComponent>,
-}
-#[derive(Deserialize)]
-struct Update {
-    body: String,
-}
-fn normalize(s: &str) -> OfficialState {
-    match s {
-        "none" | "operational" => OfficialState::Operational,
-        "minor" | "degraded_performance" => OfficialState::Degraded,
-        "partial_outage" => OfficialState::PartialOutage,
-        "major" | "critical" | "major_outage" => OfficialState::MajorOutage,
-        "maintenance" | "under_maintenance" => OfficialState::Maintenance,
-        _ => OfficialState::Unknown,
-    }
-}
-async fn bounded(client: &reqwest::Client, url: &url::Url) -> Result<Vec<u8>, String> {
-    let resp = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        if out.len() + chunk.len() > MAX_BODY {
-            return Err("status response exceeds 1 MiB".into());
-        }
-        out.extend_from_slice(&chunk)
-    }
-    Ok(out)
-}
-async fn fetch(spec: &StatusSourceSpec, timeout: Duration) -> Result<Snapshot, String> {
-    let StatusSourceSpec::StatuspageV2 {
-        summary_url,
-        incidents_url,
-        components,
-        ..
-    } = spec
-    else {
-        return Ok(Snapshot {
-            at: now_unix(),
-            state: OfficialState::Unknown,
-            components: vec![],
-            incidents: vec![],
-        });
-    };
-    fn client_for(url: &url::Url, timeout: Duration) -> Result<reqwest::Client, String> {
-        let origin = url.origin();
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(move |a| {
-                let u = a.url();
-                if u.scheme() == "https" && u.origin() == origin {
-                    a.follow()
-                } else {
-                    a.stop()
-                }
-            }))
-            .timeout(timeout)
-            .build()
-            .map_err(|e| e.to_string())
-    }
-    let summary_client = client_for(summary_url, timeout)?;
-    let incidents_client = client_for(incidents_url, timeout)?;
-    let (sb, ib) = tokio::try_join!(
-        bounded(&summary_client, summary_url),
-        bounded(&incidents_client, incidents_url)
-    )?;
-    let summary: Summary =
-        serde_json::from_slice(&sb).map_err(|e| format!("invalid status summary: {e}"))?;
-    let incidents: Incidents =
-        serde_json::from_slice(&ib).map_err(|e| format!("invalid incidents: {e}"))?;
-    let selected: Vec<Component> = summary
-        .components
-        .into_iter()
-        .filter(|c| components.is_empty() || components.contains(&c.name))
-        .map(|c| Component {
-            id: c.id,
-            name: c.name,
-            state: normalize(&c.status),
-        })
-        .collect();
-    let state = selected
-        .iter()
-        .map(|c| c.state)
-        .max_by_key(|s| match s {
-            OfficialState::MajorOutage => 5,
-            OfficialState::PartialOutage => 4,
-            OfficialState::Degraded => 3,
-            OfficialState::Maintenance => 2,
-            OfficialState::Operational => 1,
-            OfficialState::Unknown => 0,
-        })
-        .unwrap_or_else(|| normalize(&summary.status.indicator));
-    let incidents = incidents
-        .incidents
-        .into_iter()
-        .filter(|i| !matches!(i.status.as_str(), "resolved" | "postmortem"))
-        .filter(|i| {
-            i.components.is_empty()
-                || i.components
-                    .iter()
-                    .any(|c| components.is_empty() || components.contains(&c.name))
-        })
-        .map(|i| {
-            let mut latest = i
-                .incident_updates
-                .first()
-                .map(|x| x.body.clone())
-                .unwrap_or_default();
-            while latest.len() > MAX_UPDATE {
-                latest.pop();
-            }
-            Incident {
-                id: i.id,
-                name: i.name,
-                state: i.status,
-                impact: i.impact,
-                created_at: i.created_at,
-                updated_at: i.updated_at,
-                url: i.shortlink,
-                latest_update: latest,
-                scope: i.components.is_empty().then(|| "page".to_owned()),
-            }
-        })
-        .collect();
-    Ok(Snapshot {
-        at: now_unix(),
-        state,
-        components: selected,
-        incidents,
-    })
 }
