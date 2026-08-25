@@ -161,10 +161,7 @@ impl StatusSource for Adapter {
             .into_iter()
             .filter(|i| !matches!(i.status.as_str(), "resolved" | "postmortem"))
             .filter(|i| {
-                i.components.is_empty()
-                    || i.components
-                        .iter()
-                        .any(|c| components.is_empty() || components.contains(&c.name))
+                components.is_empty() || i.components.iter().any(|c| components.contains(&c.name))
             })
             .map(|i| {
                 let mut latest = i
@@ -194,5 +191,198 @@ impl StatusSource for Adapter {
             components: selected,
             incidents,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    async fn server(summary: Vec<u8>, incidents: Vec<u8>, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let summary = Arc::new(summary);
+        let incidents = Arc::new(incidents);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let summary = summary.clone();
+                let incidents = incidents.clone();
+                tokio::spawn(async move {
+                    let mut request = [0; 1024];
+                    let count = stream.read(&mut request).await.unwrap();
+                    let path = String::from_utf8_lossy(&request[..count]);
+                    let body = if path.starts_with("GET /summary ") {
+                        &summary
+                    } else {
+                        &incidents
+                    };
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn spec(base: &str, components: &[&str]) -> StatusSourceSpec {
+        StatusSourceSpec::StatuspageV2 {
+            name: Some("Provider".into()),
+            summary_url: format!("{base}/summary").parse().unwrap(),
+            incidents_url: format!("{base}/incidents").parse().unwrap(),
+            page_url: format!("{base}/").parse().unwrap(),
+            components: components.iter().map(|x| (*x).into()).collect(),
+        }
+    }
+
+    fn summary(indicator: &str) -> Vec<u8> {
+        format!(r#"{{"status":{{"indicator":"{indicator}"}},"components":[{{"id":"a","name":"API","status":"operational"}},{{"id":"w","name":"Web","status":"major_outage"}}]}}"#).into_bytes()
+    }
+
+    fn incidents(update: &str) -> Vec<u8> {
+        format!(r#"{{"incidents":[{{"id":"page","name":"Page","status":"investigating","impact":"major","created_at":"c","updated_at":"u","shortlink":"p","incident_updates":[{{"body":"page"}}],"components":[]}},{{"id":"api","name":"API incident","status":"monitoring","impact":"minor","created_at":"c","updated_at":"u","shortlink":"a","incident_updates":[{{"body":{update:?}}}],"components":[{{"id":"a","name":"API","status":"degraded_performance"}}]}},{{"id":"web","name":"Web incident","status":"investigating","impact":"major","created_at":"c","updated_at":"u","shortlink":"w","components":[{{"id":"w","name":"Web","status":"major_outage"}}]}}]}}"#).into_bytes()
+    }
+
+    /// Statuspage の未知 indicator は operational と推測せず unknown に正規化する。
+    #[tokio::test]
+    async fn unknown_status_is_preserved_as_unknown() {
+        let base = server(
+            summary("new_state"),
+            br#"{"incidents":[]}"#.to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let snapshot = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &["Missing"]))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, OfficialState::Unknown);
+    }
+
+    /// 壊れた JSON は snapshot を生成せず、summary の入力異常として返す。
+    #[tokio::test]
+    async fn malformed_summary_is_rejected() {
+        let base = server(
+            b"{".to_vec(),
+            br#"{"incidents":[]}"#.to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let error = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &[]))
+            .await
+            .err()
+            .expect("the invalid response must fail");
+        assert!(error.starts_with("invalid status summary:"), "{error}");
+    }
+
+    /// 1 MiB を 1 byte でも超える response は全体を保持せず拒否する。
+    #[tokio::test]
+    async fn oversized_response_is_rejected() {
+        let base = server(
+            vec![b'x'; MAX_BODY + 1],
+            br#"{"incidents":[]}"#.to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let error = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &[]))
+            .await
+            .err()
+            .expect("the invalid response must fail");
+        assert_eq!(error, "status response exceeds 1 MiB");
+    }
+
+    /// source が応答しない場合は adapter の request timeout 内で失敗する。
+    #[tokio::test]
+    async fn fetch_honors_the_request_timeout() {
+        let base = server(
+            summary("none"),
+            br#"{"incidents":[]}"#.to_vec(),
+            Duration::from_secs(1),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let result = Adapter::new(Duration::from_millis(20))
+            .fetch(&spec(&base, &[]))
+            .await;
+        assert!(
+            result.is_err(),
+            "a request beyond the configured deadline must fail"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the adapter must not wait for the delayed server"
+        );
+    }
+
+    /// filter が空なら page 全体を表し、page-scope と全 component incident を採用する。
+    #[tokio::test]
+    async fn empty_component_filter_uses_page_scope() {
+        let base = server(summary("none"), incidents("ok"), Duration::ZERO).await;
+        let snapshot = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &[]))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state, OfficialState::MajorOutage);
+        assert_eq!(
+            snapshot
+                .incidents
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>(),
+            ["page", "api", "web"]
+        );
+        assert_eq!(snapshot.incidents[0].scope.as_deref(), Some("page"));
+    }
+
+    /// filter が非空なら交差する component だけを採用し、page-scope や別 component の障害を混ぜない。
+    #[tokio::test]
+    async fn component_filter_keeps_only_intersecting_incidents() {
+        let base = server(summary("major"), incidents("ok"), Duration::ZERO).await;
+        let snapshot = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &["API"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state,
+            OfficialState::Operational,
+            "page indicator and Web outage do not raise API severity"
+        );
+        assert_eq!(
+            snapshot
+                .incidents
+                .iter()
+                .map(|x| x.id.as_str())
+                .collect::<Vec<_>>(),
+            ["api"]
+        );
+    }
+
+    /// latest update は UTF-8 を壊さず 4 KiB 以下へ切り詰める。
+    #[tokio::test]
+    async fn latest_update_truncates_on_a_utf8_character_boundary() {
+        let update = "界".repeat(2000);
+        let base = server(summary("none"), incidents(&update), Duration::ZERO).await;
+        let snapshot = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &["API"]))
+            .await
+            .unwrap();
+        let latest = &snapshot.incidents[0].latest_update;
+        assert!(latest.len() <= MAX_UPDATE);
+        assert_eq!(latest, &update[..latest.len()]);
+        assert!(latest.ends_with('界'));
     }
 }

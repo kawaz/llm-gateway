@@ -2857,4 +2857,56 @@ routes = ["a"]
             .unwrap();
         assert_eq!(resp.status(), 200);
     }
+
+    /// status endpoint は source の有無にかかわらず configured service をすべて 200 で返す。
+    #[tokio::test]
+    async fn status_endpoint_returns_every_configured_service() {
+        let base = crate::tests::serve(
+            r#"
+[routes.first]
+provider = "anthropic"
+models = ["m1"]
+[routes.second]
+provider = "anthropic"
+models = ["m2"]
+"#,
+        )
+        .await;
+        let response = reqwest::get(format!("{base}/llm-gateway/status"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let report: Value = response.json().await.unwrap();
+        let ids = report["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["first", "second"]);
+    }
+
+    /// refresh=true も report endpoint の成功契約を保ち、fetch 不要な link source を待たずに返す。
+    #[tokio::test]
+    async fn status_refresh_query_returns_a_report() {
+        let base = crate::tests::serve(
+            r#"
+[status.sources.provider]
+type = "link"
+page_url = "https://status.example/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#,
+        )
+        .await;
+        let response = reqwest::get(format!("{base}/llm-gateway/status?refresh=true"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let report: Value = response.json().await.unwrap();
+        assert_eq!(report["services"][0]["id"], "provider");
+        assert_eq!(report["services"][0]["official"]["state"], "unknown");
+    }
 }

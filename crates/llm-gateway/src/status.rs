@@ -466,3 +466,253 @@ fn official_from(
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    async fn counting_status_server() -> (String, Arc<AtomicUsize>, Arc<tokio::sync::Semaphore>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_hits = hits.clone();
+        let server_arrived = arrived.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                server_arrived.add_permits(1);
+                tokio::spawn(async move {
+                    let mut request = [0; 1024];
+                    let count = stream.read(&mut request).await.unwrap();
+                    let path = String::from_utf8_lossy(&request[..count]);
+                    let body = if path.starts_with("GET /summary ") {
+                        r#"{"status":{"indicator":"none"},"components":[]}"#
+                    } else {
+                        r#"{"incidents":[]}"#
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{address}"), hits, arrived)
+    }
+
+    fn manager(extra: &str) -> Manager {
+        let text = format!(
+            r#"
+[server]
+listen = "127.0.0.1:0"
+[status]
+observation_ttl = "1s"
+stale_after = "1s"
+request_timeout = "100ms"
+failure_refresh_cooldown = "60s"
+{extra}
+"#
+        );
+        let config: Config = toml::from_str(&text).expect("the status fixture is valid");
+        Manager::new(&config)
+    }
+
+    /// source を持たない route も service として残し、公式値を捏造せず実測だけを示す。
+    #[tokio::test]
+    async fn a_route_without_a_source_is_its_own_unknown_service() {
+        let m = manager(
+            r#"
+[routes.direct]
+provider = "anthropic"
+models = ["m"]
+"#,
+        );
+        m.observe_success("direct").await;
+        let report = m.report().await;
+        let service = report.services.iter().find(|s| s.id == "direct").unwrap();
+        assert_eq!(service.routes, ["direct"]);
+        assert_eq!(service.official.state, OfficialState::Unknown);
+        assert_eq!(service.official.source, "none");
+        assert_eq!(service.observed.state, ObservedState::Reachable);
+        assert_eq!(service.severity, Severity::Ok);
+    }
+
+    /// 公式取得失敗後も最後の成功 snapshot を保持し、error と stale を独立して公開する。
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_successful_snapshot() {
+        let m = manager(
+            r#"
+[status.sources.provider]
+type = "link"
+page_url = "https://status.example/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#,
+        );
+        let source = m.inner.sources.get("provider").unwrap();
+        let mut state = source.state.lock().await;
+        state.snapshot = Some(Snapshot {
+            at: now_unix() - 2,
+            state: OfficialState::Operational,
+            components: vec![],
+            incidents: vec![],
+        });
+        state.error = Some("refresh failed".into());
+        drop(state);
+        let service = &m.report().await.services[0];
+        assert_eq!(service.official.state, OfficialState::Operational);
+        assert!(service.official.stale);
+        assert_eq!(service.official.error.as_deref(), Some("refresh failed"));
+    }
+
+    /// 529 だけが failing を作り、後続成功は同秒でも reachable へ戻す。
+    #[tokio::test]
+    async fn success_after_a_529_restores_reachability() {
+        let m = manager(
+            r#"
+[routes.route]
+provider = "anthropic"
+models = ["m"]
+"#,
+        );
+        m.observe_failure("route", "overloaded", Some(529)).await;
+        assert_eq!(
+            m.report().await.services[0].observed.state,
+            ObservedState::Failing
+        );
+        m.observe_success("route").await;
+        assert_eq!(
+            m.report().await.services[0].observed.state,
+            ObservedState::Reachable
+        );
+    }
+
+    /// TTL より古い実測は成功・失敗のどちらも現在状態として扱わない。
+    #[tokio::test]
+    async fn observations_become_unknown_after_the_ttl() {
+        let m = manager(
+            r#"
+[routes.route]
+provider = "anthropic"
+models = ["m"]
+"#,
+        );
+        m.inner.observations.lock().await.insert(
+            "route".into(),
+            Observation {
+                success: Some(now_unix() - 2),
+                failure: None,
+            },
+        );
+        assert_eq!(
+            m.report().await.services[0].observed.state,
+            ObservedState::Unknown
+        );
+    }
+
+    /// 同時 refresh は leader の summary/incidents 各 1 request だけを送り、全 waiter が同じ成功結果を受け取る。
+    #[tokio::test]
+    async fn concurrent_refreshes_share_one_fetch_and_result() {
+        let (base, hits, arrived) = counting_status_server().await;
+        let m = manager(&format!(
+            r#"
+[status.sources.provider]
+type = "statuspage_v2"
+summary_url = "{base}/summary"
+incidents_url = "{base}/incidents"
+page_url = "{base}/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#
+        ));
+        let jobs = (0..20)
+            .map(|_| {
+                let m = m.clone();
+                tokio::spawn(async move { m.refresh("provider").await })
+            })
+            .collect::<Vec<_>>();
+        let results = futures_util::future::join_all(jobs).await;
+        assert!(results.into_iter().all(|r| r.unwrap() == Ok(())));
+        arrived.acquire_many(2).await.unwrap().forget();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "one summary and one incidents request form the single fetch"
+        );
+    }
+
+    /// failure が一度に大量到着しても source ごとの cooldown は最初の background refresh だけを起動する。
+    #[tokio::test]
+    async fn many_failures_trigger_one_refresh_during_the_cooldown() {
+        let (base, hits, arrived) = counting_status_server().await;
+        let m = manager(&format!(
+            r#"
+[status.sources.provider]
+type = "statuspage_v2"
+summary_url = "{base}/summary"
+incidents_url = "{base}/incidents"
+page_url = "{base}/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#
+        ));
+        let jobs = (0..100).map(|_| {
+            let m = m.clone();
+            tokio::spawn(
+                async move { m.observe_failure("route", "upstream_http", Some(529)).await },
+            )
+        });
+        futures_util::future::join_all(jobs).await;
+        arrived.acquire_many(2).await.unwrap().forget();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "cooldown permits one summary and one incidents request only"
+        );
+    }
+
+    /// leader が request timeout 内に終わらない場合、待機者自身も同じ上限で終了する。
+    #[tokio::test]
+    async fn refresh_waiter_times_out() {
+        let m = manager(
+            r#"
+[status.sources.provider]
+type = "link"
+page_url = "https://status.example/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#,
+        );
+        m.inner
+            .sources
+            .get("provider")
+            .unwrap()
+            .state
+            .lock()
+            .await
+            .refreshing = true;
+        assert_eq!(
+            m.refresh("provider").await,
+            Err("status refresh timed out".into())
+        );
+    }
+}

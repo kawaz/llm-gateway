@@ -3661,4 +3661,121 @@ opus = "claude-opus-*"
         assert_eq!(resp.response.status, 200);
         assert_eq!(up.hits(), 1);
     }
+
+    fn status_route(url: &str) -> String {
+        format!(
+            r#"
+[routes.route]
+provider = "anthropic"
+url = "{url}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["route"]
+"#
+        )
+    }
+
+    /// 401/403/429 と gateway が fallback 用に扱う 5xx は upstream service failure ではない。
+    /// status observer は 529・transport・admission busy だけを failing とする。
+    #[tokio::test]
+    async fn ordinary_denials_and_synthetic_server_errors_do_not_mark_status_failing() {
+        for code in [401, 403, 429, 500, 502, 503, 504] {
+            let upstream = FakeUpstream::always(code).await;
+            let gw = gateway(&status_route(&upstream.url)).await;
+            let _ = gw
+                .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .await;
+            let report = gw.status_report(false).await;
+            assert_ne!(
+                report.services[0].observed.state,
+                crate::status::ObservedState::Failing,
+                "{code} must not imply an upstream outage"
+            );
+        }
+    }
+
+    /// 529 は failing を作るが、後続 2xx は同じ route の最新観測として reachable へ戻す。
+    #[tokio::test]
+    async fn a_success_after_529_restores_the_gateway_status() {
+        let upstream = FakeUpstream::then(529, 200).await;
+        let gw = gateway(&status_route(&upstream.url)).await;
+        let first = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(first.response.status, 529);
+        assert_eq!(
+            gw.status_report(false).await.services[0].observed.state,
+            crate::status::ObservedState::Failing
+        );
+        // 529 で付いた一時 deny を解除し、同じ route の upstream 回復を模擬する。
+        preset_of(&gw, "route").allow(MODEL);
+        let second = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(second.response.status, 200);
+        assert_eq!(
+            gw.status_report(false).await.services[0].observed.state,
+            crate::status::ObservedState::Reachable
+        );
+    }
+
+    /// 529 で起動する公式 status refresh は背景処理であり、status source が応答を保留しても LLM response を止めない。
+    #[tokio::test]
+    async fn a_529_response_does_not_wait_for_the_status_refresh() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let status_address = listener.local_addr().unwrap();
+        let status_arrived = Arc::new(tokio::sync::Semaphore::new(0));
+        let bell = status_arrived.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((_stream, _)) = listener.accept().await else {
+                    break;
+                };
+                bell.add_permits(1);
+                // stream を task の終了まで保持し、refresh を確実に in-flight にする。
+                std::future::pending::<()>().await;
+            }
+        });
+        let upstream = FakeUpstream::always(529).await;
+        // localhost fixture は production の HTTPS-only config validation 対象外。
+        // Gateway 自体を構築し、observer の非待機契約だけを隔離して測る。
+        let config: Config = toml::from_str(&format!(
+            r#"
+[status]
+request_timeout = "5s"
+failure_refresh_cooldown = "60s"
+[status.sources.provider]
+type = "statuspage_v2"
+summary_url = "http://{status_address}/summary"
+incidents_url = "http://{status_address}/incidents"
+page_url = "http://{status_address}/"
+[routes.route]
+provider = "anthropic"
+url = "{}"
+status_source = "provider"
+models = ["m"]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["route"]
+"#,
+            upstream.url
+        ))
+        .unwrap();
+        let gw = Gateway::new(&config, StaticStore::new()).unwrap();
+        gw.refresh_models().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![]),
+        )
+        .await
+        .expect("the LLM response must not wait for the five-second status timeout")
+        .unwrap();
+        assert_eq!(response.response.status, 529);
+        status_arrived.acquire().await.unwrap().forget();
+    }
 }

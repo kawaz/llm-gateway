@@ -2370,4 +2370,100 @@ mod tests {
             "\n--- actual ---\n{out}--- expected ---\n{expected}"
         );
     }
+
+    fn status_report(
+        state: llm_gateway::status::OfficialState,
+        stale: bool,
+        incident: bool,
+    ) -> StatusReport {
+        use llm_gateway::status::*;
+        StatusReport {
+            schema_version: 1,
+            generated_at: 100,
+            overall: Overall {
+                severity: Severity::Unknown,
+                service_counts: Counts::default(),
+            },
+            services: vec![Service {
+                id: "provider".into(),
+                name: "Provider".into(),
+                routes: vec!["route".into()],
+                severity: if state == OfficialState::Operational {
+                    Severity::Ok
+                } else {
+                    Severity::Warning
+                },
+                official: Official {
+                    state,
+                    source: "statuspage_v2".into(),
+                    source_url: "https://status.example/".into(),
+                    observed_at: Some(90),
+                    stale,
+                    components: vec![],
+                    incidents: incident
+                        .then(|| Incident {
+                            id: "i".into(),
+                            name: "Incident".into(),
+                            state: "investigating".into(),
+                            impact: "minor".into(),
+                            created_at: "".into(),
+                            updated_at: "".into(),
+                            url: "https://stspg.io/i".into(),
+                            latest_update: "".into(),
+                            scope: None,
+                        })
+                        .into_iter()
+                        .collect(),
+                    error: None,
+                },
+                observed: Observed {
+                    state: ObservedState::Unknown,
+                    observed_at: None,
+                    expires_at: None,
+                    last_success_at: None,
+                    last_failure: None,
+                },
+            }],
+        }
+    }
+
+    /// operational は OK、実測なしは unknown として同じ行に表示する。
+    #[test]
+    fn status_formatter_shows_operational_and_unknown() {
+        let out = render_status(&status_report(
+            llm_gateway::status::OfficialState::Operational,
+            false,
+            false,
+        ));
+        assert!(
+            out.contains("Provider    OK        operational      unknown"),
+            "{out}"
+        );
+    }
+
+    /// incident は一覧行に加えて利用者が辿れる名前と URL を表示する。
+    #[test]
+    fn status_formatter_shows_incidents() {
+        let out = render_status(&status_report(
+            llm_gateway::status::OfficialState::Degraded,
+            false,
+            true,
+        ));
+        assert!(out.contains("degraded"), "{out}");
+        assert!(
+            out.contains("Provider: Incident\n  https://stspg.io/i"),
+            "{out}"
+        );
+    }
+
+    /// stale は更新時刻の直後へ明示し、現在値と誤認させない。
+    #[test]
+    fn status_formatter_marks_stale_snapshots() {
+        let out = render_status(&status_report(
+            llm_gateway::status::OfficialState::Operational,
+            true,
+            false,
+        ));
+        assert!(out.contains(" stale"), "{out}");
+    }
 }
