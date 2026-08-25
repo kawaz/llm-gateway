@@ -330,10 +330,6 @@ impl<P: Persistence> Gateway<P> {
                     }
                     if resp.status / 100 == 2 {
                         self.status.observe_success(route.name()).await;
-                    } else if resp.status == 529 {
-                        self.status
-                            .observe_failure(route.name(), "upstream_http", Some(529))
-                            .await;
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
                     // まで流れ切ったかどうかは crate::exchange が記録する。
@@ -366,6 +362,11 @@ impl<P: Persistence> Gateway<P> {
                         reason,
                     });
                     if let Some(resp) = denial {
+                        if resp.status == 529 {
+                            self.status
+                                .observe_failure(route.name(), "upstream_http", Some(529))
+                                .await;
+                        }
                         let (resp, body) = match egress::buffer(resp).await {
                             Ok(buffered) => buffered,
                             Err(error) => {
