@@ -518,6 +518,10 @@ mod tests {
     }
 
     fn manager(extra: &str) -> Manager {
+        manager_with_timeout(extra, "5s")
+    }
+
+    fn manager_with_timeout(extra: &str, request_timeout: &str) -> Manager {
         let text = format!(
             r#"
 [server]
@@ -525,7 +529,7 @@ listen = "127.0.0.1:0"
 [status]
 observation_ttl = "1s"
 stale_after = "1s"
-request_timeout = "100ms"
+request_timeout = "{request_timeout}"
 failure_refresh_cooldown = "60s"
 {extra}
 "#
@@ -819,7 +823,7 @@ models = ["m"]
     /// leader が request timeout 内に終わらない場合、待機者自身も同じ上限で終了する。
     #[tokio::test]
     async fn refresh_waiter_times_out() {
-        let m = manager(
+        let m = manager_with_timeout(
             r#"
 [status.sources.provider]
 type = "link"
@@ -829,6 +833,7 @@ provider = "anthropic"
 status_source = "provider"
 models = ["m"]
 "#,
+            "100ms",
         );
         m.inner
             .sources
