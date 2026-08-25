@@ -34,6 +34,7 @@ pub mod quota;
 pub mod router;
 pub mod session;
 pub mod stats;
+pub mod status;
 pub mod tap;
 pub mod webhook;
 
