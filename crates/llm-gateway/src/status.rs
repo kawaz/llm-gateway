@@ -55,6 +55,8 @@ pub struct Incident {
     pub updated_at: String,
     pub url: String,
     pub latest_update: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Official {
@@ -179,7 +181,7 @@ impl Manager {
         }
     }
     pub fn start(&self) {
-        for name in self.inner.sources.keys().cloned().collect::<Vec<_>>() {
+        for name in self.fetchable_source_names() {
             self.refresh_background(name);
         }
         let this = self.clone();
@@ -188,18 +190,27 @@ impl Manager {
             t.tick().await;
             loop {
                 t.tick().await;
-                for n in this.inner.sources.keys().cloned().collect::<Vec<_>>() {
+                for n in this.fetchable_source_names() {
                     this.refresh_background(n);
                 }
             }
         });
     }
     pub async fn refresh_all(&self) {
-        let jobs = self.inner.sources.keys().cloned().map(|n| {
+        let jobs = self.fetchable_source_names().into_iter().map(|n| {
             let s = self.clone();
             async move { s.refresh(&n).await }
         });
         futures_util::future::join_all(jobs).await;
+    }
+    fn fetchable_source_names(&self) -> Vec<String> {
+        self.inner
+            .sources
+            .iter()
+            .filter_map(|(name, source)| {
+                matches!(source.spec, StatusSourceSpec::StatuspageV2 { .. }).then(|| name.clone())
+            })
+            .collect()
     }
     fn refresh_background(&self, name: String) {
         let s = self.clone();
@@ -222,6 +233,9 @@ impl Manager {
         };
         if let Some(rx) = rx {
             let _ = tokio::time::timeout(self.inner.config.request_timeout, rx).await;
+            return;
+        }
+        if matches!(source.spec, StatusSourceSpec::Link { .. }) {
             return;
         }
         let result = fetch(&source.spec, self.inner.config.request_timeout).await;
@@ -311,7 +325,13 @@ impl Manager {
             let severity = severity(official.state, observed.state);
             services.push(Service {
                 id: id.clone(),
-                name: id,
+                name: self
+                    .inner
+                    .sources
+                    .get(&id)
+                    .and_then(|source| source.spec.name())
+                    .unwrap_or(&id)
+                    .to_owned(),
                 routes,
                 severity,
                 official,
@@ -405,7 +425,7 @@ fn official_from(
 ) -> Official {
     let (kind, url) = match spec {
         StatusSourceSpec::StatuspageV2 { page_url, .. } => ("statuspage_v2", page_url.as_str()),
-        StatusSourceSpec::Link { page_url } => ("link", page_url.as_str()),
+        StatusSourceSpec::Link { page_url, .. } => ("link", page_url.as_str()),
     };
     match &st.snapshot {
         Some(x) => Official {
@@ -518,22 +538,26 @@ async fn fetch(spec: &StatusSourceSpec, timeout: Duration) -> Result<Snapshot, S
             incidents: vec![],
         });
     };
-    let origin = summary_url.origin();
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::custom(move |a| {
-            let u = a.url();
-            if u.scheme() == "https" && u.origin() == origin {
-                a.follow()
-            } else {
-                a.stop()
-            }
-        }))
-        .timeout(timeout)
-        .build()
-        .map_err(|e| e.to_string())?;
+    fn client_for(url: &url::Url, timeout: Duration) -> Result<reqwest::Client, String> {
+        let origin = url.origin();
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::custom(move |a| {
+                let u = a.url();
+                if u.scheme() == "https" && u.origin() == origin {
+                    a.follow()
+                } else {
+                    a.stop()
+                }
+            }))
+            .timeout(timeout)
+            .build()
+            .map_err(|e| e.to_string())
+    }
+    let summary_client = client_for(summary_url, timeout)?;
+    let incidents_client = client_for(incidents_url, timeout)?;
     let (sb, ib) = tokio::try_join!(
-        bounded(&client, summary_url),
-        bounded(&client, incidents_url)
+        bounded(&summary_client, summary_url),
+        bounded(&incidents_client, incidents_url)
     )?;
     let summary: Summary =
         serde_json::from_slice(&sb).map_err(|e| format!("invalid status summary: {e}"))?;
@@ -589,6 +613,7 @@ async fn fetch(spec: &StatusSourceSpec, timeout: Duration) -> Result<Snapshot, S
                 updated_at: i.updated_at,
                 url: i.shortlink,
                 latest_update: latest,
+                scope: i.components.is_empty().then(|| "page".to_owned()),
             }
         })
         .collect();

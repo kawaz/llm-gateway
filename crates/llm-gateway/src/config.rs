@@ -756,6 +756,8 @@ fn default_status_request_timeout() -> Duration {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StatusSourceSpec {
     StatuspageV2 {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         summary_url: url::Url,
         incidents_url: url::Url,
         page_url: url::Url,
@@ -763,13 +765,20 @@ pub enum StatusSourceSpec {
         components: Vec<String>,
     },
     Link {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         page_url: url::Url,
     },
 }
 impl StatusSourceSpec {
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::StatuspageV2 { name, .. } | Self::Link { name, .. } => name.as_deref(),
+        }
+    }
     pub fn page_url(&self) -> &url::Url {
         match self {
-            Self::StatuspageV2 { page_url, .. } | Self::Link { page_url } => page_url,
+            Self::StatuspageV2 { page_url, .. } | Self::Link { page_url, .. } => page_url,
         }
     }
     fn urls(&self) -> Vec<&url::Url> {
@@ -780,7 +789,7 @@ impl StatusSourceSpec {
                 page_url,
                 ..
             } => vec![summary_url, incidents_url, page_url],
-            Self::Link { page_url } => vec![page_url],
+            Self::Link { page_url, .. } => vec![page_url],
         }
     }
 }
