@@ -296,6 +296,26 @@ impl Router {
             .map(|(name, preset)| (name.as_str(), preset))
     }
 
+    /// 一覧を聞きに行く先の認証情報。設定順、重複は除く。
+    ///
+    /// 一覧が取れるかどうかはこの認証情報次第なので、これらの更新を
+    /// 見ていれば「入れ直したのに一覧が古いまま」を避けられる。
+    pub fn discovery_credentials(&self) -> Vec<CredentialId> {
+        let mut ids: Vec<CredentialId> = Vec::new();
+        for route in self.config.routes.values() {
+            if route.discovery_flavor(&self.config).is_none() {
+                continue;
+            }
+            if let Some(name) = route.credential.as_deref() {
+                let id = CredentialId::new(name);
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     /// upstream に一覧を聞いて、公開するモデルを組み直す。
     ///
     /// 聞けなかった upstream は前回の結果を残す。一時的に繋がらないだけで
@@ -950,6 +970,23 @@ spend_down_within = "25%"
             model,
             credential: crate::stats::NO_CREDENTIAL,
         }
+    }
+
+    /// 一覧を聞きに行く先だけを、設定順で重複なく挙げる。
+    ///
+    /// この認証情報が入れ替わったら一覧を取り直す。聞きに行かない経路
+    /// (relay 型) を混ぜると、関係のない更新でも取り直すことになる。
+    #[test]
+    fn lists_the_credentials_discovery_depends_on() {
+        let config: Config = toml::from_str(CONFIG).unwrap();
+        config.validate().unwrap();
+        let router = build(config);
+        let ids: Vec<String> = router
+            .discovery_credentials()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, vec!["bedrock", "oauth-a", "oauth-b"]);
     }
 
     #[tokio::test]

@@ -37,6 +37,8 @@ pub struct Gateway<P: Persistence> {
     credentials: CredentialStore<P>,
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
+    /// 認証情報が書き換わっていないかを見に行く間隔。
+    watch_interval: std::time::Duration,
     /// 枠の観測を再起動を跨いで持つ置き場。裏で走る仕事とも共有する。
     usage: Arc<QuotaStore>,
     stats: Arc<Stats>,
@@ -89,6 +91,7 @@ impl<P: Persistence> Gateway<P> {
 
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
+            watch_interval: std::time::Duration::from_secs(config.discovery.watch_secs),
             router: Router::new(config.clone(), Arc::clone(&events)),
             // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
             // 共有しても、互いのファイルを書かない (DR-0011)。
@@ -189,15 +192,63 @@ impl<P: Persistence> Gateway<P> {
 
     /// 一覧を取り直し続ける。
     ///
-    /// 新しいモデルが出たときに、再起動せずに拾えるようにする。
+    /// 取り直す理由は 2 つある。新しいモデルが出たときに再起動せずに拾うこと
+    /// (一定間隔) と、認証情報を入れ直したときに欠けた経路をすぐ戻すこと
+    /// (更新を見たら即座に)。後者を間隔任せにすると、`llm-gateway login` で
+    /// token を直しても最大 `refresh_secs` のあいだモデルが消えたままになる。
     pub async fn keep_models_fresh(&self) {
-        let mut ticker = tokio::time::interval(self.refresh_interval);
+        self.keep_models_fresh_every(self.watch_interval, self.refresh_interval)
+            .await;
+    }
+
+    /// [`Self::keep_models_fresh`] の中身。間隔を引数で受けるのは、試験から
+    /// 実時間を待たずに回すため。
+    async fn keep_models_fresh_every(
+        &self,
+        watch: std::time::Duration,
+        refresh: std::time::Duration,
+    ) {
+        // 見に行く間隔が取り直す間隔より長いと、更新に気づくのが遅れるだけで
+        // 何の役にも立たない。
+        let watch = watch.min(refresh);
+        let mut ticker = tokio::time::interval(watch);
         // 起動直後の 1 回目は呼び出し側が済ませている。
         ticker.tick().await;
+        let mut seen = self.credential_versions();
+        let mut waited = std::time::Duration::ZERO;
+
         loop {
             ticker.tick().await;
-            self.refresh_models().await;
+            waited += watch;
+
+            let now = self.credential_versions();
+            let updated = now != seen;
+            seen = now;
+
+            if updated {
+                info!("credentials changed on disk; refreshing the model catalog");
+            }
+            if updated || waited >= refresh {
+                waited = std::time::Duration::ZERO;
+                self.refresh_models().await;
+            }
         }
+    }
+
+    /// 一覧を聞きに行く先の認証情報の、今の版 (DR-0010)。
+    ///
+    /// 中身は読まない。読むと refresh token を使う判断まで巻き込むので、
+    /// 「変わったか」だけを見る。版を持たない置き場では常に同じ値になり、
+    /// 更新には気づけない (= 従来どおり間隔で取り直す)。
+    fn credential_versions(&self) -> Vec<(CredentialId, Option<u64>)> {
+        self.router
+            .discovery_credentials()
+            .into_iter()
+            .map(|id| {
+                let version = self.credentials.version(&id);
+                (id, version)
+            })
+            .collect()
     }
 
     /// 名前で namespace を引く。無ければ `None`。
@@ -1138,6 +1189,8 @@ mod tests {
         url: String,
         hits: Arc<AtomicUsize>,
         requests: Arc<StdMutex<Vec<String>>>,
+        /// 一覧 (discovery) の問い合わせが届いた数を配る合図。転送とは別に持つ。
+        listed: Arc<tokio::sync::Semaphore>,
         /// 届いた要求の数を配る合図。裏で走る仕事の到着を、時間で待たずに掴む。
         ///
         /// 数が積み上がる形にしておく。「1 本届いた」を配るだけだと、待ち始める
@@ -1198,9 +1251,11 @@ mod tests {
             let hits = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(StdMutex::new(Vec::new()));
             let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+            let listed = Arc::new(tokio::sync::Semaphore::new(0));
             let counter = Arc::clone(&hits);
             let seen = Arc::clone(&requests);
             let bell = Arc::clone(&arrived);
+            let listing_bell = Arc::clone(&listed);
             let respond = Arc::new(respond);
 
             tokio::spawn(async move {
@@ -1211,6 +1266,7 @@ mod tests {
                     let counter = Arc::clone(&counter);
                     let seen = Arc::clone(&seen);
                     let bell = Arc::clone(&bell);
+                    let listing_bell = Arc::clone(&listing_bell);
                     let respond = Arc::clone(&respond);
                     let extra = Arc::clone(&extra);
                     tokio::spawn(async move {
@@ -1221,6 +1277,7 @@ mod tests {
 
                         // 一覧の問い合わせは数に入れない (転送だけ数える)。
                         let (status, body) = if req.starts_with("GET /v1/models") {
+                            listing_bell.add_permits(1);
                             (200, MODELS.to_owned())
                         } else {
                             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1246,8 +1303,19 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
                 url: format!("http://{addr}"),
                 hits,
                 requests,
+                listed,
                 arrived,
             }
+        }
+
+        /// 次の一覧 (discovery) の問い合わせが届くまで待つ。
+        async fn next_listing(&self) {
+            self.listed.acquire().await.expect("never closes").forget();
+        }
+
+        /// まだ受け取っていない一覧の問い合わせの数。
+        fn listings(&self) -> usize {
+            self.listed.available_permits()
         }
 
         /// 次の要求が届くまで待つ。
@@ -1283,7 +1351,12 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
 
     /// 常に有効な認証情報を返す置き場。保存された内容は覚えておく。
     #[derive(Clone)]
-    struct StaticStore(Arc<StdMutex<StoredCredential>>);
+    struct StaticStore {
+        credential: Arc<StdMutex<StoredCredential>>,
+        /// 置き場の版 (DR-0010)。`touch` で進めると、別のプロセスが
+        /// ファイルを書き換えた状況になる。
+        version: Arc<AtomicUsize>,
+    }
 
     impl StaticStore {
         fn new() -> Self {
@@ -1291,12 +1364,20 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         }
 
         fn holding(c: StoredCredential) -> Self {
-            Self(Arc::new(StdMutex::new(c)))
+            Self {
+                credential: Arc::new(StdMutex::new(c)),
+                version: Arc::new(AtomicUsize::new(1)),
+            }
+        }
+
+        /// 中身を入れ替えずに版だけ進める (= `llm-gateway login` が書いた後)。
+        fn touch(&self) {
+            self.version.fetch_add(1, Ordering::SeqCst);
         }
 
         /// 最後に保存された内容。
         fn saved(&self) -> StoredCredential {
-            self.0.lock().unwrap().clone()
+            self.credential.lock().unwrap().clone()
         }
     }
 
@@ -1330,10 +1411,10 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         type Guard = ();
 
         fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
-            Ok(self.0.lock().unwrap().clone())
+            Ok(self.credential.lock().unwrap().clone())
         }
         fn store(&self, _id: &CredentialId, v: &StoredCredential) -> Result<()> {
-            *self.0.lock().unwrap() = v.clone();
+            *self.credential.lock().unwrap() = v.clone();
             Ok(())
         }
         fn list(&self) -> Result<Vec<CredentialId>> {
@@ -1342,9 +1423,10 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         fn lock(&self, _id: &CredentialId) -> Result<Self::Guard> {
             Ok(())
         }
-        /// 版を持たない。書き換えるのは自分だけなので、控えを疑う理由が無い。
+        /// 版は `touch` でしか動かない。書き換えるのは自分だけなので、
+        /// 進めない限り控えを疑う理由が無い。
         fn version(&self, _id: &CredentialId) -> Option<u64> {
-            None
+            Some(self.version.load(Ordering::SeqCst) as u64)
         }
     }
 
@@ -2229,6 +2311,70 @@ models = ["m"]
 routes = ["a"]
 "#
         )
+    }
+
+    /// 認証情報を入れ直したら、間隔を待たずに一覧を取り直す。
+    ///
+    /// token が失効している間、その経路のモデルは一覧から消える。`login` で
+    /// 直しても取り直すまで戻らないので、次の `refresh_secs` (既定 1 時間) を
+    /// 待つあいだ failover 先が欠けたままになる。
+    #[tokio::test]
+    async fn a_credential_update_refreshes_the_catalog_right_away() {
+        let up = FakeUpstream::always(200).await;
+        let store = StaticStore::new();
+        let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
+        assert_eq!(up.listings(), 1, "asked once while starting up");
+        up.next_listing().await;
+
+        let watching = async {
+            gw.keep_models_fresh_every(
+                std::time::Duration::from_millis(10),
+                // 間隔での取り直しは起きない長さ。動いたのは更新の検知だけ。
+                std::time::Duration::from_secs(3600),
+            )
+            .await;
+        };
+
+        let asked = async {
+            // 更新が無いうちは聞きに行かない。
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), up.next_listing())
+                    .await
+                    .is_err(),
+                "an unchanged credential is no reason to ask again"
+            );
+
+            store.touch();
+            tokio::time::timeout(std::time::Duration::from_secs(5), up.next_listing())
+                .await
+                .expect("asks again as soon as the credential changes");
+        };
+
+        tokio::select! {
+            () = watching => unreachable!("the watcher never finishes"),
+            () = asked => {}
+        }
+    }
+
+    /// 更新が無くても、間隔が来れば取り直す。
+    ///
+    /// 更新の検知を足したせいで、新しいモデルが出たときに拾えなくなっては困る。
+    #[tokio::test]
+    async fn the_catalog_is_still_refreshed_on_the_interval() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway_with(&oauth_config(&up.url), StaticStore::new()).await;
+
+        let watching = gw.keep_models_fresh_every(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(20),
+        );
+
+        tokio::select! {
+            () = watching => unreachable!("the watcher never finishes"),
+            asked = tokio::time::timeout(std::time::Duration::from_secs(5), up.next_listing()) => {
+                asked.expect("asks again once the interval is up");
+            }
+        }
     }
 
     /// 締め出した経路には裏で枠を聞きに行き、開いていれば戻す。

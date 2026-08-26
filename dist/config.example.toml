@@ -33,6 +33,9 @@ type = "file"
 [discovery]
 # 一覧を取り直す間隔。新しいモデルが出たときに再起動せず拾える。
 refresh_secs = 3600
+# 認証情報が書き換わっていないかを見に行く間隔。llm-gateway login で入れ直したら
+# refresh_secs を待たずに一覧を取り直す。
+watch_secs = 60
 
 # リクエストイベントを受け口へ送る。base_url を書かなければ無効。
 # [webhook]

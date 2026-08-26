@@ -171,6 +171,14 @@ impl<P: Persistence> CredentialStore<P> {
     pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
         self.inner.record_denied_beta(id, flags).await
     }
+
+    /// 置き場に入っている今の版 (DR-0010)。控えではなく置き場を見る。
+    ///
+    /// 中身を読まずに「他のプロセスが書き換えたか」を知るのに使う。
+    /// 版を持たない置き場では常に `None` なので、変わっていない扱いになる。
+    pub fn version(&self, id: &CredentialId) -> Option<u64> {
+        self.inner.persistence.version(id)
+    }
 }
 
 impl<P: Persistence> Inner<P> {

@@ -517,18 +517,30 @@ pub struct Discovery {
     /// 一覧を取り直す間隔 (秒)。
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
+    /// 認証情報の更新を見に行く間隔 (秒)。
+    ///
+    /// `llm-gateway login` で認証情報を入れ直しても、一覧を取り直すまでは
+    /// 失効中に消えたモデルが戻らない。次の `refresh_secs` を待つと最大 1 時間
+    /// 経路が欠けたままになるので、更新に気づいた時点で取り直す。
+    #[serde(default = "default_watch_secs")]
+    pub watch_secs: u64,
 }
 
 impl Default for Discovery {
     fn default() -> Self {
         Self {
             refresh_secs: default_refresh_secs(),
+            watch_secs: default_watch_secs(),
         }
     }
 }
 
 fn default_refresh_secs() -> u64 {
     3600
+}
+
+fn default_watch_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2081,6 +2093,18 @@ routes = ["a", "typo-here"]
     fn discovery_interval_can_be_set() {
         let c = parse("[discovery]\nrefresh_secs = 300").unwrap();
         assert_eq!(c.discovery.refresh_secs, 300);
+    }
+
+    /// 認証情報の更新を見に行く間隔も設定で変えられる。
+    #[test]
+    fn credential_watch_interval_can_be_set() {
+        assert_eq!(
+            parse("").unwrap().discovery.watch_secs,
+            60,
+            "default is one minute"
+        );
+        let c = parse("[discovery]\nwatch_secs = 5").unwrap();
+        assert_eq!(c.discovery.watch_secs, 5);
     }
 
     #[test]
