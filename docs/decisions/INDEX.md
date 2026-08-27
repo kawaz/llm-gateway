@@ -24,6 +24,7 @@
 - [DR-0020](./DR-0020-denial-reason-visibility.md) — 外した理由を出力に載せる (events に `skipped`、usage に現在の `denials`。optional 追加のみ)
 - [DR-0021](./DR-0021-upstream-service-status.md) — upstream の公式状態と gateway の実測状態を `/llm-gateway/status` で一括表示し、529 時に background refresh する
 - [DR-0022](./DR-0022-credential-update-triggers-discovery.md) — 認証情報ファイルの版 (mtime) を見張り、更新に気づいたら `refresh_secs` を待たずに model catalog を取り直す
+- [DR-0023](./DR-0023-web-login-endpoint.md) — Web 経由の OAuth 再認証口 (`/llm-gateway/login`、claude_oauth のみ、手動コード貼り付けフロー)
 
 ## Archived
 
