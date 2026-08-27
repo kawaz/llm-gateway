@@ -1,11 +1,11 @@
 ---
 title: gateway の HTTP 経由で OAuth login を開始できるエンドポイント
-status: open
+status: wip
 category: request
 created: 2026-08-27T15:35:23+09:00
 last_read:
 open_entered: 2026-08-27T15:35:23+09:00
-wip_entered:
+wip_entered: 2026-08-28T00:43:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -39,3 +39,6 @@ tailnet 経由でリモートのマシンから gateway にアクセスしてい
 ## TODO
 
 <!-- wip 時のみ -->
+
+- 設計は `docs/decisions/DR-0023-web-login-endpoint.md` として確定済み
+- 実装は codex-sol-worker で進行中
