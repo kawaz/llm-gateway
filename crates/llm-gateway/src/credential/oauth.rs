@@ -163,6 +163,9 @@ a refresh may have run twice; you need to log in again: {login}"
 
 /// 認可の入口。人がブラウザで開く画面。
 pub const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+/// Web login で認可コードを画面表示させる戻り先。
+pub const ANTHROPIC_CONSOLE_REDIRECT_URI: &str =
+    "https://console.anthropic.com/oauth/code/callback";
 pub const OPENAI_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 
 /// 戻りを待つ上限。
@@ -202,6 +205,8 @@ pub struct AuthProfile {
     /// できない。塞がっていたら諦めて、塞いでいる側を止めてもらう。
     pub redirect_port: u16,
     pub redirect_path: &'static str,
+    /// localhost callback を使わないフローの登録済み戻り先。
+    pub redirect_uri_override: Option<&'static str>,
     pub scope: &'static str,
     /// provider 固有の追加パラメータ。
     pub extra_params: &'static [(&'static str, &'static str)],
@@ -227,10 +232,14 @@ pub enum ExchangeForm {
 impl AuthProfile {
     /// 認可と交換の両方に送る戻り先。食い違うと交換で弾かれる。
     pub fn redirect_uri(&self) -> String {
-        format!(
-            "http://localhost:{}{}",
-            self.redirect_port, self.redirect_path
-        )
+        self.redirect_uri_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "http://localhost:{}{}",
+                    self.redirect_port, self.redirect_path
+                )
+            })
     }
 }
 
@@ -241,6 +250,7 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
             authorize_url: ANTHROPIC_AUTHORIZE_URL,
             redirect_port: 54545,
             redirect_path: "/callback",
+            redirect_uri_override: None,
             // `user:file_upload` は単数形。複数形にすると認可画面が
             // 「不明なスコープ」で弾く (実測 2026-07-28)。
             scope: "user:profile user:inference user:sessions:claude_code \
@@ -257,6 +267,7 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
             // 登録済みの値であることのほうが優先される。
             redirect_port: 1455,
             redirect_path: "/auth/callback",
+            redirect_uri_override: None,
             // offline_access が refresh token を出させる分。これが無いと
             // 8 時間ごとに人の操作が要る。
             scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
@@ -271,6 +282,63 @@ pub fn auth_profile_for(kind: Kind) -> AuthProfile {
             exchange_form: ExchangeForm::UrlEncoded,
             exchange_state: false,
         },
+    }
+}
+
+/// Web login の認可セッション。callback listener を持たず、表示されたコードを交換する。
+pub struct WebAuthorization {
+    profile: AuthProfile,
+    url: String,
+    state: String,
+    verifier: Zeroizing<String>,
+}
+
+impl WebAuthorization {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn state(&self) -> &str {
+        &self.state
+    }
+
+    /// 表示された認可コードを token に交換し、実際に使えることまで確認する。
+    pub async fn finish(self, code: &str) -> Result<Tokens> {
+        self.finish_at(code, None, None).await
+    }
+
+    /// 接続先を差し替えて仕上げる。server の結合試験で実 provider を叩かないための口。
+    pub async fn finish_at(
+        self,
+        code: &str,
+        exchange_url: Option<&str>,
+        verify_url: Option<&str>,
+    ) -> Result<Tokens> {
+        let tokens = exchange_code(
+            Kind::Claude,
+            &self.profile,
+            code,
+            &self.state,
+            &self.verifier,
+            exchange_url,
+        )
+        .await?;
+        verify(Kind::Claude, &tokens, verify_url).await?;
+        Ok(tokens)
+    }
+}
+
+/// Anthropic console がコードを表示する Web login を始める。
+pub fn begin_web() -> WebAuthorization {
+    let mut profile = auth_profile_for(Kind::Claude);
+    profile.redirect_uri_override = Some(ANTHROPIC_CONSOLE_REDIRECT_URI);
+    let verifier = Zeroizing::new(random_token());
+    let state = random_token();
+    let url = authorize_url(&profile, Kind::Claude, &state, &challenge_of(&verifier));
+    WebAuthorization {
+        profile,
+        url,
+        state,
+        verifier,
     }
 }
 
@@ -1169,6 +1237,18 @@ mod tests {
     }
 
     /// ChatGPT 側は独自パラメータが要る。offline_access が無いと更新できない。
+    /// Web login の認可 URL は console callback を使う。交換も同じ profile を保持する。
+    #[test]
+    fn web_authorization_uses_the_console_redirect() {
+        let authorization = begin_web();
+        let query = query_of(authorization.url());
+        assert_eq!(query["redirect_uri"], ANTHROPIC_CONSOLE_REDIRECT_URI);
+        assert_eq!(
+            authorization.profile.redirect_uri(),
+            ANTHROPIC_CONSOLE_REDIRECT_URI
+        );
+    }
+
     #[test]
     fn authorize_url_carries_codex_extras() {
         let profile = auth_profile_for(Kind::Codex);
@@ -1578,6 +1658,22 @@ mod tests {
             *saved.borrow_mut() = Some(tokens.access_token.clone());
             Ok(tokens.access_token.clone())
         }
+    }
+
+    /// Web login は listener を介さず交換と確認を通し、認可時と同じ console redirect を交換 body に送る。
+    #[tokio::test]
+    async fn web_login_exchanges_and_verifies_with_the_console_redirect() {
+        let upstream = Upstream::healthy().await;
+        let authorization = begin_web();
+        let tokens = authorization
+            .finish_at(
+                "the-code",
+                Some(&upstream.exchange_url),
+                Some(&upstream.verify_url),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tokens.access_token, "at");
     }
 
     /// 認可 URL を出す → 戻りを受ける → 交換 → 確認 → 保存、が通しで動く。

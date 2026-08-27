@@ -8,15 +8,17 @@
 //! (DR-0014 §3)。ここに経路の名前を鍵にした表は無く、通った / 断られたを
 //! その経路へ伝えるだけ。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::config::{Config, Namespace};
+use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::now_unix;
-use crate::credential::{Credential, CredentialId, CredentialStore, Persistence};
+use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
 use crate::denial::Probing;
 use crate::egress::{self, EgressRequest, Headers, Response, SentResponse};
 use crate::error::UpstreamAttempt;
@@ -48,6 +50,7 @@ pub struct Gateway<P: Persistence> {
     events: Arc<Events>,
     tap: Arc<Tap>,
     status: crate::status::Manager,
+    web_logins: Mutex<HashMap<String, WebLoginSession>>,
 }
 
 impl<P: Persistence> Gateway<P> {
@@ -110,7 +113,96 @@ impl<P: Persistence> Gateway<P> {
             events,
             tap,
             status: crate::status::Manager::new(config),
+            web_logins: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Web login の対象として宣言された credential 一覧。
+    pub fn login_credentials(&self) -> Vec<(String, &'static str)> {
+        self.config
+            .credentials
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.type_name()))
+            .collect()
+    }
+
+    /// Web login を開始し、state/verifier を 10 分だけ保持する。
+    pub fn begin_web_login(
+        &self,
+        name: &str,
+        required_type: &str,
+        auth: WebAuthorization,
+        now: i64,
+    ) -> Result<String> {
+        let Some(spec) = self.config.credentials.get(name) else {
+            return Err(Error::Credential {
+                id: name.to_owned(),
+                reason: "not configured".into(),
+            });
+        };
+        if spec.type_name() != required_type {
+            return Err(Error::Login {
+                reason: format!(
+                    "web login is unavailable for credential type {}",
+                    spec.type_name()
+                ),
+            });
+        }
+        let url = auth.url().to_owned();
+        let state = auth.state().to_owned();
+        let mut sessions = self.web_logins.lock().unwrap();
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.insert(
+            state,
+            WebLoginSession {
+                name: name.to_owned(),
+                expires_at: now + 600,
+                auth,
+            },
+        );
+        Ok(url)
+    }
+
+    /// state を単回消費する。state 無しなら同じ credential の現行セッションを使う。
+    pub fn take_web_login(
+        &self,
+        name: &str,
+        state: Option<&str>,
+        now: i64,
+    ) -> Result<WebAuthorization> {
+        let mut sessions = self.web_logins.lock().unwrap();
+        let key = state
+            .map(str::to_owned)
+            .or_else(|| {
+                sessions
+                    .iter()
+                    .find(|(_, s)| s.name == name && s.expires_at > now)
+                    .map(|(k, _)| k.clone())
+            })
+            .ok_or_else(|| Error::Login {
+                reason: "no active login session; start login again".into(),
+            })?;
+        let session = sessions.remove(&key).ok_or_else(|| Error::Login {
+            reason: "login state is invalid or has already been used".into(),
+        })?;
+        if session.name != name || session.expires_at <= now {
+            return Err(Error::Login {
+                reason: "login session has expired or does not match this credential".into(),
+            });
+        }
+        Ok(session.auth)
+    }
+
+    pub async fn save_web_login(
+        &self,
+        name: &str,
+        kind: Kind,
+        tokens: &oauth::Tokens,
+    ) -> Result<()> {
+        self.credentials
+            .save_login(&CredentialId::new(name), kind, tokens)
+            .await?;
+        Ok(())
     }
 
     /// 使用量の日次集計。
@@ -1168,6 +1260,12 @@ fn should_try_next(status: u16) -> bool {
 /// 応答は捨てずに持ち回る。全部断られたときは、これをそのまま返す。
 fn is_route_denial(status: u16) -> bool {
     matches!(status, 401 | 403 | 429 | 529)
+}
+
+struct WebLoginSession {
+    name: String,
+    expires_at: i64,
+    auth: WebAuthorization,
 }
 
 #[cfg(test)]
@@ -3923,5 +4021,56 @@ routes = ["route"]
         .unwrap();
         assert_eq!(response.response.status, 529);
         status_arrived.acquire().await.unwrap().forget();
+    }
+
+    fn login_gateway() -> Gateway<StaticStore> {
+        let config: Config = toml::from_str(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+[credentials.local]
+type = "codex_oauth"
+"#,
+        )
+        .unwrap();
+        Gateway::new(&config, StaticStore::new()).unwrap()
+    }
+
+    /// Web login state は指定 credential とだけ結び付き、1 回取り出したら再利用できない。
+    #[test]
+    fn web_login_state_is_bound_and_single_use() {
+        let gateway = login_gateway();
+        let authorization = oauth::begin_web();
+        let state = authorization.state().to_owned();
+        gateway
+            .begin_web_login("web", "claude_oauth", authorization, 100)
+            .unwrap();
+        assert!(gateway.take_web_login("other", Some(&state), 101).is_err());
+        assert!(
+            gateway.take_web_login("web", Some(&state), 101).is_err(),
+            "mismatch also consumes the state"
+        );
+    }
+
+    /// 10 分は有効だが、その境界に達した session は期限切れとして拒否する。
+    #[test]
+    fn web_login_expires_after_ten_minutes() {
+        let gateway = login_gateway();
+        let authorization = oauth::begin_web();
+        let state = authorization.state().to_owned();
+        gateway
+            .begin_web_login("web", "claude_oauth", authorization, 100)
+            .unwrap();
+        assert!(gateway.take_web_login("web", Some(&state), 700).is_err());
+    }
+
+    /// state を持たない貼り付けは、その credential に残る現行 session を使う。
+    #[test]
+    fn raw_code_uses_the_current_session_for_the_credential() {
+        let gateway = login_gateway();
+        gateway
+            .begin_web_login("web", "claude_oauth", oauth::begin_web(), 100)
+            .unwrap();
+        assert!(gateway.take_web_login("web", None, 101).is_ok());
     }
 }

@@ -43,6 +43,20 @@ impl fmt::Display for CredentialId {
 /// 当面の実装は平文ファイル ([`file::FileStore`])。cache-warden の
 /// 永続化が固まったらそちらへ移す。移行で得られるのは暗号化だけでなく、
 /// 「同じ Team ID で署名されたバイナリからしか読めない」というアクセス制御。
+/// login で得た token を、現在の内容を土台にして保存する。
+/// 呼び出し側は同じ credential の lock を保持していること。
+pub fn save_login<P: Persistence>(
+    store: &P,
+    id: &CredentialId,
+    kind: Kind,
+    tokens: &oauth::Tokens,
+) -> Result<StoredCredential> {
+    let existing = store.load(id).ok();
+    let credential = tokens.to_stored(kind, existing.as_ref());
+    store.store(id, &credential)?;
+    Ok(credential)
+}
+
 pub trait Persistence: Send + Sync + 'static {
     /// 書き換えの権利。持っている間だけ、同じ置き場を使う他のプロセスを
     /// 締め出せる。手放す (drop する) と待っている相手が起きる。

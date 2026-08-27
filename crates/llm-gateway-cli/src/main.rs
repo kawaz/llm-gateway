@@ -1094,11 +1094,7 @@ fn save<P: Persistence>(
     tokens: &oauth::Tokens,
 ) -> llm_gateway::Result<StoredCredential> {
     let _guard = store.lock(id)?;
-    // 既にあれば、その内容を土台にする (priority や除外リストを消さない)。
-    let existing = store.load(id).ok();
-    let credential = tokens.to_stored(kind, existing.as_ref());
-    store.store(id, &credential)?;
-    Ok(credential)
+    llm_gateway::credential::save_login(store, id, kind, tokens)
 }
 
 /// `login` に渡された内容。

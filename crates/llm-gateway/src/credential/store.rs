@@ -167,6 +167,19 @@ impl<P: Persistence> CredentialStore<P> {
         self.inner.acquire(id).await
     }
 
+    /// login で得た token を、現在の内容を土台にして保存する。
+    pub async fn save_login(
+        &self,
+        id: &CredentialId,
+        kind: super::Kind,
+        tokens: &super::oauth::Tokens,
+    ) -> Result<StoredCredential> {
+        let _guard = self.inner.lock(id).await?;
+        let credential = super::save_login(&self.inner.persistence, id, kind, tokens)?;
+        self.inner.remember(id, credential.clone()).await;
+        Ok(credential)
+    }
+
     /// upstream が拒否した beta フラグを覚える (DR-0003)。
     pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
         self.inner.record_denied_beta(id, flags).await

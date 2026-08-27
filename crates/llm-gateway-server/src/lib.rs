@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{ConnectInfo, Form, Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{Instrument as _, error, warn};
 
@@ -47,7 +48,151 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/tap", get(tap))
+        .route("/llm-gateway/login", get(login_index))
+        .route("/llm-gateway/login/{name}/start", get(login_start))
+        .route("/llm-gateway/login/{name}", post(login_finish))
         .with_state(gateway)
+}
+
+fn html_page(title: &str, body: &str) -> Response {
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title><body><main><h1>{}</h1>{}</main></body></html>",
+        html_escape(title),
+        html_escape(title),
+        body
+    );
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn login_index<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
+    let mut rows = String::new();
+    for (name, kind) in gateway.login_credentials() {
+        let escaped = html_escape(&name);
+        if kind == "claude_oauth" {
+            rows.push_str(&format!("<section><h2>{escaped}</h2><p><a href=\"/llm-gateway/login/{escaped}/start\">Start authorization</a></p><form method=\"post\" action=\"/llm-gateway/login/{escaped}\"><label>Authorization code <input name=\"code\" required autocomplete=\"off\"></label><button type=\"submit\">Save login</button></form></section>"));
+        } else if kind == "codex_oauth" {
+            rows.push_str(&format!("<section><h2>{escaped}</h2><p>Run <code>llm-gateway login --type codex_oauth {escaped}</code> locally.</p></section>"));
+        }
+    }
+    html_page("llm-gateway login", &rows)
+}
+
+async fn login_start<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let known = gateway
+        .login_credentials()
+        .iter()
+        .find(|(candidate, _)| candidate == &name)
+        .map(|(_, kind)| *kind);
+    match known {
+        None => html_page(
+            "Credential not found",
+            "<p>No configured credential has that name.</p>",
+        )
+        .map_status(StatusCode::NOT_FOUND),
+        Some(kind) if kind != "claude_oauth" => html_page(
+            "Web login unavailable",
+            "<p>Web login is available only for claude_oauth credentials.</p>",
+        )
+        .map_status(StatusCode::BAD_REQUEST),
+        Some(_) => match gateway.begin_web_login(
+            &name,
+            "claude_oauth",
+            llm_gateway::credential::oauth::begin_web(),
+            now_unix(),
+        ) {
+            Ok(url) => Redirect::temporary(&url).into_response(),
+            Err(error) => login_error(error),
+        },
+    }
+}
+
+trait ResponseStatus {
+    fn map_status(self, status: StatusCode) -> Response;
+}
+impl ResponseStatus for Response {
+    fn map_status(mut self, status: StatusCode) -> Response {
+        *self.status_mut() = status;
+        self
+    }
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    code: String,
+}
+
+fn pasted_code(value: &str) -> Result<(&str, Option<&str>), &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Paste the authorization code shown by Anthropic.");
+    }
+    match value.split_once('#') {
+        Some((code, state)) if code.is_empty() || state.is_empty() => {
+            Err("The authorization code must be code#state, or a code without #.")
+        }
+        Some((code, state)) => Ok((code, Some(state))),
+        None => Ok((value, None)),
+    }
+}
+
+async fn login_finish<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    AxumPath(name): AxumPath<String>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let (code, state) = match pasted_code(&form.code) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_page(
+                "Authorization failed",
+                &format!("<p>{}</p>", html_escape(message)),
+            )
+            .map_status(StatusCode::BAD_REQUEST);
+        }
+    };
+    let auth = match gateway.take_web_login(&name, state, now_unix()) {
+        Ok(auth) => auth,
+        Err(error) => return login_error(error),
+    };
+    match auth.finish(code).await {
+        Ok(tokens) => match gateway
+            .save_web_login(&name, llm_gateway::credential::Kind::Claude, &tokens)
+            .await
+        {
+            Ok(()) => html_page(
+                "Authorization succeeded",
+                &format!(
+                    "<p>Credential <code>{}</code> was updated.</p>",
+                    html_escape(&name)
+                ),
+            ),
+            Err(error) => login_error(error),
+        },
+        Err(error) => login_error(error),
+    }
+}
+
+fn login_error(error: Error) -> Response {
+    html_page(
+        "Authorization failed",
+        &format!(
+            "<p>{}</p><p>Start authorization again and retry.</p>",
+            html_escape(&error.to_string())
+        ),
+    )
+    .map_status(StatusCode::BAD_REQUEST)
 }
 
 /// 生きているかだけを返す。
@@ -2825,6 +2970,56 @@ routes = ["a"]
         assert_eq!(requested_days(Some("days=0")), Ok(0));
         assert!(requested_days(Some("days=-1")).is_err());
         assert!(requested_days(Some("days=")).is_err());
+    }
+
+    /// console の表示値は code#state、生 code の 2 形式を受け、空や欠損片は拒否する。
+    #[test]
+    fn pasted_authorization_code_formats() {
+        assert_eq!(pasted_code(" code#state "), Ok(("code", Some("state"))));
+        assert_eq!(pasted_code("code"), Ok(("code", None)));
+        for value in ["", "   ", "#state", "code#"] {
+            assert!(pasted_code(value).is_err(), "{value:?}");
+        }
+    }
+
+    /// 一覧は Web 対象をフォーム付きで示し、local-only 対象には CLI の実行方法だけを示す。
+    #[tokio::test]
+    async fn login_index_lists_web_and_local_credentials() {
+        let base = crate::tests::serve(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+[credentials.local]
+type = "codex_oauth"
+"#,
+        )
+        .await;
+        let response = reqwest::get(format!("{base}/llm-gateway/login"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("/llm-gateway/login/web/start"), "{body}");
+        assert!(
+            body.contains("llm-gateway login --type codex_oauth local"),
+            "{body}"
+        );
+    }
+
+    /// local-only credential を Web で開始しても認可 URL へ進めず 400 を返す。
+    #[tokio::test]
+    async fn local_only_login_start_is_rejected() {
+        let base = crate::tests::serve(
+            r#"
+[credentials.local]
+type = "codex_oauth"
+"#,
+        )
+        .await;
+        let response = reqwest::get(format!("{base}/llm-gateway/login/local/start"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
     }
 
     /// 大きすぎる日数は上限で抑える。
