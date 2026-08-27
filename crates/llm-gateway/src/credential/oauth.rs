@@ -122,7 +122,7 @@ pub async fn refresh_at(
     if !status.is_success() {
         return Err(Error::Refresh {
             id: id.to_string(),
-            reason: refresh_failure_reason(status.as_u16(), &text),
+            reason: refresh_failure_reason(status.as_u16(), &text, id, kind),
         });
     }
 
@@ -135,17 +135,20 @@ pub async fn refresh_at(
 /// 失敗の理由を、次に何をすればよいか分かる形にする。
 ///
 /// 応答本文をそのまま出すと token が混ざる恐れがあるので、状態から言い換える。
-fn refresh_failure_reason(status: u16, body: &str) -> String {
+fn refresh_failure_reason(status: u16, body: &str, id: &CredentialId, kind: Kind) -> String {
+    // 再ログインで直る失敗には、そのまま実行できる形で手当てを添える。
+    let login = format!("run `llm-gateway login --type {} {id}`", kind.config_type());
     if body.contains("refresh_token_reused") {
-        return "the refresh token has already been used. \
-a refresh may have run twice; you need to log in again"
-            .to_owned();
+        return format!(
+            "the refresh token has already been used. \
+a refresh may have run twice; you need to log in again: {login}"
+        );
     }
     if body.contains("refresh_token_expired") || body.contains("refresh_token_invalidated") {
-        return "the refresh token has expired; you need to log in again".to_owned();
+        return format!("the refresh token has expired; you need to log in again: {login}");
     }
     match status {
-        400 | 401 => "the refresh token was rejected; you need to log in again".to_owned(),
+        400 | 401 => format!("the refresh token was rejected; you need to log in again: {login}"),
         429 => "too many refresh requests; wait and try again".to_owned(),
         500..=599 => {
             format!("the refresh endpoint returned {status}; this may be a transient failure")
@@ -1047,12 +1050,34 @@ mod tests {
         assert!(response.account.is_none());
     }
 
+    fn test_id() -> CredentialId {
+        CredentialId::new("claude-kawazzz")
+    }
+
+    /// 再ログインで直る失敗には、コピペ実行できる login コマンドが付くか。
+    #[test]
+    fn login_command_is_included() {
+        let reason = refresh_failure_reason(401, "", &test_id(), Kind::Claude);
+        assert!(
+            reason.contains("run `llm-gateway login --type claude_oauth claude-kawazzz`"),
+            "{reason}"
+        );
+        let codex =
+            refresh_failure_reason(401, "", &CredentialId::new("chatgpt-kawaz"), Kind::Codex);
+        assert!(
+            codex.contains("run `llm-gateway login --type codex_oauth chatgpt-kawaz`"),
+            "{codex}"
+        );
+    }
+
     /// 二重更新を踏んだと分かる文言になっているか。
     #[test]
     fn reused_token_is_explained() {
         let reason = refresh_failure_reason(
             400,
             r#"{"error":"invalid_grant","error_description":"refresh_token_reused"}"#,
+            &test_id(),
+            Kind::Claude,
         );
         assert!(reason.contains("twice"), "{reason}");
         assert!(reason.contains("log in again"), "{reason}");
@@ -1061,16 +1086,16 @@ mod tests {
     /// 一時障害と恒久失敗を言い分ける (再試行してよいかが変わる)。
     #[test]
     fn distinguishes_transient_from_permanent() {
-        assert!(refresh_failure_reason(503, "").contains("transient"));
-        assert!(refresh_failure_reason(401, "").contains("log in again"));
-        assert!(refresh_failure_reason(429, "").contains("wait"));
+        assert!(refresh_failure_reason(503, "", &test_id(), Kind::Claude).contains("transient"));
+        assert!(refresh_failure_reason(401, "", &test_id(), Kind::Claude).contains("log in again"));
+        assert!(refresh_failure_reason(429, "", &test_id(), Kind::Claude).contains("wait"));
     }
 
     /// 応答本文をそのまま埋め込まない (token が混ざりうるため)。
     #[test]
     fn does_not_echo_response_body() {
         let body = r#"{"error":"invalid_grant","access_token":"leaked-secret-value"}"#;
-        let reason = refresh_failure_reason(400, body);
+        let reason = refresh_failure_reason(400, body, &test_id(), Kind::Claude);
         assert!(!reason.contains("leaked-secret-value"), "{reason}");
     }
 
