@@ -55,8 +55,13 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
 }
 
 fn html_page(title: &str, body: &str) -> Response {
+    // 見た目に凝る場所ではないが、OS がダーク設定なら白背景で眩しくしない。
+    const STYLE: &str = "<style>:root{color-scheme:light dark}\
+body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:40rem;padding:0 1rem;\
+background:Canvas;color:CanvasText}\
+input,button{font:inherit}</style>";
     let html = format!(
-        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title><body><main><h1>{}</h1>{}</main></body></html>",
+        "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">{STYLE}<title>{}</title><body><main><h1>{}</h1>{}</main></body></html>",
         html_escape(title),
         html_escape(title),
         body
