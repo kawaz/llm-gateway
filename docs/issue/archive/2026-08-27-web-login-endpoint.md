@@ -1,6 +1,6 @@
 ---
 title: gateway の HTTP 経由で OAuth login を開始できるエンドポイント
-status: wip
+status: resolved
 category: request
 created: 2026-08-27T15:35:23+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-08-28T00:43:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-08-31T00:58:50+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0023","implemented","done: v0.27.0 で実装・出荷、claude-zunsystem の実機再認証成功 (last_refresh 2026-08-30T15:51:50Z) でリモート完結を確認","done: v0.27.1 でダークテーマ対応追加"]
 blocked_by:
 origin: 自リポ TODO
 ---
