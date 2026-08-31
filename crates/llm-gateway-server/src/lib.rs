@@ -4,11 +4,12 @@
 //! `POST /v1/messages` / `POST /v1/messages/count_tokens` / `GET /v1/models`。
 
 use std::net::SocketAddr;
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Form, Path as AxumPath, Request, State};
+use axum::extract::{ConnectInfo, Form, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -51,6 +52,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
+        .route("/llm-gateway/login/{name}/callback", get(login_callback))
         .with_state(gateway)
 }
 
@@ -83,7 +85,8 @@ async fn login_index<P: Persistence + 'static>(State(gateway): State<Arc<Gateway
     for (name, kind) in gateway.login_credentials() {
         let escaped = html_escape(&name);
         if kind == "claude_oauth" {
-            rows.push_str(&format!("<section><h2>{escaped}</h2><p><a href=\"/llm-gateway/login/{escaped}/start\">Start authorization</a></p><form method=\"post\" action=\"/llm-gateway/login/{escaped}\"><label>Authorization code <input name=\"code\" required autocomplete=\"off\"></label><button type=\"submit\">Save login</button></form></section>"));
+            let path_name = path_segment(&name);
+            rows.push_str(&format!("<section><h2>{escaped}</h2><p><a href=\"/llm-gateway/login/{path_name}/start\">Start (redirect)</a> · <a href=\"/llm-gateway/login/{path_name}/start?mode=paste\">Start (copy-paste)</a></p><form method=\"post\" action=\"/llm-gateway/login/{path_name}\"><label>Authorization code <input name=\"code\" required autocomplete=\"off\"></label><button type=\"submit\">Save login</button></form></section>"));
         } else if kind == "codex_oauth" {
             rows.push_str(&format!("<section><h2>{escaped}</h2><p>Run <code>llm-gateway login --type codex_oauth {escaped}</code> locally.</p></section>"));
         }
@@ -91,9 +94,16 @@ async fn login_index<P: Persistence + 'static>(State(gateway): State<Arc<Gateway
     html_page("llm-gateway login", &rows)
 }
 
+#[derive(Default, Deserialize)]
+struct LoginStartQuery {
+    mode: Option<String>,
+}
+
 async fn login_start<P: Persistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(name): AxumPath<String>,
+    Query(query): Query<LoginStartQuery>,
+    headers: HeaderMap,
 ) -> Response {
     let known = gateway
         .login_credentials()
@@ -111,16 +121,67 @@ async fn login_start<P: Persistence + 'static>(
             "<p>Web login is available only for claude_oauth credentials.</p>",
         )
         .map_status(StatusCode::BAD_REQUEST),
-        Some(_) => match gateway.begin_web_login(
-            &name,
-            "claude_oauth",
-            llm_gateway::credential::oauth::begin_web(),
-            now_unix(),
-        ) {
-            Ok(url) => Redirect::temporary(&url).into_response(),
-            Err(error) => login_error(error),
-        },
+        Some(_) => {
+            let redirect_uri = match query.mode.as_deref() {
+                None => callback_uri(&headers, &name),
+                Some("paste") => {
+                    Ok(llm_gateway::credential::oauth::ANTHROPIC_CONSOLE_REDIRECT_URI.to_owned())
+                }
+                Some(_) => Err("mode must be `paste` when specified"),
+            };
+            let redirect_uri = match redirect_uri {
+                Ok(uri) => uri,
+                Err(message) => {
+                    return html_page(
+                        "Authorization failed",
+                        &format!("<p>{}</p>", html_escape(message)),
+                    )
+                    .map_status(StatusCode::BAD_REQUEST);
+                }
+            };
+            match gateway.begin_web_login(
+                &name,
+                "claude_oauth",
+                llm_gateway::credential::oauth::begin_web(redirect_uri),
+                now_unix(),
+            ) {
+                Ok(url) => Redirect::temporary(&url).into_response(),
+                Err(error) => login_error(error),
+            }
+        }
     }
+}
+
+fn callback_uri(headers: &HeaderMap, name: &str) -> Result<String, &'static str> {
+    let scheme = match headers.get("x-forwarded-proto") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .filter(|value| matches!(*value, "http" | "https"))
+            .ok_or("X-Forwarded-Proto must be exactly `http` or `https`")?,
+        None => "http",
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or("Host header is required")?;
+    axum::http::uri::Authority::from_str(host)
+        .map_err(|_| "Host header is not a valid authority")?;
+
+    let mut url = url::Url::parse(&format!("{scheme}://{host}"))
+        .map_err(|_| "Host header cannot form a callback URL")?;
+    url.path_segments_mut()
+        .map_err(|_| "Host header cannot form a callback URL")?
+        .extend(["llm-gateway", "login", name, "callback"]);
+    Ok(url.into())
+}
+
+fn path_segment(value: &str) -> String {
+    let mut url = url::Url::parse("http://local/").expect("the base URL is constant");
+    url.path_segments_mut()
+        .expect("an HTTP URL accepts path segments")
+        .push(value);
+    url.path().trim_start_matches('/').to_owned()
 }
 
 trait ResponseStatus {
@@ -130,6 +191,84 @@ impl ResponseStatus for Response {
     fn map_status(mut self, status: StatusCode) -> Response {
         *self.status_mut() = status;
         self
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct LoginCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+async fn login_callback<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<LoginCallbackQuery>,
+) -> Response {
+    complete_callback(&gateway, &name, query, None, None).await
+}
+
+async fn complete_callback<P: Persistence + 'static>(
+    gateway: &Gateway<P>,
+    name: &str,
+    query: LoginCallbackQuery,
+    exchange_url: Option<&str>,
+    verify_url: Option<&str>,
+) -> Response {
+    if let Some(error) = query.error {
+        let detail = query.error_description.unwrap_or(error);
+        return html_page(
+            "Authorization failed",
+            &format!("<p>{}</p>", html_escape(&detail)),
+        )
+        .map_status(StatusCode::BAD_REQUEST);
+    }
+    let Some(state) = query.state.as_deref() else {
+        return html_page(
+            "Authorization failed",
+            "<p>The callback state is missing.</p>",
+        )
+        .map_status(StatusCode::BAD_REQUEST);
+    };
+    let Some(code) = query.code.as_deref().filter(|code| !code.is_empty()) else {
+        return html_page(
+            "Authorization failed",
+            "<p>The callback authorization code is missing.</p>",
+        )
+        .map_status(StatusCode::BAD_REQUEST);
+    };
+    let auth = match gateway.take_web_login(name, Some(state), now_unix()) {
+        Ok(auth) => auth,
+        Err(error) => return login_error(error),
+    };
+    finish_web_login(gateway, name, auth, code, exchange_url, verify_url).await
+}
+
+async fn finish_web_login<P: Persistence + 'static>(
+    gateway: &Gateway<P>,
+    name: &str,
+    auth: llm_gateway::credential::oauth::WebAuthorization,
+    code: &str,
+    exchange_url: Option<&str>,
+    verify_url: Option<&str>,
+) -> Response {
+    match auth.finish_at(code, exchange_url, verify_url).await {
+        Ok(tokens) => match gateway
+            .save_web_login(name, llm_gateway::credential::Kind::Claude, &tokens)
+            .await
+        {
+            Ok(()) => html_page(
+                "Authorization succeeded",
+                &format!(
+                    "<p>Credential <code>{}</code> was updated.</p>",
+                    html_escape(name)
+                ),
+            ),
+            Err(error) => login_error(error),
+        },
+        Err(error) => login_error(error),
     }
 }
 
@@ -171,22 +310,7 @@ async fn login_finish<P: Persistence + 'static>(
         Ok(auth) => auth,
         Err(error) => return login_error(error),
     };
-    match auth.finish(code).await {
-        Ok(tokens) => match gateway
-            .save_web_login(&name, llm_gateway::credential::Kind::Claude, &tokens)
-            .await
-        {
-            Ok(()) => html_page(
-                "Authorization succeeded",
-                &format!(
-                    "<p>Credential <code>{}</code> was updated.</p>",
-                    html_escape(&name)
-                ),
-            ),
-            Err(error) => login_error(error),
-        },
-        Err(error) => login_error(error),
-    }
+    finish_web_login(&gateway, &name, auth, code, None, None).await
 }
 
 fn login_error(error: Error) -> Response {
@@ -798,12 +922,11 @@ fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use llm_gateway::Config;
     use llm_gateway::credential::{CredentialId, OauthTokens, Payload, StoredCredential};
     use std::sync::{Mutex, OnceLock};
     use tokio::net::TcpListener;
 
-    struct StaticStore;
+    pub(crate) struct StaticStore;
 
     impl Persistence for StaticStore {
         /// 置き場を共有する相手がいないので、締め出すものが無い。
@@ -1022,9 +1145,9 @@ content-length: {declared}\r\n\r\n{head}"
     }
 
     async fn serve_inner(config_toml: &str, restore_at: Option<i64>) -> String {
-        let config: Config = toml::from_str(config_toml).unwrap();
+        let config: llm_gateway::Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
-        let gateway = Arc::new(Gateway::new(&config, StaticStore).unwrap());
+        let gateway = Arc::new(Gateway::new(&config, crate::tests::StaticStore).unwrap());
         gateway.refresh_models().await;
         if let Some(now) = restore_at {
             gateway.restore(now).await;
@@ -3009,6 +3132,198 @@ type = "codex_oauth"
             body.contains("llm-gateway login --type codex_oauth local"),
             "{body}"
         );
+    }
+
+    async fn response_body(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn web_login_gateway() -> Gateway<crate::tests::StaticStore> {
+        let config: llm_gateway::Config = toml::from_str(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+"#,
+        )
+        .unwrap();
+        Gateway::new(&config, crate::tests::StaticStore).unwrap()
+    }
+
+    fn authorize_redirect_uri(location: &str) -> String {
+        let authorize = url::Url::parse(location).unwrap();
+        authorize
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .expect("the authorize URL carries its callback")
+    }
+
+    /// redirect mode は前段が伝えた HTTPS scheme と Host から callback を作る。
+    /// 認可 URL に載る値を観測し、交換まで保持する session の入口を固定する。
+    #[tokio::test]
+    async fn redirect_login_start_uses_the_front_url() {
+        let base = crate::tests::serve(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+"#,
+        )
+        .await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("{base}/llm-gateway/login/web/start"))
+            .header("host", "gateway.example:8443")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 307);
+        assert_eq!(
+            authorize_redirect_uri(response.headers()[header::LOCATION].to_str().unwrap()),
+            "https://gateway.example:8443/llm-gateway/login/web/callback"
+        );
+    }
+
+    /// paste mode は front URL に関係なく console のコード表示ページを戻り先にする。
+    /// redirect mode が provider に拒否されても、手動経路を独立して使えることを保証する。
+    #[tokio::test]
+    async fn paste_login_start_uses_the_console_callback() {
+        let base = crate::tests::serve(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+"#,
+        )
+        .await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("{base}/llm-gateway/login/web/start?mode=paste"))
+            .header("host", "gateway.example")
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 307);
+        assert_eq!(
+            authorize_redirect_uri(response.headers()[header::LOCATION].to_str().unwrap()),
+            llm_gateway::credential::oauth::ANTHROPIC_CONSOLE_REDIRECT_URI
+        );
+    }
+
+    /// callback は正しい state だけを単回消費し、交換・確認・保存が全部通ってから成功を返す。
+    #[tokio::test]
+    async fn callback_exchanges_verifies_and_saves() {
+        let exchange = fake_upstream(|| {
+            (
+                200,
+                r#"{"access_token":"at","refresh_token":"rt","expires_in":28800}"#.into(),
+                vec![("content-type".into(), "application/json".into())],
+            )
+        })
+        .await;
+        let verify = fake_upstream(|| {
+            (
+                200,
+                r#"{"data":[{"id":"m","created_at":"2026-07-24T00:00:00Z"}]}"#.into(),
+                vec![("content-type".into(), "application/json".into())],
+            )
+        })
+        .await;
+        let gateway = web_login_gateway();
+        let authorization = llm_gateway::credential::oauth::begin_web(
+            "https://gateway.example/llm-gateway/login/web/callback",
+        );
+        let state = authorization.state().to_owned();
+        gateway
+            .begin_web_login("web", "claude_oauth", authorization, now_unix())
+            .unwrap();
+
+        let response = complete_callback(
+            &gateway,
+            "web",
+            LoginCallbackQuery {
+                code: Some("the-code".into()),
+                state: Some(state),
+                ..Default::default()
+            },
+            Some(&exchange),
+            Some(&verify),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        assert!(
+            response_body(response)
+                .await
+                .contains("Authorization succeeded")
+        );
+    }
+
+    /// callback の state 欠落・不一致は交換前に拒否する。CSRF と別 session の横取りを防ぐ境界。
+    #[tokio::test]
+    async fn callback_rejects_missing_and_mismatched_state() {
+        let gateway = web_login_gateway();
+        for state in [None, Some("not-the-session".to_owned())] {
+            let response = complete_callback(
+                &gateway,
+                "web",
+                LoginCallbackQuery {
+                    code: Some("the-code".into()),
+                    state,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), 400);
+        }
+    }
+
+    /// provider が認可を断った場合は token 交換へ進まず、その理由を HTML escape して示す。
+    #[tokio::test]
+    async fn callback_displays_provider_error_safely() {
+        let gateway = web_login_gateway();
+        let response = complete_callback(
+            &gateway,
+            "web",
+            LoginCallbackQuery {
+                error: Some("access_denied".into()),
+                error_description: Some("<script>refused</script>".into()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        let body = response_body(response).await;
+        assert!(
+            body.contains("&lt;script&gt;refused&lt;/script&gt;"),
+            "{body}"
+        );
+        assert!(!body.contains("<script>refused</script>"), "{body}");
+    }
+
+    /// scheme/Host は外部入力なので、許可した scheme と正しい authority だけを URL にする。
+    #[test]
+    fn callback_url_rejects_invalid_front_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "gateway.example".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert!(callback_uri(&headers, "web").is_err());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "bad host".parse().unwrap());
+        assert!(callback_uri(&headers, "web").is_err());
     }
 
     /// local-only credential を Web で開始しても認可 URL へ進めず 400 を返す。

@@ -196,7 +196,7 @@ const OPENAI_USERINFO_URL: &str = "https://auth.openai.com/api/accounts/oauth/us
 ///
 /// 交換先 ([`endpoint_for`]) と違い、認可の入口は provider ごとに要求するものが
 /// 違う (scope の語彙・戻り先・独自パラメータ)。差分をここ 1 箇所に集める。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AuthProfile {
     pub authorize_url: &'static str,
     /// 戻り先のポートとパス。
@@ -206,7 +206,7 @@ pub struct AuthProfile {
     pub redirect_port: u16,
     pub redirect_path: &'static str,
     /// localhost callback を使わないフローの登録済み戻り先。
-    pub redirect_uri_override: Option<&'static str>,
+    pub redirect_uri_override: Option<String>,
     pub scope: &'static str,
     /// provider 固有の追加パラメータ。
     pub extra_params: &'static [(&'static str, &'static str)],
@@ -232,14 +232,12 @@ pub enum ExchangeForm {
 impl AuthProfile {
     /// 認可と交換の両方に送る戻り先。食い違うと交換で弾かれる。
     pub fn redirect_uri(&self) -> String {
-        self.redirect_uri_override
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "http://localhost:{}{}",
-                    self.redirect_port, self.redirect_path
-                )
-            })
+        self.redirect_uri_override.clone().unwrap_or_else(|| {
+            format!(
+                "http://localhost:{}{}",
+                self.redirect_port, self.redirect_path
+            )
+        })
     }
 }
 
@@ -328,9 +326,9 @@ impl WebAuthorization {
 }
 
 /// Anthropic console がコードを表示する Web login を始める。
-pub fn begin_web() -> WebAuthorization {
+pub fn begin_web(redirect_uri: impl Into<String>) -> WebAuthorization {
     let mut profile = auth_profile_for(Kind::Claude);
-    profile.redirect_uri_override = Some(ANTHROPIC_CONSOLE_REDIRECT_URI);
+    profile.redirect_uri_override = Some(redirect_uri.into());
     let verifier = Zeroizing::new(random_token());
     let state = random_token();
     let url = authorize_url(&profile, Kind::Claude, &state, &challenge_of(&verifier));
@@ -1240,7 +1238,7 @@ mod tests {
     /// Web login の認可 URL は console callback を使う。交換も同じ profile を保持する。
     #[test]
     fn web_authorization_uses_the_console_redirect() {
-        let authorization = begin_web();
+        let authorization = begin_web(ANTHROPIC_CONSOLE_REDIRECT_URI);
         let query = query_of(authorization.url());
         assert_eq!(query["redirect_uri"], ANTHROPIC_CONSOLE_REDIRECT_URI);
         assert_eq!(
@@ -1664,7 +1662,7 @@ mod tests {
     #[tokio::test]
     async fn web_login_exchanges_and_verifies_with_the_console_redirect() {
         let upstream = Upstream::healthy().await;
-        let authorization = begin_web();
+        let authorization = begin_web(ANTHROPIC_CONSOLE_REDIRECT_URI);
         let tokens = authorization
             .finish_at(
                 "the-code",

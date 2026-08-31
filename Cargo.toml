@@ -30,6 +30,7 @@ axum = { version = "0.8", default-features = false, features = [
     "http1",
     "json",
     "form",
+    "query",
     "tokio",
 ] }
 # upstream への転送。stream は SSE のバイト列中継に必須。
