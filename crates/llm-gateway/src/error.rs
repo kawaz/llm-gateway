@@ -8,6 +8,12 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailureClass {
+    ReloginRequired,
+    Degraded,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// リクエストされたモデルに対応する経路が設定に無い。
@@ -43,7 +49,11 @@ pub enum Error {
 
     /// token のリフレッシュに失敗した。
     #[error("could not refresh the token for `{id}`: {reason}")]
-    Refresh { id: String, reason: String },
+    Refresh {
+        id: String,
+        reason: String,
+        class: RefreshFailureClass,
+    },
 
     /// 認可 (login) が最後まで進まなかった。
     ///

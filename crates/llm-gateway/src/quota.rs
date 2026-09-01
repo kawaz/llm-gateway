@@ -89,6 +89,9 @@ pub struct Window {
     /// provider によって指すものが違うので、期間そのものを持たせる。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_seconds: Option<u64>,
+    /// report 生成時点で reset を過ぎ、現在値として扱えない観測。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 impl Window {
@@ -371,6 +374,24 @@ pub struct CredentialDenial {
     pub model: Option<String>,
 }
 
+/// refresh の最終結果。永続 token ではなく、実行中 gateway の観測状態。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatus {
+    Ok,
+    ReloginRequired,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthState {
+    pub status: AuthStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub observed_at: i64,
+    pub observed_at_iso: String,
+}
+
 /// credential 1 件分の報告。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialUsage {
@@ -379,6 +400,8 @@ pub struct CredentialUsage {
     #[serde(rename = "type")]
     pub kind: String,
     pub support: Support,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
     /// gateway が現在控えている締め出し。無ければ欄ごと出さない。
@@ -403,6 +426,7 @@ impl CredentialUsage {
             name: name.to_owned(),
             kind: kind.to_owned(),
             support,
+            auth: None,
             snapshot,
             denials: Vec::new(),
             limits: None,
@@ -863,6 +887,50 @@ mod tests {
             "out_of_credits"
         );
         assert_eq!(c["snapshot"]["observed_at"], NOW - 120);
+    }
+
+    /// auth は additive な optional 欄で、観測前は欠け、観測後は状態・理由・時刻を自己完結して運ぶ。
+    #[test]
+    fn auth_state_is_optional_and_serializes_its_observation() {
+        let mut credential = CredentialUsage::new("a", "claude_oauth", Support::Unobserved, None);
+        assert!(
+            serde_json::to_value(&credential)
+                .unwrap()
+                .get("auth")
+                .is_none()
+        );
+        credential.auth = Some(AuthState {
+            status: AuthStatus::ReloginRequired,
+            reason: Some("run `llm-gateway login --type claude_oauth a`".to_owned()),
+            observed_at: NOW,
+            observed_at_iso: format_rfc3339(NOW),
+        });
+        let json = serde_json::to_value(&credential).unwrap();
+        assert_eq!(json["auth"]["status"], "relogin_required");
+        assert_eq!(json["auth"]["observed_at"], NOW);
+        assert!(
+            json["auth"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("llm-gateway login")
+        );
+    }
+
+    /// expired は reset を跨いだ window だけに true として現れ、false は既存 JSON 互換のため省く。
+    #[test]
+    fn window_expired_is_additive() {
+        let current = Window::default();
+        assert!(
+            serde_json::to_value(&current)
+                .unwrap()
+                .get("expired")
+                .is_none()
+        );
+        let expired = Window {
+            expired: true,
+            ..Window::default()
+        };
+        assert_eq!(serde_json::to_value(&expired).unwrap()["expired"], true);
     }
 
     /// 読み書きで欠けない (CLI は書いた形をそのまま読む)。

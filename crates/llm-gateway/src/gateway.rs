@@ -799,7 +799,10 @@ impl<P: Persistence> Gateway<P> {
             // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
             // (DR-0014 §3)。置き場はディスクとの出入りだけを担う。
             let preset = self.router.preset(name);
-            let snapshot = preset.and_then(|preset| preset.quota());
+            let mut snapshot = preset.and_then(|preset| preset.quota());
+            if let Some(snapshot) = snapshot.as_mut() {
+                mark_expired_windows(snapshot, now);
+            }
             let support = preset.map_or(
                 // 経路を組めなかった名前について、こちらから言えることは無い。
                 quota::Support::UpstreamDependent,
@@ -810,6 +813,12 @@ impl<P: Persistence> Gateway<P> {
                 .map_or("none", crate::config::CredentialSpec::type_name);
 
             let mut entry = quota::CredentialUsage::new(name, credential_type, support, snapshot);
+            if let Some(id) = route
+                .credential(&self.config)
+                .and(route.credential.as_ref())
+            {
+                entry.auth = self.credentials.auth_state(&CredentialId::new(id)).await;
+            }
             entry.denials = preset
                 .into_iter()
                 .flat_map(|preset| preset.denials(now))
@@ -1266,6 +1275,15 @@ struct WebLoginSession {
     name: String,
     expires_at: i64,
     auth: WebAuthorization,
+}
+
+fn mark_expired_windows(snapshot: &mut quota::Snapshot, now: i64) {
+    for window in [snapshot.five_hour.as_mut(), snapshot.seven_day.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        window.expired = window.reset.is_some_and(|reset| reset < now);
+    }
 }
 
 #[cfg(test)]
@@ -4021,6 +4039,25 @@ routes = ["route"]
         .unwrap();
         assert_eq!(response.response.status, 529);
         status_arrived.acquire().await.unwrap().forget();
+    }
+
+    /// reset より後に report を作る場合だけ expired。境界時刻そのものはまだ期限切れではない。
+    #[test]
+    fn usage_windows_expire_strictly_after_reset() {
+        let snapshot = |reset| {
+            quota::Snapshot::new(
+                90,
+                Some(quota::Window::default().with_reset(Some(reset))),
+                None,
+                None,
+            )
+            .expect("a reset-bearing window forms a snapshot")
+        };
+        for (reset, expected) in [(101, false), (100, false), (99, true)] {
+            let mut value = snapshot(reset);
+            mark_expired_windows(&mut value, 100);
+            assert_eq!(value.five_hour.unwrap().expired, expected, "reset={reset}");
+        }
     }
 
     fn login_gateway() -> Gateway<StaticStore> {

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::{Zeroize as _, Zeroizing};
 
+use crate::error::RefreshFailureClass;
 use crate::{Error, Result};
 
 use super::stored::{CodexTokens, OauthTokens, Payload};
@@ -111,25 +112,41 @@ pub async fn refresh_at(
         .map_err(|e| Error::Refresh {
             id: id.to_string(),
             reason: format!("cannot connect to {url}: {e}"),
+            class: RefreshFailureClass::Degraded,
         })?;
 
     let status = resp.status();
     let text = resp.text().await.map_err(|e| Error::Refresh {
         id: id.to_string(),
         reason: format!("cannot read response: {e}"),
+        class: RefreshFailureClass::Degraded,
     })?;
 
     if !status.is_success() {
         return Err(Error::Refresh {
             id: id.to_string(),
             reason: refresh_failure_reason(status.as_u16(), &text, id, kind),
+            class: refresh_failure_class(status.as_u16(), &text),
         });
     }
 
     serde_json::from_str(&text).map_err(|e| Error::Refresh {
         id: id.to_string(),
         reason: format!("response format is not what was expected: {e}"),
+        class: RefreshFailureClass::Degraded,
     })
+}
+
+fn refresh_failure_class(status: u16, body: &str) -> RefreshFailureClass {
+    if body.contains("refresh_token_reused")
+        || body.contains("refresh_token_expired")
+        || body.contains("refresh_token_invalidated")
+        || matches!(status, 400 | 401)
+    {
+        RefreshFailureClass::ReloginRequired
+    } else {
+        RefreshFailureClass::Degraded
+    }
 }
 
 /// 失敗の理由を、次に何をすればよいか分かる形にする。
@@ -1155,6 +1172,28 @@ mod tests {
         assert!(refresh_failure_reason(503, "", &test_id(), Kind::Claude).contains("transient"));
         assert!(refresh_failure_reason(401, "", &test_id(), Kind::Claude).contains("log in again"));
         assert!(refresh_failure_reason(429, "", &test_id(), Kind::Claude).contains("wait"));
+    }
+
+    /// token 自体の失効・拒否は人の再認可が必要で、混雑や upstream 障害は再試行可能として分類する。
+    #[test]
+    fn refresh_failures_are_classified_by_recovery_action() {
+        for (status, body) in [
+            (400, r#"{"error_description":"refresh_token_reused"}"#),
+            (401, ""),
+            (400, r#"{"error_description":"refresh_token_expired"}"#),
+            (400, r#"{"error_description":"refresh_token_invalidated"}"#),
+        ] {
+            assert_eq!(
+                refresh_failure_class(status, body),
+                RefreshFailureClass::ReloginRequired
+            );
+        }
+        for status in [429, 500, 503] {
+            assert_eq!(
+                refresh_failure_class(status, ""),
+                RefreshFailureClass::Degraded
+            );
+        }
     }
 
     /// 応答本文をそのまま埋め込まない (token が混ざりうるため)。

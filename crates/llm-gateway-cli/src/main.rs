@@ -651,34 +651,52 @@ fn render(report: &Report) -> String {
         out.push_str(&c.name);
         out.push_str(&" ".repeat(name_width.saturating_sub(width(&c.name)) + 2));
 
-        match &c.snapshot {
-            Some(s) => {
-                out.push_str(&window_field(
-                    '⏰',
-                    s.five_hour.as_ref(),
-                    now,
-                    5 * 3600,
-                    color,
-                ));
-                out.push(' ');
-                out.push_str(&window_field(
-                    '📆',
-                    s.seven_day.as_ref(),
-                    now,
-                    7 * 86_400,
-                    color,
-                ));
-                let age = now - s.observed_at;
-                if age > 300 {
-                    out.push_str(&format!(" ({})", elapsed(age)));
-                }
+        match c.auth.as_ref().map(|auth| &auth.status) {
+            Some(llm_gateway::quota::AuthStatus::ReloginRequired) => {
+                let reason = c
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.reason.as_deref())
+                    .unwrap_or("token rejected; log in again");
+                out.push_str(&format!("token rejected — relogin required: {reason}"));
             }
-            None => out.push_str(match c.support {
-                llm_gateway::quota::Support::Unobserved => "unobserved",
-                llm_gateway::quota::Support::NotApplicable => "not_applicable",
-                llm_gateway::quota::Support::UpstreamDependent => "upstream_dependent",
-                llm_gateway::quota::Support::Observed => "-",
-            }),
+            Some(llm_gateway::quota::AuthStatus::Degraded) => {
+                let reason = c
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.reason.as_deref())
+                    .unwrap_or("refresh failed");
+                out.push_str(&format!("refresh failing (transient): {reason}"));
+            }
+            _ => match &c.snapshot {
+                Some(s) => {
+                    out.push_str(&window_field(
+                        '⏰',
+                        s.five_hour.as_ref(),
+                        now,
+                        5 * 3600,
+                        color,
+                    ));
+                    out.push(' ');
+                    out.push_str(&window_field(
+                        '📆',
+                        s.seven_day.as_ref(),
+                        now,
+                        7 * 86_400,
+                        color,
+                    ));
+                    let age = now - s.observed_at;
+                    if age > 300 {
+                        out.push_str(&format!(" ({})", elapsed(age)));
+                    }
+                }
+                None => out.push_str(match c.support {
+                    llm_gateway::quota::Support::Unobserved => "unobserved",
+                    llm_gateway::quota::Support::NotApplicable => "not_applicable",
+                    llm_gateway::quota::Support::UpstreamDependent => "upstream_dependent",
+                    llm_gateway::quota::Support::Observed => "-",
+                }),
+            },
         }
     }
 
@@ -899,7 +917,12 @@ fn window_field(
     let wide = window_secs >= 86_400;
     let remaining = format_duration(reset - now, wide);
     let info = dual_info(util_pct, elapsed_pct, &remaining, color);
-    format!("{icon}{bar}{info}")
+    let expired = if window.is_some_and(|window| window.expired) {
+        " (expired)"
+    } else {
+        ""
+    };
+    format!("{icon}{bar}{info}{expired}")
 }
 
 /// リセット時刻とウィンドウ長から、窓の経過率 (0〜100) を逆算する。
@@ -1718,6 +1741,7 @@ mod tests {
             reset: Some(reset),
             reset_iso: Some(llm_gateway::credential::time::format_rfc3339(reset)),
             window_seconds: None,
+            expired: false,
         }
     }
 
@@ -1751,6 +1775,63 @@ mod tests {
         assert!(
             !out.contains("ago"),
             "just fetched, so no staleness is shown:\n{out}"
+        );
+    }
+
+    /// 再認可が必要な credential は古い quota bar より auth 異常を優先し、実行可能な login 指示を出す。
+    #[test]
+    fn relogin_required_replaces_the_quota_bars() {
+        let mut credential = observed();
+        credential.auth = Some(llm_gateway::quota::AuthState {
+            status: llm_gateway::quota::AuthStatus::ReloginRequired,
+            reason: Some("run `llm-gateway login --type claude_oauth claude-personal`".to_owned()),
+            observed_at: NOW,
+            observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
+        });
+        let out = render(&report(vec![credential]));
+        assert!(out.contains("token rejected — relogin required"), "{out}");
+        assert!(
+            out.contains("llm-gateway login --type claude_oauth claude-personal"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("71%"),
+            "stale quota must not hide the auth failure: {out}"
+        );
+    }
+
+    /// 一時的な refresh 失敗は再認可を促さず、再試行可能な degraded 状態として区別する。
+    #[test]
+    fn degraded_auth_is_rendered_as_transient() {
+        let mut credential = observed();
+        credential.auth = Some(llm_gateway::quota::AuthState {
+            status: llm_gateway::quota::AuthStatus::Degraded,
+            reason: Some("the refresh endpoint returned 503".to_owned()),
+            observed_at: NOW,
+            observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
+        });
+        let out = render(&report(vec![credential]));
+        assert!(out.contains("refresh failing (transient)"), "{out}");
+        assert!(!out.contains("relogin required"), "{out}");
+    }
+
+    /// reset を跨いだ window は保存済み利用率を表示しても、現在値ではないことを同じ欄で明示する。
+    #[test]
+    fn expired_window_is_marked_next_to_its_percentage() {
+        let mut credential = observed();
+        credential
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .five_hour
+            .as_mut()
+            .unwrap()
+            .expired = true;
+        let out = render(&report(vec![credential]));
+        assert!(out.contains("(expired)"), "{out}");
+        assert!(
+            out.contains("71%"),
+            "the historical observation remains visible: {out}"
         );
     }
 

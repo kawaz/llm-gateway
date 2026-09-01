@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{RwLock, broadcast};
 
+use crate::error::RefreshFailureClass;
 use crate::{Error, Result};
 
 use super::time::{format_rfc3339, parse_rfc3339};
@@ -60,17 +61,29 @@ impl Credential {
 }
 
 /// 更新の結果を待っている側へ配るための合図。
-type RefreshSignal = broadcast::Sender<std::result::Result<(), String>>;
+#[derive(Debug, Clone)]
+struct RefreshFailure {
+    reason: String,
+    class: RefreshFailureClass,
+}
+
+type RefreshSignal = broadcast::Sender<std::result::Result<(), RefreshFailure>>;
 
 /// 待っている側へ配る言葉。
 ///
 /// 更新の失敗は理由だけを渡す。丸ごと渡すと、受け取った側がもう一度
 /// [`Error::Refresh`] に包んで「更新に失敗しました: 更新に失敗しました: …」に
 /// なる。
-fn reason_of(e: &Error) -> String {
+fn refresh_failure_of(e: &Error) -> RefreshFailure {
     match e {
-        Error::Refresh { reason, .. } => reason.clone(),
-        other => other.to_string(),
+        Error::Refresh { reason, class, .. } => RefreshFailure {
+            reason: reason.clone(),
+            class: *class,
+        },
+        other => RefreshFailure {
+            reason: other.to_string(),
+            class: RefreshFailureClass::Degraded,
+        },
     }
 }
 
@@ -113,6 +126,7 @@ struct Inner<P: Persistence> {
     in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
     /// 読み出しのたびにファイルを開かないための控え。
     cache: RwLock<HashMap<CredentialId, Cached>>,
+    auth: RwLock<HashMap<CredentialId, crate::quota::AuthState>>,
     clock: Clock,
     /// 更新先の差し替え口。テストで手元のサーバへ向けるために持つ。
     token_url_override: Option<String>,
@@ -156,6 +170,7 @@ impl<P: Persistence> CredentialStore<P> {
                 http,
                 in_flight: Mutex::new(HashMap::new()),
                 cache: RwLock::new(HashMap::new()),
+                auth: RwLock::new(HashMap::new()),
                 clock,
                 token_url_override,
             }),
@@ -191,6 +206,9 @@ impl<P: Persistence> CredentialStore<P> {
     /// 版を持たない置き場では常に `None` なので、変わっていない扱いになる。
     pub fn version(&self, id: &CredentialId) -> Option<u64> {
         self.inner.persistence.version(id)
+    }
+    pub async fn auth_state(&self, id: &CredentialId) -> Option<crate::quota::AuthState> {
+        self.inner.auth.read().await.get(id).cloned()
     }
 }
 
@@ -347,7 +365,8 @@ impl<P: Persistence> Inner<P> {
                         // いる側が来ない合図を待ち続ける。
                         let mut handoff = RefreshHandoff::new(Arc::clone(&me), owned.clone(), tx);
                         let outcome = me.do_refresh(&owned).await;
-                        handoff.finish(outcome.as_ref().map(|_| ()).map_err(reason_of));
+                        me.record_auth(&owned, &outcome).await;
+                        handoff.finish(outcome.as_ref().map(|_| ()).map_err(refresh_failure_of));
                     });
                     rx
                 }
@@ -356,16 +375,44 @@ impl<P: Persistence> Inner<P> {
 
         match result.recv().await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => Err(Error::Refresh {
+            Ok(Err(failure)) => Err(Error::Refresh {
                 id: id.to_string(),
-                reason,
+                reason: failure.reason,
+                class: failure.class,
             }),
             // 結果が配られる前に消えた = 更新できたか分からない。
             Err(_) => Err(Error::Refresh {
                 id: id.to_string(),
                 reason: "did not receive the refresh result".to_owned(),
+                class: RefreshFailureClass::Degraded,
             }),
         }
+    }
+
+    async fn record_auth(&self, id: &CredentialId, outcome: &Result<()>) {
+        let observed_at = self.clock.now_unix();
+        let (status, reason) = match outcome {
+            Ok(()) => (crate::quota::AuthStatus::Ok, None),
+            Err(error) => {
+                let failure = refresh_failure_of(error);
+                let status = match failure.class {
+                    RefreshFailureClass::ReloginRequired => {
+                        crate::quota::AuthStatus::ReloginRequired
+                    }
+                    RefreshFailureClass::Degraded => crate::quota::AuthStatus::Degraded,
+                };
+                (status, Some(failure.reason))
+            }
+        };
+        self.auth.write().await.insert(
+            id.clone(),
+            crate::quota::AuthState {
+                status,
+                reason,
+                observed_at,
+                observed_at_iso: format_rfc3339(observed_at),
+            },
+        );
     }
 
     /// 実際の更新。保存まで済ませる。
@@ -390,6 +437,7 @@ impl<P: Persistence> Inner<P> {
                 reason: "cannot refresh a non-OAuth credential. \
 Issue a new key and save the credential again"
                     .to_owned(),
+                class: RefreshFailureClass::Degraded,
             });
         };
 
@@ -484,7 +532,7 @@ struct RefreshHandoff<P: Persistence> {
     id: CredentialId,
     tx: RefreshSignal,
     /// 走り切った結果。無いまま落ちたら、途中で途切れたということ。
-    outcome: Option<std::result::Result<(), String>>,
+    outcome: Option<std::result::Result<(), RefreshFailure>>,
 }
 
 impl<P: Persistence> RefreshHandoff<P> {
@@ -498,7 +546,7 @@ impl<P: Persistence> RefreshHandoff<P> {
     }
 
     /// 走り切った結果を預ける。配るのは落ちるとき。
-    fn finish(&mut self, outcome: std::result::Result<(), String>) {
+    fn finish(&mut self, outcome: std::result::Result<(), RefreshFailure>) {
         self.outcome = Some(outcome);
     }
 }
@@ -511,10 +559,12 @@ impl<P: Persistence> Drop for RefreshHandoff<P> {
 
         // 途切れた理由は追わない。待っている側にできるのは「もう一度頼む」
         // だけなので、panic の中身を運んでも打つ手は変わらない。
-        let outcome = self
-            .outcome
-            .take()
-            .unwrap_or_else(|| Err("the refresh task ended unexpectedly".to_owned()));
+        let outcome = self.outcome.take().unwrap_or_else(|| {
+            Err(RefreshFailure {
+                reason: "the refresh task ended unexpectedly".to_owned(),
+                class: RefreshFailureClass::Degraded,
+            })
+        });
         let _ = self.tx.send(outcome);
     }
 }
@@ -1469,6 +1519,48 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert!(err.contains("log in again"), "{err}");
         assert!(store.inner.in_flight().is_empty());
+    }
+
+    /// refresh の最終結果は失敗分類と時刻を記録し、次の成功で ok に遷移して理由を消す。
+    #[tokio::test]
+    async fn auth_state_moves_from_relogin_required_to_ok() {
+        let store = store_sharing(Spy::new(cred(&at(3600))));
+        let id = CredentialId::new("c");
+        let rejected = Err(Error::Refresh {
+            id: id.to_string(),
+            reason: "token rejected; run `llm-gateway login --type claude_oauth c`".to_owned(),
+            class: RefreshFailureClass::ReloginRequired,
+        });
+        store.inner.record_auth(&id, &rejected).await;
+        let failed = store.auth_state(&id).await.unwrap();
+        assert_eq!(failed.status, crate::quota::AuthStatus::ReloginRequired);
+        assert!(failed.reason.unwrap().contains("llm-gateway login"));
+        assert_eq!(failed.observed_at, NOW);
+
+        store.inner.record_auth(&id, &Ok(())).await;
+        let recovered = store.auth_state(&id).await.unwrap();
+        assert_eq!(recovered.status, crate::quota::AuthStatus::Ok);
+        assert!(
+            recovered.reason.is_none(),
+            "a successful refresh clears the failure reason"
+        );
+        assert_eq!(recovered.observed_at, NOW);
+    }
+
+    /// 一時的な失敗は再認可要求に昇格せず degraded として記録する。
+    #[tokio::test]
+    async fn transient_refresh_failure_records_degraded_auth() {
+        let store = store_sharing(Spy::new(cred(&at(3600))));
+        let id = CredentialId::new("c");
+        let transient = Err(Error::Refresh {
+            id: id.to_string(),
+            reason: "the refresh endpoint returned 503; this may be a transient failure".to_owned(),
+            class: RefreshFailureClass::Degraded,
+        });
+        store.inner.record_auth(&id, &transient).await;
+        let auth = store.auth_state(&id).await.unwrap();
+        assert_eq!(auth.status, crate::quota::AuthStatus::Degraded);
+        assert!(auth.reason.unwrap().contains("503"));
     }
 
     /// 拒否された beta を覚えるときも、控えではなく置き場から積み直す。
