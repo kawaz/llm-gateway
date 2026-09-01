@@ -42,6 +42,7 @@ device profile) を行い、それが実障害の原因になった。Anthropic 
 
 ## ドキュメント
 
+- [docs/MANUAL-ja.md](./docs/MANUAL-ja.md) — HTTP API / CLI リファレンス
 - [docs/decisions/INDEX.md](./docs/decisions/INDEX.md) — 判断記録 (DR)
 - [docs/QUESTIONS.md](./docs/QUESTIONS.md) — 裁定・確認待ち
 
