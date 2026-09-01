@@ -38,7 +38,7 @@ device profile) を行い、それが実障害の原因になった。Anthropic 
 
 ## ステータス
 
-**設計段階。実装はこれから。**
+**稼働中。** 転送 (claude / codex / Bedrock)・運用観測 (usage / stats / status / tap)・Web 再認証まで実装済み (詳細は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md))。
 
 ## ドキュメント
 
