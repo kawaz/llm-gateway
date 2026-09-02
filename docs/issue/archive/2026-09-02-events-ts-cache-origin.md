@@ -1,6 +1,6 @@
 ---
 title: events の ts を upstream 送出開始時刻に寄せる + probe max_tokens=0 化
-status: open
+status: resolved
 category: bug
 created: 2026-09-02T13:37:08+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-02T14:04:52+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:v0.29.1 で実装・出荷 (events ts を upstream 送出開始時刻へ、probe max_tokens:0 化)","done:実機で usage?refresh=true の snapshot 更新を確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
