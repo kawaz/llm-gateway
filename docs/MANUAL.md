@@ -139,6 +139,13 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
       "name": "personal",
       "type": "claude_oauth",
       "support": "observed",
+      "auth": {
+        "status": "relogin_required",
+        "reason": "log in again",
+        "login_path": "/llm-gateway/login/personal/start",
+        "observed_at": 1785326390,
+        "observed_at_iso": "2026-07-29T11:59:50Z"
+      },
       "snapshot": {
         "observed_at": 1785326390,
         "observed_at_iso": "2026-07-29T11:59:50Z",
@@ -153,7 +160,9 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 `denials` holds the denials the gateway is currently honoring, with their reason and
 scope (DR-0020). `limits` holds quotas asked for through the quota API, kept separate
 from the header-derived `snapshot` (the two do not necessarily describe the same
-quota). Fields with nothing to report are omitted entirely.
+quota). Fields with nothing to report are omitted entirely. When `auth.status` is
+`relogin_required` for a `claude_oauth` credential, `auth.login_path` gives the relative
+Web login page.
 
 ### `GET /llm-gateway/status`
 

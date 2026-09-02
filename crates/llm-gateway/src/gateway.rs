@@ -809,16 +809,18 @@ impl<P: Persistence> Gateway<P> {
                 quota::Support::UpstreamDependent,
                 |preset| preset.quota_support(),
             );
-            let credential_type = route
-                .credential(&self.config)
-                .map_or("none", crate::config::CredentialSpec::type_name);
+            let credential = route.credential(&self.config);
+            let credential_type =
+                credential.map_or("none", crate::config::CredentialSpec::type_name);
 
             let mut entry = quota::CredentialUsage::new(name, credential_type, support, snapshot);
-            if let Some(id) = route
-                .credential(&self.config)
-                .and(route.credential.as_ref())
-            {
+            if let Some(id) = credential.and(route.credential.as_ref()) {
                 entry.auth = self.credentials.auth_state(&CredentialId::new(id)).await;
+                add_login_path(
+                    &mut entry.auth,
+                    credential.is_some_and(crate::config::CredentialSpec::supports_web_login),
+                    id,
+                );
             }
             entry.denials = preset
                 .into_iter()
@@ -1276,6 +1278,20 @@ struct WebLoginSession {
     name: String,
     expires_at: i64,
     auth: WebAuthorization,
+}
+
+fn add_login_path(auth: &mut Option<quota::AuthState>, supports_web_login: bool, id: &str) {
+    let Some(auth) = auth else { return };
+    if auth.status != quota::AuthStatus::ReloginRequired || !supports_web_login {
+        return;
+    }
+    let mut url =
+        url::Url::parse("http://local/llm-gateway/login").expect("the login URL base is constant");
+    url.path_segments_mut()
+        .expect("an HTTP URL accepts path segments")
+        .push(id)
+        .push("start");
+    auth.login_path = Some(url.path().to_owned());
 }
 
 fn mark_expired_windows(snapshot: &mut quota::Snapshot, now: i64) {
@@ -4099,6 +4115,35 @@ routes = ["route"]
             mark_expired_windows(&mut value, 100);
             assert_eq!(value.five_hour.unwrap().expired, expected, "reset={reset}");
         }
+    }
+
+    /// Web 再認可が必要な Claude credential だけに、credential ID を安全な path segment として案内する。
+    #[test]
+    fn login_path_is_only_added_for_relogin_required_claude_credentials() {
+        let auth = |status| {
+            Some(crate::quota::AuthState {
+                status,
+                reason: None,
+                login_path: None,
+                observed_at: 100,
+                observed_at_iso: "1970-01-01T00:01:40Z".to_owned(),
+            })
+        };
+
+        let mut relogin = auth(crate::quota::AuthStatus::ReloginRequired);
+        add_login_path(&mut relogin, true, "name/with space");
+        assert_eq!(
+            relogin.unwrap().login_path.as_deref(),
+            Some("/llm-gateway/login/name%2Fwith%20space/start")
+        );
+
+        let mut ok = auth(crate::quota::AuthStatus::Ok);
+        add_login_path(&mut ok, true, "web");
+        assert_eq!(ok.unwrap().login_path, None);
+
+        let mut codex = auth(crate::quota::AuthStatus::ReloginRequired);
+        add_login_path(&mut codex, false, "local");
+        assert_eq!(codex.unwrap().login_path, None);
     }
 
     fn login_gateway() -> Gateway<StaticStore> {

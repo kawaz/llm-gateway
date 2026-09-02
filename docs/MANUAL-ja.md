@@ -138,6 +138,13 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
       "name": "personal",
       "type": "claude_oauth",
       "support": "observed",
+      "auth": {
+        "status": "relogin_required",
+        "reason": "log in again",
+        "login_path": "/llm-gateway/login/personal/start",
+        "observed_at": 1785326390,
+        "observed_at_iso": "2026-07-29T11:59:50Z"
+      },
       "snapshot": {
         "observed_at": 1785326390,
         "observed_at_iso": "2026-07-29T11:59:50Z",
@@ -151,7 +158,9 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 
 `denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。
 `limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として
-持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。
+持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`claude_oauth` の
+`auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの
+相対パスが入る。
 
 ### `GET /llm-gateway/status`
 

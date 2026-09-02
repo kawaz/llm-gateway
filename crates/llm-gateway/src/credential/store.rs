@@ -412,6 +412,7 @@ impl<P: Persistence> Inner<P> {
             crate::quota::AuthState {
                 status,
                 reason,
+                login_path: None,
                 observed_at,
                 observed_at_iso: format_rfc3339(observed_at),
             },

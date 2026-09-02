@@ -714,6 +714,11 @@ impl CredentialSpec {
             Self::BedrockApiKey => "bedrock_api_key",
         }
     }
+
+    /// gateway の HTTP ページだけで再認可を完結できる種別か。
+    pub fn supports_web_login(&self) -> bool {
+        matches!(self, Self::ClaudeOauth)
+    }
 }
 
 /// upstream service status の設定。

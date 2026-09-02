@@ -1785,6 +1785,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth claude-personal`".to_owned()),
+            login_path: None,
             observed_at: NOW,
             observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
         });
@@ -1807,6 +1808,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::Degraded,
             reason: Some("the refresh endpoint returned 503".to_owned()),
+            login_path: None,
             observed_at: NOW,
             observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
         });

@@ -388,6 +388,8 @@ pub struct AuthState {
     pub status: AuthStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_path: Option<String>,
     pub observed_at: i64,
     pub observed_at_iso: String,
 }
@@ -902,6 +904,7 @@ mod tests {
         credential.auth = Some(AuthState {
             status: AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth a`".to_owned()),
+            login_path: None,
             observed_at: NOW,
             observed_at_iso: format_rfc3339(NOW),
         });
