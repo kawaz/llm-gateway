@@ -86,6 +86,22 @@ static TABLE: &[Row] = &[
     // --- Anthropic (2026-07-31 確認 / claude-api skill の Current Models 表)
     //     cache write = input x1.25 (5m TTL), cache read = input x0.1。
     //     input はキャッシュ分を含まないので、4 区分は重ならない。
+    // Fable 5.1 / Mythos 5.1 は cache read だけ 0.025 倍 ($0.25/MTok)。
+    // 5 系の glob より前に置いて先に当てる (2026-09-02 確認 / prompt-caching doc)。
+    row(
+        &[
+            "claude-fable-5-1",
+            "claude-fable-5-1-*",
+            "claude-mythos-5-1",
+            "claude-mythos-5-1-*",
+        ],
+        &[
+            (INPUT, 10.0),
+            (OUTPUT, 50.0),
+            (CACHE_WRITE, 12.5),
+            (CACHE_READ, 0.25),
+        ],
+    ),
     row(
         &["claude-fable-5", "claude-fable-5-*"],
         &[
@@ -240,6 +256,16 @@ mod tests {
     fn a_plain_name_matches() {
         assert_eq!(rate("claude-opus-5", &TokenKind::input()), Some(5.0));
         assert_eq!(rate("claude-fable-5", &TokenKind::output()), Some(50.0));
+        // 5.1 は cache read だけ安い。5 系の glob に飲まれない。
+        assert_eq!(
+            rate("claude-fable-5-1", &TokenKind::input_cache_read()),
+            Some(0.25)
+        );
+        assert_eq!(
+            rate("claude-fable-5", &TokenKind::input_cache_read()),
+            Some(1.0)
+        );
+        assert_eq!(rate("claude-fable-5-1", &TokenKind::output()), Some(50.0));
         assert_eq!(rate("gpt-5.6-luna", &TokenKind::output()), Some(1.2));
     }
 
