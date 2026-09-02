@@ -32,8 +32,7 @@ const EXHAUSTED: f64 = 100.0;
 /// 枠ヘッダを引き出すために投げるモデル。
 ///
 /// ヘッダを得るには実リクエストが要る (副作用ゼロで枠だけ返す口は見つかって
-/// いない、DR-0007)。一番小さいモデルに `max_tokens = 1` で投げて、消費を
-/// 最小にする。
+/// いない、DR-0007)。一番小さいモデルへ出力なしで投げて、消費を最小にする。
 const PROBE_MODEL: &str = "claude-haiku-4-5-20251001";
 
 /// `/api/oauth/usage` で枠を聞く。
@@ -98,8 +97,8 @@ impl QuotaApi for OauthUsage {
 
     /// 枠ヘッダを引き出すための最小の 1 本。
     ///
-    /// 一番小さいモデルに 1 トークンだけ頼む。本文は捨てて構わないので、
-    /// 中身は最短で通る形にする。OAuth の beta フラグを載せるのは、
+    /// 一番小さいモデルへ出力なしで頼む。本文は捨てて構わないので、中身は
+    /// 最短で通る形にする。OAuth の beta フラグを載せるのは、
     /// 載せないとサブスクの認証が通らないため。
     fn probe_request(&self) -> Option<ProbeRequest> {
         Some(ProbeRequest {
@@ -109,7 +108,7 @@ impl QuotaApi for OauthUsage {
                 query: None,
                 body: serde_json::json!({
                     "model": PROBE_MODEL,
-                    "max_tokens": 1,
+                    "max_tokens": 0,
                     "messages": [{"role": "user", "content": "."}],
                 }),
                 headers: Headers::new(vec![
@@ -312,7 +311,7 @@ mod tests {
 
     // ---------- 枠ヘッダを引き出す 1 本 ----------
 
-    /// 投げるのは一番小さいモデルに 1 トークンだけ。
+    /// 投げるのは一番小さいモデルへの出力なしのリクエスト。
     ///
     /// 枠を見るために枠を減らすので、消費は最小にする (DR-0007)。
     #[test]
@@ -325,7 +324,13 @@ mod tests {
             probe.request.body["model"], HAIKU,
             "same name in the body too"
         );
-        assert_eq!(probe.request.body["max_tokens"], 1);
+        assert_eq!(probe.request.body["max_tokens"], 0);
+        for incompatible in ["stream", "thinking", "output_config", "tool_choice"] {
+            assert!(
+                probe.request.body.get(incompatible).is_none(),
+                "max_tokens zero excludes {incompatible}"
+            );
+        }
         assert_eq!(
             probe.request.headers.get("anthropic-beta"),
             Some("oauth-2025-04-20"),
