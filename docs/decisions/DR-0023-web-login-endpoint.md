@@ -23,12 +23,13 @@ redirect_uri を `https://console.anthropic.com/oauth/code/callback` にする�
 
 ### エンドポイント
 
-- `GET /llm-gateway/login` — config の claude_oauth credential を列挙する HTML。
-  各行に開始リンクと、コード貼り付けフォーム
+- `GET /llm-gateway/login` — config の credential を列挙する HTML。claude_oauth は
+  credential 専用ページへのログインリンク、codex_oauth は CLI の案内を表示
 - `GET /llm-gateway/login/{name}/start` — state/verifier を生成してメモリに保持
-  (TTL 10 分、単回使用) し、authorize URL へ 302
+  (TTL 10 分、単回使用) し、credential 名、別タブで開く authorize URL、手順、
+  コード貼り付けフォームを含む HTML を返す
 - `POST /llm-gateway/login/{name}` — 貼り付けられた `code#state` を受け、state で
-  セッションを引き当て、code 交換 → verify → 保存。結果を HTML で返す
+  セッションを引き当て、code 交換 → verify → 保存。credential 名を含む結果 HTML を返す
 
 ### 保存
 
@@ -51,16 +52,14 @@ credential を書き換える口だが、書けるのは「正規の認可を通
 
 ## リスク
 
-- **console callback の受理は未検証** (authorize が この client_id +
-  `https://console.anthropic.com/oauth/code/callback` を受けるか、コード表示形式が
-  `code#state` か)。Claude Code 本体が同 client_id で使うフローなので受理見込みは
-  高いが、初回の実機ログイン (claude-kawazzz の再認証) で確定させる。弾かれたら
-  本 DR を Superseded にして撤退判断に戻る
+- redirect_uri は client_id に登録済みの値に限定される。gateway 自身の URL では
+  `Redirect URI https://…/llm-gateway/login/claude-kawazzz/callback is not supported by client.`
+  と認可画面で拒否される。Web login は登録済みの Anthropic console redirect_uri に固定する
 - 交換時の redirect_uri は認可時と一致が必須。web フローは AuthProfile の
   redirect_uri を console 変種に差し替えて交換まで通す
 
 ## 不採用案
 
 - **gateway 自身の URL を redirect_uri にする**: client_id に未登録の値は認可時点で
-  弾かれる。自前 client_id の登録手段が無い
+  弾かれる。実機でも `is not supported by client` と拒否され、自前 client_id の登録手段が無い
 - **CLI を SSH で叩く運用のみ**: PC が手元に無い場面 (スマホ + tailnet) を救えない

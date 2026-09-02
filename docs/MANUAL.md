@@ -307,7 +307,8 @@ values. Interception is prevented by state (CSRF) + PKCE + single-use TTL (10 mi
 ### `GET /llm-gateway/login`
 
 An HTML page listing the credentials in the configuration. Each `claude_oauth` row
-carries two start links and a code-paste form.
+has only a "Log in" link to its credential-specific page. Each `codex_oauth` row
+shows the CLI command to run.
 
 ```bash
 open http://127.0.0.1:8402/llm-gateway/login
@@ -315,28 +316,13 @@ open http://127.0.0.1:8402/llm-gateway/login
 
 ### `GET /llm-gateway/login/{name}/start`
 
-Creates a state and a PKCE verifier, holds them in memory, and issues a 302 to the
-Anthropic authorization URL.
+Creates a state and a PKCE verifier, holds them in memory, and returns an HTML page for
+that credential. The page shows the credential name, an Anthropic authorization link
+that opens in a new tab, short instructions, and the code-paste form. After approval,
+copy the `code#state` shown by the Anthropic console, return to the original page, paste
+it, and save.
 
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `mode` | absent | `paste` makes the code display on screen after authorization |
-
-Without `mode`, the redirect_uri is built from the request's `Host` (and
-`X-Forwarded-Proto`) as this gateway's own `/llm-gateway/login/{name}/callback`.
-With `mode=paste`, the Anthropic console redirect_uri is used and you paste the
-`code#state` shown after authorization — since the callback goes nowhere, the whole
-flow completes in a remote browser.
-
-Any `mode` other than `paste` returns 400. An unconfigured name returns 404, and a
-credential that is not `claude_oauth` returns 400. A missing `Host` header, or one
-that is not a valid authority, also returns 400.
-
-### `GET /llm-gateway/login/{name}/callback`
-
-The landing point for the redirect flow. It takes `code` and `state`, looks up the
-session by state, then exchanges, verifies, and saves — returning the outcome as
-HTML. If the authorization side returned an `error`, that text is shown with a 400.
+An unconfigured name returns 404, and a credential that is not `claude_oauth` returns 400.
 
 ### `POST /llm-gateway/login/{name}`
 

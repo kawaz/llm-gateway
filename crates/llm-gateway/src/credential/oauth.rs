@@ -343,9 +343,9 @@ impl WebAuthorization {
 }
 
 /// Anthropic console がコードを表示する Web login を始める。
-pub fn begin_web(redirect_uri: impl Into<String>) -> WebAuthorization {
+pub fn begin_web() -> WebAuthorization {
     let mut profile = auth_profile_for(Kind::Claude);
-    profile.redirect_uri_override = Some(redirect_uri.into());
+    profile.redirect_uri_override = Some(ANTHROPIC_CONSOLE_REDIRECT_URI.to_owned());
     let verifier = Zeroizing::new(random_token());
     let state = random_token();
     let url = authorize_url(&profile, Kind::Claude, &state, &challenge_of(&verifier));
@@ -1277,7 +1277,7 @@ mod tests {
     /// Web login の認可 URL は console callback を使う。交換も同じ profile を保持する。
     #[test]
     fn web_authorization_uses_the_console_redirect() {
-        let authorization = begin_web(ANTHROPIC_CONSOLE_REDIRECT_URI);
+        let authorization = begin_web();
         let query = query_of(authorization.url());
         assert_eq!(query["redirect_uri"], ANTHROPIC_CONSOLE_REDIRECT_URI);
         assert_eq!(
@@ -1701,7 +1701,7 @@ mod tests {
     #[tokio::test]
     async fn web_login_exchanges_and_verifies_with_the_console_redirect() {
         let upstream = Upstream::healthy().await;
-        let authorization = begin_web(ANTHROPIC_CONSOLE_REDIRECT_URI);
+        let authorization = begin_web();
         let tokens = authorization
             .finish_at(
                 "the-code",

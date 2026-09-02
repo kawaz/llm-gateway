@@ -301,7 +301,8 @@ refresh token が失効したときに、ブラウザから OAuth をやり直�
 ### `GET /llm-gateway/login`
 
 設定に書かれた credential を列挙する HTML ページ。`claude_oauth` の行には
-開始リンク 2 種とコード貼り付けフォームが並ぶ。
+credential 専用ページへの「Log in」リンクだけを表示する。`codex_oauth` の行には
+CLI の実行方法を表示する。
 
 ```bash
 open http://127.0.0.1:8402/llm-gateway/login
@@ -309,27 +310,12 @@ open http://127.0.0.1:8402/llm-gateway/login
 
 ### `GET /llm-gateway/login/{name}/start`
 
-state と PKCE verifier を作ってメモリに保持し、Anthropic の認可 URL へ 302 で
-飛ばす。
+state と PKCE verifier を作ってメモリに保持し、credential 専用の HTML ページを返す。
+ページには credential 名、別タブで開く Anthropic の認可リンク、短い手順、コード
+貼り付けフォームがある。認可後に Anthropic console が表示する `code#state` をコピーし、
+元のページへ戻って貼り付けて保存する。
 
-| パラメータ | 既定 | 意味 |
-| --- | --- | --- |
-| `mode` | なし | `paste` のとき、認可後にコードを画面表示させる |
-
-`mode` 無しでは、リクエストの `Host` (と `X-Forwarded-Proto`) からこの gateway 自身の
-`/llm-gateway/login/{name}/callback` を組み立てて redirect_uri にする。
-`mode=paste` では Anthropic console の redirect_uri を使い、認可後に表示された
-`code#state` を利用者が貼り付ける — callback がどこにも飛ばないので、リモートの
-ブラウザだけで完結する。
-
-`mode` に `paste` 以外を渡すと 400。設定に無い名前は 404、`claude_oauth` 以外の
-credential は 400 を返す。`Host` ヘッダが無い / authority として不正な場合も 400。
-
-### `GET /llm-gateway/login/{name}/callback`
-
-リダイレクト方式の着地点。`code` と `state` を受け取り、state でセッションを
-引き当ててコード交換 → 検証 → 保存まで行い、結果を HTML で返す。認可側が
-`error` を返した場合はその内容を表示して 400。
+設定に無い名前は 404、`claude_oauth` 以外の credential は 400 を返す。
 
 ### `POST /llm-gateway/login/{name}`
 

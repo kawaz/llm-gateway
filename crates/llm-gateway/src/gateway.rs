@@ -4118,7 +4118,7 @@ type = "codex_oauth"
     #[test]
     fn web_login_state_is_bound_and_single_use() {
         let gateway = login_gateway();
-        let authorization = oauth::begin_web(oauth::ANTHROPIC_CONSOLE_REDIRECT_URI);
+        let authorization = oauth::begin_web();
         let state = authorization.state().to_owned();
         gateway
             .begin_web_login("web", "claude_oauth", authorization, 100)
@@ -4134,7 +4134,7 @@ type = "codex_oauth"
     #[test]
     fn web_login_expires_after_ten_minutes() {
         let gateway = login_gateway();
-        let authorization = oauth::begin_web(oauth::ANTHROPIC_CONSOLE_REDIRECT_URI);
+        let authorization = oauth::begin_web();
         let state = authorization.state().to_owned();
         gateway
             .begin_web_login("web", "claude_oauth", authorization, 100)
@@ -4147,12 +4147,7 @@ type = "codex_oauth"
     fn raw_code_uses_the_current_session_for_the_credential() {
         let gateway = login_gateway();
         gateway
-            .begin_web_login(
-                "web",
-                "claude_oauth",
-                oauth::begin_web(oauth::ANTHROPIC_CONSOLE_REDIRECT_URI),
-                100,
-            )
+            .begin_web_login("web", "claude_oauth", oauth::begin_web(), 100)
             .unwrap();
         assert!(gateway.take_web_login("web", None, 101).is_ok());
     }
