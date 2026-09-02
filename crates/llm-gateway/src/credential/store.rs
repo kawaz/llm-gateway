@@ -192,6 +192,7 @@ impl<P: Persistence> CredentialStore<P> {
         let _guard = self.inner.lock(id).await?;
         let credential = super::save_login(&self.inner.persistence, id, kind, tokens)?;
         self.inner.remember(id, credential.clone()).await;
+        self.inner.record_auth(id, &Ok(())).await;
         Ok(credential)
     }
 
@@ -270,10 +271,12 @@ impl<P: Persistence> Inner<P> {
 
     /// 現在の内容を返す。控えが今の版のままならそれを使う。
     async fn read(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
-        if let Some(hit) = self.cache.read().await.get(id)
-            && hit.version == self.persistence.version(id)
-        {
-            return Ok(Arc::clone(&hit.value));
+        let version = self.persistence.version(id);
+        if let Some(hit) = self.cache.read().await.get(id) {
+            if hit.version == version {
+                return Ok(Arc::clone(&hit.value));
+            }
+            self.auth.write().await.remove(id);
         }
         self.reload(id).await
     }
@@ -1171,6 +1174,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let elsewhere = FileStore::open(dir.path()).unwrap();
 
         assert_eq!(mine.acquire(&id).await.unwrap().bearer(), "Bearer at-1");
+        mine.inner.record_auth(&id, &Ok(())).await;
+        assert!(mine.auth_state(&id).await.is_some());
 
         // 期限はまだ先のまま。控えの期限切れでは気づけない書き換え。
         elsewhere
@@ -1180,6 +1185,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(
             mine.acquire(&id).await.unwrap().bearer(),
             "Bearer at-elsewhere"
+        );
+        assert_eq!(
+            mine.auth_state(&id).await,
+            None,
+            "an external version invalidates this process's auth observation"
         );
     }
 
@@ -1537,7 +1547,18 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert!(failed.reason.unwrap().contains("llm-gateway login"));
         assert_eq!(failed.observed_at, NOW);
 
-        store.inner.record_auth(&id, &Ok(())).await;
+        let tokens = oauth::Tokens {
+            access_token: "at-login".into(),
+            refresh_token: "rt-login".into(),
+            id_token: None,
+            expires_in: 3600,
+            email: Some("someone@example.com".into()),
+            account_id: None,
+        };
+        store
+            .save_login(&id, super::super::Kind::Claude, &tokens)
+            .await
+            .unwrap();
         let recovered = store.auth_state(&id).await.unwrap();
         assert_eq!(recovered.status, crate::quota::AuthStatus::Ok);
         assert!(
