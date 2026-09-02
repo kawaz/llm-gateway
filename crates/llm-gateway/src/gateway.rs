@@ -725,6 +725,7 @@ impl<P: Persistence> Gateway<P> {
             egress::rewrite_model(&mut body, upstream);
         }
 
+        let sent_at = now_unix();
         let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
@@ -756,11 +757,11 @@ impl<P: Persistence> Gateway<P> {
             self.usage.observe(id, snapshot).await;
         }
 
-        // 見ている人へ知らせる (DR-0012)。upstream がヘッダを返したこの瞬間が、
-        // prompt cache の 5 分が走り始めた時刻に一番近い。断られた応答も流す
-        // ので、status で絞らない。
+        // 見ている人へ知らせる (DR-0012)。prompt cache の起点に合わせて、
+        // この試行を upstream へ送り始めた時刻を流す。断られた応答も流すので、
+        // status で絞らない。
         self.events.publish(events::Event::with_skipped(
-            now,
+            sent_at,
             &call.origin(route.name()),
             resp.response.status,
             skipped.to_vec(),
@@ -1360,6 +1361,15 @@ mod tests {
             extra: &[(&str, &str)],
             respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
         ) -> Self {
+            Self::start_with_delay(content_type, extra, std::time::Duration::ZERO, respond).await
+        }
+
+        async fn start_with_delay(
+            content_type: &'static str,
+            extra: &[(&str, &str)],
+            delay: std::time::Duration,
+            respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
+        ) -> Self {
             let extra: Arc<String> =
                 Arc::new(extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1404,6 +1414,7 @@ mod tests {
                             answer
                         };
 
+                        tokio::time::sleep(delay).await;
                         let resp = format!(
                             "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\n\
 content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
@@ -2236,6 +2247,36 @@ routes = ["a", "b"]
         assert_eq!(second.ns, NS);
         assert_eq!(second.model, "m");
         assert_eq!(second.session_id, None, "no header attached");
+    }
+
+    /// event の時刻は upstream へ送り始めた時点を指す。
+    #[tokio::test]
+    async fn the_event_time_precedes_the_upstream_response_headers() {
+        let delayed = FakeUpstream::start_with_delay(
+            "application/json",
+            &[],
+            std::time::Duration::from_millis(1_100),
+            |_, _| (200, body_for(200)),
+        )
+        .await;
+        let gw = gateway(&one_credential(&delayed.url)).await;
+
+        let mut watching = gw.events().subscribe();
+        let started = now_unix();
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        let headers_received = now_unix();
+
+        let event = watching.recv().await.unwrap();
+        assert!(
+            event.ts >= started,
+            "the event is not older than the request"
+        );
+        assert!(
+            event.ts < headers_received,
+            "the delayed response headers do not determine the event time"
+        );
     }
 
     /// 選定前から締め出されていた経路は upstream へ当てず、実際に答えた経路の

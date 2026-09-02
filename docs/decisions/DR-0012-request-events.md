@@ -76,7 +76,7 @@ data: {"ts":1785600000,"ts_iso":"2026-08-01T12:00:00Z","session_id":"s-1",
        "status":200,"prefix":"2cf24dba"}
 ```
 
-- `ts` / `ts_iso` — **upstream の応答ヘッダを受け取った時刻**。5 分はここから
+- `ts` / `ts_iso` — **upstream へリクエストを送り始めた時刻**。5 分はここから
 - `session_id` — リクエストヘッダ `X-Claude-Code-Session-Id` の値 (大文字
   小文字は問わない)。名乗らないクライアント (curl 等) では `null`。欄自体は
   必ず出す — 欠けさせると、読む側が形を 2 通り扱うことになる
