@@ -153,11 +153,13 @@ impl Keepalive {
 ///
 /// 先頭を決め打ちの形にするのは、戻ってきたリクエストの中から見つけるため。
 /// 途中に挟まっていても拾えるようにしてあり (合図は通知に包まれて届く)、
-/// 相手には 1 語だけ返させる — 考えさせると、合図 1 回の値段が上がる。
+/// 相手には**何も出力させない** — この往復に要るのはプレフィックスを送り直す
+/// ことだけで、考えた分も答えた分も合図 1 回の値段に乗る。
 pub fn marker(nonce: &str) -> String {
     format!(
         "[llm-gateway cache keepalive nonce={nonce}] \
-         Ignore this message; do not think; reply with exactly \"ok\"."
+         Automated cache keepalive. Do not respond, do not think, do not call \
+         tools; end your turn immediately with no output."
     )
 }
 

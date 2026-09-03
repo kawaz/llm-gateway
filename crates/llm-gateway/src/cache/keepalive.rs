@@ -370,7 +370,9 @@ mod tests {
         assert_eq!(signal.prefix, "2cf24dba");
         assert!(signal.marker.contains(&signal.nonce));
         assert!(
-            signal.marker.contains("reply with exactly"),
+            signal
+                .marker
+                .contains("end your turn immediately with no output"),
             "{}",
             signal.marker
         );

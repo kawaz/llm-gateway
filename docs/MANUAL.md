@@ -322,7 +322,7 @@ when a conversation stops (DR-0024).
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Ignore this message; do not think; reply with exactly \"ok\"."}
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Automated cache keepalive. Do not respond, do not think, do not call tools; end your turn immediately with no output."}
 ```
 
 The receiver injects `marker` verbatim into that conversation (`session_id`). Only a
