@@ -31,6 +31,49 @@ namespace 名が列挙される。
 `auth_token` を書かない namespace は検査せずに通す — 手前 (tailnet / Caddy) で
 境界を引く運用を前提にしているため。
 
+## prompt cache 戦略 (`[[ns.<name>.cache]]`)
+
+namespace ごとに、転送する本文の `cache_control` をどう扱うかを書ける
+(DR-0024)。並びは `routing` と同じ「モデル glob + 先勝ち」で、照合するのは
+短い名前を解決した後のモデル名。
+
+```toml
+[[ns.personal.cache]]
+models = ["claude-fable-5-1*"]
+main = "keepalive"
+keepalive_horizon = "12h"
+
+[[ns.personal.cache]]
+models = ["*"]
+main = "1h"
+sub = "none"
+```
+
+| 欄 | 既定 | 意味 |
+| --- | --- | --- |
+| `models` | (必須) | 当てるモデル名のパターン。空だと設定エラー |
+| `main` | `passthrough` | メインの会話からのリクエストに効く戦略 |
+| `sub` | `passthrough` | サブエージェントからのリクエストに効く戦略 |
+| `keepalive_horizon` | `8h` | `keepalive` で合図を出し続ける上限 |
+
+戦略の語彙:
+
+| 値 | 動作 |
+| --- | --- |
+| `passthrough` | 本文に触らない |
+| `none` | `cache_control` を全て剥がす (使い捨ての 1 本向け) |
+| `5m` | 全ブレークポイントの `ttl` 指定を落とす (= 既定の 5 分) |
+| `1h` | 全ブレークポイントに `ttl: "1h"` を付ける |
+| `keepalive` | 本文は 5 分のまま。会話が止まったら合図を出し、戻ってきた 1 往復にだけ 1 時間を付ける。**`main` のみ**、`sub` に書くと設定エラー |
+
+触るのは `cache_control` だけで、ブレークポイントの位置と数は変えない。
+メイン / サブエージェントの判定はリクエストの `metadata.user_id` に
+`parent_session_id` があるかで決まり、読めない相手はメイン扱い。
+
+`keepalive` は合図を `webhook` 経由でしか届けられない。`webhook.base_url` を
+書いていない設定では合図を出さず、`llm-gateway check` がその namespace を
+警告として挙げる。
+
 ## 転送系
 
 ### `POST /{ns}/v1/messages`
@@ -267,7 +310,20 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。経路選定で外した経路がある場合は
-`skipped` に credential と理由が並ぶ。
+`skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
+`keepalive` (`applied` / `late`) が付く。
+
+`keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
+(DR-0024)。
+
+```
+event: cache_keepalive
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Ignore this message; do not think; reply with exactly \"ok\"."}
+```
+
+受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
+`deadline` までに戻ってきたリクエストにだけ 1 時間の cache が付き、過ぎて
+いれば何もせず素通しする。同じ受け口 (`webhook`) にも同じ形で届く。
 
 ### `GET /llm-gateway/tap`
 
@@ -294,7 +350,9 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 {"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal"}
 ```
 
-`include` を指定した購読にだけ `request_body` / `response_body` が加わる。
+効かせた prompt cache 戦略があれば `cache_strategy`、合図の戻りだった 1 本には
+`keepalive` が加わる。`include` を指定した購読にだけ `request_body` /
+`response_body` が加わる。
 切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は
 gateway が書き換える前の、クライアントが送ってきた値。
 

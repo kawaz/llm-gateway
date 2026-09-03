@@ -31,6 +31,49 @@ Authentication is per namespace. Only a namespace with `auth_token` under
 (`authentication_error`). A namespace without `auth_token` passes traffic through
 unchecked — the boundary is expected to be drawn in front (tailnet / Caddy).
 
+## Prompt cache strategy (`[[ns.<name>.cache]]`)
+
+Each namespace can say how the `cache_control` of a forwarded body is treated
+(DR-0024). Rules are ordered like `routing` — model globs, first match wins — and
+are matched against the model name after aliases are resolved.
+
+```toml
+[[ns.personal.cache]]
+models = ["claude-fable-5-1*"]
+main = "keepalive"
+keepalive_horizon = "12h"
+
+[[ns.personal.cache]]
+models = ["*"]
+main = "1h"
+sub = "none"
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `models` | (required) | Patterns this rule applies to. An empty list is a config error |
+| `main` | `passthrough` | Strategy for requests from the main conversation |
+| `sub` | `passthrough` | Strategy for requests from a subagent |
+| `keepalive_horizon` | `8h` | How long `keepalive` keeps signalling a series |
+
+The strategies:
+
+| Value | Behavior |
+| --- | --- |
+| `passthrough` | The body is left alone |
+| `none` | Every `cache_control` is stripped (for one-shot calls) |
+| `5m` | Every breakpoint loses its `ttl` (= the default five minutes) |
+| `1h` | Every breakpoint gets `ttl: "1h"` |
+| `keepalive` | The body stays at five minutes. When the conversation stops, a signal goes out and only the round trip that answers it gets the hour. **`main` only** — writing it under `sub` is a config error |
+
+Only `cache_control` is touched; breakpoints are never added or moved. A request
+counts as a subagent when its `metadata.user_id` carries `parent_session_id`;
+a caller that cannot be read is treated as the main conversation.
+
+`keepalive` can only reach a conversation through the `webhook` destination. With
+no `webhook.base_url` configured no signal is raised, and `llm-gateway check`
+lists that namespace as a warning.
+
 ## Forwarding
 
 ### `POST /{ns}/v1/messages`
@@ -271,7 +314,20 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
 omitted. If routes were skipped during route selection, `skipped` lists each
-credential and the reason.
+credential and the reason. A request that answered a cache signal carries
+`keepalive` (`applied` / `late`).
+
+In a namespace using the `keepalive` strategy, a second kind of notice is streamed
+when a conversation stops (DR-0024).
+
+```
+event: cache_keepalive
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Ignore this message; do not think; reply with exactly \"ok\"."}
+```
+
+The receiver injects `marker` verbatim into that conversation (`session_id`). Only a
+request that comes back before `deadline` gets the hour; a later one is forwarded
+untouched. The same notice reaches the `webhook` destination in the same shape.
 
 ### `GET /llm-gateway/tap`
 
@@ -299,6 +355,8 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 {"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal"}
 ```
 
+`cache_strategy` appears when a prompt cache strategy was applied, and `keepalive`
+when the request answered a cache signal.
 `request_body` / `response_body` appear only for subscriptions that asked for them,
 and the truncation limit is independent per subscription. `thinking`, `tool_choice`,
 and `stream` are the values the client sent, before the gateway rewrote anything.

@@ -49,27 +49,44 @@ keepalive_horizon = "8h"
 | `1h` | 全ブレークポイントの ttl を 1h に強制 (差分 write が 2 倍、60 分以内の再開が read になる) |
 | `keepalive` | 本文は 5m のまま。idle を検知してマーカー request を誘発し、その request だけ 1h を付ける (§2)。**main のみ受理**、sub に書いたら設定エラー |
 
-照合は alias 解決後のモデル名。main / sub の判定は anthropic preset が
+照合は alias 解決後のモデル名。main / sub の判定は anthropic 方言の preset が
 `metadata.user_id.parent_session_id` の有無から `origin` (main / sub / unknown) を決め、
-core はその値だけを見る (DR-0014 の境界。unknown は main 扱い)。
+core はその値だけを見る (DR-0014 の境界。unknown は main 扱い)。判定は
+Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が持つ —
+読む対象は upstream ではなくクライアントの本文なので、経路を切り替えても
+同じ 1 本が別の戦略に落ちない。
+
+書き換えるのは `cache_control` だけで、**ブレークポイントは増やさない・
+動かさない**。適用は各経路へ送る直前 (モデル名の書き換えの直後) で、
+純粋関数として本文を整える — 経路を何度試しても同じ本文が出ていく。
+効かせた戦略は tap の `cache_strategy` に出る。
 
 ### 2. keepalive の仕組み
 
 1. main の実リクエストを転送するたびに、会話系列 (DR-0012 の `prefix` + session_id)
    ごとのタイマーを **送出時刻 + 4 分** で再武装する (debounce)。ツールループ中は
    次のリクエストが数秒で来るので発火しない
-2. 発火したら nonce を発行し、webhook (DR-0012 の口) に
-   `cache_keepalive {session_id, prefix, nonce, deadline}` を流す。deadline =
-   最後の実リクエスト送出時刻 + 5 分 − 30 秒。受け手 (ccmsg) がそのセッションへ
-   マーカー文を注入する (`notify --as-session`)。文面は固定 prefix + nonce +
-   「無視して 1 語で返せ」
-3. マーカーを末尾 user ブロックに持つ request が来たら、nonce を単回消費し、
-   **deadline 内なら**全ブレークポイントに `ttl: "1h"` を付けて転送。deadline を
-   過ぎていれば付けない (全量 2 倍書きを避ける。1.25 倍の再構築で済ませる)
-4. マーカー request では 4 分でなく **+55 分** で再武装し、最後の実リクエストから
-   `keepalive_horizon` を超えたら止める。実リクエストが来たら pending を捨てて
-   4 分に戻す
-5. 状態はプロセス内メモリ。再起動で消えても次の実リクエストで再武装される
+2. 発火したら nonce (32 バイトの乱数を base64url) を発行し、受け口 (DR-0012 の
+   webhook / SSE) へ `cache_keepalive {type, ts, ts_iso, session_id, prefix,
+   nonce, deadline, deadline_iso, marker}` を流す。deadline = 直前の送出時刻 +
+   その本文が残した cache の寿命 − 30 秒。受け手 (ccmsg) が `marker` をその
+   セッションへ注入する (`notify --as-session`)。文面は
+   `[llm-gateway cache keepalive nonce=<nonce>] Ignore this message; do not
+   think; reply with exactly "ok".`
+3. **最後の user メッセージのどれかの text ブロックがマーカーを含む** request が
+   来たら、nonce を単回消費し、**deadline 内なら**全ブレークポイントに
+   `ttl: "1h"` を付けて転送。deadline を過ぎていれば付けない (全量 2 倍書きを
+   避ける。1.25 倍の再構築で済ませる)。先頭一致では見ないのは、合図が
+   `[SYSTEM NOTIFICATION …]` に包まれて届くため
+4. 再武装の間隔は**直前の本文が残した cache の寿命**で決まる。1 時間を付けた
+   マーカーの後は +55 分、実リクエストと**間に合わなかったマーカー** (= 5 分の
+   cache しか残っていない) の後は +4 分。最後の実リクエストから
+   `keepalive_horizon` を超えた系列には合図を継ぎ足さない。合言葉を持たない
+   リクエストが来たら pending を捨てる (= 人が戻ってきた)
+5. 対象は origin が sub でない、`tools` を持つ (= 会話の本流) リクエストだけ。
+   合図の届け先 (`webhook.base_url`) を書いていない設定では合図を出さず、
+   `llm-gateway check` が該当 namespace を警告に挙げる
+6. 状態はプロセス内メモリ。再起動で消えても次の実リクエストで再武装される
 
 ### 3. 損益の根拠
 
