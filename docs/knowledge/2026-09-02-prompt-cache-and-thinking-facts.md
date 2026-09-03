@@ -53,9 +53,29 @@ Claude Code の実リクエスト (同日)。
   tools / それ以前のメッセージが変わると署名が無効化され API が拒否 or 削除。
   透過 proxy が本文に触る際の禁則として、キャッシュ無効化より重い
 
+## 実験で確定した事実 (2026-09-03、Fable 5.1、gateway 経由)
+
+- **5m キャッシュ済みプレフィックスに `ttl:"1h"` を当ててヒットさせても TTL は昇格しない**
+  (write 課金 0、`ephemeral_1h_input_tokens` 0、6.5 分後にミス → 1h 全量書き)。
+  1h エントリはミス時に 2 倍単価で書いた時だけ生まれ、その後は 6.5 分後もヒットする
+- 同一本文の replay (差分ゼロ) では新しいエントリは生まれない。1h エントリを作るには
+  差分 > 0 の新しいブレークポイントが要る (= マーカー注入方式、DR-0024)
+- **拒否応答 (`stop_reason: refusal`) はキャッシュを残さない**: usage に
+  `cache_creation` が出ても次の同一リクエストはヒットしない
+- **サブスク OAuth 経路は Claude Code の形をしていない request を 429
+  `{"type":"rate_limit_error","message":"Error"}` で弾く**。system[0] の billing
+  header + `You are Claude Code…` + `metadata.user_id` + `User-Agent: claude-cli/…` +
+  `x-app: cli` + beta ヘッダを揃えると同一本文が 200 (どの要素が必須かは未分解)。
+  「小 probe だけ 429」の真因とみられる (docs/issue/2026-09-03-oauth-requires-claude-code-shape.md)
+- main / subagent の区別: `metadata.user_id` (JSON 文字列) の `parent_session_id` が
+  **無ければ main 系** (main、`claude --fork-session` の fork、main 直下の classifier)、
+  **あれば subagent 系** (Agent tool / `/subtask` の fork 型 subagent とその classifier、
+  値は親 session_id と同一)。fork は gateway からは独立セッションに見える
+- `system[0]` は `x-anthropic-billing-header: cc_version=<ver>; cc_entrypoint=cli;`
+  で、Claude Code のバージョンは本文からも読める (User-Agent にも入る)
+- 過去 7 日の実績 (docs は scripts/cache-cost-sim.py): 費用は write が 6 割超、
+  その 88% が 5 分失効後の再構築、再構築の 66% は失効から 60 分以内の再開
+
 ## 未検証 (実験で確定させるべき点)
 
-- 5m でキャッシュ済みのプレフィックスに `ttl:"1h"` を当てた時、差分ゼロで
-  TTL が 1h に昇格するか (`cache_creation.ephemeral_1h_input_tokens` で判定可)。
-  idle セッションの keep-alive 戦略 (55 分ごとの replay ping) の損益はここで決まる
 - 200K 超 (1M context 領域) の input 単価割増の有無
