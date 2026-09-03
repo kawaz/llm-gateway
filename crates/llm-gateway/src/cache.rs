@@ -8,6 +8,8 @@
 //! 判断は純粋関数で、状態を持たない。1 本の転送で経路を何度も試すので、
 //! どの試行でも同じ本文になる。
 
+pub mod keepalive;
+
 use serde_json::{Map, Value};
 
 use crate::config::{CacheRule, CacheStrategy};

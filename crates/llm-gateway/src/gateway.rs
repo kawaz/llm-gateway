@@ -15,7 +15,7 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::cache;
+use crate::cache::{self, keepalive};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::now_unix;
@@ -49,6 +49,12 @@ pub struct Gateway<P: Persistence> {
     ///
     /// router も同じ口を持つ (自前で返す 429 を流すため)。
     events: Arc<Events>,
+    /// 止まった会話へ cache を延ばす合図を出す役 (DR-0024 §2)。
+    ///
+    /// 合図の届け先は受け口 (DR-0012) しかないので、そこが設定されていない
+    /// 間は誰も受け取れない。書いていない設定では合図を出さない。
+    keepalive: Arc<keepalive::Keepalive>,
+    signalling: bool,
     tap: Arc<Tap>,
     status: crate::status::Manager,
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
@@ -89,6 +95,14 @@ impl<P: Persistence> Gateway<P> {
             .build()
             .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
 
+        let orphaned = config.keepalive_without_destination();
+        if !orphaned.is_empty() {
+            warn!(
+                namespaces = %orphaned.join(", "),
+                "cache keepalive needs a webhook destination; no signal will be sent"
+            );
+        }
+
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
         let tap = Arc::new(Tap::new());
@@ -111,6 +125,8 @@ impl<P: Persistence> Gateway<P> {
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
+            keepalive: Arc::new(keepalive::Keepalive::new(Arc::clone(&events))),
+            signalling: config.webhook.base_url.is_some(),
             events,
             tap,
             status: crate::status::Manager::new(config),
@@ -386,18 +402,44 @@ impl<P: Persistence> Gateway<P> {
         }
 
         let session = session::derive(&body, &headers);
+        let declared = session::declared_id(&headers);
+        let prefix = events::prefix(&body);
+        let series = declared
+            .clone()
+            .zip(prefix.clone())
+            .map(|(id, prefix)| keepalive::Series {
+                session_id: id,
+                prefix,
+            });
+
+        // 合図の戻りかどうかは、経路を選ぶ前に 1 回だけ決める (DR-0024 §2)。
+        // 経路を切り替えて送り直しても、同じ本文が同じ扱いで出ていく。
+        let marker = self.keepalive.take_marker(&body);
+        if let Some(series) = &series
+            && marker.is_none()
+        {
+            // 合言葉を持たない 1 本 = 人が会話へ戻ってきた。出したままの合図は
+            // 用済みで、遅れて戻ってきても 1 時間を付ける理由がない。
+            self.keepalive.forget(series);
+        }
+
         // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
         let call = Call {
             ns: ns_name,
             model: &model,
-            session_id: session::declared_id(&headers),
-            prefix: events::prefix(&body),
+            session_id: declared,
+            prefix,
             path,
             query,
             body: &body,
             cache: ns.cache_for(&model),
+            series,
+            keepalive: marker.as_ref().map(|(_, marker)| *marker),
         };
+        // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
+        // 経路を試す前に控えておく。
+        let keepalive_note = call.keepalive.map(|marker| marker.as_str().to_owned());
         let routes = self
             .router
             .routes_for(ns, ns_name, &model, &session)
@@ -450,6 +492,7 @@ impl<P: Persistence> Gateway<P> {
                     usage: None,
                     // 送っていないので、本文には触っていない。
                     cache_strategy: None,
+                    keepalive: keepalive_note,
                 });
             }
         };
@@ -498,6 +541,7 @@ impl<P: Persistence> Gateway<P> {
                         model,
                         usage,
                         cache_strategy,
+                        keepalive: keepalive_note,
                     });
                 }
                 Err(Switch {
@@ -584,6 +628,7 @@ impl<P: Persistence> Gateway<P> {
                 // 断られた応答に usage は載らない (DR-0011)。
                 usage: None,
                 cache_strategy: None,
+                keepalive: keepalive_note,
             });
         }
 
@@ -717,6 +762,30 @@ impl<P: Persistence> Gateway<P> {
         }
     }
 
+    /// 合図の往復を進める (DR-0024 §2)。
+    ///
+    /// 期限内に戻ってきた合図にだけ 1 時間を付け、次の合図の予定を置き直す。
+    /// 受け口を書いていない設定では何もしない — 出しても届く先がない。
+    fn keep_alive(&self, call: &Call<'_>, body: &mut Value) {
+        let Some(series) = &call.series else {
+            return;
+        };
+        if !self.signalling || !keepalive::carries_tools(call.body) {
+            return;
+        }
+        if call.keepalive == Some(keepalive::Marker::Applied) {
+            cache::apply_one_hour(body);
+        }
+        let wrote = call
+            .keepalive
+            .map_or(keepalive::Wrote::FiveMinutes, keepalive::Marker::wrote);
+        let horizon = call.cache.map_or(
+            crate::config::DEFAULT_KEEPALIVE_HORIZON,
+            crate::config::CacheRule::horizon,
+        );
+        self.keepalive.arm(series.clone(), wrote, horizon);
+    }
+
     async fn send(
         &self,
         route: &Arc<Route>,
@@ -735,6 +804,9 @@ impl<P: Persistence> Gateway<P> {
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
         if let Some(strategy) = call.cache_strategy(route.preset.as_ref()) {
             cache::apply(&mut body, strategy);
+            if strategy == CacheStrategy::Keepalive {
+                self.keep_alive(call, &mut body);
+            }
         }
 
         let sent_at = now_unix();
@@ -1112,6 +1184,11 @@ struct Call<'a> {
     /// このモデルに当たった prompt cache の規則 (DR-0024)。当たらなければ
     /// `None` で、本文には触らない。解決後のモデル名で 1 回引く。
     cache: Option<&'a CacheRule>,
+    /// この会話系列 (DR-0024 §2)。会話の id と系列の両方を名乗った相手にしか
+    /// 付かない — どちらが欠けても、合図を届ける先が決まらない。
+    series: Option<keepalive::Series>,
+    /// 合図の戻りだったときの扱い。合言葉は転送 1 本につき 1 回だけ使う。
+    keepalive: Option<keepalive::Marker>,
 }
 
 impl<'a> Call<'a> {
@@ -1123,6 +1200,7 @@ impl<'a> Call<'a> {
             ns: self.ns,
             model: self.model,
             credential,
+            keepalive: self.keepalive.map(|marker| marker.as_str()),
         }
     }
 
@@ -1169,6 +1247,8 @@ pub struct Forwarded {
     /// この本文へ効かせた prompt cache 戦略 (DR-0024)。規則に当たらなければ
     /// `None` で、本文には触っていない。
     pub cache_strategy: Option<CacheStrategy>,
+    /// この 1 本が cache の合図の戻りだったときの扱い (`applied` / `late`)。
+    pub keepalive: Option<String>,
 }
 
 impl std::fmt::Debug for Forwarded {
@@ -1180,6 +1260,7 @@ impl std::fmt::Debug for Forwarded {
             .field("model", &self.model)
             .field("usage", &self.usage.is_some())
             .field("cache_strategy", &self.cache_strategy)
+            .field("keepalive", &self.keepalive)
             .finish()
     }
 }
@@ -1622,6 +1703,11 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。
     fn preset_of<'a, P: Persistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
         gw.router.preset(name).expect("present in config")
+    }
+
+    /// 流れた 1 件を、転送の知らせとして読む。
+    fn announced(notice: events::Notice) -> events::Event {
+        notice.request().expect("a forwarding notice").clone()
     }
 
     /// 転送の試験で使う namespace 名。
@@ -2284,10 +2370,10 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        let first = watching.recv().await.unwrap();
+        let first = announced(watching.recv().await.unwrap());
         assert_eq!((first.credential.as_str(), first.status), ("a", 429));
 
-        let second = watching.recv().await.unwrap();
+        let second = announced(watching.recv().await.unwrap());
         assert_eq!((second.credential.as_str(), second.status), ("b", 200));
         assert_eq!(second.ns, NS);
         assert_eq!(second.model, "m");
@@ -2313,7 +2399,7 @@ routes = ["a", "b"]
             .unwrap();
         let headers_received = now_unix();
 
-        let event = watching.recv().await.unwrap();
+        let event = announced(watching.recv().await.unwrap());
         assert!(
             event.ts >= started,
             "the event is not older than the request"
@@ -2340,7 +2426,7 @@ routes = ["a", "b"]
             .await
             .unwrap();
 
-        let event = watching.recv().await.unwrap();
+        let event = announced(watching.recv().await.unwrap());
         assert_eq!((event.credential.as_str(), event.status), ("b", 200));
         assert_eq!(
             event.skipped,
@@ -2378,7 +2464,7 @@ routes = ["a", "b"]
             .unwrap();
         assert_eq!(resp.response.status, 429);
 
-        let event = watching.recv().await.unwrap();
+        let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.status, 429);
         assert_eq!(event.model, MODEL);
         assert_eq!(event.ns, NS);
@@ -4440,5 +4526,221 @@ main = "1h"
             sending,
             "the request is passed through untouched"
         );
+    }
+
+    /// 合図を出す設定 (受け口あり + keepalive) の namespace 1 つ。
+    fn signalling_config(url: &str) -> String {
+        format!(
+            r#"
+{}
+[webhook]
+base_url = "http://127.0.0.1:9/notify"
+
+[[ns.default.cache]]
+models = ["m"]
+main = "keepalive"
+keepalive_horizon = "8h"
+"#,
+            one_credential(url)
+        )
+    }
+
+    /// 会話の本流からの 1 本 (道具を持ち、会話と系列を名乗る)。
+    fn conversation(extra: Value) -> (Value, Vec<(String, String)>) {
+        let mut body = json!({
+            "model": MODEL,
+            "max_tokens": 8,
+            "system": [{"type": "text", "text": "You are Claude Code",
+                "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "Bash"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "metadata": {"user_id": MAIN},
+        });
+        if let Some(extra) = extra.as_object() {
+            for (key, value) in extra {
+                body[key] = value.clone();
+            }
+        }
+        let headers = vec![(session::SESSION_HEADER.to_owned(), "s-1".to_owned())];
+        (body, headers)
+    }
+
+    /// 会話が止まっている時間を進める。
+    ///
+    /// 時計を止めるのは進める間だけ。止めたままだと、偽 upstream との
+    /// やり取りの接続待ちまで即座に時間切れになる。
+    async fn idle(seconds: u64) {
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(seconds)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+    }
+
+    /// 合図が出るまで待って、その 1 件を返す。
+    async fn signal(
+        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
+    ) -> events::Keepalive {
+        loop {
+            match watching.recv().await.unwrap() {
+                events::Notice::CacheKeepalive(signal) => return signal,
+                events::Notice::Request(_) => continue,
+            }
+        }
+    }
+
+    /// 会話が止まると合図が出て、戻ってきた 1 本にだけ 1 時間が付く
+    /// (DR-0024 §2)。
+    #[tokio::test]
+    async fn an_idle_conversation_is_signalled_and_the_answer_carries_the_hour() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            sent_ttls(&up.requests()[0]),
+            vec![None],
+            "the request itself is forwarded as it came"
+        );
+
+        // 合図は 4 分で出る。期限 (4 分 30 秒) の内側で戻す。
+        idle(4 * 60 + 5).await;
+        let signal = signal(&mut watching).await;
+        assert_eq!(signal.session_id, "s-1");
+        assert!(signal.prefix.len() == 8, "{}", signal.prefix);
+
+        // 受け取った側が会話へ流し込み、その返事がここへ戻ってくる。
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": format!("[SYSTEM NOTIFICATION] {}", signal.marker)},
+        ]}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive.as_deref(), Some("applied"));
+        assert_eq!(
+            sent_ttls(&up.requests()[1]),
+            vec![Some("1h".to_owned())],
+            "only the signal round trip writes the hour"
+        );
+    }
+
+    /// 期限を過ぎて戻ってきた合図には 1 時間を付けない (DR-0024 §3)。
+    #[tokio::test]
+    async fn a_late_answer_is_forwarded_without_the_hour() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        // 合図は 4 分で出る。期限 (4 分 30 秒) の内側で戻す。
+        idle(4 * 60 + 5).await;
+        let signal = signal(&mut watching).await;
+
+        // 受け取った側が寝ていた分。
+        idle(10 * 60).await;
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive.as_deref(), Some("late"));
+        assert_eq!(
+            sent_ttls(&up.requests()[1]),
+            vec![None],
+            "a full rewrite at 1.25x beats one at 2x"
+        );
+    }
+
+    /// 道具を持たない 1 本 (分類器など) からは合図を出さない。
+    #[tokio::test]
+    async fn a_classifier_never_starts_a_signal() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (mut body, headers) = conversation(json!({}));
+        body.as_object_mut().unwrap().remove("tools");
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        idle(30 * 60).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "the main conversation's cache is not extended from a side request"
+        );
+    }
+
+    /// 受け口を書いていない設定では、合図そのものを出さない。
+    #[tokio::test]
+    async fn without_a_destination_no_signal_is_raised() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[[ns.default.cache]]
+models = ["m"]
+main = "keepalive"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        idle(30 * 60).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "nothing is signalled where nobody could receive it"
+        );
+    }
+
+    /// 人が会話へ戻ってきたら、出したままの合図は無効になる。
+    #[tokio::test]
+    async fn a_returning_conversation_voids_the_signal_that_was_out() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        // 合図は 4 分で出る。期限 (4 分 30 秒) の内側で戻す。
+        idle(4 * 60 + 5).await;
+        let signal = signal(&mut watching).await;
+
+        // 合言葉を持たない 1 本 = 人の再開。
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive, None, "the nonce was dropped");
+        assert_eq!(sent_ttls(&up.requests()[2]), vec![None]);
     }
 }

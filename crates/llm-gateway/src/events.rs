@@ -55,6 +55,10 @@ pub struct Event {
     /// 経路選定で外した経路。無ければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
+    /// この 1 本が cache の合図 (DR-0024 §2) だったときの扱い。間に合った分は
+    /// `applied`、遅れて 1 時間を付けなかった分は `late`。合図でなければ出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<String>,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -75,6 +79,8 @@ pub struct Origin<'a> {
     pub model: &'a str,
     /// 答えた経路の名前。
     pub credential: &'a str,
+    /// cache の合図としての扱い ([`Event::keepalive`])。
+    pub keepalive: Option<&'a str>,
 }
 
 impl Event {
@@ -93,7 +99,106 @@ impl Event {
             status,
             prefix: origin.prefix.map(str::to_owned),
             skipped,
+            keepalive: origin.keepalive.map(str::to_owned),
         }
+    }
+}
+
+/// 会話が止まった、という合図 (DR-0024 §2)。
+///
+/// 受け取った側 (ccmsg) が [`Self::marker`] をその会話へ流し込むと、戻って
+/// きたリクエストに 1 時間の cache が付く。[`Self::deadline`] を過ぎてから
+/// 届いたものには付けない — 間に合わなかった合図に 2 倍の書き込みをさせると、
+/// 何もしないより高くつく。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Keepalive {
+    /// 受け取る側が種類を見分ける印。値は常に `cache_keepalive`。
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub ts: i64,
+    pub ts_iso: String,
+    /// どの会話へ流し込むか。
+    pub session_id: String,
+    /// その会話のどの系列か ([`prefix`])。
+    pub prefix: String,
+    /// この 1 回きりの合言葉。戻ってきたリクエストの照合に使う。
+    pub nonce: String,
+    /// これを過ぎて届いたら 1 時間は付かない (Unix 秒)。
+    pub deadline: i64,
+    pub deadline_iso: String,
+    /// そのまま会話へ流し込む文面。
+    pub marker: String,
+}
+
+impl Keepalive {
+    /// 種類の印。受け取る側はこの値で [`Event`] と見分ける。
+    pub const KIND: &'static str = "cache_keepalive";
+
+    pub fn new(ts: i64, session_id: &str, prefix: &str, nonce: &str, deadline: i64) -> Self {
+        Self {
+            kind: Self::KIND.to_owned(),
+            ts,
+            ts_iso: format_rfc3339(ts),
+            session_id: session_id.to_owned(),
+            prefix: prefix.to_owned(),
+            nonce: nonce.to_owned(),
+            deadline,
+            deadline_iso: format_rfc3339(deadline),
+            marker: marker(nonce),
+        }
+    }
+}
+
+/// 会話へ流し込む文面。
+///
+/// 先頭を決め打ちの形にするのは、戻ってきたリクエストの中から見つけるため。
+/// 途中に挟まっていても拾えるようにしてあり (合図は通知に包まれて届く)、
+/// 相手には 1 語だけ返させる — 考えさせると、合図 1 回の値段が上がる。
+pub fn marker(nonce: &str) -> String {
+    format!(
+        "[llm-gateway cache keepalive nonce={nonce}] \
+         Ignore this message; do not think; reply with exactly \"ok\"."
+    )
+}
+
+/// 受け口へ流す 1 件。
+///
+/// 転送の知らせ ([`Event`]) と cache の合図 ([`Keepalive`]) は別の出来事で、
+/// 欄も重ならない。1 つの型に混ぜて空欄で埋めるのではなく、種類として分ける。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Notice {
+    Request(Event),
+    CacheKeepalive(Keepalive),
+}
+
+impl Notice {
+    /// SSE の 1 通に付ける名前。
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::CacheKeepalive(_) => Keepalive::KIND,
+        }
+    }
+
+    /// 転送の知らせなら中身。合図なら `None`。
+    pub fn request(&self) -> Option<&Event> {
+        match self {
+            Self::Request(event) => Some(event),
+            Self::CacheKeepalive(_) => None,
+        }
+    }
+}
+
+impl From<Event> for Notice {
+    fn from(event: Event) -> Self {
+        Self::Request(event)
+    }
+}
+
+impl From<Keepalive> for Notice {
+    fn from(keepalive: Keepalive) -> Self {
+        Self::CacheKeepalive(keepalive)
     }
 }
 
@@ -133,7 +238,7 @@ fn short_hash(text: &str) -> String {
 
 /// 見ている人へ配る口。
 pub struct Events {
-    tx: broadcast::Sender<Event>,
+    tx: broadcast::Sender<Notice>,
 }
 
 impl Default for Events {
@@ -153,15 +258,15 @@ impl Events {
     ///
     /// 誰も見ていなければ何もしない。**転送の邪魔をしないこと**が第一で、
     /// 配れなかったことを転送側へ持ち帰らない (待たない・失敗にしない)。
-    pub fn publish(&self, event: Event) {
-        let _ = self.tx.send(event);
+    pub fn publish(&self, notice: impl Into<Notice>) {
+        let _ = self.tx.send(notice.into());
     }
 
     /// 見る側に回る。届くのは**これ以降**の分だけ。
     ///
     /// 過去に遡らないのは、この知らせが「今から 5 分」を数えるためのもの
     /// だから。接続した時点で既に過ぎている分を配っても数え直せない。
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
         self.tx.subscribe()
     }
 
@@ -186,6 +291,15 @@ mod tests {
             ns: "personal",
             model: "m",
             credential,
+            keepalive: None,
+        }
+    }
+
+    /// 転送の知らせとして届いた 1 件。
+    fn request(notice: Notice) -> Event {
+        match notice {
+            Notice::Request(event) => event,
+            other => panic!("expected a forwarding notice, got {other:?}"),
         }
     }
 
@@ -212,7 +326,7 @@ mod tests {
             200,
         ));
 
-        let got = watching.recv().await.unwrap();
+        let got = request(watching.recv().await.unwrap());
         assert_eq!(got.session_id.as_deref(), Some("s-1"));
         assert_eq!(got.model, "claude-fable-5");
         assert_eq!(got.credential, "claude-kawazzz");
@@ -231,7 +345,7 @@ mod tests {
         let mut watching = events.subscribe();
         events.publish(Event::new(NOW + 1, &from("b"), 200));
 
-        let got = watching.recv().await.unwrap();
+        let got = request(watching.recv().await.unwrap());
         assert_eq!(
             got.ts,
             NOW + 1,
@@ -245,7 +359,7 @@ mod tests {
         let events = Events::new();
         let mut watching = events.subscribe();
         events.publish(Event::new(NOW, &from("a"), 429));
-        assert_eq!(watching.recv().await.unwrap().status, 429);
+        assert_eq!(request(watching.recv().await.unwrap()).status, 429);
     }
 
     /// system の先頭ブロックが同じなら、同じ系列とみなす。

@@ -19,7 +19,7 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{info, warn};
 
 use crate::config::Webhook;
-use crate::events::Event;
+use crate::events::Notice;
 
 /// 受け口が受理する 1 通の上限。
 const MAX_PAYLOAD: usize = 1024 * 1024;
@@ -48,7 +48,7 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 pub async fn keep_sending(
     config: Webhook,
     http: reqwest::Client,
-    mut watching: tokio::sync::broadcast::Receiver<Event>,
+    mut watching: tokio::sync::broadcast::Receiver<Notice>,
 ) {
     let url = match config.destination_url() {
         Ok(Some(url)) => url,
@@ -110,7 +110,7 @@ pub async fn keep_sending(
 ///
 /// 1 件目は**いつまでも待つ** (何も起きなければ何もしない)。2 件目からは
 /// [`WINDOW`] の間だけ待って、来なければそこで区切る。
-async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Option<Vec<Event>> {
+async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Notice>) -> Option<Vec<Notice>> {
     let mut batch = vec![first(watching).await?];
     let until = Instant::now() + WINDOW;
 
@@ -130,7 +130,7 @@ async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Opti
 }
 
 /// 次の 1 件を待つ。流す側が畳まれたら `None`。
-async fn first(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Option<Event> {
+async fn first(watching: &mut tokio::sync::broadcast::Receiver<Notice>) -> Option<Notice> {
     loop {
         match watching.recv().await {
             Ok(event) => return Some(event),
@@ -143,14 +143,14 @@ async fn first(watching: &mut tokio::sync::broadcast::Receiver<Event>) -> Option
 /// 1 MB を超えない JSON 配列へ分ける。
 ///
 /// 単体で上限を超えるイベントは、その 1 件だけを落とす。
-fn encode_payloads(events: &[Event]) -> (Vec<Vec<u8>>, usize) {
+fn encode_payloads(events: &[Notice]) -> (Vec<Vec<u8>>, usize) {
     let mut payloads = Vec::new();
     let mut current = Vec::from(b"[".as_slice());
     let mut count = 0usize;
     let mut oversized = 0usize;
 
     for event in events {
-        let encoded = serde_json::to_vec(event).expect("Event converts to JSON");
+        let encoded = serde_json::to_vec(event).expect("a notice converts to JSON");
         if encoded.len() + 2 > MAX_PAYLOAD {
             oversized += 1;
             continue;
@@ -232,14 +232,15 @@ fn read_token(path: &Path) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Events, Origin};
+    use crate::events::{Event, Events, Notice, Origin};
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_800_000_000;
     const TOKEN: &str = "tok-DO-NOT-LOG-0123456789";
 
-    fn event(credential: &str) -> Event {
-        Event::new(
+    /// 転送の知らせ 1 件。
+    fn event(credential: &str) -> Notice {
+        Notice::Request(Event::new(
             NOW,
             &Origin {
                 session_id: Some("s-1"),
@@ -247,9 +248,33 @@ mod tests {
                 ns: "personal",
                 model: "m",
                 credential,
+                keepalive: None,
             },
             200,
-        )
+        ))
+    }
+
+    /// 中身の大きい知らせ 1 件。
+    fn bulky(bytes: usize) -> Notice {
+        let mut event = Event::new(
+            NOW,
+            &Origin {
+                session_id: Some("s-1"),
+                prefix: None,
+                ns: "personal",
+                model: "m",
+                credential: "a",
+                keepalive: None,
+            },
+            200,
+        );
+        event.session_id = Some("x".repeat(bytes));
+        Notice::Request(event)
+    }
+
+    /// 受け口が受け取った 1 件を、転送の知らせとして読む。
+    fn request(notice: &Notice) -> &Event {
+        notice.request().expect("a forwarding notice")
     }
 
     /// 受け取った要求を覚えておく受け口。
@@ -411,11 +436,11 @@ mod tests {
         );
 
         let body = delivered.split("\r\n\r\n").nth(1).expect("body");
-        let sent: Vec<Event> = serde_json::from_str(body).expect("sent as an array");
+        let sent: Vec<Notice> = serde_json::from_str(body).expect("sent as an array");
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].credential, "claude-kawazzz");
+        assert_eq!(request(&sent[0]).credential, "claude-kawazzz");
         assert_eq!(
-            sent[0].prefix.as_deref(),
+            request(&sent[0]).prefix.as_deref(),
             Some("2cf24dba"),
             "same shape as SSE"
         );
@@ -451,7 +476,7 @@ mod tests {
         receiver.next_delivery().await;
         let body = receiver.deliveries().remove(0);
         let body = body.split("\r\n\r\n").nth(1).expect("body");
-        let sent: Vec<Event> = serde_json::from_str(body).unwrap();
+        let sent: Vec<Notice> = serde_json::from_str(body).unwrap();
 
         assert_eq!(sent.len(), 10, "10 items arrive in a single delivery");
         assert_eq!(
@@ -465,9 +490,7 @@ mod tests {
     /// 件数内でも大きければ、1 MB 以下の複数通に分ける。
     #[test]
     fn payloads_never_exceed_one_megabyte() {
-        let mut large = event("a");
-        large.session_id = Some("x".repeat(16 * 1024));
-        let events = vec![large; 100];
+        let events = vec![bulky(16 * 1024); 100];
 
         let (payloads, oversized) = encode_payloads(&events);
         assert_eq!(oversized, 0);
@@ -475,7 +498,11 @@ mod tests {
         assert!(payloads.iter().all(|payload| payload.len() <= MAX_PAYLOAD));
         let delivered = payloads
             .iter()
-            .map(|payload| serde_json::from_slice::<Vec<Event>>(payload).unwrap().len())
+            .map(|payload| {
+                serde_json::from_slice::<Vec<Notice>>(payload)
+                    .unwrap()
+                    .len()
+            })
             .sum::<usize>();
         assert_eq!(delivered, 100, "no events are dropped even when split");
     }
@@ -483,9 +510,7 @@ mod tests {
     /// 1 件だけで上限を超えるものは送らない。
     #[test]
     fn an_oversized_event_is_dropped_alone() {
-        let mut large = event("a");
-        large.session_id = Some("x".repeat(MAX_PAYLOAD));
-        let (payloads, oversized) = encode_payloads(&[large]);
+        let (payloads, oversized) = encode_payloads(&[bulky(MAX_PAYLOAD)]);
         assert!(payloads.is_empty());
         assert_eq!(oversized, 1);
     }

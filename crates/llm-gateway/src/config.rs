@@ -468,12 +468,25 @@ pub struct CacheRule {
     pub keepalive_horizon: Option<Duration>,
 }
 
+/// `keepalive_horizon` を書かなかったときに使う長さ。
+///
+/// 半日ぶりに戻ってくる会話まで繋ぐと、待ち時間のほうが高くつく
+/// (DR-0024 §3 の分岐点)。1 日の作業のうちひと続きの範囲を既定にする。
+pub const DEFAULT_KEEPALIVE_HORIZON: Duration = Duration::from_secs(8 * 60 * 60);
+
 fn default_keepalive_horizon() -> Option<Duration> {
-    Some(Duration::from_secs(8 * 60 * 60))
+    Some(DEFAULT_KEEPALIVE_HORIZON)
 }
 
 fn is_default_keepalive_horizon(value: &Option<Duration>) -> bool {
     *value == default_keepalive_horizon()
+}
+
+impl CacheRule {
+    /// この規則で合図を出し続ける上限 (DR-0024 §2)。
+    pub fn horizon(&self) -> Duration {
+        self.keepalive_horizon.unwrap_or(DEFAULT_KEEPALIVE_HORIZON)
+    }
 }
 
 /// 1 つの振り分け規則。
@@ -1154,6 +1167,26 @@ impl Config {
     /// 公開している namespace 名。
     pub fn namespace_names(&self) -> Vec<&str> {
         self.namespaces.keys().map(String::as_str).collect()
+    }
+
+    /// 合図の届け先を持たないまま `keepalive` を書いた namespace (DR-0024 §2)。
+    ///
+    /// 合図は受け口 (DR-0012) 経由でしか会話へ届かない。設定として矛盾しては
+    /// いない (受け口を後から足せば動く) ので拒まないが、書いた人の意図どおり
+    /// には動かないので名前を挙げる。
+    pub fn keepalive_without_destination(&self) -> Vec<&str> {
+        if self.webhook.base_url.is_some() {
+            return Vec::new();
+        }
+        self.namespaces
+            .iter()
+            .filter(|(_, ns)| {
+                ns.cache
+                    .iter()
+                    .any(|rule| rule.main == CacheStrategy::Keepalive)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     /// 既定の設定ファイルの場所。

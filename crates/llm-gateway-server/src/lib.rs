@@ -333,10 +333,10 @@ async fn events<P: Persistence + 'static>(
 ///
 /// 載せるのは自分で組み立てた構造体だけなので、JSON にできない事態は
 /// 起きない。それでも配信を止めないよう、万一のときは空の 1 通を送る。
-fn sse_line(event: &llm_gateway::events::Event) -> SseEvent {
+fn sse_line(notice: &llm_gateway::events::Notice) -> SseEvent {
     SseEvent::default()
-        .event("request")
-        .json_data(event)
+        .event(notice.name())
+        .json_data(notice)
         .unwrap_or_else(|e| {
             error!(%e, "cannot serialize the event to JSON");
             SseEvent::default().comment("unserializable")
@@ -662,6 +662,7 @@ async fn messages<P: Persistence + 'static>(
                     cache_strategy: forwarded
                         .cache_strategy
                         .map(|strategy| strategy.as_str().to_owned()),
+                    keepalive: forwarded.keepalive.clone(),
                     request_body: tap_request_body,
                     response_body: None,
                 },

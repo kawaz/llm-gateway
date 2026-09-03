@@ -962,6 +962,11 @@ spend_down_within = "25%"
         routes.iter().map(|r| r.name()).collect()
     }
 
+    /// 流れた 1 件を、転送の知らせとして読む。
+    fn announced(notice: events::Notice) -> events::Event {
+        notice.request().expect("a forwarding notice").clone()
+    }
+
     fn origin(model: &str) -> events::Origin<'_> {
         events::Origin {
             session_id: None,
@@ -969,6 +974,7 @@ spend_down_within = "25%"
             ns: NS,
             model,
             credential: crate::stats::NO_CREDENTIAL,
+            keepalive: None,
         }
     }
 
@@ -1799,7 +1805,7 @@ spend_down_within = "25%"
         let mut watching = r.events().subscribe();
         r.select(&routes, model, NOW, &origin(model));
 
-        let event = watching.recv().await.unwrap();
+        let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.status, 429);
         assert_eq!(event.model, model);
         assert_eq!(event.ns, NS);
