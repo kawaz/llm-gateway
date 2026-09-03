@@ -4632,8 +4632,11 @@ keepalive_horizon = "8h"
         let mut body = json!({
             "model": MODEL,
             "max_tokens": 8,
-            "system": [{"type": "text", "text": "You are Claude Code",
-                "cache_control": {"type": "ephemeral"}}],
+            "system": [{
+                "type": "text",
+                "text": "x-anthropic-billing-header: cc_version=2.0.1; cc_entrypoint=cli;",
+                "cache_control": {"type": "ephemeral"},
+            }],
             "tools": [{"name": "Bash"}],
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
             "metadata": {"user_id": MAIN},
@@ -4921,6 +4924,45 @@ sub = "5m"
         assert_eq!(
             event.cache_ttl_secs, None,
             "a body with no breakpoint leaves nothing behind"
+        );
+    }
+
+    /// 1 回きりの呼び出し (`claude -p`) は sub 側の戦略に乗り、見張りもしない。
+    ///
+    /// 会話として続かないので、続きを当て込んで cache を長く持っても報われない。
+    #[tokio::test]
+    async fn a_one_shot_call_is_not_treated_as_the_main_conversation() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (mut oneshot, headers) = conversation(json!({}));
+        oneshot["system"] = json!([{
+            "type": "text",
+            "text": "x-anthropic-billing-header: cc_version=2.0.1; cc_entrypoint=sdk-cli;",
+            "cache_control": {"type": "ephemeral"},
+        }]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, oneshot, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.origin, "oneshot");
+        assert_eq!(
+            forwarded.cache_strategy,
+            Some(CacheStrategy::Passthrough),
+            "the sub side is the default, and keepalive cannot be written there"
+        );
+        assert_eq!(
+            sent_ttls(&up.requests()[0]),
+            vec![None],
+            "the body is forwarded as it came"
+        );
+
+        idle(55 * 60 + 5).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "a call that does not continue is not watched"
         );
     }
 }

@@ -17,11 +17,13 @@ use crate::provider::RequestOrigin;
 
 /// この呼び出し元に効く戦略。
 ///
+/// `sub` 側に乗るのはサブエージェントと 1 回きりの呼び出し — どちらも続きが
+/// 来ない (来ても別系列) ので、本流に効かせたい扱いを当てても報われない。
 /// 見分けが付かなかった呼び出し元は main として扱う (DR-0024)。サブエージェント
 /// 向けの戦略を当てると、メインの会話に効かせるつもりのない扱いが本流へ及ぶ。
 pub fn strategy_of(rule: &CacheRule, origin: RequestOrigin) -> CacheStrategy {
     match origin {
-        RequestOrigin::Sub => rule.sub,
+        RequestOrigin::Sub | RequestOrigin::Oneshot => rule.sub,
         RequestOrigin::Main | RequestOrigin::Unknown => rule.main,
     }
 }

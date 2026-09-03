@@ -81,6 +81,9 @@ pub enum RequestOrigin {
     Unknown,
     Main,
     Sub,
+    /// 1 回きりの呼び出し。会話として続かないので、続きを当て込んだ扱い
+    /// (cache を長く持つ等) をしても報われない。
+    Oneshot,
 }
 
 impl RequestOrigin {
@@ -90,6 +93,7 @@ impl RequestOrigin {
             Self::Unknown => "unknown",
             Self::Main => "main",
             Self::Sub => "sub",
+            Self::Oneshot => "oneshot",
         }
     }
 }

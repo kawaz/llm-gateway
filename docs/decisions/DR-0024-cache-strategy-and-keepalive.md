@@ -59,9 +59,19 @@ keepalive_horizon = "8h"
 | `1h` | 全ブレークポイントの ttl を 1h に強制 (差分 write が 2 倍、60 分以内の再開が read になる) |
 | `keepalive` | `1h` と同じ本文にした上で、idle を検知してマーカー request を誘発し cache を繋ぐ (§2)。**main のみ受理**、sub に書いたら設定エラー |
 
-照合は alias 解決後のモデル名。main / sub の判定は anthropic 方言の preset が
-`metadata.user_id.parent_session_id` の有無から `origin` (main / sub / unknown) を決め、
-core はその値だけを見る (DR-0014 の境界。unknown は main 扱い)。判定は
+照合は alias 解決後のモデル名。呼び出し元の判定は anthropic 方言の preset が行い、
+core はその値だけを見る (DR-0014 の境界):
+
+| origin | 見分け方 | 当てる戦略 |
+|---|---|---|
+| `sub` | `metadata.user_id` に `parent_session_id` がある | `sub` |
+| `oneshot` | 親を持たず、`system` 先頭ブロックの請求ヘッダの `cc_entrypoint` が `cli` 以外 (`sdk-cli` = `claude -p` 等) | `sub` |
+| `main` | 親を持たず、`cc_entrypoint=cli` か請求ヘッダ無し | `main` |
+| `unknown` | `metadata.user_id` が無い / 読めない | `main` |
+
+`oneshot` を `sub` 側に寄せるのは、**1 回きりの呼び出しには続きが来ない**から。
+続きを当て込んだ扱い (1 時間持たせる・合図を出す) をしても報われず、割増だけが
+残る。`sub` に `keepalive` を書けないので、見張りの対象からも自動的に外れる。判定は
 Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が持つ —
 読む対象は upstream ではなくクライアントの本文なので、経路を切り替えても
 同じ 1 本が別の戦略に落ちない。他方言 (openai) は unknown = main 扱い。

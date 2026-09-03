@@ -84,8 +84,12 @@ sub = "none"
 その組み合わせは起動時のログと `llm-gateway check` が名前を挙げる。
 
 触るのは `cache_control` だけで、ブレークポイントの位置と数は変えない。
-メイン / サブエージェントの判定はリクエストの `metadata.user_id` に
-`parent_session_id` があるかで決まり、読めない相手はメイン扱い。
+呼び出し元は 4 通りに分かれる。`metadata.user_id` に `parent_session_id` が
+あればサブエージェント (`sub`)。無い場合は `system` 先頭ブロックの請求ヘッダを
+見て、`cc_entrypoint` が `cli` 以外 (`sdk-cli` = `claude -p` 等) なら 1 回きりの
+呼び出し (`oneshot`)、`cli` か請求ヘッダ無しならメイン (`main`)。`metadata` が
+読めない相手 (`unknown`) はメイン扱い。**`sub` 側の戦略に乗るのは `sub` と
+`oneshot`** — どちらも続きが来ないので、続きを当て込んだ扱いをしても報われない。
 
 `keepalive` は合図を `webhook` 経由でしか届けられない。`webhook.base_url` を
 書いていない設定では合図を出さない (= `1h` と同じ動作)。`llm-gateway check` が
@@ -327,7 +331,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
-(`main` / `sub` / `unknown`)。`cache_ttl_secs` は**この 1 本が残す
+(`main` / `sub` / `oneshot` / `unknown`)。`cache_ttl_secs` は**この 1 本が残す
 プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
 送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
 `cache_expires_at` / `cache_expires_at_iso` はその時刻。ブレークポイントの

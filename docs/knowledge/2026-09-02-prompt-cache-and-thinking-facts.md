@@ -82,6 +82,9 @@ Claude Code の実リクエスト (同日)。
   **無ければ main 系** (main、`claude --fork-session` の fork、main 直下の classifier)、
   **あれば subagent 系** (Agent tool / `/subtask` の fork 型 subagent とその classifier、
   値は親 session_id と同一)。fork は gateway からは独立セッションに見える
+- **`claude -p` (one-shot) は system[0] の請求ヘッダが `cc_entrypoint=sdk-cli;`**、
+  対話セッションは `cc_entrypoint=cli;` (2026-09-03 実測)。`metadata.user_id` には
+  parent が無いので、これを見ないと main と区別できない
 - `system[0]` は `x-anthropic-billing-header: cc_version=<ver>; cc_entrypoint=cli;`
   で、Claude Code のバージョンは本文からも読める (User-Agent にも入る)
 - 過去 7 日の実績 (docs は scripts/cache-cost-sim.py): 費用は write が 6 割超、

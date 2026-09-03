@@ -85,9 +85,14 @@ A model the price table does not cover cannot turn a share into hours, so it fal
 to the default of eight hours; the startup log and `llm-gateway check` name those
 combinations.
 
-Only `cache_control` is touched; breakpoints are never added or moved. A request
-counts as a subagent when its `metadata.user_id` carries `parent_session_id`;
-a caller that cannot be read is treated as the main conversation.
+Only `cache_control` is touched; breakpoints are never added or moved. A request counts as a
+subagent (`sub`) when its `metadata.user_id` carries `parent_session_id`. Without one,
+the billing header in the first `system` block decides: any `cc_entrypoint` other than
+`cli` (`sdk-cli`, from `claude -p`) is a one-shot call (`oneshot`), while `cli` or no
+header at all is the main conversation (`main`). A caller that cannot be read
+(`unknown`) is treated as the main conversation. **The `sub` side applies to both `sub`
+and `oneshot`** — neither is continued, so treating them as a conversation to come pays
+nothing back.
 
 `keepalive` can only reach a conversation through the `webhook` destination. With
 no `webhook.base_url` configured no signal is raised (so it behaves exactly like
@@ -332,7 +337,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
-omitted. `origin` says who asked (`main` / `sub` / `unknown`). `cache_ttl_secs` is
+omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`). `cache_ttl_secs` is
 **how long the prefix this request leaves behind lives**, in seconds: it follows the
 strategy that was applied, and for an untouched body it reads the `cache_control` that
 was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
