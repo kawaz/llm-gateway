@@ -30,6 +30,7 @@ class Request:
     output: int
     write_5m: int
     write_1h: int
+    is_sidechain: bool | None
     gap_minutes: float | None = None
     rebuild: bool = False
 
@@ -157,6 +158,7 @@ def read_session(path: Path, cutoff: datetime) -> Session | None:
                 output=integer(usage.get("output_tokens")),
                 write_5m=integer(cache_creation.get("ephemeral_5m_input_tokens")),
                 write_1h=integer(cache_creation.get("ephemeral_1h_input_tokens")),
+                is_sidechain=record.get("isSidechain") if isinstance(record.get("isSidechain"), bool) else None,
             )
         )
         cwd = record.get("cwd") or cwd
@@ -278,8 +280,32 @@ def aggregate(sessions: list[Session]) -> Session:
     return total
 
 
+def group_trend(main: Session, subagent: Session) -> str:
+    def write_share(session: Session) -> float:
+        cache = session.read + session.write
+        return session.write / cache * 100 if cache else 0
+
+    def rebuild_share(session: Session) -> float:
+        return session.rebuild_write / session.write * 100 if session.write else 0
+
+    main_write = write_share(main)
+    sub_write = write_share(subagent)
+    main_rebuild = rebuild_share(main)
+    sub_rebuild = rebuild_share(subagent)
+    if main_write > sub_write and main_rebuild > sub_rebuild:
+        return f"main は subagent より write 比率（{main_write:.1f}% vs {sub_write:.1f}%）と rebuild 比率（{main_rebuild:.1f}% vs {sub_rebuild:.1f}%）が高く、待機を挟む長寿命 session の影響が強い。subagent は連続実行による read 再利用が相対的に多い。"
+    if main_write < sub_write and main_rebuild < sub_rebuild:
+        return f"subagent は main より write 比率（{sub_write:.1f}% vs {main_write:.1f}%）と rebuild 比率（{sub_rebuild:.1f}% vs {main_rebuild:.1f}%）が高く、短命でも cache 再構築の影響が強い。"
+    return f"write 比率は main {main_write:.1f}% / subagent {sub_write:.1f}%、rebuild 比率は main {main_rebuild:.1f}% / subagent {sub_rebuild:.1f}%で、2指標の傾向は一致しない。"
+
+
 def render(sessions: list[Session], cutoff: datetime, generated: datetime) -> str:
     total = aggregate(sessions)
+    grouped_sessions = {
+        label: [session for session in sessions if kind(session.path) == label]
+        for label in ("main", "subagent")
+    }
+    grouped = {label: aggregate(items) for label, items in grouped_sessions.items()}
     actual = actual_cost(total)
     sim_b, sim_a, sim_a_bad = simulated_costs(total)
     cache_total = total.read + total.write
@@ -288,6 +314,16 @@ def render(sessions: list[Session], cutoff: datetime, generated: datetime) -> st
     rebuild_cost = usd(total.rebuild_write, RATES["write_5m"])
     raw = total.raw_entries
     deduped = len(total.requests)
+    sidechain_mismatches = [
+        request
+        for session in sessions
+        for request in session.requests
+        if request.is_sidechain is None or request.is_sidechain != (kind(session.path) == "subagent")
+    ]
+    mismatch_sessions = sum(
+        any(request.is_sidechain is None or request.is_sidechain != (kind(session.path) == "subagent") for request in session.requests)
+        for session in sessions
+    )
 
     lines = [
         "# Prompt cache 費用と TTL シミュレーション",
@@ -300,6 +336,31 @@ def render(sessions: list[Session], cutoff: datetime, generated: datetime) -> st
         f"- rebuild: {sum(total.rebuild_count_by_gap.values()):,} 回 / {mtok(total.rebuild_write)}M write tokens / 実績5m write費 {money(rebuild_cost)}",
         f"- rebuild gap: {gap_summary(total)}",
         f"- 判定: {effectiveness(total)}",
+        f"- main/subagent 分類: jsonl path を基準にし、dedupe 後 entry の isSidechain と照合。不一致 {len(sidechain_mismatches):,} requests / {mismatch_sessions} sessions。",
+        "",
+        "### main / subagent 比較",
+        "",
+        "| 群 | sessions | requests | rt M | wt M | it M | ot M | rc | wc | ic | oc | read:write | rebuild/write | rebuild gap（回数/write M） | B 差額 | A α=0 差額 | A α悲観差額 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|",
+    ]
+    for label in ("main", "subagent"):
+        group = grouped[label]
+        group_actual = actual_cost(group)
+        group_b, group_a, group_bad = simulated_costs(group)
+        group_cache = group.read + group.write
+        group_read_share = group.read / group_cache * 100 if group_cache else 0
+        group_write_share = group.write / group_cache * 100 if group_cache else 0
+        group_rebuild_share = group.rebuild_write / group.write * 100 if group.write else 0
+        lines.append(
+            f"| {label} | {len(grouped_sessions[label])} | {len(group.requests):,} | {mtok(group.read)} | {mtok(group.write)} | {mtok(group.input)} | {mtok(group.output)} | "
+            f"{money(usd(group.read, RATES['read']))} | {money(usd(group.write, RATES['write_5m']))} | {money(usd(group.input, RATES['input']))} | {money(usd(group.output, RATES['output']))} | "
+            f"{group_read_share:.1f}%:{group_write_share:.1f}% | {group_rebuild_share:.1f}% | {gap_summary(group)} | {money(group_b - group_actual)} | {money(group_a - group_actual)} | {money(group_bad - group_actual)} |"
+        )
+    lines += [
+        "",
+        f"- 群別傾向: {group_trend(grouped['main'], grouped['subagent'])}",
+        f"- main: {effectiveness(grouped['main'])}",
+        f"- subagent: {effectiveness(grouped['subagent'])}",
         "",
         "## 集計条件",
         "",
