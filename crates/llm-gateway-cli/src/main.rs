@@ -156,6 +156,7 @@ to listen, remove disabled from [server], or point --config at another configura
             .restore(llm_gateway::credential::time::now_unix())
             .await;
         gateway.start_status();
+        gateway.start_keepalive();
 
         tracing::info!(
             listen = %config.server.listen,

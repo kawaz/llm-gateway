@@ -95,6 +95,17 @@ sub = "none"
 書いていない設定では合図を出さない (= `1h` と同じ動作)。`llm-gateway check` が
 その namespace を警告として挙げる。
 
+### keepalive の運用
+
+止まっている会話の見張りは `<stats の置き場>/keepalive/<待ち受け>.json` に残り、
+再起動で読み戻される (`stats.dir` の既定は `~/.local/state/llm-gateway/stats`)。
+待ち受けごとに別ファイルなので、同じ置き場を複数プロセスで共有してよい。
+
+複数プロセスを LB の後ろで動かす場合、合図は**観測だけで 1 本に収束する**
+(他プロセスの合図を見たら控えに回る)。振り分けは優先度型 (Caddy の
+`lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を
+推奨。round-robin でも収束するが、収束するまでの重複した合図が増える。
+
 ## 転送系
 
 ### `POST /{ns}/v1/messages`

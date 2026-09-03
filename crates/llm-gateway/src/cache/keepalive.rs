@@ -9,8 +9,15 @@
 //! 流し、文面を会話へ流し込むのは受け取った側 (ccmsg) の仕事。戻ってきた
 //! リクエストは合言葉 (nonce) で見分ける。
 //!
-//! 状態はプロセス内のメモリだけ。落ちれば消えるが、次の実リクエストで
-//! 張り直されるので、失うのは合図 1 回分の機会だけ。
+//! 見張りは[置き場]へも落とす。動いている会話なら次のリクエストで張り直るが、
+//! **止まっている会話は誰も張り直さない** — そこを繋ぐのが keepalive の
+//! 仕事なので、リリースのたびに全部落とすと意味がない。
+//!
+//! 出したままの合言葉 (nonce) は落とさない。再起動を跨いで戻ってきた合図は
+//! 「出した覚えのない合言葉」= [`Marker::Foreign`] になり、控えとして
+//! 吸収される — 別のプロセスの合図と同じ扱いで正しく収束する。
+//!
+//! [置き場]: store
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::credential::time::now_unix;
 use crate::egress::BoxFuture;
@@ -51,6 +58,8 @@ const MARGIN: Duration = Duration::from_secs(30);
 
 /// 合言葉の長さ (バイト)。
 const NONCE_BYTES: usize = 32;
+
+pub mod store;
 
 /// 会話系列。同じ会話でも、系列が違えば別の cache になる (DR-0012 の `prefix`)。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -103,11 +112,25 @@ pub trait Reachable: Send + Sync {
     fn usable<'a>(&'a self, bound: &'a Bound) -> BoxFuture<'a, bool>;
 }
 
+/// 置く予定 1 つ。欄が増えたときに位置で取り違えないよう、名前で書く。
+struct Plan {
+    series: Series,
+    /// 今から合図を出すまでの間。
+    after: Duration,
+    /// この系列の cache が消える時刻。
+    expires_at: Instant,
+    horizon_end: Instant,
+    bound: Bound,
+    kind: store::Kind,
+}
+
 /// 合図を出す仕掛け。
 pub struct Keepalive {
     events: Arc<Events>,
     /// 直前に通った経路がまだ使えるかを聞く先。
     reach: Arc<dyn Reachable>,
+    /// 見張りを再起動を跨いで残す置き場。持たない (= 残さない) 構成もある。
+    store: Option<store::Store>,
     state: Mutex<State>,
 }
 
@@ -122,10 +145,17 @@ struct State {
 struct Watched {
     /// 次に合図を出す予定。出した直後は空 (戻りを待っている間)。
     timer: Option<Timer>,
+    /// 次に合図を出す時刻。予定を持たない間 (戻り待ち) も、置き場に残すために
+    /// 覚えておく。
+    fires_at: Instant,
+    /// この系列の cache が消える時刻。過ぎていれば張り直す意味がない。
+    expires_at: Instant,
     /// この系列に合図を出し続ける終わり。実リクエストのたびに先へ延びる。
     horizon_end: Instant,
     /// 直前の実リクエストが通った先。合図の往復では書き換えない。
     bound: Bound,
+    /// 自分が出す番か、別のプロセスの後ろに控えているか。
+    kind: store::Kind,
 }
 
 /// 予定の実体。畳まれたら止まる。
@@ -148,8 +178,90 @@ impl Keepalive {
         Self {
             events,
             reach,
+            store: None,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// 見張りを残す置き場を持たせる。
+    pub fn with_store(mut self, store: store::Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// 前回の見張りを読み戻す (DR-0024 §2)。
+    ///
+    /// 予定の時刻がまだ来ていなければ残りの時間で、過ぎていても cache が
+    /// 生きている間なら**すぐに**出す。cache が消えた後・期間の終わった系列は
+    /// 捨てる — 出しても繋ぐものが無い。
+    pub fn restore(self: &Arc<Self>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let (now, now_unix) = (Instant::now(), now_unix());
+        let mut restored = 0;
+        for saved in store.load() {
+            if saved.expires_at <= now_unix || saved.horizon_end <= now_unix {
+                continue;
+            }
+            let series = Series {
+                session_id: saved.session_id,
+                prefix: saved.prefix,
+            };
+            let bound = Bound {
+                ns: saved.ns,
+                model: saved.model,
+                route: saved.route,
+            };
+            let after = Duration::from_secs((saved.fires_at - now_unix).max(0) as u64);
+            debug!(
+                session = %series.session_id,
+                prefix = %series.prefix,
+                kind = saved.kind.as_str(),
+                seconds = after.as_secs(),
+                "restoring a cache keepalive watch"
+            );
+            self.plan(Plan {
+                series,
+                after,
+                expires_at: now + Duration::from_secs((saved.expires_at - now_unix).max(0) as u64),
+                horizon_end: now
+                    + Duration::from_secs((saved.horizon_end - now_unix).max(0) as u64),
+                bound,
+                kind: saved.kind,
+            });
+            restored += 1;
+        }
+        if restored > 0 {
+            info!(series = restored, "picked up the cache keepalive watch");
+        }
+    }
+
+    /// 今の見張りを置き場へ落とす。
+    pub fn save(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let (now, now_unix) = (Instant::now(), now_unix());
+        let watched: Vec<store::Saved> = self
+            .state
+            .lock()
+            .unwrap()
+            .watched
+            .iter()
+            .map(|(series, watched)| store::Saved {
+                session_id: series.session_id.clone(),
+                prefix: series.prefix.clone(),
+                ns: watched.bound.ns.clone(),
+                model: watched.bound.model.clone(),
+                route: watched.bound.route.clone(),
+                fires_at: unix_of(watched.fires_at, now, now_unix),
+                expires_at: unix_of(watched.expires_at, now, now_unix),
+                horizon_end: unix_of(watched.horizon_end, now, now_unix),
+                kind: watched.kind,
+            })
+            .collect();
+        store.save(&watched);
     }
 
     /// 実リクエストを送った。見張りを張り直す。
@@ -159,7 +271,13 @@ impl Keepalive {
     /// 通った先を延ばせるのは、この 1 本だけ。
     pub fn armed_by_request(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
         let horizon_end = Instant::now() + horizon;
-        self.schedule(series, REFRESH_AFTER, horizon_end, bound);
+        self.schedule(
+            series,
+            REFRESH_AFTER,
+            horizon_end,
+            bound,
+            store::Kind::Primary,
+        );
     }
 
     /// 自分が出した合図が戻ってきた。同じ期間の中で次の予定だけ置き直す。
@@ -171,7 +289,13 @@ impl Keepalive {
         let Some((horizon_end, bound)) = self.watch_of(&series) else {
             return;
         };
-        self.schedule(series, REFRESH_AFTER, horizon_end, bound);
+        self.schedule(
+            series,
+            REFRESH_AFTER,
+            horizon_end,
+            bound,
+            store::Kind::Primary,
+        );
     }
 
     /// 別のプロセスが出した合図を見た。一歩下がって控える (DR-0024 §2)。
@@ -187,7 +311,13 @@ impl Keepalive {
         let (horizon_end, bound) = self
             .watch_of(&series)
             .unwrap_or_else(|| (Instant::now() + horizon, bound));
-        self.schedule(series, STANDBY_AFTER, horizon_end, bound);
+        self.schedule(
+            series,
+            STANDBY_AFTER,
+            horizon_end,
+            bound,
+            store::Kind::Standby,
+        );
     }
 
     /// 見張っている系列の、期間の終わりと通った先。期間を過ぎていれば畳む。
@@ -200,6 +330,8 @@ impl Keepalive {
             }
             Some(_) => {
                 state.watched.remove(series);
+                drop(state);
+                self.save();
                 None
             }
             None => None,
@@ -213,26 +345,46 @@ impl Keepalive {
         after: Duration,
         horizon_end: Instant,
         bound: Bound,
+        kind: store::Kind,
     ) {
         let now = Instant::now();
-        let fires_at = now + after;
-        let deadline = now + LIFETIME - MARGIN;
-        let deadline_unix = now_unix() + (LIFETIME - MARGIN).as_secs() as i64;
+        self.plan(Plan {
+            series,
+            after,
+            // この 1 本が置いた cache が消える時刻。合図が間に合ったかの
+            // 判定にも、置き場から読み戻すかの判定にも使う。
+            expires_at: now + LIFETIME - MARGIN,
+            horizon_end,
+            bound,
+            kind,
+        });
+    }
+
+    /// 予定を 1 つ置いて、置き場へ落とす。
+    fn plan(self: &Arc<Self>, plan: Plan) {
+        let now = Instant::now();
+        let fires_at = now + plan.after;
+        let expires_at = plan.expires_at;
+        let expires_at_unix = unix_of(expires_at, now, now_unix());
         let waking = Arc::clone(self);
-        let ringing = series.clone();
+        let ringing = plan.series.clone();
         let timer = Timer(tokio::spawn(async move {
             tokio::time::sleep_until(fires_at).await;
-            waking.fire(ringing, deadline, deadline_unix).await;
+            waking.fire(ringing, expires_at, expires_at_unix).await;
         }));
         // 前の予定は差し替えで畳まれる (`Timer` の Drop が止める)。
         self.state.lock().unwrap().watched.insert(
-            series,
+            plan.series,
             Watched {
                 timer: Some(timer),
-                horizon_end,
-                bound,
+                fires_at,
+                expires_at,
+                horizon_end: plan.horizon_end,
+                bound: plan.bound,
+                kind: plan.kind,
             },
         );
+        self.save();
     }
 
     /// この系列の実リクエストが最後に通った先。
@@ -250,9 +402,12 @@ impl Keepalive {
     /// 合言葉を持たないリクエストが来た = 人が会話を再開した。出したままの
     /// 合図は用済みで、戻ってきても 1 時間を付ける理由がない。
     pub fn forget(&self, series: &Series) {
-        let mut state = self.state.lock().unwrap();
-        state.watched.remove(series);
-        state.pending.retain(|_, pending| &pending.series != series);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.watched.remove(series);
+            state.pending.retain(|_, pending| &pending.series != series);
+        }
+        self.save();
     }
 
     /// 本文が合図の戻りなら、合言葉を使い切って扱いを返す。
@@ -315,6 +470,7 @@ impl Keepalive {
         }
         state.pending.insert(nonce, Pending { series, deadline });
         drop(state);
+        self.save();
         self.events.publish(notice);
     }
 
@@ -334,6 +490,18 @@ impl Keepalive {
             .values()
             .filter(|watched| watched.timer.is_some())
             .count()
+    }
+}
+
+/// 単調時計の時刻を、置き場に書ける時刻へ直す。
+///
+/// 単調時計は保存できない (再起動で起点が変わる)。読み書きの瞬間の対応
+/// 1 組だけを使って差で写す。
+fn unix_of(instant: Instant, now: Instant, now_unix: i64) -> i64 {
+    if instant >= now {
+        now_unix + (instant - now).as_secs() as i64
+    } else {
+        now_unix - (now - instant).as_secs() as i64
     }
 }
 
@@ -789,5 +957,113 @@ mod tests {
 
         tokio::time::advance(STANDBY_AFTER + Duration::from_secs(1)).await;
         assert_eq!(signalled(watching.recv().await.unwrap()).session_id, "s-1");
+    }
+
+    /// 置き場を持たせた見張り。
+    fn keepalive_storing(
+        dir: &std::path::Path,
+    ) -> (Arc<Keepalive>, tokio::sync::broadcast::Receiver<Notice>) {
+        let events = Arc::new(Events::new());
+        let watching = events.subscribe();
+        let keepalive = Keepalive::new(events, Arc::new(Reach::open()))
+            .with_store(store::Store::new(dir, "127.0.0.1:11301"));
+        (Arc::new(keepalive), watching)
+    }
+
+    /// 止まっている会話の見張りは、再起動を跨いで残る (DR-0024 §2)。
+    ///
+    /// 動いている会話なら次のリクエストで張り直るが、止まっている会話は
+    /// 誰も張り直さない。
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (before, _) = keepalive_storing(dir.path());
+        before.armed_by_request(series(), bound(), HORIZON);
+        drop(before);
+
+        // ここで落ちて、起動し直す。
+        let (after, mut watching) = keepalive_storing(dir.path());
+        after.restore();
+        assert_eq!(after.armed(), 1, "the watch was picked up");
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        let signal = signalled(watching.recv().await.unwrap());
+        assert_eq!(signal.session_id, "s-1");
+        assert_eq!(signal.prefix, "2cf24dba");
+    }
+
+    /// 予定の時刻を過ぎていても、cache が生きている間はすぐに出す。
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_that_came_due_while_down_signals_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::Store::new(dir.path(), "127.0.0.1:11301");
+        let now = now_unix();
+        store.save(&[store::Saved {
+            session_id: "s-1".to_owned(),
+            prefix: "2cf24dba".to_owned(),
+            ns: "default".to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+            // 止まっている間に予定の時刻が過ぎた。cache はまだ生きている。
+            fires_at: now - 60,
+            expires_at: now + 120,
+            horizon_end: now + 3600,
+            kind: store::Kind::Primary,
+        }]);
+
+        let (keepalive, mut watching) = keepalive_storing(dir.path());
+        keepalive.restore();
+
+        settle().await;
+        assert_eq!(
+            signalled(watching.recv().await.unwrap()).session_id,
+            "s-1",
+            "the remaining life is worth one signal right away"
+        );
+    }
+
+    /// cache の消えた系列と、期間の終わった系列は読み戻さない。
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_with_nothing_left_to_extend_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::Store::new(dir.path(), "127.0.0.1:11301");
+        let now = now_unix();
+        let saved = |expires_at: i64, horizon_end: i64| store::Saved {
+            session_id: "s-1".to_owned(),
+            prefix: "2cf24dba".to_owned(),
+            ns: "default".to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+            fires_at: now + 60,
+            expires_at,
+            horizon_end,
+            kind: store::Kind::Primary,
+        };
+
+        for gone in [
+            // cache が消えている。
+            saved(now - 1, now + 3600),
+            // 見張る期間が終わっている。
+            saved(now + 120, now - 1),
+        ] {
+            store.save(&[gone]);
+            let (keepalive, _watching) = keepalive_storing(dir.path());
+            keepalive.restore();
+            assert_eq!(keepalive.armed(), 0);
+        }
+    }
+
+    /// 畳んだ系列は置き場からも消える。
+    #[tokio::test(start_paused = true)]
+    async fn what_was_forgotten_does_not_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (before, _) = keepalive_storing(dir.path());
+        before.armed_by_request(series(), bound(), HORIZON);
+        before.forget(&series());
+        drop(before);
+
+        let (after, _watching) = keepalive_storing(dir.path());
+        after.restore();
+        assert_eq!(after.armed(), 0);
     }
 }

@@ -98,6 +98,19 @@ nothing back.
 no `webhook.base_url` configured no signal is raised (so it behaves exactly like
 `1h`), and `llm-gateway check` lists that namespace as a warning.
 
+### Running keepalive
+
+The watch over a stopped conversation is kept in
+`<stats dir>/keepalive/<listener>.json` and picked up again after a restart
+(`stats.dir` defaults to `~/.local/state/llm-gateway/stats`). Each listener writes its
+own file, so several processes may share one directory.
+
+With several processes behind a load balancer, the signal **converges on a single one
+from observation alone** (a process that sees another's signal steps back). Prefer a
+priority policy (Caddy's `lb_policy first`) or sticky routing keyed on the
+`X-Claude-Code-Session-Id` header; round-robin also converges, but with more duplicate
+signals along the way.
+
 ## Forwarding
 
 ### `POST /{ns}/v1/messages`

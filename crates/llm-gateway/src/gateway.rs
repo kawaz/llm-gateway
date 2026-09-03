@@ -117,10 +117,19 @@ impl<P: Persistence> Gateway<P> {
         let events = Arc::new(Events::new());
         let tap = Arc::new(Tap::new());
         let router = Arc::new(Router::new(config.clone(), Arc::clone(&events)));
-        let keepalive = Arc::new(keepalive::Keepalive::new(
-            Arc::clone(&events),
-            Arc::new(RouterReach(Arc::clone(&router))),
-        ));
+        // 見張りは日次集計と同じ置き場に、待ち受けごとのファイルで残す
+        // (DR-0024 §2)。止まっている会話は次のリクエストが来ないので、
+        // 再起動で落とすと誰も張り直さない。
+        let keepalive = Arc::new(
+            keepalive::Keepalive::new(
+                Arc::clone(&events),
+                Arc::new(RouterReach(Arc::clone(&router))),
+            )
+            .with_store(keepalive::store::Store::new(
+                config.stats.resolve_dir(),
+                &config.server.listen,
+            )),
+        );
 
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
@@ -293,6 +302,7 @@ impl<P: Persistence> Gateway<P> {
         if let Err(e) = self.usage.save().await {
             tracing::warn!(%e, "cannot save usage");
         }
+        self.keepalive.save();
     }
 
     /// 一定の間隔で落とし続ける。
@@ -910,6 +920,11 @@ impl<P: Persistence> Gateway<P> {
             skipped.to_vec(),
         ));
         Ok(resp)
+    }
+
+    /// 前回の見張りを読み戻して、合図の予定を張り直す (DR-0024 §2)。
+    pub fn start_keepalive(&self) {
+        self.keepalive.restore();
     }
 
     /// upstream service 状態の収集を開始する。
