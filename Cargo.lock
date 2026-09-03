@@ -752,7 +752,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llm-gateway"
-version = "0.31.1"
+version = "0.31.2"
 dependencies = [
  "axum",
  "base64",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "llm-gateway-cli"
-version = "0.31.1"
+version = "0.31.2"
 dependencies = [
  "axum",
  "llm-gateway",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "llm-gateway-server"
-version = "0.31.1"
+version = "0.31.2"
 dependencies = [
  "axum",
  "futures-util",
