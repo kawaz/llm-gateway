@@ -37,6 +37,9 @@ pub struct Event {
     pub request_body_size: usize,
     pub response_body_size: usize,
     pub credential: Option<String>,
+    /// 効かせた prompt cache 戦略 (DR-0024)。設定に当たらなければ出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +191,7 @@ mod tests {
             request_body_size: 6,
             response_body_size: 6,
             credential: None,
+            cache_strategy: None,
             request_body: Some("abcdef".into()),
             response_body: Some("uvwxyz".into()),
         }

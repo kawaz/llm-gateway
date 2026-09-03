@@ -18,6 +18,7 @@
 //! - [`metering`] トークン集計の正規形と、単価を引き当てる契約
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
 
+pub mod cache;
 pub mod config;
 pub mod credential;
 pub mod denial;
@@ -65,6 +66,7 @@ mod provider_neutrality {
     /// クライアント方言と設定の語彙は、どの upstream を選ぶかとは別の軸で
     /// 実名を持つ (DR-0004 の 2 軸)。
     const GENERIC: &[&str] = &[
+        "cache.rs",
         "egress.rs",
         "provider.rs",
         "metering.rs",

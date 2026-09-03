@@ -12,6 +12,7 @@ mod auth;
 pub mod beta;
 mod metering;
 mod negotiation;
+mod origin;
 mod quota_api;
 mod wire;
 
@@ -20,6 +21,7 @@ use std::sync::Arc;
 pub use auth::OauthBearer;
 pub use metering::AnthropicMetering;
 pub use negotiation::BetaFlags;
+pub use origin::MetadataOrigin;
 pub use quota_api::OauthUsage;
 pub use wire::AnthropicWire;
 
@@ -62,6 +64,7 @@ pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     )
     .with_quota_api(Arc::new(quota_api))
     .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
+    .with_caller_origin(Arc::new(MetadataOrigin))
     .with_quota_support(Support::Unobserved)
 }
 

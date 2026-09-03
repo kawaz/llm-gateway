@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::credential::Credential;
 use crate::egress::{Headers, UpstreamRequest};
-use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, beta};
+use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, MetadataOrigin, beta};
 use crate::provider::{Auth, Preset};
 use crate::quota::Support;
 use crate::{Error, Result};
@@ -74,6 +74,7 @@ pub fn preset(name: &str, wire: Arc<AnthropicWire>, deny_beta: Option<Vec<String
         Arc::new(AnthropicMetering),
     )
     .with_negotiation(Arc::new(BetaFlags::new(policy)))
+    .with_caller_origin(Arc::new(MetadataOrigin))
     // 使用量は別の IAM アクションで、実行権限しかない API キーでは取れない。
     .with_quota_support(Support::NotApplicable)
 }

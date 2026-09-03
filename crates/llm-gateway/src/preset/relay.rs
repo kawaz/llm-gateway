@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::Result;
 use crate::credential::Credential;
 use crate::egress::UpstreamRequest;
-use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, beta};
+use crate::preset::anthropic::{AnthropicMetering, AnthropicWire, BetaFlags, MetadataOrigin, beta};
 use crate::provider::{Auth, Preset};
 use crate::quota::Support;
 
@@ -33,6 +33,7 @@ impl Auth for NoAuth {
 pub fn preset(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     Preset::new(name, Arc::new(NoAuth), wire, Arc::new(AnthropicMetering))
         .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
+        .with_caller_origin(Arc::new(MetadataOrigin))
         // 枠を返すかどうかは転送先次第。こちらからは何とも言えない。
         .with_quota_support(Support::UpstreamDependent)
 }

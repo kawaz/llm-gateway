@@ -15,7 +15,8 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::config::{Config, Namespace};
+use crate::cache;
+use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::now_unix;
 use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
@@ -395,6 +396,7 @@ impl<P: Persistence> Gateway<P> {
             path,
             query,
             body: &body,
+            cache: ns.cache_for(&model),
         };
         let routes = self
             .router
@@ -446,6 +448,8 @@ impl<P: Persistence> Gateway<P> {
                     model,
                     // 自前で組んだ断りなので、消費したトークンは無い。
                     usage: None,
+                    // 送っていないので、本文には触っていない。
+                    cache_strategy: None,
                 });
             }
         };
@@ -486,12 +490,14 @@ impl<P: Persistence> Gateway<P> {
                     // (DR-0014 §4)。受け取り口は preset を知らないので、読む役を
                     // 応答と一緒に持たせて渡す。
                     let usage = usage_observer(route.preset.as_ref(), &resp);
+                    let cache_strategy = call.cache_strategy(route.preset.as_ref());
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
                         route: route.name().to_owned(),
                         model,
                         usage,
+                        cache_strategy,
                     });
                 }
                 Err(Switch {
@@ -577,6 +583,7 @@ impl<P: Persistence> Gateway<P> {
                 model,
                 // 断られた応答に usage は載らない (DR-0011)。
                 usage: None,
+                cache_strategy: None,
             });
         }
 
@@ -723,6 +730,11 @@ impl<P: Persistence> Gateway<P> {
         let mut body = call.body.clone();
         if let Some(upstream) = &route.upstream_model {
             egress::rewrite_model(&mut body, upstream);
+        }
+        // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
+        // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
+        if let Some(strategy) = call.cache_strategy(route.preset.as_ref()) {
+            cache::apply(&mut body, strategy);
         }
 
         let sent_at = now_unix();
@@ -1097,6 +1109,9 @@ struct Call<'a> {
     path: &'a str,
     query: Option<&'a str>,
     body: &'a Value,
+    /// このモデルに当たった prompt cache の規則 (DR-0024)。当たらなければ
+    /// `None` で、本文には触らない。解決後のモデル名で 1 回引く。
+    cache: Option<&'a CacheRule>,
 }
 
 impl<'a> Call<'a> {
@@ -1109,6 +1124,16 @@ impl<'a> Call<'a> {
             model: self.model,
             credential,
         }
+    }
+
+    /// この経路へ送るときに効く prompt cache 戦略 (DR-0024)。
+    ///
+    /// 呼び出し元 (メイン / サブエージェント) を読めるのは方言を知っている
+    /// 経路だけなので、経路ごとに聞く。同じ本文なら答えも同じで、経路を
+    /// 何度試しても本文は同じになる。
+    fn cache_strategy(&self, preset: &Preset) -> Option<CacheStrategy> {
+        let rule = self.cache?;
+        Some(cache::strategy_of(rule, preset.request_origin(self.body)))
     }
 }
 
@@ -1141,6 +1166,9 @@ pub struct Forwarded {
     /// 作れるのは応答を出した provider だけなので、応答と一緒に持ち回る。
     /// 本文へ挟むのは受け取り口 ([`crate::exchange::observe`])。
     pub usage: Option<Box<dyn UsageObserver>>,
+    /// この本文へ効かせた prompt cache 戦略 (DR-0024)。規則に当たらなければ
+    /// `None` で、本文には触っていない。
+    pub cache_strategy: Option<CacheStrategy>,
 }
 
 impl std::fmt::Debug for Forwarded {
@@ -1151,6 +1179,7 @@ impl std::fmt::Debug for Forwarded {
             .field("route", &self.route)
             .field("model", &self.model)
             .field("usage", &self.usage.is_some())
+            .field("cache_strategy", &self.cache_strategy)
             .finish()
     }
 }
@@ -4195,5 +4224,221 @@ type = "codex_oauth"
             .begin_web_login("web", "claude_oauth", oauth::begin_web(), 100)
             .unwrap();
         assert!(gateway.take_web_login("web", None, 101).is_ok());
+    }
+
+    /// 送る本文で、prompt cache のブレークポイントに書いてある ttl。
+    ///
+    /// 生の要求 (ヘッダ + 本文) から本文だけを起こして読む。
+    fn sent_ttls(request: &str) -> Vec<Option<String>> {
+        let body = request.split("\r\n\r\n").nth(1).expect("a body was sent");
+        let body: Value = serde_json::from_str(body).expect("valid JSON was sent");
+        let mut found = Vec::new();
+        crate::cache::visit(&mut body.clone(), &mut |holder| {
+            if let Some(control) = holder.get("cache_control") {
+                found.push(
+                    control
+                        .get("ttl")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        });
+        found
+    }
+
+    /// ブレークポイントを 2 つ持つ、メインの会話からの 1 本。
+    fn caching_request(model: &str, user_id: &str) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 8,
+            "system": [{"type": "text", "text": "head", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+            ]}],
+            "metadata": {"user_id": user_id},
+        })
+    }
+
+    const MAIN: &str = r#"{"session_id":"s1"}"#;
+    const SUB: &str = r#"{"session_id":"s2","parent_session_id":"s1"}"#;
+
+    /// 設定した戦略が、upstream へ送る本文に効く (DR-0024 §1)。
+    #[tokio::test]
+    async fn the_configured_strategy_reaches_the_upstream_body() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[[ns.default.cache]]
+models = ["m"]
+main = "1h"
+sub = "none"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                "/v1/messages",
+                None,
+                caching_request(MODEL, MAIN),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.cache_strategy, Some(CacheStrategy::OneHour));
+        assert_eq!(
+            sent_ttls(&up.requests()[0]),
+            vec![Some("1h".to_owned()); 2],
+            "every breakpoint carries the hour the namespace asked for"
+        );
+    }
+
+    /// サブエージェントには sub 側の戦略が効く。呼び出し元は本文から読む。
+    #[tokio::test]
+    async fn a_subagent_gets_the_strategy_written_for_it() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[[ns.default.cache]]
+models = ["m"]
+main = "1h"
+sub = "none"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                "/v1/messages",
+                None,
+                caching_request(MODEL, SUB),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.cache_strategy, Some(CacheStrategy::None));
+        assert!(
+            sent_ttls(&up.requests()[0]).is_empty(),
+            "no breakpoint is left to carry a ttl"
+        );
+    }
+
+    /// 照合は上から順で、最初に当たった規則だけが効く。
+    #[tokio::test]
+    async fn the_first_matching_cache_rule_wins() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[[ns.default.cache]]
+models = ["m"]
+main = "5m"
+
+[[ns.default.cache]]
+models = ["*"]
+main = "1h"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                "/v1/messages",
+                None,
+                json!({
+                    "model": MODEL,
+                    "max_tokens": 8,
+                    "system": [{"type": "text", "text": "head",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "metadata": {"user_id": MAIN},
+                }),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.cache_strategy, Some(CacheStrategy::FiveMinutes));
+        assert_eq!(
+            sent_ttls(&up.requests()[0]),
+            vec![None],
+            "the later catch-all rule never gets a say"
+        );
+    }
+
+    /// 照合するのは短い名前を解決した後のモデル名。
+    #[tokio::test]
+    async fn cache_rules_match_the_resolved_model_name() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["claude-opus-5"]
+
+[ns.default.aliases]
+opus = "claude-opus-*"
+
+[[ns.default.cache]]
+models = ["claude-opus-*"]
+main = "1h"
+"#,
+            up.url
+        ))
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                "/v1/messages",
+                None,
+                caching_request("opus", MAIN),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.cache_strategy, Some(CacheStrategy::OneHour));
+        assert_eq!(sent_ttls(&up.requests()[0]), vec![Some("1h".to_owned()); 2]);
+    }
+
+    /// 設定を書いていない namespace では、本文はそのまま流れる。
+    #[tokio::test]
+    async fn a_namespace_without_cache_rules_forwards_the_body_as_it_came() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+        let sending = caching_request(MODEL, MAIN);
+
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, sending.clone(), vec![])
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.cache_strategy, None);
+        let sent = up.requests()[0]
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("a body was sent")
+            .to_owned();
+        assert_eq!(
+            serde_json::from_str::<Value>(&sent).unwrap(),
+            sending,
+            "the request is passed through untouched"
+        );
     }
 }
