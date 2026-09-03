@@ -132,6 +132,10 @@ pub struct Namespace {
     #[serde(default)]
     pub routing: Vec<RoutingRule>,
 
+    /// モデルと呼び出し元ごとの prompt cache 戦略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache: Vec<CacheRule>,
+
     /// 短い名前。値はパターンで、当たるもののうち一番新しいものに向く。
     /// 別の短い名前を指してもよい。
     #[serde(default)]
@@ -419,6 +423,57 @@ impl Serialize for Share {
     ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
     }
+}
+
+/// prompt cache の扱い。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheStrategy {
+    #[default]
+    Passthrough,
+    None,
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+    Keepalive,
+}
+
+impl CacheStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::None => "none",
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
+            Self::Keepalive => "keepalive",
+        }
+    }
+}
+
+/// 1 つの prompt cache 規則。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheRule {
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub main: CacheStrategy,
+    #[serde(default)]
+    pub sub: CacheStrategy,
+    #[serde(
+        default = "default_keepalive_horizon",
+        with = "optional_human_duration",
+        skip_serializing_if = "is_default_keepalive_horizon"
+    )]
+    pub keepalive_horizon: Option<Duration>,
+}
+
+fn default_keepalive_horizon() -> Option<Duration> {
+    Some(Duration::from_secs(8 * 60 * 60))
+}
+
+fn is_default_keepalive_horizon(value: &Option<Duration>) -> bool {
+    *value == default_keepalive_horizon()
 }
 
 /// 1 つの振り分け規則。
@@ -827,6 +882,28 @@ mod human_duration {
     }
 }
 
+mod optional_human_duration {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<Duration>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(value) => {
+                serializer.serialize_some(&humantime::format_duration(*value).to_string())
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Duration>, D::Error> {
+        let text = Option::<String>::deserialize(deserializer)?;
+        text.map(|text| humantime::parse_duration(&text).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 /// upstream へ出る 1 経路。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1002,6 +1079,18 @@ impl Config {
                 )));
             }
         }
+        for (i, rule) in ns.cache.iter().enumerate() {
+            if rule.models.is_empty() {
+                return Err(Error::Config(format!(
+                    "namespace `{ns_name}` cache[{i}] does not specify models"
+                )));
+            }
+            if rule.sub == CacheStrategy::Keepalive {
+                return Err(Error::Config(format!(
+                    "namespace `{ns_name}` cache[{i}] cannot use keepalive for sub requests"
+                )));
+            }
+        }
         for (i, rule) in ns.routing.iter().enumerate() {
             if rule.models.is_empty() {
                 return Err(Error::Config(format!(
@@ -1120,6 +1209,15 @@ impl Namespace {
     /// このモデルに当たる振り分け規則。当たらなければ無い。
     fn rule_for(&self, model: &str) -> Option<&RoutingRule> {
         self.routing
+            .iter()
+            .find(|rule| crate::pattern::matches_any(&rule.models, model))
+    }
+
+    /// このモデルに適用する prompt cache 規則。
+    ///
+    /// `cache` の上から照合し、最初に当たった規則を使う。
+    pub fn cache_for(&self, model: &str) -> Option<&CacheRule> {
+        self.cache
             .iter()
             .find(|rule| crate::pattern::matches_any(&rule.models, model))
     }
