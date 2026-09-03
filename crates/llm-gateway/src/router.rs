@@ -647,6 +647,42 @@ impl Router {
         }))
     }
 
+    /// この namespace / モデルで、その経路を今も使えるか (DR-0024 §2)。
+    ///
+    /// 候補に居ること (namespace が許し、upstream が扱う) と、締め出しにも
+    /// pace にも掛かっていないことの両方を見る。合図を出す前の確認に使う —
+    /// 直前に通った経路が塞がっていれば、その会話は別の credential へ流れ、
+    /// 延ばしたい cache には届かない。
+    pub async fn usable(&self, ns_name: &str, model: &str, name: &str, now: i64) -> bool {
+        let Some(ns) = self.config.namespace(ns_name) else {
+            return false;
+        };
+        let allowed = ns
+            .route_groups_for(model, &self.config)
+            .into_iter()
+            .flatten()
+            .any(|candidate| candidate == name);
+        if !allowed {
+            return false;
+        }
+
+        let catalog = self.catalog.read().await;
+        let handled = catalog
+            .visible(ns, &self.config)
+            .get(model)
+            .is_some_and(|available| available.iter().any(|available| available == name));
+        let route = handled
+            .then(|| self.build_route(&catalog, ns, name, model))
+            .flatten();
+        drop(catalog);
+
+        let Some(route) = route else {
+            return false;
+        };
+        route.paced_out(now).is_none()
+            && matches!(route.preset.availability(model, now), Availability::Ready)
+    }
+
     /// 実際に使えた経路を覚える。
     pub async fn remember(
         &self,

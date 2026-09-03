@@ -36,7 +36,7 @@ use crate::{Error, Result};
 
 pub struct Gateway<P: Persistence> {
     config: Config,
-    router: Router,
+    router: Arc<Router>,
     credentials: CredentialStore<P>,
     http: reqwest::Client,
     refresh_interval: std::time::Duration,
@@ -106,11 +106,16 @@ impl<P: Persistence> Gateway<P> {
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
         let tap = Arc::new(Tap::new());
+        let router = Arc::new(Router::new(config.clone(), Arc::clone(&events)));
+        let keepalive = Arc::new(keepalive::Keepalive::new(
+            Arc::clone(&events),
+            Arc::new(RouterReach(Arc::clone(&router))),
+        ));
 
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             watch_interval: std::time::Duration::from_secs(config.discovery.watch_secs),
-            router: Router::new(config.clone(), Arc::clone(&events)),
+            router,
             // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
             // 共有しても、互いのファイルを書かない (DR-0011)。
             stats: Arc::new(Stats::new(
@@ -125,7 +130,7 @@ impl<P: Persistence> Gateway<P> {
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
-            keepalive: Arc::new(keepalive::Keepalive::new(Arc::clone(&events))),
+            keepalive,
             signalling: config.webhook.base_url.is_some(),
             events,
             tap,
@@ -438,8 +443,8 @@ impl<P: Persistence> Gateway<P> {
             keepalive: marker.as_ref().map(|(_, marker)| *marker),
         };
         // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
-        // 経路を試す前に控えておく。
-        let keepalive_note = call.keepalive.map(|marker| marker.as_str().to_owned());
+        // 経路が要らない分はここで控えておく。
+        let taken = call.keepalive.map(|marker| marker.as_str().to_owned());
         let routes = self
             .router
             .routes_for(ns, ns_name, &model, &session)
@@ -492,7 +497,7 @@ impl<P: Persistence> Gateway<P> {
                     usage: None,
                     // 送っていないので、本文には触っていない。
                     cache_strategy: None,
-                    keepalive: keepalive_note,
+                    keepalive: taken.clone(),
                 });
             }
         };
@@ -534,6 +539,9 @@ impl<P: Persistence> Gateway<P> {
                     // 応答と一緒に持たせて渡す。
                     let usage = usage_observer(route.preset.as_ref(), &resp);
                     let cache_strategy = call.cache_strategy(route.preset.as_ref());
+                    let keepalive_note = self
+                        .marker_for(&call, route)
+                        .map(|marker| marker.as_str().to_owned());
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
@@ -628,7 +636,7 @@ impl<P: Persistence> Gateway<P> {
                 // 断られた応答に usage は載らない (DR-0011)。
                 usage: None,
                 cache_strategy: None,
-                keepalive: keepalive_note,
+                keepalive: taken,
             });
         }
 
@@ -766,24 +774,58 @@ impl<P: Persistence> Gateway<P> {
     ///
     /// 期限内に戻ってきた合図にだけ 1 時間を付け、次の合図の予定を置き直す。
     /// 受け口を書いていない設定では何もしない — 出しても届く先がない。
-    fn keep_alive(&self, call: &Call<'_>, body: &mut Value) {
+    fn keep_alive(&self, call: &Call<'_>, route: &Route, body: &mut Value) {
         let Some(series) = &call.series else {
             return;
         };
         if !self.signalling || !keepalive::carries_tools(call.body) {
             return;
         }
-        if call.keepalive == Some(keepalive::Marker::Applied) {
-            cache::apply_one_hour(body);
+        match self.marker_for(call, route) {
+            Some(marker) => {
+                if marker == keepalive::Marker::Applied {
+                    cache::apply_one_hour(body);
+                }
+                // 合図の往復は「人が動かした 1 本」ではないので、見張る期間も
+                // 通った先も延ばさない。
+                self.keepalive.rearm(series.clone(), marker.wrote());
+            }
+            None => {
+                let horizon = call.cache.map_or(
+                    crate::config::DEFAULT_KEEPALIVE_HORIZON,
+                    crate::config::CacheRule::horizon,
+                );
+                self.keepalive.armed_by_request(
+                    series.clone(),
+                    keepalive::Bound {
+                        ns: call.ns.to_owned(),
+                        model: call.model.to_owned(),
+                        route: route.name().to_owned(),
+                    },
+                    horizon,
+                );
+            }
         }
-        let wrote = call
+    }
+
+    /// この経路へ送るときの、合図の戻りとしての扱い (DR-0024 §2)。
+    ///
+    /// 直前の実リクエストとは別の経路へ出ていく合図には 1 時間を付けない。
+    /// 経路が違えば upstream にプレフィックスが無く、どのみち全量を書く —
+    /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図に賭けるほうが安い。
+    /// 発火時にも同じ確認をしているが (`Keepalive::fire`)、出した後で締め出さ
+    /// れた分はここでしか捕まえられない。
+    fn marker_for(&self, call: &Call<'_>, route: &Route) -> Option<keepalive::Marker> {
+        let marker = call.keepalive?;
+        let series = call.series.as_ref()?;
+        let rerouted = self
             .keepalive
-            .map_or(keepalive::Wrote::FiveMinutes, keepalive::Marker::wrote);
-        let horizon = call.cache.map_or(
-            crate::config::DEFAULT_KEEPALIVE_HORIZON,
-            crate::config::CacheRule::horizon,
-        );
-        self.keepalive.arm(series.clone(), wrote, horizon);
+            .bound_route(series)
+            .is_some_and(|bound| bound != route.name());
+        match marker {
+            keepalive::Marker::Applied if rerouted => Some(keepalive::Marker::Rerouted),
+            marker => Some(marker),
+        }
     }
 
     async fn send(
@@ -805,7 +847,7 @@ impl<P: Persistence> Gateway<P> {
         if let Some(strategy) = call.cache_strategy(route.preset.as_ref()) {
             cache::apply(&mut body, strategy);
             if strategy == CacheStrategy::Keepalive {
-                self.keep_alive(call, &mut body);
+                self.keep_alive(call, route, &mut body);
             }
         }
 
@@ -844,9 +886,13 @@ impl<P: Persistence> Gateway<P> {
         // 見ている人へ知らせる (DR-0012)。prompt cache の起点に合わせて、
         // この試行を upstream へ送り始めた時刻を流す。断られた応答も流すので、
         // status で絞らない。
+        let marker = self.marker_for(call, route).map(|marker| marker.as_str());
         self.events.publish(events::Event::with_skipped(
             sent_at,
-            &call.origin(route.name()),
+            &events::Origin {
+                keepalive: marker,
+                ..call.origin(route.name())
+            },
             resp.response.status,
             skipped.to_vec(),
         ));
@@ -1200,7 +1246,7 @@ impl<'a> Call<'a> {
             ns: self.ns,
             model: self.model,
             credential,
-            keepalive: self.keepalive.map(|marker| marker.as_str()),
+            keepalive: self.keepalive.map(keepalive::Marker::as_str),
         }
     }
 
@@ -1230,6 +1276,22 @@ struct Sample {
 /// 束ねるのに対し、[`Response`] は HTTP の応答そのもの (状態・ヘッダ・本文) を
 /// 表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
 /// upstream の応答を表す構造体に溜まっていく (DR-0011)。
+/// 経路がまだ使えるかを router に聞く役 (DR-0024 §2)。
+///
+/// 締め出しや候補の入れ替わりを知っているのは経路を選ぶ側で、合図を出す側は
+/// 答えだけを要る。
+struct RouterReach(Arc<Router>);
+
+impl keepalive::Reachable for RouterReach {
+    fn usable<'a>(&'a self, bound: &'a keepalive::Bound) -> crate::egress::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.0
+                .usable(&bound.ns, &bound.model, &bound.route, now_unix())
+                .await
+        })
+    }
+}
+
 pub struct Forwarded {
     pub response: Response,
     /// この応答を出した credential。relay 型のように認証情報を持たない経路は
@@ -4742,5 +4804,92 @@ main = "keepalive"
 
         assert_eq!(forwarded.keepalive, None, "the nonce was dropped");
         assert_eq!(sent_ttls(&up.requests()[2]), vec![None]);
+    }
+
+    /// 出した後で経路が塞がったら、別経路へ出ていく合図に 1 時間を付けない。
+    ///
+    /// 経路が違えば upstream にプレフィックスが無く、どのみち全量を書く。
+    /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図に賭けるほうが安い。
+    #[tokio::test]
+    async fn a_signal_that_lands_on_another_route_does_not_write_the_hour() {
+        let first = FakeUpstream::always(200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[webhook]
+base_url = "http://127.0.0.1:9/notify"
+
+[[ns.default.cache]]
+models = ["m"]
+main = "keepalive"
+"#,
+            two_credentials(&first.url, &spare.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.forwards(), 1, "the conversation is cached on `a`");
+
+        idle(4 * 60 + 5).await;
+        let raised = signal(&mut watching).await;
+
+        // 合図を出した後で `a` が塞がった。戻りは `b` へ出ていく。
+        let now = now_unix();
+        preset_of(&gw, "a").deny(window_closed(now + 100), now);
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": raised.marker}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive.as_deref(), Some("rerouted"));
+        assert_eq!(
+            sent_ttls(&spare.requests()[0]),
+            vec![None],
+            "a full rewrite at 1.25x beats one at 2x on a cold route"
+        );
+
+        // 見張りは畳まれていない。塞がりが解ければ次の合図が出る。
+        preset_of(&gw, "a").allow(MODEL);
+        idle(4 * 60 + 5).await;
+        assert_eq!(signal(&mut watching).await.session_id, "s-1");
+    }
+
+    /// 通った経路が塞がっている間は、合図そのものを出さない。
+    ///
+    /// 出しても会話は別の credential へ流れ、延ばしたい cache には届かない。
+    /// 塞がりは解けるので、見張りは畳まずに 4 分後にまた試す。
+    #[tokio::test]
+    async fn a_conversation_on_a_closed_route_is_not_signalled() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        let now = now_unix();
+        preset_of(&gw, "a").deny(window_closed(now + 10_000), now);
+        idle(4 * 60 + 5).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "no marker is injected while the cached route is closed"
+        );
+
+        preset_of(&gw, "a").allow(MODEL);
+        idle(4 * 60 + 5).await;
+        assert_eq!(
+            signal(&mut watching).await.session_id,
+            "s-1",
+            "the next attempt signals once the route reopens"
+        );
     }
 }

@@ -21,8 +21,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use tracing::debug;
 
 use crate::credential::time::now_unix;
+use crate::egress::BoxFuture;
 use crate::events::{self, Events};
 
 /// 実リクエストの後、合図を出すまで待つ時間。
@@ -91,6 +93,11 @@ pub enum Marker {
     /// 期限を過ぎていた。付けない — 全量を 2 倍で書くより、1.25 倍の
     /// 書き直しで済ませたほうが安い (DR-0024 §3)。
     Late,
+    /// 直前の実リクエストとは別の経路へ出ていく。付けない — 経路が違えば
+    /// upstream にプレフィックスが無く、どのみち全量を書くことになる。
+    /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図で差分だけ 1 時間に
+    /// するほうが安い。
+    Rerouted,
 }
 
 impl Marker {
@@ -99,24 +106,45 @@ impl Marker {
         match self {
             Self::Applied => "applied",
             Self::Late => "late",
+            Self::Rerouted => "rerouted",
         }
     }
 
     /// この往復が残した cache の寿命。
     ///
-    /// 間に合わなかった合図は 5 分の cache しか残していない。次の合図は
+    /// 1 時間を付けなかった往復は 5 分の cache しか残していない。次の合図は
     /// 1 時間ではなくその 5 分に合わせる。
     pub fn wrote(self) -> Wrote {
         match self {
             Self::Applied => Wrote::OneHour,
-            Self::Late => Wrote::FiveMinutes,
+            Self::Late | Self::Rerouted => Wrote::FiveMinutes,
         }
     }
+}
+
+/// 直前の実リクエストが通った先。
+///
+/// 合図を出す前に、そこがまだ使えるかを確かめるために覚えておく。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    pub ns: String,
+    pub model: String,
+    pub route: String,
+}
+
+/// 経路が今も使えるかを答える口。
+///
+/// 締め出しや候補の入れ替わりを知っているのは経路を選ぶ側なので、こちらは
+/// 答えだけを聞く。
+pub trait Reachable: Send + Sync {
+    fn usable<'a>(&'a self, bound: &'a Bound) -> BoxFuture<'a, bool>;
 }
 
 /// 合図を出す仕掛け。
 pub struct Keepalive {
     events: Arc<Events>,
+    /// 直前に通った経路がまだ使えるかを聞く先。
+    reach: Arc<dyn Reachable>,
     state: Mutex<State>,
 }
 
@@ -133,6 +161,8 @@ struct Watched {
     timer: Option<Timer>,
     /// この系列に合図を出し続ける終わり。実リクエストのたびに先へ延びる。
     horizon_end: Instant,
+    /// 直前の実リクエストが通った先。合図の往復では書き換えない。
+    bound: Bound,
 }
 
 /// 予定の実体。畳まれたら止まる。
@@ -151,36 +181,62 @@ struct Pending {
 }
 
 impl Keepalive {
-    pub fn new(events: Arc<Events>) -> Self {
+    pub fn new(events: Arc<Events>, reach: Arc<dyn Reachable>) -> Self {
         Self {
             events,
+            reach,
             state: Mutex::new(State::default()),
         }
     }
 
-    /// この系列に、次の合図の予定を置き直す。
+    /// 実リクエストを送った。見張りを張り直す。
     ///
     /// 前の予定は捨てる。**次のリクエストが来るたびに先送りされる**ので、
-    /// 会話が動いている間は一度も発火しない。
+    /// 会話が動いている間は一度も発火しない。見張る期間 (`horizon`) と
+    /// 通った先を延ばせるのは、この 1 本だけ。
+    pub fn armed_by_request(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
+        let horizon_end = Instant::now() + horizon;
+        self.schedule(series, Wrote::FiveMinutes, horizon_end, Some(bound));
+    }
+
+    /// 合図の往復や見送りの後、同じ期間の中で次の予定だけ置き直す。
     ///
-    /// `horizon` を過ぎた系列には合図を出さない。1 時間の cache を延々と
-    /// 継ぎ足す価値があるのは、再開される見込みがある間だけ (DR-0024 §3)。
-    pub fn arm(self: &Arc<Self>, series: Series, wrote: Wrote, horizon: Duration) {
+    /// 期間を延ばせるのは実リクエストだけなので、`horizon` を過ぎた系列は
+    /// ここで見張るのをやめる。1 時間の cache を延々と継ぎ足す価値があるのは、
+    /// 再開される見込みがある間だけ (DR-0024 §3)。
+    pub fn rearm(self: &Arc<Self>, series: Series, wrote: Wrote) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
-        let horizon_end = match wrote {
-            // 実リクエストは、この系列を見張る期間そのものを延ばす。
-            Wrote::FiveMinutes => now + horizon,
-            // 合図は自分では期間を延ばさない。延ばせるのは人が動かした分だけで、
-            // 終わりに達した系列はここで見張るのをやめる。
-            Wrote::OneHour => match state.watched.get(&series) {
+        let horizon_end = {
+            let mut state = self.state.lock().unwrap();
+            match state.watched.get(&series) {
                 Some(watched) if watched.horizon_end > now => watched.horizon_end,
                 Some(_) => {
                     state.watched.remove(&series);
                     return;
                 }
                 None => return,
-            },
+            }
+        };
+        self.schedule(series, wrote, horizon_end, None);
+    }
+
+    /// 次に合図を出す時刻を置く。
+    ///
+    /// `bound` を渡したときだけ、通った先の記録も置き換える。
+    fn schedule(
+        self: &Arc<Self>,
+        series: Series,
+        wrote: Wrote,
+        horizon_end: Instant,
+        bound: Option<Bound>,
+    ) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let bound = match bound.or_else(|| state.watched.get(&series).map(|w| w.bound.clone())) {
+            Some(bound) => bound,
+            // どこへ通ったか分からない系列は見張れない (合図を出す前の確認が
+            // できない)。
+            None => return,
         };
 
         let fires_at = now + wrote.rearm_after();
@@ -190,7 +246,7 @@ impl Keepalive {
         let ringing = series.clone();
         let timer = Timer(tokio::spawn(async move {
             tokio::time::sleep_until(fires_at).await;
-            waking.fire(ringing, deadline, deadline_unix);
+            waking.fire(ringing, deadline, deadline_unix).await;
         }));
         // 前の予定は差し替えで畳まれる (`Timer` の Drop が止める)。
         state.watched.insert(
@@ -198,8 +254,19 @@ impl Keepalive {
             Watched {
                 timer: Some(timer),
                 horizon_end,
+                bound,
             },
         );
+    }
+
+    /// この系列の実リクエストが最後に通った経路。
+    pub fn bound_route(&self, series: &Series) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .watched
+            .get(series)
+            .map(|watched| watched.bound.route.clone())
     }
 
     /// この系列の合図待ちを畳む。
@@ -228,7 +295,33 @@ impl Keepalive {
     }
 
     /// 合図を 1 つ出す。
-    fn fire(&self, series: Series, deadline: Instant, deadline_unix: i64) {
+    ///
+    /// 直前に通った経路が塞がっていたら**出さない**。別の経路へ流れた合図は
+    /// upstream にプレフィックスを持たないので、延ばしたい cache には届かず、
+    /// 会話に無意味な 1 往復を挟むだけになる (DR-0024 §2)。塞がりは解ける
+    /// ものなので、見張りは畳まずに次の予定だけ置き直す。
+    async fn fire(self: &Arc<Self>, series: Series, deadline: Instant, deadline_unix: i64) {
+        let bound = self
+            .state
+            .lock()
+            .unwrap()
+            .watched
+            .get(&series)
+            .map(|watched| watched.bound.clone());
+        let Some(bound) = bound else {
+            return;
+        };
+        if !self.reach.usable(&bound).await {
+            debug!(
+                session = %series.session_id,
+                prefix = %series.prefix,
+                route = %bound.route,
+                "the route this conversation was cached on is unavailable; not signalling"
+            );
+            self.rearm(series, Wrote::FiveMinutes);
+            return;
+        }
+
         let nonce = nonce();
         let notice = events::Keepalive::new(
             now_unix(),
@@ -334,10 +427,53 @@ mod tests {
         }
     }
 
+    fn bound() -> Bound {
+        Bound {
+            ns: "default".to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+        }
+    }
+
+    /// 経路が使えるかどうかを、試験の側から切り替えられる口。
+    #[derive(Clone, Default)]
+    struct Reach(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Reach {
+        fn open() -> Self {
+            let reach = Self::default();
+            reach.set(true);
+            reach
+        }
+
+        fn set(&self, usable: bool) {
+            self.0.store(usable, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Reachable for Reach {
+        fn usable<'a>(&'a self, _bound: &'a Bound) -> BoxFuture<'a, bool> {
+            let usable = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { usable })
+        }
+    }
+
     fn keepalive() -> (Arc<Keepalive>, tokio::sync::broadcast::Receiver<Notice>) {
+        let (keepalive, watching, _) = keepalive_reaching(Reach::open());
+        (keepalive, watching)
+    }
+
+    fn keepalive_reaching(
+        reach: Reach,
+    ) -> (
+        Arc<Keepalive>,
+        tokio::sync::broadcast::Receiver<Notice>,
+        Reach,
+    ) {
         let events = Arc::new(Events::new());
         let watching = events.subscribe();
-        (Arc::new(Keepalive::new(events)), watching)
+        let keepalive = Arc::new(Keepalive::new(events, Arc::new(reach.clone())));
+        (keepalive, watching, reach)
     }
 
     /// 発火したタイマーの続きを走らせる (時計を止めた試験用)。
@@ -360,7 +496,7 @@ mod tests {
     async fn a_conversation_that_stops_gets_a_signal() {
         let (keepalive, mut watching) = keepalive();
         let armed_at = now_unix();
-        keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
 
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
@@ -393,7 +529,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
 
         for _ in 0..5 {
-            keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+            keepalive.armed_by_request(series(), bound(), HORIZON);
             tokio::time::advance(AFTER_REQUEST - Duration::from_secs(30)).await;
             settle().await;
         }
@@ -406,7 +542,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_in_time_is_applied() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -431,7 +567,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_late_is_not_applied() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -448,11 +584,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn after_an_applied_signal_the_next_one_waits_for_the_hour() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         watching.recv().await.unwrap();
 
-        keepalive.arm(series(), Wrote::OneHour, HORIZON);
+        keepalive.rearm(series(), Wrote::OneHour);
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         assert!(
             watching.try_recv().is_err(),
@@ -472,7 +608,7 @@ mod tests {
     async fn signalling_stops_at_the_horizon() {
         let horizon = Duration::from_secs(2 * 60 * 60);
         let (keepalive, mut watching) = keepalive();
-        keepalive.arm(series(), Wrote::FiveMinutes, horizon);
+        keepalive.armed_by_request(series(), bound(), horizon);
 
         // 合図と応答を、horizon を跨ぐまで繰り返す。
         let mut signals = 0;
@@ -483,7 +619,7 @@ mod tests {
                 break;
             }
             signals += 1;
-            keepalive.arm(series(), Wrote::OneHour, horizon);
+            keepalive.rearm(series(), Wrote::OneHour);
         }
 
         assert!(
@@ -495,11 +631,50 @@ mod tests {
         assert!(watching.try_recv().is_err(), "and none fires afterwards");
     }
 
+    /// 直前に通った経路が塞がっている間は、合図を出さない。
+    ///
+    /// 出しても会話は別の credential へ流れ、延ばしたい cache には届かない。
+    #[tokio::test(start_paused = true)]
+    async fn a_conversation_whose_route_is_closed_is_not_signalled() {
+        let (keepalive, mut watching, reach) = keepalive_reaching(Reach::open());
+        reach.set(false);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+
+        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        settle().await;
+
+        assert!(watching.try_recv().is_err(), "nothing was signalled");
+        assert_eq!(keepalive.waiting(), 0, "no nonce was minted either");
+        assert_eq!(
+            keepalive.armed(),
+            1,
+            "the watch stays, for the next attempt"
+        );
+    }
+
+    /// 塞がりが解けたら、次の予定で合図が出る。
+    #[tokio::test(start_paused = true)]
+    async fn signalling_resumes_once_the_route_reopens() {
+        let (keepalive, mut watching, reach) = keepalive_reaching(Reach::open());
+        reach.set(false);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+
+        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(watching.try_recv().is_err());
+
+        // 見送りの後は 4 分で次を試す。
+        reach.set(true);
+        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        let signal = signalled(watching.recv().await.unwrap());
+        assert_eq!(signal.session_id, "s-1");
+    }
+
     /// 合図を出す前に人が戻ってきたら、予定も合言葉も畳む。
     #[tokio::test(start_paused = true)]
     async fn a_returning_conversation_cancels_what_was_waiting() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.arm(series(), Wrote::FiveMinutes, HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON);
         tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 

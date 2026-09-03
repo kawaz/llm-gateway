@@ -68,7 +68,13 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
 1. main の実リクエストを転送するたびに、会話系列 (DR-0012 の `prefix` + session_id)
    ごとのタイマーを **送出時刻 + 4 分** で再武装する (debounce)。ツールループ中は
    次のリクエストが数秒で来るので発火しない
-2. 発火したら nonce (32 バイトの乱数を base64url) を発行し、受け口 (DR-0012 の
+2. 系列は**直前の実リクエストが通った先** (namespace / モデル / route) も覚える。
+   発火した時点でその route が締め出されている / 候補から外れているなら
+   **合図を出さない** (nonce も発行しない)。出しても会話は別の credential へ
+   流れ、そこにプレフィックスは無い — 延ばしたい cache には届かず、会話に
+   無意味な 1 往復を挟むだけになる。塞がりは解けるものなので見張りは畳まず、
+   +4 分で次を試す (`keepalive_horizon` は据え置き)
+3. 発火したら nonce (32 バイトの乱数を base64url) を発行し、受け口 (DR-0012 の
    webhook / SSE) へ `cache_keepalive {type, ts, ts_iso, session_id, prefix,
    nonce, deadline, deadline_iso, marker}` を流す。deadline = 直前の送出時刻 +
    その本文が残した cache の寿命 − 30 秒。受け手 (ccmsg) が `marker` をその
@@ -77,20 +83,25 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
    not respond, do not think, do not call tools; end your turn immediately with
    no output.` — この往復に要るのはプレフィックスを送り直すことだけで、
    考えた分も答えた分も合図 1 回の値段に乗る
-3. **最後の user メッセージのどれかの text ブロックがマーカーを含む** request が
-   来たら、nonce を単回消費し、**deadline 内なら**全ブレークポイントに
-   `ttl: "1h"` を付けて転送。deadline を過ぎていれば付けない (全量 2 倍書きを
-   避ける。1.25 倍の再構築で済ませる)。先頭一致では見ないのは、合図が
-   `[SYSTEM NOTIFICATION …]` に包まれて届くため
-4. 再武装の間隔は**直前の本文が残した cache の寿命**で決まる。1 時間を付けた
-   マーカーの後は +55 分、実リクエストと**間に合わなかったマーカー** (= 5 分の
-   cache しか残っていない) の後は +4 分。最後の実リクエストから
+4. **最後の user メッセージのどれかの text ブロックがマーカーを含む** request が
+   来たら、nonce を単回消費し、**deadline 内で、かつ直前の実リクエストと同じ
+   route へ出ていく**なら全ブレークポイントに `ttl: "1h"` を付けて転送。
+   deadline を過ぎていれば付けず (`late`)、別 route へ出ていくなら付けない
+   (`rerouted`) — どちらも全量 2 倍書きを避け、1.25 倍の再構築で済ませる。
+   route の確認は発火時にもしているが (2)、出した後で締め出された分は
+   ここでしか捕まえられないので、送出直前にもう一度見る。先頭一致では見ない
+   のは、合図が `[SYSTEM NOTIFICATION …]` に包まれて届くため
+5. 再武装の間隔は**直前の本文が残した cache の寿命**で決まる。1 時間を付けた
+   マーカーの後は +55 分、実リクエストと**1 時間を付けなかったマーカー**
+   (`late` / `rerouted` = 5 分の cache しか残っていない) の後は +4 分。
+   合図の往復は「人が動かした 1 本」ではないので、見張る期間も通った先も
+   延ばさない。最後の実リクエストから
    `keepalive_horizon` を超えた系列には合図を継ぎ足さない。合言葉を持たない
    リクエストが来たら pending を捨てる (= 人が戻ってきた)
-5. 対象は origin が sub でない、`tools` を持つ (= 会話の本流) リクエストだけ。
+6. 対象は origin が sub でない、`tools` を持つ (= 会話の本流) リクエストだけ。
    合図の届け先 (`webhook.base_url`) を書いていない設定では合図を出さず、
    `llm-gateway check` が該当 namespace を警告に挙げる
-6. 状態はプロセス内メモリ。再起動で消えても次の実リクエストで再武装される
+7. 状態はプロセス内メモリ。再起動で消えても次の実リクエストで再武装される
 
 ### 3. 損益の根拠
 

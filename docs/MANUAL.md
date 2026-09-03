@@ -315,7 +315,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 conversation series a request belongs to; when it cannot be derived, the field is
 omitted. If routes were skipped during route selection, `skipped` lists each
 credential and the reason. A request that answered a cache signal carries
-`keepalive` (`applied` / `late`).
+`keepalive` (`applied` / `late` / `rerouted`).
 
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
@@ -325,9 +325,12 @@ event: cache_keepalive
 data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Automated cache keepalive. Do not respond, do not think, do not call tools; end your turn immediately with no output."}
 ```
 
-The receiver injects `marker` verbatim into that conversation (`session_id`). Only a
-request that comes back before `deadline` gets the hour; a later one is forwarded
-untouched. The same notice reaches the `webhook` destination in the same shape.
+The receiver injects `marker` verbatim into that conversation (`session_id`). The hour
+is written only for a request that comes back before `deadline` *and* goes out on the
+same route as the request before it (`applied`); a late one (`late`) and one that lands
+on another route (`rerouted`) are forwarded untouched. While the route a conversation
+was cached on is unavailable, no signal is raised at all. The same notice reaches the
+`webhook` destination in the same shape.
 
 ### `GET /llm-gateway/tap`
 
