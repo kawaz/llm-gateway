@@ -54,7 +54,9 @@ keepalive_horizon = "8h"
 core はその値だけを見る (DR-0014 の境界。unknown は main 扱い)。判定は
 Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が持つ —
 読む対象は upstream ではなくクライアントの本文なので、経路を切り替えても
-同じ 1 本が別の戦略に落ちない。
+同じ 1 本が別の戦略に落ちない。他方言 (openai) は unknown = main 扱い。
+そちらも変換前の本文を読めば判定できる余地はあるが、prompt cache の語彙が
+違うので、必要になってから決める。
 
 書き換えるのは `cache_control` だけで、**ブレークポイントは増やさない・
 動かさない**。適用は各経路へ送る直前 (モデル名の書き換えの直後) で、
