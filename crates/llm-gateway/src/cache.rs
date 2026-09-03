@@ -28,11 +28,11 @@ pub fn strategy_of(rule: &CacheRule, origin: RequestOrigin) -> CacheStrategy {
 
 /// 戦略どおりに `cache_control` を整える。
 ///
-/// `keepalive` の本文は 5m のまま流す。1h を付けるのはマーカーの往復だけで、
-/// そこは [`apply_one_hour`] が受け持つ (DR-0024 §2)。
+/// `keepalive` の本文は `1h` と同じに整える。違うのは、会話が止まったときに
+/// 合図を出して cache を継ぎ足すかどうかだけ (DR-0024 §2)。
 pub fn apply(body: &mut Value, strategy: CacheStrategy) {
     match strategy {
-        CacheStrategy::Passthrough | CacheStrategy::Keepalive => {}
+        CacheStrategy::Passthrough => {}
         CacheStrategy::None => visit(body, &mut |holder| {
             holder.remove("cache_control");
         }),
@@ -41,12 +41,12 @@ pub fn apply(body: &mut Value, strategy: CacheStrategy) {
                 control.remove("ttl");
             }
         }),
-        CacheStrategy::OneHour => apply_one_hour(body),
+        CacheStrategy::OneHour | CacheStrategy::Keepalive => apply_one_hour(body),
     }
 }
 
 /// 既にあるブレークポイント全部に 1 時間を指定する。
-pub fn apply_one_hour(body: &mut Value) {
+fn apply_one_hour(body: &mut Value) {
     visit(body, &mut |holder| {
         if let Some(control) = control_of(holder) {
             control.insert("ttl".to_owned(), Value::String("1h".to_owned()));
@@ -137,11 +137,9 @@ mod tests {
     /// 素通しは 1 文字も変えない。
     #[test]
     fn passthrough_changes_nothing() {
-        for strategy in [CacheStrategy::Passthrough, CacheStrategy::Keepalive] {
-            let mut sending = body();
-            apply(&mut sending, strategy);
-            assert_eq!(sending, body(), "{}", strategy.as_str());
-        }
+        let mut sending = body();
+        apply(&mut sending, CacheStrategy::Passthrough);
+        assert_eq!(sending, body());
     }
 
     /// `none` は置き場所を問わず全部剥がす。
@@ -173,19 +171,25 @@ mod tests {
     }
 
     /// `1h` は全ブレークポイントに 1 時間を書く。無い場所には付けない。
+    ///
+    /// `keepalive` の本文も同じ — 違うのは合図を出すかどうかだけ (DR-0024 §2)。
     #[test]
     fn one_hour_marks_every_existing_breakpoint() {
-        let mut sending = body();
-        apply(&mut sending, CacheStrategy::OneHour);
+        for strategy in [CacheStrategy::OneHour, CacheStrategy::Keepalive] {
+            let mut sending = body();
+            apply(&mut sending, strategy);
 
-        assert_eq!(
-            controls(&sending),
-            vec![json!({"type": "ephemeral", "ttl": "1h"}); 4]
-        );
-        assert!(
-            sending["system"][0].get("cache_control").is_none(),
-            "a place without a breakpoint does not gain one"
-        );
+            assert_eq!(
+                controls(&sending),
+                vec![json!({"type": "ephemeral", "ttl": "1h"}); 4],
+                "{}",
+                strategy.as_str()
+            );
+            assert!(
+                sending["system"][0].get("cache_control").is_none(),
+                "a place without a breakpoint does not gain one"
+            );
+        }
     }
 
     /// ブレークポイントの数と位置は、どの戦略でも動かさない (DR-0024 の禁則)。

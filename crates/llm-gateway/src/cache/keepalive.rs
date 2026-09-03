@@ -1,9 +1,9 @@
 //! 止まった会話へ、cache を延ばす合図を出す (DR-0024 §2)。
 //!
-//! 5 分の cache は、会話が止まった 5 分後に消える。消えてから再開すると、
+//! 1 時間の cache は、会話が止まった 1 時間後に消える。消えてから再開すると、
 //! その時点のプレフィックス全量を書き直すことになり、書き込みは読み出しの
-//! 50 倍の単価で効く。そこで**止まりかけたところで 1 往復だけ挟み**、その
-//! 往復にだけ 1 時間を付ける。付くのは差分だけなので、全量の書き直しより安い。
+//! 50 倍の単価で効く。そこで**消える手前で 1 往復だけ挟む**。その 1 本は
+//! プレフィックス全量の read で済み、次の 1 時間へ繋がる。
 //!
 //! こちらから会話へ話し掛ける口は持っていない。合図は受け口 (DR-0012) へ
 //! 流し、文面を会話へ流し込むのは受け取った側 (ccmsg) の仕事。戻ってきた
@@ -27,25 +27,19 @@ use crate::credential::time::now_unix;
 use crate::egress::BoxFuture;
 use crate::events::{self, Events};
 
-/// 実リクエストの後、合図を出すまで待つ時間。
+/// 1 本送ってから、次の合図を出すまでの時間。
 ///
-/// 5 分の cache が消える手前。ツールを回している間は数秒おきに次が来るので、
-/// ここまで空くこと自体が「止まった」の合図になる。
-const AFTER_REQUEST: Duration = Duration::from_secs(4 * 60);
+/// cache が消える手前。会話が動いている間は次のリクエストのたびに先送りされる
+/// ので、ここまで空くこと自体が「止まった」の合図になる。
+const REFRESH_AFTER: Duration = Duration::from_secs(55 * 60);
 
-/// 合図が戻ってきた後、次の合図までの時間。付いた cache は 1 時間もつ。
-const AFTER_MARKER: Duration = Duration::from_secs(55 * 60);
-
-/// 実リクエストが残した cache の寿命。
-const LIFETIME_5M: Duration = Duration::from_secs(5 * 60);
-
-/// 1 時間を付けた合図が残した cache の寿命。
-const LIFETIME_1H: Duration = Duration::from_secs(60 * 60);
+/// 送った本文が残す cache の寿命 (`keepalive` は全ブレークポイントが 1 時間)。
+const LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// 期限にどれだけ余裕を見るか。
 ///
 /// 合図が届いてから upstream が前処理を始めるまでの分。切り詰めると、
-/// 間に合ったつもりの往復が全量の 2 倍書きになる。
+/// 間に合ったつもりの往復が全量の書き直しになる。
 const MARGIN: Duration = Duration::from_secs(30);
 
 /// 合言葉の長さ (バイト)。
@@ -58,50 +52,16 @@ pub struct Series {
     pub prefix: String,
 }
 
-/// 直前のリクエストが残した cache の寿命。次の合図をいつ出すかが決まる。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wrote {
-    /// 5 分の cache (実リクエスト、および間に合わなかった合図)。
-    FiveMinutes,
-    /// 1 時間の cache (間に合った合図)。
-    OneHour,
-}
-
-impl Wrote {
-    /// 次の合図を出すまでの間。
-    fn rearm_after(self) -> Duration {
-        match self {
-            Self::FiveMinutes => AFTER_REQUEST,
-            Self::OneHour => AFTER_MARKER,
-        }
-    }
-
-    /// 書いた cache が消えるまでの間。
-    fn lifetime(self) -> Duration {
-        match self {
-            Self::FiveMinutes => LIFETIME_5M,
-            Self::OneHour => LIFETIME_1H,
-        }
-    }
-}
-
 /// 戻ってきた合図の扱い。
+///
+/// どちらでも本文の扱いは同じ (戦略が全ブレークポイントに 1 時間を付ける)。
+/// 分けているのは、合図が役に立ったかを見る側に伝えるため。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
-    /// 期限内。この往復に 1 時間を付ける。
+    /// 期限内に戻ってきた。狙いどおり cache が繋がる。
     Applied,
-    /// 期限を過ぎていた。付けない — 全量を 2 倍で書くより、1.25 倍の
-    /// 書き直しで済ませたほうが安い (DR-0024 §3)。
+    /// 期限を過ぎていた。cache は既に消えていて、この 1 本が書き直す。
     Late,
-    /// 直前の実リクエストとは別の経路へ出ていく。付けない — 経路が違えば
-    /// upstream にプレフィックスが無く、どのみち全量を書くことになる。
-    /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図で差分だけ 1 時間に
-    /// するほうが安い。
-    Rerouted,
-    /// 直前の実リクエストからプレフィックスが変わっていた ([`shape`])。
-    /// 変わった位置から先は全部書き直しになるので、[`Self::Rerouted`] と
-    /// 同じ理由で付けない。
-    Drifted,
 }
 
 impl Marker {
@@ -110,19 +70,6 @@ impl Marker {
         match self {
             Self::Applied => "applied",
             Self::Late => "late",
-            Self::Rerouted => "rerouted",
-            Self::Drifted => "drifted",
-        }
-    }
-
-    /// この往復が残した cache の寿命。
-    ///
-    /// 1 時間を付けなかった往復は 5 分の cache しか残していない。次の合図は
-    /// 1 時間ではなくその 5 分に合わせる。
-    pub fn wrote(self) -> Wrote {
-        match self {
-            Self::Applied => Wrote::OneHour,
-            Self::Late | Self::Rerouted | Self::Drifted => Wrote::FiveMinutes,
         }
     }
 }
@@ -135,8 +82,6 @@ pub struct Bound {
     pub ns: String,
     pub model: String,
     pub route: String,
-    /// そのとき送ったプレフィックスの形 ([`shape`])。
-    pub shape: String,
 }
 
 /// 経路が今も使えるかを答える口。
@@ -203,7 +148,7 @@ impl Keepalive {
     /// 通った先を延ばせるのは、この 1 本だけ。
     pub fn armed_by_request(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
         let horizon_end = Instant::now() + horizon;
-        self.schedule(series, Wrote::FiveMinutes, horizon_end, Some(bound));
+        self.schedule(series, horizon_end, Some(bound));
     }
 
     /// 合図の往復や見送りの後、同じ期間の中で次の予定だけ置き直す。
@@ -211,7 +156,7 @@ impl Keepalive {
     /// 期間を延ばせるのは実リクエストだけなので、`horizon` を過ぎた系列は
     /// ここで見張るのをやめる。1 時間の cache を延々と継ぎ足す価値があるのは、
     /// 再開される見込みがある間だけ (DR-0024 §3)。
-    pub fn rearm(self: &Arc<Self>, series: Series, wrote: Wrote) {
+    pub fn rearm(self: &Arc<Self>, series: Series) {
         let now = Instant::now();
         let horizon_end = {
             let mut state = self.state.lock().unwrap();
@@ -224,19 +169,13 @@ impl Keepalive {
                 None => return,
             }
         };
-        self.schedule(series, wrote, horizon_end, None);
+        self.schedule(series, horizon_end, None);
     }
 
     /// 次に合図を出す時刻を置く。
     ///
     /// `bound` を渡したときだけ、通った先の記録も置き換える。
-    fn schedule(
-        self: &Arc<Self>,
-        series: Series,
-        wrote: Wrote,
-        horizon_end: Instant,
-        bound: Option<Bound>,
-    ) {
+    fn schedule(self: &Arc<Self>, series: Series, horizon_end: Instant, bound: Option<Bound>) {
         let now = Instant::now();
         let mut state = self.state.lock().unwrap();
         let bound = match bound.or_else(|| state.watched.get(&series).map(|w| w.bound.clone())) {
@@ -246,9 +185,9 @@ impl Keepalive {
             None => return,
         };
 
-        let fires_at = now + wrote.rearm_after();
-        let deadline = now + wrote.lifetime() - MARGIN;
-        let deadline_unix = now_unix() + (wrote.lifetime() - MARGIN).as_secs() as i64;
+        let fires_at = now + REFRESH_AFTER;
+        let deadline = now + LIFETIME - MARGIN;
+        let deadline_unix = now_unix() + (LIFETIME - MARGIN).as_secs() as i64;
         let waking = Arc::clone(self);
         let ringing = series.clone();
         let timer = Timer(tokio::spawn(async move {
@@ -325,7 +264,7 @@ impl Keepalive {
                 route = %bound.route,
                 "the route this conversation was cached on is unavailable; not signalling"
             );
-            self.rearm(series, Wrote::FiveMinutes);
+            self.rearm(series);
             return;
         }
 
@@ -364,32 +303,6 @@ impl Keepalive {
             .filter(|watched| watched.timer.is_some())
             .count()
     }
-}
-
-/// この本文が upstream へ送るプレフィックスの形 (DR-0024 §2)。
-///
-/// 見るのは `tools` と `system` — 1 つ目のブレークポイントより手前にあり、
-/// ここが変われば以降のブロックは全部書き直しになる。クライアントは
-/// `system` の末尾に作業ディレクトリの状態のような可変の内容を載せるので、
-/// 会話が止まっている間にも変わりうる。
-///
-/// `cache_control` は外して比べる。付け外しはこちらの判断で起きるもので、
-/// プレフィックスが変わったかどうかとは別。
-///
-/// [`crate::events::prefix`] とは別物 — あちらは `system` の**先頭ブロック**
-/// だけを見て「同じ会話系列か」を言う印で、こちらは「同じ本文か」を見る。
-pub fn shape(body: &Value) -> String {
-    use sha2::{Digest as _, Sha256};
-
-    let mut prefix = serde_json::json!({
-        "tools": body.get("tools").cloned().unwrap_or(Value::Null),
-        "system": body.get("system").cloned().unwrap_or(Value::Null),
-    });
-    crate::cache::visit(&mut prefix, &mut |holder| {
-        holder.remove("cache_control");
-    });
-    let digest = Sha256::digest(prefix.to_string().as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// この 1 本が会話の本流か。
@@ -468,7 +381,6 @@ mod tests {
             ns: "default".to_owned(),
             model: "m".to_owned(),
             route: "a".to_owned(),
-            shape: shape(&json!({"system": [{"type": "text", "text": "head"}]})),
         }
     }
 
@@ -528,14 +440,14 @@ mod tests {
         }
     }
 
-    /// 会話が止まって 4 分で、合図が 1 つ出る。
+    /// 会話が止まって 55 分で、合図が 1 つ出る。
     #[tokio::test(start_paused = true)]
     async fn a_conversation_that_stops_gets_a_signal() {
         let (keepalive, mut watching) = keepalive();
         let armed_at = now_unix();
         keepalive.armed_by_request(series(), bound(), HORIZON);
 
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
         assert_eq!(signal.kind, "cache_keepalive");
@@ -550,8 +462,8 @@ mod tests {
             signal.marker
         );
         assert!(
-            (signal.deadline - armed_at - (LIFETIME_5M - MARGIN).as_secs() as i64).abs() <= 1,
-            "the deadline is the 5 minute cache after the request, less the margin"
+            (signal.deadline - armed_at - (LIFETIME - MARGIN).as_secs() as i64).abs() <= 1,
+            "the deadline is an hour after the request, less the margin"
         );
         assert_eq!(
             signal.deadline_iso,
@@ -567,7 +479,7 @@ mod tests {
 
         for _ in 0..5 {
             keepalive.armed_by_request(series(), bound(), HORIZON);
-            tokio::time::advance(AFTER_REQUEST - Duration::from_secs(30)).await;
+            tokio::time::advance(REFRESH_AFTER - Duration::from_secs(30)).await;
             settle().await;
         }
 
@@ -575,12 +487,12 @@ mod tests {
         assert_eq!(keepalive.armed(), 1, "one plan, replaced each time");
     }
 
-    /// 期限内に戻ってきた合図には 1 時間を付ける。合言葉は使い切る。
+    /// 期限内に戻ってきた合図は、狙いどおりに効いた 1 本。合言葉は使い切る。
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_in_time_is_applied() {
         let (keepalive, mut watching) = keepalive();
         keepalive.armed_by_request(series(), bound(), HORIZON);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
         let coming_back = json!({"messages": [{"role": "user", "content": [
@@ -600,15 +512,15 @@ mod tests {
         assert_eq!(keepalive.waiting(), 0);
     }
 
-    /// 期限を過ぎて戻ってきた合図には付けない。
+    /// 期限を過ぎて戻ってきた合図は、繋ぐつもりだった cache に間に合っていない。
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_late_is_not_applied() {
         let (keepalive, mut watching) = keepalive();
         keepalive.armed_by_request(series(), bound(), HORIZON);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
-        tokio::time::advance(LIFETIME_5M).await;
+        tokio::time::advance(LIFETIME).await;
         let coming_back = json!({"messages": [{"role": "user", "content": signal.marker}]});
 
         assert_eq!(
@@ -617,26 +529,24 @@ mod tests {
         );
     }
 
-    /// 合図が効いた後は、1 時間の cache に合わせて 55 分後に次を出す。
+    /// 合図が戻ってきた後も、同じ 55 分の間隔で次を出す。
     #[tokio::test(start_paused = true)]
-    async fn after_an_applied_signal_the_next_one_waits_for_the_hour() {
+    async fn the_next_signal_follows_at_the_same_interval() {
         let (keepalive, mut watching) = keepalive();
         keepalive.armed_by_request(series(), bound(), HORIZON);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         watching.recv().await.unwrap();
 
-        keepalive.rearm(series(), Wrote::OneHour);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
-        assert!(
-            watching.try_recv().is_err(),
-            "four minutes is too early for an hour-long cache"
-        );
+        keepalive.rearm(series());
+        tokio::time::advance(REFRESH_AFTER - Duration::from_secs(60)).await;
+        settle().await;
+        assert!(watching.try_recv().is_err(), "not yet");
 
-        tokio::time::advance(AFTER_MARKER - AFTER_REQUEST).await;
+        tokio::time::advance(Duration::from_secs(120)).await;
         let signal = signalled(watching.recv().await.unwrap());
         assert!(
-            signal.deadline - signal.ts >= (LIFETIME_1H - MARGIN - AFTER_MARKER).as_secs() as i64,
-            "the deadline follows the hour that was written"
+            signal.deadline - signal.ts >= (LIFETIME - MARGIN - REFRESH_AFTER).as_secs() as i64,
+            "the deadline follows the hour this round trip writes"
         );
     }
 
@@ -650,13 +560,13 @@ mod tests {
         // 合図と応答を、horizon を跨ぐまで繰り返す。
         let mut signals = 0;
         for _ in 0..10 {
-            tokio::time::advance(AFTER_MARKER + Duration::from_secs(1)).await;
+            tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
             settle().await;
             if watching.try_recv().is_err() {
                 break;
             }
             signals += 1;
-            keepalive.rearm(series(), Wrote::OneHour);
+            keepalive.rearm(series());
         }
 
         assert!(
@@ -664,7 +574,7 @@ mod tests {
             "{signals} signals before the 2 hour horizon"
         );
         assert_eq!(keepalive.armed(), 0, "no plan is left past the horizon");
-        tokio::time::advance(AFTER_MARKER * 2).await;
+        tokio::time::advance(REFRESH_AFTER * 2).await;
         assert!(watching.try_recv().is_err(), "and none fires afterwards");
     }
 
@@ -677,7 +587,7 @@ mod tests {
         reach.set(false);
         keepalive.armed_by_request(series(), bound(), HORIZON);
 
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
 
         assert!(watching.try_recv().is_err(), "nothing was signalled");
@@ -696,13 +606,13 @@ mod tests {
         reach.set(false);
         keepalive.armed_by_request(series(), bound(), HORIZON);
 
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
         assert!(watching.try_recv().is_err());
 
         // 見送りの後は 4 分で次を試す。
         reach.set(true);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
         assert_eq!(signal.session_id, "s-1");
     }
@@ -712,7 +622,7 @@ mod tests {
     async fn a_returning_conversation_cancels_what_was_waiting() {
         let (keepalive, mut watching) = keepalive();
         keepalive.armed_by_request(series(), bound(), HORIZON);
-        tokio::time::advance(AFTER_REQUEST + Duration::from_secs(1)).await;
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
         keepalive.forget(&series());
@@ -733,48 +643,6 @@ mod tests {
         let (keepalive, _watching) = keepalive();
         keepalive.forget(&series());
         assert_eq!(keepalive.armed(), 0);
-    }
-
-    /// プレフィックスの形は `tools` と `system` で決まる。
-    ///
-    /// `cache_control` の付け外しでは変わらず、`system` の中身が変われば変わる。
-    /// 後ろに続くメッセージは見ない (そこは cache に載る手前ではない)。
-    #[test]
-    fn the_shape_follows_the_prefix_and_nothing_else() {
-        let body = json!({
-            "system": [{"type": "text", "text": "You are Claude Code"},
-                {"type": "text", "text": "gitStatus: clean"}],
-            "tools": [{"name": "Bash"}],
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-
-        let mut marked = body.clone();
-        marked["system"][1]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
-        assert_eq!(
-            shape(&marked),
-            shape(&body),
-            "a breakpoint is our own doing, not a change of the prefix"
-        );
-
-        let mut later = body.clone();
-        later["messages"] = json!([{"role": "user", "content": "and then?"}]);
-        assert_eq!(
-            shape(&later),
-            shape(&body),
-            "what follows the prefix is not it"
-        );
-
-        let mut moved = body.clone();
-        moved["system"][1]["text"] = json!("gitStatus: 3 files changed");
-        assert_ne!(
-            shape(&moved),
-            shape(&body),
-            "the client rewrites the tail of the system prompt as work goes on"
-        );
-
-        let mut fewer = body.clone();
-        fewer["tools"] = json!([]);
-        assert_ne!(shape(&fewer), shape(&body));
     }
 
     /// 道具を持たない 1 本は会話の本流ではない。
