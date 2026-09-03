@@ -450,7 +450,7 @@ impl<P: Persistence> Gateway<P> {
             body: &body,
             cache: ns.cache_for(&model),
             series,
-            keepalive: marker.as_ref().map(|(_, marker)| *marker),
+            keepalive: marker,
         };
         // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
         // 経路が要らない分はここで控えておく。
@@ -815,22 +815,27 @@ impl<P: Persistence> Gateway<P> {
         if !self.signalling || !keepalive::carries_tools(call.body) {
             return;
         }
-        if call.keepalive.is_some() {
-            // 合図の往復は「人が動かした 1 本」ではないので、見張る期間も
-            // 通った先も延ばさない。
-            self.keepalive.rearm(series.clone());
-            return;
+        let bound = keepalive::Bound {
+            ns: call.ns.to_owned(),
+            model: call.model.to_owned(),
+            route: route.name().to_owned(),
+        };
+        match call.keepalive {
+            // 別のプロセスが同じ会話を見ている。cache はそちらが繋いでいるので、
+            // こちらは一歩下がって控える (DR-0024 §2)。
+            Some(keepalive::Marker::Foreign) => {
+                let horizon = self.horizon_for(call, route);
+                self.keepalive.standby(series.clone(), bound, horizon);
+            }
+            // 自分が出した合図の往復は「人が動かした 1 本」ではないので、
+            // 見張る期間も通った先も延ばさない。
+            Some(_) => self.keepalive.rearm(series.clone()),
+            None => {
+                let horizon = self.horizon_for(call, route);
+                self.keepalive
+                    .armed_by_request(series.clone(), bound, horizon);
+            }
         }
-        let horizon = self.horizon_for(call, route);
-        self.keepalive.armed_by_request(
-            series.clone(),
-            keepalive::Bound {
-                ns: call.ns.to_owned(),
-                model: call.model.to_owned(),
-                route: route.name().to_owned(),
-            },
-            horizon,
-        );
     }
 
     async fn send(
@@ -4796,7 +4801,10 @@ main = "keepalive"
         );
     }
 
-    /// 人が会話へ戻ってきたら、出したままの合図は無効になる。
+    /// 人が会話へ戻ってきたら、出したままの合図は用済みになる。
+    ///
+    /// 後から届いても、こちらの合言葉としては数えない (= 誰か別の人が出した
+    /// 合図と同じ扱いで、こちらは控えに回るだけ)。
     #[tokio::test]
     async fn a_returning_conversation_voids_the_signal_that_was_out() {
         let up = FakeUpstream::always(200).await;
@@ -4807,7 +4815,6 @@ main = "keepalive"
         gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
             .await
             .unwrap();
-        // 合図は 4 分で出る。期限 (4 分 30 秒) の内側で戻す。
         idle(55 * 60 + 5).await;
         let signal = signal(&mut watching).await;
 
@@ -4824,13 +4831,17 @@ main = "keepalive"
             .await
             .unwrap();
 
-        assert_eq!(forwarded.keepalive, None, "the nonce was dropped");
+        assert_eq!(
+            forwarded.keepalive.as_deref(),
+            Some("foreign"),
+            "the nonce was dropped, so what came back is nobody's signal here"
+        );
     }
 
     /// 通った経路が塞がっている間は、合図そのものを出さない。
     ///
     /// 出しても会話は別の credential へ流れ、延ばしたい cache には届かない。
-    /// 塞がりは解けるので、見張りは畳まずに 4 分後にまた試す。
+    /// 塞がりは解けるので、見張りは畳まずに 55 分後にまた試す。
     #[tokio::test]
     async fn a_conversation_on_a_closed_route_is_not_signalled() {
         let up = FakeUpstream::always(200).await;
@@ -4964,5 +4975,37 @@ sub = "5m"
             !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
             "a call that does not continue is not watched"
         );
+    }
+
+    /// 別のプロセスが出した合図が届いたら、こちらは控えに回る (DR-0024 §2)。
+    ///
+    /// 2 プロセスが同じ会話を見ていても、観測だけで合図が 1 本に収束する。
+    #[tokio::test]
+    async fn a_marker_this_process_did_not_mint_puts_it_on_standby() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (mut foreign, headers) = conversation(json!({}));
+        foreign["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": events::marker("not-one-of-ours")},
+        ]}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, foreign, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive.as_deref(), Some("foreign"));
+
+        // 相手が出し続ける限り (55 分ごと)、こちらの控え (57 分) は発火しない。
+        idle(55 * 60 + 5).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "the other process is still the one signalling"
+        );
+
+        // 相手が居なくなれば引き継ぐ。
+        idle(2 * 60).await;
+        assert_eq!(signal(&mut watching).await.session_id, "s-1");
     }
 }

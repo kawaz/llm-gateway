@@ -337,7 +337,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 `cache_expires_at` / `cache_expires_at_iso` はその時刻。ブレークポイントの
 無い 1 本では 3 つとも欄ごと出ない。経路選定で外した経路がある場合は
 `skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
-`keepalive` (`applied` / `late`) が付く。
+`keepalive` (`applied` / `late` / `foreign`) が付く。
 
 `keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
 (DR-0024)。
@@ -352,7 +352,9 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 頭に付けたものが合言葉。返事はその 1 行だけになる。
 戻ってきた 1 本の本文は普通のリクエストと同じ扱い (`keepalive` は常に 1 時間を
 書く) で、`deadline` までに戻れば `applied`、過ぎていれば `late` として知らせに
-出る。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
+出る。**この gateway が出していない合言葉**が戻ってきた場合は `foreign` —
+同じ会話を見ている別プロセスの合図で、こちらは控えに回る (合図が 1 本に
+収束する仕組み、DR-0024)。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
 (`webhook`) にも同じ形で届く。
 
 ### `GET /llm-gateway/tap`

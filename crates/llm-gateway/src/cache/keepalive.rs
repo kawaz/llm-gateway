@@ -27,6 +27,13 @@ use crate::credential::time::now_unix;
 use crate::egress::BoxFuture;
 use crate::events::{self, Events};
 
+/// 別のプロセスが出した合図を見た後、こちらが出しに行くまでの時間。
+///
+/// cache が消える手前 ([`LIFETIME`] − [`MARGIN`] = 59 分 30 秒) より前に置く。
+/// 相手が生きていれば、こちらが出す前に相手の次の合図が届いて、また後ろへ
+/// 下がる。相手が居なくなったときだけ、こちらが引き継ぐ (DR-0024 §2)。
+const STANDBY_AFTER: Duration = Duration::from_secs(57 * 60);
+
 /// 1 本送ってから、次の合図を出すまでの時間。
 ///
 /// cache が消える手前。会話が動いている間は次のリクエストのたびに先送りされる
@@ -62,6 +69,9 @@ pub enum Marker {
     Applied,
     /// 期限を過ぎていた。cache は既に消えていて、この 1 本が書き直す。
     Late,
+    /// **こちらが出していない**合言葉。同じ会話を見ている別のプロセスが
+    /// 出した合図で、cache はそちらが繋いでいる (DR-0024 §2)。
+    Foreign,
 }
 
 impl Marker {
@@ -70,6 +80,7 @@ impl Marker {
         match self {
             Self::Applied => "applied",
             Self::Late => "late",
+            Self::Foreign => "foreign",
         }
     }
 }
@@ -148,44 +159,63 @@ impl Keepalive {
     /// 通った先を延ばせるのは、この 1 本だけ。
     pub fn armed_by_request(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
         let horizon_end = Instant::now() + horizon;
-        self.schedule(series, horizon_end, Some(bound));
+        self.schedule(series, REFRESH_AFTER, horizon_end, bound);
     }
 
-    /// 合図の往復や見送りの後、同じ期間の中で次の予定だけ置き直す。
+    /// 自分が出した合図が戻ってきた。同じ期間の中で次の予定だけ置き直す。
     ///
     /// 期間を延ばせるのは実リクエストだけなので、`horizon` を過ぎた系列は
     /// ここで見張るのをやめる。1 時間の cache を延々と継ぎ足す価値があるのは、
     /// 再開される見込みがある間だけ (DR-0024 §3)。
     pub fn rearm(self: &Arc<Self>, series: Series) {
-        let now = Instant::now();
-        let horizon_end = {
-            let mut state = self.state.lock().unwrap();
-            match state.watched.get(&series) {
-                Some(watched) if watched.horizon_end > now => watched.horizon_end,
-                Some(_) => {
-                    state.watched.remove(&series);
-                    return;
-                }
-                None => return,
-            }
+        let Some((horizon_end, bound)) = self.watch_of(&series) else {
+            return;
         };
-        self.schedule(series, horizon_end, None);
+        self.schedule(series, REFRESH_AFTER, horizon_end, bound);
+    }
+
+    /// 別のプロセスが出した合図を見た。一歩下がって控える (DR-0024 §2)。
+    ///
+    /// 相手が生きている限り、相手の合図が届くたびにここへ戻ってきて予定が
+    /// 後ろへ延びる (= こちらは一度も出さない)。相手が居なくなったときだけ
+    /// [`STANDBY_AFTER`] で発火して引き継ぐ。共有する状態を持たずに、
+    /// 見えているものだけで 1 本へ収束する。
+    ///
+    /// この系列を見たことのないプロセスでは、その合図が通った先を起点にする
+    /// — 実リクエストを見ていなくても、控えには入れる。
+    pub fn standby(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
+        let (horizon_end, bound) = self
+            .watch_of(&series)
+            .unwrap_or_else(|| (Instant::now() + horizon, bound));
+        self.schedule(series, STANDBY_AFTER, horizon_end, bound);
+    }
+
+    /// 見張っている系列の、期間の終わりと通った先。期間を過ぎていれば畳む。
+    fn watch_of(&self, series: &Series) -> Option<(Instant, Bound)> {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        match state.watched.get(series) {
+            Some(watched) if watched.horizon_end > now => {
+                Some((watched.horizon_end, watched.bound.clone()))
+            }
+            Some(_) => {
+                state.watched.remove(series);
+                None
+            }
+            None => None,
+        }
     }
 
     /// 次に合図を出す時刻を置く。
-    ///
-    /// `bound` を渡したときだけ、通った先の記録も置き換える。
-    fn schedule(self: &Arc<Self>, series: Series, horizon_end: Instant, bound: Option<Bound>) {
+    fn schedule(
+        self: &Arc<Self>,
+        series: Series,
+        after: Duration,
+        horizon_end: Instant,
+        bound: Bound,
+    ) {
         let now = Instant::now();
-        let mut state = self.state.lock().unwrap();
-        let bound = match bound.or_else(|| state.watched.get(&series).map(|w| w.bound.clone())) {
-            Some(bound) => bound,
-            // どこへ通ったか分からない系列は見張れない (合図を出す前の確認が
-            // できない)。
-            None => return,
-        };
-
-        let fires_at = now + REFRESH_AFTER;
+        let fires_at = now + after;
         let deadline = now + LIFETIME - MARGIN;
         let deadline_unix = now_unix() + (LIFETIME - MARGIN).as_secs() as i64;
         let waking = Arc::clone(self);
@@ -195,7 +225,7 @@ impl Keepalive {
             waking.fire(ringing, deadline, deadline_unix).await;
         }));
         // 前の予定は差し替えで畳まれる (`Timer` の Drop が止める)。
-        state.watched.insert(
+        self.state.lock().unwrap().watched.insert(
             series,
             Watched {
                 timer: Some(timer),
@@ -227,17 +257,19 @@ impl Keepalive {
 
     /// 本文が合図の戻りなら、合言葉を使い切って扱いを返す。
     ///
-    /// 合言葉は 1 回だけ有効。同じものが 2 度戻ってきても、2 度目は普通の
-    /// リクエストとして扱う。
-    pub fn take_marker(&self, body: &Value) -> Option<(Series, Marker)> {
+    /// 合言葉は 1 回だけ有効。**出した覚えのない合言葉も合図の戻り** —
+    /// 同じ会話を見ている別のプロセスが出したもので、2 度目に戻ってきた
+    /// 自分の合言葉も同じ扱いになる ([`Marker::Foreign`]、DR-0024 §2)。
+    pub fn take_marker(&self, body: &Value) -> Option<Marker> {
         let nonce = nonce_in(body)?;
-        let pending = self.state.lock().unwrap().pending.remove(&nonce)?;
-        let marker = if Instant::now() <= pending.deadline {
+        let Some(pending) = self.state.lock().unwrap().pending.remove(&nonce) else {
+            return Some(Marker::Foreign);
+        };
+        Some(if Instant::now() <= pending.deadline {
             Marker::Applied
         } else {
             Marker::Late
-        };
-        Some((pending.series, marker))
+        })
     }
 
     /// 合図を 1 つ出す。
@@ -501,13 +533,13 @@ mod tests {
 
         assert_eq!(
             keepalive.take_marker(&coming_back),
-            Some((series(), Marker::Applied)),
+            Some(Marker::Applied),
             "found even though the marker is wrapped in a notification"
         );
         assert_eq!(
             keepalive.take_marker(&coming_back),
-            None,
-            "the nonce is spent once"
+            Some(Marker::Foreign),
+            "a nonce is spent once; what comes back after that is someone else's"
         );
         assert_eq!(keepalive.waiting(), 0);
     }
@@ -523,10 +555,7 @@ mod tests {
         tokio::time::advance(LIFETIME).await;
         let coming_back = json!({"messages": [{"role": "user", "content": signal.marker}]});
 
-        assert_eq!(
-            keepalive.take_marker(&coming_back),
-            Some((series(), Marker::Late))
-        );
+        assert_eq!(keepalive.take_marker(&coming_back), Some(Marker::Late));
     }
 
     /// 合図が戻ってきた後も、同じ 55 分の間隔で次を出す。
@@ -632,8 +661,8 @@ mod tests {
         let coming_back = json!({"messages": [{"role": "user", "content": signal.marker}]});
         assert_eq!(
             keepalive.take_marker(&coming_back),
-            None,
-            "a spent plan cannot be redeemed later"
+            Some(Marker::Foreign),
+            "a dropped plan cannot be redeemed later"
         );
     }
 
@@ -687,5 +716,78 @@ mod tests {
                 "{one}"
             );
         }
+    }
+
+    /// 別のプロセスの合図を見たら、こちらは控えに回る (DR-0024 §2)。
+    ///
+    /// 相手が生きている限り出さない。相手が居なくなったときだけ引き継ぐ。
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_from_elsewhere_puts_this_process_on_standby() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.standby(series(), bound(), HORIZON);
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            watching.try_recv().is_err(),
+            "the other process is still the one signalling"
+        );
+
+        tokio::time::advance(STANDBY_AFTER - REFRESH_AFTER).await;
+        assert_eq!(
+            signalled(watching.recv().await.unwrap()).session_id,
+            "s-1",
+            "nobody else did it, so this process takes over"
+        );
+    }
+
+    /// 相手の合図が届き続ける限り、控えは発火しない。
+    #[tokio::test(start_paused = true)]
+    async fn a_process_on_standby_keeps_stepping_back() {
+        let (keepalive, mut watching) = keepalive();
+
+        for _ in 0..6 {
+            keepalive.standby(series(), bound(), HORIZON);
+            // 相手は 55 分ごとに出す。こちらの控え (57 分) より先に届く。
+            tokio::time::advance(REFRESH_AFTER).await;
+            settle().await;
+            assert!(watching.try_recv().is_err(), "still the other one's turn");
+        }
+    }
+
+    /// 合図を出した後、何も戻らなければ二度と出さない。
+    ///
+    /// 戻らないのは、その会話が別のプロセスへ流れた印。出し続けると 2 本に
+    /// なるので、次を仕込むのは何かが戻ってきた時だけにする。
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_nobody_answers_is_not_repeated() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        signalled(watching.recv().await.unwrap());
+
+        tokio::time::advance(REFRESH_AFTER * 3).await;
+        settle().await;
+        assert!(
+            watching.try_recv().is_err(),
+            "no answer came back, so no second signal goes out"
+        );
+    }
+
+    /// 見たことのない系列でも控えには入れる。
+    ///
+    /// フェイルオーバーで初めてその会話を見たプロセスが、そのまま相手の
+    /// 後ろに並べる。
+    #[tokio::test(start_paused = true)]
+    async fn a_series_first_seen_through_a_foreign_signal_can_stand_by() {
+        let (keepalive, mut watching) = keepalive();
+        assert_eq!(keepalive.armed(), 0);
+
+        keepalive.standby(series(), bound(), HORIZON);
+        assert_eq!(keepalive.armed(), 1);
+
+        tokio::time::advance(STANDBY_AFTER + Duration::from_secs(1)).await;
+        assert_eq!(signalled(watching.recv().await.unwrap()).session_id, "s-1");
     }
 }

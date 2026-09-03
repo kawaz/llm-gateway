@@ -344,7 +344,7 @@ was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
 `cache_expires_at` / `cache_expires_at_iso` are that moment. A request that leaves no
 breakpoint omits all three. If routes were skipped during route selection, `skipped` lists each
 credential and the reason. A request that answered a cache signal carries
-`keepalive` (`applied` / `late`).
+`keepalive` (`applied` / `late` / `foreign`).
 
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
@@ -359,7 +359,9 @@ The receiver injects `marker` verbatim into that conversation (`session_id`).
 followed by it is the token the answer consists of. The body of the
 answer is treated like any other request (under `keepalive` every request writes the
 hour); the notice only says whether it came back before `deadline` (`applied`) or after
-it (`late`). While the route a conversation was cached on is unavailable, no signal is
+it (`late`). A token **this gateway never minted** is reported as `foreign`: another
+process watching the same conversation raised that signal, and this one steps back
+(that is how several processes converge on a single signal, DR-0024). While the route a conversation was cached on is unavailable, no signal is
 raised at all. The same notice reaches the
 `webhook` destination in the same shape.
 
