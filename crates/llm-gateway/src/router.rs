@@ -238,23 +238,27 @@ pub struct Router {
     /// リクエストごとに組み直すと、断られた印も枠の観測も毎回消える。
     presets: BTreeMap<String, Arc<Preset>>,
     catalog: RwLock<Catalog>,
-    /// 会話と経路の結びつき。鍵は (namespace 名, 会話)。
+    /// 会話と経路の結びつき。鍵は (namespace 名, 会話, モデル)。
     ///
     /// namespace が違えば見えるモデルも経路の順も違うので、会話だけで引くと
     /// 別の namespace の結果が混ざる。同じ本文から derive した会話の鍵は
     /// namespace をまたいでも一致するので、分けないと経路の順が汚れる。
     ///
+    /// **モデルも鍵に含める**。1 つの会話は本流のほかに、別のモデルで走る
+    /// 脇の呼び出し (権限の判定・要約など) を同じ会話の id で送ってくる。
+    /// モデルを鍵から外すと、脇の 1 本が通った経路で本流の結びつきが上書き
+    /// され、本流は次の 1 本で結びつきを失って設定順に落ちる (= 別 credential
+    /// へ飛び、その会話の prompt cache が丸ごと無効になる)。
+    ///
     /// **provider 間で選ぶための状態**なので、経路の側ではなく core が持つ
     /// (DR-0014 §3 の横断機構)。
-    affinity: Mutex<HashMap<(String, SessionKey), Binding>>,
+    affinity: Mutex<HashMap<(String, SessionKey, String), Binding>>,
     /// 起きたことを見ている人へ流す口。全 provider ぶんで 1 本。
     events: Arc<Events>,
 }
 
 struct Binding {
     route: Arc<Route>,
-    /// 同じモデルの会話にだけ効かせる。モデルが変われば選び直す。
-    model: String,
     seen: Instant,
 }
 
@@ -500,8 +504,8 @@ impl Router {
         let now = Instant::now();
         affinity.retain(|_, b| now.duration_since(b.seen) < AFFINITY_TTL);
 
-        let key = (ns_name.to_owned(), session.clone());
-        if let Some(bound) = affinity.get(&key).filter(|b| b.model == model)
+        let key = (ns_name.to_owned(), session.clone(), model.to_owned());
+        if let Some(bound) = affinity.get(&key)
             && let Some(at) = routes.iter().position(|r| r.name() == bound.route.name())
         {
             // 抜いて先頭へ差し込む。入れ替えると、先頭にいた経路が抜けた穴へ
@@ -652,10 +656,9 @@ impl Router {
         route: &Arc<Route>,
     ) {
         self.affinity.lock().await.insert(
-            (ns_name.to_owned(), session.clone()),
+            (ns_name.to_owned(), session.clone(), model.to_owned()),
             Binding {
                 route: Arc::clone(route),
-                model: model.to_owned(),
                 seen: Instant::now(),
             },
         );
@@ -1950,6 +1953,73 @@ spend_down_within = "25%"
             names(&r.routes_for(ns(&r), NS, "claude-opus-5", &s).await.unwrap()),
             vec!["oauth-a", "oauth-b"],
             "has no effect on a different model"
+        );
+    }
+
+    /// 同じ会話 id で走る脇の呼び出しは、本流の結びつきを壊さない。
+    ///
+    /// クライアントは本流と、別モデルで走る判定・要約を同じ会話の id で
+    /// 送ってくる。モデルを鍵に含めないと、脇の 1 本が通った経路で本流の
+    /// 結びつきが消え、本流が別の credential へ飛ぶ (= その会話の
+    /// prompt cache が丸ごと無効になる)。
+    #[tokio::test]
+    async fn a_side_call_on_another_model_keeps_the_main_binding() {
+        let r = router().await;
+        let s = session("s1");
+
+        let main = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        r.remember(NS, &s, "claude-fable-5", &main[1]).await;
+
+        // 同じ会話を名乗る、別モデルの 1 本。
+        let side = r
+            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .await
+            .unwrap();
+        r.remember(NS, &s, "claude-sonnet-5", &side[2]).await;
+
+        assert_eq!(
+            names(
+                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["oauth-a", "bedrock"],
+            "the main conversation stays on the route it was bound to"
+        );
+        assert_eq!(
+            names(
+                &r.routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["oauth-b", "bedrock", "oauth-a"],
+            "and the side call keeps its own"
+        );
+    }
+
+    /// 同じモデルで通り直したら、そちらが結びつきになる。
+    #[tokio::test]
+    async fn the_route_that_worked_last_replaces_the_one_before() {
+        let r = router().await;
+        let s = session("s1");
+
+        let routes = r
+            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .await
+            .unwrap();
+        r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
+        r.remember(NS, &s, "claude-fable-5", &routes[0]).await;
+
+        assert_eq!(
+            names(
+                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                    .await
+                    .unwrap()
+            ),
+            vec!["bedrock", "oauth-a"]
         );
     }
 
