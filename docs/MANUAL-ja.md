@@ -322,11 +322,16 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02"}
+data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000,"cache_expires_at_iso":"2026-07-29T13:00:00Z"}
 ```
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
-見分ける印。取れなければ欄ごと出ない。経路選定で外した経路がある場合は
+見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
+(`main` / `sub` / `unknown`)。`cache_ttl_secs` は**この 1 本が残す
+プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
+送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
+`cache_expires_at` / `cache_expires_at_iso` はその時刻。ブレークポイントの
+無い 1 本では 3 つとも欄ごと出ない。経路選定で外した経路がある場合は
 `skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
 `keepalive` (`applied` / `late`) が付く。
 
@@ -368,11 +373,12 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 ```
 
 ```json
-{"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal"}
+{"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
 ```
 
-効かせた prompt cache 戦略があれば `cache_strategy`、合図の戻りだった 1 本には
-`keepalive` が加わる。`include` を指定した購読にだけ `request_body` /
+`origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば
+`cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs`、合図の戻りだった
+1 本には `keepalive` が加わる。`include` を指定した購読にだけ `request_body` /
 `response_body` が加わる。
 切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は
 gateway が書き換える前の、クライアントが送ってきた値。

@@ -37,9 +37,14 @@ pub struct Event {
     pub request_body_size: usize,
     pub response_body_size: usize,
     pub credential: Option<String>,
+    /// この 1 本を出した側 (`main` / `sub` / `unknown`、DR-0024)。
+    pub origin: String,
     /// 効かせた prompt cache 戦略 (DR-0024)。設定に当たらなければ出さない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_strategy: Option<String>,
+    /// この 1 本が残すプレフィックスの寿命 (秒)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_secs: Option<u64>,
     /// cache の合図の戻りだったときの扱い (`applied` / `late`)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keepalive: Option<String>,
@@ -194,7 +199,9 @@ mod tests {
             request_body_size: 6,
             response_body_size: 6,
             credential: None,
+            origin: "main".into(),
             cache_strategy: None,
+            cache_ttl_secs: None,
             keepalive: None,
             request_body: Some("abcdef".into()),
             response_body: Some("uvwxyz".into()),

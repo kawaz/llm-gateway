@@ -52,6 +52,18 @@ pub struct Event {
     /// この会話系列の識別子 ([`prefix`])。取れなければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// この 1 本を出した側 (`main` / `sub` / `unknown`、DR-0024)。
+    pub origin: String,
+    /// この 1 本が残すプレフィックスの寿命 (秒)。cache を使わない 1 本では
+    /// 欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_secs: Option<u64>,
+    /// その寿命が尽きる時刻 (Unix 秒)。`ts` + [`Self::cache_ttl_secs`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<i64>,
+    /// 同じ時刻の ISO 8601 表記。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at_iso: Option<String>,
     /// 経路選定で外した経路。無ければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
@@ -79,6 +91,10 @@ pub struct Origin<'a> {
     pub model: &'a str,
     /// 答えた経路の名前。
     pub credential: &'a str,
+    /// この 1 本を出した側 (`main` / `sub` / `unknown`)。
+    pub origin: &'a str,
+    /// この 1 本が残すプレフィックスの寿命 (秒)。
+    pub cache_ttl_secs: Option<u64>,
     /// cache の合図としての扱い ([`Event::keepalive`])。
     pub keepalive: Option<&'a str>,
 }
@@ -98,6 +114,14 @@ impl Event {
             credential: origin.credential.to_owned(),
             status,
             prefix: origin.prefix.map(str::to_owned),
+            origin: origin.origin.to_owned(),
+            cache_ttl_secs: origin.cache_ttl_secs,
+            // 寿命の起点は、この 1 本を upstream へ送り始めた時刻。数える側で
+            // 足し算をさせない。
+            cache_expires_at: origin.cache_ttl_secs.map(|ttl| ts + ttl as i64),
+            cache_expires_at_iso: origin
+                .cache_ttl_secs
+                .map(|ttl| format_rfc3339(ts + ttl as i64)),
             skipped,
             keepalive: origin.keepalive.map(str::to_owned),
         }
@@ -304,6 +328,8 @@ mod tests {
             model: "m",
             credential,
             keepalive: None,
+            origin: "main",
+            cache_ttl_secs: None,
         }
     }
 
@@ -499,6 +525,34 @@ mod tests {
             ]),
             "each internal reason has one stable lowercase output word"
         );
+
+        let cached = Event::new(
+            NOW,
+            &Origin {
+                origin: "sub",
+                cache_ttl_secs: Some(3600),
+                ..from("a")
+            },
+            200,
+        );
+        let json = serde_json::to_value(&cached).unwrap();
+        assert_eq!(json["origin"], "sub");
+        assert_eq!(json["cache_ttl_secs"], 3600);
+        assert_eq!(
+            json["cache_expires_at"],
+            NOW + 3600,
+            "counted from the moment the request went out"
+        );
+        assert_eq!(json["cache_expires_at_iso"], format_rfc3339(NOW + 3600));
+
+        let uncached = serde_json::to_value(Event::new(NOW, &from("a"), 200)).unwrap();
+        assert_eq!(uncached["origin"], "main", "the field is always there");
+        for field in ["cache_ttl_secs", "cache_expires_at", "cache_expires_at_iso"] {
+            assert!(
+                uncached.get(field).is_none(),
+                "{field} is omitted when nothing is cached"
+            );
+        }
 
         let in_series = Event::new(
             NOW,

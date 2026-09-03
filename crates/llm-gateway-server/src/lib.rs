@@ -659,9 +659,11 @@ async fn messages<P: Persistence + 'static>(
                         .credential
                         .as_ref()
                         .map(|credential| credential.as_str().to_owned()),
+                    origin: forwarded.origin.clone(),
                     cache_strategy: forwarded
                         .cache_strategy
                         .map(|strategy| strategy.as_str().to_owned()),
+                    cache_ttl_secs: forwarded.cache_ttl_secs,
                     keepalive: forwarded.keepalive.clone(),
                     request_body: tap_request_body,
                     response_body: None,

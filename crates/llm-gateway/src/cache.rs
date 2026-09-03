@@ -54,6 +54,41 @@ fn apply_one_hour(body: &mut Value) {
     });
 }
 
+/// この本文が残すプレフィックスの寿命 (秒)。cache に載らない 1 本では `None`。
+///
+/// 戦略で決め打ちにできるものはそれで答え、本文に触らない `passthrough`
+/// (と規則の無い namespace) だけ、送る本文のブレークポイントを読む —
+/// `ttl: "1h"` がひとつでもあれば 1 時間、`ttl` の無いブレークポイントだけなら
+/// 既定の 5 分、ブレークポイントが無ければ載らない。
+///
+/// 見る側が「あと何分もつか」を描くための値 (DR-0012)。`prefix` と同じで、
+/// **キャッシュに当たる保証ではない** — プレフィックスが変われば実際には
+/// 効かない。
+pub fn ttl_secs(strategy: Option<CacheStrategy>, body: &Value) -> Option<u64> {
+    const FIVE_MINUTES: u64 = 5 * 60;
+    const ONE_HOUR: u64 = 60 * 60;
+
+    match strategy {
+        Some(CacheStrategy::None) => None,
+        Some(CacheStrategy::FiveMinutes) => Some(FIVE_MINUTES),
+        Some(CacheStrategy::OneHour | CacheStrategy::Keepalive) => Some(ONE_HOUR),
+        Some(CacheStrategy::Passthrough) | None => {
+            let mut longest = None;
+            visit(&mut body.clone(), &mut |holder| {
+                let Some(control) = holder.get("cache_control").and_then(Value::as_object) else {
+                    return;
+                };
+                let ttl = match control.get("ttl").and_then(Value::as_str) {
+                    Some("1h") => ONE_HOUR,
+                    _ => FIVE_MINUTES,
+                };
+                longest = Some(longest.map_or(ttl, |seen: u64| seen.max(ttl)));
+            });
+            longest
+        }
+    }
+}
+
 /// `cache_control` を持てる場所を全部なめる。
 ///
 /// 置ける場所は本文の形で決まっている — トップレベル、`system` の各ブロック、
@@ -260,5 +295,52 @@ mod tests {
             CacheStrategy::OneHour,
             "an unrecognized caller is treated as the main conversation"
         );
+    }
+
+    /// 戦略を書いた 1 本の寿命は、戦略だけで決まる。
+    #[test]
+    fn the_strategy_decides_how_long_the_prefix_lives() {
+        for (strategy, want) in [
+            (CacheStrategy::FiveMinutes, Some(300)),
+            (CacheStrategy::OneHour, Some(3600)),
+            (CacheStrategy::Keepalive, Some(3600)),
+            (CacheStrategy::None, None),
+        ] {
+            let mut sending = body();
+            apply(&mut sending, strategy);
+            assert_eq!(
+                ttl_secs(Some(strategy), &sending),
+                want,
+                "{}",
+                strategy.as_str()
+            );
+        }
+    }
+
+    /// 本文に触らない 1 本の寿命は、クライアントが書いたブレークポイントで決まる。
+    #[test]
+    fn an_untouched_body_answers_for_itself() {
+        let hour = json!({"system": [
+            {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "b", "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        ]});
+        let five = json!({"system": [
+            {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+        ]});
+        let none = json!({"system": [{"type": "text", "text": "a"}]});
+
+        for strategy in [Some(CacheStrategy::Passthrough), None] {
+            assert_eq!(
+                ttl_secs(strategy, &hour),
+                Some(3600),
+                "one hour anywhere is the life of the prefix"
+            );
+            assert_eq!(ttl_secs(strategy, &five), Some(300));
+            assert_eq!(
+                ttl_secs(strategy, &none),
+                None,
+                "a body with no breakpoint leaves nothing behind"
+            );
+        }
     }
 }

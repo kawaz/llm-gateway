@@ -249,6 +249,8 @@ mod tests {
                 model: "m",
                 credential,
                 keepalive: None,
+                origin: "main",
+                cache_ttl_secs: None,
             },
             200,
         ))
@@ -265,6 +267,8 @@ mod tests {
                 model: "m",
                 credential: "a",
                 keepalive: None,
+                origin: "main",
+                cache_ttl_secs: None,
             },
             200,
         );

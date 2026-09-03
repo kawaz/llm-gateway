@@ -83,6 +83,17 @@ pub enum RequestOrigin {
     Sub,
 }
 
+impl RequestOrigin {
+    /// 知らせに出す 1 語。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Main => "main",
+            Self::Sub => "sub",
+        }
+    }
+}
+
 /// リクエスト本文から呼び出し元を読む任意 capability。
 pub trait CallerOrigin: Send + Sync {
     fn origin(&self, body: &serde_json::Value) -> RequestOrigin;

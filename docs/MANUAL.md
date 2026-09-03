@@ -327,12 +327,17 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02"}
+data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000,"cache_expires_at_iso":"2026-07-29T13:00:00Z"}
 ```
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
-omitted. If routes were skipped during route selection, `skipped` lists each
+omitted. `origin` says who asked (`main` / `sub` / `unknown`). `cache_ttl_secs` is
+**how long the prefix this request leaves behind lives**, in seconds: it follows the
+strategy that was applied, and for an untouched body it reads the `cache_control` that
+was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
+`cache_expires_at` / `cache_expires_at_iso` are that moment. A request that leaves no
+breakpoint omits all three. If routes were skipped during route selection, `skipped` lists each
 credential and the reason. A request that answered a cache signal carries
 `keepalive` (`applied` / `late`).
 
@@ -376,10 +381,11 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 ```
 
 ```json
-{"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal"}
+{"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
 ```
 
-`cache_strategy` appears when a prompt cache strategy was applied, and `keepalive`
+`origin` says who asked. `cache_strategy` appears when a prompt cache strategy was
+applied, `cache_ttl_secs` when the request leaves a prefix behind, and `keepalive`
 when the request answered a cache signal.
 `request_body` / `response_body` appear only for subscriptions that asked for them,
 and the truncation limit is independent per subscription. `thinking`, `tool_choice`,

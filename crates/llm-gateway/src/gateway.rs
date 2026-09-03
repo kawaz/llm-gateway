@@ -26,7 +26,7 @@ use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
 use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
-use crate::provider::{Admission, Preset, ProbeRequest};
+use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
 use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Route, Router, Selection};
 use crate::session;
@@ -508,6 +508,8 @@ impl<P: Persistence> Gateway<P> {
                     // 送っていないので、本文には触っていない。
                     cache_strategy: None,
                     keepalive: taken.clone(),
+                    origin: RequestOrigin::Unknown.as_str().to_owned(),
+                    cache_ttl_secs: None,
                 });
             }
         };
@@ -548,7 +550,11 @@ impl<P: Persistence> Gateway<P> {
                     // (DR-0014 §4)。受け取り口は preset を知らないので、読む役を
                     // 応答と一緒に持たせて渡す。
                     let usage = usage_observer(route.preset.as_ref(), &resp);
-                    let cache_strategy = call.cache_strategy(route.preset.as_ref());
+                    let (origin, cache_strategy) = call.cache_view(route.preset.as_ref());
+                    // 送る本文で `cache_control` が変わるのは戦略を書いた場合
+                    // だけで、そこは戦略から寿命が決まる。読んで決めるのは
+                    // 素通しのときだけなので、書き換え前の本文で同じ答えになる。
+                    let cache_ttl_secs = cache::ttl_secs(cache_strategy, call.body);
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
@@ -557,6 +563,8 @@ impl<P: Persistence> Gateway<P> {
                         usage,
                         cache_strategy,
                         keepalive: taken.clone(),
+                        origin: origin.as_str().to_owned(),
+                        cache_ttl_secs,
                     });
                 }
                 Err(Switch {
@@ -644,6 +652,8 @@ impl<P: Persistence> Gateway<P> {
                 usage: None,
                 cache_strategy: None,
                 keepalive: taken,
+                origin: RequestOrigin::Unknown.as_str().to_owned(),
+                cache_ttl_secs: None,
             });
         }
 
@@ -839,12 +849,15 @@ impl<P: Persistence> Gateway<P> {
         }
         // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
-        if let Some(strategy) = call.cache_strategy(route.preset.as_ref()) {
+        let (origin, strategy) = call.cache_view(route.preset.as_ref());
+        if let Some(strategy) = strategy {
             cache::apply(&mut body, strategy);
             if strategy == CacheStrategy::Keepalive {
                 self.keep_alive(call, route);
             }
         }
+        // 送る本文が決まったので、この 1 本が残す cache の寿命も決まる。
+        let cache_ttl_secs = cache::ttl_secs(strategy, &body);
 
         let sent_at = now_unix();
         let resp = match egress::send(
@@ -883,7 +896,11 @@ impl<P: Persistence> Gateway<P> {
         // status で絞らない。
         self.events.publish(events::Event::with_skipped(
             sent_at,
-            &call.origin(route.name()),
+            &events::Origin {
+                origin: origin.as_str(),
+                cache_ttl_secs,
+                ..call.origin(route.name())
+            },
             resp.response.status,
             skipped.to_vec(),
         ));
@@ -1238,17 +1255,24 @@ impl<'a> Call<'a> {
             model: self.model,
             credential,
             keepalive: self.keepalive.map(keepalive::Marker::as_str),
+            // 出した側と cache の寿命は、送る経路が決まって初めて分かる。
+            // 経路の手前で組む知らせ (全滅の 429 等) には載らない。
+            origin: crate::provider::RequestOrigin::Unknown.as_str(),
+            cache_ttl_secs: None,
         }
     }
 
-    /// この経路へ送るときに効く prompt cache 戦略 (DR-0024)。
+    /// この経路へ送るときの、出した側と効かせる prompt cache 戦略 (DR-0024)。
     ///
     /// 呼び出し元 (メイン / サブエージェント) を読めるのは方言を知っている
     /// 経路だけなので、経路ごとに聞く。同じ本文なら答えも同じで、経路を
     /// 何度試しても本文は同じになる。
-    fn cache_strategy(&self, preset: &Preset) -> Option<CacheStrategy> {
-        let rule = self.cache?;
-        Some(cache::strategy_of(rule, preset.request_origin(self.body)))
+    fn cache_view(&self, preset: &Preset) -> (RequestOrigin, Option<CacheStrategy>) {
+        let origin = preset.request_origin(self.body);
+        (
+            origin,
+            self.cache.map(|rule| cache::strategy_of(rule, origin)),
+        )
     }
 }
 
@@ -1302,6 +1326,10 @@ pub struct Forwarded {
     pub cache_strategy: Option<CacheStrategy>,
     /// この 1 本が cache の合図の戻りだったときの扱い (`applied` / `late`)。
     pub keepalive: Option<String>,
+    /// この 1 本を出した側 (`main` / `sub` / `unknown`、DR-0024)。
+    pub origin: String,
+    /// この 1 本が残すプレフィックスの寿命 (秒)。
+    pub cache_ttl_secs: Option<u64>,
 }
 
 impl std::fmt::Debug for Forwarded {
@@ -1314,6 +1342,7 @@ impl std::fmt::Debug for Forwarded {
             .field("usage", &self.usage.is_some())
             .field("cache_strategy", &self.cache_strategy)
             .field("keepalive", &self.keepalive)
+            .field("origin", &self.origin)
             .finish()
     }
 }
@@ -4824,6 +4853,74 @@ main = "keepalive"
             signal(&mut watching).await.session_id,
             "s-1",
             "the next attempt signals once the route reopens"
+        );
+    }
+
+    /// 知らせは、出した側とこの 1 本が残す cache の寿命を載せる (DR-0012)。
+    #[tokio::test]
+    async fn the_event_says_who_asked_and_how_long_the_cache_lives() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[[ns.default.cache]]
+models = ["m"]
+main = "1h"
+sub = "5m"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!(event.origin, "main");
+        assert_eq!(event.cache_ttl_secs, Some(3600));
+        assert_eq!(event.cache_expires_at, Some(event.ts + 3600));
+
+        let (mut sub, headers) = conversation(json!({}));
+        sub["metadata"] = json!({"user_id": SUB});
+        gw.forward(ns(&gw), NS, "/v1/messages", None, sub, headers)
+            .await
+            .unwrap();
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!(event.origin, "sub");
+        assert_eq!(
+            event.cache_ttl_secs,
+            Some(300),
+            "the subagent's own strategy decides its own life"
+        );
+    }
+
+    /// 設定を書いていない namespace では、クライアントの本文が寿命を決める。
+    #[tokio::test]
+    async fn an_untouched_body_still_reports_what_it_leaves_behind() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!(
+            event.cache_ttl_secs,
+            Some(300),
+            "the client wrote a breakpoint without a ttl"
+        );
+
+        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!(
+            event.cache_ttl_secs, None,
+            "a body with no breakpoint leaves nothing behind"
         );
     }
 }
