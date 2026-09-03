@@ -98,6 +98,10 @@ pub enum Marker {
     /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図で差分だけ 1 時間に
     /// するほうが安い。
     Rerouted,
+    /// 直前の実リクエストからプレフィックスが変わっていた ([`shape`])。
+    /// 変わった位置から先は全部書き直しになるので、[`Self::Rerouted`] と
+    /// 同じ理由で付けない。
+    Drifted,
 }
 
 impl Marker {
@@ -107,6 +111,7 @@ impl Marker {
             Self::Applied => "applied",
             Self::Late => "late",
             Self::Rerouted => "rerouted",
+            Self::Drifted => "drifted",
         }
     }
 
@@ -117,7 +122,7 @@ impl Marker {
     pub fn wrote(self) -> Wrote {
         match self {
             Self::Applied => Wrote::OneHour,
-            Self::Late | Self::Rerouted => Wrote::FiveMinutes,
+            Self::Late | Self::Rerouted | Self::Drifted => Wrote::FiveMinutes,
         }
     }
 }
@@ -130,6 +135,8 @@ pub struct Bound {
     pub ns: String,
     pub model: String,
     pub route: String,
+    /// そのとき送ったプレフィックスの形 ([`shape`])。
+    pub shape: String,
 }
 
 /// 経路が今も使えるかを答える口。
@@ -259,14 +266,14 @@ impl Keepalive {
         );
     }
 
-    /// この系列の実リクエストが最後に通った経路。
-    pub fn bound_route(&self, series: &Series) -> Option<String> {
+    /// この系列の実リクエストが最後に通った先。
+    pub fn bound(&self, series: &Series) -> Option<Bound> {
         self.state
             .lock()
             .unwrap()
             .watched
             .get(series)
-            .map(|watched| watched.bound.route.clone())
+            .map(|watched| watched.bound.clone())
     }
 
     /// この系列の合図待ちを畳む。
@@ -359,6 +366,32 @@ impl Keepalive {
     }
 }
 
+/// この本文が upstream へ送るプレフィックスの形 (DR-0024 §2)。
+///
+/// 見るのは `tools` と `system` — 1 つ目のブレークポイントより手前にあり、
+/// ここが変われば以降のブロックは全部書き直しになる。クライアントは
+/// `system` の末尾に作業ディレクトリの状態のような可変の内容を載せるので、
+/// 会話が止まっている間にも変わりうる。
+///
+/// `cache_control` は外して比べる。付け外しはこちらの判断で起きるもので、
+/// プレフィックスが変わったかどうかとは別。
+///
+/// [`crate::events::prefix`] とは別物 — あちらは `system` の**先頭ブロック**
+/// だけを見て「同じ会話系列か」を言う印で、こちらは「同じ本文か」を見る。
+pub fn shape(body: &Value) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let mut prefix = serde_json::json!({
+        "tools": body.get("tools").cloned().unwrap_or(Value::Null),
+        "system": body.get("system").cloned().unwrap_or(Value::Null),
+    });
+    crate::cache::visit(&mut prefix, &mut |holder| {
+        holder.remove("cache_control");
+    });
+    let digest = Sha256::digest(prefix.to_string().as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// この 1 本が会話の本流か。
 ///
 /// 道具を渡していないリクエスト (分類器・要約など) は、本流とは別の
@@ -432,6 +465,7 @@ mod tests {
             ns: "default".to_owned(),
             model: "m".to_owned(),
             route: "a".to_owned(),
+            shape: shape(&json!({"system": [{"type": "text", "text": "head"}]})),
         }
     }
 
@@ -696,6 +730,48 @@ mod tests {
         let (keepalive, _watching) = keepalive();
         keepalive.forget(&series());
         assert_eq!(keepalive.armed(), 0);
+    }
+
+    /// プレフィックスの形は `tools` と `system` で決まる。
+    ///
+    /// `cache_control` の付け外しでは変わらず、`system` の中身が変われば変わる。
+    /// 後ろに続くメッセージは見ない (そこは cache に載る手前ではない)。
+    #[test]
+    fn the_shape_follows_the_prefix_and_nothing_else() {
+        let body = json!({
+            "system": [{"type": "text", "text": "You are Claude Code"},
+                {"type": "text", "text": "gitStatus: clean"}],
+            "tools": [{"name": "Bash"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+
+        let mut marked = body.clone();
+        marked["system"][1]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(
+            shape(&marked),
+            shape(&body),
+            "a breakpoint is our own doing, not a change of the prefix"
+        );
+
+        let mut later = body.clone();
+        later["messages"] = json!([{"role": "user", "content": "and then?"}]);
+        assert_eq!(
+            shape(&later),
+            shape(&body),
+            "what follows the prefix is not it"
+        );
+
+        let mut moved = body.clone();
+        moved["system"][1]["text"] = json!("gitStatus: 3 files changed");
+        assert_ne!(
+            shape(&moved),
+            shape(&body),
+            "the client rewrites the tail of the system prompt as work goes on"
+        );
+
+        let mut fewer = body.clone();
+        fewer["tools"] = json!([]);
+        assert_ne!(shape(&fewer), shape(&body));
     }
 
     /// 道具を持たない 1 本は会話の本流ではない。

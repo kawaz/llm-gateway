@@ -311,7 +311,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。経路選定で外した経路がある場合は
 `skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
-`keepalive` (`applied` / `late` / `rerouted`) が付く。
+`keepalive` (`applied` / `late` / `rerouted` / `drifted`) が付く。
 
 `keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
 (DR-0024)。
@@ -322,10 +322,11 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 ```
 
 受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
-1 時間の cache が付くのは、`deadline` までに戻ってきて、かつ直前の
-リクエストと同じ経路へ出ていく 1 本だけ (`applied`)。遅れたもの (`late`) と
-別経路へ出ていくもの (`rerouted`) は素通しする。直前に通った経路が塞がって
-いる間は合図そのものを出さない。同じ受け口 (`webhook`) にも同じ形で届く。
+1 時間の cache が付くのは、`deadline` までに戻ってきて、直前のリクエストと
+同じ経路へ出ていき、`tools` + `system` も変わっていない 1 本だけ (`applied`)。
+遅れたもの (`late`)・別経路へ出ていくもの (`rerouted`)・プレフィックスが
+変わったもの (`drifted`) は素通しする。直前に通った経路が塞がっている間は
+合図そのものを出さない。同じ受け口 (`webhook`) にも同じ形で届く。
 
 ### `GET /llm-gateway/tap`
 

@@ -315,7 +315,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 conversation series a request belongs to; when it cannot be derived, the field is
 omitted. If routes were skipped during route selection, `skipped` lists each
 credential and the reason. A request that answered a cache signal carries
-`keepalive` (`applied` / `late` / `rerouted`).
+`keepalive` (`applied` / `late` / `rerouted` / `drifted`).
 
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
@@ -326,9 +326,10 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 ```
 
 The receiver injects `marker` verbatim into that conversation (`session_id`). The hour
-is written only for a request that comes back before `deadline` *and* goes out on the
-same route as the request before it (`applied`); a late one (`late`) and one that lands
-on another route (`rerouted`) are forwarded untouched. While the route a conversation
+is written only for a request that comes back before `deadline`, goes out on the same
+route as the request before it, and carries the same `tools` + `system` (`applied`);
+a late one (`late`), one that lands on another route (`rerouted`), and one whose prefix
+changed in the meantime (`drifted`) are forwarded untouched. While the route a conversation
 was cached on is unavailable, no signal is raised at all. The same notice reaches the
 `webhook` destination in the same shape.
 

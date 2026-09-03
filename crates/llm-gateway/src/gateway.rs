@@ -801,6 +801,7 @@ impl<P: Persistence> Gateway<P> {
                         ns: call.ns.to_owned(),
                         model: call.model.to_owned(),
                         route: route.name().to_owned(),
+                        shape: keepalive::shape(call.body),
                     },
                     horizon,
                 );
@@ -810,22 +811,28 @@ impl<P: Persistence> Gateway<P> {
 
     /// この経路へ送るときの、合図の戻りとしての扱い (DR-0024 §2)。
     ///
-    /// 直前の実リクエストとは別の経路へ出ていく合図には 1 時間を付けない。
-    /// 経路が違えば upstream にプレフィックスが無く、どのみち全量を書く —
-    /// そこで 2 倍を払うより、1.25 倍で書き直して次の合図に賭けるほうが安い。
-    /// 発火時にも同じ確認をしているが (`Keepalive::fire`)、出した後で締め出さ
-    /// れた分はここでしか捕まえられない。
+    /// 1 時間を付けるのは、**直前の実リクエストと同じ経路へ、同じプレフィックス
+    /// で**出ていく合図だけ。経路が違えば upstream にプレフィックスが無く、
+    /// プレフィックス自体が変わっていればそこから先は書き直しになる。どちらも
+    /// どのみち全量を書くので、2 倍を払うより 1.25 倍で書き直して次の合図に
+    /// 賭けるほうが安い。経路は発火時にも確かめているが (`Keepalive::fire`)、
+    /// 出した後で締め出された分はここでしか捕まえられない。
     fn marker_for(&self, call: &Call<'_>, route: &Route) -> Option<keepalive::Marker> {
         let marker = call.keepalive?;
         let series = call.series.as_ref()?;
-        let rerouted = self
-            .keepalive
-            .bound_route(series)
-            .is_some_and(|bound| bound != route.name());
-        match marker {
-            keepalive::Marker::Applied if rerouted => Some(keepalive::Marker::Rerouted),
-            marker => Some(marker),
+        if marker != keepalive::Marker::Applied {
+            return Some(marker);
         }
+        let Some(bound) = self.keepalive.bound(series) else {
+            return Some(marker);
+        };
+        if bound.route != route.name() {
+            return Some(keepalive::Marker::Rerouted);
+        }
+        if bound.shape != keepalive::shape(call.body) {
+            return Some(keepalive::Marker::Drifted);
+        }
+        Some(marker)
     }
 
     async fn send(
@@ -4890,6 +4897,44 @@ main = "keepalive"
             signal(&mut watching).await.session_id,
             "s-1",
             "the next attempt signals once the route reopens"
+        );
+    }
+
+    /// 会話が止まっている間にプレフィックスが変わったら、1 時間を付けない。
+    ///
+    /// クライアントは `system` の末尾に作業ディレクトリの状態を載せる。そこが
+    /// 変わると、以降のブロックはどのみち全部書き直しになる。
+    #[tokio::test]
+    async fn a_signal_that_comes_back_with_a_changed_prefix_does_not_write_the_hour() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+
+        idle(4 * 60 + 5).await;
+        let raised = signal(&mut watching).await;
+
+        // 戻ってきた 1 本は、system の末尾が書き換わっている。
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["system"] = json!([
+            {"type": "text", "text": "You are Claude Code", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "gitStatus: 3 files changed"},
+        ]);
+        coming_back["messages"] = json!([{"role": "user", "content": raised.marker}]);
+        let forwarded = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.keepalive.as_deref(), Some("drifted"));
+        assert_eq!(
+            sent_ttls(&up.requests()[1]),
+            vec![None],
+            "the prefix it would have extended is already gone"
         );
     }
 }
