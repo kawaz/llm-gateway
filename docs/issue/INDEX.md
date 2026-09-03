@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-03 | request | open | [check-warn-namespace-without-routing](./2026-09-03-check-warn-namespace-without-routing.md) | check/起動時に routing/alias が空の namespace を warning、check 出力に ns 要約行を追加 |
 | 2026-09-03 | bug | open | [count-tokens-alias-resolution](./2026-09-03-count-tokens-alias-resolution.md) | count_tokens 経路で model alias (例: "haiku") が解決されず no route configured for model エラー |
 | 2026-09-03 | tech-memo | open | [oauth-requires-claude-code-shape](./2026-09-03-oauth-requires-claude-code-shape.md) | サブスク OAuth 経路は Claude Code の形をしていない request を 429 "Error" で弾く (真因と対応候補) |
 | 2026-09-03 | design | open | [pricing-table-override-and-gap-warning](./2026-09-03-pricing-table-override-and-gap-warning.md) | catalog に単価行が無い/glob に飲まれるモデルを check/discovery で warning する (config 上書きはスコープ外に裁定) |
