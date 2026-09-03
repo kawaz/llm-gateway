@@ -338,7 +338,7 @@ def render(sessions: list[Session], cutoff: datetime, generated: datetime) -> st
         f"- 判定: {effectiveness(total)}",
         f"- main/subagent 分類: jsonl path を基準にし、dedupe 後 entry の isSidechain と照合。不一致 {len(sidechain_mismatches):,} requests / {mismatch_sessions} sessions。",
         "",
-        "### main / subagent 比較",
+        "## main / subagent 別",
         "",
         "| 群 | sessions | requests | rt M | wt M | it M | ot M | rc | wc | ic | oc | read:write | rebuild/write | rebuild gap（回数/write M） | B 差額 | A α=0 差額 | A α悲観差額 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|",
