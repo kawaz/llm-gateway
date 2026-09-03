@@ -542,8 +542,8 @@ mod tests {
         assert!(
             signal
                 .marker
-                .contains("end your turn immediately with no output"),
-            "{}",
+                .ends_with(&format!("LLMGW-KEEPALIVE-{}", signal.nonce)),
+            "the token to send back is spelled out: {}",
             signal.marker
         );
         assert!(

@@ -79,10 +79,11 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
    nonce, deadline, deadline_iso, marker}` を流す。deadline = 直前の送出時刻 +
    その本文が残した cache の寿命 − 30 秒。受け手 (ccmsg) が `marker` をその
    セッションへ注入する (`notify --as-session`)。文面は
-   `[llm-gateway cache keepalive nonce=<nonce>] Automated cache keepalive. Do
-   not respond, do not think, do not call tools; end your turn immediately with
-   no output.` — この往復に要るのはプレフィックスを送り直すことだけで、
-   考えた分も答えた分も合図 1 回の値段に乗る
+   `[llm-gateway cache keepalive nonce=<nonce>] Reply with exactly this token and
+   nothing else: LLMGW-KEEPALIVE-<nonce>` — 返る形が決まっていれば、受け取った
+   側がその 1 行を畳んで見せずに済む (空白を含まないので 1 つの語として拾える)。
+   「何も出力するな」とは頼まない: 自分の振る舞いについての指示は完全には
+   従わせられず、断り書きが 1 行返ってきた (実測)
 4. **最後の user メッセージのどれかの text ブロックがマーカーを含む** request が
    来たら、nonce を単回消費する。先頭一致では見ないのは、合図が
    `[SYSTEM NOTIFICATION …]` に包まれて届くため。1 時間を付けるのは次の 3 つを

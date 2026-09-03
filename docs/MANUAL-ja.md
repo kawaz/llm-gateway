@@ -318,7 +318,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Automated cache keepalive. Do not respond, do not think, do not call tools; end your turn immediately with no output."}
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Reply with exactly this token and nothing else: LLMGW-KEEPALIVE-5Qv…"}
 ```
 
 受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。

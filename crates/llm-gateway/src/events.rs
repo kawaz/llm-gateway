@@ -153,13 +153,17 @@ impl Keepalive {
 ///
 /// 先頭を決め打ちの形にするのは、戻ってきたリクエストの中から見つけるため。
 /// 途中に挟まっていても拾えるようにしてあり (合図は通知に包まれて届く)、
-/// 相手には**何も出力させない** — この往復に要るのはプレフィックスを送り直す
-/// ことだけで、考えた分も答えた分も合図 1 回の値段に乗る。
+/// 返させるのは**空白を含まない 1 つのトークンだけ**。
+///
+/// 「何も出力するな」とは頼まない。それは自分の振る舞いについての指示なので
+/// 完全には従わせられず、断り書きが 1 行返ってくる (実測)。返る形が決まって
+/// いれば、受け取った側がその 1 行を畳んで見せずに済む。空白を含まない形に
+/// するのは、受け取った側が 1 つの語として拾えるようにするため。
 pub fn marker(nonce: &str) -> String {
     format!(
         "[llm-gateway cache keepalive nonce={nonce}] \
-         Automated cache keepalive. Do not respond, do not think, do not call \
-         tools; end your turn immediately with no output."
+         Reply with exactly this token and nothing else: \
+         LLMGW-KEEPALIVE-{nonce}"
     )
 }
 
