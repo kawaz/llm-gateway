@@ -64,15 +64,15 @@ sub = "none"
 | `none` | `cache_control` を全て剥がす (使い捨ての 1 本向け) |
 | `5m` | 全ブレークポイントの `ttl` 指定を落とす (= 既定の 5 分) |
 | `1h` | 全ブレークポイントに `ttl: "1h"` を付ける |
-| `keepalive` | 本文は 5 分のまま。会話が止まったら合図を出し、戻ってきた 1 往復にだけ 1 時間を付ける。**`main` のみ**、`sub` に書くと設定エラー |
+| `keepalive` | `1h` と同じ本文にした上で、会話が止まったら合図を出して 1 往復を誘発し、cache を次の 1 時間へ繋ぐ。**`main` のみ**、`sub` に書くと設定エラー |
 
 触るのは `cache_control` だけで、ブレークポイントの位置と数は変えない。
 メイン / サブエージェントの判定はリクエストの `metadata.user_id` に
 `parent_session_id` があるかで決まり、読めない相手はメイン扱い。
 
 `keepalive` は合図を `webhook` 経由でしか届けられない。`webhook.base_url` を
-書いていない設定では合図を出さず、`llm-gateway check` がその namespace を
-警告として挙げる。
+書いていない設定では合図を出さない (= `1h` と同じ動作)。`llm-gateway check` が
+その namespace を警告として挙げる。
 
 ## 転送系
 
@@ -311,7 +311,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。経路選定で外した経路がある場合は
 `skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
-`keepalive` (`applied` / `late` / `rerouted` / `drifted`) が付く。
+`keepalive` (`applied` / `late`) が付く。
 
 `keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
 (DR-0024)。
@@ -324,11 +324,10 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
 `nonce` は 32 バイトの乱数を base64url にした 43 文字で、`LLMGW-KEEPALIVE-` を
 頭に付けたものが合言葉。返事はその 1 行だけになる。
-1 時間の cache が付くのは、`deadline` までに戻ってきて、直前のリクエストと
-同じ経路へ出ていき、`tools` + `system` も変わっていない 1 本だけ (`applied`)。
-遅れたもの (`late`)・別経路へ出ていくもの (`rerouted`)・プレフィックスが
-変わったもの (`drifted`) は素通しする。直前に通った経路が塞がっている間は
-合図そのものを出さない。同じ受け口 (`webhook`) にも同じ形で届く。
+戻ってきた 1 本の本文は普通のリクエストと同じ扱い (`keepalive` は常に 1 時間を
+書く) で、`deadline` までに戻れば `applied`、過ぎていれば `late` として知らせに
+出る。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
+(`webhook`) にも同じ形で届く。
 
 ### `GET /llm-gateway/tap`
 

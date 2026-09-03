@@ -64,15 +64,15 @@ The strategies:
 | `none` | Every `cache_control` is stripped (for one-shot calls) |
 | `5m` | Every breakpoint loses its `ttl` (= the default five minutes) |
 | `1h` | Every breakpoint gets `ttl: "1h"` |
-| `keepalive` | The body stays at five minutes. When the conversation stops, a signal goes out and only the round trip that answers it gets the hour. **`main` only** — writing it under `sub` is a config error |
+| `keepalive` | The body is written like `1h`, and when the conversation stops a signal goes out to draw one round trip that carries the cache into the next hour. **`main` only** — writing it under `sub` is a config error |
 
 Only `cache_control` is touched; breakpoints are never added or moved. A request
 counts as a subagent when its `metadata.user_id` carries `parent_session_id`;
 a caller that cannot be read is treated as the main conversation.
 
 `keepalive` can only reach a conversation through the `webhook` destination. With
-no `webhook.base_url` configured no signal is raised, and `llm-gateway check`
-lists that namespace as a warning.
+no `webhook.base_url` configured no signal is raised (so it behaves exactly like
+`1h`), and `llm-gateway check` lists that namespace as a warning.
 
 ## Forwarding
 
@@ -315,7 +315,7 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 conversation series a request belongs to; when it cannot be derived, the field is
 omitted. If routes were skipped during route selection, `skipped` lists each
 credential and the reason. A request that answered a cache signal carries
-`keepalive` (`applied` / `late` / `rerouted` / `drifted`).
+`keepalive` (`applied` / `late`).
 
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
@@ -327,12 +327,11 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 
 The receiver injects `marker` verbatim into that conversation (`session_id`).
 `nonce` is 32 random bytes as base64url — 43 characters — and `LLMGW-KEEPALIVE-`
-followed by it is the token the answer consists of. The hour
-is written only for a request that comes back before `deadline`, goes out on the same
-route as the request before it, and carries the same `tools` + `system` (`applied`);
-a late one (`late`), one that lands on another route (`rerouted`), and one whose prefix
-changed in the meantime (`drifted`) are forwarded untouched. While the route a conversation
-was cached on is unavailable, no signal is raised at all. The same notice reaches the
+followed by it is the token the answer consists of. The body of the
+answer is treated like any other request (under `keepalive` every request writes the
+hour); the notice only says whether it came back before `deadline` (`applied`) or after
+it (`late`). While the route a conversation was cached on is unavailable, no signal is
+raised at all. The same notice reaches the
 `webhook` destination in the same shape.
 
 ### `GET /llm-gateway/tap`
