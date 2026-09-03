@@ -322,10 +322,12 @@ when a conversation stops (DR-0024).
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Reply with exactly this token and nothing else: LLMGW-KEEPALIVE-5Qv…"}
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive] token=`LLMGW-KEEPALIVE-5Qv…`; reply with a single line containing only that token, nothing before or after"}
 ```
 
-The receiver injects `marker` verbatim into that conversation (`session_id`). The hour
+The receiver injects `marker` verbatim into that conversation (`session_id`).
+`nonce` is 32 random bytes as base64url — 43 characters — and `LLMGW-KEEPALIVE-`
+followed by it is the token the answer consists of. The hour
 is written only for a request that comes back before `deadline`, goes out on the same
 route as the request before it, and carries the same `tools` + `system` (`applied`);
 a late one (`late`), one that lands on another route (`rerouted`), and one whose prefix

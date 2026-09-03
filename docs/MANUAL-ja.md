@@ -318,10 +318,12 @@ data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive nonce=5Qv…] Reply with exactly this token and nothing else: LLMGW-KEEPALIVE-5Qv…"}
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive] token=`LLMGW-KEEPALIVE-5Qv…`; reply with a single line containing only that token, nothing before or after"}
 ```
 
 受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
+`nonce` は 32 バイトの乱数を base64url にした 43 文字で、`LLMGW-KEEPALIVE-` を
+頭に付けたものが合言葉。返事はその 1 行だけになる。
 1 時間の cache が付くのは、`deadline` までに戻ってきて、直前のリクエストと
 同じ経路へ出ていき、`tools` + `system` も変わっていない 1 本だけ (`applied`)。
 遅れたもの (`late`)・別経路へ出ていくもの (`rerouted`)・プレフィックスが

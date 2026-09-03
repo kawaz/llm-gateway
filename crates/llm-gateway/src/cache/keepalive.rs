@@ -407,9 +407,9 @@ pub fn carries_tools(body: &Value) -> bool {
 ///
 /// 探すのは**最後の user メッセージ**の中。合図は通知に包まれて届くことが
 /// あるので、ブロックの先頭に来ているとは限らない (= 含んでいれば拾う)。
+/// 合言葉は頭 ([`events::KEEPALIVE_TOKEN_PREFIX`]) の後ろに続く、nonce に
+/// 使える文字の並び。拾えても、出したものと一致しなければ普通の 1 本になる。
 fn nonce_in(body: &Value) -> Option<String> {
-    const OPEN: &str = "[llm-gateway cache keepalive nonce=";
-
     let last = body
         .get("messages")?
         .as_array()?
@@ -425,17 +425,20 @@ fn nonce_in(body: &Value) -> Option<String> {
         _ => return None,
     };
     for text in texts {
-        if let Some(rest) = text.split(OPEN).nth(1)
-            && let Some(nonce) = rest.split(']').next()
-            && !nonce.is_empty()
-        {
-            return Some(nonce.to_owned());
+        if let Some(rest) = text.split(events::KEEPALIVE_TOKEN_PREFIX).nth(1) {
+            let nonce: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !nonce.is_empty() {
+                return Some(nonce);
+            }
         }
     }
     None
 }
 
-/// 1 回きりの合言葉。
+/// 1 回きりの合言葉。32 バイトの乱数を base64url にした 43 文字。
 ///
 /// 推測できると、無関係なリクエストに 1 時間を付けさせられる。OS 由来の
 /// 種で回る乱数から起こす ([`crate::credential::oauth`] の token と同じ作り)。
@@ -542,8 +545,8 @@ mod tests {
         assert!(
             signal
                 .marker
-                .ends_with(&format!("LLMGW-KEEPALIVE-{}", signal.nonce)),
-            "the token to send back is spelled out: {}",
+                .contains(&format!("`LLMGW-KEEPALIVE-{}`", signal.nonce)),
+            "the token to send back is spelled out once: {}",
             signal.marker
         );
         assert!(
@@ -791,11 +794,11 @@ mod tests {
             json!({"messages": []}),
             json!({"messages": [{"role": "user", "content": "hello"}]}),
             json!({"messages": [{"role": "user", "content": 42}]}),
-            json!({"messages": [{"role": "user", "content": "[llm-gateway cache keepalive nonce=]"}]}),
+            json!({"messages": [{"role": "user", "content": "LLMGW-KEEPALIVE- "}]}),
             // 合言葉は最後の user 発話でだけ見る。会話の履歴に残った分は拾わない。
             json!({"messages": [
-                {"role": "user", "content": "[llm-gateway cache keepalive nonce=old]"},
-                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "LLMGW-KEEPALIVE-old"},
+                {"role": "assistant", "content": "LLMGW-KEEPALIVE-old"},
                 {"role": "user", "content": "and then?"},
             ]}),
         ] {
@@ -803,12 +806,13 @@ mod tests {
         }
     }
 
-    /// 合言葉は毎回違い、URL に置ける文字だけでできている。
+    /// 合言葉は毎回違い、長さが決まっていて、URL に置ける文字だけでできている。
     #[test]
     fn each_nonce_is_unpredictable_and_url_safe() {
         let mint: Vec<String> = (0..8).map(|_| nonce()).collect();
         for one in &mint {
             assert_eq!(mint.iter().filter(|other| *other == one).count(), 1);
+            assert_eq!(one.len(), 43, "32 bytes as base64url, without padding");
             assert!(
                 one.chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),

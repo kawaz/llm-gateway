@@ -149,11 +149,17 @@ impl Keepalive {
     }
 }
 
+/// 合言葉の頭。この後ろに nonce が続いたものが 1 つの合言葉になる。
+///
+/// 会話へ送る文面にも、返させる語にも、戻ってきたリクエストから探すときにも
+/// 同じものを使う (= 合言葉は 1 つしか出てこない)。
+pub const KEEPALIVE_TOKEN_PREFIX: &str = "LLMGW-KEEPALIVE-";
+
 /// 会話へ流し込む文面。
 ///
-/// 先頭を決め打ちの形にするのは、戻ってきたリクエストの中から見つけるため。
-/// 途中に挟まっていても拾えるようにしてあり (合図は通知に包まれて届く)、
-/// 返させるのは**空白を含まない 1 つのトークンだけ**。
+/// 合言葉が 1 度だけ出てくる決め打ちの形にするのは、戻ってきたリクエストの
+/// 中から見つけるため。途中に挟まっていても拾えるようにしてあり (合図は通知に
+/// 包まれて届く)、返させるのは**その合言葉 1 語だけ**。
 ///
 /// 「何も出力するな」とは頼まない。それは自分の振る舞いについての指示なので
 /// 完全には従わせられず、断り書きが 1 行返ってくる (実測)。返る形が決まって
@@ -161,9 +167,9 @@ impl Keepalive {
 /// するのは、受け取った側が 1 つの語として拾えるようにするため。
 pub fn marker(nonce: &str) -> String {
     format!(
-        "[llm-gateway cache keepalive nonce={nonce}] \
-         Reply with exactly this token and nothing else: \
-         LLMGW-KEEPALIVE-{nonce}"
+        "[llm-gateway cache keepalive] token=`{KEEPALIVE_TOKEN_PREFIX}{nonce}`; \
+         reply with a single line containing only that token, \
+         nothing before or after"
     )
 }
 
