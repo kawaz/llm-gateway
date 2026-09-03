@@ -66,6 +66,25 @@ The strategies:
 | `1h` | Every breakpoint gets `ttl: "1h"` |
 | `keepalive` | The body is written like `1h`, and when the conversation stops a signal goes out to draw one round trip that carries the cache into the next hour. **`main` only** — writing it under `sub` is a config error |
 
+`keepalive_horizon` can be written two ways:
+
+| Form | Example | Meaning |
+| --- | --- | --- |
+| Hours | `"12h"` | Twelve hours. A whole number followed by `h` |
+| Share | `0.3` | Three tenths of the **break-even time**. Any number above 0 (1 and up is allowed) |
+
+The break-even time is `(1h write rate / cache read rate) x 55 minutes` — the point
+where signalling for that long costs as much as rebuilding the cache once. It follows
+from the model's prices alone (80 pings, 73.3 hours, for Fable 5.1; 20 pings, 18.3
+hours, for Opus 5), so a share applies the same judgement to models that cost
+differently (`0.3` is 22 hours on Fable 5.1 and 5.5 hours on Opus 5). Measured against
+the last seven days, **0.2 to 0.35** is the useful range
+(`scripts/keepalive-horizon-sim.py`).
+
+A model the price table does not cover cannot turn a share into hours, so it falls back
+to the default of eight hours; the startup log and `llm-gateway check` name those
+combinations.
+
 Only `cache_control` is touched; breakpoints are never added or moved. A request
 counts as a subagent when its `metadata.user_id` carries `parent_session_id`;
 a caller that cannot be read is treated as the main conversation.

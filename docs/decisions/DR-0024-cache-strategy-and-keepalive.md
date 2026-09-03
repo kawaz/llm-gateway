@@ -44,6 +44,11 @@ sub = "passthrough"
 keepalive_horizon = "8h"
 ```
 
+`keepalive_horizon` は時間 (`"12h"`、整数 + `h`) か、**分岐時間に対する比率**
+(`0.3`、0 より大きい実数) で書く。比率は単価の違うモデルに同じ判断基準を当てる
+ための書き方で、分岐時間の求め方は §3。単価表に無いモデルでは時間に直せないので
+既定 (8 時間) へ落とし、起動時と `llm-gateway check` で名前を挙げる。
+
 戦略の語彙 (main / sub 共通):
 
 | 値 | 動作 |
@@ -118,6 +123,18 @@ ping 1 回はプレフィックス全量の read で、再構築 1 回は同量�
 決まる: Fable 5.1 / Mythos 5.1 で 50 倍 (55 分間隔なら ~46 時間分の ping が 1 回の
 再構築に相当)、read 0.1 倍のモデルで 12.5 倍 (~11.5 時間)。`keepalive_horizon` は
 この分岐点と「再開される見込み」から人が決める。
+
+`keepalive_horizon` を比率で書いた場合は、この分岐時間に比率を掛けた長さになる:
+
+```
+分岐時間 = (1 時間 write の単価 ÷ cache read の単価) x 55 分
+        = (input x 2.0 ÷ cache read) x 55 分
+```
+
+Fable 5.1 は cache read が input の 0.025 倍なので 80 回ぶん = 73.3 時間、
+Opus 5 は 0.1 倍なので 20 回ぶん = 18.3 時間。同じ `0.3` がそれぞれ 22 時間と
+5.5 時間になる。過去 7 日の実測では **0.2〜0.35** が目安
+(`scripts/keepalive-horizon-sim.py`)。
 
 週次試算 (main、Fable 5.1、`scripts/cache-cost-sim.py` の実績から):
 
