@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::metering::{Pricing, TokenKind};
 use crate::{Error, Result};
 
 mod extends;
@@ -460,32 +461,102 @@ pub struct CacheRule {
     pub main: CacheStrategy,
     #[serde(default)]
     pub sub: CacheStrategy,
-    #[serde(
-        default = "default_keepalive_horizon",
-        with = "optional_human_duration",
-        skip_serializing_if = "is_default_keepalive_horizon"
-    )]
-    pub keepalive_horizon: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_horizon: Option<KeepaliveHorizon>,
 }
 
 /// `keepalive_horizon` を書かなかったときに使う長さ。
 ///
-/// 半日ぶりに戻ってくる会話まで繋ぐと、待ち時間のほうが高くつく
-/// (DR-0024 §3 の分岐点)。1 日の作業のうちひと続きの範囲を既定にする。
+/// 単価が分からないモデルでも同じ長さに落とす。1 日の作業のうち、ひと続きの
+/// 範囲。
 pub const DEFAULT_KEEPALIVE_HORIZON: Duration = Duration::from_secs(8 * 60 * 60);
 
-fn default_keepalive_horizon() -> Option<Duration> {
-    Some(DEFAULT_KEEPALIVE_HORIZON)
+/// 合図を出し続ける上限の書き方 (DR-0024 §3)。
+///
+/// 時間で直接書く (`"12h"`) か、**分岐時間に対する比率**で書く (`0.3`)。
+/// 分岐時間はモデルの単価で決まる — 1 時間 write が cache read の何倍かに
+/// 合図の間隔 (55 分) を掛けたところで、合図を出し続ける費用が再構築 1 回に
+/// 追いつく。比率で書くと、単価の違うモデルに同じ判断基準を当てられる。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeepaliveHorizon {
+    /// 時間で直接指定した長さ。
+    Fixed(Duration),
+    /// 分岐時間に対する比率。0 より大きい実数。
+    Ratio(f64),
 }
 
-fn is_default_keepalive_horizon(value: &Option<Duration>) -> bool {
-    *value == default_keepalive_horizon()
+/// 合図を出す間隔。分岐時間はこの間隔で ping を打ち続ける前提で決まる。
+const KEEPALIVE_INTERVAL_SECS: f64 = 55.0 * 60.0;
+
+/// 1 時間 cache の write は input の何倍か (Anthropic の課金区分)。
+const ONE_HOUR_WRITE_MULTIPLIER: f64 = 2.0;
+
+impl KeepaliveHorizon {
+    /// このモデルでの上限。比率指定で単価が分からなければ `None`。
+    ///
+    /// 比率の基準になる分岐時間は「合図を出し続ける費用が、cache を作り直す
+    /// 費用に追いつく点」。プレフィックス全量を 1 時間 write で書き直す費用を、
+    /// 同じ量の read (= 合図 1 回) で割ると何回ぶんかが出る。
+    pub fn resolve(self, pricing: Option<&Pricing>) -> Option<Duration> {
+        let ratio = match self {
+            Self::Fixed(duration) => return Some(duration),
+            Self::Ratio(ratio) => ratio,
+        };
+        let rate = |kind: TokenKind| pricing?.rates.get(&kind).copied().filter(|usd| *usd > 0.0);
+        let input = rate(TokenKind::input())?;
+        let read = rate(TokenKind::input_cache_read())?;
+        let pings = input * ONE_HOUR_WRITE_MULTIPLIER / read;
+        Some(Duration::from_secs_f64(
+            pings * KEEPALIVE_INTERVAL_SECS * ratio,
+        ))
+    }
 }
 
-impl CacheRule {
-    /// この規則で合図を出し続ける上限 (DR-0024 §2)。
-    pub fn horizon(&self) -> Duration {
-        self.keepalive_horizon.unwrap_or(DEFAULT_KEEPALIVE_HORIZON)
+impl<'de> Deserialize<'de> for KeepaliveHorizon {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Hours(String),
+            Ratio(f64),
+        }
+
+        match Written::deserialize(deserializer)? {
+            Written::Hours(text) => {
+                let hours = text
+                    .strip_suffix('h')
+                    .and_then(|digits| digits.parse::<u64>().ok())
+                    .filter(|hours| *hours > 0)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!(
+                            "`{text}` is not a whole number of hours (for example `12h`), \
+                             and a share of the break-even time is written as a number \
+                             (for example 0.3)"
+                        ))
+                    })?;
+                Ok(Self::Fixed(Duration::from_secs(hours * 60 * 60)))
+            }
+            Written::Ratio(ratio) if ratio > 0.0 => Ok(Self::Ratio(ratio)),
+            Written::Ratio(ratio) => Err(serde::de::Error::custom(format!(
+                "a share of the break-even time must be greater than 0, not {ratio}"
+            ))),
+        }
+    }
+}
+
+impl Serialize for KeepaliveHorizon {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed(duration) => {
+                serializer.serialize_str(&format!("{}h", duration.as_secs() / 3600))
+            }
+            Self::Ratio(ratio) => serializer.serialize_f64(*ratio),
+        }
     }
 }
 
@@ -895,28 +966,6 @@ mod human_duration {
     }
 }
 
-mod optional_human_duration {
-    use super::*;
-    pub fn serialize<S: serde::Serializer>(
-        value: &Option<Duration>,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        match value {
-            Some(value) => {
-                serializer.serialize_some(&humantime::format_duration(*value).to_string())
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Option<Duration>, D::Error> {
-        let text = Option::<String>::deserialize(deserializer)?;
-        text.map(|text| humantime::parse_duration(&text).map_err(serde::de::Error::custom))
-            .transpose()
-    }
-}
-
 /// upstream へ出る 1 経路。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1187,6 +1236,42 @@ impl Config {
             })
             .map(|(name, _)| name.as_str())
             .collect()
+    }
+
+    /// 比率で書いた `keepalive_horizon` のうち、単価が分からず既定へ落ちるもの。
+    ///
+    /// 返すのは `(namespace 名, モデル名)`。比率は「そのモデルの分岐時間の
+    /// 何割か」を意味するので、単価を持たないモデルでは意味を持てない。
+    /// 設定に書いてあるモデル名だけを見る (upstream に聞いて初めて分かる分は、
+    /// 起動時にはまだ知らない)。
+    pub fn keepalive_horizon_without_pricing(
+        &self,
+        priced: &dyn Fn(&str) -> bool,
+    ) -> Vec<(&str, &str)> {
+        let declared: Vec<&str> = self
+            .routes
+            .values()
+            .flat_map(|route| route.declared_models())
+            .map(String::as_str)
+            .collect();
+
+        let mut unpriced = Vec::new();
+        for (ns_name, ns) in &self.namespaces {
+            for rule in &ns.cache {
+                if !matches!(rule.keepalive_horizon, Some(KeepaliveHorizon::Ratio(_))) {
+                    continue;
+                }
+                for model in &declared {
+                    if crate::pattern::matches_any(&rule.models, model)
+                        && !priced(model)
+                        && !unpriced.contains(&(ns_name.as_str(), *model))
+                    {
+                        unpriced.push((ns_name.as_str(), *model));
+                    }
+                }
+            }
+        }
+        unpriced
     }
 
     /// 既定の設定ファイルの場所。
@@ -2378,6 +2463,144 @@ mod example_tests {
         assert!(
             !raw.contains("[models."),
             "a legacy-format model definition remains"
+        );
+    }
+
+    /// `keepalive_horizon` は時間でも、分岐時間に対する比率でも書ける。
+    #[test]
+    fn the_keepalive_horizon_is_written_as_hours_or_as_a_share() {
+        let config: Config = toml::from_str(
+            r#"
+[[ns.default.cache]]
+models = ["a*"]
+main = "keepalive"
+keepalive_horizon = "12h"
+
+[[ns.default.cache]]
+models = ["b*"]
+main = "keepalive"
+keepalive_horizon = 0.3
+
+[[ns.default.cache]]
+models = ["c*"]
+main = "keepalive"
+keepalive_horizon = 1
+
+[[ns.default.cache]]
+models = ["d*"]
+main = "keepalive"
+"#,
+        )
+        .expect("both forms parse");
+
+        let rules = &config.namespace(DEFAULT_NAMESPACE).unwrap().cache;
+        assert_eq!(
+            rules[0].keepalive_horizon,
+            Some(KeepaliveHorizon::Fixed(Duration::from_secs(12 * 60 * 60)))
+        );
+        assert_eq!(
+            rules[1].keepalive_horizon,
+            Some(KeepaliveHorizon::Ratio(0.3))
+        );
+        assert_eq!(
+            rules[2].keepalive_horizon,
+            Some(KeepaliveHorizon::Ratio(1.0)),
+            "a whole number is a share too"
+        );
+        assert_eq!(
+            rules[3].keepalive_horizon, None,
+            "unwritten stays unwritten; the default applies where it is read"
+        );
+    }
+
+    /// 書き方が読めない上限は、読み込みの時点で断る。
+    #[test]
+    fn an_unreadable_keepalive_horizon_is_refused() {
+        for written in [
+            "\"12m\"",
+            "\"h\"",
+            "\"0h\"",
+            "\"twelve hours\"",
+            "0",
+            "-0.5",
+        ] {
+            let raw = format!(
+                r#"
+[[ns.default.cache]]
+models = ["*"]
+main = "keepalive"
+keepalive_horizon = {written}
+"#
+            );
+            assert!(
+                toml::from_str::<Config>(&raw).is_err(),
+                "{written} is not a horizon"
+            );
+        }
+    }
+
+    /// 比率は、そのモデルの分岐時間から時間へ直る。
+    ///
+    /// 分岐時間 = (1 時間 write ÷ cache read) × 55 分。Fable 5.1 は read が
+    /// 安い (input の 0.025 倍) ので、同じ比率でも長く見張ることになる。
+    #[test]
+    fn a_share_becomes_hours_through_the_price_of_the_model() {
+        let hours = |horizon: KeepaliveHorizon, model: &str| {
+            horizon
+                .resolve(crate::preset::pricing::for_model(model).as_ref())
+                .map(|horizon| (horizon.as_secs_f64() / 3600.0 * 10.0).round() / 10.0)
+        };
+
+        assert_eq!(
+            hours(KeepaliveHorizon::Ratio(0.3), "claude-fable-5-1"),
+            Some(22.0),
+            "80 pings' worth of break-even, three tenths of it"
+        );
+        assert_eq!(
+            hours(KeepaliveHorizon::Ratio(0.3), "claude-opus-5"),
+            Some(5.5)
+        );
+        assert_eq!(
+            hours(
+                KeepaliveHorizon::Fixed(Duration::from_secs(9 * 60 * 60)),
+                "claude-opus-5"
+            ),
+            Some(9.0),
+            "hours are hours whatever the model costs"
+        );
+    }
+
+    /// 単価を知らないモデルでは、比率は時間に直せない。
+    #[test]
+    fn a_share_needs_a_price_to_mean_anything() {
+        assert_eq!(KeepaliveHorizon::Ratio(0.3).resolve(None), None);
+        assert_eq!(
+            KeepaliveHorizon::Ratio(0.3)
+                .resolve(crate::preset::pricing::for_model("some-local-model").as_ref()),
+            None
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[routes.local]
+provider = "anthropic"
+url = "http://127.0.0.1:8317"
+models = ["some-local-model", "claude-opus-5"]
+
+[[ns.default.cache]]
+models = ["*"]
+main = "keepalive"
+keepalive_horizon = 0.3
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.keepalive_horizon_without_pricing(&|model| {
+                crate::preset::pricing::for_model(model).is_some()
+            }),
+            vec![("default", "some-local-model")],
+            "only the model without a price is named"
         );
     }
 }

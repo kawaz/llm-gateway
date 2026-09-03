@@ -102,6 +102,16 @@ impl<P: Persistence> Gateway<P> {
                 "cache keepalive needs a webhook destination; no signal will be sent"
             );
         }
+        for (ns_name, model) in config.keepalive_horizon_without_pricing(&|model| {
+            crate::preset::pricing::for_model(model).is_some()
+        }) {
+            warn!(
+                namespace = ns_name,
+                model,
+                hours = crate::config::DEFAULT_KEEPALIVE_HORIZON.as_secs() / 3600,
+                "no price is known for this model, so the keepalive horizon falls back to the default"
+            );
+        }
 
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
@@ -767,6 +777,21 @@ impl<P: Persistence> Gateway<P> {
         }
     }
 
+    /// この系列で合図を出し続ける上限 (DR-0024 §3)。
+    ///
+    /// 比率で書かれた上限は、そのモデルの単価から起こす。単価を持たない
+    /// モデルでは既定へ落ちる — 推測した分岐時間で合図を出し続けるより、
+    /// 決め打ちの長さのほうが読める (設定を書いた時点で警告している)。
+    fn horizon_for(&self, call: &Call<'_>, route: &Route) -> std::time::Duration {
+        call.cache
+            .and_then(|rule| rule.keepalive_horizon)
+            .and_then(|horizon| {
+                let pricing = route.preset.metering().pricing(call.model);
+                horizon.resolve(pricing.as_ref())
+            })
+            .unwrap_or(crate::config::DEFAULT_KEEPALIVE_HORIZON)
+    }
+
     /// 合図の見張りを進める (DR-0024 §2)。
     ///
     /// 本文には触らない — 1 時間を付けるのは戦略の側の仕事で、実リクエストも
@@ -786,10 +811,7 @@ impl<P: Persistence> Gateway<P> {
             self.keepalive.rearm(series.clone());
             return;
         }
-        let horizon = call.cache.map_or(
-            crate::config::DEFAULT_KEEPALIVE_HORIZON,
-            crate::config::CacheRule::horizon,
-        );
+        let horizon = self.horizon_for(call, route);
         self.keepalive.armed_by_request(
             series.clone(),
             keepalive::Bound {

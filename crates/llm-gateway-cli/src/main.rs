@@ -275,6 +275,17 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
         println!("  set `webhook.base_url` so the signal can reach the conversation");
     }
 
+    let unpriced = config.keepalive_horizon_without_pricing(&|model| {
+        llm_gateway::preset::pricing::for_model(model).is_some()
+    });
+    if !unpriced.is_empty() {
+        println!("\nwarning: no price is known for these models, so a keepalive horizon");
+        println!("written as a share of the break-even time falls back to the default:");
+        for (ns_name, model) in &unpriced {
+            println!("  {ns_name}: {model}");
+        }
+    }
+
     if missing.is_empty() && unreadable.is_empty() {
         println!("\nno problems found");
         return Ok(ExitCode::SUCCESS);
