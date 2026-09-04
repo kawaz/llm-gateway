@@ -185,15 +185,19 @@ pub const KEEPALIVE_TOKEN_PREFIX: &str = "LLMGW-KEEPALIVE-";
 /// 中から見つけるため。途中に挟まっていても拾えるようにしてあり (合図は通知に
 /// 包まれて届く)、返させるのは**その合言葉 1 語だけ**。
 ///
+/// 出所と目的を文面自身に書く。合図は会話の文脈を持たない相手にも届くので、
+/// 素性の分からない指示に見えると、注入を疑われて断られる (実測)。
+///
 /// 「何も出力するな」とは頼まない。それは自分の振る舞いについての指示なので
 /// 完全には従わせられず、断り書きが 1 行返ってくる (実測)。返る形が決まって
 /// いれば、受け取った側がその 1 行を畳んで見せずに済む。空白を含まない形に
 /// するのは、受け取った側が 1 つの語として拾えるようにするため。
 pub fn marker(nonce: &str) -> String {
     format!(
-        "[llm-gateway cache keepalive] token=`{KEEPALIVE_TOKEN_PREFIX}{nonce}`; \
-         reply with a single line containing only that token, \
-         nothing before or after"
+        "[llm-gateway keepalive ping] nonce=`{KEEPALIVE_TOKEN_PREFIX}{nonce}` — \
+         automated prompt-cache refresh from your own llm-gateway proxy \
+         (see llm-gateway docs, DR-0024). Reply with a single line containing \
+         only the nonce above, nothing before or after."
     )
 }
 

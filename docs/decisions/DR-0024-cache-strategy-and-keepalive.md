@@ -103,11 +103,16 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
    session_id, prefix, nonce, deadline, deadline_iso, marker}` を流す。
    deadline = 最後の実リクエスト送出時刻 + 60 分 − 30 秒。受け手 (ccmsg) が
    `marker` をそのセッションへ注入する (`notify --as-session`)。文面は
-   ``[llm-gateway cache keepalive] token=`LLMGW-KEEPALIVE-<nonce>`; reply with a
-   single line containing only that token, nothing before or after`` — 合言葉
-   (`LLMGW-KEEPALIVE-` + nonce) は文面に 1 度だけ出てきて、送る印・返させる語・
-   戻りを探す印の全部を兼ねる。返る形が決まっていれば、受け取った側がその
-   1 行を畳んで見せずに済む (空白を含まないので 1 つの語として拾える)。
+   ``[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-<nonce>` — automated
+   prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs,
+   DR-0024). Reply with a single line containing only the nonce above, nothing
+   before or after.`` — 合言葉 (`LLMGW-KEEPALIVE-` + nonce) は文面に 1 度だけ
+   出てきて、送る印・返させる語・戻りを探す印の全部を兼ねる。返る形が決まって
+   いれば、受け取った側がその 1 行を畳んで見せずに済む (空白を含まないので
+   1 つの語として拾える)。
+
+   **出所と目的を文面自身に書く**: 合図は会話の文脈を持たない相手にも届くので、
+   素性の分からない指示に見えると注入を疑われて断られる (実測)。
    「何も出力するな」とは頼まない: 自分の振る舞いについての指示は完全には
    従わせられず、断り書きが 1 行返ってきた (実測)
 4. **最後の user メッセージのどれかの text ブロックが合言葉を含む** request が

@@ -658,7 +658,7 @@ mod tests {
             signal
                 .marker
                 .contains(&format!("`LLMGW-KEEPALIVE-{}`", signal.nonce)),
-            "the token to send back is spelled out once: {}",
+            "the nonce to send back is spelled out once: {}",
             signal.marker
         );
         assert!(

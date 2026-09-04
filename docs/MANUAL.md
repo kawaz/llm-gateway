@@ -364,7 +364,7 @@ when a conversation stops (DR-0024).
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway cache keepalive] token=`LLMGW-KEEPALIVE-5Qv…`; reply with a single line containing only that token, nothing before or after"}
+data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
 ```
 
 The receiver injects `marker` verbatim into that conversation (`session_id`).
