@@ -378,6 +378,19 @@ process watching the same conversation raised that signal, and this one steps ba
 raised at all. The same notice reaches the
 `webhook` destination in the same shape.
 
+To receive the same stream without holding a connection open (ccmsg on another host,
+say), write the endpoint roots under `[webhook]` and the gateway POSTs to them. Both
+`base_url` (one) and `base_urls` (several) are accepted, and **every notice goes to
+every endpoint** — the gateway does not pick a destination. Conversation ids are
+globally unique, so a receiver simply drops the conversations it does not know
+(DR-0012). One endpoint being down does not stop delivery to the others.
+
+```toml
+[webhook]
+base_url = "http://127.0.0.1:7777"
+base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
+```
+
 ### `GET /llm-gateway/tap`
 
 Streams the details of each forward as JSONL, one JSON object per line (DR-0017).

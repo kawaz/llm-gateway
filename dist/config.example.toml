@@ -37,9 +37,11 @@ refresh_secs = 3600
 # refresh_secs を待たずに一覧を取り直す。
 watch_secs = 60
 
-# リクエストイベントを受け口へ送る。base_url を書かなければ無効。
+# リクエストイベントを受け口へ送る。受け口を書かなければ無効。
 # [webhook]
 # base_url = "http://127.0.0.1:11400"
+# 別ホストの受け口にも同じ知らせを流す (書いた全部へ送る)。
+# base_urls = ["http://192.168.1.5:11400"]
 # 省略時は $XDG_DATA_HOME/ccmsg/webhook-llm-gateway.token
 # token_file = "/path/to/webhook-llm-gateway.token"
 

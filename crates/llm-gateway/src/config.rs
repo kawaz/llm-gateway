@@ -731,9 +731,18 @@ fn default_listen() -> String {
 pub struct Webhook {
     /// 受け口の根。ここに受け取る側が決めたパスを足した先へ送る。
     ///
-    /// **書かなければ送らない** (機能ごと無効)。
+    /// **どちらも書かなければ送らない** (機能ごと無効)。複数の受け口へ
+    /// 届けるなら [`Self::base_urls`] に並べる。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+
+    /// 受け口の根を複数。[`Self::base_url`] と併記すると両方へ届く。
+    ///
+    /// 同じ知らせを全部の受け口へ流す。どの受け口宛かを gateway は選ばない —
+    /// 会話の id は世界で一意で、受け取った側が自分の知らない会話を捨てる
+    /// (DR-0012)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_urls: Vec<String>,
 
     /// 合言葉を置いたファイル。
     ///
@@ -747,35 +756,49 @@ impl Default for Webhook {
     fn default() -> Self {
         Self {
             base_url: None,
+            base_urls: Vec::new(),
             token_file: default_token_file(),
         }
     }
 }
 
 impl Webhook {
-    /// 設定された根に、受け取る側が決めたパスを足す。
-    pub fn destination_url(&self) -> std::result::Result<Option<url::Url>, String> {
-        let Some(base) = &self.base_url else {
-            return Ok(None);
-        };
-        let mut url =
-            url::Url::parse(base).map_err(|e| format!("webhook.base_url is not a URL: {e}"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err("webhook.base_url must be http or https".to_owned());
+    /// 書いてある受け口を、書いた順に重複なく。
+    ///
+    /// 同じ根を 2 度書いても送る先は 1 つ。読めない根はそれだけを外し、
+    /// 残りへは送り続ける (1 つの書き間違いで全部止めない)。
+    pub fn destinations(&self) -> (Vec<url::Url>, Vec<String>) {
+        let mut urls: Vec<url::Url> = Vec::new();
+        let mut refused = Vec::new();
+        for base in self.base_url.iter().chain(&self.base_urls) {
+            match destination_url(base) {
+                Ok(url) if urls.contains(&url) => {}
+                Ok(url) => urls.push(url),
+                Err(reason) => refused.push(reason),
+            }
         }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err("webhook.base_url must not contain userinfo".to_owned());
-        }
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err("webhook.base_url must not contain a query or fragment".to_owned());
-        }
-        url.path_segments_mut()
-            .map_err(|_| "webhook.base_url cannot be used as a base URL".to_owned())?
-            .pop_if_empty()
-            .push("webhook")
-            .push("llm-gateway");
-        Ok(Some(url))
+        (urls, refused)
     }
+}
+
+/// 設定された根に、受け取る側が決めたパスを足す。
+fn destination_url(base: &str) -> std::result::Result<url::Url, String> {
+    let mut url = url::Url::parse(base).map_err(|e| format!("`{base}` is not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("`{base}` must be http or https"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("`{base}` must not contain userinfo"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!("`{base}` must not contain a query or fragment"));
+    }
+    url.path_segments_mut()
+        .map_err(|_| format!("`{base}` cannot be used as a base URL"))?
+        .pop_if_empty()
+        .push("webhook")
+        .push("llm-gateway");
+    Ok(url)
 }
 
 /// 既定の合言葉の置き場。受け取る側 (ccmsg) が置く場所に合わせる。
@@ -1089,7 +1112,10 @@ impl Config {
     /// 起動時に落としておかないと、その規則を最初に踏んだ人が
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
-        self.webhook.destination_url().map_err(Error::Config)?;
+        let (_, refused) = self.webhook.destinations();
+        if let Some(reason) = refused.first() {
+            return Err(Error::Config(format!("webhook destination {reason}")));
+        }
         for (name, source) in &self.status.sources {
             if name.is_empty() {
                 return Err(Error::Config("status source name is empty".to_owned()));
@@ -2351,17 +2377,68 @@ routes = ["a", "typo-here"]
         );
         assert_eq!(c.webhook.token_file, PathBuf::from("/tmp/hook.token"));
         assert_eq!(
-            c.webhook.destination_url().unwrap().unwrap().as_str(),
-            "http://127.0.0.1:1234/webhook/llm-gateway"
+            destinations(&c.webhook),
+            vec!["http://127.0.0.1:1234/webhook/llm-gateway"]
         );
+    }
+
+    /// 送る先を読みやすく並べる。
+    fn destinations(webhook: &Webhook) -> Vec<String> {
+        let (urls, refused) = webhook.destinations();
+        assert!(refused.is_empty(), "{refused:?}");
+        urls.iter().map(|url| url.to_string()).collect()
+    }
+
+    /// 受け口は複数書ける。書いた順に、重複は 1 つに畳んで送る。
+    ///
+    /// 同じ知らせを全部へ流すので、どれへ送るかを選ぶ仕組みは要らない
+    /// (受け取った側が自分の知らない会話を捨てる、DR-0012)。
+    #[test]
+    fn several_webhook_destinations_can_be_listed() {
+        let c = parse(
+            r#"
+[webhook]
+base_url = "http://127.0.0.1:1234/"
+base_urls = ["http://192.168.1.5:1234", "http://127.0.0.1:1234", "http://192.168.1.6:1234/"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            destinations(&c.webhook),
+            vec![
+                "http://127.0.0.1:1234/webhook/llm-gateway",
+                "http://192.168.1.5:1234/webhook/llm-gateway",
+                "http://192.168.1.6:1234/webhook/llm-gateway",
+            ],
+            "the one written twice is sent to once"
+        );
+
+        let only_list = parse(
+            r#"[webhook]
+base_urls = ["http://127.0.0.1:1234"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            destinations(&only_list.webhook),
+            vec!["http://127.0.0.1:1234/webhook/llm-gateway"],
+            "the list stands on its own"
+        );
+
+        let none = parse(
+            "[webhook]
+base_urls = []",
+        )
+        .unwrap();
+        assert!(destinations(&none.webhook).is_empty());
     }
 
     #[test]
     fn webhook_base_path_is_preserved() {
         let c = parse("[webhook]\nbase_url = \"https://example.test/hooks\"").unwrap();
         assert_eq!(
-            c.webhook.destination_url().unwrap().unwrap().as_str(),
-            "https://example.test/hooks/webhook/llm-gateway"
+            destinations(&c.webhook),
+            vec!["https://example.test/hooks/webhook/llm-gateway"]
         );
     }
 
@@ -2374,8 +2451,12 @@ routes = ["a", "typo-here"]
             "https://example.test?target=other",
             "https://example.test#other",
         ] {
-            let source = format!("[webhook]\nbase_url = {base:?}");
-            assert!(parse(&source).is_err(), "{base} was accepted");
+            for source in [
+                format!("[webhook]\nbase_url = {base:?}"),
+                format!("[webhook]\nbase_urls = [{base:?}]"),
+            ] {
+                assert!(parse(&source).is_err(), "{base} was accepted");
+            }
         }
     }
 

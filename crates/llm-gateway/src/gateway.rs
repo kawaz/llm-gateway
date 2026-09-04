@@ -150,7 +150,7 @@ impl<P: Persistence> Gateway<P> {
                 &config.server.listen,
             )),
             keepalive,
-            signalling: config.webhook.base_url.is_some(),
+            signalling: !config.webhook.destinations().0.is_empty(),
             events,
             tap,
             status: crate::status::Manager::new(config),

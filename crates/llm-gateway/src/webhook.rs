@@ -50,14 +50,13 @@ pub async fn keep_sending(
     http: reqwest::Client,
     mut watching: tokio::sync::broadcast::Receiver<Notice>,
 ) {
-    let url = match config.destination_url() {
-        Ok(Some(url)) => url,
-        Ok(None) => return,
-        Err(reason) => {
-            warn!(%reason, "the webhook destination is invalid; not sending notifications");
-            return;
-        }
-    };
+    let (urls, refused) = config.destinations();
+    for reason in refused {
+        warn!(%reason, "this webhook destination is unusable; not sending to it");
+    }
+    if urls.is_empty() {
+        return;
+    }
 
     // 合言葉は起動時に 1 回だけ読む。読めなければ**この機能だけ**諦める —
     // 知らせが届かないことは、中継そのものを止める理由にならない。
@@ -72,10 +71,11 @@ pub async fn keep_sending(
             return;
         }
     };
-    info!(%url, "sending the event to the endpoint");
+    info!(endpoints = urls.len(), "sending the event to the endpoints");
 
-    // 続けて失敗しているときに、同じ warning を並べない。
-    let mut failing = 0u64;
+    // 続けて失敗しているときに、同じ warning を並べない。受け口ごとに数える —
+    // 1 つが落ちていることを、他の受け口の記録に混ぜない。
+    let mut failing = vec![0u64; urls.len()];
 
     loop {
         let Some(batch) = collect(&mut watching).await else {
@@ -86,20 +86,24 @@ pub async fn keep_sending(
             warn!(oversized, "cannot send an event over 1 MB to a webhook");
         }
         for payload in payloads {
-            match send(&http, &url, &token, payload, TIMEOUT).await {
-                Ok(()) => {
-                    if failing > 0 {
-                        info!(failed = failing, "the webhook endpoint recovered");
-                        failing = 0;
+            // 同じ知らせを全部の受け口へ。どれかが落ちていても、他への配達は
+            // 止めない (DR-0012)。
+            for (url, failing) in urls.iter().zip(&mut failing) {
+                match send(&http, url, &token, payload.clone(), TIMEOUT).await {
+                    Ok(()) => {
+                        if *failing > 0 {
+                            info!(%url, failed = *failing, "the webhook endpoint recovered");
+                            *failing = 0;
+                        }
                     }
-                }
-                Err(reason) => {
-                    // 最初の 1 回だけ言う。落ちている間は数えるだけにして、
-                    // 戻ったときにまとめて報告する。
-                    if failing == 0 {
-                        warn!(%url, %reason, "cannot send to the webhook");
+                    Err(reason) => {
+                        // 最初の 1 回だけ言う。落ちている間は数えるだけにして、
+                        // 戻ったときにまとめて報告する。
+                        if *failing == 0 {
+                            warn!(%url, %reason, "cannot send to the webhook");
+                        }
+                        *failing += 1;
                     }
-                    failing += 1;
                 }
             }
         }
@@ -350,6 +354,16 @@ mod tests {
     fn config(base_url: Option<&str>, token_file: std::path::PathBuf) -> Webhook {
         Webhook {
             base_url: base_url.map(str::to_owned),
+            base_urls: Vec::new(),
+            token_file,
+        }
+    }
+
+    /// 受け口を複数書いた設定。
+    fn config_for(bases: &[&str], token_file: std::path::PathBuf) -> Webhook {
+        Webhook {
+            base_url: None,
+            base_urls: bases.iter().map(|base| (*base).to_owned()).collect(),
             token_file,
         }
     }
@@ -672,5 +686,88 @@ mod tests {
         });
         let text = buffer.0.lock().unwrap().clone();
         String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// 受け口を複数書いたら、同じ知らせが全部へ届く。
+    ///
+    /// どこへ送るかを選ばないのは、会話の id が世界で一意で、受け取った側が
+    /// 自分の知らない会話を捨てるから (DR-0012)。
+    #[tokio::test]
+    async fn every_destination_gets_the_same_event() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let one = Receiver::answering(204).await;
+        let other = Receiver::answering(204).await;
+
+        let events = Arc::new(Events::new());
+        let running = Arc::clone(&events);
+        let token_file = with_token(&dir, TOKEN);
+        let bases = [one.url.clone(), other.url.clone()];
+        let task = tokio::spawn(async move {
+            let bases: Vec<&str> = bases.iter().map(String::as_str).collect();
+            keep_sending(
+                config_for(&bases, token_file),
+                reqwest::Client::new(),
+                running.subscribe(),
+            )
+            .await;
+        });
+
+        while events.watchers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        events.publish(event("claude-kawazzz"));
+
+        for receiver in [&one, &other] {
+            receiver.next_delivery().await;
+            let delivered = receiver.deliveries().remove(0);
+            assert!(
+                delivered.starts_with("POST /webhook/llm-gateway"),
+                "{delivered}"
+            );
+            let body = delivered.split("\r\n\r\n").nth(1).expect("body");
+            let sent: Vec<Notice> = serde_json::from_str(body).expect("sent as an array");
+            assert_eq!(request(&sent[0]).credential, "claude-kawazzz");
+        }
+        task.abort();
+    }
+
+    /// 1 つの受け口が落ちていても、他へは届く。
+    #[tokio::test]
+    async fn a_broken_destination_does_not_stop_the_others() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let broken = Receiver::answering(500).await;
+        let healthy = Receiver::answering(204).await;
+
+        let events = Arc::new(Events::new());
+        let running = Arc::clone(&events);
+        let token_file = with_token(&dir, TOKEN);
+        let bases = [broken.url.clone(), healthy.url.clone()];
+        let task = tokio::spawn(async move {
+            let bases: Vec<&str> = bases.iter().map(String::as_str).collect();
+            keep_sending(
+                config_for(&bases, token_file),
+                reqwest::Client::new(),
+                running.subscribe(),
+            )
+            .await;
+        });
+
+        while events.watchers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        events.publish(event("a"));
+        healthy.next_delivery().await;
+        assert_eq!(healthy.deliveries().len(), 1);
+
+        // 落ちている先を諦めない。次の分も両方へ試す。
+        events.publish(event("b"));
+        healthy.next_delivery().await;
+        assert_eq!(healthy.deliveries().len(), 2);
+        assert_eq!(
+            broken.deliveries().len(),
+            2,
+            "the broken one is still tried"
+        );
+        task.abort();
     }
 }

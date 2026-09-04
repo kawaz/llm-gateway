@@ -194,7 +194,7 @@ to listen, remove disabled from [server], or point --config at another configura
 
         // 送り先があるときだけ購読する。Receiver は spawn より先に作り、
         // 待ち受け開始直後のイベントも取りこぼさない。
-        let webhook = config.webhook.base_url.as_ref().map(|_| {
+        let webhook = (!config.webhook.destinations().0.is_empty()).then(|| {
             let watching = gateway.events().subscribe();
             let webhook_config = config.webhook.clone();
             tokio::spawn(async move {
@@ -246,6 +246,15 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     println!("store        {}", dir.display());
     println!("credentials  {}", config.credentials.len());
     println!("namespaces   {}", config.namespace_names().join(", "));
+    let (destinations, _) = config.webhook.destinations();
+    println!(
+        "webhook      {}",
+        match destinations.len() {
+            0 => "not configured".to_owned(),
+            1 => destinations[0].to_string(),
+            count => format!("{count} endpoints"),
+        }
+    );
 
     // 認証情報が置かれているかは、起動しないと分からない部分。ここで見ておくと
     // 動かしてから 401 で気づく事態を減らせる。
@@ -273,7 +282,9 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
         for name in &orphaned {
             println!("  {name}");
         }
-        println!("  set `webhook.base_url` so the signal can reach the conversation");
+        println!(
+            "  set `webhook.base_url` (or `base_urls`) so the signal can reach the conversation"
+        );
     }
 
     let unpriced = config.keepalive_horizon_without_pricing(&|model| {
