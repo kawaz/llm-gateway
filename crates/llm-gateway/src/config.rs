@@ -1250,7 +1250,7 @@ impl Config {
     /// いない (受け口を後から足せば動く) ので拒まないが、書いた人の意図どおり
     /// には動かないので名前を挙げる。
     pub fn keepalive_without_destination(&self) -> Vec<&str> {
-        if self.webhook.base_url.is_some() {
+        if !self.destinations_are_empty() {
             return Vec::new();
         }
         self.namespaces
@@ -1262,6 +1262,15 @@ impl Config {
             })
             .map(|(name, _)| name.as_str())
             .collect()
+    }
+
+    /// 知らせの届け先が 1 つも無いか。
+    ///
+    /// 受け口は 2 通りの書き方があるので ([`Webhook::base_url`] /
+    /// [`Webhook::base_urls`])、片方だけを見ると書いてあるのに「無い」と
+    /// 言うことになる。数えるのは解決した後の送り先。
+    fn destinations_are_empty(&self) -> bool {
+        self.webhook.destinations().0.is_empty()
     }
 
     /// 比率で書いた `keepalive_horizon` のうち、単価が分からず既定へ落ちるもの。
@@ -2475,6 +2484,41 @@ base_urls = []",
         assert_eq!(
             ns(&again).routes_for("claude-fable-5", &again),
             ns(&original).routes_for("claude-fable-5", &original)
+        );
+    }
+    /// 合図の届け先は、`base_url` でも `base_urls` でも「書いてある」。
+    ///
+    /// 片方だけを見ると、`base_urls` で書いた受け口が見えず「届け先が無い」と
+    /// 言ってしまう (= keepalive を黙って止める)。
+    #[test]
+    fn a_destination_counts_however_it_was_written() {
+        let with = |webhook: &str| {
+            let source = format!(
+                r#"
+{webhook}
+
+[[ns.default.cache]]
+models = ["*"]
+main = "keepalive"
+"#
+            );
+            parse(&source)
+                .unwrap()
+                .keepalive_without_destination()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<String>>()
+        };
+
+        assert!(with("[webhook]\nbase_url = \"http://127.0.0.1:8642\"").is_empty());
+        assert!(
+            with("[webhook]\nbase_urls = [\"http://127.0.0.1:8642\"]").is_empty(),
+            "a destination written only as a list is a destination"
+        );
+        assert_eq!(with(""), vec!["default".to_owned()]);
+        assert_eq!(
+            with("[webhook]\nbase_urls = []"),
+            vec!["default".to_owned()]
         );
     }
 }

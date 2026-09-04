@@ -150,7 +150,7 @@ impl<P: Persistence> Gateway<P> {
                 &config.server.listen,
             )),
             keepalive,
-            signalling: !config.webhook.destinations().0.is_empty(),
+            signalling: config.keepalive_without_destination().is_empty(),
             events,
             tap,
             status: crate::status::Manager::new(config),
@@ -5021,6 +5021,34 @@ sub = "5m"
 
         // 相手が居なくなれば引き継ぐ。
         idle(2 * 60).await;
+        assert_eq!(signal(&mut watching).await.session_id, "s-1");
+    }
+
+    /// 受け口を `base_urls` で書いた設定でも、合図は出る。
+    #[tokio::test]
+    async fn a_destination_written_as_a_list_still_signals() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[webhook]
+base_urls = ["http://127.0.0.1:9/notify"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "keepalive"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        idle(55 * 60 + 5).await;
         assert_eq!(signal(&mut watching).await.session_id, "s-1");
     }
 }
