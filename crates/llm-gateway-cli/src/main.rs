@@ -246,6 +246,9 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
     println!("store        {}", dir.display());
     println!("credentials  {}", config.credentials.len());
     println!("namespaces   {}", config.namespace_names().join(", "));
+    for line in namespace_summary_lines(&config) {
+        println!("{line}");
+    }
     let (destinations, _) = config.webhook.destinations();
     println!(
         "webhook      {}",
@@ -272,6 +275,25 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
             Err(e) if placed.contains(&id) => unreadable.push((name.as_str(), e.to_string())),
             Err(_) => missing.push(name.as_str()),
         }
+    }
+
+    let unrouted = config.namespaces_without_routing();
+    if !unrouted.is_empty() {
+        println!("\nwarning: these namespaces have no routing rule, so every model falls back");
+        println!("to the declared order of credentials:");
+        for name in &unrouted {
+            println!("  {name}");
+        }
+        println!("  write `[[ns.<name>.routing]]` to say which route each model takes");
+    }
+
+    let unaliased = config.namespaces_without_aliases();
+    if !unaliased.is_empty() {
+        println!("\nwarning: these namespaces write no short name of their own:");
+        for name in &unaliased {
+            println!("  {name}");
+        }
+        println!("  write `[ns.<name>.aliases]` to add short names of your own");
     }
 
     let orphaned = config.keepalive_without_destination();
@@ -1276,6 +1298,25 @@ fn take_value(
 ///
 /// `-` 始まりも弾く。綴りを間違えたオプションが名前として通ると、意図しない
 /// ファイルに保存される。
+/// `check` に出す namespace ごとの要約行。
+///
+/// 名前を並べるだけでは、節が丸ごと消えていても「居る」ようにしか見えない。
+/// 数を並べると、0 が並んだ行がその場で目に入る。
+fn namespace_summary_lines(config: &llm_gateway::config::Config) -> Vec<String> {
+    config
+        .namespaces
+        .iter()
+        .map(|(name, ns)| {
+            format!(
+                "  {name:<11}{} routing, {} aliases, {} cache",
+                ns.routing.len(),
+                ns.aliases.len(),
+                ns.cache.len()
+            )
+        })
+        .collect()
+}
+
 /// `check` に出す待ち受け行。
 ///
 /// 待ち受けない設定でも住所は出す。CLI (`usage` / `stats`) の問い合わせ先は
@@ -1731,6 +1772,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(check(&path).unwrap(), ExitCode::SUCCESS);
+    }
+
+    /// 要約行は namespace ごとに 1 行、数がそのまま並ぶ。
+    #[test]
+    fn the_summary_line_counts_what_each_namespace_wrote() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dummy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[credentials.a]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
+
+[ns.personal]
+
+[ns.work]
+aliases = { fast = "claude-haiku-*" }
+
+[[ns.work.routing]]
+models = ["*"]
+routes = ["a"]
+
+[[ns.work.cache]]
+models = ["*"]
+main = "keepalive"
+"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+
+        assert_eq!(
+            namespace_summary_lines(&config),
+            vec![
+                "  personal   0 routing, 0 aliases, 0 cache".to_owned(),
+                "  work       1 routing, 1 aliases, 1 cache".to_owned(),
+            ]
+        );
     }
 
     /// 待ち受け行は、無効かどうかで書き分ける。住所そのものは伏せない。

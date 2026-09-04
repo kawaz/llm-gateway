@@ -1244,6 +1244,32 @@ impl Config {
         self.namespaces.keys().map(String::as_str).collect()
     }
 
+    /// 経路の規則を 1 つも書いていない namespace。
+    ///
+    /// 書かなければ `credentials` の宣言順に試すだけなので、設定として矛盾は
+    /// していない。ただし namespace を分ける動機はたいてい経路を分けることに
+    /// あるので、空なのは書き落とし (節ごと消えた等) である方が多い。拒むと
+    /// 正しい設定まで起動できなくなるので、名前を挙げるだけにする。
+    pub fn namespaces_without_routing(&self) -> Vec<&str> {
+        self.namespaces
+            .iter()
+            .filter(|(_, ns)| ns.routing.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// 短い名前を 1 つも書いていない namespace。
+    ///
+    /// 見るのは namespace 自身が書いた分 (`aliases`)。短い名前が無くても
+    /// 正式名で呼べば動くので、これも拒まず名前を挙げる。
+    pub fn namespaces_without_aliases(&self) -> Vec<&str> {
+        self.namespaces
+            .iter()
+            .filter(|(_, ns)| ns.aliases.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// 合図の届け先を持たないまま `keepalive` を書いた namespace (DR-0024 §2)。
     ///
     /// 合図は受け口 (DR-0012) 経由でしか会話へ届かない。設定として矛盾しては
@@ -1696,6 +1722,34 @@ type = "claude_oauth"
             vec!["personal"],
             "only what was written is exposed"
         );
+    }
+
+    /// 経路も短い名前も空の namespace は、拒まずに名前を挙げる。
+    #[test]
+    fn empty_namespaces_are_named_not_rejected() {
+        let c = parse(
+            r#"
+[credentials.a]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
+
+[ns.personal]
+
+[ns.work]
+aliases = { fast = "claude-haiku-*" }
+
+[[ns.work.routing]]
+models = ["*"]
+routes = ["a"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(c.namespaces_without_routing(), vec!["personal"]);
+        assert_eq!(c.namespaces_without_aliases(), vec!["personal"]);
     }
 
     #[test]

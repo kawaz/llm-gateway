@@ -95,6 +95,21 @@ impl<P: Persistence> Gateway<P> {
             .build()
             .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
 
+        let unrouted = config.namespaces_without_routing();
+        if !unrouted.is_empty() {
+            warn!(
+                namespaces = %unrouted.join(", "),
+                "no routing rule is written; every model falls back to the declared order of credentials"
+            );
+        }
+        let unaliased = config.namespaces_without_aliases();
+        if !unaliased.is_empty() {
+            warn!(
+                namespaces = %unaliased.join(", "),
+                "no short name of its own is written"
+            );
+        }
+
         let orphaned = config.keepalive_without_destination();
         if !orphaned.is_empty() {
             warn!(
