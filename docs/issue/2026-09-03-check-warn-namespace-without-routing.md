@@ -1,11 +1,11 @@
 ---
 title: check/起動時に routing/alias が空の namespace を warning する
-status: open
+status: wip
 category: request
 created: 2026-09-03T20:05:58+09:00
 last_read:
 open_entered: 2026-09-03T20:05:58+09:00
-wip_entered:
+wip_entered: 2026-09-04T15:32:18+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
