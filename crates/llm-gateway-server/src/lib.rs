@@ -21,6 +21,7 @@ use tracing::{Instrument as _, error, warn};
 use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::time::now_unix;
 use llm_gateway::credential::{CredentialId, Persistence};
+use llm_gateway::gateway::RELAYED_HEADER;
 use llm_gateway::{Error, Gateway, exchange};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -48,6 +49,8 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/tap", get(tap))
+        .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
+        .route("/llm-gateway/keepalive/paused", get(keepalive_paused))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
@@ -260,6 +263,37 @@ async fn usage<P: Persistence + 'static>(
 ) -> Response {
     let refresh = wants_refresh(request.uri().query());
     json_utf8(Json(gateway.usage_report(refresh).await))
+}
+
+/// 頼まれた会話への cache keepalive を止める (DR-0024 §2 追補)。
+///
+/// 認証は usage / status と同じ扱い (掛けない)。手前の tailnet の境界を信頼
+/// する。できるのは自分の会話への合図を止めることだけで、転送も認証情報も
+/// 動かない。
+///
+/// 受けた側は兄弟へ同じ頼みを回す。回ってきた 1 本には [`RELAYED_HEADER`] が
+/// 付いていて、それ以上は回らない。
+async fn keepalive_pause<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    headers: HeaderMap,
+    body: Json<PauseRequest>,
+) -> Response {
+    gateway.pause_keepalive(&body.session_id, headers.contains_key(RELAYED_HEADER));
+    json_utf8(Json(json!({"session_id": body.session_id, "paused": true})))
+}
+
+#[derive(Deserialize)]
+struct PauseRequest {
+    session_id: String,
+}
+
+/// 合図を止めてある会話の id を返す。
+///
+/// 起き上がった兄弟がここを見て、落ちている間に止められた分を取り込む。
+async fn keepalive_paused<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+) -> Response {
+    json_utf8(Json(gateway.paused_keepalive()))
 }
 
 /// configured upstream の公式状態と実測状態を返す。
@@ -1064,6 +1098,10 @@ content-length: {declared}\r\n\r\n{head}"
         if let Some(now) = restore_at {
             gateway.restore(now).await;
         }
+        // 兄弟への問い合わせは起動時の仕事。見張りの読み戻し
+        // (`start_keepalive`) までは呼ばない — 置き場を書いていない設定では
+        // 利用者の実データを読むことになる。
+        gateway.sync_paused_keepalive().await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1075,6 +1113,161 @@ content-length: {declared}\r\n\r\n{head}"
             .await;
         });
         format!("http://{addr}")
+    }
+
+    /// 兄弟を 1 つ書いた gateway。`listen` は自分の分として一覧にも入れる。
+    async fn serve_with_sibling(listen: &str, sibling: &str) -> String {
+        serve(&format!(
+            r#"
+[server]
+listen = "{listen}"
+peers = ["{listen}", "{sibling}"]
+
+[ns.default]
+"#
+        ))
+        .await
+    }
+
+    /// 中継されたリクエストの本文だけを取り出す。
+    fn relayed_pauses(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|request| {
+                let (head, body) = request.split_once("\r\n\r\n")?;
+                head.starts_with("POST /llm-gateway/keepalive/pause")
+                    .then(|| body.to_owned())
+            })
+            .collect()
+    }
+
+    /// 兄弟のところへ届くまで待つ。
+    ///
+    /// 中継は送りっぱなしなので、返した応答からは届いたかどうか分からない。
+    /// 見えるのは相手側の記録だけ。
+    async fn until_relayed(seen: &Arc<Mutex<Vec<String>>>, count: usize) -> Vec<String> {
+        for _ in 0..200 {
+            let relayed = relayed_pauses(seen);
+            if relayed.len() >= count {
+                return relayed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{count} relayed pauses never arrived: {:?}", seen.lock());
+    }
+
+    /// 止めた会話は一覧に出て、兄弟にも渡る (DR-0024 §2 追補)。
+    #[tokio::test]
+    async fn a_pause_is_listed_and_passed_to_the_sibling() {
+        let (sibling, seen) = recording_upstream().await;
+        let base = serve_with_sibling("127.0.0.1:11301", &sibling).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("{base}/llm-gateway/keepalive/pause"))
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let listed: Vec<String> = client
+            .get(format!("{base}/llm-gateway/keepalive/paused"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listed, ["s-1"]);
+
+        let relayed = until_relayed(&seen, 1).await;
+        assert_eq!(
+            relayed,
+            [json!({"session_id": "s-1"}).to_string()],
+            "the sibling was asked to pause the same conversation"
+        );
+    }
+
+    /// 中継の印が付いたリクエストは、それ以上回さない。
+    ///
+    /// 一覧は全員が全員を書いているので、印が無いと止まらない。
+    #[tokio::test]
+    async fn a_relayed_pause_is_not_passed_on_again() {
+        let (sibling, seen) = recording_upstream().await;
+        let base = serve_with_sibling("127.0.0.1:11301", &sibling).await;
+        let client = reqwest::Client::new();
+
+        // 先に印付きを出しておく。後から出した 1 本が兄弟に届いた時点では、
+        // 先に出したほうが回っていれば既に届いている。
+        client
+            .post(format!("{base}/llm-gateway/keepalive/pause"))
+            .header(RELAYED_HEADER, "1")
+            .json(&json!({"session_id": "came-from-the-sibling"}))
+            .send()
+            .await
+            .unwrap();
+        client
+            .post(format!("{base}/llm-gateway/keepalive/pause"))
+            .json(&json!({"session_id": "came-from-a-person"}))
+            .send()
+            .await
+            .unwrap();
+
+        let relayed = until_relayed(&seen, 1).await;
+        assert_eq!(
+            relayed,
+            [json!({"session_id": "came-from-a-person"}).to_string()],
+            "only the one a person asked for went on"
+        );
+
+        let listed: Vec<String> = client
+            .get(format!("{base}/llm-gateway/keepalive/paused"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            ["came-from-a-person", "came-from-the-sibling"],
+            "both were paused here; only the passing on differs"
+        );
+    }
+
+    /// 起動時に、兄弟が止めている会話を取り込む。
+    ///
+    /// 落ちている間に止められた分は自分の置き場に無い。聞かないと、起き
+    /// 上がった側だけが合図を出し続けることになる。
+    #[tokio::test]
+    async fn what_the_sibling_paused_while_this_one_was_down_is_picked_up() {
+        let (sibling, _) = recording_upstream().await;
+        let paused = serve_with_sibling("127.0.0.1:11302", &sibling).await;
+        reqwest::Client::new()
+            .post(format!("{paused}/llm-gateway/keepalive/pause"))
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+
+        let base = serve_with_sibling("127.0.0.1:11301", &paused).await;
+        for _ in 0..200 {
+            let listed: Vec<String> = reqwest::Client::new()
+                .get(format!("{base}/llm-gateway/keepalive/paused"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if listed == ["s-1"] {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the pause held by the sibling was never picked up");
     }
 
     pub(crate) fn request_body() -> Value {

@@ -33,6 +33,52 @@ pub struct Saved {
     pub kind: Kind,
 }
 
+/// 合図を止めてある会話 1 つ。
+///
+/// 止めたのは人の意思なので、再起動で解けては困る。解くのは
+/// **その会話から実リクエストが来たとき**だけ (DR-0024 §2 追補)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paused {
+    pub session_id: String,
+    /// 止めた時刻。ここから離れすぎた停止は、起動時に捨てる。
+    pub paused_at: i64,
+}
+
+/// 置き場に書く一式。
+///
+/// 見張りと停止は同じ待ち受けの持ち物なので、1 ファイルにまとめて 1 回で
+/// 差し替える。別ファイルにすると、片方だけ書けた状態が生まれる。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    #[serde(default)]
+    pub watched: Vec<Saved>,
+    #[serde(default)]
+    pub paused: Vec<Paused>,
+}
+
+/// 読み込むときだけ、見張りの配列だけが書かれた形も受ける。
+///
+/// 停止を持たなかった頃に書かれたファイルが手元に残っている。読めなければ
+/// 止まっている会話の見張りを 1 世代ぶん落とすことになるので、両方受ける。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Read {
+    Kept(Kept),
+    Watched(Vec<Saved>),
+}
+
+impl From<Read> for Kept {
+    fn from(read: Read) -> Self {
+        match read {
+            Read::Kept(kept) => kept,
+            Read::Watched(watched) => Kept {
+                watched,
+                paused: Vec::new(),
+            },
+        }
+    }
+}
+
 /// 見張りの立ち位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,26 +116,26 @@ impl Store {
     ///
     /// 読めないことは転送を止める理由にならない — 失うのは止まっている会話の
     /// 延長の機会だけで、次の実リクエストで張り直される。
-    pub fn load(&self) -> Vec<Saved> {
+    pub fn load(&self) -> Kept {
         let raw = match std::fs::read(&self.path) {
             Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Kept::default(),
             Err(e) => {
                 tracing::warn!(path = %self.path.display(), %e, "cannot read the saved cache keepalive watch");
-                return Vec::new();
+                return Kept::default();
             }
         };
-        match serde_json::from_slice(&raw) {
-            Ok(saved) => saved,
+        match serde_json::from_slice::<Read>(&raw) {
+            Ok(read) => read.into(),
             Err(e) => {
                 tracing::warn!(path = %self.path.display(), %e, "the saved cache keepalive watch is unreadable; starting empty");
-                Vec::new()
+                Kept::default()
             }
         }
     }
 
-    /// 今の見張りを丸ごと書く。
-    pub fn save(&self, watched: &[Saved]) {
+    /// 今の見張りと停止を丸ごと書く。
+    pub fn save(&self, watched: &Kept) {
         if let Some(dir) = self.path.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
@@ -120,17 +166,45 @@ mod tests {
         }
     }
 
+    fn kept(watched: Vec<Saved>) -> Kept {
+        Kept {
+            watched,
+            paused: Vec::new(),
+        }
+    }
+
     /// 書いたものがそのまま読み戻る。
     #[test]
     fn what_was_written_comes_back() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path(), "127.0.0.1:11301");
 
-        assert!(store.load().is_empty(), "nothing has been written yet");
+        assert_eq!(
+            store.load(),
+            Kept::default(),
+            "nothing has been written yet"
+        );
 
-        let watched = vec![saved("s-1"), saved("s-2")];
-        store.save(&watched);
-        assert_eq!(store.load(), watched);
+        let written = Kept {
+            watched: vec![saved("s-1"), saved("s-2")],
+            paused: vec![Paused {
+                session_id: "s-3".to_owned(),
+                paused_at: 1_800_000_000,
+            }],
+        };
+        store.save(&written);
+        assert_eq!(store.load(), written);
+    }
+
+    /// 停止を持たなかった頃のファイル (見張りの配列だけ) も読める。
+    #[test]
+    fn a_file_written_without_the_pauses_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path(), "127.0.0.1:11301");
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(&store.path, serde_json::to_vec(&[saved("s-1")]).unwrap()).unwrap();
+
+        assert_eq!(store.load(), kept(vec![saved("s-1")]));
     }
 
     /// 待ち受けごとに別のファイルを持つ。同じ置き場を共有しても上書きしない。
@@ -140,11 +214,11 @@ mod tests {
         let one = Store::new(dir.path(), "127.0.0.1:11301");
         let other = Store::new(dir.path(), "127.0.0.1:11302");
 
-        one.save(&[saved("s-1")]);
-        other.save(&[saved("s-2")]);
+        one.save(&kept(vec![saved("s-1")]));
+        other.save(&kept(vec![saved("s-2")]));
 
-        assert_eq!(one.load()[0].session_id, "s-1");
-        assert_eq!(other.load()[0].session_id, "s-2");
+        assert_eq!(one.load().watched[0].session_id, "s-1");
+        assert_eq!(other.load().watched[0].session_id, "s-2");
     }
 
     /// 壊れたファイルは、空から始める理由にしかならない。
@@ -152,9 +226,9 @@ mod tests {
     fn an_unreadable_file_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path(), "127.0.0.1:11301");
-        store.save(&[saved("s-1")]);
+        store.save(&kept(vec![saved("s-1")]));
         std::fs::write(&store.path, b"{ this is not json").unwrap();
 
-        assert!(store.load().is_empty());
+        assert_eq!(store.load(), Kept::default());
     }
 }

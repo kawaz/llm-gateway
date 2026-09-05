@@ -13,6 +13,11 @@
 //! **止まっている会話は誰も張り直さない** — そこを繋ぐのが keepalive の
 //! 仕事なので、リリースのたびに全部落とすと意味がない。
 //!
+//! 会話ごとに**合図を止めておく**こともできる (DR-0024 §2 追補)。しばらく
+//! 触らないと分かっている会話へ 1 時間おきに合図を出しても、繋がるのは
+//! 使われない cache だけ。止めたのは人の意思なので再起動を跨いで残し、
+//! 解くのはその会話から実リクエストが来たときだけにする。
+//!
 //! 出したままの合言葉 (nonce) は落とさない。再起動を跨いで戻ってきた合図は
 //! 「出した覚えのない合言葉」= [`Marker::Foreign`] になり、控えとして
 //! 吸収される — 別のプロセスの合図と同じ扱いで正しく収束する。
@@ -58,6 +63,15 @@ const MARGIN: Duration = Duration::from_secs(30);
 
 /// 合言葉の長さ (バイト)。
 const NONCE_BYTES: usize = 32;
+
+/// 止めた合図を覚えておく長さ。
+///
+/// 解くのは実リクエストなので、二度と戻らない会話の停止は誰も片付けない。
+/// 止めた時点で見張りは畳んであり、停止が効くのは「停止を受け取れなかった
+/// 兄弟の合図が `foreign` で見えても控えに入らない」ことだけ。その兄弟も
+/// 自分の `keepalive_horizon` が尽きれば黙るので、どの horizon より長く
+/// 残せば足りる (horizon に上限は無いが、日単位で書く値ではない)。
+const PAUSE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 pub mod store;
 
@@ -140,6 +154,11 @@ struct State {
     watched: HashMap<Series, Watched>,
     /// 出したまま戻ってきていない合図。
     pending: HashMap<String, Pending>,
+    /// 合図を止めてある会話と、止めた時刻 (Unix 秒)。
+    ///
+    /// 鍵が会話の id だけなのは、止めるのが会話全体の意思だから — 系列
+    /// (`prefix`) ごとに止めたい場面は無い (DR-0024 §2 追補)。
+    paused: HashMap<String, i64>,
 }
 
 struct Watched {
@@ -199,9 +218,24 @@ impl Keepalive {
             return;
         };
         let (now, now_unix) = (Instant::now(), now_unix());
+        let kept = store.load();
+
+        // 止めた会話を先に戻す。長く経ちすぎた停止は、解く実リクエストが
+        // 二度と来なかったもの — ここで捨てないと誰も片付けない。
+        let stale = now_unix - PAUSE_LIFETIME.as_secs() as i64;
+        self.state.lock().unwrap().paused = kept
+            .paused
+            .into_iter()
+            .filter(|paused| paused.paused_at > stale)
+            .map(|paused| (paused.session_id, paused.paused_at))
+            .collect();
+
         let mut restored = 0;
-        for saved in store.load() {
+        for saved in kept.watched {
             if saved.expires_at <= now_unix || saved.horizon_end <= now_unix {
+                continue;
+            }
+            if self.is_paused(&saved.session_id) {
                 continue;
             }
             let series = Series {
@@ -243,10 +277,8 @@ impl Keepalive {
             return;
         };
         let (now, now_unix) = (Instant::now(), now_unix());
-        let watched: Vec<store::Saved> = self
-            .state
-            .lock()
-            .unwrap()
+        let state = self.state.lock().unwrap();
+        let watched: Vec<store::Saved> = state
             .watched
             .iter()
             .map(|(series, watched)| store::Saved {
@@ -261,7 +293,70 @@ impl Keepalive {
                 kind: watched.kind,
             })
             .collect();
-        store.save(&watched);
+        let paused: Vec<store::Paused> = state
+            .paused
+            .iter()
+            .map(|(session_id, paused_at)| store::Paused {
+                session_id: session_id.clone(),
+                paused_at: *paused_at,
+            })
+            .collect();
+        drop(state);
+        store.save(&store::Kept { watched, paused });
+    }
+
+    /// この会話への合図を止める (DR-0024 §2 追補)。
+    ///
+    /// 会話の id を持つ**全系列**の見張りを畳む。止めたい相手は会話であって
+    /// 系列ではないので、どの prefix で走っているかを頼む側に知らせる必要が
+    /// ないようにする。合図を出したまま止めた場合、戻ってきた合言葉は
+    /// 「出した覚えのない合言葉」= [`Marker::Foreign`] になり、次を仕込まない。
+    pub fn pause(&self, session_id: &str) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.paused.insert(session_id.to_owned(), now_unix());
+            state
+                .watched
+                .retain(|series, _| series.session_id != session_id);
+            state
+                .pending
+                .retain(|_, pending| pending.series.session_id != session_id);
+        }
+        self.save();
+    }
+
+    /// この会話への合図を再開する。止まっていなければ何もしない。
+    ///
+    /// 呼ぶのは**合言葉を持たない実リクエストが来たとき**だけ。人が会話へ
+    /// 戻ってきた印で、これ以外に解く口は持たない — 止めた会話へ「まだ
+    /// 止めますか」と合図を出すのは本末転倒だし、止めた側が解きに来ることも
+    /// 期待できない。
+    pub fn resume(&self, session_id: &str) {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .paused
+            .remove(session_id)
+            .is_none()
+        {
+            return;
+        }
+        info!(session = session_id, "resuming the cache keepalive signal");
+        self.save();
+    }
+
+    /// この会話への合図が止まっているか。
+    pub fn is_paused(&self, session_id: &str) -> bool {
+        self.state.lock().unwrap().paused.contains_key(session_id)
+    }
+
+    /// 合図を止めてある会話の id。兄弟へ渡す一覧でもある。
+    pub fn paused_sessions(&self) -> Vec<String> {
+        let mut sessions: Vec<String> = self.state.lock().unwrap().paused.keys().cloned().collect();
+        // 見る側にとって、順番が回るたびに変わる一覧は読みにくい。
+        sessions.sort();
+        sessions
     }
 
     /// 実リクエストを送った。見張りを張り直す。
@@ -339,6 +434,10 @@ impl Keepalive {
     }
 
     /// 次に合図を出す時刻を置く。
+    ///
+    /// 止めてある会話には何も置かない。控え ([`Self::standby`]) も置かないのは、
+    /// 別のプロセスの合図が見えたからといって引き継ぐ相手が居ないため — 止めた
+    /// のは会話全体の意思で、兄弟にも同じ停止が渡っている (DR-0024 §2 追補)。
     fn schedule(
         self: &Arc<Self>,
         series: Series,
@@ -347,6 +446,9 @@ impl Keepalive {
         bound: Bound,
         kind: store::Kind,
     ) {
+        if self.is_paused(&series.session_id) {
+            return;
+        }
         let now = Instant::now();
         self.plan(Plan {
             series,
@@ -959,6 +1061,117 @@ mod tests {
         assert_eq!(signalled(watching.recv().await.unwrap()).session_id, "s-1");
     }
 
+    /// 停止を持たない、見張りだけの一式。
+    fn kept(watched: Vec<store::Saved>) -> store::Kept {
+        store::Kept {
+            watched,
+            paused: Vec::new(),
+        }
+    }
+
+    /// 止めた会話には合図を仕込まない (DR-0024 §2 追補)。
+    ///
+    /// 実リクエストでも、別のプロセスの合図でも、合図の往復でも同じ。
+    #[tokio::test(start_paused = true)]
+    async fn a_paused_conversation_is_never_armed() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.pause("s-1");
+
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+        assert_eq!(keepalive.armed(), 0, "a real request does not arm it");
+
+        keepalive.standby(series(), bound(), HORIZON);
+        assert_eq!(
+            keepalive.armed(),
+            0,
+            "nor does someone else's signal — the pause reached them too"
+        );
+
+        keepalive.rearm(series());
+        assert_eq!(keepalive.armed(), 0);
+
+        tokio::time::advance(STANDBY_AFTER * 2).await;
+        settle().await;
+        assert!(watching.try_recv().is_err(), "so nothing is ever signalled");
+    }
+
+    /// 止めると、その会話の系列は全部畳まれる。
+    ///
+    /// 止めたいのは会話であって系列ではないので、頼む側がどの prefix で
+    /// 走っているかを知っている必要はない。
+    #[tokio::test(start_paused = true)]
+    async fn pausing_folds_every_series_of_that_conversation() {
+        let (keepalive, _watching) = keepalive();
+        let other_prefix = Series {
+            session_id: "s-1".to_owned(),
+            prefix: "9e107d9d".to_owned(),
+        };
+        let other_session = Series {
+            session_id: "s-2".to_owned(),
+            prefix: "2cf24dba".to_owned(),
+        };
+        for series in [series(), other_prefix, other_session.clone()] {
+            keepalive.armed_by_request(series, bound(), HORIZON);
+        }
+        assert_eq!(keepalive.armed(), 3);
+
+        keepalive.pause("s-1");
+        assert_eq!(keepalive.armed(), 1, "only the other conversation is left");
+        assert_eq!(keepalive.bound(&other_session), Some(bound()));
+    }
+
+    /// 合言葉を持たない実リクエストが、止めた合図を解く。
+    #[tokio::test(start_paused = true)]
+    async fn a_real_request_lifts_the_pause() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.pause("s-1");
+
+        keepalive.resume(&series().session_id);
+        assert!(!keepalive.is_paused("s-1"));
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        assert_eq!(signalled(watching.recv().await.unwrap()).session_id, "s-1");
+    }
+
+    /// 合図の往復は解除に数えない。
+    ///
+    /// 止めた会話へ最後の合図が出たままだったときに、その戻りで自分を解いて
+    /// しまうと、止めた意味がなくなる。
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_coming_back_does_not_lift_the_pause() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON);
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        let signal = signalled(watching.recv().await.unwrap());
+
+        keepalive.pause("s-1");
+        let coming_back = json!({"messages": [{"role": "user", "content": signal.marker}]});
+        assert_eq!(
+            keepalive.take_marker(&coming_back),
+            Some(Marker::Foreign),
+            "the nonce went away with the pause"
+        );
+        assert!(keepalive.is_paused("s-1"), "and the pause is still there");
+
+        keepalive.rearm(series());
+        tokio::time::advance(STANDBY_AFTER * 2).await;
+        settle().await;
+        assert!(watching.try_recv().is_err());
+    }
+
+    /// 止めてある会話の一覧は、名前の順で返る。
+    #[tokio::test(start_paused = true)]
+    async fn the_paused_conversations_come_back_in_a_settled_order() {
+        let (keepalive, _watching) = keepalive();
+        assert!(keepalive.paused_sessions().is_empty());
+
+        for session in ["s-3", "s-1", "s-2"] {
+            keepalive.pause(session);
+        }
+        assert_eq!(keepalive.paused_sessions(), ["s-1", "s-2", "s-3"]);
+    }
+
     /// 置き場を持たせた見張り。
     fn keepalive_storing(
         dir: &std::path::Path,
@@ -998,7 +1211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store::Store::new(dir.path(), "127.0.0.1:11301");
         let now = now_unix();
-        store.save(&[store::Saved {
+        store.save(&kept(vec![store::Saved {
             session_id: "s-1".to_owned(),
             prefix: "2cf24dba".to_owned(),
             ns: "default".to_owned(),
@@ -1009,7 +1222,7 @@ mod tests {
             expires_at: now + 120,
             horizon_end: now + 3600,
             kind: store::Kind::Primary,
-        }]);
+        }]));
 
         let (keepalive, mut watching) = keepalive_storing(dir.path());
         keepalive.restore();
@@ -1046,11 +1259,91 @@ mod tests {
             // 見張る期間が終わっている。
             saved(now + 120, now - 1),
         ] {
-            store.save(&[gone]);
+            store.save(&kept(vec![gone]));
             let (keepalive, _watching) = keepalive_storing(dir.path());
             keepalive.restore();
             assert_eq!(keepalive.armed(), 0);
         }
+    }
+
+    /// 止めた合図は再起動を跨いで残り、見張りも読み戻さない。
+    ///
+    /// 止めたのは人の意思で、再起動はそれを覆す出来事ではない。
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (before, _) = keepalive_storing(dir.path());
+        before.armed_by_request(series(), bound(), HORIZON);
+        before.pause("s-1");
+        drop(before);
+
+        let (after, mut watching) = keepalive_storing(dir.path());
+        after.restore();
+        assert!(after.is_paused("s-1"));
+        assert_eq!(after.armed(), 0);
+
+        tokio::time::advance(STANDBY_AFTER * 2).await;
+        settle().await;
+        assert!(watching.try_recv().is_err());
+    }
+
+    /// 見張りが残っていても、止めてある会話の分は読み戻さない。
+    ///
+    /// 止めた側と見張りを書いた側が別のプロセスだと、この形になる。
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_belonging_to_a_paused_conversation_is_not_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::Store::new(dir.path(), "127.0.0.1:11301");
+        let now = now_unix();
+        store.save(&store::Kept {
+            watched: vec![store::Saved {
+                session_id: "s-1".to_owned(),
+                prefix: "2cf24dba".to_owned(),
+                ns: "default".to_owned(),
+                model: "m".to_owned(),
+                route: "a".to_owned(),
+                fires_at: now + 60,
+                expires_at: now + 3000,
+                horizon_end: now + 3600,
+                kind: store::Kind::Primary,
+            }],
+            paused: vec![store::Paused {
+                session_id: "s-1".to_owned(),
+                paused_at: now - 60,
+            }],
+        });
+
+        let (keepalive, _watching) = keepalive_storing(dir.path());
+        keepalive.restore();
+        assert_eq!(keepalive.armed(), 0);
+    }
+
+    /// 誰も解きに来なかった停止は、起動時に捨てる。
+    ///
+    /// 解くのは実リクエストだけなので、二度と戻らない会話の停止は放って
+    /// おくと溜まり続ける。
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_nobody_came_back_to_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store::Store::new(dir.path(), "127.0.0.1:11301");
+        let now = now_unix();
+        store.save(&store::Kept {
+            watched: Vec::new(),
+            paused: vec![
+                store::Paused {
+                    session_id: "long-gone".to_owned(),
+                    paused_at: now - PAUSE_LIFETIME.as_secs() as i64 - 1,
+                },
+                store::Paused {
+                    session_id: "still-waiting".to_owned(),
+                    paused_at: now - 60,
+                },
+            ],
+        });
+
+        let (keepalive, _watching) = keepalive_storing(dir.path());
+        keepalive.restore();
+        assert_eq!(keepalive.paused_sessions(), ["still-waiting"]);
     }
 
     /// 畳んだ系列は置き場からも消える。

@@ -6,6 +6,8 @@
 //! ```toml
 //! [server]
 //! listen = "127.0.0.1:11300"
+//! # 対称に動く一式を、自分を含めて書く (keepalive の停止を渡す先)
+//! # peers = ["127.0.0.1:11301", "127.0.0.1:11302"]
 //!
 //! [store]
 //! type = "file"
@@ -703,6 +705,36 @@ pub struct Server {
     /// いるか」を書いた欄として、問い合わせ先の組み立てには使い続ける。
     #[serde(default)]
     pub disabled: bool,
+
+    /// LB の後ろで対称に動く gateway 一式の住所 (DR-0024 §2 追補)。
+    ///
+    /// **自分を含めて書く**。両プロセスの設定を `listen` 以外そっくり同じに
+    /// 保つためで、自分の分は [`Self::siblings`] が住所で外す。ここに書いた
+    /// 相手へ渡るのは keepalive の停止だけ — 転送も経路選定も、これまで
+    /// どおり互いの存在を知らないまま進む。
+    #[serde(default)]
+    pub peers: Vec<String>,
+}
+
+impl Server {
+    /// 自分を除いた兄弟の住所。
+    ///
+    /// 見るのは host:port だけ。`http://127.0.0.1:11301` と
+    /// `127.0.0.1:11301` を書き分ける理由は無いので、どちらでも同じ 1 つと
+    /// して扱う。
+    pub fn siblings(&self) -> Vec<&str> {
+        self.peers
+            .iter()
+            .filter(|peer| authority_of(peer) != authority_of(&self.listen))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// 住所から host:port だけを取り出す。
+fn authority_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
 impl Default for Server {
@@ -710,6 +742,7 @@ impl Default for Server {
         Self {
             listen: default_listen(),
             disabled: false,
+            peers: Vec::new(),
         }
     }
 }
@@ -2689,6 +2722,38 @@ main = "keepalive"
         assert_eq!(
             rules[3].keepalive_horizon, None,
             "unwritten stays unwritten; the default applies where it is read"
+        );
+    }
+
+    /// 兄弟の一覧は自分を含めて書き、自分の分は住所で外れる。
+    ///
+    /// 両プロセスの設定を `listen` 以外そっくり同じに保つための書き方なので、
+    /// 頭に scheme が付いていても、末尾に `/` が付いていても同じ 1 つと見る。
+    #[test]
+    fn a_gateway_leaves_itself_out_of_its_peers() {
+        let server = |listen: &str, peers: &[&str]| Server {
+            listen: listen.to_owned(),
+            disabled: false,
+            peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
+        };
+
+        assert_eq!(
+            server(
+                "127.0.0.1:11301",
+                &["127.0.0.1:11301", "http://127.0.0.1:11302"],
+            )
+            .siblings(),
+            ["http://127.0.0.1:11302"]
+        );
+        assert!(
+            server("127.0.0.1:11301", &["http://127.0.0.1:11301/"])
+                .siblings()
+                .is_empty(),
+            "the same address, written the other way"
+        );
+        assert!(
+            server("127.0.0.1:11301", &[]).siblings().is_empty(),
+            "a lone gateway has no one to tell"
         );
     }
 

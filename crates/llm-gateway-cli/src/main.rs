@@ -1823,6 +1823,7 @@ main = "keepalive"
         let listening = Server {
             listen: "127.0.0.1:11300".to_owned(),
             disabled: false,
+            peers: Vec::new(),
         };
         assert_eq!(listen_line(&listening), "127.0.0.1:11300");
 

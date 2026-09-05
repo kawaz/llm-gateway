@@ -60,6 +60,24 @@ pub struct Gateway<P: Persistence> {
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
 }
 
+/// 兄弟から回ってきた 2 次リクエストに付く印 (DR-0024 §2 追補)。
+///
+/// これが付いた 1 本は、受けた側がさらに配らない。全員が全員へ配る一覧を
+/// 持っているので、印が無いと止まらない。
+pub const RELAYED_HEADER: &str = "x-llm-gateway-relayed";
+
+/// 兄弟の住所を、叩ける URL の頭にする。
+///
+/// 設定には `127.0.0.1:11301` とだけ書けるようにしてある (`listen` と同じ形で
+/// 書けたほうが、両方の設定を見比べやすい)。
+fn base_of(sibling: &str) -> String {
+    if sibling.contains("://") {
+        sibling.trim_end_matches('/').to_owned()
+    } else {
+        format!("http://{}", sibling.trim_end_matches('/'))
+    }
+}
+
 impl<P: Persistence> Gateway<P> {
     pub fn new(config: &Config, persistence: P) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -461,7 +479,13 @@ impl<P: Persistence> Gateway<P> {
             // 合言葉を持たない 1 本 = 人が会話へ戻ってきた。出したままの合図は
             // 用済みで、遅れて戻ってきても 1 時間を付ける理由がない。
             self.keepalive.forget(series);
+            // 戻ってきたのなら、止めてあった合図も要る (DR-0024 §2 追補)。
+            // 解く口をここだけにしているので、合図の往復では解けない。
+            self.keepalive.resume(&series.session_id);
         }
+        let keepalive_paused = series
+            .as_ref()
+            .is_some_and(|series| self.keepalive.is_paused(&series.session_id));
 
         // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
@@ -476,6 +500,7 @@ impl<P: Persistence> Gateway<P> {
             cache: ns.cache_for(&model),
             series,
             keepalive: marker,
+            keepalive_paused,
         };
         // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
         // 経路が要らない分はここで控えておく。
@@ -938,8 +963,67 @@ impl<P: Persistence> Gateway<P> {
     }
 
     /// 前回の見張りを読み戻して、合図の予定を張り直す (DR-0024 §2)。
-    pub fn start_keepalive(&self) {
+    ///
+    /// 読み戻した後、兄弟へ停止の一覧を聞きに行く。落ちている間に止められた
+    /// 会話は、こちらの置き場には無い — 聞かないと、起き上がった側だけが
+    /// 合図を出し続けることになる (DR-0024 §2 追補)。
+    pub fn start_keepalive(self: &Arc<Self>) {
         self.keepalive.restore();
+        let gateway = Arc::clone(self);
+        tokio::spawn(async move { gateway.sync_paused_keepalive().await });
+    }
+
+    /// 兄弟が止めている会話を、こちらにも取り込む。
+    ///
+    /// 答えない兄弟は warning 1 行で飛ばす。取りこぼすのは止めたはずの会話へ
+    /// 合図が出ることだけで、転送は止めない。
+    pub async fn sync_paused_keepalive(&self) {
+        for sibling in self.config.server.siblings() {
+            let url = format!("{}/llm-gateway/keepalive/paused", base_of(sibling));
+            match self.http.get(&url).send().await {
+                Ok(resp) => match resp.json::<Vec<String>>().await {
+                    Ok(sessions) => {
+                        for session_id in sessions {
+                            self.keepalive.pause(&session_id);
+                        }
+                    }
+                    Err(e) => warn!(%url, %e, "cannot read the paused sessions from the sibling"),
+                },
+                Err(e) => warn!(%url, %e, "cannot ask the sibling which sessions are paused"),
+            }
+        }
+    }
+
+    /// この会話への cache keepalive を止める (DR-0024 §2 追補)。
+    ///
+    /// `relayed` が真なら、これは兄弟から回ってきた 2 次リクエスト。そこから
+    /// また配ると輪になるので、配るのは人から直に受けた 1 本だけにする。
+    pub fn pause_keepalive(&self, session_id: &str, relayed: bool) {
+        info!(session = session_id, "pausing the cache keepalive signal");
+        self.keepalive.pause(session_id);
+        if relayed {
+            return;
+        }
+        for sibling in self.config.server.siblings() {
+            let url = format!("{}/llm-gateway/keepalive/pause", base_of(sibling));
+            let sending = self
+                .http
+                .post(&url)
+                .header(RELAYED_HEADER, "1")
+                .json(&serde_json::json!({ "session_id": session_id }));
+            // 届いたかを待たない。待っても人へ返せることは増えず、届かなかった
+            // 分は兄弟が起き上がるときに聞きに来る。
+            tokio::spawn(async move {
+                if let Err(e) = sending.send().await {
+                    warn!(%url, %e, "cannot pass the keepalive pause to the sibling");
+                }
+            });
+        }
+    }
+
+    /// 合図を止めてある会話の id。
+    pub fn paused_keepalive(&self) -> Vec<String> {
+        self.keepalive.paused_sessions()
     }
 
     /// upstream service 状態の収集を開始する。
@@ -1278,6 +1362,8 @@ struct Call<'a> {
     series: Option<keepalive::Series>,
     /// 合図の戻りだったときの扱い。合言葉は転送 1 本につき 1 回だけ使う。
     keepalive: Option<keepalive::Marker>,
+    /// この会話への合図が止めてあるか (DR-0024 §2 追補)。
+    keepalive_paused: bool,
 }
 
 impl<'a> Call<'a> {
@@ -1290,6 +1376,7 @@ impl<'a> Call<'a> {
             model: self.model,
             credential,
             keepalive: self.keepalive.map(keepalive::Marker::as_str),
+            keepalive_paused: self.keepalive_paused,
             // 出した側と cache の寿命は、送る経路が決まって初めて分かる。
             // 経路の手前で組む知らせ (全滅の 429 等) には載らない。
             origin: crate::provider::RequestOrigin::Unknown.as_str(),
@@ -4781,6 +4868,61 @@ keepalive_horizon = "8h"
             vec![Some("1h".to_owned())],
             "the body is written the same way; only the signal missed its window"
         );
+    }
+
+    /// 転送の知らせが出るまで待って、その 1 件を返す。
+    async fn forwarding(
+        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
+    ) -> events::Event {
+        loop {
+            match watching.recv().await.unwrap() {
+                events::Notice::Request(event) => return event,
+                events::Notice::CacheKeepalive(_) => continue,
+            }
+        }
+    }
+
+    /// 止めた会話には合図を出さず、実リクエストが来たら再開する
+    /// (DR-0024 §2 追補)。
+    #[tokio::test]
+    async fn a_paused_conversation_is_silent_until_someone_comes_back() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        forwarding(&mut watching).await;
+
+        gw.pause_keepalive("s-1", false);
+        assert_eq!(gw.paused_keepalive(), ["s-1"]);
+        idle(60 * 60).await;
+        assert!(
+            !matches!(watching.try_recv(), Ok(events::Notice::CacheKeepalive(_))),
+            "a paused conversation is left alone"
+        );
+
+        // 合図の往復で紛れ込んだ 1 本は、止まったままの会話として知らせる。
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": events::marker("spent")}]);
+        gw.forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+        assert!(forwarding(&mut watching).await.keepalive_paused);
+        assert_eq!(gw.paused_keepalive(), ["s-1"], "and it stays paused");
+
+        // 人が戻ってきた。知らせは、解けた後の姿を載せる。
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+        assert!(!forwarding(&mut watching).await.keepalive_paused);
+        assert!(gw.paused_keepalive().is_empty());
+
+        idle(55 * 60 + 5).await;
+        assert_eq!(signal(&mut watching).await.session_id, "s-1");
     }
 
     /// 道具を持たない 1 本 (分類器など) からは合図を出さない。

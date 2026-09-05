@@ -71,6 +71,10 @@ pub struct Event {
     /// `applied`、遅れて 1 時間を付けなかった分は `late`。合図でなければ出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepalive: Option<String>,
+    /// この会話への合図が止めてあるか (DR-0024 §2 追補)。止まっていなければ
+    /// 欄ごと出さない — 見る側にとって既定は「止まっていない」。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keepalive_paused: bool,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -97,6 +101,8 @@ pub struct Origin<'a> {
     pub cache_ttl_secs: Option<u64>,
     /// cache の合図としての扱い ([`Event::keepalive`])。
     pub keepalive: Option<&'a str>,
+    /// この会話への合図が止めてあるか ([`Event::keepalive_paused`])。
+    pub keepalive_paused: bool,
 }
 
 impl Event {
@@ -124,6 +130,7 @@ impl Event {
                 .map(|ttl| format_rfc3339(ts + ttl as i64)),
             skipped,
             keepalive: origin.keepalive.map(str::to_owned),
+            keepalive_paused: origin.keepalive_paused,
         }
     }
 }
@@ -332,6 +339,7 @@ mod tests {
             model: "m",
             credential,
             keepalive: None,
+            keepalive_paused: false,
             origin: "main",
             cache_ttl_secs: None,
         }
