@@ -1,11 +1,11 @@
 ---
 title: セッション単位で keepalive を止める API (兄弟 gateway へ中継)
-status: open
+status: wip
 category: task
 created: 2026-09-05T19:50:52+09:00
 last_read:
 open_entered: 2026-09-05T19:50:52+09:00
-wip_entered:
+wip_entered: 2026-09-05T19:51:49+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
