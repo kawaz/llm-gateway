@@ -1,11 +1,11 @@
 ---
 title: 応答完了の event (stop_reason 付き) を出して ccmsg がターン終了 = 入力待ちを判定できるようにする
-status: open
+status: wip
 category: design
 created: 2026-09-06T21:38:05+09:00
 last_read:
 open_entered: 2026-09-06T21:38:05+09:00
-wip_entered:
+wip_entered: 2026-09-06T21:39:07+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
