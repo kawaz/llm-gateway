@@ -337,25 +337,49 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000,"cache_expires_at_iso":"2026-07-29T13:00:00Z"}
+data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_paused":false}
 ```
+
+**時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べない
+ので、人が読む形へは受け取った側で直す。名前に単位が入っている欄
+(`cache_ttl_secs`) だけが**長さ**で、こちらは秒。
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
 (`main` / `sub` / `oneshot` / `unknown`)。`cache_ttl_secs` は**この 1 本が残す
 プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
 送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
-`cache_expires_at` / `cache_expires_at_iso` はその時刻。ブレークポイントの
-無い 1 本では 3 つとも欄ごと出ない。経路選定で外した経路がある場合は
-`skipped` に credential と理由が並ぶ。合図の戻りだった 1 本には
-`keepalive` (`applied` / `late` / `foreign`) が付く。
+`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと
+出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が
+並ぶ。合図の戻りだった 1 本には `keepalive` (`applied` / `late` / `foreign`)
+が付く。
+
+`keepalive` 戦略で見張っている系列には、合図の連鎖の姿が付く (見張りが
+無ければ欄ごと出ない):
+
+| 欄 | 意味 |
+|---|---|
+| `cache_since` | 連鎖の起点 = この系列で最後に来た実リクエストの時刻 |
+| `next_keepalive_at` | 次の合図の予定時刻 (もう出さないなら欄ごと出ない) |
+| `cache_count` | この 1 本が連鎖の何番目か (実リクエスト = 0、k 回目の合図 = k) |
+| `cache_until` | **合図で継ぎ足せる終わり** = 最後の合図が置く cache が消える時刻 |
+| `cache_until_count` | 連鎖で出す合図の総数 |
+| `cache_breakeven_until` / `cache_breakeven_count` | 損益分岐時間まで繋いだ場合の終わりと本数 (単価が分からないモデルでは出ない) |
+
+`cache_expires_at` が「この 1 本が置いた cache がいつ消えるか」なのに対して、
+`cache_until` は「最後に出る合図が置く cache がいつ消えるか」。合図は 55 分
+刻みで、`keepalive_horizon` を跨いだ 1 本が最後になる。合図が出せなかった
+場合はここより早く切れるので、見る側は最新の 1 通で上書きする。
+
+合図が止めてあるかは `cache_paused` (bool) に**常に**出る。欄が消えると
+「止まっていない」と区別が付かないため。
 
 `keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
 (DR-0024)。
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
+data: {"type":"cache_keepalive","ts":1785326640000,"session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670000,"marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
 ```
 
 受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
@@ -367,6 +391,17 @@ data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z",
 同じ会話を見ている別プロセスの合図で、こちらは控えに回る (合図が 1 本に
 収束する仕組み、DR-0024)。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
 (`webhook`) にも同じ形で届く。
+
+会話への合図を止めたとき (`POST /llm-gateway/keepalive/pause`) にも 1 通流れる。
+止めた会話には次のリクエストが来ないので、これが止まったことを伝える唯一の
+知らせになる。兄弟から回ってきた停止では流さない (同じ受け口が 2 度受け取る)。
+解除に対応する 1 通は無く、解いた実リクエストの知らせが
+`keepalive_paused: false` を運ぶ。
+
+```
+event: keepalive_paused
+data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
+```
 
 同じ内容を待たずに受け取りたい相手 (別ホストの ccmsg 等) には、`[webhook]` に
 受け口の根を書くと gateway 側から POST で届く。`base_url` (1 つ) と `base_urls`

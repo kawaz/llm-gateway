@@ -51,6 +51,17 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// 今この瞬間の unix ミリ秒。
+///
+/// 知らせ (DR-0012) の時刻はこの細かさで出す。人が読む形へ直すのは受け取った
+/// 側の仕事で、こちらは 1 つの数だけを渡す。
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// その時刻を、この機械の地方時で見たときの日付 (`YYYY-MM-DD`)。
 ///
 /// 使用量を日ごとに束ねる鍵に使う。UTC で数えると JST では日の境目が朝 9 時に

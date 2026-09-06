@@ -73,17 +73,30 @@ gateway は宛先を選ばない — 会話の id は世界で一意で、受け
 SSE の `data` と webhook の JSON 要素は同じ `Event` 型を使う。webhook は常に配列で
 送る。
 
+#### 時刻は数値 1 つ = Unix ミリ秒
+
+**時刻の欄は数値 1 つで出し、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形
+(`_iso` の併記) で並べない — 人が読む形へ直すのは受け取った側の仕事で、
+複数の表現が混在するほうが害になる。**長さ**の欄だけが名前に単位を持つ
+(`cache_ttl_secs`)。これで「名前に単位が無い数値の時刻 = ミリ秒、単位付きの
+名前 = 長さ」と、欄名だけで読める。
+
 1 通の形 (欄の名前が、見る側との契約):
 
 ```
 event: request
-data: {"ts":1785600000,"ts_iso":"2026-08-01T12:00:00Z","session_id":"s-1",
-       "ns":"personal","model":"claude-fable-5","credential":"claude-kawazzz",
-       "status":200,"prefix":"2cf24dba","origin":"main","cache_ttl_secs":3600,
-       "cache_expires_at":1785603600,"cache_expires_at_iso":"2026-08-01T13:00:00Z"}
+data: {"ts":1785600000000,"session_id":"s-1","ns":"personal",
+       "model":"claude-opus-5","credential":"claude-kawazzz","status":200,
+       "prefix":"2cf24dba","origin":"main","cache_ttl_secs":3600,
+       "cache_expires_at":1785603600000,"cache_paused":false,
+       "cache_since":1785600000000,"next_keepalive_at":1785603300000,
+       "cache_count":0,"cache_until":1785633300000,"cache_until_count":9,
+       "cache_breakeven_until":1785669300000,"cache_breakeven_count":20}
 ```
 
-- `ts` / `ts_iso` — **upstream へリクエストを送り始めた時刻**。5 分はここから
+- `ts` — **この知らせの時刻** = upstream へリクエストを送り始めた瞬間。
+  5 分はここから。他の意味を持つ時刻と違い、ログ共通の「その出来事の時刻」
+  なので名前は `ts` のまま
 - `session_id` — リクエストヘッダ `X-Claude-Code-Session-Id` の値 (大文字
   小文字は問わない)。名乗らないクライアント (curl 等) では `null`。欄自体は
   必ず出す — 欠けさせると、読む側が形を 2 通り扱うことになる
@@ -97,8 +110,41 @@ data: {"ts":1785600000,"ts_iso":"2026-08-01T12:00:00Z","session_id":"s-1",
   戦略 (DR-0024) で決まり、本文に触らない場合は送った `cache_control` を読む
   (`ttl: "1h"` がひとつでもあれば 3600、`ttl` の無いブレークポイントだけなら
   300)。ブレークポイントが無ければ欄ごと出さない
-- `cache_expires_at` / `cache_expires_at_iso` — `ts` + `cache_ttl_secs`。
-  残りを数える側で足し算をさせない。寿命が分からなければ欄ごと出さない
+- `cache_expires_at` — `ts` + `cache_ttl_secs`。残りを数える側で足し算を
+  させない。寿命が分からなければ欄ごと出さない
+- `keepalive` — この 1 本が cache の合図の戻りだったときの扱い
+  (`applied` / `late` / `foreign`、DR-0024 §2)。合図でなければ欄ごと出さない
+- `cache_paused` — この会話への合図が止めてあるか (DR-0024 §2 追補)。
+  **常に出す** — 見る側は毎回の知らせで塗り替えるので、欄が消えると
+  「止まっていない」と区別が付かない
+
+以下の `cache_*` は、**合図の見張りが付いている系列**にだけ出る (= `keepalive`
+戦略が効く本流)。付いていなければ欄ごと出さない:
+
+- `cache_since` — **合図の連鎖の起点** = この系列で最後に来た実リクエストを
+  送った時刻。合図の往復の知らせでも、起点の実リクエストの時刻を出す
+  (実リクエスト自身の知らせでは `ts` と同じ瞬間になるので、起点を別名で
+  重ねて出すことはしない)
+- `next_keepalive_at` — 次の合図の予定時刻。もう出さない (期間が尽きた) なら
+  欄ごと出さない
+- `cache_count` — この 1 本が連鎖の何番目か。実リクエストは 0、k 回目の合図は k
+- `cache_until` — **合図で継ぎ足せる終わり**。`cache_expires_at` が「この 1 本が
+  置いた cache がいつ消えるか」なのに対して、こちらは「最後に出る合図が置く
+  cache がいつ消えるか」
+- `cache_until_count` — 連鎖で出す合図の総数。`cache_until` を作る合図の番号
+- `cache_breakeven_until` / `cache_breakeven_count` — **損益分岐時間**
+  (DR-0024 §3) まで繋いだ場合の終わりと本数。単価が分からず分岐時間を出せない
+  モデルでは欄ごと出さない。`keepalive_horizon` の書き方 (時間 / 比率) には
+  依らず出す — 見る側が知りたいのは「今の継ぎ足しが分岐点の手前か先か」で、
+  書き方は関係ない
+
+`cache_until` / `cache_until_count` は**離散**で決まる: 合図は 55 分刻みで
+出て、次を仕込めるのは「その 1 本を出す時点で `keepalive_horizon` が残って
+いる」間だけなので、期間を跨いだ 1 本が最後になり、そこに cache の 1 時間を
+足したものが終端。連続値 (期間の終わりそのもの) は載せない — 見る側が描くのは
+「いつ切れるか」で、そこは合図の刻みでしか動かない。`cache_ttl_secs` と同じ
+**見込み**で、合図が出せない (経路が塞がる) / 戻りが `late` なら実際はもっと
+早く切れる。見る側は最新の知らせで上書きする。
 
 `cache_ttl_secs` は `prefix` と同じ性格の値で、**キャッシュに当たる保証では
 ない** — プレフィックスが変われば実際には効かない。リングが描けるのは

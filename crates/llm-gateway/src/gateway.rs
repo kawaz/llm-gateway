@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::cache::{self, keepalive};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
-use crate::credential::time::now_unix;
+use crate::credential::time::{now_unix, now_unix_ms};
 use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
 use crate::denial::Probing;
 use crate::egress::{self, EgressRequest, Headers, Response, SentResponse};
@@ -484,7 +484,7 @@ impl<P: Persistence> Gateway<P> {
             // 人が戻ったことは兄弟も知らないので、こちらから伝える。
             self.resume_keepalive(&series.session_id, false);
         }
-        let keepalive_paused = series
+        let cache_paused = series
             .as_ref()
             .is_some_and(|series| self.keepalive.is_paused(&series.session_id));
 
@@ -501,7 +501,7 @@ impl<P: Persistence> Gateway<P> {
             cache: ns.cache_for(&model),
             series,
             keepalive: marker,
-            keepalive_paused,
+            cache_paused,
         };
         // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
         // 経路が要らない分はここで控えておく。
@@ -858,6 +858,15 @@ impl<P: Persistence> Gateway<P> {
             .unwrap_or(crate::config::DEFAULT_KEEPALIVE_HORIZON)
     }
 
+    /// このモデルの損益分岐時間 (DR-0024 §3)。単価が分からなければ `None`。
+    ///
+    /// 設定の期間が比率で書かれているかに依らず出す — 見る側が知りたいのは
+    /// 「今の継ぎ足しが分岐点の手前か先か」で、書き方は関係ない。
+    fn breakeven_for(&self, call: &Call<'_>, route: &Route) -> Option<std::time::Duration> {
+        let pricing = route.preset.metering().pricing(call.model);
+        crate::config::KeepaliveHorizon::Ratio(1.0).resolve(pricing.as_ref())
+    }
+
     /// 合図の見張りを進める (DR-0024 §2)。
     ///
     /// 本文には触らない — 1 時間を付けるのは戦略の側の仕事で、実リクエストも
@@ -911,16 +920,27 @@ impl<P: Persistence> Gateway<P> {
         // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
         let (origin, strategy) = call.cache_view(route.preset.as_ref());
+        // 合図の連鎖。見張りを進めた後の予定から起こすので、実リクエスト・
+        // 合図の往復・控えのどれでも同じ 1 箇所で求まる。
+        let mut chain = None;
         if let Some(strategy) = strategy {
             cache::apply(&mut body, strategy);
             if strategy == CacheStrategy::Keepalive {
                 self.keep_alive(call, route);
+                chain = call
+                    .series
+                    .as_ref()
+                    .and_then(|series| self.keepalive.chain(series));
             }
         }
+        // 分岐点は連鎖の起点から数える。単価を持たないモデルでは出せない。
+        let breakeven = chain
+            .zip(self.breakeven_for(call, route))
+            .map(|(chain, breakeven)| keepalive::Breakeven::from(chain.since_ms, breakeven));
         // 送る本文が決まったので、この 1 本が残す cache の寿命も決まる。
         let cache_ttl_secs = cache::ttl_secs(strategy, &body);
 
-        let sent_at = now_unix();
+        let sent_at_ms = now_unix_ms();
         let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
@@ -956,10 +976,12 @@ impl<P: Persistence> Gateway<P> {
         // この試行を upstream へ送り始めた時刻を流す。断られた応答も流すので、
         // status で絞らない。
         self.events.publish(events::Event::with_skipped(
-            sent_at,
+            sent_at_ms,
             &events::Origin {
                 origin: origin.as_str(),
                 cache_ttl_secs,
+                chain,
+                breakeven,
                 ..call.origin(route.name())
             },
             resp.response.status,
@@ -1010,6 +1032,11 @@ impl<P: Persistence> Gateway<P> {
         if relayed {
             return;
         }
+        // 止まった瞬間を見ている人へ流す (DR-0012)。回ってきた分で流さないのは、
+        // 人から直に受けた instance が既に流しているから (同じ受け口が 2 度
+        // 受け取る)。
+        self.events
+            .publish(events::KeepalivePaused::new(session_id, now_unix_ms()));
         for sibling in self.config.server.siblings() {
             let url = format!("{}/llm-gateway/keepalive/pause", base_of(sibling));
             let sending = self
@@ -1406,7 +1433,7 @@ struct Call<'a> {
     /// 合図の戻りだったときの扱い。合言葉は転送 1 本につき 1 回だけ使う。
     keepalive: Option<keepalive::Marker>,
     /// この会話への合図が止めてあるか (DR-0024 §2 追補)。
-    keepalive_paused: bool,
+    cache_paused: bool,
 }
 
 impl<'a> Call<'a> {
@@ -1419,11 +1446,14 @@ impl<'a> Call<'a> {
             model: self.model,
             credential,
             keepalive: self.keepalive.map(keepalive::Marker::as_str),
-            keepalive_paused: self.keepalive_paused,
-            // 出した側と cache の寿命は、送る経路が決まって初めて分かる。
-            // 経路の手前で組む知らせ (全滅の 429 等) には載らない。
+            cache_paused: self.cache_paused,
+            // 出した側と cache の寿命 (合図の連鎖も) は、送る経路が決まって
+            // 初めて分かる。経路の手前で組む知らせ (全滅の 429 等) には
+            // 載らない。
             origin: crate::provider::RequestOrigin::Unknown.as_str(),
             cache_ttl_secs: None,
+            chain: None,
+            breakeven: None,
         }
     }
 
@@ -2640,19 +2670,19 @@ routes = ["a", "b"]
         let gw = gateway(&one_credential(&delayed.url)).await;
 
         let mut watching = gw.events().subscribe();
-        let started = now_unix();
+        let started_ms = crate::credential::time::now_unix_ms();
         gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
             .await
             .unwrap();
-        let headers_received = now_unix();
+        let headers_received_ms = crate::credential::time::now_unix_ms();
 
         let event = announced(watching.recv().await.unwrap());
         assert!(
-            event.ts >= started,
+            event.ts >= started_ms,
             "the event is not older than the request"
         );
         assert!(
-            event.ts < headers_received,
+            event.ts < headers_received_ms,
             "the delayed response headers do not determine the event time"
         );
     }
@@ -4857,7 +4887,7 @@ keepalive_horizon = "8h"
         loop {
             match watching.recv().await.unwrap() {
                 events::Notice::CacheKeepalive(signal) => return signal,
-                events::Notice::Request(_) => continue,
+                events::Notice::Request(_) | events::Notice::KeepalivePaused(_) => continue,
             }
         }
     }
@@ -4941,8 +4971,8 @@ keepalive_horizon = "8h"
     ) -> events::Event {
         loop {
             match watching.recv().await.unwrap() {
-                events::Notice::Request(event) => return event,
-                events::Notice::CacheKeepalive(_) => continue,
+                events::Notice::Request(event) => return *event,
+                events::Notice::CacheKeepalive(_) | events::Notice::KeepalivePaused(_) => continue,
             }
         }
     }
@@ -4975,7 +5005,8 @@ keepalive_horizon = "8h"
         gw.forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
             .await
             .unwrap();
-        assert!(forwarding(&mut watching).await.keepalive_paused);
+        let forwarded = forwarding(&mut watching).await;
+        assert!(forwarded.cache_paused, "still paused");
         assert_eq!(gw.paused_keepalive(), ["s-1"], "and it stays paused");
 
         // 人が戻ってきた。知らせは、解けた後の姿を載せる。
@@ -4983,11 +5014,220 @@ keepalive_horizon = "8h"
         gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
             .await
             .unwrap();
-        assert!(!forwarding(&mut watching).await.keepalive_paused);
+        assert!(
+            !forwarding(&mut watching).await.cache_paused,
+            "the request that lifted the pause says so"
+        );
         assert!(gw.paused_keepalive().is_empty());
 
         idle(55 * 60 + 5).await;
         assert_eq!(signal(&mut watching).await.session_id, "s-1");
+    }
+
+    /// 知らせは、合図の連鎖を載せる (DR-0012)。
+    ///
+    /// 見る側 (ccmsg) が描くリングは `cache_expires_at` の 1 時間で終わるが、
+    /// 合図が付いている系列は実際にはその先まで生きる。
+    #[tokio::test]
+    async fn a_watched_conversation_reports_how_far_the_signal_reaches() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        let forwarded = forwarding(&mut watching).await;
+        let minute = 60 * 1_000;
+        assert!(
+            (forwarded.cache_since.unwrap() - forwarded.ts).abs() <= 1_000,
+            "a real request is where the chain starts"
+        );
+        assert_eq!(forwarded.cache_count, Some(0), "and it is the zeroth link");
+        assert!(
+            (forwarded.next_keepalive_at.unwrap() - forwarded.cache_since.unwrap() - 55 * minute)
+                .abs()
+                <= 2_000,
+            "the first signal follows in 55 minutes"
+        );
+        // 8 時間の期間なら、最後の合図は 9 本目 (55 分刻みで期間を跨いだ 1 本
+        // = 8 時間 15 分後)。そこから 1 時間が、この系列の cache の終わり。
+        assert_eq!(forwarded.cache_until_count, Some(9));
+        assert!(
+            (forwarded.cache_until.unwrap()
+                - forwarded.cache_since.unwrap()
+                - (9 * 55 + 60) * minute)
+                .abs()
+                <= 2_000
+        );
+        assert!(
+            forwarded.cache_expires_at.unwrap() < forwarded.cache_until.unwrap(),
+            "and it reaches past the hour this one request buys"
+        );
+        assert!(!forwarded.cache_paused, "nothing is stopping the signal");
+
+        // 分岐点は単価から出る。この試験の経路は単価を知らないので出ない。
+        assert_eq!(forwarded.cache_breakeven_count, None);
+        assert_eq!(forwarded.cache_breakeven_until, None);
+    }
+
+    /// 単価の分かるモデルでは、損益分岐点も添える (DR-0024 §3)。
+    #[tokio::test]
+    async fn a_priced_model_also_reports_the_break_even() {
+        let up = FakeUpstream::always(200).await;
+        let priced = "claude-opus-5";
+        let gw = gateway(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["{priced}"]
+
+[[ns.default.routing]]
+models = ["{priced}"]
+routes = ["a"]
+
+[webhook]
+base_url = "http://127.0.0.1:9/notify"
+
+[[ns.default.cache]]
+models = ["{priced}"]
+main = "keepalive"
+keepalive_horizon = "8h"
+"#,
+            up.url
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({"model": priced}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        // 1 時間 write は input の 2 倍、read は input の 1/10 (5.0 と 0.5)
+        // なので、作り直し 1 回ぶんは合図 20 回。
+        let forwarded = forwarding(&mut watching).await;
+        assert_eq!(forwarded.cache_breakeven_count, Some(20));
+        assert!(
+            (forwarded.cache_breakeven_until.unwrap()
+                - forwarded.cache_since.unwrap()
+                - (20 * 55 + 60) * 60 * 1_000)
+                .abs()
+                <= 2_000
+        );
+        assert!(
+            forwarded.cache_until.unwrap() < forwarded.cache_breakeven_until.unwrap(),
+            "an 8 hour horizon stops well short of the break-even"
+        );
+    }
+
+    /// 合図の往復は連鎖を進めるだけで、起点は動かさない。
+    #[tokio::test]
+    async fn a_signal_round_trip_moves_the_chain_along() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
+            .await
+            .unwrap();
+        let first = forwarding(&mut watching).await;
+
+        idle(55 * 60 + 5).await;
+        let signal = signal(&mut watching).await;
+
+        let (mut coming_back, headers) = conversation(json!({}));
+        coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
+        gw.forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .await
+            .unwrap();
+
+        let answered = forwarding(&mut watching).await;
+        assert_eq!(answered.keepalive.as_deref(), Some("applied"));
+        assert_eq!(answered.cache_count, Some(1), "the first signal is spent");
+        // 試験の時計では壁時計だけが止まるので、起点は「この 1 本から見て
+        // 55 分前」の形で確かめる (実機でも同じ関係になる)。
+        assert!(
+            (answered.ts - answered.cache_since.unwrap() - (55 * 60 + 5) * 1_000).abs() <= 2_000,
+            "but the chain still starts at the last real request"
+        );
+        let _ = first.cache_since;
+        assert_eq!(
+            answered.cache_until_count, first.cache_until_count,
+            "and the horizon it was given has not moved"
+        );
+    }
+
+    /// 合図を出さない戦略では、継ぎ足せる終わりも無い。
+    #[tokio::test]
+    async fn a_conversation_nobody_signals_reports_no_end() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+{}
+[webhook]
+base_url = "http://127.0.0.1:9/notify"
+
+[[ns.default.cache]]
+models = ["m"]
+main = "1h"
+"#,
+            one_credential(&up.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
+            .await
+            .unwrap();
+
+        let forwarded = forwarding(&mut watching).await;
+        assert_eq!(forwarded.cache_ttl_secs, Some(3600), "an hour is written");
+        assert_eq!(forwarded.cache_until, None, "but nothing will extend it");
+        assert_eq!(forwarded.cache_since, None);
+        assert_eq!(forwarded.cache_count, None);
+        assert_eq!(forwarded.next_keepalive_at, None);
+        assert!(
+            !forwarded.cache_paused,
+            "the pause is reported either way, and nothing is paused"
+        );
+    }
+
+    /// 止めた瞬間も知らせに流す (DR-0024 §2 追補)。
+    ///
+    /// 止めた会話には次の 1 本が来ないので、これを流さないと見る側は
+    /// 止まったことを知れない。
+    #[tokio::test]
+    async fn pausing_a_conversation_is_an_event_too() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let paused_at_ms = crate::credential::time::now_unix_ms();
+        gw.pause_keepalive("s-1", false);
+
+        let events::Notice::KeepalivePaused(notice) = watching.try_recv().unwrap() else {
+            panic!("expected the pause to be announced");
+        };
+        assert_eq!(notice.kind, "keepalive_paused");
+        assert_eq!(notice.session_id, "s-1");
+        assert!(
+            (notice.paused_at - paused_at_ms).abs() <= 1_000,
+            "the moment it stopped, in milliseconds"
+        );
+
+        // 兄弟から回ってきた分は流さない。人から直に受けた側が既に流している。
+        gw.pause_keepalive("s-2", true);
+        assert!(
+            watching.try_recv().is_err(),
+            "a relayed pause would reach the same destination twice"
+        );
+        assert_eq!(gw.paused_keepalive(), ["s-1", "s-2"], "but it still stops");
     }
 
     /// 道具を持たない 1 本 (分類器など) からは合図を出さない。
@@ -5131,7 +5371,7 @@ sub = "5m"
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.origin, "main");
         assert_eq!(event.cache_ttl_secs, Some(3600));
-        assert_eq!(event.cache_expires_at, Some(event.ts + 3600));
+        assert_eq!(event.cache_expires_at, Some(event.ts + 3600 * 1_000));
 
         let (mut sub, headers) = conversation(json!({}));
         sub["metadata"] = json!({"user_id": SUB});

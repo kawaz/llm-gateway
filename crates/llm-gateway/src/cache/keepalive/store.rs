@@ -29,6 +29,15 @@ pub struct Saved {
     pub expires_at: i64,
     /// 合図を出し続ける期間の終わり。
     pub horizon_end: i64,
+    /// この連鎖の起点 (最後に来た実リクエストの時刻)。
+    ///
+    /// 起点を持たなかった頃に書かれたファイルでは 0 になる。読み戻す側が
+    /// 予定から起こし直す。
+    #[serde(default)]
+    pub since: i64,
+    /// ここまでに出した合図の本数。
+    #[serde(default)]
+    pub count: u32,
     /// 自分が出す番か ([`Kind::Primary`])、別のプロセスの後ろに控えているか。
     pub kind: Kind,
 }
@@ -162,6 +171,8 @@ mod tests {
             fires_at: 1_800_003_300,
             expires_at: 1_800_003_570,
             horizon_end: 1_800_028_800,
+            since: 1_800_000_000,
+            count: 2,
             kind: Kind::Primary,
         }
     }

@@ -1026,7 +1026,9 @@ spend_down_within = "25%"
             model,
             credential: crate::stats::NO_CREDENTIAL,
             keepalive: None,
-            keepalive_paused: false,
+            cache_paused: false,
+            chain: None,
+            breakeven: None,
             origin: crate::provider::RequestOrigin::Unknown.as_str(),
             cache_ttl_secs: None,
         }

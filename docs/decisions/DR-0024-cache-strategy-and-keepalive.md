@@ -99,8 +99,8 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
    無意味な 1 往復を挟むだけになる。塞がりは解けるものなので見張りは畳まず、
    +55 分で次を試す (`keepalive_horizon` は据え置き)
 3. 発火したら nonce (32 バイトの乱数を base64url にした 43 文字) を発行し、
-   受け口 (DR-0012 の webhook / SSE) へ `cache_keepalive {type, ts, ts_iso,
-   session_id, prefix, nonce, deadline, deadline_iso, marker}` を流す。
+   受け口 (DR-0012 の webhook / SSE) へ `cache_keepalive {type, ts,
+   session_id, prefix, nonce, deadline, marker}` を流す (時刻は Unix ms)。
    deadline = 最後の実リクエスト送出時刻 + 60 分 − 30 秒。受け手 (ccmsg) が
    `marker` をそのセッションへ注入する (`notify --as-session`)。文面は
    ``[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-<nonce>` — automated
@@ -142,6 +142,14 @@ Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が�
    「出した覚えのない合言葉」= `foreign` になり、控えとして吸収される
    (下記の収束規則がそのまま働く)。合言葉を残すと、再起動後に「自分が出した」
    と誤って数えて出し続ける側になり、相方と 2 本になる
+9. 知らせ (DR-0012 の request event) に**連鎖の姿** (`cache_since` /
+   `cache_count` / `next_keepalive_at` / `cache_until` / `cache_until_count`)
+   を載せる。終わりはこの規則から決まる離散値で、「次の予定から 55 分刻みで、
+   期間が残っている間だけ次を仕込む」= 期間を跨いだ 1 本が最後に出て、そこに
+   cache の 1 時間を足した時刻。見る側 (ccmsg のリング) は `cache_expires_at`
+   の 1 時間で終わりを描くが、合図の付いた系列は実際にはその先まで生きる。
+   何番目かを数えるため、見張りは**出した本数と連鎖の起点**も持ち、置き場へ
+   落とす (再起動を跨いでも番号が続く)
 
 #### 多プロセス運用: 観測だけで 1 本に収束させる
 
@@ -190,9 +198,15 @@ gateway は同じ設定の複数プロセスが LB の後ろで対称に動く�
    時点で見張りは畳んであるので、停止が効くのは「停止を受け取れなかった兄弟の
    合図が `foreign` で見えても控えに入らない」ことだけ。その兄弟も自分の
    `keepalive_horizon` が尽きれば黙るから、どの horizon より長く残せば足りる
-6. 知らせ (DR-0012 の request event) に `keepalive_paused` を載せる。止まって
-   いなければ欄ごと出さない。見る側 (ccmsg の webui) が `cache_expires_at` と
-   並べて出せる
+6. 知らせ (DR-0012 の request event) に `cache_paused` を**常に**載せる。
+   見る側 (ccmsg の webui) は毎回の知らせで塗り替えるので、欄が消えると
+   「止まっていない」と区別が付かない。`cache_expires_at` と並べて出せる
+7. **止めた瞬間も 1 通流す** (`type: "keepalive_paused"`、`session_id` /
+   `paused_at`、Unix ms)。止めた会話には次の 1 本が来ないので、
+   request event だけでは止まったことが伝わらない。兄弟から回ってきた停止では
+   流さない — 人から直に受けた instance が既に流していて、同じ受け口が 2 度
+   受け取ることになる。解除に対応する 1 通は持たない (解くのは実リクエスト
+   なので、その知らせが `cache_paused: false` を運ぶ)
 
 #### 兄弟の存在は「停止を渡す先」としてだけ知る
 

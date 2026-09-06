@@ -1639,8 +1639,23 @@ routes = ["a"]
         assert_eq!(event["model"], "m");
         assert_eq!(event["credential"], "a");
         assert_eq!(event["status"], 200);
-        assert!(event["ts"].as_i64().unwrap() > 0);
-        assert!(event["ts_iso"].as_str().unwrap().ends_with('Z'));
+        assert!(
+            event["ts"].as_i64().unwrap() > 1_700_000_000_000,
+            "the time is a single number, in milliseconds: {}",
+            event["ts"]
+        );
+        assert!(
+            event
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.ends_with("_iso")),
+            "and no field spells the same moment a second way: {event}"
+        );
+        assert_eq!(
+            event["cache_paused"], false,
+            "whether the signal is paused is always said"
+        );
 
         let series = event["prefix"].as_str().expect("the series is known");
         assert_eq!(series.len(), 8, "a single short hex string: {series}");

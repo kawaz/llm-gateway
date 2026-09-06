@@ -244,7 +244,7 @@ mod tests {
 
     /// 転送の知らせ 1 件。
     fn event(credential: &str) -> Notice {
-        Notice::Request(Event::new(
+        Notice::from(Event::new(
             NOW,
             &Origin {
                 session_id: Some("s-1"),
@@ -253,7 +253,9 @@ mod tests {
                 model: "m",
                 credential,
                 keepalive: None,
-                keepalive_paused: false,
+                cache_paused: false,
+                chain: None,
+                breakeven: None,
                 origin: "main",
                 cache_ttl_secs: None,
             },
@@ -272,14 +274,16 @@ mod tests {
                 model: "m",
                 credential: "a",
                 keepalive: None,
-                keepalive_paused: false,
+                cache_paused: false,
+                chain: None,
+                breakeven: None,
                 origin: "main",
                 cache_ttl_secs: None,
             },
             200,
         );
         event.session_id = Some("x".repeat(bytes));
-        Notice::Request(event)
+        Notice::from(event)
     }
 
     /// 受け口が受け取った 1 件を、転送の知らせとして読む。

@@ -345,8 +345,12 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400,"ts_iso":"2026-07-29T12:00:00Z","session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000,"cache_expires_at_iso":"2026-07-29T13:00:00Z"}
+data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_paused":false}
 ```
+
+**Every moment is a single number in Unix milliseconds.** The same instant is never
+spelled a second way, so rendering it for a human is the receiver's job. Only fields
+whose name carries a unit (`cache_ttl_secs`) are *durations*, and those are in seconds.
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
@@ -354,17 +358,37 @@ omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`). `cach
 **how long the prefix this request leaves behind lives**, in seconds: it follows the
 strategy that was applied, and for an untouched body it reads the `cache_control` that
 was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
-`cache_expires_at` / `cache_expires_at_iso` are that moment. A request that leaves no
-breakpoint omits all three. If routes were skipped during route selection, `skipped` lists each
-credential and the reason. A request that answered a cache signal carries
-`keepalive` (`applied` / `late` / `foreign`).
+`cache_expires_at` is that moment. A request that leaves no breakpoint omits both. If
+routes were skipped during route selection, `skipped` lists each credential and the
+reason. A request that answered a cache signal carries `keepalive` (`applied` / `late`
+/ `foreign`).
+
+A series watched by the `keepalive` strategy also carries the shape of its signal chain
+(all omitted when no signal watches the series):
+
+| Field | Meaning |
+|---|---|
+| `cache_since` | Where the chain starts: the last real request on this series |
+| `next_keepalive_at` | When the next signal is due (omitted once no more go out) |
+| `cache_count` | Which link this request is (a real request is 0, the k-th signal is k) |
+| `cache_until` | **How far the signal can carry the cache**: when the hour the last signal buys runs out |
+| `cache_until_count` | How many signals the chain will send in total |
+| `cache_breakeven_until` / `cache_breakeven_count` | The same, counted to the break-even time (omitted when the model has no known price) |
+
+Where `cache_expires_at` is when the hour this one request bought runs out, `cache_until`
+is when the hour the *last* signal buys runs out. Signals go out every 55 minutes, and
+the one that crosses `keepalive_horizon` is the last. If a signal cannot go out, the
+cache dies earlier than this, so a watcher overwrites it with the latest notice.
+
+Whether the signal is paused is reported in `cache_paused` (a bool) on **every** notice:
+were the field omitted, "not paused" could not be told from "not reported".
 
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
 
 ```
 event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640,"ts_iso":"2026-07-29T12:04:00Z","session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670,"deadline_iso":"2026-07-29T12:04:30Z","marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
+data: {"type":"cache_keepalive","ts":1785326640000,"session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670000,"marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
 ```
 
 The receiver injects `marker` verbatim into that conversation (`session_id`).
@@ -377,6 +401,17 @@ process watching the same conversation raised that signal, and this one steps ba
 (that is how several processes converge on a single signal, DR-0024). While the route a conversation was cached on is unavailable, no signal is
 raised at all. The same notice reaches the
 `webhook` destination in the same shape.
+
+Pausing the signal for a conversation (`POST /llm-gateway/keepalive/pause`) streams one
+notice too. No further request arrives for a paused conversation, so this is the only
+word that it stopped. A pause relayed from a sibling is not streamed (the same
+destination would receive it twice). There is no notice for resuming: the real request
+that lifts the pause carries `keepalive_paused: false`.
+
+```
+event: keepalive_paused
+data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
+```
 
 To receive the same stream without holding a connection open (ccmsg on another host,
 say), write the endpoint roots under `[webhook]` and the gateway POSTs to them. Both
