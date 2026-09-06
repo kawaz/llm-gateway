@@ -1,6 +1,6 @@
 ---
 title: keepalive の自動解除を兄弟 gateway へ中継する
-status: wip
+status: resolved
 category: task
 created: 2026-09-06T14:42:49+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T14:43:48+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T15:05:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: v0.38.1 で出荷 (change kwpylppq)", "実機 2026-09-06 06:02 UTC: pause → 実リクエストで 11301 が resume → 10ms 後に 11302 も relay で resume、両 instance の paused が空、watch 再武装を確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
