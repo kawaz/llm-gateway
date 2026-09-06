@@ -138,6 +138,19 @@ adapter が受け取った生の語彙を、このいずれかへ写像する。
 `stale_after` を超えたら `stale = true` にする。成功値が一度も無ければ
 `state = "unknown"` と `error` を返す。
 
+#### `official.source` と `official.source_url`
+
+`source` は状態の出所を表し、語彙は次の 3 個に固定する。
+
+- `statuspage_v2`: Statuspage v2 JSON を取得した source
+- `link`: 案内先だけを持つ placeholder source
+- `none`: `status_source` を書いていない route。その route 自身を service として
+  返すため、出所となる source が無い
+
+`source_url` は `statuspage_v2` と `link` では `page_url`、`none` では空文字列に
+する。source が無いことを URL の欠落で表さないのは、field 自体は常に string で
+あるという形を保つためである。
+
 #### `observed.state`
 
 gateway が実通信から判断する語彙は、公式状態と混ざらないよう次の 3 個に絞る。
@@ -152,6 +165,10 @@ gateway が実通信から判断する語彙は、公式状態と混ざらない
 変換層で合成されたものを upstream 障害と誤認しうるため、v1 では自動判定へ含めない。
 adapter が `upstream_http` と確定できる 529、transport error、provider 固有の
 `ResponseAdmission::Busy` だけを対象にする。
+
+報告する時刻は秒なので、同じ秒に成功と失敗が届くと時刻だけでは並べられない。
+どちらが後かは観測の到着順で決め、成功と失敗のどちらか一方が同秒で埋もれる
+偏りを作らない。
 
 実測状態は履歴集計ではなく、route ごとの「最後の成功」と「最後の health failure」だけを
 メモリに持つ。`observation_ttl` の既定は 5 分。再起動後は `unknown` へ戻し、永続化しない。
@@ -244,7 +261,12 @@ filter と交差するものだけを載せる。対応情報が無い incident 
 参考表示できるが、その incident の impact だけで対象 service の severity を引き上げない。
 選択 component の状態または gateway の実測を severity の根拠にする。
 
-`link` は外部アクセスせず、`page_url` と `unknown` を返す placeholder とする。AWS Health API は
+どの route からも指されていない source も report から落とさず、`routes` を空にした
+service として返す。設定に書いた source が黙って消えると、書き落としに気づけない。
+
+`link` は外部アクセスせず、`page_url` と `unknown` を返す placeholder とする。
+取得しないので snapshot を持たず、`stale` は常に `false` になる。取得した振りの
+snapshot を置いて鮮度を計算する対象にはしない。AWS Health API は
 AWS 認証と対象 support plan を要するため v1 は `link` になる。HTML scraping や route
 credential の流用は行わない。将来、正式な取得方法が確定したら source type を追加する。
 

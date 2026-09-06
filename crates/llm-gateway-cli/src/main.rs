@@ -309,6 +309,15 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
         );
     }
 
+    let unpointed = config.status_sources_without_routes();
+    if !unpointed.is_empty() {
+        println!("\nwarning: no route names these status sources, so they describe nothing:");
+        for name in &unpointed {
+            println!("  {name}");
+        }
+        println!("  write `status_source = \"<name>\"` on the routes each source speaks for");
+    }
+
     let unpriced = config.keepalive_horizon_without_pricing(&|model| {
         llm_gateway::preset::pricing::for_model(model).is_some()
     });
@@ -676,7 +685,7 @@ fn render_status(report: &StatusReport) -> String {
             .official
             .observed_at
             .or(service.observed.observed_at)
-            .map(|at| format!("{} ago", elapsed(report.generated_at.saturating_sub(at))))
+            .map(|at| elapsed(report.generated_at.saturating_sub(at)))
             .unwrap_or_else(|| "-".to_owned());
         let stale = if service.official.stale { " stale" } else { "" };
         out.push_str(&format!(
@@ -2713,6 +2722,19 @@ main = "keepalive"
             out.contains("Provider: Incident\n  https://stspg.io/i"),
             "{out}"
         );
+    }
+
+    /// 更新時刻は経過時間の表現をそのまま置く (`elapsed` が既に「いつ」を言い切る)。
+    #[test]
+    fn status_formatter_writes_the_age_once() {
+        let out = render_status(&status_report(
+            llm_gateway::status::OfficialState::Operational,
+            false,
+            false,
+        ));
+        assert!(out.contains("just now"), "{out}");
+        assert!(!out.contains("just now ago"), "{out}");
+        assert!(!out.contains("ago ago"), "{out}");
     }
 
     /// stale は更新時刻の直後へ明示し、現在値と誤認させない。

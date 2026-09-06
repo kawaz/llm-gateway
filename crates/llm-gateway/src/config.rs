@@ -1303,6 +1303,25 @@ impl Config {
             .collect()
     }
 
+    /// どの route からも指されていない status source (DR-0021 §4)。
+    ///
+    /// 指す route が無い source は公式状態を取りに行くだけで、誰の状態も
+    /// 説明しない。設定として矛盾はしていない (route 側に `status_source` を
+    /// 書き足せば繋がる) ので拒まず、名前を挙げる。
+    pub fn status_sources_without_routes(&self) -> Vec<&str> {
+        self.status
+            .sources
+            .keys()
+            .filter(|name| {
+                !self
+                    .routes
+                    .values()
+                    .any(|route| route.status_source.as_ref() == Some(*name))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
     /// 合図の届け先を持たないまま `keepalive` を書いた namespace (DR-0024 §2)。
     ///
     /// 合図は受け口 (DR-0012) 経由でしか会話へ届かない。設定として矛盾しては
@@ -1796,6 +1815,29 @@ routes = ["a"]
 
         assert_eq!(c.namespaces_without_routing(), vec!["personal"]);
         assert_eq!(c.namespaces_without_aliases(), vec!["personal"]);
+    }
+
+    /// route から指されていない status source だけを挙げる (指されていれば挙げない)。
+    #[test]
+    fn lists_status_sources_no_route_names() {
+        let c = parse(
+            r#"
+[status.sources.used]
+type = "link"
+page_url = "https://status.example/used"
+
+[status.sources.unused]
+type = "link"
+page_url = "https://status.example/unused"
+
+[routes.a]
+provider = "anthropic"
+status_source = "used"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(c.status_sources_without_routes(), vec!["unused"]);
     }
 
     #[test]

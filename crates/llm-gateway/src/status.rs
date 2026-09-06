@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -120,6 +121,9 @@ struct Inner {
     routes: BTreeMap<String, Option<String>>,
     sources: BTreeMap<String, Source>,
     observations: Mutex<BTreeMap<String, Observation>>,
+    /// 観測の到着順。報告する時刻は秒なので、同じ秒に届いた成功と失敗は
+    /// 時刻だけでは並べられない。どちらが後かは通し番号で決める。
+    sequence: AtomicU64,
 }
 struct Source {
     spec: StatusSourceSpec,
@@ -140,10 +144,16 @@ pub(crate) struct Snapshot {
     pub(crate) components: Vec<Component>,
     pub(crate) incidents: Vec<Incident>,
 }
+/// 1 つの観測が「いつ」「何番目に」届いたか。
+#[derive(Clone, Copy)]
+struct Stamp {
+    at: i64,
+    seq: u64,
+}
 #[derive(Default, Clone)]
 struct Observation {
-    success: Option<i64>,
-    failure: Option<Failure>,
+    success: Option<Stamp>,
+    failure: Option<(Stamp, Failure)>,
 }
 
 impl Manager {
@@ -173,6 +183,7 @@ impl Manager {
                 routes,
                 sources,
                 observations: Mutex::new(BTreeMap::new()),
+                sequence: AtomicU64::new(0),
             }),
         }
     }
@@ -203,7 +214,7 @@ impl Manager {
         self.inner
             .sources
             .iter()
-            .filter(|(_, source)| matches!(source.spec, StatusSourceSpec::StatuspageV2 { .. }))
+            .filter(|(_, source)| is_fetchable(&source.spec))
             .map(|(name, _)| name.clone())
             .collect()
     }
@@ -217,6 +228,12 @@ impl Manager {
         let Some(source) = self.inner.sources.get(name) else {
             return Err(format!("unknown status source: {name}"));
         };
+        // `link` は外部へ触らない案内先なので、更新しても新しく分かることが
+        // 無い。取得した振りの snapshot を置くと、時刻だけが進んで公式値の
+        // 鮮度 (`stale`) を計算する対象になってしまう。
+        if !is_fetchable(&source.spec) {
+            return Ok(());
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let start = {
             let mut st = source.state.lock().await;
@@ -237,19 +254,11 @@ impl Manager {
                     .sources
                     .get(&name)
                     .expect("the source exists for the lifetime of the manager");
-                let result = match &source.spec {
-                    StatusSourceSpec::StatuspageV2 { .. } => {
-                        use crate::statuspage_v2::StatusSource as _;
-                        crate::statuspage_v2::Adapter::new(this.inner.config.request_timeout)
-                            .fetch(&source.spec)
-                            .await
-                    }
-                    StatusSourceSpec::Link { .. } => Ok(Snapshot {
-                        at: now_unix(),
-                        state: OfficialState::Unknown,
-                        components: vec![],
-                        incidents: vec![],
-                    }),
+                let result = {
+                    use crate::statuspage_v2::StatusSource as _;
+                    crate::statuspage_v2::Adapter::new(this.inner.config.request_timeout)
+                        .fetch(&source.spec)
+                        .await
                 };
                 let mut st = source.state.lock().await;
                 match &result {
@@ -270,34 +279,47 @@ impl Manager {
             .map_err(|_| "status refresh timed out".to_owned())?
             .map_err(|_| "status refresh was cancelled".to_owned())?
     }
+    fn stamp(&self) -> Stamp {
+        Stamp {
+            at: now_unix(),
+            seq: self.inner.sequence.fetch_add(1, Ordering::Relaxed),
+        }
+    }
     pub async fn observe_success(&self, route: &str) {
+        let stamp = self.stamp();
         self.inner
             .observations
             .lock()
             .await
             .entry(route.to_owned())
             .or_default()
-            .success = Some(now_unix());
+            .success = Some(stamp);
     }
     pub async fn observe_failure(&self, route: &str, kind: &str, status: Option<u16>) {
-        let now = now_unix();
+        let stamp = self.stamp();
         self.inner
             .observations
             .lock()
             .await
             .entry(route.to_owned())
             .or_default()
-            .failure = Some(Failure {
-            at: now,
-            kind: kind.to_owned(),
-            status,
-        });
+            .failure = Some((
+            stamp,
+            Failure {
+                at: stamp.at,
+                kind: kind.to_owned(),
+                status,
+            },
+        ));
         let Some(Some(source)) = self.inner.routes.get(route) else {
             return;
         };
         let Some(src) = self.inner.sources.get(source) else {
             return;
         };
+        if !is_fetchable(&src.spec) {
+            return;
+        }
         let trigger = {
             let mut st = src.state.lock().await;
             let due = st
@@ -316,6 +338,12 @@ impl Manager {
         let now = now_unix();
         let obs = self.inner.observations.lock().await.clone();
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // 設定した source は、まだどの route も指していなくても service として
+        // 残す。消してしまうと「書いたのに出てこない」だけになり、`routes` が
+        // 空であること自体が書き落としの手がかりにならない。
+        for name in self.inner.sources.keys() {
+            groups.entry(name.clone()).or_default();
+        }
         for (r, s) in &self.inner.routes {
             groups
                 .entry(s.clone().unwrap_or_else(|| r.clone()))
@@ -326,7 +354,7 @@ impl Manager {
         for (id, routes) in groups {
             let official = if let Some(src) = self.inner.sources.get(&id) {
                 let st = src.state.lock().await;
-                official_from(&id, &src.spec, &st, now, self.inner.config.stale_after)
+                official_from(&src.spec, &st, now, self.inner.config.stale_after)
             } else {
                 Official {
                     state: OfficialState::Unknown,
@@ -401,26 +429,34 @@ fn observed_from(
     now: i64,
     ttl: Duration,
 ) -> Observed {
-    let mut success = None;
-    let mut failure = None;
+    let mut success: Option<Stamp> = None;
+    let mut failure: Option<(Stamp, Failure)> = None;
     for r in routes {
         if let Some(o) = all.get(r) {
-            success = success.max(o.success);
+            if o.success
+                .is_some_and(|s| success.is_none_or(|x| s.seq > x.seq))
+            {
+                success = o.success
+            }
             if o.failure
                 .as_ref()
-                .is_some_and(|f| failure.as_ref().is_none_or(|x: &Failure| f.at > x.at))
+                .is_some_and(|(s, _)| failure.as_ref().is_none_or(|(x, _)| s.seq > x.seq))
             {
                 failure = o.failure.clone()
             }
         }
     }
-    let latest = success.max(failure.as_ref().map(|f| f.at));
+    let latest = success
+        .map(|s| s.at)
+        .max(failure.as_ref().map(|(s, _)| s.at));
     let valid = latest.is_some_and(|x| now - x <= ttl.as_secs() as i64);
+    // 順序は到着順で決める。秒だけで比べると、同じ秒に届いた失敗が成功へ
+    // 埋もれる (逆は埋もれない) という向きの偏りが出る。
     let state = if !valid {
         ObservedState::Unknown
     } else if failure
         .as_ref()
-        .is_some_and(|f| success.is_none_or(|s| f.at > s))
+        .is_some_and(|(f, _)| success.is_none_or(|s| f.seq > s.seq))
     {
         ObservedState::Failing
     } else {
@@ -430,12 +466,14 @@ fn observed_from(
         state,
         observed_at: latest,
         expires_at: latest.map(|x| x + ttl.as_secs() as i64),
-        last_success_at: success,
-        last_failure: failure,
+        last_success_at: success.map(|s| s.at),
+        last_failure: failure.map(|(_, f)| f),
     }
 }
+fn is_fetchable(spec: &StatusSourceSpec) -> bool {
+    matches!(spec, StatusSourceSpec::StatuspageV2 { .. })
+}
 fn official_from(
-    id: &str,
     spec: &StatusSourceSpec,
     st: &SourceState,
     now: i64,
@@ -464,13 +502,7 @@ fn official_from(
             stale: false,
             components: vec![],
             incidents: vec![],
-            error: st.error.clone().or_else(|| {
-                if id.is_empty() {
-                    Some("invalid source".into())
-                } else {
-                    None
-                }
-            }),
+            error: st.error.clone(),
         },
     }
 }
@@ -564,7 +596,9 @@ models = ["m"]
         let m = manager(
             r#"
 [status.sources.provider]
-type = "link"
+type = "statuspage_v2"
+summary_url = "https://status.example/api/v2/summary.json"
+incidents_url = "https://status.example/api/v2/incidents.json"
 page_url = "https://status.example/"
 [routes.route]
 provider = "anthropic"
@@ -623,7 +657,10 @@ models = ["m"]
         m.inner.observations.lock().await.insert(
             "route".into(),
             Observation {
-                success: Some(now_unix() - 2),
+                success: Some(Stamp {
+                    at: now_unix() - 2,
+                    seq: 0,
+                }),
                 failure: None,
             },
         );
@@ -636,7 +673,7 @@ models = ["m"]
     /// 同時 refresh は leader の summary/incidents 各 1 request だけを送り、全 waiter が同じ成功結果を受け取る。
     #[tokio::test]
     async fn concurrent_refreshes_share_one_fetch_and_result() {
-        let (base, hits, arrived) = counting_status_server().await;
+        let (base, hits, _arrived) = counting_status_server().await;
         let m = manager(&format!(
             r#"
 [status.sources.provider]
@@ -650,16 +687,11 @@ status_source = "provider"
 models = ["m"]
 "#
         ));
-        let jobs = (0..20)
-            .map(|_| {
-                let m = m.clone();
-                tokio::spawn(async move { m.refresh("provider").await })
-            })
-            .collect::<Vec<_>>();
-        let results = futures_util::future::join_all(jobs).await;
-        assert!(results.into_iter().all(|r| r.unwrap() == Ok(())));
-        arrived.acquire_many(2).await.unwrap().forget();
-        tokio::task::yield_now().await;
+        // task へ切り出さず 1 つの future として畳むのは、20 本すべてが待ち行列へ
+        // 並んでから leader の取得が終わる順序を保証するため。別 task にすると
+        // 先に終わった取得の後から並ぶ組が出て、その分だけ request が増える。
+        let results = futures_util::future::join_all((0..20).map(|_| m.refresh("provider"))).await;
+        assert!(results.into_iter().all(|r| r == Ok(())));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -820,13 +852,78 @@ models = ["m"]
         );
     }
 
+    /// 同じ秒に届いた失敗は、直前の成功へ埋もれず failing として残る。
+    #[tokio::test]
+    async fn a_failure_in_the_same_second_outranks_the_earlier_success() {
+        let m = manager(
+            r#"
+[routes.route]
+provider = "anthropic"
+models = ["m"]
+"#,
+        );
+        m.observe_success("route").await;
+        m.observe_failure("route", "upstream_http", Some(529)).await;
+        let observed = &m.report().await.services[0].observed;
+        assert_eq!(observed.state, ObservedState::Failing);
+        assert_eq!(
+            observed.last_success_at, observed.observed_at,
+            "同秒なら成功も失敗も同じ時刻を持つ"
+        );
+    }
+
+    /// `link` は取得しないので snapshot を作らず、公式値は鮮度の計算対象にならない。
+    #[tokio::test]
+    async fn a_link_source_never_becomes_stale() {
+        let m = manager(
+            r#"
+[status.sources.provider]
+type = "link"
+page_url = "https://status.example/"
+[routes.route]
+provider = "anthropic"
+status_source = "provider"
+models = ["m"]
+"#,
+        );
+        assert_eq!(m.refresh("provider").await, Ok(()));
+        m.observe_failure("route", "upstream_http", Some(529)).await;
+        let official = &m.report().await.services[0].official;
+        assert_eq!(official.source, "link");
+        assert_eq!(official.state, OfficialState::Unknown);
+        assert!(!official.stale);
+        assert_eq!(official.observed_at, None);
+    }
+
+    /// どの route からも指されていない source も、route が空の service として残る。
+    #[tokio::test]
+    async fn a_source_without_routes_stays_in_the_report() {
+        let m = manager(
+            r#"
+[status.sources.unused]
+type = "link"
+page_url = "https://status.example/"
+[routes.direct]
+provider = "anthropic"
+models = ["m"]
+"#,
+        );
+        let report = m.report().await;
+        let service = report.services.iter().find(|s| s.id == "unused").unwrap();
+        assert!(service.routes.is_empty());
+        assert_eq!(service.official.source, "link");
+        assert_eq!(service.severity, Severity::Unknown);
+    }
+
     /// leader が request timeout 内に終わらない場合、待機者自身も同じ上限で終了する。
     #[tokio::test]
     async fn refresh_waiter_times_out() {
         let m = manager_with_timeout(
             r#"
 [status.sources.provider]
-type = "link"
+type = "statuspage_v2"
+summary_url = "https://status.example/api/v2/summary.json"
+incidents_url = "https://status.example/api/v2/incidents.json"
 page_url = "https://status.example/"
 [routes.route]
 provider = "anthropic"

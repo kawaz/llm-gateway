@@ -586,7 +586,12 @@ impl<P: Persistence> Gateway<P> {
                         // 通ったなら締め出しの根拠は消えている。
                         route.preset.allow(&model);
                     }
-                    if resp.status / 100 == 2 {
+                    // 採用した応答は upstream に届いた証拠なので、成功でなくても
+                    // 到達できたこと自体は数える (DR-0021 §2)。数えないのは
+                    // upstream 障害を疑う 5xx で、そちらは 529 と transport error
+                    // だけを failing として別に記録する。credential や枠の断り
+                    // (401 / 403 / 429) はこの分岐まで来ない。
+                    if resp.status < 500 {
                         self.status.observe_success(route.name()).await;
                     }
                     // ここまでで届いているのはヘッダだけ。本文がクライアント
@@ -4376,6 +4381,22 @@ routes = ["route"]
                 "{code} must not imply an upstream outage"
             );
         }
+    }
+
+    /// そのまま返す 4xx も upstream から届いた応答なので、到達できたことは数える。
+    #[tokio::test]
+    async fn an_adopted_client_error_still_counts_as_reachable() {
+        let upstream = FakeUpstream::always(400).await;
+        let gw = gateway(&status_route(&upstream.url)).await;
+        let resp = gw
+            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(resp.response.status, 400);
+        assert_eq!(
+            gw.status_report(false).await.services[0].observed.state,
+            crate::status::ObservedState::Reachable
+        );
     }
 
     /// 529 は failing を作るが、後続 2xx は同じ route の最新観測として reachable へ戻す。
