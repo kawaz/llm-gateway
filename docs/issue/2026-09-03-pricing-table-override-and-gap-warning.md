@@ -1,11 +1,11 @@
 ---
 title: catalog-pricing ギャップ warning
-status: open
+status: wip
 category: design
 created: 2026-09-03T12:07:36+09:00
 last_read:
 open_entered: 2026-09-03T12:07:36+09:00
-wip_entered:
+wip_entered: 2026-09-06T15:40:15+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
