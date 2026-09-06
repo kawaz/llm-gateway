@@ -1,6 +1,6 @@
 ---
 title: usage / status / stats の JSON の時刻欄を Unix ms に統一し秒と _iso を全廃
-status: wip
+status: resolved
 category: task
 created: 2026-09-06T19:24:07+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T20:31:38+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T20:51:10+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0007","dr/DR-0011","dr/DR-0012","dr/DR-0020","dr/DR-0021","done:usage/status/stats を秒 + _iso から Unix ms 統一 (change txlkxxlt)","done:MANUAL 更新","done:ccmsg へ r276 で変更欄を通知済み"]
 blocked_by:
 origin: 自リポ TODO
 ---
