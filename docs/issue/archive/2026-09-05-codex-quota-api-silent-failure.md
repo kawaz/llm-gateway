@@ -1,6 +1,6 @@
 ---
 title: codex の枠照会 API が黙って失敗し usage が unobserved のまま (spend_down が効かない)
-status: open
+status: resolved
 category: bug
 created: 2026-09-05T21:41:27+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T15:16:47+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:v0.38.2 で refresh 経路 (probe_usage) に preset.apply_quota を接続し snapshot に反映、ask_limits 失敗時の warn ログも追加。実機検証: 再起動直後 unobserved -> usage?refresh=true で codex 2件とも observed (7d 窓 reset 付き)。真因は API 失敗ではなく apply_quota 未接続だった"]
 blocked_by:
 origin: 自リポ TODO
 ---
