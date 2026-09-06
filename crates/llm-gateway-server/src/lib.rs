@@ -50,6 +50,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/tap", get(tap))
         .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
+        .route("/llm-gateway/keepalive/resume", post(keepalive_resume))
         .route("/llm-gateway/keepalive/paused", get(keepalive_paused))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
@@ -285,6 +286,22 @@ async fn keepalive_pause<P: Persistence + 'static>(
 #[derive(Deserialize)]
 struct PauseRequest {
     session_id: String,
+}
+
+/// 頼まれた会話への cache keepalive を再開する (DR-0024 §2 追補)。
+///
+/// 内部の口。人が叩くものではなく、実リクエストを受けた instance が兄弟へ
+/// 「この会話は戻ってきた」と伝えるために使う。認証と中継の扱いは
+/// [`keepalive_pause`] と同じ。
+async fn keepalive_resume<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    headers: HeaderMap,
+    body: Json<PauseRequest>,
+) -> Response {
+    gateway.resume_keepalive(&body.session_id, headers.contains_key(RELAYED_HEADER));
+    json_utf8(Json(
+        json!({"session_id": body.session_id, "paused": false}),
+    ))
 }
 
 /// 合図を止めてある会話の id を返す。
@@ -1129,15 +1146,15 @@ peers = ["{listen}", "{sibling}"]
         .await
     }
 
-    /// 中継されたリクエストの本文だけを取り出す。
-    fn relayed_pauses(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    /// その口へ中継されたリクエストの本文だけを取り出す。
+    fn relayed_to(seen: &Arc<Mutex<Vec<String>>>, path: &str) -> Vec<String> {
+        let head_line = format!("POST {path}");
         seen.lock()
             .unwrap()
             .iter()
             .filter_map(|request| {
                 let (head, body) = request.split_once("\r\n\r\n")?;
-                head.starts_with("POST /llm-gateway/keepalive/pause")
-                    .then(|| body.to_owned())
+                head.starts_with(&head_line).then(|| body.to_owned())
             })
             .collect()
     }
@@ -1146,15 +1163,22 @@ peers = ["{listen}", "{sibling}"]
     ///
     /// 中継は送りっぱなしなので、返した応答からは届いたかどうか分からない。
     /// 見えるのは相手側の記録だけ。
-    async fn until_relayed(seen: &Arc<Mutex<Vec<String>>>, count: usize) -> Vec<String> {
+    async fn until_relayed(
+        seen: &Arc<Mutex<Vec<String>>>,
+        path: &str,
+        count: usize,
+    ) -> Vec<String> {
         for _ in 0..200 {
-            let relayed = relayed_pauses(seen);
+            let relayed = relayed_to(seen, path);
             if relayed.len() >= count {
                 return relayed;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("{count} relayed pauses never arrived: {:?}", seen.lock());
+        panic!(
+            "{count} relayed calls to {path} never arrived: {:?}",
+            seen.lock()
+        );
     }
 
     /// 止めた会話は一覧に出て、兄弟にも渡る (DR-0024 §2 追補)。
@@ -1182,7 +1206,7 @@ peers = ["{listen}", "{sibling}"]
             .unwrap();
         assert_eq!(listed, ["s-1"]);
 
-        let relayed = until_relayed(&seen, 1).await;
+        let relayed = until_relayed(&seen, "/llm-gateway/keepalive/pause", 1).await;
         assert_eq!(
             relayed,
             [json!({"session_id": "s-1"}).to_string()],
@@ -1215,7 +1239,7 @@ peers = ["{listen}", "{sibling}"]
             .await
             .unwrap();
 
-        let relayed = until_relayed(&seen, 1).await;
+        let relayed = until_relayed(&seen, "/llm-gateway/keepalive/pause", 1).await;
         assert_eq!(
             relayed,
             [json!({"session_id": "came-from-a-person"}).to_string()],
@@ -1234,6 +1258,131 @@ peers = ["{listen}", "{sibling}"]
             listed,
             ["came-from-a-person", "came-from-the-sibling"],
             "both were paused here; only the passing on differs"
+        );
+    }
+
+    /// 解除も兄弟へ渡る。実リクエストは片方にしか来ないので、伝えないと
+    /// もう片方が止まったままになる (DR-0024 §2 追補)。
+    #[tokio::test]
+    async fn a_resume_is_passed_to_the_sibling() {
+        let (sibling, seen) = recording_upstream().await;
+        let base = serve_with_sibling("127.0.0.1:11301", &sibling).await;
+        let client = reqwest::Client::new();
+
+        client
+            .post(format!("{base}/llm-gateway/keepalive/pause"))
+            .header(RELAYED_HEADER, "1")
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+        let response = client
+            .post(format!("{base}/llm-gateway/keepalive/resume"))
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let relayed = until_relayed(&seen, "/llm-gateway/keepalive/resume", 1).await;
+        assert_eq!(
+            relayed,
+            [json!({"session_id": "s-1"}).to_string()],
+            "the sibling was asked to resume the same conversation"
+        );
+
+        let listed: Vec<String> = client
+            .get(format!("{base}/llm-gateway/keepalive/paused"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "and it is no longer paused here");
+    }
+
+    /// 中継の印が付いた解除は、それ以上回さない。
+    #[tokio::test]
+    async fn a_relayed_resume_is_not_passed_on_again() {
+        let (sibling, seen) = recording_upstream().await;
+        let base = serve_with_sibling("127.0.0.1:11301", &sibling).await;
+        let client = reqwest::Client::new();
+
+        for session in ["came-from-the-sibling", "came-from-a-person"] {
+            client
+                .post(format!("{base}/llm-gateway/keepalive/pause"))
+                .header(RELAYED_HEADER, "1")
+                .json(&json!({"session_id": session}))
+                .send()
+                .await
+                .unwrap();
+        }
+        // 先に印付きを出しておく。後から出した 1 本が兄弟に届いた時点では、
+        // 先に出したほうが回っていれば既に届いている。
+        client
+            .post(format!("{base}/llm-gateway/keepalive/resume"))
+            .header(RELAYED_HEADER, "1")
+            .json(&json!({"session_id": "came-from-the-sibling"}))
+            .send()
+            .await
+            .unwrap();
+        client
+            .post(format!("{base}/llm-gateway/keepalive/resume"))
+            .json(&json!({"session_id": "came-from-a-person"}))
+            .send()
+            .await
+            .unwrap();
+
+        let relayed = until_relayed(&seen, "/llm-gateway/keepalive/resume", 1).await;
+        assert_eq!(
+            relayed,
+            [json!({"session_id": "came-from-a-person"}).to_string()],
+            "only the one a person came back to went on"
+        );
+
+        let listed: Vec<String> = client
+            .get(format!("{base}/llm-gateway/keepalive/paused"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "both were resumed here; only the passing on differs"
+        );
+    }
+
+    /// 止まっていない会話へ実リクエストが来ても、兄弟には何も渡らない。
+    ///
+    /// 大半のリクエストがこれなので、渡すと兄弟への往復が常時 1 本増える。
+    #[tokio::test]
+    async fn a_conversation_that_was_never_paused_relays_nothing() {
+        let (sibling, seen) = recording_upstream().await;
+        let base = serve_with_sibling("127.0.0.1:11301", &sibling).await;
+        let client = reqwest::Client::new();
+
+        client
+            .post(format!("{base}/llm-gateway/keepalive/resume"))
+            .json(&json!({"session_id": "never-paused"}))
+            .send()
+            .await
+            .unwrap();
+        // 後から出した止める頼みが届いたなら、先の解除が回っていれば
+        // 既に届いている。
+        client
+            .post(format!("{base}/llm-gateway/keepalive/pause"))
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+        until_relayed(&seen, "/llm-gateway/keepalive/pause", 1).await;
+
+        assert!(
+            relayed_to(&seen, "/llm-gateway/keepalive/resume").is_empty(),
+            "nothing was stopped, so there is nothing to tell the sibling"
         );
     }
 

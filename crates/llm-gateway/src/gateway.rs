@@ -481,7 +481,8 @@ impl<P: Persistence> Gateway<P> {
             self.keepalive.forget(series);
             // 戻ってきたのなら、止めてあった合図も要る (DR-0024 §2 追補)。
             // 解く口をここだけにしているので、合図の往復では解けない。
-            self.keepalive.resume(&series.session_id);
+            // 人が戻ったことは兄弟も知らないので、こちらから伝える。
+            self.resume_keepalive(&series.session_id, false);
         }
         let keepalive_paused = series
             .as_ref()
@@ -1016,6 +1017,33 @@ impl<P: Persistence> Gateway<P> {
             tokio::spawn(async move {
                 if let Err(e) = sending.send().await {
                     warn!(%url, %e, "cannot pass the keepalive pause to the sibling");
+                }
+            });
+        }
+    }
+
+    /// この会話への cache keepalive を再開する (DR-0024 §2 追補)。
+    ///
+    /// 解けるのは実リクエストが来た instance だけで、Caddy は片方を選ぶ。
+    /// 伝えないと選ばれなかった側が止まったままになり、こちらが落ちたときに
+    /// 見張りを引き継げない。`relayed` の扱いは [`Self::pause_keepalive`] と
+    /// 同じ。止まっていなかったなら誰にも伝えることはない。
+    pub fn resume_keepalive(&self, session_id: &str, relayed: bool) {
+        if !self.keepalive.resume(session_id) || relayed {
+            return;
+        }
+        for sibling in self.config.server.siblings() {
+            let url = format!("{}/llm-gateway/keepalive/resume", base_of(sibling));
+            let sending = self
+                .http
+                .post(&url)
+                .header(RELAYED_HEADER, "1")
+                .json(&serde_json::json!({ "session_id": session_id }));
+            // pause と同じく届いたかは待たない。落としても、次の実リクエストか
+            // 兄弟の起き上がりで揃う。
+            tokio::spawn(async move {
+                if let Err(e) = sending.send().await {
+                    warn!(%url, %e, "cannot pass the keepalive resume to the sibling");
                 }
             });
         }
