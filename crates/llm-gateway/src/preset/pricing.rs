@@ -234,6 +234,103 @@ pub fn for_model(model: &str) -> Option<Pricing> {
     })
 }
 
+/// 単価表に目を通したほうがよいモデル。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gap<'a> {
+    pub model: &'a str,
+    pub kind: GapKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GapKind {
+    /// どの行にも当たらない。コストが出ない。
+    Unpriced,
+    /// 世代の行の `*` に飲まれている。当たった `patterns` の 1 つを持つ。
+    Absorbed { pattern: &'static str },
+}
+
+impl std::fmt::Display for Gap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            GapKind::Unpriced => write!(f, "{}: no row in the price table", self.model),
+            GapKind::Absorbed { pattern } => write!(
+                f,
+                "{}: no row of its own; `{pattern}` prices it as the older generation",
+                self.model
+            ),
+        }
+    }
+}
+
+/// 単価表と突き合わせて、目を通したほうがよいモデルを挙げる。
+///
+/// 見るのは 2 つ。
+///
+/// 1. **行が無い**。[`for_model`] が `None` を返すモデルは、動かしてもコストの
+///    欄が出ない。
+/// 2. **世代の行に飲まれている**。表の書き方は「呼び名と日付付きの形の両方を
+///    書く」なので、`<呼び名>-*` は**日付付きの形だけ**を拾うつもりで置いてある
+///    (モジュールの doc 参照)。同じ行に呼び名そのものがあるのに、`*` が日付
+///    以外を飲んでいたら、それは別のモデルが旧世代の単価で計算されている。
+///    Fable 5.1 が `claude-fable-5-*` に飲まれて cache read を 4 倍で見積もって
+///    いたのがこの形。
+///
+/// 呼び名を持たない広い行 (`codex-*` のように、狙って何でも拾う行) は 2 の
+/// 対象にしない。飲むのが仕事なので、当たっただけでは誤りと言えない。
+pub fn gaps<'a, I: IntoIterator<Item = &'a str>>(models: I) -> Vec<Gap<'a>> {
+    let mut found: Vec<Gap<'a>> = Vec::new();
+    for model in models {
+        if found.iter().any(|gap| gap.model == model) {
+            continue;
+        }
+        let Some(row) = TABLE
+            .iter()
+            .find(|row| pattern::matches_any(row.patterns, model))
+        else {
+            found.push(Gap {
+                model,
+                kind: GapKind::Unpriced,
+            });
+            continue;
+        };
+        // 呼び名そのもので当たっているなら、その行はこのモデルのために書かれている。
+        if row.patterns.contains(&model) {
+            continue;
+        }
+        if let Some(pattern) = row
+            .patterns
+            .iter()
+            .find(|p| absorbs_a_non_dated_name(p, row.patterns, model))
+        {
+            found.push(Gap {
+                model,
+                kind: GapKind::Absorbed { pattern },
+            });
+        }
+    }
+    found
+}
+
+/// `pattern` が「呼び名 + 日付付き」の対の後者で、日付でないものを飲んでいるか。
+fn absorbs_a_non_dated_name(pattern: &str, siblings: &[&str], model: &str) -> bool {
+    let Some(plain) = pattern.strip_suffix("-*") else {
+        return false;
+    };
+    // 同じ行に呼び名が無ければ、狙って広く書いた行。飲むのが仕事。
+    if !siblings.contains(&plain) {
+        return false;
+    }
+    let Some(suffix) = model.strip_prefix(plain).and_then(|s| s.strip_prefix('-')) else {
+        return false;
+    };
+    !is_a_date(suffix)
+}
+
+/// 日付付きの形の日付部分か (`claude-haiku-4-5-20251001` の `20251001`)。
+fn is_a_date(suffix: &str) -> bool {
+    suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +392,69 @@ mod tests {
         assert!(for_model("").is_none());
         // 予約名 (認証情報を持たない経路) もモデルではないので当たらない。
         assert!(for_model(crate::stats::NO_CREDENTIAL).is_none());
+    }
+
+    /// 行の無いモデルが挙がる。
+    #[test]
+    fn a_model_with_no_row_is_named() {
+        assert_eq!(
+            gaps(["claude-opus-5", "some-local-model"]),
+            vec![Gap {
+                model: "some-local-model",
+                kind: GapKind::Unpriced,
+            }]
+        );
+    }
+
+    /// 世代の `*` に飲まれたモデルが挙がる。Fable 5.1 が踏んだ形。
+    #[test]
+    fn a_model_absorbed_by_an_older_generation_is_named() {
+        assert_eq!(
+            gaps(["claude-opus-5-1"]),
+            vec![Gap {
+                model: "claude-opus-5-1",
+                kind: GapKind::Absorbed {
+                    pattern: "claude-opus-5-*",
+                },
+            }],
+            "5-1 は 5 の行に当たるが、5 の単価でよいとは限らない"
+        );
+        // 5.1 は自分の行を持つので挙がらない。これが直したあとの姿。
+        assert_eq!(gaps(["claude-fable-5-1"]), vec![]);
+    }
+
+    /// 日付付きの形は飲まれたのではなく、そう書いてある。
+    #[test]
+    fn a_dated_name_is_not_a_gap() {
+        assert_eq!(gaps(["claude-haiku-4-5-20251001"]), vec![]);
+    }
+
+    /// 呼び名を持たない広い行は、当たっただけでは誤りにしない。
+    #[test]
+    fn a_deliberately_broad_row_absorbs_by_design() {
+        assert_eq!(gaps(["codex-mini-latest", "gpt-5.1-codex-max"]), vec![]);
+    }
+
+    /// 表に載っているモデルだけなら何も挙がらない。
+    #[test]
+    fn a_fully_described_list_is_empty() {
+        assert_eq!(
+            gaps([
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-haiku-4-5",
+                "claude-fable-5",
+                "claude-fable-5-1",
+                "gpt-5.6-luna",
+            ]),
+            vec![]
+        );
+    }
+
+    /// 同じ名前が 2 つの経路から来ても 1 度だけ挙げる。
+    #[test]
+    fn a_repeated_model_is_named_once() {
+        assert_eq!(gaps(["unknown", "unknown"]).len(), 1);
     }
 
     /// 表に挙げた区分がそれぞれ掛かる。

@@ -320,6 +320,18 @@ fn check(config_path: &Path) -> Result<ExitCode, String> {
         }
     }
 
+    // 単価表は手で書くので、新しいモデルが出ると置いていかれる。動かす前に
+    // 見えるのは設定に名前を書いた分だけ (upstream に聞いた一覧は起動しないと
+    // 無い) なので、ここで挙がらなくても discovery 側がもう一度見る。
+    let gaps = llm_gateway::preset::pricing::gaps(config.declared_model_names());
+    if !gaps.is_empty() {
+        println!("\nwarning: the price table does not describe these models:");
+        for gap in &gaps {
+            println!("  {gap}");
+        }
+        println!("  add a row to `preset/pricing.rs` so the cost is not guessed");
+    }
+
     if missing.is_empty() && unreadable.is_empty() {
         println!("\nno problems found");
         return Ok(ExitCode::SUCCESS);

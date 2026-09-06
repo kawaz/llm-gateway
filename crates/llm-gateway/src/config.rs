@@ -1338,16 +1338,29 @@ impl Config {
     /// 何割か」を意味するので、単価を持たないモデルでは意味を持てない。
     /// 設定に書いてあるモデル名だけを見る (upstream に聞いて初めて分かる分は、
     /// 起動時にはまだ知らない)。
+    /// 経路が扱うと書いてあるモデルのうち、名前が定まっているもの。
+    ///
+    /// `models` には `gpt-*` のような書き方も混ざる。これはモデル 1 つを
+    /// 指す名前ではなく、当たったものを通すという意味なので、単価や catalog と
+    /// 突き合わせる相手にはならない。起動していれば upstream に聞いた一覧が
+    /// あるが、設定を読むだけの場面ではこれが分かる全部。
+    pub fn declared_model_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for route in self.routes.values() {
+            for model in route.declared_models() {
+                if !model.contains('*') && !names.contains(&model.as_str()) {
+                    names.push(model.as_str());
+                }
+            }
+        }
+        names
+    }
+
     pub fn keepalive_horizon_without_pricing(
         &self,
         priced: &dyn Fn(&str) -> bool,
     ) -> Vec<(&str, &str)> {
-        let declared: Vec<&str> = self
-            .routes
-            .values()
-            .flat_map(|route| route.declared_models())
-            .map(String::as_str)
-            .collect();
+        let declared = self.declared_model_names();
 
         let mut unpriced = Vec::new();
         for (ns_name, ns) in &self.namespaces {

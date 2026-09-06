@@ -369,6 +369,18 @@ impl Router {
             models = total,
             "updated model catalog"
         );
+        // 一覧を取り直した直後が、単価表の抜けに気づける唯一の場所。新しい
+        // モデルは upstream に出てから表に載るまでのあいだ、黙って旧世代の
+        // 単価で計算されるか、コストの欄ごと消える。
+        for gap in crate::preset::pricing::gaps(
+            by_route
+                .values()
+                .flat_map(BTreeMap::keys)
+                .map(String::as_str),
+        ) {
+            warn!(%gap, "the price table does not describe this model");
+        }
+
         *self.catalog.write().await = Catalog { by_route };
     }
 
