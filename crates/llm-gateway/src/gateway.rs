@@ -873,7 +873,10 @@ impl<P: Persistence> Gateway<P> {
     /// 合図の往復も同じ扱いになる。ここでやるのは、次に合図を出す時刻を
     /// 置き直すことだけ。受け口を書いていない設定では何もしないので、
     /// `keepalive` は `1h` と同じ振る舞いになる。
-    fn keep_alive(&self, call: &Call<'_>, route: &Route) {
+    /// `sent_at_ms` は、この 1 本の知らせに出す `ts`。連鎖の起点をそこへ
+    /// 揃えるために渡す — 起点を別に時計から起こすと、同じ瞬間のはずの
+    /// `ts` と `cache_since` がずれる。
+    fn keep_alive(&self, call: &Call<'_>, route: &Route, sent_at_ms: i64) {
         let Some(series) = &call.series else {
             return;
         };
@@ -890,7 +893,8 @@ impl<P: Persistence> Gateway<P> {
             // こちらは一歩下がって控える (DR-0024 §2)。
             Some(keepalive::Marker::Foreign) => {
                 let horizon = self.horizon_for(call, route);
-                self.keepalive.standby(series.clone(), bound, horizon);
+                self.keepalive
+                    .standby(series.clone(), bound, horizon, sent_at_ms);
             }
             // 自分が出した合図の往復は「人が動かした 1 本」ではないので、
             // 見張る期間も通った先も延ばさない。
@@ -898,7 +902,7 @@ impl<P: Persistence> Gateway<P> {
             None => {
                 let horizon = self.horizon_for(call, route);
                 self.keepalive
-                    .armed_by_request(series.clone(), bound, horizon);
+                    .armed_by_request(series.clone(), bound, horizon, sent_at_ms);
             }
         }
     }
@@ -922,11 +926,14 @@ impl<P: Persistence> Gateway<P> {
         let (origin, strategy) = call.cache_view(route.preset.as_ref());
         // 合図の連鎖。見張りを進めた後の予定から起こすので、実リクエスト・
         // 合図の往復・控えのどれでも同じ 1 箇所で求まる。
+        // この 1 本の時刻は**ここで 1 回だけ**読む。知らせの `ts` にも、
+        // 合図の連鎖の起点にも同じ値を使う。
+        let sent_at_ms = now_unix_ms();
         let mut chain = None;
         if let Some(strategy) = strategy {
             cache::apply(&mut body, strategy);
             if strategy == CacheStrategy::Keepalive {
-                self.keep_alive(call, route);
+                self.keep_alive(call, route, sent_at_ms);
                 chain = call
                     .series
                     .as_ref()
@@ -940,7 +947,6 @@ impl<P: Persistence> Gateway<P> {
         // 送る本文が決まったので、この 1 本が残す cache の寿命も決まる。
         let cache_ttl_secs = cache::ttl_secs(strategy, &body);
 
-        let sent_at_ms = now_unix_ms();
         let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
@@ -5040,27 +5046,27 @@ keepalive_horizon = "8h"
             .unwrap();
 
         let forwarded = forwarding(&mut watching).await;
-        let minute = 60 * 1_000;
-        assert!(
-            (forwarded.cache_since.unwrap() - forwarded.ts).abs() <= 1_000,
-            "a real request is where the chain starts"
+        // 合図は 55 分の格子に乗るので、時刻はすべて `ts` からの整数倍で
+        // 決まる。欄ごとに時計を読み直すと、ここに端数が乗る (実測)。
+        let refresh = 55 * 60 * 1_000;
+        let lifetime = 60 * 60 * 1_000;
+        assert_eq!(
+            forwarded.cache_since,
+            Some(forwarded.ts),
+            "a real request is where the chain starts, to the millisecond"
         );
         assert_eq!(forwarded.cache_count, Some(0), "and it is the zeroth link");
-        assert!(
-            (forwarded.next_keepalive_at.unwrap() - forwarded.cache_since.unwrap() - 55 * minute)
-                .abs()
-                <= 2_000,
-            "the first signal follows in 55 minutes"
+        assert_eq!(
+            forwarded.next_keepalive_at,
+            Some(forwarded.ts + refresh),
+            "the first signal follows exactly 55 minutes later"
         );
         // 8 時間の期間なら、最後の合図は 9 本目 (55 分刻みで期間を跨いだ 1 本
         // = 8 時間 15 分後)。そこから 1 時間が、この系列の cache の終わり。
         assert_eq!(forwarded.cache_until_count, Some(9));
-        assert!(
-            (forwarded.cache_until.unwrap()
-                - forwarded.cache_since.unwrap()
-                - (9 * 55 + 60) * minute)
-                .abs()
-                <= 2_000
+        assert_eq!(
+            forwarded.cache_until,
+            Some(forwarded.ts + 9 * refresh + lifetime)
         );
         assert!(
             forwarded.cache_expires_at.unwrap() < forwarded.cache_until.unwrap(),
@@ -5111,12 +5117,9 @@ keepalive_horizon = "8h"
         // なので、作り直し 1 回ぶんは合図 20 回。
         let forwarded = forwarding(&mut watching).await;
         assert_eq!(forwarded.cache_breakeven_count, Some(20));
-        assert!(
-            (forwarded.cache_breakeven_until.unwrap()
-                - forwarded.cache_since.unwrap()
-                - (20 * 55 + 60) * 60 * 1_000)
-                .abs()
-                <= 2_000
+        assert_eq!(
+            forwarded.cache_breakeven_until,
+            Some(forwarded.ts + 20 * 55 * 60 * 1_000 + 60 * 60 * 1_000)
         );
         assert!(
             forwarded.cache_until.unwrap() < forwarded.cache_breakeven_until.unwrap(),
@@ -5149,16 +5152,23 @@ keepalive_horizon = "8h"
         let answered = forwarding(&mut watching).await;
         assert_eq!(answered.keepalive.as_deref(), Some("applied"));
         assert_eq!(answered.cache_count, Some(1), "the first signal is spent");
-        // 試験の時計では壁時計だけが止まるので、起点は「この 1 本から見て
-        // 55 分前」の形で確かめる (実機でも同じ関係になる)。
-        assert!(
-            (answered.ts - answered.cache_since.unwrap() - (55 * 60 + 5) * 1_000).abs() <= 2_000,
-            "but the chain still starts at the last real request"
+        assert_eq!(
+            answered.cache_since,
+            Some(first.ts),
+            "but the chain still starts at the last real request, to the millisecond"
         );
-        let _ = first.cache_since;
         assert_eq!(
             answered.cache_until_count, first.cache_until_count,
             "and the horizon it was given has not moved"
+        );
+        assert_eq!(
+            answered.cache_until, first.cache_until,
+            "so the end it reaches is the very same moment"
+        );
+        assert_eq!(
+            answered.next_keepalive_at,
+            Some(first.ts + 2 * 3_300_000),
+            "and the next signal sits on the same 55 minute grid"
         );
     }
 

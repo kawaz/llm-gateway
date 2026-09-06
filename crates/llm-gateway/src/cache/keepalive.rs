@@ -146,10 +146,23 @@ struct Plan {
 /// (= 人が会話を動かしたら、そこから数え直す)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Counted {
-    /// この連鎖の起点 = 最後に来た実リクエストを送った時刻。
-    since: Instant,
+    /// この連鎖の起点 = 最後に来た実リクエストを送った時刻 (Unix ミリ秒)。
+    ///
+    /// **知らせに出す `ts` と同じ値**をそのまま持つ。単調時計から欄ごとに
+    /// 起こし直すと、同じ瞬間のはずの `ts` と `cache_since` が数ミリ秒ずれ、
+    /// 55 分刻みの予定にも端数が乗る (実測)。
+    since_ms: i64,
     /// ここまでに出した合図の本数。
     count: u32,
+}
+
+/// 合図の間隔と cache の寿命を、知らせの細かさ (ミリ秒) で。
+fn refresh_ms() -> i64 {
+    REFRESH_AFTER.as_millis() as i64
+}
+
+fn lifetime_ms() -> i64 {
+    LIFETIME.as_millis() as i64
 }
 
 /// 見張っている系列から、次の予定へ引き継ぐもの。
@@ -159,7 +172,7 @@ struct Carried {
     chain: Counted,
 }
 
-/// この系列に立っている合図の連鎖の見立て (Unix 秒)。
+/// この系列に立っている合図の連鎖の見立て (時刻は Unix ミリ秒)。
 ///
 /// 見る側 (ccmsg) が「この会話の cache はいつまで、あと何本の合図で保つか」を
 /// 描くための一式 (DR-0012 の `cache_*`)。
@@ -343,17 +356,13 @@ impl Keepalive {
                 bound,
                 kind: saved.kind,
                 chain: Counted {
-                    // 起点を持たなかった頃のファイルでは、予定の 1 つ手前を
-                    // 起点と見なす。数え直せる材料が他に無い。
-                    since: instant_of(
-                        if saved.since > 0 {
-                            saved.since
-                        } else {
-                            saved.fires_at - REFRESH_AFTER.as_secs() as i64
-                        },
-                        now,
-                        now_unix,
-                    ),
+                    // 起点を持たないファイルでは、予定の 1 つ手前を起点と
+                    // 見なす。数え直せる材料が他に無い。
+                    since_ms: if saved.since_ms > 0 {
+                        saved.since_ms
+                    } else {
+                        (saved.fires_at - REFRESH_AFTER.as_secs() as i64) * 1_000
+                    },
                     count: saved.count,
                 },
             });
@@ -383,7 +392,7 @@ impl Keepalive {
                 fires_at: unix_of(watched.fires_at, now, now_unix),
                 expires_at: unix_of(watched.expires_at, now, now_unix),
                 horizon_end: unix_of(watched.horizon_end, now, now_unix),
-                since: unix_of(watched.chain.since, now, now_unix),
+                since_ms: watched.chain.since_ms,
                 count: watched.chain.count,
                 kind: watched.kind,
             })
@@ -463,11 +472,19 @@ impl Keepalive {
     /// 前の予定は捨てる。**次のリクエストが来るたびに先送りされる**ので、
     /// 会話が動いている間は一度も発火しない。見張る期間 (`horizon`) と
     /// 通った先を延ばせるのは、この 1 本だけ。
-    pub fn armed_by_request(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
+    /// `sent_at_ms` は、この 1 本の知らせに出す `ts` と同じ値を渡す。連鎖の
+    /// 起点はそこに揃える (欄ごとに時計を読み直さない)。
+    pub fn armed_by_request(
+        self: &Arc<Self>,
+        series: Series,
+        bound: Bound,
+        horizon: Duration,
+        sent_at_ms: i64,
+    ) {
         let now = Instant::now();
         // 人が会話を動かした。連鎖はここから数え直す。
         let chain = Counted {
-            since: now,
+            since_ms: sent_at_ms,
             count: 0,
         };
         self.schedule(
@@ -508,14 +525,19 @@ impl Keepalive {
     ///
     /// この系列を見たことのないプロセスでは、その合図が通った先を起点にする
     /// — 実リクエストを見ていなくても、控えには入れる。
-    pub fn standby(self: &Arc<Self>, series: Series, bound: Bound, horizon: Duration) {
-        let now = Instant::now();
+    pub fn standby(
+        self: &Arc<Self>,
+        series: Series,
+        bound: Bound,
+        horizon: Duration,
+        seen_at_ms: i64,
+    ) {
         let carried = self.watch_of(&series).unwrap_or(Carried {
-            horizon_end: now + horizon,
+            horizon_end: Instant::now() + horizon,
             bound,
             // 見たことのない系列は、相手の合図が見えたところを起点にする。
             chain: Counted {
-                since: now,
+                since_ms: seen_at_ms,
                 count: 0,
             },
         });
@@ -620,7 +642,7 @@ impl Keepalive {
     /// **見込み値**。合図が出せない (経路が塞がる) / 戻りが遅れて 1 時間が
     /// 付かない場合は、ここより早く切れる。
     pub fn chain(&self, series: &Series) -> Option<Chain> {
-        let (now, now_ms) = (Instant::now(), now_unix_ms());
+        let now = Instant::now();
         let state = self.state.lock().unwrap();
         let watched = state.watched.get(series)?;
         let (fires_at, horizon_end, counted) =
@@ -628,38 +650,42 @@ impl Keepalive {
         // 予定を持たない間 (= 出した 1 本の戻り待ち) の次は、戻ってきたときに
         // 置き直される 1 本。それが仕込まれるのは、そのとき期間が残っている
         // 場合だけ ([`Self::rearm`])。
-        let next_at = if watched.timer.is_some() {
-            Some(fires_at)
-        } else if horizon_end > now {
-            Some(fires_at + REFRESH_AFTER)
-        } else {
-            None
-        };
+        let planned = watched.timer.is_some();
+        let has_next = planned || horizon_end > now;
         drop(state);
 
-        let since_ms = unix_ms_of(counted.since, now, now_ms);
-        let Some(next_at) = next_at else {
+        // 時刻は起点からの**整数演算**だけで出す。合図は 55 分の格子に乗る
+        // ので、単調時計から起こし直すと端数が乗るだけで何も得られない。
+        let at = |signal: u32| counted.since_ms + signal as i64 * refresh_ms();
+        if !has_next {
             // 出した 1 本が最後。それが置く cache で終わる。
             return Some(Chain {
-                since_ms,
+                since_ms: counted.since_ms,
                 count: counted.count,
                 next_at_ms: None,
-                until_ms: unix_ms_of(fires_at + LIFETIME, now, now_ms),
+                until_ms: at(counted.count) + lifetime_ms(),
                 until_count: counted.count,
             });
-        };
+        }
         // 次の 1 本の後に、あと何本続くか。期間の終わりちょうどに出る 1 本は、
-        // その時点で期間が残っていない (`>` の比較) ので出ない。
+        // その時点で期間が残っていない (`>` の比較) ので出ない。本数だけを
+        // 単調時計から数え、時刻には持ち込まない。
+        let next_at = if planned {
+            fires_at
+        } else {
+            fires_at + REFRESH_AFTER
+        };
         let more = horizon_end
             .checked_duration_since(next_at)
             .map_or(0, |left| left.as_secs().div_ceil(REFRESH_AFTER.as_secs()))
             as u32;
+        let until_count = counted.count + 1 + more;
         Some(Chain {
-            since_ms,
+            since_ms: counted.since_ms,
             count: counted.count,
-            next_at_ms: Some(unix_ms_of(next_at, now, now_ms)),
-            until_ms: unix_ms_of(next_at + REFRESH_AFTER * more + LIFETIME, now, now_ms),
-            until_count: counted.count + 1 + more,
+            next_at_ms: Some(at(counted.count + 1)),
+            until_ms: at(until_count) + lifetime_ms(),
+            until_count,
         })
     }
 
@@ -791,15 +817,6 @@ fn unix_ms_of(instant: Instant, now: Instant, now_ms: i64) -> i64 {
         now_ms + (instant - now).as_millis() as i64
     } else {
         now_ms - (now - instant).as_millis() as i64
-    }
-}
-
-/// 置き場に書いた時刻を、単調時計の時刻へ戻す ([`unix_of`] の逆)。
-fn instant_of(unix: i64, now: Instant, now_unix: i64) -> Instant {
-    if unix >= now_unix {
-        now + Duration::from_secs((unix - now_unix) as u64)
-    } else {
-        now - Duration::from_secs((now_unix - unix) as u64)
     }
 }
 
@@ -943,7 +960,7 @@ mod tests {
     async fn a_conversation_that_stops_gets_a_signal() {
         let (keepalive, mut watching) = keepalive();
         let armed_at_ms = now_unix_ms();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, armed_at_ms);
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
@@ -977,7 +994,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
 
         for _ in 0..5 {
-            keepalive.armed_by_request(series(), bound(), HORIZON);
+            keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
             tokio::time::advance(REFRESH_AFTER - Duration::from_secs(30)).await;
             settle().await;
         }
@@ -990,7 +1007,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_in_time_is_applied() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -1015,7 +1032,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_that_comes_back_late_is_not_applied() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -1029,7 +1046,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_next_signal_follows_at_the_same_interval() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         watching.recv().await.unwrap();
 
@@ -1051,7 +1068,7 @@ mod tests {
     async fn signalling_stops_at_the_horizon() {
         let horizon = Duration::from_secs(2 * 60 * 60);
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), horizon);
+        keepalive.armed_by_request(series(), bound(), horizon, now_unix_ms());
 
         // 合図と応答を、horizon を跨ぐまで繰り返す。
         let mut signals = 0;
@@ -1096,15 +1113,14 @@ mod tests {
             let (keepalive, _watching) = keepalive();
             let armed_at_ms = now_unix_ms();
             let horizon = Duration::from_secs(horizon_minutes * 60);
-            keepalive.armed_by_request(series(), bound(), horizon);
+            keepalive.armed_by_request(series(), bound(), horizon, armed_at_ms);
 
             let chain = keepalive.chain(&series()).unwrap();
             let want = armed_at_ms + (REFRESH_AFTER * signals + LIFETIME).as_millis() as i64;
             assert_eq!(chain.until_count, signals, "over {horizon_minutes} minutes");
-            assert!(
-                (chain.until_ms - want).abs() <= 1_000,
-                "a {horizon_minutes} minute horizon ends at {want}, got {}",
-                chain.until_ms
+            assert_eq!(
+                chain.until_ms, want,
+                "a {horizon_minutes} minute horizon ends on the 55 minute grid"
             );
             assert_eq!(
                 signals_within(horizon),
@@ -1112,12 +1128,15 @@ mod tests {
                 "the same count comes out of the horizon alone"
             );
 
-            // 実リクエスト自身は連鎖の 0 番目で、次の 1 本は 55 分後。
+            // 実リクエスト自身は連鎖の 0 番目で、次の 1 本はきっかり 55 分後。
             assert_eq!(chain.count, 0);
-            assert!((chain.since_ms - armed_at_ms).abs() <= 1_000);
-            assert!(
-                (chain.next_at_ms.unwrap() - armed_at_ms - REFRESH_AFTER.as_millis() as i64).abs()
-                    <= 1_000
+            assert_eq!(
+                chain.since_ms, armed_at_ms,
+                "the start is the very moment the request went out"
+            );
+            assert_eq!(
+                chain.next_at_ms,
+                Some(armed_at_ms + REFRESH_AFTER.as_millis() as i64)
             );
         }
     }
@@ -1130,7 +1149,7 @@ mod tests {
     async fn the_end_agrees_with_how_many_signals_actually_go_out() {
         let horizon = Duration::from_secs(2 * 60 * 60);
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), horizon);
+        keepalive.armed_by_request(series(), bound(), horizon, now_unix_ms());
         let promised = keepalive.chain(&series()).unwrap();
 
         let mut signals = 0;
@@ -1145,11 +1164,16 @@ mod tests {
             let waiting = keepalive.chain(&series()).unwrap();
             assert_eq!(waiting.count, signals, "the chain counts each signal");
             assert_eq!(waiting.until_count, promised.until_count, "the end holds");
-            // 時計を止めた試験では壁時計が進まないので、起点からの隔たりで
-            // 比べる (実機では両方が一緒に進む)。1 周ごとに 1 秒余分に進めて
-            // いるぶんだけずれる。
-            let reach = |chain: &Chain| chain.until_ms - chain.since_ms;
-            assert!((reach(&waiting) - reach(&promised)).abs() <= 5_000);
+            assert_eq!(waiting.since_ms, promised.since_ms, "the start never moves");
+            assert_eq!(waiting.until_ms, promised.until_ms, "nor does the end");
+            // 最後の 1 本を出し終えたときだけ次が無い (下で確かめる)。
+            if let Some(next_at_ms) = waiting.next_at_ms {
+                assert_eq!(
+                    next_at_ms,
+                    promised.since_ms + (signals as i64 + 1) * REFRESH_AFTER.as_millis() as i64,
+                    "each signal sits on the 55 minute grid"
+                );
+            }
 
             keepalive.rearm(series());
             // 置き直した後も同じ終わりを指す。期間が尽きていれば見張りごと
@@ -1157,7 +1181,8 @@ mod tests {
             if let Some(rearmed) = keepalive.chain(&series()) {
                 assert_eq!(rearmed.count, signals);
                 assert_eq!(rearmed.until_count, promised.until_count);
-                assert!((reach(&rearmed) - reach(&promised)).abs() <= 5_000);
+                assert_eq!(rearmed.until_ms, promised.until_ms);
+                assert_eq!(rearmed.since_ms, promised.since_ms);
             } else {
                 assert_eq!(
                     waiting.next_at_ms, None,
@@ -1193,7 +1218,7 @@ mod tests {
         assert_eq!(keepalive.chain(&series()), None);
 
         keepalive.pause("s-1");
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         assert_eq!(
             keepalive.chain(&series()),
             None,
@@ -1206,7 +1231,7 @@ mod tests {
     async fn the_chain_keeps_its_place_across_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (before, mut watching) = keepalive_storing(dir.path());
-        before.armed_by_request(series(), bound(), HORIZON);
+        before.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         signalled(watching.recv().await.unwrap());
@@ -1221,7 +1246,10 @@ mod tests {
         after.restore();
         let picked_up = after.chain(&series()).unwrap();
         assert_eq!(picked_up.count, 1, "the signal that went out still counts");
-        assert!((picked_up.since_ms - started.since_ms).abs() <= 1_000);
+        assert_eq!(
+            picked_up.since_ms, started.since_ms,
+            "and the start comes back as the very same moment"
+        );
     }
 
     /// 直前に通った経路が塞がっている間は、合図を出さない。
@@ -1231,7 +1259,7 @@ mod tests {
     async fn a_conversation_whose_route_is_closed_is_not_signalled() {
         let (keepalive, mut watching, reach) = keepalive_reaching(Reach::open());
         reach.set(false);
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
@@ -1250,7 +1278,7 @@ mod tests {
     async fn signalling_resumes_once_the_route_reopens() {
         let (keepalive, mut watching, reach) = keepalive_reaching(Reach::open());
         reach.set(false);
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
@@ -1267,7 +1295,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_returning_conversation_cancels_what_was_waiting() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -1341,7 +1369,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_from_elsewhere_puts_this_process_on_standby() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.standby(series(), bound(), HORIZON);
+        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
@@ -1364,7 +1392,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
 
         for _ in 0..6 {
-            keepalive.standby(series(), bound(), HORIZON);
+            keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
             // 相手は 55 分ごとに出す。こちらの控え (57 分) より先に届く。
             tokio::time::advance(REFRESH_AFTER).await;
             settle().await;
@@ -1379,7 +1407,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_nobody_answers_is_not_repeated() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         signalled(watching.recv().await.unwrap());
@@ -1401,7 +1429,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
         assert_eq!(keepalive.armed(), 0);
 
-        keepalive.standby(series(), bound(), HORIZON);
+        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
         assert_eq!(keepalive.armed(), 1);
 
         tokio::time::advance(STANDBY_AFTER + Duration::from_secs(1)).await;
@@ -1424,10 +1452,10 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
         keepalive.pause("s-1");
 
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         assert_eq!(keepalive.armed(), 0, "a real request does not arm it");
 
-        keepalive.standby(series(), bound(), HORIZON);
+        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
         assert_eq!(
             keepalive.armed(),
             0,
@@ -1458,7 +1486,7 @@ mod tests {
             prefix: "2cf24dba".to_owned(),
         };
         for series in [series(), other_prefix, other_session.clone()] {
-            keepalive.armed_by_request(series, bound(), HORIZON);
+            keepalive.armed_by_request(series, bound(), HORIZON, now_unix_ms());
         }
         assert_eq!(keepalive.armed(), 3);
 
@@ -1475,7 +1503,7 @@ mod tests {
 
         keepalive.resume(&series().session_id);
         assert!(!keepalive.is_paused("s-1"));
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         assert_eq!(signalled(watching.recv().await.unwrap()).session_id, "s-1");
@@ -1488,7 +1516,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_signal_coming_back_does_not_lift_the_pause() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.armed_by_request(series(), bound(), HORIZON);
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         let signal = signalled(watching.recv().await.unwrap());
 
@@ -1538,7 +1566,7 @@ mod tests {
     async fn the_watch_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (before, _) = keepalive_storing(dir.path());
-        before.armed_by_request(series(), bound(), HORIZON);
+        before.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         drop(before);
 
         // ここで落ちて、起動し直す。
@@ -1568,7 +1596,7 @@ mod tests {
             fires_at: now - 60,
             expires_at: now + 120,
             horizon_end: now + 3600,
-            since: now,
+            since_ms: now * 1_000,
             count: 0,
             kind: store::Kind::Primary,
         }]));
@@ -1599,7 +1627,7 @@ mod tests {
             fires_at: now + 60,
             expires_at,
             horizon_end,
-            since: now,
+            since_ms: now * 1_000,
             count: 0,
             kind: store::Kind::Primary,
         };
@@ -1624,7 +1652,7 @@ mod tests {
     async fn a_pause_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (before, _) = keepalive_storing(dir.path());
-        before.armed_by_request(series(), bound(), HORIZON);
+        before.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         before.pause("s-1");
         drop(before);
 
@@ -1656,7 +1684,7 @@ mod tests {
                 fires_at: now + 60,
                 expires_at: now + 3000,
                 horizon_end: now + 3600,
-                since: now,
+                since_ms: now * 1_000,
                 count: 0,
                 kind: store::Kind::Primary,
             }],
@@ -1704,7 +1732,7 @@ mod tests {
     async fn what_was_forgotten_does_not_come_back() {
         let dir = tempfile::tempdir().unwrap();
         let (before, _) = keepalive_storing(dir.path());
-        before.armed_by_request(series(), bound(), HORIZON);
+        before.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         before.forget(&series());
         drop(before);
 
