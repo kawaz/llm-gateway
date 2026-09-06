@@ -561,6 +561,8 @@ impl<P: Persistence> Gateway<P> {
                     keepalive: taken.clone(),
                     origin: RequestOrigin::Unknown.as_str().to_owned(),
                     cache_ttl_secs: None,
+                    // 送っていないので、閉じる本文も無い。
+                    completion: None,
                 });
             }
         };
@@ -578,7 +580,10 @@ impl<P: Persistence> Gateway<P> {
         )> = None;
         for route in &routes {
             match self.try_route(route, &call, &headers, &skipped).await {
-                Ok(resp) => {
+                Ok(Attempt {
+                    response: resp,
+                    completion,
+                }) => {
                     // 貼り付けるのは通った経路だけ。断られた先を覚えると、
                     // 次の転送も同じところから始めることになる。
                     if resp.status / 100 == 2 {
@@ -621,6 +626,7 @@ impl<P: Persistence> Gateway<P> {
                         keepalive: taken.clone(),
                         origin: origin.as_str().to_owned(),
                         cache_ttl_secs,
+                        completion,
                     });
                 }
                 Err(Switch {
@@ -710,6 +716,8 @@ impl<P: Persistence> Gateway<P> {
                 keepalive: taken,
                 origin: RequestOrigin::Unknown.as_str().to_owned(),
                 cache_ttl_secs: None,
+                // 断りの本文に会話の終わりは載らない。
+                completion: None,
             });
         }
 
@@ -727,7 +735,7 @@ impl<P: Persistence> Gateway<P> {
         call: &Call<'_>,
         headers: &[(String, String)],
         skipped: &[events::Skipped],
-    ) -> std::result::Result<Response, Switch> {
+    ) -> std::result::Result<Attempt, Switch> {
         let credential = match &route.credential {
             Some(id) => match self.credentials.acquire(id).await {
                 Ok(c) => Some(c),
@@ -752,17 +760,20 @@ impl<P: Persistence> Gateway<P> {
             .map(|n| n.prepare(&mut sending, &learned))
             .unwrap_or_default();
 
-        let resp = self
+        let sent_response = self
             .send(route, call, credential.as_ref(), sending, skipped)
             .await?;
-        let resp = self.admit(route, call.model, resp).await?;
+        let completion = sent_response.completion;
+        let resp = self
+            .admit(route, call.model, sent_response.response)
+            .await?;
 
         // 交渉するものを載せていないなら、失敗の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
-            return accept_or_switch(resp);
+            return Attempt::of(resp, completion);
         }
         let Some(negotiation) = negotiation else {
-            return accept_or_switch(resp);
+            return Attempt::of(resp, completion);
         };
 
         let (resp, raw) = egress::buffer(resp)
@@ -770,7 +781,7 @@ impl<P: Persistence> Gateway<P> {
             .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
         let Some(blamed) = negotiation.blame(&raw, &sent) else {
-            return accept_or_switch(resp);
+            return Attempt::of(resp, completion);
         };
 
         warn!(
@@ -792,11 +803,13 @@ impl<P: Persistence> Gateway<P> {
         negotiation.prepare(&mut retrying, &learned);
 
         // 送り直すのは 1 回だけ。これでも失敗ならクライアントへ返す。
-        let resp = self
+        let sent_response = self
             .send(route, call, credential.as_ref(), retrying, skipped)
             .await?;
-        let resp = self.admit(route, call.model, resp).await?;
-        accept_or_switch(resp)
+        let resp = self
+            .admit(route, call.model, sent_response.response)
+            .await?;
+        Attempt::of(resp, sent_response.completion)
     }
 
     async fn admit(
@@ -914,7 +927,7 @@ impl<P: Persistence> Gateway<P> {
         credential: Option<&Credential>,
         headers: Headers,
         skipped: &[events::Skipped],
-    ) -> std::result::Result<SentResponse, Switch> {
+    ) -> std::result::Result<Sent, Switch> {
         // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
         // 送る。何という名前で受け付けるかは discovery が答えている。
         let mut body = call.body.clone();
@@ -993,7 +1006,23 @@ impl<P: Persistence> Gateway<P> {
             resp.response.status,
             skipped.to_vec(),
         ));
-        Ok(resp)
+        // 応答が閉じたときの知らせは、素性がここで揃う。終わり方が分かるのは
+        // 本文を流し切ったところ ([`crate::exchange`]) なので、下書きだけを
+        // 作って持たせる。会話でない口 (`count_tokens`) には作らない。
+        let completion = is_conversation(call.path).then(|| {
+            events::Response::pending(
+                sent_at_ms,
+                &events::Origin {
+                    origin: origin.as_str(),
+                    ..call.origin(route.name())
+                },
+                resp.response.status,
+            )
+        });
+        Ok(Sent {
+            response: resp,
+            completion,
+        })
     }
 
     /// 前回の見張りを読み戻して、合図の予定を張り直す (DR-0024 §2)。
@@ -1402,7 +1431,7 @@ impl<P: Persistence> Gateway<P> {
             .usage_observer(content_type.as_deref())
             .and_then(|mut observer| {
                 observer.observe(&raw);
-                observer.finish()
+                observer.finish().usage
             })
             .unwrap_or_default();
 
@@ -1479,6 +1508,47 @@ impl<'a> Call<'a> {
     }
 }
 
+/// 1 経路へ送った直後の応答と、それに対する応答完了の知らせの下書き。
+///
+/// 下書きをここで持ち回るのは、素性 (会話・系列・経路・出した側) が揃うのが
+/// 送る場所だけだから (DR-0012)。本文の終わり方が分かるのはずっと後なので、
+/// 埋まっていない欄を持ったまま応答に付いて回る。
+struct Sent {
+    response: SentResponse,
+    completion: Option<events::Response>,
+}
+
+/// トークンを数えるだけの口。会話の往復ではない。
+const COUNT_TOKENS: &str = "/count_tokens";
+
+/// この 1 本は会話の往復か (DR-0012)。
+///
+/// 転送のうち、応答に「ターンの終わり」があるのは会話そのものだけ。トークンを
+/// 数える口は転送ではあっても会話ではないので、閉じた知らせを出さない — 出すと、
+/// 見る側が「クライアントは入力待ちに戻った」と誤って読む。
+fn is_conversation(path: &str) -> bool {
+    !path.ends_with(COUNT_TOKENS)
+}
+
+/// 1 経路を試した結果。受け入れた応答と、応答完了の知らせの下書き。
+struct Attempt {
+    response: Response,
+    completion: Option<events::Response>,
+}
+
+impl Attempt {
+    /// 受け入れられる応答なら [`Attempt`]、そうでなければ次の経路へ。
+    fn of(
+        response: Response,
+        completion: Option<events::Response>,
+    ) -> std::result::Result<Self, Switch> {
+        accept_or_switch(response).map(|response| Self {
+            response,
+            completion,
+        })
+    }
+}
+
 /// プローブが持ち帰ったもの。
 struct Sample {
     status: u16,
@@ -1533,6 +1603,12 @@ pub struct Forwarded {
     pub origin: String,
     /// この 1 本が残すプレフィックスの寿命 (秒)。
     pub cache_ttl_secs: Option<u64>,
+    /// 応答が閉じたときに流す知らせの下書き (DR-0012)。
+    ///
+    /// 埋まっていないのは終わった時刻と終わり方だけで、受け取り口が本文の
+    /// 終端で閉じて流す。upstream へ送っていない応答 (経路の手前で組んだ
+    /// 断り) では `None` — 閉じる本文が無い。
+    pub completion: Option<events::Response>,
 }
 
 impl std::fmt::Debug for Forwarded {
@@ -4895,7 +4971,9 @@ keepalive_horizon = "8h"
         loop {
             match watching.recv().await.unwrap() {
                 events::Notice::CacheKeepalive(signal) => return signal,
-                events::Notice::Request(_) | events::Notice::KeepalivePaused(_) => continue,
+                events::Notice::Request(_)
+                | events::Notice::Response(_)
+                | events::Notice::KeepalivePaused(_) => continue,
             }
         }
     }
@@ -4980,7 +5058,9 @@ keepalive_horizon = "8h"
         loop {
             match watching.recv().await.unwrap() {
                 events::Notice::Request(event) => return *event,
-                events::Notice::CacheKeepalive(_) | events::Notice::KeepalivePaused(_) => continue,
+                events::Notice::CacheKeepalive(_)
+                | events::Notice::Response(_)
+                | events::Notice::KeepalivePaused(_) => continue,
             }
         }
     }

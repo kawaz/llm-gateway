@@ -55,8 +55,10 @@ use tracing::field::Empty;
 use tracing::{Span, error, info, info_span, warn};
 
 use crate::Result;
+use crate::credential::time::now_unix_ms;
 use crate::egress::BodyStream;
-use crate::metering::UsageObserver;
+use crate::events::{self, Events};
+use crate::metering::{Outcome, UsageObserver};
 use crate::stats::Stats;
 use crate::tap::{self, Tap};
 
@@ -137,6 +139,7 @@ pub fn observe(
         model: model.to_owned(),
         tap: None,
         response_body: Vec::new(),
+        completion: None,
     }
 }
 
@@ -145,6 +148,15 @@ pub struct TapObservation {
     pub tap: Arc<Tap>,
     pub event: tap::Event,
     pub response_body_limit: usize,
+}
+
+/// 応答が閉じたことを知らせるのに要る値 (DR-0012)。
+///
+/// 下書き ([`events::Response`]) は経路が決まった時点で作ってある。ここは
+/// **終わった時刻と終わり方**だけを入れて流す。
+pub struct Completion {
+    pub events: Arc<Events>,
+    pub notice: events::Response,
 }
 
 /// 終端を記録し、usage を抽出しながら流すストリーム。
@@ -179,12 +191,20 @@ pub struct BodyObservation {
     model: String,
     tap: Option<TapObservation>,
     response_body: Vec<u8>,
+    /// 応答が閉じたことを流す先と、その下書き。流さない応答では `None`。
+    completion: Option<Completion>,
 }
 
 impl BodyObservation {
     /// tap 購読時だけ応答本文を上限まで控え、交換の終端で 1 件配信する。
     pub fn with_tap(mut self, tap: Option<TapObservation>) -> Self {
         self.tap = tap;
+        self
+    }
+
+    /// 応答が閉じた (または切れた) ことを、終端で 1 件流す。
+    pub fn with_completion(mut self, completion: Option<Completion>) -> Self {
+        self.completion = completion;
         self
     }
 
@@ -219,15 +239,32 @@ impl BodyObservation {
     /// 途中で捨てられた場合も同じ道を通る。途中まで流れた応答は、そこまでに
     /// 読めた分が入る (`message_start` まで届いていれば input は分かる) —
     /// 中断した分を丸ごと捨てると、実際に消費した入力が記録から消える。
-    fn finish_usage(&mut self) {
+    fn finish_usage(&mut self) -> Outcome {
         let Some(observer) = self.observer.take() else {
+            return Outcome::default();
+        };
+        let outcome = observer.finish();
+        if let Some(usage) = &outcome.usage {
+            self.stats
+                .record(self.at, self.credential.as_deref(), &self.model, usage);
+        }
+        outcome
+    }
+
+    /// 応答が閉じたことを見ている人へ流す (DR-0012)。
+    ///
+    /// 下書きを持っている応答では**必ず 1 通流す**。1 バイトも届かないうちに
+    /// 切られた 1 本もそこに入る — クライアントは入力待ちに戻っているので、
+    /// 読めた中身の有無で黙ると、見る側がその会話を待ったままになる。会話で
+    /// ない口 (`count_tokens`) はそもそも下書きを持たない。
+    fn tell_completed(&mut self, outcome: Outcome, completed: bool) {
+        let Some(mut completion) = self.completion.take() else {
             return;
         };
-        let Some(usage) = observer.finish() else {
-            return;
-        };
-        self.stats
-            .record(self.at, self.credential.as_deref(), &self.model, &usage);
+        completion
+            .notice
+            .settle(now_unix_ms(), outcome.stop_reason, !completed);
+        completion.events.publish(completion.notice);
     }
 
     /// 終端のログに載せる値をまとめて取り、usage も締める。
@@ -235,9 +272,13 @@ impl BodyObservation {
     /// 最後の無音をここで数え切る。チャンクが 1 つも来ていなければ無音は
     /// 存在しないので、`max_gap` は 0 のまま (`bytes` が 0 かどうかで
     /// 「1 つも来なかった」と「詰まらず流れ切った」を見分けられる)。
-    fn settle(&mut self) -> (u64, u128, u128, u128) {
+    ///
+    /// `completed` は本文が最後まで流れたか。流れなかったもの (upstream が
+    /// 途切れた / クライアントが去った) は、知らせに `aborted` として出る。
+    fn settle(&mut self, completed: bool) -> (u64, u128, u128, u128) {
         self.note_gap(Instant::now());
-        self.finish_usage();
+        let outcome = self.finish_usage();
+        self.tell_completed(outcome, completed);
         if let Some(mut observation) = self.tap.take() {
             observation.event.response_body_size = self.bytes as usize;
             observation.event.response_body =
@@ -286,7 +327,7 @@ impl Stream for BodyObservation {
             }
             Poll::Ready(Some(Err(e))) => {
                 this.settled = true;
-                let (bytes, ms, gap, gap_at) = this.settle();
+                let (bytes, ms, gap, gap_at) = this.settle(false);
                 this.span.in_scope(|| {
                     error!(
                         bytes,
@@ -301,7 +342,7 @@ impl Stream for BodyObservation {
             }
             Poll::Ready(None) => {
                 this.settled = true;
-                let (bytes, ms, gap, gap_at) = this.settle();
+                let (bytes, ms, gap, gap_at) = this.settle(true);
                 this.span.in_scope(|| {
                     info!(
                         bytes,
@@ -328,7 +369,7 @@ impl Drop for BodyObservation {
         // 去る直前の無音がそのまま `max_gap_ms` に出る — 黙り込んだのを見て
         // 切ったのなら、その長さがここに残る。usage もここで締める
         // ([`Self::finish_usage`]) — ここまでに読めた分は記録に残す。
-        let (bytes, ms, gap, gap_at) = self.settle();
+        let (bytes, ms, gap, gap_at) = self.settle(false);
         self.span.in_scope(|| {
             warn!(
                 bytes,
@@ -736,8 +777,11 @@ mod tests {
     const USAGE_NOW: i64 = 1_785_326_400;
 
     /// 試験用の観測役。中身を解釈せず、通ったバイト数を input として数える。
+    ///
+    /// 終わり方は方言の知識なので、ここでは持たせた値をそのまま返す。
     struct ByteCounter {
         seen: u64,
+        stop_reason: Option<String>,
     }
 
     impl UsageObserver for ByteCounter {
@@ -745,17 +789,31 @@ mod tests {
             self.seen += chunk.len() as u64;
         }
 
-        fn finish(self: Box<Self>) -> Option<TokenUsage> {
-            (self.seen > 0).then(|| {
-                let mut usage = TokenUsage::default();
-                usage.set(TokenKind::input(), self.seen);
-                usage
-            })
+        fn finish(self: Box<Self>) -> Outcome {
+            Outcome {
+                usage: (self.seen > 0).then(|| {
+                    let mut usage = TokenUsage::default();
+                    usage.set(TokenKind::input(), self.seen);
+                    usage
+                }),
+                stop_reason: self.stop_reason,
+            }
         }
     }
 
     fn counter() -> Option<Box<dyn UsageObserver>> {
-        Some(Box::new(ByteCounter { seen: 0 }))
+        Some(Box::new(ByteCounter {
+            seen: 0,
+            stop_reason: None,
+        }))
+    }
+
+    /// 終わり方まで読めた観測役。
+    fn counter_ending(stop_reason: &str) -> Option<Box<dyn UsageObserver>> {
+        Some(Box::new(ByteCounter {
+            seen: 0,
+            stop_reason: Some(stop_reason.to_owned()),
+        }))
     }
 
     fn stream_of(chunks: Vec<Vec<u8>>) -> BodyStream {
@@ -939,5 +997,198 @@ mod tests {
             2,
             "a route without a credential is recorded under the reserved name"
         );
+    }
+
+    // ---------- 応答が閉じた知らせ (DR-0012) ----------
+    //
+    // 終わり方を読むのは provider の役で、ここが確かめるのは「終端で 1 度だけ
+    // 流す」「流し切ったかどうかが `aborted` に出る」「会話でない応答では
+    // 流さない」の 3 つ。
+
+    /// 対応する request の知らせの時刻。本文が閉じるのはこれより後になるので、
+    /// 過ぎた時刻を置く (終端の時刻は実際の時計から取る)。
+    const REQUEST_TS: i64 = 1_700_000_000_000;
+
+    /// 下書き付きで観測を組む。
+    fn with_notice(
+        chunks: Vec<Vec<u8>>,
+        observer: Option<Box<dyn UsageObserver>>,
+        events: &Arc<Events>,
+    ) -> BodyObservation {
+        let dir = tempfile::tempdir().unwrap();
+        observe(
+            stream_of(chunks),
+            observer,
+            Arc::new(Stats::new(dir.path(), "test")),
+            USAGE_NOW,
+            Some("a"),
+            "m",
+            request_span(),
+        )
+        .with_completion(Some(Completion {
+            events: Arc::clone(events),
+            notice: events::Response::pending(REQUEST_TS, &notice_origin(), 200),
+        }))
+    }
+
+    /// 知らせに載せる素性。
+    fn notice_origin() -> events::Origin<'static> {
+        events::Origin {
+            session_id: Some("s-1"),
+            prefix: Some("2cf24dba"),
+            ns: "personal",
+            model: "claude-opus-5",
+            credential: "personal",
+            origin: "main",
+            keepalive: None,
+            cache_paused: false,
+            chain: None,
+            breakeven: None,
+            cache_ttl_secs: None,
+        }
+    }
+
+    /// 届いた知らせのうち、応答が閉じた 1 通。
+    fn completed(
+        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
+    ) -> events::Response {
+        match watching.try_recv() {
+            Ok(notice) => notice.response().expect("a completion notice").clone(),
+            Err(e) => panic!("no completion notice arrived: {e}"),
+        }
+    }
+
+    /// 本文を流し切ったら、終わり方の付いた知らせが 1 通出る。
+    #[tokio::test]
+    async fn a_finished_body_tells_how_the_turn_ended() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        let mut obs = with_notice(vec![b"data".to_vec()], counter_ending("end_turn"), &events);
+        while obs.next().await.is_some() {}
+
+        let notice = completed(&mut watching);
+        assert_eq!(notice.kind, "response");
+        assert_eq!(notice.stop_reason.as_deref(), Some("end_turn"));
+        assert!(!notice.aborted, "the body ran to the end");
+        assert_eq!(
+            notice.request_ts, REQUEST_TS,
+            "it pairs with the request notice"
+        );
+        assert!(notice.ts > REQUEST_TS, "the moment the body closed");
+        // 素性は request の知らせと同じものが載る。
+        assert_eq!(notice.session_id.as_deref(), Some("s-1"));
+        assert_eq!(notice.prefix.as_deref(), Some("2cf24dba"));
+        assert_eq!(notice.ns, "personal");
+        assert_eq!(notice.model, "claude-opus-5");
+        assert_eq!(notice.credential, "personal");
+        assert_eq!(notice.origin, "main");
+        assert_eq!(notice.status, 200);
+
+        assert!(
+            watching.try_recv().is_err(),
+            "exactly one notice per response"
+        );
+    }
+
+    /// 道具を使うために終わった 1 本も、そのまま写して流す。
+    ///
+    /// 見る側はこの語で「まだ入力待ちではない」と決めるので、解釈せずに渡す。
+    #[tokio::test]
+    async fn the_upstream_word_is_passed_through() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        let mut obs = with_notice(vec![b"data".to_vec()], counter_ending("tool_use"), &events);
+        while obs.next().await.is_some() {}
+
+        assert_eq!(
+            completed(&mut watching).stop_reason.as_deref(),
+            Some("tool_use")
+        );
+    }
+
+    /// クライアントが去ったら、切れたと分かる形で流す。
+    ///
+    /// 入力待ちに戻るのは終わり方が分かった時だけではない。終わり方は
+    /// 載らないので、欄ごと出さない。
+    #[tokio::test]
+    async fn a_client_leaving_is_told_as_aborted() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        {
+            let mut obs = with_notice(
+                vec![b"12345".to_vec(), b"67890".to_vec()],
+                counter(),
+                &events,
+            );
+            // 1 チャンクだけ読んで捨てる。
+            let _ = obs.next().await;
+        }
+
+        let notice = completed(&mut watching);
+        assert!(notice.aborted, "the body never reached its end");
+        assert_eq!(notice.stop_reason, None, "nothing said how it ended");
+    }
+
+    /// upstream が途切れた場合も、閉じなかったこととして流す。
+    #[tokio::test]
+    async fn a_broken_upstream_is_told_as_aborted() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut obs = observe(
+            body(vec![
+                Ok(Bytes::from_static(b"123")),
+                Err(Error::Config("response reading was interrupted".into())),
+            ]),
+            counter(),
+            Arc::new(Stats::new(dir.path(), "test")),
+            USAGE_NOW,
+            Some("a"),
+            "m",
+            request_span(),
+        )
+        .with_completion(Some(Completion {
+            events: Arc::clone(&events),
+            notice: events::Response::pending(REQUEST_TS, &notice_origin(), 200),
+        }));
+        while obs.next().await.is_some() {}
+
+        assert!(completed(&mut watching).aborted);
+    }
+
+    /// 1 バイトも届かないうちに切られても流す。
+    ///
+    /// 送った直後に Esc を押した場合がこれ。読めた中身が無いことを理由に
+    /// 黙ると、見る側はその会話を待ったままになる。
+    #[tokio::test]
+    async fn a_response_cut_before_it_started_is_still_told() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        {
+            let obs = with_notice(vec![b"12345".to_vec()], counter(), &events);
+            // 1 チャンクも読まずに捨てる。
+            drop(obs);
+        }
+
+        let notice = completed(&mut watching);
+        assert!(notice.aborted, "the body never started");
+        assert_eq!(notice.stop_reason, None);
+    }
+
+    /// 会話でない口 (`count_tokens`) は下書きを持たないので、何も流れない。
+    #[tokio::test]
+    async fn a_response_without_a_draft_tells_nothing() {
+        let events = Arc::new(Events::new());
+        let mut watching = events.subscribe();
+
+        let stats = new_stats();
+        let _ = drain(vec![b"1234".to_vec()], counter_ending("end_turn"), &stats).await;
+
+        assert!(watching.try_recv().is_err());
     }
 }

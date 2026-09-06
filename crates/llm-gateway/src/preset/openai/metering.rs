@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, Scope};
 use crate::egress::Headers;
-use crate::metering::{Pricing, TokenKind, TokenUsage, UsageObserver};
+use crate::metering::{Outcome, Pricing, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Metering;
 use crate::quota::{Overage, Snapshot, Window};
 
@@ -203,16 +203,21 @@ impl UsageObserver for OpenAiUsage {
         }
     }
 
-    fn finish(mut self: Box<Self>) -> Option<TokenUsage> {
+    /// 終わり方 (`stop_reason`) は載せない。この方言の応答に、Anthropic の
+    /// `stop_reason` にあたる 1 語は無い。
+    fn finish(mut self: Box<Self>) -> Outcome {
         if self.given_up {
-            return None;
+            return Outcome::default();
         }
         let line = std::mem::take(&mut self.held);
         if !line.is_empty() {
             self.line(&line);
         }
         self.finish_event();
-        (!self.usage.is_empty()).then_some(self.usage)
+        Outcome {
+            usage: (!self.usage.is_empty()).then_some(self.usage),
+            stop_reason: None,
+        }
     }
 }
 
@@ -220,6 +225,18 @@ impl UsageObserver for OpenAiUsage {
 struct OpenAiJsonUsage {
     body: Vec<u8>,
     given_up: bool,
+}
+
+impl OpenAiJsonUsage {
+    fn read(&self) -> Option<TokenUsage> {
+        if self.given_up {
+            return None;
+        }
+        let value: Value = serde_json::from_slice(&self.body).ok()?;
+        let mut usage = TokenUsage::default();
+        read_usage(value.get("usage")?, &mut usage);
+        (!usage.is_empty()).then_some(usage)
+    }
 }
 
 impl UsageObserver for OpenAiJsonUsage {
@@ -236,14 +253,11 @@ impl UsageObserver for OpenAiJsonUsage {
         self.body.extend_from_slice(chunk);
     }
 
-    fn finish(self: Box<Self>) -> Option<TokenUsage> {
-        if self.given_up {
-            return None;
+    fn finish(self: Box<Self>) -> Outcome {
+        Outcome {
+            usage: self.read(),
+            stop_reason: None,
         }
-        let value: Value = serde_json::from_slice(&self.body).ok()?;
-        let mut usage = TokenUsage::default();
-        read_usage(value.get("usage")?, &mut usage);
-        (!usage.is_empty()).then_some(usage)
     }
 }
 
@@ -374,7 +388,7 @@ mod tests {
         observer.observe(br#"data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}
 
 "#);
-        assert_all_usage_kinds(&observer.finish().unwrap());
+        assert_all_usage_kinds(&observer.finish().usage.unwrap());
     }
 
     /// 非ストリーム用に集約された message JSON からも、SSE と同じ usage を読む。
@@ -384,6 +398,6 @@ mod tests {
             .usage_observer(Some("application/json"))
             .unwrap();
         observer.observe(br#"{"type":"message","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}"#);
-        assert_all_usage_kinds(&observer.finish().unwrap());
+        assert_all_usage_kinds(&observer.finish().usage.unwrap());
     }
 }

@@ -380,6 +380,28 @@ cache dies earlier than this, so a watcher overwrites it with the latest notice.
 Whether the signal is paused is reported in `cache_paused` (a bool) on **every** notice:
 were the field omitted, "not paused" could not be told from "not reported".
 
+When the response body closes, a second notice says how the turn ended.
+
+```
+event: response
+data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false}
+```
+
+`request_ts` is the `ts` of the matching `request` notice, so the two pair up one to
+one even when several requests run on the same conversation. The identity fields
+(`session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status`) carry the
+same values as that notice. `stop_reason` is whatever word the upstream used
+(`end_turn` / `tool_use` / `max_tokens` …), passed through untouched; `end_turn` means
+that client is back to waiting for input. `aborted` says whether the body failed to
+reach its end (a client pressing Esc lands here) and is **always** present. A body that
+was cut short says nothing about how it ended, so `stop_reason` is omitted there.
+
+The notice goes out **only for the conversational endpoint** (`/v1/messages`). Counting
+tokens (`/v1/messages/count_tokens`) is a forward but not a turn, so it streams nothing.
+A request that did reach the conversational endpoint is announced even when the body was
+cut before a single byte arrived (`aborted: true`). A dialect with no single word for
+`stop_reason` (OpenAI) omits the field.
+
 In a namespace using the `keepalive` strategy, a second kind of notice is streamed
 when a conversation stops (DR-0024).
 

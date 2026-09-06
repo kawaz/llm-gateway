@@ -159,10 +159,28 @@ impl Pricing {
     }
 }
 
-/// 応答本文を変更せず、通過した chunk から usage を抽出する。
+/// 応答本文を読み終えて分かったこと。
+///
+/// 消費したトークンと**どう終わったか**は、どちらも応答本文にしか載らない。
+/// 読む役を 2 つ立てると同じバイト列を 2 度なぞることになるので、1 度の観測で
+/// 両方を持ち帰る。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// 読めた usage。載っていなければ `None` (`count_tokens` のような、
+    /// 消費を報告しない応答がこれ)。
+    pub usage: Option<TokenUsage>,
+    /// upstream が言った終わり方 (`end_turn` / `tool_use` / `max_tokens` …)。
+    ///
+    /// 値は**写すだけで解釈しない** — 語彙を持っているのは upstream で、
+    /// こちらが知っている語の一覧を持つと、増えた語を落とす。載っていない
+    /// 応答 (途中で切れた / この方言が報告しない) では `None`。
+    pub stop_reason: Option<String>,
+}
+
+/// 応答本文を変更せず、通過した chunk から観測する。
 pub trait UsageObserver: Send {
     fn observe(&mut self, chunk: &[u8]);
-    fn finish(self: Box<Self>) -> Option<TokenUsage>;
+    fn finish(self: Box<Self>) -> Outcome;
 }
 
 /// 集計の 1 行 (credential × モデル) に当てる単価を答える役。

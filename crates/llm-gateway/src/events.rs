@@ -186,6 +186,88 @@ impl Event {
     }
 }
 
+/// 応答本文が終わった、という知らせ。
+///
+/// [`Event`] が「upstream へ送り始めた」を伝えるのに対して、こちらは
+/// **その 1 本の応答が閉じた瞬間**を伝える。見る側 (ccmsg) は
+/// [`Self::stop_reason`] が `end_turn` の 1 通で「クライアントは入力待ちに
+/// 戻った」と判断する — `tool_use` ならクライアントが道具を動かして次の
+/// 1 本が来るので、まだ待っていない。
+///
+/// クライアントが途中で切った場合も入力待ちに戻るので、そこでも 1 通出す
+/// ([`Self::aborted`])。
+///
+/// 対応する [`Event`] とは [`Self::request_ts`] で結ぶ。時刻の欄はすべて
+/// Unix ミリ秒。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Response {
+    /// 受け取る側が種類を見分ける印。値は常に `response`。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// この知らせの時刻 = 本文が閉じた (または切れた) 瞬間。
+    pub ts: i64,
+    /// 対応する [`Event`] の [`Event::ts`]。同じ会話で何本も走るので、
+    /// 素性が同じでも 1 対 1 に結べるようにする。
+    pub request_ts: i64,
+    /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
+    pub session_id: Option<String>,
+    /// この会話系列の識別子 ([`prefix`])。取れなければ欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// どの namespace 宛か。
+    pub ns: String,
+    /// 解決後の実モデル名。
+    pub model: String,
+    /// 答えた経路の名前。
+    pub credential: String,
+    /// この 1 本を出した側 (`main` / `sub` / `unknown`、DR-0024)。
+    pub origin: String,
+    /// upstream が返した状態。対応する [`Event`] と同じ値。
+    pub status: u16,
+    /// upstream が言った終わり方。**値はそのまま写す**。取れなければ
+    /// 欄ごと出さない (途中で切れた場合がこれ)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// 本文が最後まで流れなかったか。**常に出す** — 欄が消えると、見る側が
+    /// 「切れていない」と区別できない。
+    pub aborted: bool,
+}
+
+impl Response {
+    /// 種類の印。
+    pub const KIND: &'static str = "response";
+
+    /// 素性だけを埋めた下書きを作る。
+    ///
+    /// 出すのは本文が終わってからだが、素性が揃うのは経路が決まった時点。
+    /// 終わり方の分かる場所 ([`crate::exchange`]) は経路も会話も知らないので、
+    /// ここで下書きを作って持たせ、終端で [`Self::settle`] が閉じる。
+    pub fn pending(request_ts: i64, origin: &Origin<'_>, status: u16) -> Self {
+        Self {
+            kind: Self::KIND.to_owned(),
+            // 本文が終わった時刻は、まだ来ていない ([`Self::settle`] が埋める)。
+            ts: 0,
+            request_ts,
+            session_id: origin.session_id.map(str::to_owned),
+            prefix: origin.prefix.map(str::to_owned),
+            ns: origin.ns.to_owned(),
+            model: origin.model.to_owned(),
+            credential: origin.credential.to_owned(),
+            origin: origin.origin.to_owned(),
+            status,
+            stop_reason: None,
+            aborted: false,
+        }
+    }
+
+    /// 本文が終わった。時刻と終わり方を入れて、流せる形にする。
+    pub fn settle(&mut self, ts_ms: i64, stop_reason: Option<String>, aborted: bool) {
+        self.ts = ts_ms;
+        self.stop_reason = stop_reason;
+        self.aborted = aborted;
+    }
+}
+
 /// この会話への合図を止めた、という知らせ (DR-0024 §2 追補)。
 ///
 /// 止めるのは人の意思で、実リクエストとは別の出来事。**止まった瞬間**を
@@ -292,14 +374,19 @@ pub fn marker(nonce: &str) -> String {
 ///
 /// 転送の知らせ ([`Event`]) と cache の合図 ([`Keepalive`]) は別の出来事で、
 /// 欄も重ならない。1 つの型に混ぜて空欄で埋めるのではなく、種類として分ける。
+///
+/// 読み戻すときは書いた順に当てはめる (`untagged`)。印を持つ種類を先に置くのは、
+/// 印の無い転送の知らせが**他の種類まで飲み込まないようにする**ため。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Notice {
-    /// 転送の知らせ。欄が多く、他の 2 種より大きいので箱に入れる
-    /// (この列は 1 件流すたびに写される)。
-    Request(Box<Event>),
     CacheKeepalive(Keepalive),
     KeepalivePaused(KeepalivePaused),
+    /// 応答が閉じた知らせ。
+    Response(Box<Response>),
+    /// 転送の知らせ。欄が多く、他の 3 種より大きいので箱に入れる
+    /// (この列は 1 件流すたびに写される)。
+    Request(Box<Event>),
 }
 
 impl Notice {
@@ -307,6 +394,7 @@ impl Notice {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Request(_) => "request",
+            Self::Response(_) => Response::KIND,
             Self::CacheKeepalive(_) => Keepalive::KIND,
             Self::KeepalivePaused(_) => KeepalivePaused::KIND,
         }
@@ -316,7 +404,15 @@ impl Notice {
     pub fn request(&self) -> Option<&Event> {
         match self {
             Self::Request(event) => Some(event),
-            Self::CacheKeepalive(_) | Self::KeepalivePaused(_) => None,
+            Self::Response(_) | Self::CacheKeepalive(_) | Self::KeepalivePaused(_) => None,
+        }
+    }
+
+    /// 応答が閉じた知らせなら中身。それ以外なら `None`。
+    pub fn response(&self) -> Option<&Response> {
+        match self {
+            Self::Response(response) => Some(response),
+            Self::Request(_) | Self::CacheKeepalive(_) | Self::KeepalivePaused(_) => None,
         }
     }
 }
@@ -324,6 +420,12 @@ impl Notice {
 impl From<Event> for Notice {
     fn from(event: Event) -> Self {
         Self::Request(Box::new(event))
+    }
+}
+
+impl From<Response> for Notice {
+    fn from(response: Response) -> Self {
+        Self::Response(Box::new(response))
     }
 }
 
@@ -892,6 +994,98 @@ mod tests {
                 "session_id": "s-1",
                 "paused_at": NOW,
             })
+        );
+    }
+
+    /// 応答が閉じた知らせの全文。欄の名前・並び・単位が、見る側との契約になる。
+    #[test]
+    fn a_completion_notice_is_settled() {
+        let mut notice = Response::pending(
+            NOW,
+            &Origin {
+                session_id: Some("s-1"),
+                prefix: Some("2cf24dba"),
+                model: "claude-opus-5",
+                origin: "main",
+                ..from("personal")
+            },
+            200,
+        );
+        notice.settle(NOW + 8 * 1_000, Some("end_turn".to_owned()), false);
+
+        assert_eq!(
+            serde_json::to_value(&notice).unwrap(),
+            json!({
+                "type": "response",
+                "ts": NOW + 8 * 1_000,
+                "request_ts": NOW,
+                "session_id": "s-1",
+                "prefix": "2cf24dba",
+                "ns": "personal",
+                "model": "claude-opus-5",
+                "credential": "personal",
+                "origin": "main",
+                "status": 200,
+                "stop_reason": "end_turn",
+                "aborted": false,
+            })
+        );
+
+        // 切れた 1 本には終わり方が無い。切れたことは常に出す。
+        let mut cut = Response::pending(NOW, &from("personal"), 200);
+        cut.settle(NOW + 3 * 1_000, None, true);
+        let json = serde_json::to_value(&cut).unwrap();
+        assert_eq!(json["aborted"], true);
+        assert!(
+            json.get("stop_reason").is_none(),
+            "omitted when the upstream never said how it ended"
+        );
+        assert!(
+            json.get("prefix").is_none(),
+            "omits the field entirely when the series is unknown"
+        );
+        assert!(
+            json["session_id"].is_null(),
+            "the field stays even when the conversation is unknown"
+        );
+        assert!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.ends_with("_iso")),
+            "times are one number each: {json}"
+        );
+    }
+
+    /// 応答の知らせは、転送の知らせと取り違えられない。
+    ///
+    /// 受け取る側は 1 つの列で読むので、型を跨いで当てはまると欄が化ける。
+    #[test]
+    fn a_completion_is_told_apart_from_a_forward() {
+        let mut response = Response::pending(NOW, &from("a"), 200);
+        response.settle(NOW + 1, Some("end_turn".to_owned()), false);
+        let notice = Notice::from(response);
+
+        assert_eq!(notice.name(), "response");
+        assert!(notice.request().is_none(), "it is not a forwarding notice");
+        assert_eq!(
+            notice.response().map(|r| r.stop_reason.as_deref()),
+            Some(Some("end_turn"))
+        );
+
+        let json = serde_json::to_value(&notice).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Notice>(json).unwrap(),
+            notice,
+            "it reads back as the same kind of notice"
+        );
+
+        // 逆向きも同じ。転送の知らせが応答の知らせに化けない。
+        let forwarded = Notice::from(Event::new(NOW, &from("a"), 200));
+        assert!(forwarded.response().is_none());
+        assert_eq!(
+            serde_json::from_value::<Notice>(serde_json::to_value(&forwarded).unwrap()).unwrap(),
+            forwarded
         );
     }
 

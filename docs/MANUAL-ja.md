@@ -370,6 +370,27 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 合図が止めてあるかは `cache_paused` (bool) に**常に**出る。欄が消えると
 「止まっていない」と区別が付かないため。
 
+応答本文が閉じたら、終わり方を載せた 2 通目が流れる。
+
+```
+event: response
+data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false}
+```
+
+`request_ts` は対応する `request` の `ts` で、同じ会話で何本も走っていても
+1 対 1 に結べる。素性 (`session_id` / `prefix` / `ns` / `model` / `credential` /
+`origin` / `status`) は `request` と同じ値が載る。`stop_reason` は upstream が
+言った終わり方をそのまま写したもの (`end_turn` / `tool_use` / `max_tokens` …)
+で、`end_turn` ならそのクライアントは入力待ちに戻っている。`aborted` は本文が
+最後まで流れなかったか (クライアントが Esc で切った場合がこれ) で、**常に**
+出る。切れた 1 本に終わり方は載らないので、`stop_reason` は欄ごと出ない。
+
+流れるのは**会話の口 (`/v1/messages`) への 1 本だけ**。トークンを数える口
+(`/v1/messages/count_tokens`) は転送ではあっても会話ではないので流れない。
+会話の口へ来た 1 本は、本文が 1 バイトも届かないうちに切られても流れる
+(`aborted: true`)。`stop_reason` にあたる 1 語を持たない方言 (OpenAI) では
+欄ごと出ない。
+
 `keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
 (DR-0024)。
 

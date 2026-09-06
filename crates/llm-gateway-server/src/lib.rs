@@ -720,6 +720,12 @@ async fn messages<P: Persistence + 'static>(
                     response_body: None,
                 },
             });
+            // 応答が閉じたら 1 通流す (DR-0012)。下書きは経路が決まった時点で
+            // 作ってあり、終わり方を入れるのは本文の終端。
+            let completion = forwarded.completion.map(|notice| exchange::Completion {
+                events: Arc::clone(gateway.events()),
+                notice,
+            });
             let mut resp = Response::builder().status(upstream.status);
             for (name, value) in upstream.headers.iter() {
                 resp = resp.header(name, value);
@@ -740,7 +746,8 @@ async fn messages<P: Persistence + 'static>(
                     &forwarded.model,
                     span.clone(),
                 )
-                .with_tap(tap),
+                .with_tap(tap)
+                .with_completion(completion),
             ))
             .unwrap_or_else(|e| {
                 span.in_scope(|| {
@@ -1660,6 +1667,154 @@ routes = ["a"]
         let series = event["prefix"].as_str().expect("the series is known");
         assert_eq!(series.len(), 8, "a single short hex string: {series}");
         assert!(series.chars().all(|c| c.is_ascii_hexdigit()), "{series}");
+    }
+
+    /// 応答を流し切ったら、終わり方を載せた 2 通目が流れる (DR-0012)。
+    ///
+    /// 見る側 (ccmsg) はこの 1 通で「クライアントは入力待ちに戻った」と決める。
+    #[tokio::test]
+    async fn a_finished_response_is_announced_too() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"type":"message","stop_reason":"end_turn","content":[],"usage":{"input_tokens":10,"output_tokens":3}}"#
+                    .to_owned(),
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await;
+
+        let mut watching = reqwest::Client::new()
+            .get(format!("{base}/llm-gateway/events"))
+            .send()
+            .await
+            .unwrap();
+
+        let forwarded = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("X-Claude-Code-Session-Id", "s-1")
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(forwarded.status(), 200);
+        // 知らせが出るのは本文を流し切ったところ。読み切るまで待つ。
+        forwarded.text().await.unwrap();
+
+        let (kind, event) = next_notice(&mut watching, "response").await;
+        assert_eq!(kind, "event: response");
+        assert_eq!(event["type"], "response");
+        assert_eq!(event["stop_reason"], "end_turn");
+        assert_eq!(event["aborted"], false);
+        assert_eq!(event["session_id"], "s-1");
+        assert_eq!(event["ns"], "default");
+        assert_eq!(event["model"], "m");
+        assert_eq!(event["credential"], "a");
+        assert_eq!(event["status"], 200);
+        assert!(
+            event["request_ts"].as_i64().unwrap() > 1_700_000_000_000,
+            "it points back at the request notice: {}",
+            event["request_ts"]
+        );
+        assert!(event["ts"].as_i64().unwrap() >= event["request_ts"].as_i64().unwrap());
+    }
+
+    /// トークンを数える口には、閉じた知らせを出さない (DR-0012)。
+    ///
+    /// 転送ではあっても会話ではないので、出すと見る側が「入力待ちに戻った」と
+    /// 誤って読む。`request` の知らせのほうは変わらず流れる。
+    #[tokio::test]
+    async fn counting_tokens_announces_no_completion() {
+        let upstream = fake_upstream(|| {
+            (
+                200,
+                r#"{"input_tokens":1234}"#.to_owned(),
+                vec![("content-type".to_owned(), "application/json".to_owned())],
+            )
+        })
+        .await;
+
+        let base = serve_with_default_ns(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await;
+
+        let mut watching = reqwest::Client::new()
+            .get(format!("{base}/llm-gateway/events"))
+            .send()
+            .await
+            .unwrap();
+
+        let counted = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages/count_tokens"))
+                .header("X-Claude-Code-Session-Id", "s-1")
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(counted.status(), 200);
+        counted.text().await.unwrap();
+
+        // 送り始めの知らせは来る。その後に閉じた知らせは続かない。
+        let (kind, _) = next_notice(&mut watching, "request").await;
+        assert_eq!(kind, "event: request");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                next_notice(&mut watching, "response"),
+            )
+            .await
+            .is_err(),
+            "counting tokens is a forward, not a turn"
+        );
+    }
+
+    /// 名前の付いた知らせが来るまで読み進める。
+    async fn next_notice(watching: &mut reqwest::Response, name: &str) -> (String, Value) {
+        let wanted = format!("event: {name}");
+        let mut seen = String::new();
+        while let Some(chunk) = watching.chunk().await.unwrap() {
+            seen.push_str(std::str::from_utf8(&chunk).unwrap());
+            for notice in seen.split("\n\n") {
+                let Some((kind, data)) = notice.trim_end().split_once('\n') else {
+                    continue;
+                };
+                let Some(data) = data.strip_prefix("data: ") else {
+                    continue;
+                };
+                if kind == wanted {
+                    return (kind.to_owned(), serde_json::from_str(data).unwrap());
+                }
+            }
+        }
+        panic!("no `{wanted}` arrived; what came through was:\n{seen}");
     }
 
     /// 会話を名乗らないクライアント (curl 等) の分も流す。

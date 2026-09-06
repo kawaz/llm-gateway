@@ -431,7 +431,7 @@ mod tests {
     use super::*;
     use crate::denial::Reason;
     use crate::egress::BodyStream;
-    use crate::metering::TokenUsage;
+    use crate::metering::Outcome;
 
     const NOW: i64 = 1_800_000_000;
 
@@ -523,8 +523,8 @@ mod tests {
     impl UsageObserver for Observer {
         fn observe(&mut self, _chunk: &[u8]) {}
 
-        fn finish(self: Box<Self>) -> Option<TokenUsage> {
-            None
+        fn finish(self: Box<Self>) -> Outcome {
+            Outcome::default()
         }
     }
 
@@ -624,7 +624,7 @@ mod tests {
     fn usage_observer_is_object_safe() {
         let mut observer: Box<dyn UsageObserver> = Box::new(Observer);
         observer.observe(b"data");
-        assert_eq!(observer.finish(), None);
+        assert_eq!(observer.finish(), Outcome::default());
     }
 
     /// 断られたかどうかの判断は provider が読み、印は経路が持つ。

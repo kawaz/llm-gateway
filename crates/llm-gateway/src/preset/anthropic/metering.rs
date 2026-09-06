@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, Scope};
 use crate::egress::Headers;
-use crate::metering::{Pricing, TokenKind, TokenUsage, UsageObserver};
+use crate::metering::{Outcome, Pricing, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Metering;
 use crate::quota::{Overage, Snapshot, Window};
 
@@ -219,6 +219,8 @@ struct MessagesUsage {
     /// 上限を超えたので、この応答の集計をやめた。
     given_up: bool,
     usage: TokenUsage,
+    /// upstream が言った終わり方。最後に読めたものを残す。
+    stop_reason: Option<String>,
 }
 
 impl MessagesUsage {
@@ -229,6 +231,7 @@ impl MessagesUsage {
             event: Vec::new(),
             given_up: false,
             usage: TokenUsage::default(),
+            stop_reason: None,
         }
     }
 
@@ -279,13 +282,13 @@ impl MessagesUsage {
         self.event.extend_from_slice(payload);
     }
 
-    /// イベントが閉じた。溜めた中身から usage を読む。
+    /// イベントが閉じた。溜めた中身から usage と終わり方を読む。
     ///
-    /// JSON として解くのは usage が載っているものだけ。イベントは 1 応答で
-    /// 何十個も流れるので、全部解くと中継の脇で無駄に働くことになる。
+    /// JSON として解くのは usage か終わり方が載っているものだけ。イベントは
+    /// 1 応答で何十個も流れるので、全部解くと中継の脇で無駄に働くことになる。
     fn finish_event(&mut self) {
         let event = std::mem::take(&mut self.event);
-        if !contains(&event, b"\"usage\"") {
+        if !contains(&event, b"\"usage\"") && !contains(&event, b"\"stop_reason\"") {
             return;
         }
         let Ok(parsed) = serde_json::from_slice::<Value>(&event) else {
@@ -296,6 +299,21 @@ impl MessagesUsage {
         for pointer in ["/message/usage", "/usage"] {
             if let Some(usage) = parsed.pointer(pointer) {
                 self.absorb(usage);
+            }
+        }
+        self.absorb_stop_reason(&parsed);
+    }
+
+    /// 終わり方を読む。
+    ///
+    /// 終わりを告げるのは `message_delta` の `/delta/stop_reason`。
+    /// `message_start` にも欄はあるが、そこでは必ず null で届く
+    /// (まだ終わっていない) ので、読めた文字列だけを残せば取り違えない。
+    /// ストリームでない応答は本文直下に載る。
+    fn absorb_stop_reason(&mut self, value: &Value) {
+        for pointer in ["/delta/stop_reason", "/message/stop_reason", "/stop_reason"] {
+            if let Some(reason) = value.pointer(pointer).and_then(Value::as_str) {
+                self.stop_reason = Some(reason.to_owned());
             }
         }
     }
@@ -350,6 +368,7 @@ impl MessagesUsage {
         self.held = Vec::new();
         self.event = Vec::new();
         self.usage = TokenUsage::default();
+        self.stop_reason = None;
         tracing::warn!(reason, "skipping usage metering");
     }
 }
@@ -374,19 +393,22 @@ impl UsageObserver for MessagesUsage {
     /// 途中まで流れた応答は、そこまでに読めた分を返す。
     ///
     /// `message_start` まで届いていれば input は分かる。中断した分を丸ごと
-    /// 捨てると、実際に消費した入力が記録から消える。
-    fn finish(mut self: Box<Self>) -> Option<TokenUsage> {
+    /// 捨てると、実際に消費した入力が記録から消える。終わり方は、終わりまで
+    /// 届いた応答にしか載らない。
+    fn finish(mut self: Box<Self>) -> Outcome {
         if self.given_up {
-            return None;
+            return Outcome::default();
         }
         match self.mode {
             // ストリームでない応答は、ここで初めて全体が揃う。
             Mode::Json => {
                 if !self.held.is_empty()
                     && let Ok(body) = serde_json::from_slice::<Value>(&self.held)
-                    && let Some(usage) = body.pointer("/usage")
                 {
-                    self.absorb(usage);
+                    if let Some(usage) = body.pointer("/usage") {
+                        self.absorb(usage);
+                    }
+                    self.absorb_stop_reason(&body);
                 }
             }
             // 終端が空行で閉じられていなければ、最後のイベントが溜まったまま
@@ -399,7 +421,10 @@ impl UsageObserver for MessagesUsage {
                 self.finish_event();
             }
         }
-        (!self.usage.is_empty()).then_some(self.usage)
+        Outcome {
+            usage: (!self.usage.is_empty()).then_some(self.usage),
+            stop_reason: self.stop_reason,
+        }
     }
 }
 
@@ -467,6 +492,17 @@ mod tests {
     }
 
     fn read(content_type: &str, chunks: &[&[u8]]) -> Option<TokenUsage> {
+        let mut observer = AnthropicMetering
+            .usage_observer(Some(content_type))
+            .expect("a readable shape");
+        for chunk in chunks {
+            observer.observe(chunk);
+        }
+        observer.finish().usage
+    }
+
+    /// 終わり方まで含めて読み切る。
+    fn read_outcome(content_type: &str, chunks: &[&[u8]]) -> Outcome {
         let mut observer = AnthropicMetering
             .usage_observer(Some(content_type))
             .expect("a readable shape");
@@ -848,6 +884,79 @@ mod tests {
 
         assert_eq!(usage.get(&TokenKind::input()), Some(1));
         assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(2));
+    }
+
+    // ---------- 終わり方 (DR-0012) ----------
+
+    /// ストリームの終わり方は `message_delta` に載る。
+    ///
+    /// `message_start` にも欄はあるが、そこでは必ず null で届く。読めた文字列
+    /// だけを残すので、後から来た本物で上書きされる。
+    #[test]
+    fn reads_how_a_streamed_response_ended() {
+        let outcome = read_outcome(
+            "text/event-stream",
+            &[
+                b"event: message_start\ndata: {\"message\":{\"stop_reason\":null,\"usage\":{\"input_tokens\":10}}}\n\n",
+                b"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
+            ],
+        );
+
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            outcome.usage.expect("readable").get(&TokenKind::output()),
+            Some(7),
+            "usage is still read from the same event"
+        );
+    }
+
+    /// 道具を使うために終わった 1 本も、同じ欄でそのまま届く。
+    #[test]
+    fn passes_through_whatever_word_the_upstream_used() {
+        for word in ["tool_use", "max_tokens", "refusal", "a_word_we_do_not_know"] {
+            let event = format!(
+                "event: message_delta\ndata: {{\"delta\":{{\"stop_reason\":\"{word}\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n"
+            );
+            let outcome = read_outcome("text/event-stream", &[event.as_bytes()]);
+            assert_eq!(outcome.stop_reason.as_deref(), Some(word));
+        }
+    }
+
+    /// ストリームでない応答は本文直下に載る。
+    #[test]
+    fn reads_how_a_whole_json_response_ended() {
+        let outcome = read_outcome(
+            "application/json",
+            &[br#"{"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}"#],
+        );
+
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(
+            outcome.usage.expect("readable").get(&TokenKind::output()),
+            Some(2)
+        );
+    }
+
+    /// 途中で切れた応答に終わり方は無い。usage は読めた分が残る。
+    #[test]
+    fn an_unfinished_response_says_nothing_about_how_it_ended() {
+        let outcome = read_outcome(
+            "text/event-stream",
+            &[b"event: message_start\ndata: {\"message\":{\"stop_reason\":null,\"usage\":{\"input_tokens\":10}}}\n\n"],
+        );
+
+        assert_eq!(outcome.stop_reason, None);
+        assert!(outcome.usage.is_some(), "what was read is still kept");
+    }
+
+    /// 消費を報告しない応答 (`count_tokens`) からは何も読めない。
+    ///
+    /// 読めないままにするのは、見る側が「会話が終わった」と誤らないため。
+    #[test]
+    fn a_token_count_reads_as_nothing() {
+        let outcome = read_outcome("application/json", &[br#"{"input_tokens":1234}"#]);
+
+        assert_eq!(outcome, Outcome::default());
     }
 
     /// キャッシュ書き込みは合計と TTL 別の内訳の両方を拾う。
