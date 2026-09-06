@@ -576,6 +576,7 @@ mod tests {
             };
             Some(crate::metering::Pricing {
                 rates: rates.iter().cloned().collect(),
+                ..Default::default()
             })
         }
     }
@@ -737,7 +738,7 @@ mod tests {
         let mut usage = TokenUsage::default();
         usage.set(TokenKind::input(), 1_000_000);
         // input の内訳 (単価表に無い)。
-        usage.set("input.ephemeral_1h", 900_000);
+        usage.set("input.long_context", 900_000);
         s.record(NOW, Some("a"), "m-rich", &usage);
 
         let entry = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
@@ -747,7 +748,7 @@ mod tests {
             "only the input portion; breakdowns are not stacked on top"
         );
         assert_eq!(
-            count(&entry.counters, TokenKind::new("input.ephemeral_1h")),
+            count(&entry.counters, TokenKind::new("input.long_context")),
             900_000,
             "non-billed breakdowns are still kept as observed values"
         );

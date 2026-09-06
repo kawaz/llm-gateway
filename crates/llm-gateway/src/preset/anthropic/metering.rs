@@ -88,9 +88,11 @@ impl Metering for AnthropicMetering {
 
     /// 重複しない課金軸を選ぶ。
     ///
-    /// Anthropic の `input_tokens` はキャッシュ分を含まないので、単価表の
-    /// 4 区分をそのまま並べても二重計上にならない。表に無い区分 (provider 固有の
-    /// 内訳) は課金へ入らないので、観測値として残したまま合計は動かない。
+    /// Anthropic の `input_tokens` はキャッシュ分を含まないので、input / output /
+    /// cache write / cache read をそのまま並べても二重計上にならない。唯一
+    /// 重なるのがキャッシュ書き込みの TTL 別内訳で、そちらは単価表が親を宣言し、
+    /// 親から引いて課金する。表に無い区分は課金へ入らないので、観測値として
+    /// 残したまま合計は動かない。
     fn pricing(&self, model: &str) -> Option<Pricing> {
         crate::preset::pricing::for_model(model)
     }
@@ -297,6 +299,11 @@ impl MessagesUsage {
     ///
     /// 値は累積で届くので**上書き**する (足さない)。載っていない区分は前に
     /// 拾った値を保つ — `message_delta` が一部しか載せない場合に備える。
+    ///
+    /// キャッシュ書き込みは合計 (`cache_creation_input_tokens`) と TTL 別の内訳
+    /// (`cache_creation` オブジェクト) の両方が載る。単価が TTL で違う (1h は
+    /// input の 2 倍、5m は 1.25 倍) ので内訳も写す。二重に数えないための引き算は
+    /// 単価表の側の役目 ([`crate::metering::Pricing`] / [`super::super::pricing`])。
     fn absorb(&mut self, usage: &Value) {
         const AXES: &[(&str, &str)] = &[
             ("input_tokens", TokenKind::INPUT_NAME),
@@ -307,9 +314,27 @@ impl MessagesUsage {
             ),
             ("cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
         ];
+        /// `cache_creation` オブジェクトの中の欄。
+        const TTLS: &[(&str, &str)] = &[
+            (
+                "ephemeral_1h_input_tokens",
+                TokenKind::INPUT_CACHE_CREATION_1H_NAME,
+            ),
+            (
+                "ephemeral_5m_input_tokens",
+                TokenKind::INPUT_CACHE_CREATION_5M_NAME,
+            ),
+        ];
         for (field, kind) in AXES {
             if let Some(count) = usage.get(field).and_then(Value::as_u64) {
                 self.usage.set(*kind, count);
+            }
+        }
+        if let Some(breakdown) = usage.get("cache_creation") {
+            for (field, kind) in TTLS {
+                if let Some(count) = breakdown.get(field).and_then(Value::as_u64) {
+                    self.usage.set(*kind, count);
+                }
             }
         }
     }
@@ -820,6 +845,105 @@ mod tests {
 
         assert_eq!(usage.get(&TokenKind::input()), Some(1));
         assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(2));
+    }
+
+    /// キャッシュ書き込みは合計と TTL 別の内訳の両方を拾う。
+    #[test]
+    fn reads_the_cache_write_ttl_breakdown() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"cache_creation_input_tokens":300,
+                "cache_creation":{"ephemeral_5m_input_tokens":100,
+                                  "ephemeral_1h_input_tokens":200}}}"#],
+        )
+        .expect("readable");
+
+        assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(300));
+        assert_eq!(usage.get(&TokenKind::input_cache_creation_1h()), Some(200));
+        assert_eq!(usage.get(&TokenKind::input_cache_creation_5m()), Some(100));
+    }
+
+    /// 内訳はストリームでも拾える。累積で届くので最後の値が残る。
+    #[test]
+    fn the_ttl_breakdown_is_cumulative_too() {
+        let usage = read(
+            "text/event-stream",
+            &[
+                b"event: message_start\ndata: {\"message\":{\"usage\":{\"cache_creation_input_tokens\":1,\"cache_creation\":{\"ephemeral_1h_input_tokens\":1}}}}\n\n",
+                b"event: message_delta\ndata: {\"usage\":{\"cache_creation_input_tokens\":9,\"cache_creation\":{\"ephemeral_1h_input_tokens\":9}}}\n\n",
+            ],
+        )
+        .expect("readable");
+
+        assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(9));
+        assert_eq!(
+            usage.get(&TokenKind::input_cache_creation_1h()),
+            Some(9),
+            "not summed as 1 + 9"
+        );
+    }
+
+    /// 内訳を載せない応答では、合計だけが残る。
+    #[test]
+    fn a_response_without_the_breakdown_keeps_only_the_total() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"cache_creation_input_tokens":300}}"#],
+        )
+        .expect("readable");
+
+        assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(300));
+        assert_eq!(usage.get(&TokenKind::input_cache_creation_1h()), None);
+    }
+
+    /// 1h のキャッシュ書き込みは 2 倍で課金する。
+    ///
+    /// 合計だけを 5m 単価で数えると、1h を使う運用 (DR-0024) で実額より安く出る。
+    #[test]
+    fn a_one_hour_cache_write_costs_twice_the_input_rate() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"cache_creation_input_tokens":1000000,
+                "cache_creation":{"ephemeral_5m_input_tokens":0,
+                                  "ephemeral_1h_input_tokens":1000000}}}"#],
+        )
+        .expect("readable");
+        let pricing = AnthropicMetering.pricing("claude-opus-5").expect("priced");
+
+        // opus-5 の input は $5 なので 1h 書き込み 100 万 = $10。
+        assert_eq!(pricing.cost(&usage), 10.0);
+    }
+
+    /// 内訳と合計を二重に数えない。
+    #[test]
+    fn the_total_and_its_breakdown_are_not_charged_twice() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"cache_creation_input_tokens":1000000,
+                "cache_creation":{"ephemeral_5m_input_tokens":600000,
+                                  "ephemeral_1h_input_tokens":400000}}}"#],
+        )
+        .expect("readable");
+        let pricing = AnthropicMetering.pricing("claude-opus-5").expect("priced");
+
+        // 1h 40 万 x $10 + 5m 60 万 x $6.25 = $4 + $3.75。
+        assert_eq!(pricing.cost(&usage), 7.75);
+    }
+
+    /// 内訳の無い記録は従来どおり 5m 単価で計算する。
+    ///
+    /// 過去日の記録はトークン数しか持たない (DR-0011) ので、内訳の無い行が
+    /// 値付けから落ちてはいけない。
+    #[test]
+    fn a_record_without_a_breakdown_is_priced_as_before() {
+        let usage = read(
+            "application/json",
+            &[br#"{"usage":{"cache_creation_input_tokens":1000000}}"#],
+        )
+        .expect("readable");
+        let pricing = AnthropicMetering.pricing("claude-opus-5").expect("priced");
+
+        assert_eq!(pricing.cost(&usage), 6.25);
     }
 
     /// usage を載せない content-type には observer を作らない。

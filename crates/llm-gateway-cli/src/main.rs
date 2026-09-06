@@ -894,10 +894,12 @@ const USD_HEADER: &str = "usd";
 ///
 /// 並べ替えの都合なので、ここに無い区分も落とさない (落とすと、その provider の
 /// 消費が表から消える)。
-const KIND_ORDER: [&str; 5] = [
+const KIND_ORDER: [&str; 7] = [
     TokenKind::INPUT_NAME,
     TokenKind::OUTPUT_NAME,
     TokenKind::INPUT_CACHE_CREATION_NAME,
+    TokenKind::INPUT_CACHE_CREATION_1H_NAME,
+    TokenKind::INPUT_CACHE_CREATION_5M_NAME,
     TokenKind::INPUT_CACHE_READ_NAME,
     TokenKind::OUTPUT_REASONING_NAME,
 ];
@@ -928,6 +930,9 @@ fn kinds_of(lines: &[Line]) -> Vec<TokenKind> {
 fn header_of(kind: &TokenKind) -> &str {
     match kind.as_str() {
         TokenKind::INPUT_CACHE_CREATION_NAME => "cache_w",
+        // 内訳は親のすぐ隣に立つので、TTL だけを見出しにする。
+        TokenKind::INPUT_CACHE_CREATION_1H_NAME => "w_1h",
+        TokenKind::INPUT_CACHE_CREATION_5M_NAME => "w_5m",
         TokenKind::INPUT_CACHE_READ_NAME => "cache_r",
         TokenKind::OUTPUT_REASONING_NAME => "reasoning",
         other => other,
@@ -2540,6 +2545,29 @@ main = "keepalive"
     fn help_mentions_stats() {
         assert!(USAGE.contains("stats"), "missing from the command list");
         assert!(USAGE.contains("--days"), "missing the option description");
+    }
+
+    /// キャッシュ書き込みの内訳は、合計のすぐ隣に短い見出しで並ぶ。
+    ///
+    /// 生の区分名 (`input.cache_creation.ephemeral_1h`) を見出しにすると、
+    /// 毎日出る列で桁が大きく広がる。
+    #[test]
+    fn the_cache_write_breakdown_sits_next_to_its_total() {
+        let mut c = counters(1, 10, 5);
+        c.tokens.set(TokenKind::input_cache_creation(), 300);
+        c.tokens.set(TokenKind::input_cache_creation_1h(), 200);
+        c.tokens.set(TokenKind::input_cache_creation_5m(), 100);
+
+        let out = render_stats(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
+
+        let head = out.lines().next().expect("a header line");
+        let heads: Vec<&str> = head.split_whitespace().collect();
+        let at = |name| heads.iter().position(|h| *h == name);
+        assert_eq!(
+            (at("w_1h"), at("w_5m")),
+            (at("cache_w").map(|i| i + 1), at("cache_w").map(|i| i + 2)),
+            "the breakdown follows the total: {head}"
+        );
     }
 
     /// 表の形を丸ごと固定する。

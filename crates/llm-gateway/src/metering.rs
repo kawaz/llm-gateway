@@ -16,6 +16,13 @@ impl TokenKind {
     pub const INPUT_NAME: &'static str = "input";
     pub const OUTPUT_NAME: &'static str = "output";
     pub const INPUT_CACHE_CREATION_NAME: &'static str = "input.cache_creation";
+    /// キャッシュ書き込みのうち、寿命の長い方 (1 時間)。
+    ///
+    /// TTL 別の単価差を持つ upstream があるので、綴りを core で揃える。値は
+    /// [`Self::INPUT_CACHE_CREATION_NAME`] の内数。
+    pub const INPUT_CACHE_CREATION_1H_NAME: &'static str = "input.cache_creation.ephemeral_1h";
+    /// キャッシュ書き込みのうち、寿命の短い方 (5 分)。同じく親の内数。
+    pub const INPUT_CACHE_CREATION_5M_NAME: &'static str = "input.cache_creation.ephemeral_5m";
     pub const INPUT_CACHE_READ_NAME: &'static str = "input.cache_read";
     pub const OUTPUT_REASONING_NAME: &'static str = "output.reasoning";
 
@@ -37,6 +44,14 @@ impl TokenKind {
 
     pub fn input_cache_creation() -> Self {
         Self::new(Self::INPUT_CACHE_CREATION_NAME)
+    }
+
+    pub fn input_cache_creation_1h() -> Self {
+        Self::new(Self::INPUT_CACHE_CREATION_1H_NAME)
+    }
+
+    pub fn input_cache_creation_5m() -> Self {
+        Self::new(Self::INPUT_CACHE_CREATION_5M_NAME)
     }
 
     pub fn input_cache_read() -> Self {
@@ -98,6 +113,13 @@ impl TokenUsage {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pricing {
     pub rates: BTreeMap<TokenKind, f64>,
+    /// 内訳区分 → その値を含んでいる親区分。
+    ///
+    /// 単価の違う内訳を親と一緒に課金するための宣言。内訳が届く記録では
+    /// 内訳がそれぞれの単価で、届かない記録では親が全量を負担する
+    /// ([`Self::billable`])。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refines: BTreeMap<TokenKind, TokenKind>,
 }
 
 impl Pricing {
@@ -108,9 +130,32 @@ impl Pricing {
     /// Metering がこの map を組み立てる時点で行う。
     pub fn cost(&self, usage: &TokenUsage) -> f64 {
         let usd = self.rates.iter().fold(0.0, |total, (kind, rate)| {
-            total + usage.get(kind).unwrap_or(0) as f64 * rate / 1_000_000.0
+            total + self.billable(usage, kind) as f64 * rate / 1_000_000.0
         });
         round_usd(usd)
+    }
+
+    /// この区分に何トークン課金するか。
+    ///
+    /// 親区分は、**単価を持つ内訳の分を引いた残り**だけを負担する。内訳の単価が
+    /// 親と違う (キャッシュ書き込みの寿命別の値付け等) 場合に、内訳を別立てで
+    /// 課金しても親と二重に数えないため。
+    ///
+    /// 内訳の届かない記録 — 内訳を返さない provider、内訳を持たない過去日
+    /// (DR-0011: 記録はトークン数だけで、USD は閲覧のたびに換算する) — では
+    /// 引く相手がいないので、親が全量を負担する = 従来どおりの計算になる。
+    ///
+    /// 単価を書いていない内訳は引かない。引いてしまうと、その分がどの区分でも
+    /// 課金されずに消える。
+    fn billable(&self, usage: &TokenUsage, kind: &TokenKind) -> u64 {
+        let detailed: u64 = self
+            .refines
+            .iter()
+            .filter(|(child, parent)| *parent == kind && self.rates.contains_key(*child))
+            .map(|(child, _)| usage.get(child).unwrap_or(0))
+            .sum();
+        // 内訳の合計が親を超えていても負にしない (観測値は upstream 任せ)。
+        usage.get(kind).unwrap_or(0).saturating_sub(detailed)
     }
 }
 
@@ -172,6 +217,7 @@ mod tests {
         };
         let pricing = Pricing {
             rates: BTreeMap::from([(TokenKind::input(), 5.0)]),
+            ..Pricing::default()
         };
 
         assert_eq!(pricing.cost(&usage), 5.0);
@@ -198,8 +244,79 @@ mod tests {
                 (TokenKind::output(), 25.0),
                 (TokenKind::input_cache_read(), 0.5),
             ]),
+            ..Pricing::default()
         };
 
         assert_eq!(pricing.cost(&usage), 30.5);
+    }
+
+    /// 内訳を別単価で課金する表。親は内訳の残りだけを負担する。
+    fn split_cache_write() -> Pricing {
+        Pricing {
+            rates: BTreeMap::from([
+                (TokenKind::input_cache_creation(), 1.25),
+                (TokenKind::input_cache_creation_1h(), 2.0),
+            ]),
+            refines: BTreeMap::from([(
+                TokenKind::input_cache_creation_1h(),
+                TokenKind::input_cache_creation(),
+            )]),
+        }
+    }
+
+    /// 内訳が届いた分はその単価で、残りは親の単価で課金する。
+    #[test]
+    fn a_priced_breakdown_replaces_its_share_of_the_parent() {
+        let usage = TokenUsage {
+            tokens: BTreeMap::from([
+                (TokenKind::input_cache_creation(), 1_000_000),
+                (TokenKind::input_cache_creation_1h(), 600_000),
+                (TokenKind::input_cache_creation_5m(), 400_000),
+            ]),
+        };
+
+        // 1h 60 万 x $2 + 残り 40 万 x $1.25 = $1.2 + $0.5。
+        assert_eq!(split_cache_write().cost(&usage), 1.7);
+    }
+
+    /// 内訳の無い記録では、親が全量を負担する。
+    ///
+    /// 過去日や、内訳を返さない provider の記録が従来どおりに計算される。
+    #[test]
+    fn a_parent_without_a_breakdown_is_charged_in_full() {
+        let usage = TokenUsage {
+            tokens: BTreeMap::from([(TokenKind::input_cache_creation(), 1_000_000)]),
+        };
+
+        assert_eq!(split_cache_write().cost(&usage), 1.25);
+    }
+
+    /// 内訳の合計が親を超えていても、負の課金にはしない。
+    #[test]
+    fn an_oversized_breakdown_does_not_go_negative() {
+        let usage = TokenUsage {
+            tokens: BTreeMap::from([
+                (TokenKind::input_cache_creation(), 100),
+                (TokenKind::input_cache_creation_1h(), 1_000_000),
+            ]),
+        };
+
+        // 親の取り分は 0 まで。1h の 100 万 x $2 だけが残る。
+        assert_eq!(split_cache_write().cost(&usage), 2.0);
+    }
+
+    /// 単価を書いていない内訳は親から引かない。
+    ///
+    /// 引くと、その分がどの区分でも課金されずに消える。
+    #[test]
+    fn an_unpriced_breakdown_is_not_subtracted() {
+        let usage = TokenUsage {
+            tokens: BTreeMap::from([
+                (TokenKind::input_cache_creation(), 1_000_000),
+                (TokenKind::input_cache_creation_5m(), 1_000_000),
+            ]),
+        };
+        // 5m は親と同じ単価なので単価表に持たない = 親が全量を負担する。
+        assert_eq!(split_cache_write().cost(&usage), 1.25);
     }
 }

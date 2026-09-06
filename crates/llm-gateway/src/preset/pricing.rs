@@ -36,6 +36,12 @@
 //! 並べる区分は**互いに重ならないもの**だけにする。合計は行に挙げた区分の
 //! 足し算なので、親区分とその内訳を両方書くと二重に課金される。
 //!
+//! 例外は [`REFINEMENTS`] に親を宣言した内訳で、こちらは親と一緒に並べてよい。
+//! 親は内訳を引いた残りだけを負担する ([`Pricing::cost`])。単価の違う内訳
+//! (TTL で値段の変わるキャッシュ書き込み) を、内訳の届かない記録との互換を
+//! 保ったまま課金するための逃げ道なので、**単価が親と同じ内訳は書かない** —
+//! 書かなければ親が全量を負担して同じ額になる。
+//!
 //! # 倍率でなく実値で持つ
 //!
 //! Anthropic の cache write (5 分) は input の 1.25 倍、cache read は 0.1 倍だが、
@@ -50,7 +56,18 @@ use crate::pattern;
 const INPUT: &str = TokenKind::INPUT_NAME;
 const OUTPUT: &str = TokenKind::OUTPUT_NAME;
 const CACHE_WRITE: &str = TokenKind::INPUT_CACHE_CREATION_NAME;
+const CACHE_WRITE_1H: &str = TokenKind::INPUT_CACHE_CREATION_1H_NAME;
 const CACHE_READ: &str = TokenKind::INPUT_CACHE_READ_NAME;
+
+/// 内訳区分と、その値を含んでいる親区分。
+///
+/// 1 時間キャッシュ書き込みは 5 分のものより高い (input の 2 倍 / 1.25 倍) が、
+/// upstream の合計 (`cache_creation_input_tokens`) には両方が入っている。親を
+/// 宣言しておくと、内訳の届いた分だけが親から引かれる。
+///
+/// 5 分の内訳 ([`TokenKind::INPUT_CACHE_CREATION_5M_NAME`]) は単価が親と同じ
+/// なので挙げない。観測値としては残り、課金は親が受け持つ。
+static REFINEMENTS: &[(&str, &str)] = &[(CACHE_WRITE_1H, CACHE_WRITE)];
 
 /// 単価表の 1 行。`patterns` のどれかに当たれば `rates` を使う。
 struct Row {
@@ -84,8 +101,10 @@ static TABLE: &[Row] = &[
         &[(INPUT, 0.0), (OUTPUT, 0.0), (CACHE_READ, 0.0)],
     ),
     // --- Anthropic (2026-07-31 確認 / claude-api skill の Current Models 表)
-    //     cache write = input x1.25 (5m TTL), cache read = input x0.1。
-    //     input はキャッシュ分を含まないので、4 区分は重ならない。
+    //     cache write = input x1.25 (5m TTL) / x2 (1h TTL)、cache read = input x0.1
+    //     (1h の倍率は 2026-09-02 確認 / prompt-caching doc)。input はキャッシュ分を
+    //     含まないので重ならない。1h だけは cache write の内数で、[`REFINEMENTS`] が
+    //     親を宣言している。
     // Fable 5.1 / Mythos 5.1 は cache read だけ 0.025 倍 ($0.25/MTok)。
     // 5 系の glob より前に置いて先に当てる (2026-09-02 確認 / prompt-caching doc)。
     row(
@@ -99,6 +118,7 @@ static TABLE: &[Row] = &[
             (INPUT, 10.0),
             (OUTPUT, 50.0),
             (CACHE_WRITE, 12.5),
+            (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 0.25),
         ],
     ),
@@ -108,6 +128,7 @@ static TABLE: &[Row] = &[
             (INPUT, 10.0),
             (OUTPUT, 50.0),
             (CACHE_WRITE, 12.5),
+            (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 1.0),
         ],
     ),
@@ -117,6 +138,7 @@ static TABLE: &[Row] = &[
             (INPUT, 10.0),
             (OUTPUT, 50.0),
             (CACHE_WRITE, 12.5),
+            (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 1.0),
         ],
     ),
@@ -126,6 +148,7 @@ static TABLE: &[Row] = &[
             (INPUT, 5.0),
             (OUTPUT, 25.0),
             (CACHE_WRITE, 6.25),
+            (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
     ),
@@ -135,6 +158,7 @@ static TABLE: &[Row] = &[
             (INPUT, 5.0),
             (OUTPUT, 25.0),
             (CACHE_WRITE, 6.25),
+            (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
     ),
@@ -144,6 +168,7 @@ static TABLE: &[Row] = &[
             (INPUT, 5.0),
             (OUTPUT, 25.0),
             (CACHE_WRITE, 6.25),
+            (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
     ),
@@ -153,6 +178,7 @@ static TABLE: &[Row] = &[
             (INPUT, 5.0),
             (OUTPUT, 25.0),
             (CACHE_WRITE, 6.25),
+            (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
     ),
@@ -165,6 +191,7 @@ static TABLE: &[Row] = &[
             (INPUT, 3.0),
             (OUTPUT, 15.0),
             (CACHE_WRITE, 3.75),
+            (CACHE_WRITE_1H, 6.0),
             (CACHE_READ, 0.3),
         ],
     ),
@@ -174,6 +201,7 @@ static TABLE: &[Row] = &[
             (INPUT, 3.0),
             (OUTPUT, 15.0),
             (CACHE_WRITE, 3.75),
+            (CACHE_WRITE_1H, 6.0),
             (CACHE_READ, 0.3),
         ],
     ),
@@ -183,6 +211,7 @@ static TABLE: &[Row] = &[
             (INPUT, 1.0),
             (OUTPUT, 5.0),
             (CACHE_WRITE, 1.25),
+            (CACHE_WRITE_1H, 2.0),
             (CACHE_READ, 0.1),
         ],
     ),
@@ -225,12 +254,19 @@ pub fn for_model(model: &str) -> Option<Pricing> {
     let row = TABLE
         .iter()
         .find(|row| pattern::matches_any(row.patterns, model))?;
+    let rates: std::collections::BTreeMap<_, _> = row
+        .rates
+        .iter()
+        .map(|(kind, usd)| (TokenKind::new(*kind), *usd))
+        .collect();
     Some(Pricing {
-        rates: row
-            .rates
+        // 親子の関係は、両方に単価を書いた行にだけ要る。
+        refines: REFINEMENTS
             .iter()
-            .map(|(kind, usd)| (TokenKind::new(*kind), *usd))
+            .map(|(child, parent)| (TokenKind::new(*child), TokenKind::new(*parent)))
+            .filter(|(child, parent)| rates.contains_key(child) && rates.contains_key(parent))
             .collect(),
+        rates,
     })
 }
 
