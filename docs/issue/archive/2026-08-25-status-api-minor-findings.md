@@ -1,6 +1,6 @@
 ---
 title: DR-0021 status API レビュー Minor 指摘 7 件
-status: wip
+status: resolved
 category: tech-memo
 created: 2026-08-25T14:23:19+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T16:00:06+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T16:05:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: 観測に到着順の通し番号を付けて同秒の順序を決める (change qvpkomoz)","done: link は refresh しない (snapshot 無し、stale 常に false) (change qvpkomoz)","done: 未参照 source を routes: [] で report に残し check でも warning (change qvpkomoz)","dr/DR-0021:implemented: official.source の語彙 (statuspage_v2 / link / none) と source_url の規則を追記","done: 到達不能分岐を削除 (change qvpkomoz)","done: single-flight test を race 無しに、observe_success は採用した 5xx 未満を reachable に (change qvpkomoz)","done: CLI の 'just now ago' 重複を修正 (change qvpkomoz)"]
 blocked_by:
 origin: 自リポ TODO
 ---
