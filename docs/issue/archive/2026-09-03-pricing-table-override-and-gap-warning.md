@@ -1,6 +1,6 @@
 ---
 title: catalog-pricing ギャップ warning
-status: wip
+status: resolved
 category: design
 created: 2026-09-03T12:07:36+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T15:40:15+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T15:57:28+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: pricing::gaps() が単価行なし/呼び名の対を持つ行の<呼び名>-*に日付でない部分で当たり旧世代の行に飲まれるケースを検出、checkとdiscovery時にwarning (change mzluolsr)", "discarded: 単価表の確認日をstatusに出す任意項目は、確認日が表内にモデル群ごとに3つあり単一定数にできないため見送り"]
 blocked_by:
 origin: 自リポ TODO
 ---
