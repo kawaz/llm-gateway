@@ -215,6 +215,17 @@ static TABLE: &[Row] = &[
             (CACHE_READ, 0.1),
         ],
     ),
+    // --- OpenAI gpt-6 (2026-09-06 確認 / OpenAI API docs 2026-09-03 時点の値)
+    //     区分の扱いは gpt-5.6 系と同じ (下記)。
+    row(
+        &["gpt-6-astra", "gpt-6-astra-*"],
+        &[
+            (INPUT, 10.0),
+            (OUTPUT, 50.0),
+            (CACHE_WRITE, 10.0),
+            (CACHE_READ, 1.0),
+        ],
+    ),
     // --- OpenAI gpt-5.6 系 (2026-07-31 確認 / developers.openai.com/api/docs/pricing)
     //     Standard tier・短コンテキストの値。cache write の割増は無いので
     //     input と同額、cache read は cached input の値。長コンテキスト
