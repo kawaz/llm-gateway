@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-06 | task | open | [keepalive-resume-relay](./2026-09-06-keepalive-resume-relay.md) | keepalive の自動解除を兄弟 gateway へ中継する (pause は中継済みだが resume が漏れている) |
 | 2026-09-05 | task | wip | [keepalive-pause-per-session](./2026-09-05-keepalive-pause-per-session.md) | セッション単位で keepalive を止める API (兄弟 gateway へ中継) |
 | 2026-09-05 | bug | open | [codex-quota-api-silent-failure](./2026-09-05-codex-quota-api-silent-failure.md) | codex の枠照会 API が黙って失敗し usage が unobserved のまま (spend_down が効かない) |
 | 2026-09-03 | tech-memo | open | [oauth-requires-claude-code-shape](./2026-09-03-oauth-requires-claude-code-shape.md) | サブスク OAuth 経路は Claude Code の形をしていない request を 429 "Error" で弾く (真因と対応候補) |
