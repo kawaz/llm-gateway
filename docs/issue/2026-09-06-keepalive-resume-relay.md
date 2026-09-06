@@ -1,11 +1,11 @@
 ---
 title: keepalive の自動解除を兄弟 gateway へ中継する
-status: open
+status: wip
 category: task
 created: 2026-09-06T14:42:49+09:00
 last_read:
 open_entered: 2026-09-06T14:42:49+09:00
-wip_entered:
+wip_entered: 2026-09-06T14:43:48+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
