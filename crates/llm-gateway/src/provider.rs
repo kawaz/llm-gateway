@@ -106,7 +106,10 @@ pub trait CallerOrigin: Send + Sync {
 /// 応答から provider 固有の quota・拒否・usage・単価を読む。
 pub trait Metering: Send + Sync {
     /// 応答ヘッダに quota が載っていれば正規スナップショットへ写す。
-    fn quota_snapshot(&self, headers: &Headers, observed_at: i64) -> Option<Snapshot>;
+    ///
+    /// `observed_at_ms` は Unix ミリ秒。スナップショットが運ぶ時刻は全て
+    /// この数え方なので、秒で返る upstream のヘッダは写す側で直す。
+    fn quota_snapshot(&self, headers: &Headers, observed_at_ms: i64) -> Option<Snapshot>;
 
     /// この応答が一時的な経路拒否なら、候補へ戻す条件を返す。
     fn rejection(
@@ -115,7 +118,7 @@ pub trait Metering: Send + Sync {
         headers: &Headers,
         body: Option<&[u8]>,
         model: &str,
-        observed_at: i64,
+        observed_at_secs: i64,
     ) -> Option<Denial>;
 
     /// 本文 usage を読む observer。読めない content-type なら `None`。
@@ -328,8 +331,10 @@ impl Preset {
     }
 
     /// 応答ヘッダに枠が載っていれば控える。控えた分を返す。
-    pub fn observe_quota(&self, headers: &Headers, now: i64) -> Option<Snapshot> {
-        let snapshot = self.metering.quota_snapshot(headers, now)?;
+    ///
+    /// `now_ms` は Unix ミリ秒 (スナップショットが運ぶ時刻の数え方)。
+    pub fn observe_quota(&self, headers: &Headers, now_ms: i64) -> Option<Snapshot> {
+        let snapshot = self.metering.quota_snapshot(headers, now_ms)?;
         self.state.observe_quota(snapshot.clone());
         Some(snapshot)
     }
@@ -372,16 +377,18 @@ impl Preset {
     /// ヘッダと枠照会は同じ枠について違う値を返すことがあり (DR-0007)、
     /// 転送のたびに更新されるヘッダ側の方が新しい。ここで埋めるのは、
     /// 埋めないと誰も何も知らないままになる穴だけ。
-    pub fn apply_quota(&self, limits: &[QuotaLimit], now: i64) {
+    pub fn apply_quota(&self, limits: &[QuotaLimit], now_secs: i64) {
         let Some(api) = self.quota_api() else {
             return;
         };
-        self.state.apply(&api.denials(limits, now), now);
+        self.state.apply(&api.denials(limits, now_secs), now_secs);
 
+        // 締め出しの印は秒で持ち、スナップショットが運ぶ時刻はミリ秒。
+        let now_ms = crate::credential::time::to_unix_ms(now_secs);
         let known = self
             .quota()
-            .is_some_and(|snapshot| snapshot.has_usable_window(now));
-        if !known && let Some(snapshot) = Snapshot::from_limits(limits, now) {
+            .is_some_and(|snapshot| snapshot.has_usable_window(now_ms));
+        if !known && let Some(snapshot) = Snapshot::from_limits(limits, now_ms) {
             self.state.observe_quota(snapshot);
         }
     }
@@ -704,7 +711,10 @@ mod tests {
         let window = preset.quota().expect("filled in").longest_window().cloned();
         let window = window.expect("the weekly window");
         assert_eq!(window.utilization, Some(0.003));
-        assert_eq!(window.reset, Some(NOW + 1000));
+        assert_eq!(
+            window.reset,
+            Some(crate::credential::time::to_unix_ms(NOW + 1000))
+        );
         assert_eq!(window.window_seconds, Some(WEEK));
     }
 
@@ -723,7 +733,7 @@ mod tests {
                     utilization: Some(0.34),
                     ..crate::quota::Window::default()
                 }
-                .with_reset(Some(NOW + 1000))
+                .with_reset(Some(crate::credential::time::to_unix_ms(NOW + 1000)))
                 .with_window_seconds(Some(WEEK)),
             ),
             None,
@@ -750,7 +760,7 @@ mod tests {
             kind: "weekly_all".to_owned(),
             percent,
             severity: None,
-            resets_at: Some(crate::credential::time::format_rfc3339(resets_at)),
+            resets_at: Some(crate::credential::time::to_unix_ms(resets_at)),
             model: None,
             model_id: None,
             window_seconds: Some(WEEK),

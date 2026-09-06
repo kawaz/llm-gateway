@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tracing::{Instrument as _, error, warn};
 
 use llm_gateway::config::{Authorization, Namespace};
-use llm_gateway::credential::time::now_unix;
+use llm_gateway::credential::time::{now_unix, now_unix_ms};
 use llm_gateway::credential::{CredentialId, Persistence};
 use llm_gateway::gateway::RELAYED_HEADER;
 use llm_gateway::{Error, Gateway, exchange};
@@ -495,7 +495,7 @@ async fn stats<P: Persistence + 'static>(
         Ok(days) => days,
         Err(message) => return client_error("stats", StatusCode::BAD_REQUEST, &message),
     };
-    json_utf8(Json(gateway.stats_report(days, now_unix())))
+    json_utf8(Json(gateway.stats_report(days, now_unix_ms())))
 }
 
 /// 既定で見せる日数。
@@ -2409,10 +2409,10 @@ mod usage_tests {
         let dir = tempfile::tempdir().unwrap();
         let listen = "127.0.0.1:11300";
         // 3 時間前に観測して落とした、前の起動の分。
-        let observed_at = 1_785_326_400 - 3 * 3600;
+        let observed_at_ms = (1_785_326_400 - 3 * 3600) * 1000;
         {
             let snapshot = AnthropicMetering
-                .quota_snapshot(&Headers::new(unified_headers()), observed_at)
+                .quota_snapshot(&Headers::new(unified_headers()), observed_at_ms)
                 .expect("a limit is present");
             let usage = QuotaStore::new(dir.path(), listen);
             usage
@@ -2440,7 +2440,7 @@ url = "https://upstream.invalid"
 "#,
                 dir.path().display()
             ),
-            observed_at,
+            llm_gateway::credential::time::to_unix_secs(observed_at_ms),
         )
         .await;
 
@@ -2451,7 +2451,7 @@ url = "https://upstream.invalid"
         );
         assert_eq!(c["snapshot"]["5h"]["utilization"], 0.71);
         assert_eq!(
-            c["snapshot"]["observed_at"], observed_at,
+            c["snapshot"]["observed_at"], observed_at_ms,
             "the fetch time stays as originally observed (not replaced by the reload time): {c}"
         );
     }
@@ -2545,19 +2545,17 @@ routes = ["claude-personal"]
         let c = entry(&after, "claude-personal");
         assert_eq!(c["support"], "observed");
 
+        crate::stats_tests::assert_times_are_milliseconds(&after, "usage");
+
         let s = &c["snapshot"];
         assert_eq!(s["5h"]["utilization"], 0.71);
         assert_eq!(s["5h"]["status"], "allowed");
-        assert_eq!(s["5h"]["reset"], 1_785_344_400_i64);
-        assert_eq!(
-            s["5h"]["reset_iso"], "2026-07-29T17:00:00Z",
-            "emits both Unix seconds and ISO"
-        );
+        assert_eq!(s["5h"]["reset"], 1_785_344_400_000_i64);
         assert_eq!(s["7d"]["utilization"], 0.3);
         assert_eq!(s["overage"]["disabled_reason"], "out_of_credits");
         assert!(
-            s["observed_at"].as_i64().unwrap() > 1_700_000_000,
-            "shows when it was observed: {s}"
+            s["observed_at"].as_i64().unwrap() > 1_700_000_000_000,
+            "shows when it was observed, in milliseconds: {s}"
         );
     }
 
@@ -3339,8 +3337,8 @@ routes = ["a"]
         let report: Value = resp.json().await.unwrap();
         assert!(report["days"].as_object().unwrap().is_empty(), "{report}");
         assert!(
-            report["generated_at_iso"].is_string(),
-            "when it was created: {report}"
+            report["generated_at"].as_i64().unwrap() > 1_700_000_000_000,
+            "when it was created, in milliseconds: {report}"
         );
     }
 
@@ -3576,6 +3574,101 @@ type = "codex_oauth"
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    /// 時刻の欄は数値 1 つで、単位は Unix ミリ秒 (DR-0012)。
+    ///
+    /// 秒で出すと桁が 3 つ足りず、受け取った側は 1970 年代の時刻として読む。
+    /// 取り違えは黙って通るので、桁の下限で検める。
+    pub(crate) fn assert_times_are_milliseconds(value: &Value, path: &str) {
+        /// Unix ミリ秒はこの桁を必ず超える (2001-09-09T01:46:40Z 相当)。秒で
+        /// 数えた現在時刻がここへ届くのは西暦 33658 年。
+        const MS_FLOOR: i64 = 1_000_000_000_000;
+        /// 時刻を運ぶ欄の名前。長さの欄 (`window_seconds`) は単位を名前に
+        /// 持つので、ここには入らない。
+        const TIMES: &[&str] = &[
+            "generated_at",
+            "observed_at",
+            "reset",
+            "resets_at",
+            "until",
+            "at",
+            "expires_at",
+            "last_success_at",
+            "created_at",
+            "updated_at",
+        ];
+
+        match value {
+            Value::Object(fields) => {
+                for (key, child) in fields {
+                    assert!(
+                        !key.ends_with("_iso"),
+                        "the same moment is spelled a second way at {path}.{key}"
+                    );
+                    if TIMES.contains(&key.as_str())
+                        && let Some(at) = child.as_i64()
+                    {
+                        assert!(
+                            at >= MS_FLOOR,
+                            "{path}.{key} looks like seconds, not milliseconds: {at}"
+                        );
+                    }
+                    assert_times_are_milliseconds(child, &format!("{path}.{key}"));
+                }
+            }
+            Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    assert_times_are_milliseconds(child, &format!("{path}[{index}]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// usage / status / stats の 3 つが同じ時刻の形で答える。
+    ///
+    /// 3 つを 1 つの試験で見るのは、揃っていることそのものが要件だから。
+    /// 片方だけ直しても気付けない形にしない。
+    #[tokio::test]
+    async fn every_report_speaks_one_time_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::tests::serve_with_default_ns(&format!(
+            r#"
+[stats]
+dir = "{}"
+
+[status.sources.provider]
+type = "link"
+page_url = "https://status.example/"
+
+[credentials.claude-personal]
+type = "claude_oauth"
+
+[routes.claude-personal]
+provider = "anthropic"
+credential = "claude-personal"
+status_source = "provider"
+url = "https://upstream.invalid"
+"#,
+            dir.path().display()
+        ))
+        .await;
+
+        for path in [
+            "/llm-gateway/usage",
+            "/llm-gateway/status",
+            "/llm-gateway/stats",
+        ] {
+            let response = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(response.status(), 200, "{path}");
+            let report: Value = response.json().await.unwrap();
+            assert!(
+                report["generated_at"].as_i64().is_some(),
+                "{path} says when it was made: {report}"
+            );
+            assert_times_are_milliseconds(&report, path);
+        }
     }
 
     /// status endpoint は source の有無にかかわらず configured service をすべて 200 で返す。

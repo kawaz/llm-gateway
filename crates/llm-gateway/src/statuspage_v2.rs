@@ -6,7 +6,7 @@ use futures_util::StreamExt as _;
 use serde::Deserialize;
 
 use crate::config::StatusSourceSpec;
-use crate::credential::time::now_unix;
+use crate::credential::time::{now_unix_ms, parse_rfc3339_ms};
 use crate::status::{Component, Incident, OfficialState, Snapshot};
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -103,7 +103,7 @@ impl StatusSource for Adapter {
         } = spec
         else {
             return Ok(Snapshot {
-                at: now_unix(),
+                at: now_unix_ms(),
                 state: OfficialState::Unknown,
                 components: vec![],
                 incidents: vec![],
@@ -180,8 +180,8 @@ impl StatusSource for Adapter {
                     name: i.name,
                     state: i.status,
                     impact: i.impact,
-                    created_at: i.created_at,
-                    updated_at: i.updated_at,
+                    created_at: parse_rfc3339_ms(&i.created_at),
+                    updated_at: parse_rfc3339_ms(&i.updated_at),
                     url: i.shortlink,
                     latest_update: latest,
                     scope: i.components.is_empty().then(|| "page".to_owned()),
@@ -189,7 +189,7 @@ impl StatusSource for Adapter {
             })
             .collect();
         Ok(Snapshot {
-            at: now_unix(),
+            at: now_unix_ms(),
             state,
             components: selected,
             incidents,

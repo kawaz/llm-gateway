@@ -393,7 +393,7 @@ impl<P: Persistence> Inner<P> {
     }
 
     async fn record_auth(&self, id: &CredentialId, outcome: &Result<()>) {
-        let observed_at = self.clock.now_unix();
+        let observed_at_ms = crate::credential::time::to_unix_ms(self.clock.now_unix());
         let (status, reason) = match outcome {
             Ok(()) => (crate::quota::AuthStatus::Ok, None),
             Err(error) => {
@@ -413,8 +413,7 @@ impl<P: Persistence> Inner<P> {
                 status,
                 reason,
                 login_path: None,
-                observed_at,
-                observed_at_iso: format_rfc3339(observed_at),
+                observed_at: observed_at_ms,
             },
         );
     }
@@ -1546,7 +1545,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let failed = store.auth_state(&id).await.unwrap();
         assert_eq!(failed.status, crate::quota::AuthStatus::ReloginRequired);
         assert!(failed.reason.unwrap().contains("llm-gateway login"));
-        assert_eq!(failed.observed_at, NOW);
+        assert_eq!(failed.observed_at, NOW * 1000, "観測時刻は Unix ミリ秒");
 
         let tokens = oauth::Tokens {
             access_token: "at-login".into(),
@@ -1566,7 +1565,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             recovered.reason.is_none(),
             "a successful refresh clears the failure reason"
         );
-        assert_eq!(recovered.observed_at, NOW);
+        assert_eq!(recovered.observed_at, NOW * 1000);
     }
 
     /// 一時的な失敗は再認可要求に昇格せず degraded として記録する。

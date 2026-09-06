@@ -13,7 +13,7 @@
 use serde::Deserialize;
 
 use crate::credential::Credential;
-use crate::credential::time::parse_rfc3339;
+use crate::credential::time::parse_rfc3339_ms;
 use crate::denial::{Denial, RESET_SLACK, Reason, Scope};
 use crate::egress::{BoxFuture, EgressRequest, Headers};
 use crate::provider::{ProbeRequest, QuotaApi};
@@ -80,13 +80,14 @@ impl QuotaApi for OauthUsage {
                 entries.push((scope, None));
                 continue;
             }
-            let Some(reset) = limit.resets_at.as_deref().and_then(parse_rfc3339) else {
+            let Some(reset_ms) = limit.resets_at else {
                 continue;
             };
             entries.push((
                 scope.clone(),
                 Some(Denial {
-                    until: reset + RESET_SLACK,
+                    // 締め出しの期限は秒で持つ。枠が開く時刻はミリ秒。
+                    until: crate::credential::time::to_unix_secs(reset_ms) + RESET_SLACK,
                     reason: Reason::Limited,
                     scope,
                 }),
@@ -217,7 +218,7 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
                     kind: e.kind,
                     percent: e.percent,
                     severity: e.severity,
-                    resets_at: e.resets_at,
+                    resets_at: e.resets_at.as_deref().and_then(parse_rfc3339_ms),
                     model_id: model.as_ref().and_then(|m| m.id.clone()),
                     model: model.and_then(|m| m.display_name),
                     is_active: e.is_active,
@@ -296,7 +297,7 @@ mod tests {
             kind: kind.to_owned(),
             percent,
             severity: None,
-            resets_at: resets_at.map(str::to_owned),
+            resets_at: resets_at.and_then(parse_rfc3339_ms),
             model: model.map(str::to_owned),
             model_id: None,
             window_seconds: crate::preset::anthropic::window_seconds(kind),
@@ -366,8 +367,14 @@ mod tests {
             "no identifier is returned when observed"
         );
         assert_eq!(
-            scoped.resets_at.as_deref(),
-            Some("2026-08-02T08:59:59.571875+00:00")
+            scoped.resets_at,
+            parse_rfc3339_ms("2026-08-02T08:59:59.571875+00:00"),
+            "上流の ISO はミリ秒の数へ直して持つ"
+        );
+        assert!(
+            scoped.resets_at.unwrap() >= 1_000_000_000_000,
+            "milliseconds, not seconds: {:?}",
+            scoped.resets_at
         );
     }
 

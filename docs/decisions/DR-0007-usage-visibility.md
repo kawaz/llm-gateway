@@ -35,7 +35,8 @@ kawaz の要望:
 
 `GET https://api.anthropic.com/api/oauth/usage` が、**トークンを使わずに**枠を返す
 (`authorization: Bearer <OAuth token>` / `anthropic-beta: oauth-2025-04-20` /
-`anthropic-version: 2023-06-01`)。ヘッダより広く、モデル別の枠まで載る:
+`anthropic-version: 2023-06-01`)。ヘッダより広く、モデル別の枠まで載る。下は
+upstream の生の応答で、`resets_at` の ISO 8601 はこちらが出すときミリ秒の数になる:
 
 ```json
 {"limits": [
@@ -103,6 +104,11 @@ Anthropic 側 Admin API の対象でもない (AWS Marketplace 課金)。**対�
 
 - `GET /llm-gateway/usage` — credential ごとの利用状況を JSON で返す
   (名前・種別・5h/7d の使用率とリセット時刻・上限フラグ・overage 可否・**取得時刻**)
+- **時刻の欄は数値 1 つで、単位は Unix ミリ秒** (DR-0012 と同じ規約)。
+  `generated_at` / `observed_at` / `reset` / `resets_at` / `denials[].until` の
+  すべてがこの形。upstream が秒 (`unified-5h-reset`) や ISO 8601 (`resets_at`)
+  で返す値は、載せる前にこちらで直す。長さの欄 (`window_seconds`) だけが秒で、
+  そちらは単位を名前が持つ
 - `?refresh=true` のときは専用の口にも聞き、`limits` をそのまま `limits` 欄に
   載せる。語は upstream のもの (`weekly_scoped` / `percent` / `resets_at`) を
   そのまま使う — 言い換えると、実物と照らす人が対応表を覚えることになる。

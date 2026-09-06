@@ -3,7 +3,6 @@
 use serde::Deserialize;
 
 use crate::credential::Credential;
-use crate::credential::time::format_rfc3339;
 use crate::denial::{Denial, RESET_SLACK, Reason, Scope};
 use crate::egress::BoxFuture;
 use crate::provider::{ProbeRequest, QuotaApi};
@@ -84,14 +83,12 @@ impl QuotaApi for WhamUsage {
                 if limit.percent < 100.0 {
                     return Some((scope, None));
                 }
-                let reset = limit
-                    .resets_at
-                    .as_deref()
-                    .and_then(crate::credential::time::parse_rfc3339)?;
+                let reset_ms = limit.resets_at?;
                 Some((
                     scope.clone(),
                     Some(Denial {
-                        until: reset + RESET_SLACK,
+                        // 締め出しの期限は秒で持つ。枠が開く時刻はミリ秒。
+                        until: crate::credential::time::to_unix_secs(reset_ms) + RESET_SLACK,
                         reason: Reason::Limited,
                         scope,
                     }),
@@ -141,7 +138,8 @@ fn parse(body: &str) -> Option<Vec<QuotaLimit>> {
             kind: kind.to_owned(),
             percent: window.used_percent,
             severity: (window.used_percent >= 100.0).then(|| "critical".to_owned()),
-            resets_at: window.reset_at.map(format_rfc3339),
+            // upstream は Unix 秒で返す。枠が開く時刻はミリ秒で持つ。
+            resets_at: window.reset_at.map(crate::credential::time::to_unix_ms),
             model: None,
             model_id: None,
             window_seconds: window.limit_window_seconds,

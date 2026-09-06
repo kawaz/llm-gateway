@@ -27,8 +27,7 @@ upstream に断られた (`Limited` / `Busy`) のかの区別は、pace_cap の�
 
 ```json
 {
-  "ts": 1755500000,
-  "ts_iso": "2026-08-19T12:00:00+09:00",
+  "ts": 1755500000000,
   "session_id": "…",
   "ns": "personal",
   "model": "claude-fable-5",

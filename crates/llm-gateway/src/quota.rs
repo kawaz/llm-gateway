@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::credential::CredentialId;
-use crate::credential::time::format_rfc3339;
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// provider の枠照会 API から得た枠 1 本。
@@ -49,8 +48,9 @@ pub struct QuotaLimit {
     pub percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<String>,
+    /// この枠が開く時刻 (Unix ミリ秒)。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<String>,
+    pub resets_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,12 +77,9 @@ pub struct Window {
     /// `allowed` など。上限に達しているかが分かる。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// リセット時刻 (Unix 秒)。
+    /// リセット時刻 (Unix ミリ秒)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset: Option<i64>,
-    /// 同じ時刻の ISO 8601 表記。人が読む側で変換し直さずに済む。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reset_iso: Option<String>,
     /// この窓が回る周期の長さ (秒)。
     ///
     /// 窓を周期の長さで比べるために使う (DR-0018 §2)。欄名 (`5h` / `7d`) は
@@ -100,10 +97,9 @@ impl Window {
         *self == Self::default()
     }
 
-    /// リセット時刻を入れる。ISO 表記は Unix 秒から起こす。
-    pub fn with_reset(mut self, reset: Option<i64>) -> Self {
-        self.reset = reset;
-        self.reset_iso = reset.map(format_rfc3339);
+    /// リセット時刻 (Unix ミリ秒) を入れる。
+    pub fn with_reset(mut self, reset_ms: Option<i64>) -> Self {
+        self.reset = reset_ms;
         self
     }
 
@@ -135,10 +131,9 @@ impl Overage {
 /// ある時点で観測した枠の状況。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// 観測した時刻 (Unix 秒)。**必ず付ける** — 古さが見えないと、
+    /// 観測した時刻 (Unix ミリ秒)。**必ず付ける** — 古さが見えないと、
     /// 使っていない credential の値を最新だと誤解する。
     pub observed_at: i64,
-    pub observed_at_iso: String,
     #[serde(rename = "5h", skip_serializing_if = "Option::is_none")]
     pub five_hour: Option<Window>,
     #[serde(rename = "7d", skip_serializing_if = "Option::is_none")]
@@ -153,7 +148,7 @@ impl Snapshot {
     /// `None` を返すのは大事で、ここで空のスナップショットを作ると
     /// 「観測した (中身は空)」と「まだ観測していない」が区別できなくなる。
     pub fn new(
-        observed_at: i64,
+        observed_at_ms: i64,
         five_hour: Option<Window>,
         seven_day: Option<Window>,
         overage: Option<Overage>,
@@ -162,8 +157,7 @@ impl Snapshot {
             return None;
         }
         Some(Self {
-            observed_at,
-            observed_at_iso: format_rfc3339(observed_at),
+            observed_at: observed_at_ms,
             five_hour,
             seven_day,
             overage,
@@ -179,7 +173,7 @@ impl Snapshot {
     ///
     /// 周期が一番長いものを長周期の欄に、それより短いものを短周期の欄に置く。
     /// 1 本も無ければ `None`。
-    pub fn from_limits(limits: &[QuotaLimit], observed_at: i64) -> Option<Self> {
+    pub fn from_limits(limits: &[QuotaLimit], observed_at_ms: i64) -> Option<Self> {
         let mut windows: Vec<&QuotaLimit> = limits
             .iter()
             .filter(|limit| limit.model.is_none() && limit.model_id.is_none())
@@ -193,17 +187,12 @@ impl Snapshot {
                 status: None,
                 ..Window::default()
             }
-            .with_reset(
-                limit
-                    .resets_at
-                    .as_deref()
-                    .and_then(crate::credential::time::parse_rfc3339),
-            )
+            .with_reset(limit.resets_at)
             .with_window_seconds(limit.window_seconds)
         };
         let longest = windows.pop()?;
         Self::new(
-            observed_at,
+            observed_at_ms,
             windows.pop().map(window),
             Some(window(longest)),
             None,
@@ -213,9 +202,9 @@ impl Snapshot {
     /// 上限の判定に使える窓を持っているか (DR-0019 §4)。
     ///
     /// 周期・リセット時刻・使用率が揃って初めて「どれだけ使ったか」が言える。
-    pub fn has_usable_window(&self, now: i64) -> bool {
+    pub fn has_usable_window(&self, now_ms: i64) -> bool {
         self.longest_window().is_some_and(|window| {
-            window.utilization.is_some() && window.reset.is_some_and(|reset| reset > now)
+            window.utilization.is_some() && window.reset.is_some_and(|reset| reset > now_ms)
         })
     }
 
@@ -313,7 +302,10 @@ impl QuotaStore {
         let credentials = saved.len();
         *self.latest.write().await = saved
             .into_iter()
-            .map(|(name, snapshot)| (CredentialId::new(name), snapshot))
+            .map(|(name, mut snapshot)| {
+                normalize_to_ms(&mut snapshot);
+                (CredentialId::new(name), snapshot)
+            })
             .collect();
         tracing::info!(credentials, "loaded usage from disk");
     }
@@ -350,6 +342,32 @@ impl QuotaStore {
     }
 }
 
+/// ディスクから読み戻した時刻を Unix ミリ秒へ揃える。
+///
+/// 置き場には秒で数えた時刻を書いたファイルが残っている。秒の値をミリ秒として
+/// 読むと 1970 年代の時刻になり、「56 年前に観測した値」として表に出る。桁で
+/// 見分けて直す — 現在時刻を秒で数えると 10 桁、ミリ秒なら 13 桁で、両者が
+/// 重なるのは西暦 33658 年まで無い。
+fn normalize_to_ms(snapshot: &mut Snapshot) {
+    /// これより小さい値は秒として書かれたもの (2001-09-09T01:46:40Z 相当)。
+    const MS_FLOOR: i64 = 1_000_000_000_000;
+
+    let to_ms = |value: &mut i64| {
+        if *value < MS_FLOOR {
+            *value *= 1000;
+        }
+    };
+    to_ms(&mut snapshot.observed_at);
+    for window in [snapshot.five_hour.as_mut(), snapshot.seven_day.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(reset) = window.reset.as_mut() {
+            to_ms(reset);
+        }
+    }
+}
+
 /// その credential の利用状況をどこまで出せるか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -368,6 +386,7 @@ pub enum Support {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialDenial {
     pub reason: crate::denial::Reason,
+    /// この印が解ける時刻 (Unix ミリ秒)。
     pub until: i64,
     /// モデル単位の印が効く対象。経路全体の印では欄ごと出さない。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,8 +409,8 @@ pub struct AuthState {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_path: Option<String>,
+    /// この状態を観測した時刻 (Unix ミリ秒)。
     pub observed_at: i64,
-    pub observed_at_iso: String,
 }
 
 /// credential 1 件分の報告。
@@ -454,8 +473,8 @@ pub struct Probe {
 /// 一括表示の中身。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
+    /// この報告を組んだ時刻 (Unix ミリ秒)。
     pub generated_at: i64,
-    pub generated_at_iso: String,
     /// `?refresh=true` のときだけ入る。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<Probe>,
@@ -463,10 +482,9 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn new(now: i64, credentials: Vec<CredentialUsage>) -> Self {
+    pub fn new(now_ms: i64, credentials: Vec<CredentialUsage>) -> Self {
         Self {
-            generated_at: now,
-            generated_at_iso: format_rfc3339(now),
+            generated_at: now_ms,
             probe: None,
             credentials,
         }
@@ -477,8 +495,8 @@ impl Report {
 mod tests {
     use super::*;
 
-    /// 2026-07-29T12:00:00Z
-    const NOW: i64 = 1_785_326_400;
+    /// 2026-07-29T12:00:00Z を Unix ミリ秒で。
+    const NOW: i64 = 1_785_326_400_000;
 
     fn store(dir: &std::path::Path) -> QuotaStore {
         QuotaStore::new(dir, "8402")
@@ -494,7 +512,7 @@ mod tests {
                     status: Some("allowed".to_owned()),
                     ..Window::default()
                 }
-                .with_reset(Some(1_785_344_400)),
+                .with_reset(Some(1_785_344_400_000)),
             ),
             Some(
                 Window {
@@ -502,7 +520,7 @@ mod tests {
                     status: Some("allowed".to_owned()),
                     ..Window::default()
                 }
-                .with_reset(Some(1_785_661_200)),
+                .with_reset(Some(1_785_661_200_000)),
             ),
             Some(Overage {
                 status: Some("disabled".to_owned()),
@@ -531,7 +549,7 @@ mod tests {
             kind: kind.to_owned(),
             percent,
             severity: None,
-            resets_at: Some(crate::credential::time::format_rfc3339(NOW + 1000)),
+            resets_at: Some(NOW + 1000),
             model: None,
             model_id: None,
             window_seconds,
@@ -602,16 +620,28 @@ mod tests {
         assert!(!no_period.has_usable_window(NOW));
     }
 
-    /// 取得時刻は Unix 秒と ISO の両方を出す。
+    /// 時刻は Unix ミリ秒の数 1 つ。秒として書くと 3 桁足りない。
     #[test]
     fn a_snapshot_always_carries_its_time() {
         let s = observed(NOW);
         assert_eq!(s.observed_at, NOW);
-        assert_eq!(s.observed_at_iso, "2026-07-29T12:00:00Z");
         assert_eq!(
-            s.five_hour.unwrap().reset_iso.as_deref(),
-            Some("2026-07-29T17:00:00Z"),
+            s.five_hour.unwrap().reset,
+            Some(1_785_344_400_000),
             "the window reset time is emitted in the same shape"
+        );
+
+        let json = serde_json::to_value(observed(NOW)).unwrap();
+        assert!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.ends_with("_iso")),
+            "the ISO twin is gone: {json}"
+        );
+        assert!(
+            json["observed_at"].as_i64().unwrap() >= 1_000_000_000_000,
+            "milliseconds, not seconds: {json}"
         );
     }
 
@@ -682,12 +712,45 @@ mod tests {
             restored.observed_at, NOW,
             "the observed time is restored too"
         );
-        assert_eq!(restored.observed_at_iso, "2026-07-29T12:00:00Z");
         assert_eq!(restored.five_hour.unwrap().utilization, Some(0.71));
         assert_eq!(
             restored.overage.unwrap().disabled_reason.as_deref(),
             Some("out_of_credits")
         );
+    }
+
+    /// 秒で数えた時刻を書いた前の置き場も、そのまま読み戻せる。
+    ///
+    /// 秒の値をミリ秒として読むと 1970 年代の時刻になり、最後の観測が「56 年前」
+    /// として表に出る。桁で見分けて直す。
+    #[tokio::test]
+    async fn a_file_written_in_seconds_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let seconds = NOW / 1000;
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            store.path(),
+            serde_json::json!({
+                "a": {
+                    "observed_at": seconds,
+                    "observed_at_iso": "2026-07-29T12:00:00Z",
+                    "5h": {"utilization": 0.71, "reset": seconds + 3600,
+                           "reset_iso": "2026-07-29T13:00:00Z"},
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        store.restore().await;
+
+        let restored = store
+            .get(&CredentialId::new("a"))
+            .await
+            .expect("読み戻せる");
+        assert_eq!(restored.observed_at, NOW, "秒はミリ秒へ直して読む");
+        assert_eq!(restored.five_hour.unwrap().reset, Some(NOW + 3_600_000));
     }
 
     /// 観測していなければ書かない。
@@ -875,14 +938,12 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(json["generated_at"], NOW);
-        assert_eq!(json["generated_at_iso"], "2026-07-29T12:00:00Z");
         assert!(json.get("probe").is_none(), "omitted without a probe");
 
         let c = &json["credentials"][0];
         assert_eq!(c["support"], "observed");
         assert_eq!(c["snapshot"]["5h"]["utilization"], 0.71);
-        assert_eq!(c["snapshot"]["5h"]["reset"], 1_785_344_400_i64);
-        assert_eq!(c["snapshot"]["5h"]["reset_iso"], "2026-07-29T17:00:00Z");
+        assert_eq!(c["snapshot"]["5h"]["reset"], 1_785_344_400_000_i64);
         assert_eq!(c["snapshot"]["7d"]["utilization"], 0.3);
         assert_eq!(
             c["snapshot"]["overage"]["disabled_reason"],
@@ -906,7 +967,6 @@ mod tests {
             reason: Some("run `llm-gateway login --type claude_oauth a`".to_owned()),
             login_path: None,
             observed_at: NOW,
-            observed_at_iso: format_rfc3339(NOW),
         });
         let json = serde_json::to_value(&credential).unwrap();
         assert_eq!(json["auth"]["status"], "relogin_required");

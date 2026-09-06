@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{Config, StatusConfig, StatusSourceSpec};
-use crate::credential::time::now_unix;
+use crate::credential::time::now_unix_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,8 +48,12 @@ pub struct Incident {
     pub name: String,
     pub state: String,
     pub impact: String,
-    pub created_at: String,
-    pub updated_at: String,
+    /// 障害が立った時刻 (Unix ミリ秒)。upstream の表記が読めなければ欄ごと出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+    /// 最後に更新された時刻 (Unix ミリ秒)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
     pub url: String,
     pub latest_update: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,6 +64,7 @@ pub struct Official {
     pub state: OfficialState,
     pub source: String,
     pub source_url: String,
+    /// 公式値を取りに行けた時刻 (Unix ミリ秒)。
     pub observed_at: Option<i64>,
     pub stale: bool,
     pub components: Vec<Component>,
@@ -69,6 +74,7 @@ pub struct Official {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
+    /// 失敗を観測した時刻 (Unix ミリ秒)。
     pub at: i64,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,8 +83,11 @@ pub struct Failure {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observed {
     pub state: ObservedState,
+    /// 最後に何かを観測した時刻 (Unix ミリ秒)。
     pub observed_at: Option<i64>,
+    /// その観測を現在状態として扱わなくなる時刻 (Unix ミリ秒)。
     pub expires_at: Option<i64>,
+    /// 最後に通った時刻 (Unix ミリ秒)。
     pub last_success_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<Failure>,
@@ -107,6 +116,7 @@ pub struct Overall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema_version: u8,
+    /// この報告を組んだ時刻 (Unix ミリ秒)。
     pub generated_at: i64,
     pub overall: Overall,
     pub services: Vec<Service>,
@@ -121,8 +131,8 @@ struct Inner {
     routes: BTreeMap<String, Option<String>>,
     sources: BTreeMap<String, Source>,
     observations: Mutex<BTreeMap<String, Observation>>,
-    /// 観測の到着順。報告する時刻は秒なので、同じ秒に届いた成功と失敗は
-    /// 時刻だけでは並べられない。どちらが後かは通し番号で決める。
+    /// 観測の到着順。同じミリ秒に届いた成功と失敗は時刻だけでは並べられない。
+    /// どちらが後かは通し番号で決める。
     sequence: AtomicU64,
 }
 struct Source {
@@ -281,7 +291,7 @@ impl Manager {
     }
     fn stamp(&self) -> Stamp {
         Stamp {
-            at: now_unix(),
+            at: now_unix_ms(),
             seq: self.inner.sequence.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -335,7 +345,7 @@ impl Manager {
         }
     }
     pub async fn report(&self) -> Report {
-        let now = now_unix();
+        let now = now_unix_ms();
         let obs = self.inner.observations.lock().await.clone();
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         // 設定した source は、まだどの route も指していなくても service として
@@ -399,7 +409,7 @@ impl Manager {
             .max()
             .unwrap_or(Severity::Unknown);
         Report {
-            schema_version: 1,
+            schema_version: 2,
             generated_at: now,
             overall: Overall {
                 severity: overall,
@@ -449,8 +459,8 @@ fn observed_from(
     let latest = success
         .map(|s| s.at)
         .max(failure.as_ref().map(|(s, _)| s.at));
-    let valid = latest.is_some_and(|x| now - x <= ttl.as_secs() as i64);
-    // 順序は到着順で決める。秒だけで比べると、同じ秒に届いた失敗が成功へ
+    let valid = latest.is_some_and(|x| now - x <= ttl.as_millis() as i64);
+    // 順序は到着順で決める。時刻だけで比べると、同じ目盛りに届いた失敗が成功へ
     // 埋もれる (逆は埋もれない) という向きの偏りが出る。
     let state = if !valid {
         ObservedState::Unknown
@@ -465,7 +475,7 @@ fn observed_from(
     Observed {
         state,
         observed_at: latest,
-        expires_at: latest.map(|x| x + ttl.as_secs() as i64),
+        expires_at: latest.map(|x| x + ttl.as_millis() as i64),
         last_success_at: success.map(|s| s.at),
         last_failure: failure.map(|(_, f)| f),
     }
@@ -489,7 +499,7 @@ fn official_from(
             source: kind.into(),
             source_url: url.into(),
             observed_at: Some(x.at),
-            stale: now - x.at > stale_after.as_secs() as i64,
+            stale: now - x.at > stale_after.as_millis() as i64,
             components: x.components.clone(),
             incidents: x.incidents.clone(),
             error: st.error.clone(),
@@ -609,7 +619,7 @@ models = ["m"]
         let source = m.inner.sources.get("provider").unwrap();
         let mut state = source.state.lock().await;
         state.snapshot = Some(Snapshot {
-            at: now_unix() - 2,
+            at: now_unix_ms() - 2_000,
             state: OfficialState::Operational,
             components: vec![],
             incidents: vec![],
@@ -658,7 +668,7 @@ models = ["m"]
             "route".into(),
             Observation {
                 success: Some(Stamp {
-                    at: now_unix() - 2,
+                    at: now_unix_ms() - 2_000,
                     seq: 0,
                 }),
                 failure: None,
@@ -868,7 +878,7 @@ models = ["m"]
         assert_eq!(observed.state, ObservedState::Failing);
         assert_eq!(
             observed.last_success_at, observed.observed_at,
-            "同秒なら成功も失敗も同じ時刻を持つ"
+            "同じ目盛りなら成功も失敗も同じ時刻を持つ"
         );
     }
 

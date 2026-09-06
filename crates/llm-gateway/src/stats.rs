@@ -326,7 +326,7 @@ impl Stats {
     ///
     /// `pricing` は 1 行ずつ単価を答える役。ここが単価表を持たないのは、
     /// いくら掛かるかを知っているのが答えた provider の側だから (DR-0014 §4)。
-    pub fn report(&self, days: usize, now: i64, pricing: &dyn PricingSource) -> Report {
+    pub fn report(&self, days: usize, now_ms: i64, pricing: &dyn PricingSource) -> Report {
         let mine = self.in_memory();
         // メモリに載っている日は、自分のファイルより新しい。その日だけ
         // 自分のファイルを読み飛ばす (両方足すと二重に数える)。読み戻しの
@@ -342,13 +342,13 @@ impl Stats {
         // 上限で抑えてから秒に直す (抑えないと桁あふれで起点が未来に回る)。
         if days > 0 {
             let back = (days.min(MAX_DAYS) as i64 - 1).saturating_mul(86_400);
-            let from = local_date(now.saturating_sub(back));
+            let now_secs = crate::credential::time::to_unix_secs(now_ms);
+            let from = local_date(now_secs.saturating_sub(back));
             merged.retain(|date, _| date.as_str() >= from.as_str());
         }
         let (days, total_usd) = price(merged, pricing);
         Report {
-            generated_at: now,
-            generated_at_iso: crate::credential::time::format_rfc3339(now),
+            generated_at: now_ms,
             days,
             total_usd,
         }
@@ -480,8 +480,8 @@ pub struct Day {
 /// 閲覧に出す形。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
+    /// この報告を組んだ時刻 (Unix ミリ秒)。
     pub generated_at: i64,
-    pub generated_at_iso: String,
     /// 日付 → 1 日分。
     pub days: BTreeMap<String, Day>,
     /// 全期間の合計。日ごとの合計と同じく、出せる分だけを足す。
@@ -531,6 +531,8 @@ mod tests {
 
     /// 2026-07-29T12:00:00Z
     const NOW: i64 = 1_785_326_400;
+    /// 同じ時刻を Unix ミリ秒で。報告が運ぶ時刻はこの数え方 (DR-0012)。
+    const NOW_MS: i64 = NOW * 1000;
 
     fn tokens(input: u64, output: u64) -> TokenUsage {
         let mut usage = TokenUsage::default();
@@ -630,7 +632,7 @@ mod tests {
         s.record(NOW, Some("a"), "m-cheap", &tokens(1_000_000, 0));
         s.record(NOW, Some("a"), "who-knows", &tokens(1_000_000, 0));
 
-        let day = &s.report(7, NOW, &Rates).days[&local_date(NOW)];
+        let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         let models = &day.credentials["a"];
         assert_eq!(models["m-cheap"].usd, Some(1.0));
         assert_eq!(
@@ -668,7 +670,7 @@ mod tests {
         s.record(NOW, None, "m", &tokens(1, 1));
 
         let asked = Asked(StdMutex::new(Vec::new()));
-        s.report(7, NOW, &asked);
+        s.report(7, NOW_MS, &asked);
 
         assert_eq!(
             asked.0.into_inner().unwrap(),
@@ -692,7 +694,7 @@ mod tests {
         s.record(NOW, Some("b"), "m-rich", &tokens(1_000_000, 0)); // $5
         s.record(NOW, Some("b"), "who-knows", &tokens(9_000_000, 0)); // 不明
 
-        let report = s.report(7, NOW, &Rates);
+        let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days[&local_date(NOW)].total_usd, Some(6.0));
         assert_eq!(report.total_usd, Some(6.0), "the total is the same sum");
     }
@@ -705,7 +707,7 @@ mod tests {
 
         s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
 
-        let report = s.report(7, NOW, &Rates);
+        let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days[&local_date(NOW)].total_usd, None);
         assert_eq!(report.total_usd, None);
     }
@@ -722,7 +724,7 @@ mod tests {
         usage.set(TokenKind::input_cache_read(), 1_000_000);
         s.record(NOW, Some("a"), "m-rich", &usage);
 
-        let day = &s.report(7, NOW, &Rates).days[&local_date(NOW)];
+        let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         assert_eq!(day.credentials["a"]["m-rich"].usd, Some(36.75));
     }
 
@@ -741,7 +743,7 @@ mod tests {
         usage.set("input.long_context", 900_000);
         s.record(NOW, Some("a"), "m-rich", &usage);
 
-        let entry = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
+        let entry = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
         assert_eq!(
             entry.usd,
             Some(5.0),
@@ -765,7 +767,7 @@ mod tests {
         s.record(NOW, Some("a"), "m-rich", &tokens(10, 5));
         s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
 
-        let json = serde_json::to_value(s.report(7, NOW, &Rates)).unwrap();
+        let json = serde_json::to_value(s.report(7, NOW_MS, &Rates)).unwrap();
         let models = &json["days"][local_date(NOW)]["credentials"]["a"];
         assert!(models["m-rich"].get("usd").is_some());
         assert!(models["who-knows"].get("usd").is_none(), "{models}");
@@ -988,7 +990,7 @@ mod tests {
         usage.set(TokenKind::input_cache_read(), 1_000_000);
         s.record(NOW, Some("normalized"), "m-rich", &usage);
 
-        let day = &s.report(7, NOW, &Rates).days[&local_date(NOW)];
+        let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         let legacy = day.credentials["legacy"]["m-rich"].usd;
         let normalized = day.credentials["normalized"]["m-rich"].usd;
         assert_eq!(legacy, Some(36.75));
@@ -1057,7 +1059,7 @@ mod tests {
         let s = stats(dir.path());
         s.record(NOW, Some("a"), "m", &tokens(1, 2));
 
-        let report = s.report(7, NOW, &Rates);
+        let report = s.report(7, NOW_MS, &Rates);
         let c = &report.days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "counts both writers");
         assert_eq!(input_of(c), 101);
@@ -1074,7 +1076,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(10, 5));
         s.flush().unwrap();
 
-        let c = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
+        let c = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "stays at one");
         assert_eq!(input_of(c), 10);
     }
@@ -1086,7 +1088,7 @@ mod tests {
         let s = stats(dir.path());
         s.record(NOW, Some("a"), "m", &tokens(3, 4));
 
-        let c = &s.report(7, NOW, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
+        let c = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(output_of(c), 4, "visible without waiting for a save");
     }
 
@@ -1098,7 +1100,7 @@ mod tests {
         s.record(NOW - 10 * 86_400, Some("a"), "m", &tokens(1, 1));
         s.record(NOW, Some("a"), "m", &tokens(2, 2));
 
-        let recent = s.report(7, NOW, &Rates);
+        let recent = s.report(7, NOW_MS, &Rates);
         assert_eq!(
             recent.days.len(),
             1,
@@ -1107,7 +1109,7 @@ mod tests {
         );
         assert!(recent.days.contains_key(&local_date(NOW)));
 
-        let all = s.report(0, NOW, &Rates);
+        let all = s.report(0, NOW_MS, &Rates);
         assert_eq!(all.days.len(), 2, "0 means no filtering");
     }
 
@@ -1119,7 +1121,7 @@ mod tests {
         s.record(NOW - 86_400, Some("a"), "m", &tokens(1, 1));
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
 
-        let today = s.report(1, NOW, &Rates);
+        let today = s.report(1, NOW_MS, &Rates);
         assert_eq!(today.days.len(), 1, "{:?}", today.days);
         assert!(today.days.contains_key(&local_date(NOW)));
     }
@@ -1129,7 +1131,7 @@ mod tests {
     fn a_missing_directory_reports_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let s = Stats::new(dir.path().join("not-yet"), "8402");
-        assert!(s.report(7, NOW, &Rates).days.is_empty());
+        assert!(s.report(7, NOW_MS, &Rates).days.is_empty());
         s.restore(NOW);
         assert!(s.in_memory().is_empty());
     }
@@ -1145,7 +1147,7 @@ mod tests {
         let s = stats(dir.path());
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
 
-        let report = s.report(7, NOW, &Rates);
+        let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days.len(), 1, "only its own: {:?}", report.days);
     }
 
@@ -1215,7 +1217,7 @@ mod tests {
             "10 days ago is not loaded into memory"
         );
 
-        let report = s.report(0, NOW, &Rates);
+        let report = s.report(0, NOW_MS, &Rates);
         let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 1, "a past day is read from the file");
         assert_eq!(input_of(c), 100);
@@ -1242,7 +1244,7 @@ mod tests {
         s.flush().unwrap();
 
         let s = stats(dir.path());
-        let report = s.report(0, NOW, &Rates);
+        let report = s.report(0, NOW_MS, &Rates);
         let c = &report.days[&local_date(old)].credentials["a"]["m"].counters;
         assert_eq!(c.requests, 2, "adds to the one already there");
         assert_eq!(input_of(c), 101, "not erased by the overwrite");
@@ -1366,7 +1368,7 @@ mod tests {
         s.record(NOW, Some("a"), "m", &tokens(1, 1));
 
         for days in [1, usize::MAX] {
-            let report = s.report(days, NOW, &Rates);
+            let report = s.report(days, NOW_MS, &Rates);
             assert!(
                 report.days.contains_key(&local_date(NOW)),
                 "today disappears with days={days}"

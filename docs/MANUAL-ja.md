@@ -177,6 +177,10 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/models
 `/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため
 (DR-0006)。運用系はいずれも認証を持たない。境界は手前で引く。
 
+**時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べない
+ので、人が読む形へは受け取った側で直す。名前に単位が入っている欄
+(`window_seconds` / `cache_ttl_secs`) だけが**長さ**で、こちらは秒。
+
 ### `GET /llm-gateway/healthz`
 
 生きているかだけを返す。credential にも upstream にも触らない。前段の
@@ -205,8 +209,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 
 ```json
 {
-  "generated_at": 1785326400,
-  "generated_at_iso": "2026-07-29T12:00:00Z",
+  "generated_at": 1785326400000,
   "probe": {"requests": 2, "model": "claude-haiku-4-5", "input_tokens": 18, "output_tokens": 1},
   "credentials": [
     {
@@ -217,13 +220,11 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
         "status": "relogin_required",
         "reason": "log in again",
         "login_path": "/llm-gateway/login/personal/start",
-        "observed_at": 1785326390,
-        "observed_at_iso": "2026-07-29T11:59:50Z"
+        "observed_at": 1785326390000
       },
       "snapshot": {
-        "observed_at": 1785326390,
-        "observed_at_iso": "2026-07-29T11:59:50Z",
-        "5h": {"utilization": 0.71, "status": "allowed", "reset": 1785340800, "window_seconds": 18000},
+        "observed_at": 1785326390000,
+        "5h": {"utilization": 0.71, "status": "allowed", "reset": 1785340800000, "window_seconds": 18000},
         "7d": {"utilization": 0.34, "status": "allowed"}
       }
     }
@@ -251,8 +252,8 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
 
 ```json
 {
-  "schema_version": 1,
-  "generated_at": 1785326400,
+  "schema_version": 2,
+  "generated_at": 1785326400000,
   "overall": {"severity": "ok", "service_counts": {"ok": 2, "warning": 0, "critical": 0, "unknown": 0}},
   "services": [
     {
@@ -264,12 +265,12 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
         "state": "operational",
         "source": "anthropic",
         "source_url": "https://status.anthropic.com/",
-        "observed_at": 1785326100,
+        "observed_at": 1785326100000,
         "stale": false,
         "components": [],
         "incidents": []
       },
-      "observed": {"state": "ok", "observed_at": 1785326390, "last_success_at": 1785326390}
+      "observed": {"state": "ok", "observed_at": 1785326390000, "last_success_at": 1785326390000}
     }
   ]
 }
@@ -297,8 +298,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 
 ```json
 {
-  "generated_at": 1785326400,
-  "generated_at_iso": "2026-07-29T12:00:00Z",
+  "generated_at": 1785326400000,
   "days": {
     "2026-07-29": {
       "credentials": {
@@ -339,10 +339,6 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 event: request
 data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_paused":false}
 ```
-
-**時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べない
-ので、人が読む形へは受け取った側で直す。名前に単位が入っている欄
-(`cache_ttl_secs`) だけが**長さ**で、こちらは秒。
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
@@ -437,7 +433,7 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 ```
 
 ```json
-{"ts":1785326400,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
+{"ts":1785326400000,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
 ```
 
 `origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば

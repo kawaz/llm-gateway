@@ -58,10 +58,14 @@ response body は出さず、tailnet / reverse proxy の境界を信頼する。
 全体の障害とは限らない。どちらか一方を真実として上書きせず、同じ service の中へ
 別々に載せる。
 
+**時刻の欄は数値 1 つで、単位は Unix ミリ秒** (DR-0012 と同じ規約)。公式 status
+page が ISO 8601 で返す時刻 (障害の `created_at` / `updated_at`) も、この形へ
+直してから載せる。読めない表記は欄ごと出さない。
+
 ```json
 {
-  "schema_version": 1,
-  "generated_at": 1787529600,
+  "schema_version": 2,
+  "generated_at": 1787529600000,
   "overall": {
     "severity": "critical",
     "service_counts": {
@@ -81,7 +85,7 @@ response body は出さず、tailnet / reverse proxy の境界を信頼する。
         "state": "major_outage",
         "source": "statuspage_v2",
         "source_url": "https://status.claude.com/",
-        "observed_at": 1787529580,
+        "observed_at": 1787529580000,
         "stale": false,
         "components": [
           {
@@ -96,8 +100,8 @@ response body は出さず、tailnet / reverse proxy の境界を信頼する。
             "name": "Elevated errors on the Claude API",
             "state": "investigating",
             "impact": "major",
-            "created_at": "2026-08-24T00:00:00Z",
-            "updated_at": "2026-08-24T00:10:00Z",
+            "created_at": 1787529600000,
+            "updated_at": 1787530200000,
             "url": "https://status.claude.com/incidents/incident-id",
             "latest_update": "We are investigating elevated error rates."
           }
@@ -105,11 +109,11 @@ response body は出さず、tailnet / reverse proxy の境界を信頼する。
       },
       "observed": {
         "state": "failing",
-        "observed_at": 1787529572,
-        "expires_at": 1787529872,
-        "last_success_at": 1787529000,
+        "observed_at": 1787529572000,
+        "expires_at": 1787529872000,
+        "last_success_at": 1787529000000,
         "last_failure": {
-          "at": 1787529572,
+          "at": 1787529572000,
           "kind": "upstream_http",
           "status": 529
         }
@@ -166,9 +170,8 @@ gateway が実通信から判断する語彙は、公式状態と混ざらない
 adapter が `upstream_http` と確定できる 529、transport error、provider 固有の
 `ResponseAdmission::Busy` だけを対象にする。
 
-報告する時刻は秒なので、同じ秒に成功と失敗が届くと時刻だけでは並べられない。
-どちらが後かは観測の到着順で決め、成功と失敗のどちらか一方が同秒で埋もれる
-偏りを作らない。
+同じ目盛りに成功と失敗が届くと時刻だけでは並べられない。どちらが後かは観測の
+到着順で決め、一方が埋もれる偏りを作らない。
 
 実測状態は履歴集計ではなく、route ごとの「最後の成功」と「最後の health failure」だけを
 メモリに持つ。`observation_ttl` の既定は 5 分。再起動後は `unknown` へ戻し、永続化しない。

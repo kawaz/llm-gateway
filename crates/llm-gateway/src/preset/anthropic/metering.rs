@@ -33,8 +33,8 @@ const MAX_JSON_BODY: usize = 4 * 1024 * 1024;
 pub struct AnthropicMetering;
 
 impl Metering for AnthropicMetering {
-    fn quota_snapshot(&self, headers: &Headers, observed_at: i64) -> Option<Snapshot> {
-        read_unified(headers, observed_at)
+    fn quota_snapshot(&self, headers: &Headers, observed_at_ms: i64) -> Option<Snapshot> {
+        read_unified(headers, observed_at_ms)
     }
 
     /// この応答は経路を締め出すか。するならいつまで、どの範囲で。
@@ -58,13 +58,13 @@ impl Metering for AnthropicMetering {
         headers: &Headers,
         _body: Option<&[u8]>,
         model: &str,
-        observed_at: i64,
+        observed_at_secs: i64,
     ) -> Option<Denial> {
         if !matches!(status, 429 | 529) {
             return None;
         }
         if status == 429
-            && let Some(reset) = last_reset(headers, observed_at)
+            && let Some(reset) = last_reset(headers, observed_at_secs)
         {
             return Some(Denial {
                 // 開くと言われた時刻ちょうどではなく、少し待ってから戻す。
@@ -75,7 +75,7 @@ impl Metering for AnthropicMetering {
         }
         let after = retry_after(headers).unwrap_or(DEFAULT_BACKOFF);
         Some(Denial {
-            until: observed_at + after.clamp(0, MAX_BACKOFF),
+            until: observed_at_secs + after.clamp(0, MAX_BACKOFF),
             reason: Reason::Busy,
             scope: Scope::Model(model.to_owned()),
         })
@@ -103,7 +103,7 @@ impl Metering for AnthropicMetering {
 /// undocumented なヘッダなので、読めた分だけ使って残りは `None` にする。
 /// 1 つも読めなければスナップショットを作らない — 空の器を置くと「観測した」
 /// と「まだ観測していない」が区別できなくなる。
-fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
+fn read_unified(headers: &Headers, now_ms: i64) -> Option<Snapshot> {
     let window = |prefix: &str| {
         let w = Window {
             utilization: headers
@@ -114,10 +114,12 @@ fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
                 .map(str::to_owned),
             ..Window::default()
         }
+        // ヘッダは Unix 秒で返る。スナップショットはミリ秒で持つ。
         .with_reset(
             headers
                 .get(&format!("anthropic-ratelimit-unified-{prefix}-reset"))
-                .and_then(|v| v.trim().parse().ok()),
+                .and_then(|v| v.trim().parse().ok())
+                .map(crate::credential::time::to_unix_ms),
         );
         // 周期は欄名そのものが答えなので、読めなくても付けられる。ただし
         // 中身が 1 つも読めなかった窓を「観測した」に変えないよう、空判定の
@@ -135,7 +137,7 @@ fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
     };
 
     Snapshot::new(
-        now,
+        now_ms,
         window("5h"),
         window("7d"),
         (!overage.is_empty()).then_some(overage),
@@ -147,16 +149,19 @@ fn read_unified(headers: &Headers, now: i64) -> Option<Snapshot> {
 /// **最も遅い方**を採る。5 時間の窓が開いても、7 日の窓が塞がったままなら
 /// このリクエストは通らない。早い方を採ると、開いていない相手に当てに行って
 /// 429 を貰い直すことになる。
-fn last_reset(headers: &Headers, now: i64) -> Option<i64> {
-    let snapshot = read_unified(headers, now)?;
+fn last_reset(headers: &Headers, now_secs: i64) -> Option<i64> {
+    let now_ms = crate::credential::time::to_unix_ms(now_secs);
+    let snapshot = read_unified(headers, now_ms)?;
     [snapshot.five_hour, snapshot.seven_day]
         .into_iter()
         .flatten()
         .filter(is_rejected)
         .filter_map(|w| w.reset)
         // 過ぎている時刻は手掛かりにならない。次の手掛かりへ落とす。
-        .filter(|reset| *reset > now)
+        .filter(|reset_ms| *reset_ms > now_ms)
         .max()
+        // 締め出しの期限は秒で持つ。
+        .map(crate::credential::time::to_unix_secs)
 }
 
 /// この窓は塞がっているか。
@@ -502,16 +507,15 @@ mod tests {
         let five = s.five_hour.unwrap();
         assert_eq!(five.utilization, Some(0.71));
         assert_eq!(five.status.as_deref(), Some("allowed"));
-        assert_eq!(five.reset, Some(1_785_344_400));
         assert_eq!(
-            five.reset_iso.as_deref(),
-            Some("2026-07-29T17:00:00Z"),
-            "emits both Unix seconds and ISO"
+            five.reset,
+            Some(1_785_344_400_000),
+            "秒で返るヘッダをミリ秒へ直して持つ"
         );
 
         let seven = s.seven_day.unwrap();
         assert_eq!(seven.utilization, Some(0.3));
-        assert_eq!(seven.reset, Some(1_785_661_200));
+        assert_eq!(seven.reset, Some(1_785_661_200_000));
 
         let overage = s.overage.unwrap();
         assert_eq!(overage.status.as_deref(), Some("disabled"));
@@ -582,7 +586,6 @@ mod tests {
         let five = s.five_hour.unwrap();
         assert_eq!(five.utilization, Some(0.9));
         assert_eq!(five.reset, None, "a missing value is None");
-        assert_eq!(five.reset_iso, None);
         assert!(s.overage.is_none());
         assert!(
             s.seven_day.is_none(),

@@ -6,6 +6,19 @@
 
 /// RFC 3339 を unix 秒にする。読めなければ `None`。
 pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    parse_parts(s).map(|(secs, _)| secs)
+}
+
+/// RFC 3339 を unix ミリ秒にする。読めなければ `None`。
+///
+/// 外から来る時刻 (枠の開く時刻・障害の発生時刻) を、こちらが出す形
+/// ([`now_unix_ms`] と同じ数え方) へ揃えるための入口。
+pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    parse_parts(s).map(|(secs, millis)| secs * 1000 + millis)
+}
+
+/// 秒とミリ秒に分けて読む。
+fn parse_parts(s: &str) -> Option<(i64, i64)> {
     let b = s.as_bytes();
     if b.len() < 19 {
         return None;
@@ -14,11 +27,19 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
 
-    // 小数秒 (`…:59.571539+00:00`) は秒より細かいので捨てる。枠の開く時刻は
-    // マイクロ秒まで返ってくるが、こちらが持つのは秒。
-    let zone = match b.get(19) {
-        Some(b'.') => 20 + b[20..].iter().take_while(|c| c.is_ascii_digit()).count(),
-        _ => 19,
+    // 小数秒 (`…:59.571539+00:00`) はミリ秒までを取り、それより細かい桁は
+    // 捨てる。枠の開く時刻はマイクロ秒まで返ってくる。
+    let (zone, millis) = match b.get(19) {
+        Some(b'.') => {
+            let digits = b[20..].iter().take_while(|c| c.is_ascii_digit()).count();
+            let ms = s
+                .get(20..20 + digits.min(3))
+                .and_then(|head| head.parse::<i64>().ok())
+                .map(|n| n * 10_i64.pow(3 - digits.min(3) as u32))
+                .unwrap_or(0);
+            (20 + digits, ms)
+        }
+        _ => (19, 0),
     };
 
     let offset = match b.get(zone) {
@@ -32,7 +53,10 @@ pub fn parse_rfc3339(s: &str) -> Option<i64> {
         Some(_) => return None,
     };
 
-    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset)
+    Some((
+        days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec - offset,
+        millis,
+    ))
 }
 
 /// unix 秒を RFC 3339 にする。
@@ -41,6 +65,25 @@ pub fn format_rfc3339(unix: i64) -> String {
     let (y, mo, d) = civil_from_days(days);
     let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// unix ミリ秒を RFC 3339 にする。秒より細かい桁は落とす。
+///
+/// JSON は数値 1 つで渡す (DR-0012) ので、人へ見せる形へ直すのは受け取った
+/// 側の仕事。CLI の表示がこれを使う。
+pub fn format_rfc3339_ms(unix_ms: i64) -> String {
+    format_rfc3339(unix_ms.div_euclid(1000))
+}
+
+/// unix ミリ秒を unix 秒にする。秒でしか意味を持たない計算 (日付の切り出し・
+/// 秒単位で持っている締め出しの期限) へ渡すときに使う。
+pub fn to_unix_secs(unix_ms: i64) -> i64 {
+    unix_ms.div_euclid(1000)
+}
+
+/// unix 秒を unix ミリ秒にする。
+pub fn to_unix_ms(unix: i64) -> i64 {
+    unix * 1000
 }
 
 /// 今この瞬間の unix 秒。
@@ -195,7 +238,37 @@ mod tests {
         }
     }
 
-    /// 枠の開く時刻はマイクロ秒まで返ってくる (DR-0007)。秒より細かい分は捨てる。
+    /// ミリ秒で読むと、小数秒はミリまで残り、それより細かい桁は落ちる。
+    #[test]
+    fn milliseconds_survive_the_parse() {
+        let base = parse_rfc3339("2026-08-02T08:59:59Z").unwrap() * 1000;
+        assert_eq!(parse_rfc3339_ms("2026-08-02T08:59:59Z"), Some(base));
+        assert_eq!(parse_rfc3339_ms("2026-08-02T08:59:59.5Z"), Some(base + 500));
+        assert_eq!(
+            parse_rfc3339_ms("2026-08-02T08:59:59.57Z"),
+            Some(base + 570)
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2026-08-02T08:59:59.571539+00:00"),
+            Some(base + 571),
+            "マイクロ秒はミリで切る"
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2026-08-02T17:59:59.571539+09:00"),
+            Some(base + 571),
+            "時差を引いても小数秒は同じ"
+        );
+    }
+
+    /// ミリ秒と秒は 1000 倍で行き来し、表示は秒の桁で揃う。
+    #[test]
+    fn milliseconds_convert_both_ways() {
+        assert_eq!(to_unix_ms(NOW), NOW * 1000);
+        assert_eq!(to_unix_secs(NOW * 1000 + 999), NOW);
+        assert_eq!(format_rfc3339_ms(NOW * 1000 + 999), format_rfc3339(NOW));
+    }
+
+    /// 秒として読むぶんには、枠の開く時刻の小数秒は今までどおり落ちる (DR-0007)。
     #[test]
     fn fractional_seconds_are_dropped() {
         let utc = parse_rfc3339("2026-08-02T08:59:59Z").unwrap();

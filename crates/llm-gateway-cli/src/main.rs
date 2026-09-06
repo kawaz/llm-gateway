@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
+use llm_gateway::credential::time::{format_rfc3339_ms, to_unix_secs};
 use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
 use llm_gateway::metering::TokenKind;
 use llm_gateway::quota::{CredentialUsage, Report, Window};
@@ -685,7 +686,7 @@ fn render_status(report: &StatusReport) -> String {
             .official
             .observed_at
             .or(service.observed.observed_at)
-            .map(|at| elapsed(report.generated_at.saturating_sub(at)))
+            .map(|at| elapsed_ms(report.generated_at.saturating_sub(at)))
             .unwrap_or_else(|| "-".to_owned());
         let stale = if service.official.stale { " stale" } else { "" };
         out.push_str(&format!(
@@ -710,7 +711,7 @@ fn render_status(report: &StatusReport) -> String {
 }
 
 fn render(report: &Report) -> String {
-    let now = report.generated_at;
+    let now_ms = report.generated_at;
     let color = color_enabled();
     let name_width = report
         .credentials
@@ -750,7 +751,7 @@ fn render(report: &Report) -> String {
                     out.push_str(&window_field(
                         '⏰',
                         s.five_hour.as_ref(),
-                        now,
+                        now_ms,
                         5 * 3600,
                         color,
                     ));
@@ -758,13 +759,13 @@ fn render(report: &Report) -> String {
                     out.push_str(&window_field(
                         '📆',
                         s.seven_day.as_ref(),
-                        now,
+                        now_ms,
                         7 * 86_400,
                         color,
                     ));
-                    let age = now - s.observed_at;
-                    if age > 300 {
-                        out.push_str(&format!(" ({})", elapsed(age)));
+                    let age_ms = now_ms - s.observed_at;
+                    if age_ms > 300_000 {
+                        out.push_str(&format!(" ({})", elapsed_ms(age_ms)));
                     }
                 }
                 None => out.push_str(match c.support {
@@ -981,23 +982,23 @@ fn thousands(n: u64) -> String {
 fn window_field(
     icon: char,
     window: Option<&Window>,
-    now: i64,
+    now_ms: i64,
     window_secs: i64,
     color: bool,
 ) -> String {
-    let (Some(util), Some(reset)) = (
+    let (Some(util), Some(reset_ms)) = (
         window.and_then(|w| w.utilization),
         window.and_then(|w| w.reset),
     ) else {
         return format!("{icon}-");
     };
     let util_pct = util * 100.0;
-    let elapsed_pct = calc_elapsed(reset, window_secs, now);
+    let elapsed_pct = calc_elapsed(reset_ms, window_secs * 1000, now_ms);
     let bar = dual_bar(util_pct, elapsed_pct, 10, color);
     // 7d 窓は日〜分をまたいで幅が揺れるので、先頭単位を 2 桁にして 6 桁固定にする。
     // 5h 窓は 10 時間に届かず 5 桁で揃うので、そのまま。
     let wide = window_secs >= 86_400;
-    let remaining = format_duration(reset - now, wide);
+    let remaining = format_duration(to_unix_secs(reset_ms - now_ms), wide);
     let info = dual_info(util_pct, elapsed_pct, &remaining, color);
     let expired = if window.is_some_and(|window| window.expired) {
         " (expired)"
@@ -1009,12 +1010,12 @@ fn window_field(
 
 /// リセット時刻とウィンドウ長から、窓の経過率 (0〜100) を逆算する。
 /// (claude-statusline `calcElapsed` の移植)
-fn calc_elapsed(reset: i64, window_secs: i64, now: i64) -> f64 {
-    if window_secs <= 0 {
+fn calc_elapsed(reset_ms: i64, window_ms: i64, now_ms: i64) -> f64 {
+    if window_ms <= 0 {
         return 0.0;
     }
-    let window_start = reset - window_secs;
-    let pct = (now - window_start) as f64 / window_secs as f64 * 100.0;
+    let window_start = reset_ms - window_ms;
+    let pct = (now_ms - window_start) as f64 / window_ms as f64 * 100.0;
     pct.clamp(0.0, 100.0)
 }
 
@@ -1127,6 +1128,12 @@ fn sgr_reset(color: bool) -> String {
     sgr("0", color)
 }
 
+/// 経過した長さ (ミリ秒) を人が読む形に。JSON の時刻は Unix ミリ秒なので、
+/// その差もミリ秒で来る。
+fn elapsed_ms(ms: i64) -> String {
+    elapsed(to_unix_secs(ms))
+}
+
 fn elapsed(secs: i64) -> String {
     match secs {
         s if s < 60 => "just now".to_owned(),
@@ -1153,26 +1160,12 @@ fn remarks(c: &CredentialUsage) -> Vec<String> {
             continue;
         };
         let mut line = format!("{}: the {model} limit is at {:.0}%", c.name, limit.percent);
-        if let Some(at) = &limit.resets_at {
-            line.push_str(&format!(" (resets at {})", to_the_second(at)));
+        if let Some(at_ms) = limit.resets_at {
+            line.push_str(&format!(" (resets at {})", format_rfc3339_ms(at_ms)));
         }
         lines.push(line);
     }
     lines
-}
-
-/// 端数の秒を落とす。
-///
-/// `2026-08-02T08:59:59.571875+00:00` → `2026-08-02T08:59:59+00:00`。
-/// 6 桁の端数まで読める人はいないので、行を短くする分だけ読みやすい。
-fn to_the_second(at: &str) -> String {
-    let Some(dot) = at.find('.') else {
-        return at.to_owned();
-    };
-    let zone = at[dot..]
-        .find(['+', '-', 'Z'])
-        .map_or(at.len(), |offset| dot + offset);
-    format!("{}{}", &at[..dot], &at[zone..])
 }
 
 /// 端末上の見た目の幅。日本語は 2 桁ぶん取る。
@@ -1874,15 +1867,15 @@ main = "keepalive"
         assert!(message.contains("launchctl"), "{message}");
     }
 
-    /// 2026-07-29T12:00:00Z
-    const NOW: i64 = 1_785_326_400;
+    /// 2026-07-29T12:00:00Z を Unix ミリ秒で。JSON の時刻はこの数え方 (DR-0012)。
+    const NOW: i64 = 1_785_326_400_000;
+    const SECOND: i64 = 1_000;
 
     fn window(utilization: f64, reset: i64, status: &str) -> Window {
         Window {
             utilization: Some(utilization),
             status: Some(status.to_owned()),
             reset: Some(reset),
-            reset_iso: Some(llm_gateway::credential::time::format_rfc3339(reset)),
             window_seconds: None,
             expired: false,
         }
@@ -1894,10 +1887,9 @@ main = "keepalive"
             "claude_oauth",
             llm_gateway::quota::Support::Observed,
             Some(llm_gateway::quota::Snapshot {
-                observed_at: NOW - 120,
-                observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW - 120),
-                five_hour: Some(window(0.71, NOW + 960, "allowed")),
-                seven_day: Some(window(0.3, NOW + 86_400 * 4, "allowed")),
+                observed_at: NOW - 120 * SECOND,
+                five_hour: Some(window(0.71, NOW + 960 * SECOND, "allowed")),
+                seven_day: Some(window(0.3, NOW + 86_400 * 4 * SECOND, "allowed")),
                 overage: None,
             }),
         )
@@ -1930,7 +1922,6 @@ main = "keepalive"
             reason: Some("run `llm-gateway login --type claude_oauth claude-personal`".to_owned()),
             login_path: None,
             observed_at: NOW,
-            observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
         });
         let out = render(&report(vec![credential]));
         assert!(out.contains("token rejected — relogin required"), "{out}");
@@ -1953,7 +1944,6 @@ main = "keepalive"
             reason: Some("the refresh endpoint returned 503".to_owned()),
             login_path: None,
             observed_at: NOW,
-            observed_at_iso: llm_gateway::credential::time::format_rfc3339(NOW),
         });
         let out = render(&report(vec![credential]));
         assert!(out.contains("refresh failing (transient)"), "{out}");
@@ -1992,7 +1982,9 @@ main = "keepalive"
                 kind: "weekly_all".to_owned(),
                 percent: 100.0,
                 severity: Some("critical".to_owned()),
-                resets_at: Some("2026-08-02T08:59:59.571539+00:00".to_owned()),
+                resets_at: llm_gateway::credential::time::parse_rfc3339_ms(
+                    "2026-08-02T08:59:59.571539+00:00",
+                ),
                 model: None,
                 model_id: None,
                 window_seconds: Some(7 * 24 * 60 * 60),
@@ -2002,7 +1994,9 @@ main = "keepalive"
                 kind: "weekly_scoped".to_owned(),
                 percent: 80.0,
                 severity: Some("warning".to_owned()),
-                resets_at: Some("2026-08-02T08:59:59.571875+00:00".to_owned()),
+                resets_at: llm_gateway::credential::time::parse_rfc3339_ms(
+                    "2026-08-02T08:59:59.571875+00:00",
+                ),
                 model: Some("Fable".to_owned()),
                 model_id: None,
                 window_seconds: Some(7 * 24 * 60 * 60),
@@ -2013,8 +2007,8 @@ main = "keepalive"
         let out = render(&report(vec![c]));
         assert!(out.contains("the Fable limit is at 80%"), "{out}");
         assert!(
-            out.contains("resets at 2026-08-02T08:59:59+00:00"),
-            "fractional seconds are dropped:\n{out}"
+            out.contains("resets at 2026-08-02T08:59:59Z"),
+            "the millisecond stamp is shown to the second:\n{out}"
         );
         assert!(
             !out.contains("weekly_all"),
@@ -2022,17 +2016,32 @@ main = "keepalive"
         );
     }
 
+    /// JSON は Unix ミリ秒で来るので、経過はミリ秒の差から組む。
     #[test]
-    fn a_timestamp_without_a_fraction_is_left_alone() {
+    fn elapsed_reads_a_millisecond_gap() {
+        assert_eq!(elapsed_ms(59 * SECOND), "just now");
+        assert_eq!(elapsed_ms(120 * SECOND), "2m ago");
+        assert_eq!(elapsed_ms(2 * 3600 * SECOND), "2h ago");
         assert_eq!(
-            to_the_second("2026-08-02T08:59:59Z"),
-            "2026-08-02T08:59:59Z"
+            elapsed_ms(999),
+            "just now",
+            "1 秒に満たない差でも桁を取り違えない"
         );
-        assert_eq!(
-            to_the_second("2026-08-02T08:59:59.5Z"),
-            "2026-08-02T08:59:59Z"
+    }
+
+    /// status の UPDATED 列も、ミリ秒の 2 つの時刻の差から組む。
+    #[test]
+    fn status_updated_column_reads_millisecond_stamps() {
+        let mut report = status_report(
+            llm_gateway::status::OfficialState::Operational,
+            false,
+            false,
         );
-        assert_eq!(to_the_second("いつか"), "いつか");
+        report.generated_at = 1_785_326_400_000;
+        report.services[0].official.observed_at = Some(1_785_326_400_000 - 7200 * SECOND);
+
+        let out = render_status(&report);
+        assert!(out.contains("2h ago"), "{out}");
     }
 
     /// 取得から 5 分を超えたスナップショットだけ古さを添える。
@@ -2040,7 +2049,7 @@ main = "keepalive"
     fn shows_age_only_when_snapshot_is_stale() {
         let mut c = observed();
         if let Some(s) = c.snapshot.as_mut() {
-            s.observed_at = NOW - 400;
+            s.observed_at = NOW - 400 * SECOND;
         }
         let out = render(&report(vec![c]));
         assert!(out.contains("(6m ago)"), "{out}");
@@ -2055,7 +2064,7 @@ main = "keepalive"
     fn a_snapshot_restored_from_disk_shows_how_old_it_is() {
         let mut c = observed();
         if let Some(s) = c.snapshot.as_mut() {
-            s.observed_at = NOW - 3 * 3600;
+            s.observed_at = NOW - 3 * 3600 * SECOND;
         }
         let out = render(&report(vec![c]));
         assert!(out.contains("(3h ago)"), "{out}");
@@ -2285,8 +2294,7 @@ main = "keepalive"
         // JSON を経由するのは、server が返す形をそのまま読めることも一緒に
         // 確かめられるため。
         serde_json::from_value(serde_json::json!({
-            "generated_at": 1_785_326_400_i64,
-            "generated_at_iso": "2026-07-29T12:00:00Z",
+            "generated_at": 1_785_326_400_000_i64,
             "days": by_date,
             "total_usd": grand,
         }))
@@ -2633,8 +2641,8 @@ main = "keepalive"
     ) -> StatusReport {
         use llm_gateway::status::*;
         StatusReport {
-            schema_version: 1,
-            generated_at: 100,
+            schema_version: 2,
+            generated_at: 100_000,
             overall: Overall {
                 severity: Severity::Unknown,
                 service_counts: Counts::default(),
@@ -2652,7 +2660,7 @@ main = "keepalive"
                     state,
                     source: "statuspage_v2".into(),
                     source_url: "https://status.example/".into(),
-                    observed_at: Some(90),
+                    observed_at: Some(90_000),
                     stale,
                     components: vec![],
                     incidents: incident
@@ -2661,8 +2669,8 @@ main = "keepalive"
                             name: "Incident".into(),
                             state: "investigating".into(),
                             impact: "minor".into(),
-                            created_at: "".into(),
-                            updated_at: "".into(),
+                            created_at: None,
+                            updated_at: None,
                             url: "https://stspg.io/i".into(),
                             latest_update: "".into(),
                             scope: None,

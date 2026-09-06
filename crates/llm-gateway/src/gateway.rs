@@ -291,8 +291,8 @@ impl<P: Persistence> Gateway<P> {
     ///
     /// USD は読み出しのたびに換算する。単価を知っているのは答えた経路の
     /// provider なので、集計の器には引き当て役を渡す (DR-0014 §4)。
-    pub fn stats_report(&self, days: usize, now: i64) -> stats::Report {
-        self.stats.report(days, now, &RoutePricing(&self.router))
+    pub fn stats_report(&self, days: usize, now_ms: i64) -> stats::Report {
+        self.stats.report(days, now_ms, &RoutePricing(&self.router))
     }
 
     /// 転送のたびに起きたことを流す口 (DR-0012)。
@@ -971,9 +971,9 @@ impl<P: Persistence> Gateway<P> {
 
         // 便乗して枠を拾う (DR-0007)。読むのはヘッダだけなので、本文はこの後も
         // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
-        let now = now_unix();
+        let now_ms = now_unix_ms();
         if let Some(id) = &route.credential
-            && let Some(snapshot) = route.preset.observe_quota(&resp.response.headers, now)
+            && let Some(snapshot) = route.preset.observe_quota(&resp.response.headers, now_ms)
         {
             self.usage.observe(id, snapshot).await;
         }
@@ -1117,7 +1117,9 @@ impl<P: Persistence> Gateway<P> {
             None
         };
 
-        let now = now_unix();
+        // 報告に載る時刻は Unix ミリ秒 (DR-0012)。締め出しの印だけは秒で持つ。
+        let now_ms = now_unix_ms();
+        let now_secs = crate::credential::time::to_unix_secs(now_ms);
         let mut credentials = Vec::new();
         for (name, route) in &self.config.routes {
             // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
@@ -1125,7 +1127,7 @@ impl<P: Persistence> Gateway<P> {
             let preset = self.router.preset(name);
             let mut snapshot = preset.and_then(|preset| preset.quota());
             if let Some(snapshot) = snapshot.as_mut() {
-                mark_expired_windows(snapshot, now);
+                mark_expired_windows(snapshot, now_ms);
             }
             let support = preset.map_or(
                 // 経路を組めなかった名前について、こちらから言えることは無い。
@@ -1147,10 +1149,10 @@ impl<P: Persistence> Gateway<P> {
             }
             entry.denials = preset
                 .into_iter()
-                .flat_map(|preset| preset.denials(now))
+                .flat_map(|preset| preset.denials(now_secs))
                 .map(|denial| quota::CredentialDenial {
                     reason: denial.reason,
-                    until: denial.until,
+                    until: crate::credential::time::to_unix_ms(denial.until),
                     model: match denial.scope {
                         crate::denial::Scope::Everything => None,
                         crate::denial::Scope::Model(model)
@@ -1167,7 +1169,7 @@ impl<P: Persistence> Gateway<P> {
             credentials.push(entry);
         }
 
-        let mut report = quota::Report::new(now_unix(), credentials);
+        let mut report = quota::Report::new(now_ms, credentials);
         report.probe = probed.map(|p| p.spent);
         report
     }
@@ -1385,7 +1387,7 @@ impl<P: Persistence> Gateway<P> {
         // 上限に当たった応答にも使用率は載る。状態を見る前に拾っておく。
         let status = resp.status;
         let content_type = resp.headers.get("content-type").map(str::to_owned);
-        if let Some(snapshot) = preset.observe_quota(&resp.headers, now_unix()) {
+        if let Some(snapshot) = preset.observe_quota(&resp.headers, now_unix_ms()) {
             self.usage.observe(id, snapshot).await;
         }
 
@@ -1687,12 +1689,12 @@ fn add_login_path(auth: &mut Option<quota::AuthState>, supports_web_login: bool,
     auth.login_path = Some(url.path().to_owned());
 }
 
-fn mark_expired_windows(snapshot: &mut quota::Snapshot, now: i64) {
+fn mark_expired_windows(snapshot: &mut quota::Snapshot, now_ms: i64) {
     for window in [snapshot.five_hour.as_mut(), snapshot.seven_day.as_mut()]
         .into_iter()
         .flatten()
     {
-        window.expired = window.reset.is_some_and(|reset| reset < now);
+        window.expired = window.reset.is_some_and(|reset| reset < now_ms);
     }
 }
 
@@ -4075,9 +4077,10 @@ models = ["m"]
         assert_eq!(
             serde_json::to_value(entry).unwrap()["denials"],
             json!([
-                {"reason": "limited", "until": now + 300},
-                {"reason": "busy", "until": now + 60, "model": "m-fable"},
-            ])
+                {"reason": "limited", "until": (now + 300) * 1000},
+                {"reason": "busy", "until": (now + 60) * 1000, "model": "m-fable"},
+            ]),
+            "締め出しが解ける時刻も Unix ミリ秒で出す"
         );
     }
 
@@ -4545,8 +4548,7 @@ routes = ["route"]
                 status,
                 reason: None,
                 login_path: None,
-                observed_at: 100,
-                observed_at_iso: "1970-01-01T00:01:40Z".to_owned(),
+                observed_at: 100_000,
             })
         };
 

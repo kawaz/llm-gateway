@@ -15,7 +15,7 @@ const MAX_BACKOFF: i64 = 7 * 24 * 60 * 60;
 pub struct OpenAiMetering;
 
 impl Metering for OpenAiMetering {
-    fn quota_snapshot(&self, headers: &Headers, observed_at: i64) -> Option<Snapshot> {
+    fn quota_snapshot(&self, headers: &Headers, observed_at_ms: i64) -> Option<Snapshot> {
         let window = |name: &str| {
             let percent = header_f64(headers, &format!("x-codex-{name}-used-percent"));
             let reset = header_i64(headers, &format!("x-codex-{name}-reset-at"));
@@ -31,7 +31,8 @@ impl Metering for OpenAiMetering {
                 status,
                 ..Window::default()
             }
-            .with_reset(reset);
+            // ヘッダは Unix 秒で返る。スナップショットはミリ秒で持つ。
+            .with_reset(reset.map(crate::credential::time::to_unix_ms));
             // 周期は分で返る。中身が 1 つも読めなかった窓を「観測した」に
             // 変えないよう、空判定の後に付ける。
             let minutes = header_i64(headers, &format!("x-codex-{name}-window-minutes"));
@@ -52,7 +53,7 @@ impl Metering for OpenAiMetering {
             disabled_reason: reached,
         };
         Snapshot::new(
-            observed_at,
+            observed_at_ms,
             window("primary"),
             window("secondary"),
             (!overage.is_empty()).then_some(overage),
@@ -65,7 +66,7 @@ impl Metering for OpenAiMetering {
         headers: &Headers,
         body: Option<&[u8]>,
         model: &str,
-        observed_at: i64,
+        observed_at_secs: i64,
     ) -> Option<Denial> {
         if status != 429 {
             return None;
@@ -77,9 +78,9 @@ impl Metering for OpenAiMetering {
                     .is_some_and(|used| used >= 100.0)
             })
             .filter_map(|name| header_i64(headers, &format!("x-codex-{name}-reset-at")))
-            .filter(|reset| *reset > observed_at)
+            .filter(|reset| *reset > observed_at_secs)
             .max()
-            .or_else(|| reset_from_body(body, observed_at));
+            .or_else(|| reset_from_body(body, observed_at_secs));
         if let Some(reset) = reset {
             return Some(Denial {
                 until: reset + RESET_SLACK,
@@ -93,7 +94,7 @@ impl Metering for OpenAiMetering {
             .unwrap_or(DEFAULT_BACKOFF)
             .clamp(0, MAX_BACKOFF);
         Some(Denial {
-            until: observed_at + after,
+            until: observed_at_secs + after,
             reason: Reason::Busy,
             scope: Scope::Model(model.to_owned()),
         })
@@ -318,7 +319,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.longest_window().and_then(|w| w.reset),
-            Some(1_800_005_000),
+            Some(1_800_005_000_000),
             "the weekly window is the longest one"
         );
     }
