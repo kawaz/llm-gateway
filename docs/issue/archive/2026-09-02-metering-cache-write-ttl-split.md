@@ -1,6 +1,6 @@
 ---
 title: metering が cache write の 1h/5m TTL 内訳を拾えていない
-status: wip
+status: resolved
 category: bug
 created: 2026-09-02T14:04:03+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T15:40:08+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T15:56:34+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0014","change tttxtywk: TokenKind に cache_creation の 1h/5m 内訳を追加、Pricing の refines 親子関係で内訳の単価差分を課金、stats に w_1h/w_5m 列追加"]
 blocked_by:
 origin: 自リポ TODO
 ---
