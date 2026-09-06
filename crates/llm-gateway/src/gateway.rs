@@ -1159,6 +1159,10 @@ impl<P: Persistence> Gateway<P> {
             // 枠を聞くのが先。こちらはトークンを使わないので、この後の
             // 最小リクエストが失敗しても、枠だけは見えるようにしておく。
             if let Some(found) = self.ask_limits(&id, preset).await {
+                // 一覧に載せるだけでなく経路の印にも引き直す。ヘッダで観測できる
+                // まで何も知らない経路 (codex は実リクエストが通るまで窓を持たない)
+                // が、聞けた答えで spend_down (DR-0018) を判定できるようになる。
+                preset.apply_quota(&found, now_unix());
                 limits.insert(name.to_owned(), found);
             }
 
@@ -1234,7 +1238,13 @@ impl<P: Persistence> Gateway<P> {
                 return None;
             }
         };
-        api.fetch(&self.http, &credential).await.ok()
+        match api.fetch(&self.http, &credential).await {
+            Ok(limits) => Some(limits),
+            Err(e) => {
+                warn!(credential = %id, %e, "cannot query the quota");
+                None
+            }
+        }
     }
 
     /// 1 つの経路に投げて、ヘッダを拾う。返すのは消費したトークン。
@@ -4122,6 +4132,12 @@ models = ["m"]
             "identifies which model the limit is for"
         );
         assert_eq!(limits[1].percent, 80.0);
+        // 聞けた答えは一覧に載るだけでなく、ヘッダの観測が無い経路の印にもなる
+        // (= 実リクエストが通る前でも spend_down が判定できる)。
+        assert!(
+            subscription.snapshot.is_some(),
+            "the queried limits stand in for the snapshot until a header is seen"
+        );
 
         let other = report
             .credentials
