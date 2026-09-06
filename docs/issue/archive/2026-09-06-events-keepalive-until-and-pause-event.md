@@ -1,6 +1,6 @@
 ---
 title: request event に keepalive の終端 (keepalive_until) を載せ、pause 時に event を出す
-status: wip
+status: resolved
 category: request
 created: 2026-09-06T19:03:13+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T19:04:14+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T19:46:18+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented:change oqlqyprp", "done:仕様拡張 (時刻欄を Unix ms 整数に統一、_iso 全廃、request event に cache_since/cache_count/next_keepalive_at/cache_until/cache_until_count/cache_breakeven_until/cache_breakeven_count/cache_paused を追加、keepalive_paused を cache_paused に置換、pause 時 type=keepalive_paused event。cache_until は horizon を跨いだ最後の1本まで出る実挙動と同じ計算)", "dr/DR-0012:implemented", "dr/DR-0024:implemented", "done:MANUAL 更新", "done:ccmsg には r276 で新形式を通知済み", "related:api-timestamps-unix-ms (usage/status/stats の ms 化は別 issue)"]
 blocked_by:
 origin: 自リポ TODO
 ---
