@@ -1,11 +1,11 @@
 ---
 title: metering が cache write の 1h/5m TTL 内訳を拾えていない
-status: open
+status: wip
 category: bug
 created: 2026-09-02T14:04:03+09:00
 last_read:
 open_entered: 2026-09-02T14:04:03+09:00
-wip_entered:
+wip_entered: 2026-09-06T15:40:08+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
