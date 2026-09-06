@@ -1,6 +1,6 @@
 ---
 title: 応答完了の event (stop_reason 付き) を出して ccmsg がターン終了 = 入力待ちを判定できるようにする
-status: wip
+status: resolved
 category: design
 created: 2026-09-06T21:38:05+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-06T21:39:07+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T22:10:04+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented (change rouywnno)","dr/DR-0012","done:ccmsg には固まった時点で欄の形を送る"]
 blocked_by:
 origin: 自リポ TODO
 ---
