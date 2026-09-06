@@ -1,11 +1,11 @@
 ---
 title: DR-0021 status API レビュー Minor 指摘 7 件
-status: open
+status: wip
 category: tech-memo
 created: 2026-08-25T14:23:19+09:00
 last_read:
 open_entered: 2026-08-25T14:23:19+09:00
-wip_entered:
+wip_entered: 2026-09-06T16:00:06+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
