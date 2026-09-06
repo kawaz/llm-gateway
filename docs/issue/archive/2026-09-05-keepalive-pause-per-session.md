@@ -1,6 +1,6 @@
 ---
 title: セッション単位で keepalive を止める API (兄弟 gateway へ中継)
-status: wip
+status: resolved
 category: task
 created: 2026-09-05T19:50:52+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-05T19:51:49+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-06T15:04:16+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0024","implemented","done: v0.38.0 (pause API / 永続化 / 兄弟中継 / 起動時同期 / event の keepalive_paused) + v0.38.1 (解除の兄弟中継) で出荷、両 config に peers 設定済み","done: 実機確認 2026-09-06 (pause -> 両 instance 停止、実リクエストで両 instance 解除)","done: ccmsg 側 webui ボタンは claude-ccmsg リポ issue keepalive-pause-button に依頼済み"]
 blocked_by:
 origin:
 ---
