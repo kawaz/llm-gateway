@@ -1,11 +1,11 @@
 ---
 title: codex CLI をクライアントにする: Responses API の受け口 + codex 上流へのパススルー
-status: open
+status: wip
 category: design
 created: 2026-09-07T11:18:28+09:00
 last_read:
 open_entered: 2026-09-07T11:18:28+09:00
-wip_entered:
+wip_entered: 2026-09-07T11:19:32+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
