@@ -111,6 +111,7 @@ headers = { x-trace = "on" }
                 query: None,
                 body: serde_json::json!({"model": "m"}),
                 headers: crate::egress::Headers::default(),
+                shape: crate::egress::RequestShape::Messages,
             })
             .unwrap();
 

@@ -1,7 +1,9 @@
-//! HTTP 層。Anthropic Messages API を話す口を生やす。
+//! HTTP 層。クライアントが話す API の口を生やす。
 //!
-//! 実運用のログから、クライアントが叩くのは 3 つと分かっている:
+//! 実運用のログから、Claude Code が叩くのは 3 つと分かっている:
 //! `POST /v1/messages` / `POST /v1/messages/count_tokens` / `GET /v1/models`。
+//! codex CLI 向けに `POST /v1/responses` も受ける (DR-0025)。どの形で受けたかは
+//! [`RequestShape`] で転送側へ渡す — 経路の選び方も本文の扱い方もそこで変わる。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,7 +23,8 @@ use tracing::{Instrument as _, error, warn};
 use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::time::{now_unix, now_unix_ms};
 use llm_gateway::credential::{CredentialId, Persistence};
-use llm_gateway::gateway::RELAYED_HEADER;
+use llm_gateway::egress::RequestShape;
+use llm_gateway::gateway::{Ingress, RELAYED_HEADER};
 use llm_gateway::{Error, Gateway, exchange};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -38,10 +41,13 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/{ns}/v1/messages", post(messages))
         .route("/{ns}/v1/messages/count_tokens", post(messages))
         .route("/{ns}/v1/models", get(models))
+        // codex CLI のような Responses API を話すクライアント (DR-0025)。
+        .route("/{ns}/v1/responses", post(responses))
         // 付けなければ既定の namespace。単一の用途で使う分には意識しなくてよい。
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages))
         .route("/v1/models", get(models))
+        .route("/v1/responses", post(responses))
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/usage", get(usage))
@@ -611,6 +617,26 @@ async fn messages<P: Persistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
+    forward(gateway, request, RequestShape::Messages).await
+}
+
+/// Responses 形式の受け口 (DR-0025)。
+///
+/// 本文は model 欄の解決以外そのままで、応答も無変換で返す。認証だけ
+/// gateway が差し替える。
+async fn responses<P: Persistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    forward(gateway, request, RequestShape::Responses).await
+}
+
+/// 1 本を転送する。受け口ごとに違うのは、受けた本文の形だけ。
+async fn forward<P: Persistence + 'static>(
+    gateway: Arc<Gateway<P>>,
+    request: Request,
+    shape: RequestShape,
+) -> Response {
     let (parts, body) = request.into_parts();
     let uri = parts.uri.clone();
 
@@ -680,13 +706,27 @@ async fn messages<P: Persistence + 'static>(
     let tap_stream = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let tap_request_body =
         tap_plan.and_then(|plan| llm_gateway::tap::capture(&bytes, plan.request_body));
-    apply_thinking_display(&mut json, ns.thinking_display);
+    // namespace の thinking 方針は Messages 形式の欄に書く指示。Responses 形式の
+    // 本文には置き場所が無いので当てない (DR-0025)。
+    if shape == RequestShape::Messages {
+        apply_thinking_display(&mut json, ns.thinking_display);
+    }
 
     let path = upstream_path(uri.path()).to_owned();
     let query = uri.query().map(str::to_owned);
 
     match gateway
-        .forward(ns, &ns_name, &path, query.as_deref(), json, headers)
+        .forward(
+            ns,
+            &ns_name,
+            Ingress {
+                path: &path,
+                query: query.as_deref(),
+                shape,
+            },
+            json,
+            headers,
+        )
         .instrument(span.clone())
         .await
     {
@@ -834,7 +874,9 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 /// Anthropic のエラー形式に合わせる。クライアントはこの形を読める。
 fn error_response(ns: &str, e: &Error) -> Response {
     let (status, kind) = match e {
-        Error::UnknownModel(_) => (StatusCode::NOT_FOUND, "not_found_error"),
+        Error::UnknownModel(_) | Error::UnsupportedRequestShape { .. } => {
+            (StatusCode::NOT_FOUND, "not_found_error")
+        }
         Error::AllUpstreamsFailed { .. } | Error::UpstreamUnreachable { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "api_error")
         }
@@ -2140,6 +2182,43 @@ routes = ["a"]
             "carries over the upstream headers"
         );
         assert!(resp.text().await.unwrap().contains("ok"));
+    }
+
+    /// Responses 形式の受け口は生えているが、運べる経路が無ければ 404 (DR-0025)。
+    ///
+    /// 口が無い (405 / 404 not_found の既定文) のと、口はあるが経路が無いのは
+    /// 別の話。後者は文言で見分けが付かないと、設定を直すのか受け口を変えるのか
+    /// が分からない。
+    #[tokio::test]
+    async fn a_responses_request_without_a_capable_route_is_a_readable_404() {
+        let upstream = fake_upstream(|| (200, "{}".to_owned(), vec![])).await;
+        let base = serve_with_default_ns(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await;
+
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/responses"))
+                .json(&serde_json::json!({"model": "m", "input": []})),
+        )
+        .send()
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 404);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("responses"), "{body}");
+        assert!(body.contains("`m`"), "{body}");
     }
 
     /// SSE がそのまま流れる。イベントの形を崩さない。

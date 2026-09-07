@@ -64,6 +64,7 @@ mod tests {
                 query: None,
                 body: json!({"model": "gpt-5.6-sol"}),
                 headers: Headers::default(),
+                shape: crate::egress::RequestShape::Messages,
             })
             .unwrap();
 

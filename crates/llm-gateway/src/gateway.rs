@@ -21,7 +21,7 @@ use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms};
 use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
 use crate::denial::Probing;
-use crate::egress::{self, EgressRequest, Headers, Response, SentResponse};
+use crate::egress::{self, EgressRequest, Headers, RequestShape, Response, SentResponse};
 use crate::error::UpstreamAttempt;
 use crate::events::{self, Events};
 use crate::exchange;
@@ -440,16 +440,16 @@ impl<P: Persistence> Gateway<P> {
 
     /// 転送する。
     ///
-    /// `path` は `/v1/messages` のようなクライアントが叩いたパス。
+    /// 受け口が受け取った宛先と形は [`Ingress`] にまとめて渡す。
     pub async fn forward(
         &self,
         ns: &Namespace,
         ns_name: &str,
-        path: &str,
-        query: Option<&str>,
+        received: Ingress<'_>,
         mut body: Value,
         headers: Vec<(String, String)>,
     ) -> Result<Forwarded> {
+        let Ingress { path, query, shape } = received;
         let requested = egress::model_of(&body)?.to_owned();
 
         // `opus` のような短い名前は、ここで実際のモデル名に直す。
@@ -502,14 +502,27 @@ impl<P: Persistence> Gateway<P> {
             series,
             keepalive: marker,
             cache_paused,
+            shape,
         };
         // 応答に添える 1 語。`model` を返り値へ渡した後は call を読めないので、
         // 経路が要らない分はここで控えておく。
         let taken = call.keepalive.map(|marker| marker.as_str().to_owned());
-        let routes = self
+        let mut routes = self
             .router
             .routes_for(ns, ns_name, &model, &session)
             .await?;
+        // この形を運べない経路は、ここで落とす。運べるかどうかは方言を知って
+        // いる経路が答える (DR-0025) ので、core は provider の名前を知らないまま
+        // 選別できる (DR-0014 §3)。全滅なら、断る理由は「そのモデルの経路が
+        // 無い」ではなく「この形では運べない」— 別の受け口なら通るので、
+        // 区別が付かないと直しようがない。
+        routes.retain(|route| route.preset.wire().accepts(shape));
+        if routes.is_empty() {
+            return Err(Error::UnsupportedRequestShape {
+                model,
+                shape: shape.as_str(),
+            });
+        }
         let now = now_unix();
 
         // 締め出している経路には、裏で様子を聞きに行く役を立てる。上限は
@@ -969,6 +982,7 @@ impl<P: Persistence> Gateway<P> {
                 query: call.query.map(str::to_owned),
                 body,
                 headers,
+                shape: call.shape,
             },
         )
         .await
@@ -1471,6 +1485,8 @@ struct Call<'a> {
     keepalive: Option<keepalive::Marker>,
     /// この会話への合図が止めてあるか (DR-0024 §2 追補)。
     cache_paused: bool,
+    /// クライアントから受けた本文の形 (DR-0025)。
+    shape: RequestShape,
 }
 
 impl<'a> Call<'a> {
@@ -1500,7 +1516,13 @@ impl<'a> Call<'a> {
     /// 経路だけなので、経路ごとに聞く。同じ本文なら答えも同じで、経路を
     /// 何度試しても本文は同じになる。
     fn cache_view(&self, preset: &Preset) -> (RequestOrigin, Option<CacheStrategy>) {
-        let origin = preset.request_origin(self.body);
+        // Responses 形式の本文に、出した側を見分ける手掛かりは無い (見分け方は
+        // 正規形の方言の読み方)。経路へ聞いても答えは `Unknown` にしかならず、
+        // 「codex CLI から来た」という確かな素性を捨てることになる (DR-0025)。
+        let origin = match self.shape {
+            RequestShape::Responses => RequestOrigin::Codex,
+            RequestShape::Messages => preset.request_origin(self.body),
+        };
         (
             origin,
             self.cache.map(|rule| cache::strategy_of(rule, origin)),
@@ -1578,6 +1600,20 @@ impl keepalive::Reachable for RouterReach {
                 .await
         })
     }
+}
+
+/// 受け口が受け取った 1 本の宛先と形。
+///
+/// `path` は `/v1/messages` のようなクライアントが叩いたパス、`shape` はその
+/// パスで受けた本文の形 (DR-0025)。**`shape` を `path` から起こさない** — どの
+/// 受け口をどの形で生やしたかを知っているのは受け口を作った側だけで、転送側で
+/// 文字列から復元すると受け口の一覧が 2 箇所に散る。3 つを 1 つにまとめて
+/// 持ち回るのは、どれも「クライアントが叩いた 1 本」を指す同じ 1 組だから。
+#[derive(Debug, Clone, Copy)]
+pub struct Ingress<'a> {
+    pub path: &'a str,
+    pub query: Option<&'a str>,
+    pub shape: RequestShape,
 }
 
 pub struct Forwarded {
@@ -2159,7 +2195,17 @@ routes = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2178,7 +2224,17 @@ routes = ["a"]
         let gw = gateway(&one_credential(&up.url)).await;
 
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2193,7 +2249,17 @@ routes = ["a"]
         let gw = gateway(&one_credential(&up.url)).await;
 
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2214,7 +2280,17 @@ routes = ["a"]
         preset_of(&gw, "a").deny(window_closed(now + 100), now);
 
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2246,7 +2322,17 @@ routes = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2282,8 +2368,11 @@ opus = "claude-opus-*"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 json!({"model": "opus", "max_tokens": 8, "messages": []}),
                 vec![],
             )
@@ -2317,7 +2406,17 @@ routes = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2348,7 +2447,17 @@ routes = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2421,7 +2530,17 @@ routes = ["down", "alive"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2455,7 +2574,17 @@ routes = ["nowhere", "alive"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(resp.response.status, 200);
@@ -2488,7 +2617,17 @@ routes = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2543,7 +2682,17 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2563,7 +2712,17 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&stale.url, &spare.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2588,7 +2747,17 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&first.url, &last.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2613,7 +2782,17 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&first.url, &last.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2638,7 +2817,17 @@ routes = ["a", "b"]
 
         for _ in 0..2 {
             let resp = gw
-                .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .forward(
+                    ns(&gw),
+                    NS,
+                    Ingress {
+                        path: "/v1/messages",
+                        query: None,
+                        shape: RequestShape::Messages,
+                    },
+                    request(),
+                    vec![],
+                )
                 .await
                 .unwrap();
             assert_eq!(resp.response.status, 200);
@@ -2695,7 +2884,17 @@ routes = ["a", "b"]
                 "messages": [{"role": "user", "content": "hi"}],
                 "metadata": {"user_id": r#"{"session_id":"s1"}"#},
             });
-            gw.forward(ns(&gw), NS, "/v1/messages", None, body, vec![])
+            gw.forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                vec![],
+            )
         };
 
         for _ in 0..2 {
@@ -2727,9 +2926,19 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
         let mut watching = gw.events().subscribe();
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         let first = announced(watching.recv().await.unwrap());
         assert_eq!((first.credential.as_str(), first.status), ("a", 429));
@@ -2755,9 +2964,19 @@ routes = ["a", "b"]
 
         let mut watching = gw.events().subscribe();
         let started_ms = crate::credential::time::now_unix_ms();
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         let headers_received_ms = crate::credential::time::now_unix_ms();
 
         let event = announced(watching.recv().await.unwrap());
@@ -2783,9 +3002,19 @@ routes = ["a", "b"]
         preset_of(&gw, "a").deny(window_closed(now + 100), now);
 
         let mut watching = gw.events().subscribe();
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         let event = announced(watching.recv().await.unwrap());
         assert_eq!((event.credential.as_str(), event.status), ("b", 200));
@@ -2820,7 +3049,17 @@ routes = ["a", "b"]
 
         let mut watching = gw.events().subscribe();
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(resp.response.status, 429);
@@ -2858,9 +3097,19 @@ routes = ["a", "b"]
         let spare = FakeUpstream::always(200).await;
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             preset_of(&gw, "a").availability(MODEL, now_unix()),
@@ -2881,9 +3130,19 @@ routes = ["a", "b"]
 
         let past = now_unix() - 1;
         preset_of(&gw, "a").deny(window_closed(past), past);
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(recovered.hits(), 1, "an expired mark is passed through");
         assert_eq!(spare.hits(), 0);
@@ -2910,7 +3169,17 @@ routes = ["a", "b"]
         }
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -2931,9 +3200,19 @@ routes = ["a", "b"]
             let spare = FakeUpstream::always(200).await;
             let gw = gateway(&two_credentials(&broken.url, &spare.url)).await;
 
-            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-                .await
-                .unwrap();
+            gw.forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
                 preset_of(&gw, "a").availability(MODEL, now_unix()),
@@ -3179,7 +3458,17 @@ routes = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3231,9 +3520,19 @@ routes = ["a", "b"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(spare.hits(), 1, "the real request goes to the undenied one");
         denied.next_request().await;
@@ -3257,9 +3556,19 @@ routes = ["a", "b"]
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(denied.hits(), 0, "a relay route is not probed");
         assert!(
@@ -3281,7 +3590,17 @@ routes = ["a", "b"]
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now);
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3313,7 +3632,17 @@ routes = ["a", "b"]
         }
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3335,7 +3664,17 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&crowded.url, &spare.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3393,7 +3732,17 @@ routes = ["codex", "spare"]
         let before = (crowded.hits(), spare.hits());
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3423,7 +3772,17 @@ routes = ["codex", "spare"]
         let gw = gateway(&two_credentials(&first.url, &last.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3455,7 +3814,17 @@ routes = ["a"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3472,7 +3841,17 @@ routes = ["a"]
         let gw = gateway(&two_credentials(&down.url, &limited.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3490,7 +3869,17 @@ routes = ["a"]
         let gw = gateway(&two_credentials(&limited.url, &down.url)).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3527,7 +3916,17 @@ routes = ["first", "second"]
         .await;
 
         let err = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap_err();
 
@@ -3570,15 +3969,35 @@ routes = ["flaky", "alive"]
         .await;
 
         // 1 回目: flaky が落ちていて alive が通る。
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         assert_eq!((flaky.hits(), alive.hits()), (1, 1));
 
         // 2 回目: flaky は復帰しているが、通った alive を先に試す。
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (flaky.hits(), alive.hits()),
             (1, 2),
@@ -3613,7 +4032,17 @@ routes = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -3666,7 +4095,17 @@ routes = ["a", "b"]
         .await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
 
@@ -3695,7 +4134,17 @@ routes = ["a", "b"]
         let gw = gateway_with(&oauth_config(&up.url), StaticStore::new()).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
 
@@ -3717,18 +4166,38 @@ routes = ["a", "b"]
         let spare = FakeUpstream::always(200).await;
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (limited.hits(), spare.hits()),
             (1, 1),
             "denied, then moved on"
         );
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         assert_eq!(
             (limited.hits(), spare.hits()),
             (1, 2),
@@ -3755,8 +4224,11 @@ routes = ["a"]
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 json!({"model": "unknown"}),
                 vec![],
             )
@@ -3784,10 +4256,13 @@ routes = ["a"]
             gw.forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages
+                },
                 json!({"max_tokens": 1}),
-                vec![]
+                vec![],
             )
             .await
             .is_err()
@@ -3843,8 +4318,11 @@ opus = "claude-opus-*"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 json!({"model": "claude-opus-4-8"}),
                 vec![],
             )
@@ -3878,7 +4356,17 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
 
@@ -3910,9 +4398,19 @@ advisor-tool-2026-03-01";
         }
 
         // 覚えた分は、同じ工程の次の転送から効く (毎回 400 を踏まない)。
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            beta_header(),
+        )
+        .await
+        .unwrap();
         assert_eq!(up.hits(), 3, "the second time takes only one attempt");
         assert!(
             !up.requests()[2].to_lowercase().contains("anthropic-beta"),
@@ -3931,7 +4429,17 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
 
@@ -3963,9 +4471,19 @@ advisor-tool-2026-03-01";
         let store = StaticStore::holding(stale);
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            beta_header(),
+        )
+        .await
+        .unwrap();
 
         assert!(
             up.requests()[0].contains("advisor-tool-2026-03-01"),
@@ -3982,7 +4500,17 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
 
@@ -4013,7 +4541,17 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.response.status, 200);
@@ -4042,9 +4580,19 @@ advisor-tool-2026-03-01";
         let store = StaticStore::new();
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), beta_header())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            beta_header(),
+        )
+        .await
+        .unwrap();
 
         let json = serde_json::to_string(&store.saved()).unwrap();
         let reloaded: StoredCredential = serde_json::from_str(&json).unwrap();
@@ -4177,9 +4725,19 @@ models = ["m"]
         .await;
         let gw = gateway(&oauth_config(&up.url)).await;
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
 
         let report = gw.usage_report(false).await;
         let entry = &report.credentials[0];
@@ -4453,8 +5011,11 @@ opus = "claude-opus-*"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 json!({"model": "opus"}),
                 vec![],
             )
@@ -4487,7 +5048,17 @@ routes = ["route"]
             let upstream = FakeUpstream::always(code).await;
             let gw = gateway(&status_route(&upstream.url)).await;
             let _ = gw
-                .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+                .forward(
+                    ns(&gw),
+                    NS,
+                    Ingress {
+                        path: "/v1/messages",
+                        query: None,
+                        shape: RequestShape::Messages,
+                    },
+                    request(),
+                    vec![],
+                )
                 .await;
             let report = gw.status_report(false).await;
             assert_ne!(
@@ -4504,7 +5075,17 @@ routes = ["route"]
         let upstream = FakeUpstream::always(400).await;
         let gw = gateway(&status_route(&upstream.url)).await;
         let resp = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(resp.response.status, 400);
@@ -4520,7 +5101,17 @@ routes = ["route"]
         let upstream = FakeUpstream::then(529, 200).await;
         let gw = gateway(&status_route(&upstream.url)).await;
         let first = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(first.response.status, 529);
@@ -4531,7 +5122,17 @@ routes = ["route"]
         // 529 で付いた一時 deny を解除し、同じ route の upstream 回復を模擬する。
         preset_of(&gw, "route").allow(MODEL);
         let second = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
             .await
             .unwrap();
         assert_eq!(second.response.status, 200);
@@ -4588,7 +5189,17 @@ routes = ["route"]
 
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![]),
+            gw.forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            ),
         )
         .await
         .expect("the LLM response must not wait for the five-second status timeout")
@@ -4751,8 +5362,11 @@ sub = "none"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 caching_request(MODEL, MAIN),
                 vec![],
             )
@@ -4787,8 +5401,11 @@ sub = "none"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 caching_request(MODEL, SUB),
                 vec![],
             )
@@ -4825,8 +5442,11 @@ main = "1h"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 json!({
                     "model": MODEL,
                     "max_tokens": 8,
@@ -4874,8 +5494,11 @@ main = "1h"
             .forward(
                 ns(&gw),
                 NS,
-                "/v1/messages",
-                None,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
                 caching_request("opus", MAIN),
                 vec![],
             )
@@ -4894,7 +5517,17 @@ main = "1h"
         let sending = caching_request(MODEL, MAIN);
 
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, sending.clone(), vec![])
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                sending.clone(),
+                vec![],
+            )
             .await
             .unwrap();
 
@@ -4987,9 +5620,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             sent_ttls(&up.requests()[0]),
             vec![Some("1h".to_owned())],
@@ -5008,7 +5651,17 @@ keepalive_horizon = "8h"
             {"type": "text", "text": format!("[SYSTEM NOTIFICATION] {}", signal.marker)},
         ]}]);
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                coming_back,
+                headers,
+            )
             .await
             .unwrap();
 
@@ -5028,9 +5681,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         idle(55 * 60 + 5).await;
         let signal = signal(&mut watching).await;
 
@@ -5039,7 +5702,17 @@ keepalive_horizon = "8h"
         let (mut coming_back, headers) = conversation(json!({}));
         coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                coming_back,
+                headers,
+            )
             .await
             .unwrap();
 
@@ -5074,9 +5747,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         forwarding(&mut watching).await;
 
         gw.pause_keepalive("s-1", false);
@@ -5090,18 +5773,38 @@ keepalive_horizon = "8h"
         // 合図の往復で紛れ込んだ 1 本は、止まったままの会話として知らせる。
         let (mut coming_back, headers) = conversation(json!({}));
         coming_back["messages"] = json!([{"role": "user", "content": events::marker("spent")}]);
-        gw.forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            coming_back,
+            headers,
+        )
+        .await
+        .unwrap();
         let forwarded = forwarding(&mut watching).await;
         assert!(forwarded.cache_paused, "still paused");
         assert_eq!(gw.paused_keepalive(), ["s-1"], "and it stays paused");
 
         // 人が戻ってきた。知らせは、解けた後の姿を載せる。
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
         assert!(
             !forwarding(&mut watching).await.cache_paused,
             "the request that lifted the pause says so"
@@ -5123,9 +5826,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         let forwarded = forwarding(&mut watching).await;
         // 合図は 55 分の格子に乗るので、時刻はすべて `ts` からの整数倍で
@@ -5191,9 +5904,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({"model": priced}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         // 1 時間 write は input の 2 倍、read は input の 1/10 (5.0 と 0.5)
         // なので、作り直し 1 回ぶんは合図 20 回。
@@ -5217,9 +5940,19 @@ keepalive_horizon = "8h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         let first = forwarding(&mut watching).await;
 
         idle(55 * 60 + 5).await;
@@ -5227,9 +5960,19 @@ keepalive_horizon = "8h"
 
         let (mut coming_back, headers) = conversation(json!({}));
         coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
-        gw.forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            coming_back,
+            headers,
+        )
+        .await
+        .unwrap();
 
         let answered = forwarding(&mut watching).await;
         assert_eq!(answered.keepalive.as_deref(), Some("applied"));
@@ -5274,9 +6017,19 @@ main = "1h"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         let forwarded = forwarding(&mut watching).await;
         assert_eq!(forwarded.cache_ttl_secs, Some(3600), "an hour is written");
@@ -5331,9 +6084,19 @@ main = "1h"
 
         let (mut body, headers) = conversation(json!({}));
         body.as_object_mut().unwrap().remove("tools");
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         idle(60 * 60).await;
         assert!(
@@ -5359,9 +6122,19 @@ main = "keepalive"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         idle(60 * 60).await;
         assert!(
@@ -5381,22 +6154,52 @@ main = "keepalive"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         idle(55 * 60 + 5).await;
         let signal = signal(&mut watching).await;
 
         // 合言葉を持たない 1 本 = 人の再開。
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
 
         let (mut coming_back, headers) = conversation(json!({}));
         coming_back["messages"] = json!([{"role": "user", "content": signal.marker}]);
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, coming_back, headers)
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                coming_back,
+                headers,
+            )
             .await
             .unwrap();
 
@@ -5418,9 +6221,19 @@ main = "keepalive"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         let now = now_unix();
         preset_of(&gw, "a").deny(window_closed(now + 10_000), now);
@@ -5457,9 +6270,19 @@ sub = "5m"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers.clone())
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers.clone(),
+        )
+        .await
+        .unwrap();
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.origin, "main");
         assert_eq!(event.cache_ttl_secs, Some(3600));
@@ -5467,9 +6290,19 @@ sub = "5m"
 
         let (mut sub, headers) = conversation(json!({}));
         sub["metadata"] = json!({"user_id": SUB});
-        gw.forward(ns(&gw), NS, "/v1/messages", None, sub, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            sub,
+            headers,
+        )
+        .await
+        .unwrap();
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.origin, "sub");
         assert_eq!(
@@ -5487,9 +6320,19 @@ sub = "5m"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(
             event.cache_ttl_secs,
@@ -5497,9 +6340,19 @@ sub = "5m"
             "the client wrote a breakpoint without a ttl"
         );
 
-        gw.forward(ns(&gw), NS, "/v1/messages", None, request(), vec![])
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            vec![],
+        )
+        .await
+        .unwrap();
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(
             event.cache_ttl_secs, None,
@@ -5523,7 +6376,17 @@ sub = "5m"
             "cache_control": {"type": "ephemeral"},
         }]);
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, oneshot, headers)
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                oneshot,
+                headers,
+            )
             .await
             .unwrap();
 
@@ -5560,7 +6423,17 @@ sub = "5m"
             {"type": "text", "text": events::marker("not-one-of-ours")},
         ]}]);
         let forwarded = gw
-            .forward(ns(&gw), NS, "/v1/messages", None, foreign, headers)
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                foreign,
+                headers,
+            )
             .await
             .unwrap();
 
@@ -5598,11 +6471,291 @@ main = "keepalive"
         let mut watching = gw.events().subscribe();
 
         let (body, headers) = conversation(json!({}));
-        gw.forward(ns(&gw), NS, "/v1/messages", None, body, headers)
-            .await
-            .unwrap();
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
 
         idle(55 * 60 + 5).await;
         assert_eq!(signal(&mut watching).await.session_id, "s-1");
+    }
+
+    // ---------------------------------------------------------------------
+    // Responses 形式の受け口 (DR-0025)
+    // ---------------------------------------------------------------------
+
+    /// codex CLI が送る形の 1 本。model 以外は触られないことを確かめる素材。
+    fn responses_request() -> Value {
+        json!({
+            "model": "sol",
+            "instructions": "You are Codex.",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "stream": true,
+        })
+    }
+
+    /// codex 経路と、同じモデルを持つ Anthropic 経路を並べた設定。
+    ///
+    /// 「Responses 形式では openai 経路しか選ばれない」を、経路が 1 本しか
+    /// 無い状態ではなく**候補が並んでいる状態**で確かめるため。
+    fn responses_config(codex_url: &str, spare_url: &str) -> String {
+        format!(
+            r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "{codex_url}/backend-api/codex"
+models = ["m"]
+
+[routes.spare]
+provider = "anthropic"
+url = "{spare_url}"
+models = ["m"]
+
+[ns.default]
+[ns.default.aliases]
+sol = "m"
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["spare", "codex"]
+"#
+        )
+    }
+
+    /// Responses SSE を返す upstream。無変換で流れることを本文の型で確かめる。
+    async fn responses_upstream() -> FakeUpstream {
+        FakeUpstream::start_sse(|_, _| {
+            (
+                200,
+                concat!(
+                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",",
+                    "\"usage\":{\"input_tokens\":11,\"output_tokens\":5,",
+                    "\"input_tokens_details\":{\"cached_tokens\":4},",
+                    "\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n",
+                )
+                .to_owned(),
+            )
+        })
+        .await
+    }
+
+    /// 上流へ届いた本文を JSON として読む。
+    fn sent_body(raw: &str) -> Value {
+        let (_, body) = raw.split_once("\r\n\r\n").expect("headers end");
+        serde_json::from_str(body).expect("a JSON body")
+    }
+
+    /// Responses 形式の本文は、model 欄の解決を除いてそのまま上流へ届く。
+    ///
+    /// 変換を挟まないことが第一段の全部なので、送った欄がひとつでも消えて
+    /// いたら (あるいは `store` のように勝手に書き換わっていたら) 失敗させる。
+    #[tokio::test]
+    async fn a_responses_body_reaches_the_upstream_untouched() {
+        let codex = responses_upstream().await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &responses_config(&codex.url, &spare.url),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/responses",
+                    query: None,
+                    shape: RequestShape::Responses,
+                },
+                responses_request(),
+                vec![("authorization".to_owned(), "Bearer client-dummy".to_owned())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            forwarded.route, "codex",
+            "only the openai route can carry it"
+        );
+        assert_eq!(spare.hits(), 0, "the Messages route is never tried");
+
+        // 一覧の問い合わせ (discovery) も同じ相手に届くので、転送だけを拾う。
+        let requests = codex.requests();
+        let sent = requests
+            .iter()
+            .find(|req| req.starts_with("POST "))
+            .expect("the forwarded request");
+        assert!(
+            sent.starts_with("POST /backend-api/codex/responses"),
+            "{sent}"
+        );
+        let mut expected = responses_request();
+        // 短い名前だけが実名へ解決される。
+        expected["model"] = json!("m");
+        assert_eq!(sent_body(sent), expected);
+
+        // クライアントの Bearer は落ち、gateway の OAuth に差し替わる。
+        let lowered = sent.to_lowercase();
+        assert!(lowered.contains("authorization: bearer tok"), "{sent}");
+        assert!(!lowered.contains("client-dummy"), "{sent}");
+        assert!(lowered.contains("chatgpt-account-id: acc-1"), "{sent}");
+    }
+
+    /// 応答は通訳せず、上流の Responses SSE がそのまま返る。
+    #[tokio::test]
+    async fn a_responses_answer_is_streamed_without_translation() {
+        let codex = responses_upstream().await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &responses_config(&codex.url, &spare.url),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/responses",
+                    query: None,
+                    shape: RequestShape::Responses,
+                },
+                responses_request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // 消費したトークンの読み方は、通訳の有無で変わらない。
+        let usage = forwarded.usage.expect("the openai route reads its usage");
+        let body = body_text(forwarded.response).await;
+        assert!(body.contains("\"type\":\"response.completed\""), "{body}");
+        assert!(
+            !body.contains("message_stop"),
+            "the Messages dialect never appears: {body}"
+        );
+
+        let counted = {
+            let mut usage = usage;
+            usage.observe(body.as_bytes());
+            usage.finish().usage.expect("usage on the completed event")
+        };
+        assert_eq!(counted.get(&TokenKind::input()), Some(11));
+        assert_eq!(counted.get(&TokenKind::output()), Some(5));
+        assert_eq!(counted.get(&TokenKind::input_cache_read()), Some(4));
+        assert_eq!(counted.get(&TokenKind::output_reasoning()), Some(3));
+    }
+
+    /// Responses 形式を運べる経路が無いモデルは、モデル不明とは別の断りにする。
+    ///
+    /// 同じモデルが Messages 形式でなら通るので、「経路が無い」で片付けると
+    /// 受け口を変えれば済む話だと気づけない。
+    #[tokio::test]
+    async fn a_model_without_an_openai_route_refuses_the_responses_shape() {
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[credentials.claude]
+type = "claude_oauth"
+
+[routes.spare]
+provider = "anthropic"
+credential = "claude"
+url = "{}"
+models = ["m"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["spare"]
+"#,
+            spare.url
+        ))
+        .await;
+
+        let error = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/responses",
+                    query: None,
+                    shape: RequestShape::Responses,
+                },
+                json!({"model": "m", "input": []}),
+                vec![],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::UnsupportedRequestShape { model, shape }
+                if model == "m" && *shape == "responses"),
+            "{error:?}"
+        );
+        assert_eq!(
+            spare.hits(),
+            0,
+            "nothing is sent to a route that cannot carry it"
+        );
+        assert!(error.to_string().contains("responses"), "{error}");
+    }
+
+    /// Responses 形式の 1 本は `origin: "codex"` として流れ、cache 戦略を持たない。
+    #[tokio::test]
+    async fn a_responses_request_is_announced_as_codex() {
+        let codex = responses_upstream().await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &responses_config(&codex.url, &spare.url),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/responses",
+                    query: None,
+                    shape: RequestShape::Responses,
+                },
+                responses_request(),
+                vec![("session-id".to_owned(), "codex-1".to_owned())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.origin, "codex");
+        assert_eq!(
+            forwarded.cache_strategy, None,
+            "no cache rule is written for this model, so nothing is applied"
+        );
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!(event.origin, "codex");
+        assert_eq!(event.model, "m");
+        assert_eq!(event.status, 200);
     }
 }

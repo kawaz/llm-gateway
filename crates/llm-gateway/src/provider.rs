@@ -14,7 +14,9 @@ use std::sync::Arc;
 use crate::Result;
 use crate::credential::Credential;
 use crate::denial::{Availability, Denial, Probing, RouteState, Scope};
-use crate::egress::{BoxFuture, EgressRequest, EncodedRequest, Headers, Response, UpstreamRequest};
+use crate::egress::{
+    BoxFuture, EgressRequest, EncodedRequest, Headers, RequestShape, Response, UpstreamRequest,
+};
 use crate::metering::{Pricing, UsageObserver};
 use crate::quota::{QuotaLimit, Snapshot, Support};
 
@@ -32,12 +34,26 @@ pub trait Auth: Send + Sync {
 
 /// 正規形を upstream 方言へ変換して送る。
 pub trait Wire: Send + Sync {
+    /// この形で受けた 1 本を、この経路が運べるか (DR-0025)。
+    ///
+    /// 既定は正規形 (Messages) だけ。方言を知っているのは経路の側なので、
+    /// 「どの受け口をどの経路へ流せるか」もここが答える — core が provider の
+    /// 名前で分岐すると、DR-0014 §3 の判定基準を破る。
+    fn accepts(&self, shape: RequestShape) -> bool {
+        shape == RequestShape::Messages
+    }
+
     fn encode(&self, request: EgressRequest) -> Result<EncodedRequest>;
 
+    /// 送って、応答をクライアントへ返せる形にして返す。
+    ///
+    /// `shape` は**クライアントから受けた形**。上流の方言をクライアントの
+    /// 方言へ通訳するかどうかがこれで決まる (同じ形で受けたなら通訳しない)。
     fn send<'a>(
         &'a self,
         http: &'a reqwest::Client,
         request: UpstreamRequest,
+        shape: RequestShape,
     ) -> BoxFuture<'a, Result<Response>>;
 }
 
@@ -73,7 +89,7 @@ pub enum Admission {
 ///
 /// 同じ会話でも、メインとサブエージェントでは prompt cache の使い方が違う。
 /// どこを読めば見分けが付くかはクライアント方言の知識なので provider が答え、
-/// core はこの 3 値だけを見る (DR-0014 の境界)。
+/// core は返ってきた値だけを見る (DR-0014 の境界)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RequestOrigin {
     /// 見分けが付かなかった。判断が要る場面では [`Self::Main`] と同じ扱い。
@@ -84,6 +100,13 @@ pub enum RequestOrigin {
     /// 1 回きりの呼び出し。会話として続かないので、続きを当て込んだ扱い
     /// (cache を長く持つ等) をしても報われない。
     Oneshot,
+    /// Responses 形式で受けた 1 本 (DR-0025)。
+    ///
+    /// 出した側の見分け (メイン / サブ) は正規形の本文の読み方なので、
+    /// この形では付かない。代わりに**受けた形そのもの**を素性にする —
+    /// 見る側にとって「codex CLI から来た」は `unknown` より確かな情報で、
+    /// prompt cache の扱いが Messages とは別であることもこの 1 語で分かる。
+    Codex,
 }
 
 impl RequestOrigin {
@@ -94,6 +117,7 @@ impl RequestOrigin {
             Self::Main => "main",
             Self::Sub => "sub",
             Self::Oneshot => "oneshot",
+            Self::Codex => "codex",
         }
     }
 }
@@ -465,6 +489,7 @@ mod tests {
             &'a self,
             _http: &'a reqwest::Client,
             _request: UpstreamRequest,
+            _shape: RequestShape,
         ) -> BoxFuture<'a, Result<Response>> {
             Box::pin(async {
                 let body: BodyStream = Box::pin(futures_util::stream::empty());
@@ -561,6 +586,7 @@ mod tests {
                     query: None,
                     body: serde_json::json!({"model": "probe-model"}),
                     headers: Headers::default(),
+                    shape: RequestShape::Messages,
                 },
             })
         }

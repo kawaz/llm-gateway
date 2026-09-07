@@ -7,7 +7,8 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 
 use crate::egress::{
-    BoxFuture, EgressRequest, EncodedRequest, Headers, Response, ResponseMode, UpstreamRequest,
+    BoxFuture, EgressRequest, EncodedRequest, Headers, RequestShape, Response, ResponseMode,
+    UpstreamRequest,
 };
 use crate::provider::Wire;
 use crate::{Error, Result};
@@ -43,6 +44,11 @@ impl OpenAiWire {
 }
 
 impl Wire for OpenAiWire {
+    /// 上流が Responses API なので、その形で受けた 1 本はそのまま運べる (DR-0025)。
+    fn accepts(&self, shape: RequestShape) -> bool {
+        matches!(shape, RequestShape::Messages | RequestShape::Responses)
+    }
+
     fn encode(&self, request: EgressRequest) -> Result<EncodedRequest> {
         let client_streams = request.body.get("stream").and_then(Value::as_bool) == Some(true);
         let mut headers = request.headers;
@@ -53,18 +59,28 @@ impl Wire for OpenAiWire {
         headers.set("content-type", "application/json");
         headers.set("accept", "text/event-stream");
 
-        let body = Bytes::from(serde_json::to_vec(&request::convert(request.body)?)?);
+        // Responses 形式で受けたなら、本文は上流の方言そのもの。`stream` や
+        // `store` の決め方もクライアントの言い分に従う (DR-0025) — こちらで
+        // 直すと、送った側が組み立てた会話の続き方と食い違う。
+        let (body, response) = match request.shape {
+            RequestShape::Responses => (request.body, ResponseMode::Passthrough),
+            RequestShape::Messages => (
+                request::convert(request.body)?,
+                if client_streams {
+                    ResponseMode::Passthrough
+                } else {
+                    ResponseMode::CollectMessagesSse
+                },
+            ),
+        };
+        let body = Bytes::from(serde_json::to_vec(&body)?);
         Ok(EncodedRequest {
             upstream: UpstreamRequest {
                 url: self.responses_url(),
                 headers,
                 body,
             },
-            response: if client_streams {
-                ResponseMode::Passthrough
-            } else {
-                ResponseMode::CollectMessagesSse
-            },
+            response,
         })
     }
 
@@ -72,6 +88,7 @@ impl Wire for OpenAiWire {
         &'a self,
         http: &'a reqwest::Client,
         request: UpstreamRequest,
+        shape: RequestShape,
     ) -> BoxFuture<'a, Result<Response>> {
         Box::pin(async move {
             let UpstreamRequest { url, headers, body } = request;
@@ -111,7 +128,11 @@ impl Wire for OpenAiWire {
                     })
                 })
                 .boxed();
-            let body = if is_sse {
+            // Responses 形式で受けたなら通訳しない。上流の event をそのまま
+            // 流す (DR-0025) — 送り主は Responses API の返事を待っている。
+            // content-type を補うのは通訳の有無と無関係: 名乗らない SSE を
+            // そのまま渡すと、受け取る側が本文を読み始められない。
+            let body = if is_sse && shape == RequestShape::Messages {
                 response::translate(body)
             } else {
                 body
@@ -179,6 +200,7 @@ mod tests {
                 path: "/v1/messages".to_owned(),
                 query: None,
                 body: json!({"model":"gpt-5.3-codex","max_tokens":1024,"messages":[]}),
+                shape: RequestShape::Messages,
                 headers: Headers::new(vec![
                     ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
                     ("authorization".to_owned(), "Bearer client".to_owned()),
@@ -223,6 +245,7 @@ mod tests {
                     query: None,
                     body,
                     headers: Headers::default(),
+                    shape: RequestShape::Messages,
                 })
                 .unwrap();
 

@@ -152,13 +152,23 @@ fn first_error(bytes: &[u8]) -> Result<Option<ErrorEvent>> {
         return Ok(None);
     }
     let event: Value = serde_json::from_slice(&data)?;
-    if event.get("type").and_then(Value::as_str) != Some("error") {
+    // 通訳した後の Messages SSE では `error`、無変換で流す Responses SSE では
+    // `error` / `response.failed` の 2 通りが来る (DR-0025)。中身の置き場所も
+    // 揃っていないので、[`super::response`] の通訳と同じ順で探す。
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed")
+    ) {
         return Ok(None);
     }
-    let error = &event["error"];
+    let error = event
+        .get("error")
+        .or_else(|| event.pointer("/response/error"))
+        .unwrap_or(&event);
     Ok(Some(ErrorEvent {
         kind: error
             .get("type")
+            .or_else(|| error.get("code"))
             .and_then(Value::as_str)
             .unwrap_or("api_error")
             .to_owned(),
@@ -260,6 +270,26 @@ mod tests {
             panic!("a request error returns with the status filled in");
         };
         assert_eq!(client_error.unwrap().status, 400);
+    }
+
+    /// 無変換で流す 1 本 (DR-0025) では、上流の生の失敗 event をそのまま読む。
+    ///
+    /// 通訳を挟まないので `response.failed` も `/response/error` の入れ子も
+    /// ここまで届く。読めないと、混んでいる経路を採用して fallback を捨てる。
+    #[tokio::test]
+    async fn rejects_a_native_response_failed_event() {
+        let raw = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"rate limit reached\"}}}\n\n";
+        let outcome = admit(response(vec![raw]), "m", 100).await.unwrap();
+        let Admission::Rejected {
+            reason,
+            client_error,
+            ..
+        } = outcome
+        else {
+            panic!("a native failure is not admitted");
+        };
+        assert_eq!(reason, "rate limit reached");
+        assert_eq!(client_error.unwrap().status, 429);
     }
 
     /// 本文内エラーの意味を Anthropic error type と HTTP status の組へ正規化する。

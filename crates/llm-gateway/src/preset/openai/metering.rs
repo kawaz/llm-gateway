@@ -175,7 +175,13 @@ impl OpenAiUsage {
         let Ok(value) = serde_json::from_slice::<Value>(&event) else {
             return;
         };
-        if let Some(usage) = value.get("usage") {
+        // 通訳した後の Messages SSE (`message_delta`) と、無変換で流す
+        // Responses SSE (`response.completed`) の両方から読む (DR-0025)。
+        // 読む側は 1 つで足りる — 欄の名前が違うだけで、同じ 1 本の消費。
+        if let Some(usage) = value
+            .get("usage")
+            .or_else(|| value.pointer("/response/usage"))
+        {
             read_usage(usage, &mut self.usage);
         }
     }
@@ -261,14 +267,27 @@ impl UsageObserver for OpenAiJsonUsage {
     }
 }
 
+/// usage を正規区分へ写す。
+///
+/// 内訳の欄は 2 通りある。通訳した Messages 形式では平らな欄になり、無変換で
+/// 流す Responses 形式では入れ子のまま来る (DR-0025)。同じ数を指す別表記なので、
+/// 両方を同じ区分へ読む。
 fn read_usage(value: &Value, usage: &mut TokenUsage) {
-    for (field, kind) in [
-        ("input_tokens", TokenKind::INPUT_NAME),
-        ("output_tokens", TokenKind::OUTPUT_NAME),
-        ("cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
-        ("reasoning_output_tokens", TokenKind::OUTPUT_REASONING_NAME),
+    for (pointer, kind) in [
+        ("/input_tokens", TokenKind::INPUT_NAME),
+        ("/output_tokens", TokenKind::OUTPUT_NAME),
+        ("/cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
+        (
+            "/input_tokens_details/cached_tokens",
+            TokenKind::INPUT_CACHE_READ_NAME,
+        ),
+        ("/reasoning_output_tokens", TokenKind::OUTPUT_REASONING_NAME),
+        (
+            "/output_tokens_details/reasoning_tokens",
+            TokenKind::OUTPUT_REASONING_NAME,
+        ),
     ] {
-        if let Some(count) = value.get(field).and_then(Value::as_u64) {
+        if let Some(count) = value.pointer(pointer).and_then(Value::as_u64) {
             usage.set(kind, count);
         }
     }

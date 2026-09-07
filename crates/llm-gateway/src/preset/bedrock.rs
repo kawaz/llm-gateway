@@ -106,6 +106,7 @@ extended-cache-ttl-2025-04-11";
             query: None,
             body: json!({"model": model, "max_tokens": 8}),
             headers: Headers::default(),
+            shape: crate::egress::RequestShape::Messages,
         }
     }
 

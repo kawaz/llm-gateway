@@ -20,6 +20,13 @@ pub enum Error {
     #[error("no route configured for model `{0}`")]
     UnknownModel(String),
 
+    /// モデルの経路はあるが、受けた形のまま運べる経路が 1 つも無い (DR-0025)。
+    ///
+    /// 「モデルが無い」とは別物。同じモデルでも、Messages 形式の受け口からなら
+    /// 通ることがある。
+    #[error("no route for model `{model}` can carry a `{shape}` request")]
+    UnsupportedRequestShape { model: String, shape: &'static str },
+
     /// 経路はあるが、全て試して届かなかった。
     #[error("all routes for model `{model}` failed ({} attempts)", attempts.len())]
     AllUpstreamsFailed {

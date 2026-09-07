@@ -19,7 +19,8 @@ use bytes::Bytes;
 use futures_util::StreamExt as _;
 
 use crate::egress::{
-    BoxFuture, EgressRequest, EncodedRequest, Headers, Response, ResponseMode, UpstreamRequest,
+    BoxFuture, EgressRequest, EncodedRequest, Headers, RequestShape, Response, ResponseMode,
+    UpstreamRequest,
 };
 use crate::provider::Wire;
 use crate::{Error, Result};
@@ -71,6 +72,9 @@ impl Wire for AnthropicWire {
             query,
             body,
             mut headers,
+            // 上流も正規形と同じ Messages 形式。運べる形は 1 つしかないので
+            // ([`Wire::accepts`] の既定)、ここで見分ける必要は無い。
+            shape: _,
         } = request;
 
         headers.strip_for_upstream();
@@ -94,6 +98,8 @@ impl Wire for AnthropicWire {
         &'a self,
         http: &'a reqwest::Client,
         request: UpstreamRequest,
+        // 上流もクライアントも Anthropic 方言なので、通訳する余地が無い。
+        _shape: RequestShape,
     ) -> BoxFuture<'a, Result<Response>> {
         Box::pin(async move {
             let UpstreamRequest { url, headers, body } = request;
@@ -183,6 +189,7 @@ extended-cache-ttl-2025-04-11";
             query: None,
             body,
             headers,
+            shape: RequestShape::Messages,
         }
     }
 

@@ -147,6 +147,51 @@ gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を�
 | モデルがどの経路にも無い | 404 | `not_found_error` |
 | 全経路が失敗 / upstream に届かない | 503 | `api_error` |
 
+### `POST /{ns}/v1/responses`
+
+Responses API を話すクライアント (codex CLI) の受け口 (DR-0025)。本文は
+`model` 欄の alias 解決以外そのままで上流へ渡し、応答も無変換で流す。gateway が
+差し替えるのは認証だけ — クライアントの `Authorization` は落とし、経路の
+credential (`codex_oauth`) の token と `chatgpt-account-id` を載せる。
+
+- 認証: namespace の設定に従う (クライアントが名乗る token は upstream へ渡らない)
+- 選ばれるのは **Responses API へ出る経路 (`provider = "openai"`) だけ**。その
+  モデルにそういう経路が無ければ 404 (`no route for model ... can carry a
+  responses request`)。同じモデルでも `/v1/messages` からなら通ることがあるので、
+  「モデルが無い」とは別の文言にしてある
+- prompt cache 戦略 (`[[ns.<name>.cache]]`) は当たらない。`cache_control` は
+  Messages 形式の語彙で、この本文には置き場所が無い
+- 知らせ (`/llm-gateway/events`) には `origin: "codex"` で出る
+- 消費は `/llm-gateway/stats` と `/llm-gateway/usage` に、Messages 経由の分と
+  同じように載る
+
+#### codex CLI の設定
+
+`~/.codex/config.toml` (または `CODEX_HOME/config.toml`) にカスタム provider を
+書いて向ける。`env_key` の中身は gateway が捨てるので、**namespace に
+`auth_token` を書いていなければ何でもよい** (書いてあるならその token を入れる)。
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "llm-gateway"
+
+[model_providers.llm-gateway]
+name = "llm-gateway"
+base_url = "http://127.0.0.1:8402/ns-personal/v1"
+env_key = "LLM_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+provider の名前に `openai` のような組み込み ID は使えない (codex CLI が予約して
+いる)。
+
+```bash
+LLM_GATEWAY_API_KEY=dummy codex exec -m gpt-5.6-sol --skip-git-repo-check 'hi'
+```
+
+codex CLI は `Session-Id` ヘッダを送るので、会話と経路の貼り付け (affinity) は
+Messages 経由と同じように効く。
+
 ### `POST /{ns}/v1/messages/count_tokens`
 
 `/v1/messages` と同じ中継。トークン数の見積もりを upstream に問い合わせる。
@@ -342,7 +387,8 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
-(`main` / `sub` / `oneshot` / `unknown`)。`cache_ttl_secs` は**この 1 本が残す
+(`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は
+`codex`)。`cache_ttl_secs` は**この 1 本が残す
 プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
 送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
 `cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと

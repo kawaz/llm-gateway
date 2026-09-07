@@ -152,6 +152,52 @@ Errors:
 | Model on no route | 404 | `not_found_error` |
 | Every route failed / upstream unreachable | 503 | `api_error` |
 
+### `POST /{ns}/v1/responses`
+
+The entry point for clients that speak the Responses API (the codex CLI, DR-0025).
+The body is passed to the upstream untouched apart from resolving the `model` alias,
+and the answer is streamed back without translation. The only thing the gateway
+replaces is authentication — the client's `Authorization` is dropped and the route's
+`codex_oauth` credential supplies the token and `chatgpt-account-id`.
+
+- Authentication: as configured for the namespace (whatever token the client names
+  never reaches the upstream)
+- Only routes that speak the Responses API (`provider = "openai"`) are eligible. When
+  the model has no such route the answer is 404 (`no route for model ... can carry a
+  responses request`) — deliberately worded apart from "model on no route", because
+  the same model may well be reachable through `/v1/messages`
+- Prompt cache strategies (`[[ns.<name>.cache]]`) do not apply. `cache_control`
+  belongs to the Messages shape and has nowhere to live in this body
+- Events (`/llm-gateway/events`) carry `origin: "codex"`
+- Spending shows up in `/llm-gateway/stats` and `/llm-gateway/usage` exactly as it
+  does for Messages traffic
+
+#### Pointing the codex CLI at the gateway
+
+Add a custom provider to `~/.codex/config.toml` (or `CODEX_HOME/config.toml`). The
+gateway discards whatever `env_key` resolves to, so **any value works unless the
+namespace sets `auth_token`** (in which case use that token).
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "llm-gateway"
+
+[model_providers.llm-gateway]
+name = "llm-gateway"
+base_url = "http://127.0.0.1:8402/ns-personal/v1"
+env_key = "LLM_GATEWAY_API_KEY"
+wire_api = "responses"
+```
+
+The provider id cannot be one of the codex CLI's built-in ids such as `openai`.
+
+```bash
+LLM_GATEWAY_API_KEY=dummy codex exec -m gpt-5.6-sol --skip-git-repo-check 'hi'
+```
+
+The codex CLI sends a `Session-Id` header, so route affinity works the same way as it
+does for Messages traffic.
+
 ### `POST /{ns}/v1/messages/count_tokens`
 
 The same relay as `/v1/messages`. Asks the upstream for a token count estimate.
@@ -351,7 +397,8 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
-omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`). `cache_ttl_secs` is
+omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in
+the Responses shape is `codex`). `cache_ttl_secs` is
 **how long the prefix this request leaves behind lives**, in seconds: it follows the
 strategy that was applied, and for an untouched body it reads the `cache_control` that
 was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).

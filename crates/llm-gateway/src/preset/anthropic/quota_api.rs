@@ -116,6 +116,7 @@ impl QuotaApi for OauthUsage {
                     ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
                     ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
                 ]),
+                shape: crate::egress::RequestShape::Messages,
             },
         })
     }

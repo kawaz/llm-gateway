@@ -114,15 +114,42 @@ impl Headers {
     }
 }
 
+/// クライアントから受けた本文の形 (DR-0025)。
+///
+/// 内部正規形は Messages 形式 (DR-0014 §5) だが、Responses 形式を話す
+/// クライアント (codex CLI) をそのまま上流へ通す口も持つ。どちらの形で
+/// 受けたかは **path から復元しない** — 受け口を生やした側だけが知っている
+/// ことで、方言を判る経路 (`Wire`) へ最後まで運ぶ必要がある。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestShape {
+    /// 正規形。
+    #[default]
+    Messages,
+    /// Responses 形式。変換せずそのまま上流へ渡す (DR-0025)。
+    Responses,
+}
+
+impl RequestShape {
+    /// ログや断りの文言に出す 1 語。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Responses => "responses",
+        }
+    }
+}
+
 /// ingress から egress へ渡す正規形。
 ///
-/// `body` は Messages 形式の `serde_json::Value`。中立 IR は挟まない。
+/// `body` は [`RequestShape`] が示す形の `serde_json::Value`。中立 IR は挟まない。
 #[derive(Debug, Clone)]
 pub struct EgressRequest {
     pub path: String,
     pub query: Option<String>,
     pub body: Value,
     pub headers: Headers,
+    /// クライアントから受けた形。返す本文をどの方言に整えるかもこれで決まる。
+    pub shape: RequestShape,
 }
 
 /// Auth が認証し、Wire が送る HTTP リクエスト。
@@ -189,12 +216,15 @@ pub async fn send(
     credential: Option<&Credential>,
     request: EgressRequest,
 ) -> Result<SentResponse> {
+    let shape = request.shape;
     let EncodedRequest {
         mut upstream,
         response: mode,
     } = preset.wire().encode(request)?;
     preset.auth().authorize(credential, &mut upstream)?;
-    let response = preset.wire().send(http, upstream).await?;
+    // 受けた形も渡す。上流の応答をクライアントの方言へ通訳するかどうかは
+    // 「何で受けたか」で決まり、送る内容 ([`UpstreamRequest`]) からは読めない。
+    let response = preset.wire().send(http, upstream, shape).await?;
     Ok(SentResponse { response, mode })
 }
 
