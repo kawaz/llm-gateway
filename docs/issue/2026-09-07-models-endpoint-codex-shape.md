@@ -1,11 +1,11 @@
 ---
 title: codex CLI 向けに GET /{ns}/v1/models を ChatGPT backend の形で返す
-status: open
+status: wip
 category: request
 created: 2026-09-07T13:15:09+09:00
 last_read:
 open_entered: 2026-09-07T13:15:09+09:00
-wip_entered:
+wip_entered: 2026-09-07T13:16:20+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
