@@ -1,6 +1,6 @@
 ---
 title: codex CLI をクライアントにする: Responses API の受け口 + codex 上流へのパススルー
-status: wip
+status: resolved
 category: design
 created: 2026-09-07T11:18:28+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-07T11:19:32+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-07T11:45:24+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0025"]
 blocked_by:
 origin: 自リポ TODO
 ---
