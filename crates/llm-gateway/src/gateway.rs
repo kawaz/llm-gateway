@@ -433,6 +433,16 @@ impl<P: Persistence> Gateway<P> {
         self.router.models(ns).await
     }
 
+    /// 同じ一覧を、codex backend の記述で返す (DR-0025 追補)。
+    ///
+    /// codex 経路を持たない namespace では空。`client_version` は聞きに来た
+    /// クライアントが名乗った版で、upstream が見せる範囲を決める。
+    pub async fn codex_models(&self, ns: &Namespace, client_version: &str) -> Result<Vec<Value>> {
+        self.router
+            .codex_details(&self.http, &self.credentials, ns, client_version)
+            .await
+    }
+
     /// このモデルを実際に試す順。設定の優先順のうち、扱える経路だけ。
     pub async fn route_names(&self, ns: &Namespace, model: &str) -> Vec<String> {
         self.router.route_names(ns, model).await
@@ -6757,5 +6767,93 @@ routes = ["spare"]
         assert_eq!(event.origin, "codex");
         assert_eq!(event.model, "m");
         assert_eq!(event.status, 200);
+    }
+
+    /// codex backend が返した記述を、namespace が見せるモデルだけに絞って渡す。
+    ///
+    /// 記述を組み立てないので、gateway が持たない欄もそのまま届く。ここで
+    /// `context_window` を見るのはその確認 — 欄を選んで写す実装だと落ちる。
+    #[tokio::test]
+    async fn codex_models_carry_the_backend_description_for_visible_models() {
+        // 本物と同じく、古い版を名乗る相手には何も見せない (実測 2026-09-07:
+        // `client_version=0.43.0` で 0 件、`0.153.4` で 9 件)。
+        let backend = FakeUpstream::start(|_, req| {
+            let body = if req.contains("client_version=0.153.4") {
+                concat!(
+                    r#"{"models":["#,
+                    r#"{"slug":"m","display_name":"M","context_window":272000},"#,
+                    r#"{"slug":"unlisted","display_name":"Unlisted"}"#,
+                    r#"]}"#
+                )
+            } else {
+                r#"{"models":[]}"#
+            };
+            (200, body.to_owned())
+        })
+        .await;
+
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["m"]
+
+[ns.default]
+"#,
+                backend.url
+            ),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let listed = gw.codex_models(ns(&gw), "0.153.4").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "only what this namespace shows reaches the client: {listed:?}"
+        );
+        assert_eq!(listed[0]["slug"], "m");
+        assert_eq!(
+            listed[0]["context_window"], 272_000,
+            "fields the gateway does not model are carried, not rebuilt"
+        );
+
+        assert!(
+            gw.codex_models(ns(&gw), "0.43.0").await.unwrap().is_empty(),
+            "the client's own version decides what the upstream shows"
+        );
+    }
+
+    /// codex 経路を持たない namespace には見せるものが無い。
+    ///
+    /// Anthropic だけの経路から記述を作り出さない — 作れば必ず嘘になる。
+    #[tokio::test]
+    async fn a_namespace_without_a_codex_route_describes_nothing() {
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[routes.spare]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[ns.default]
+"#,
+            spare.url
+        ))
+        .await;
+
+        assert!(
+            gw.codex_models(ns(&gw), "0.153.4")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

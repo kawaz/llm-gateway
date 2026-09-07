@@ -93,13 +93,46 @@ keepalive (DR-0024 §2) の見張りも付かない。
 無変換の `error` / `response.failed` の両方を読む。読めないと、混んでいる経路を
 成功として採用して fallback の機会を捨てる。
 
+### 7. `/models` も名乗りで形を選ぶ。中身は backend の記述を運ぶ
+
+codex CLI は起動のたびに `GET <base_url>/models?client_version=<版>` を叩き、
+ChatGPT backend と同じ `{"models":[…]}` を期待する。Anthropic 形式
+(`{"object":"list","data":[…]}`) を返すと `missing field models` で一覧の更新に
+失敗する (実測 2026-09-07。内蔵の記述に落ちるので動作自体は止まらない)。
+
+**返す形は受け口が名乗りから決める** (§2 と同じ理屈)。`originator`
+(既定 `codex_cli_rs`、`codex exec` は `codex_exec`) か `User-Agent` の先頭が
+`codex` で始まる相手には codex の形、それ以外は従来どおり Anthropic 形式。
+
+中身は **backend の記述をそのまま運ぶ**。組み立てない理由は欄の数と型:
+codex の `ModelInfo` は必須欄だけで 10 (`slug` / `display_name` /
+`supported_reasoning_levels` / `shell_type` / `visibility` / `supported_in_api` /
+`priority` / `support_verbosity` / `truncation_policy` /
+`experimental_supported_tools`)、全体では 40 近くあり、その多くが enum。
+こちらで組むと版が上がるたびに追随が要るうえ、`context_window` や
+`model_messages.instructions_template` のように **gateway が知りようのない値**
+まで捏造することになる。運べば正しいものが正しいまま届く。
+
+絞り込みは Anthropic 形式と同じ (namespace が見せるモデルだけ)。一覧に
+出ないモデルを codex が指定しても、向こうは内蔵の記述に落ちて動く
+(`construct_model_info_from_candidates`) ので、絞っても選択肢が壊れない。
+
+`client_version` は **聞きに来た codex が名乗った版をそのまま渡す**。upstream は
+これを各モデルの `minimal_client_version` と突き合わせるので、gateway 自身の版を
+渡すと 0 件になる (実測 2026-09-07: `0.43.0` で 0 件、`0.153.4` で 9 件)。
+
+取れなかったときは空の一覧を返す。codex は空を「差し替えるものが無い」と読んで
+内蔵の記述を使い続ける (`apply_remote_models`) ので、こちらの一時的な不調で
+向こうの起動を止めずに済む。
+
 ## 影響
 
 - `Wire::send` が受けた形を受け取るようになる (返す本文を通訳するかがこれで決まる)。
   Messages しか運ばない経路は無視する
 - 中継 (relay) の経路は Messages のみのまま。転送先の gateway も同じ口を持つので
   運べる余地はあるが、確かめていないので広げない
-- `GET /{ns}/v1/models` は既存のまま。codex CLI は使わない (実測 2026-09-07)
+- `GET /{ns}/v1/models` は名乗りで形が変わる (§7)。codex の形を返すときだけ
+  upstream へ問い合わせが 1 本増える (codex CLI の起動ごとに 1 回)
 
 ## 受け入れ確認 (実機 2026-09-07)
 

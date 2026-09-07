@@ -818,6 +818,23 @@ async fn models<P: Persistence + 'static>(
         return denied;
     }
 
+    if list_shape(request.headers()) == ListShape::Codex {
+        // codex は自分の版を `client_version` に添えて聞いてくる。upstream は
+        // これで見せる範囲を決めるので、こちらの版に置き換えずそのまま渡す。
+        let client_version = client_version(request.uri().query());
+        let models = match gateway.codex_models(ns, &client_version).await {
+            Ok(models) => models,
+            // 取れなくても空で返す。codex CLI は空の一覧を「差し替えるものが
+            // 無い」と読んで内蔵の記述を使い続けるので、こちらの一時的な不調が
+            // 向こうの起動を止めない。
+            Err(e) => {
+                warn!(namespace = %ns_name, %e, "cannot describe the models for a codex client");
+                Vec::new()
+            }
+        };
+        return json_utf8(Json(json!({"models": models})));
+    }
+
     let data: Vec<Value> = gateway
         .models(ns)
         .await
@@ -825,6 +842,55 @@ async fn models<P: Persistence + 'static>(
         .map(|id| json!({"id": id, "object": "model", "type": "model"}))
         .collect();
     json_utf8(Json(json!({"object": "list", "data": data})))
+}
+
+/// 一覧を返す形。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListShape {
+    /// `{"object":"list","data":[…]}`。Claude Code と curl が読む形。
+    Anthropic,
+    /// `{"models":[…]}`。codex CLI が読む形 (DR-0025 追補)。
+    Codex,
+}
+
+/// 名乗りから、この相手が読める形を選ぶ。
+///
+/// 受けた形を受け口が決める (DR-0025 §2) のと同じ理屈で、**何を返すかは
+/// 受け口が名乗りを見て決める**。codex CLI へ Anthropic 形式を返すと
+/// `missing field models` で一覧の更新に失敗する (実測 2026-09-07)。
+fn list_shape(headers: &HeaderMap) -> ListShape {
+    // codex CLI は `originator` を必ず送る (既定 `codex_cli_rs`、`codex exec` は
+    // `codex_exec`)。別の名を名乗らせる口もあるので User-Agent も見る —
+    // こちらも `<originator>/<version> …` の形で始まる。
+    let named_codex = [headers.get("originator"), headers.get(header::USER_AGENT)]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            let name = value.split('/').next().unwrap_or_default().trim();
+            name.to_ascii_lowercase().starts_with("codex")
+        });
+
+    if named_codex {
+        ListShape::Codex
+    } else {
+        ListShape::Anthropic
+    }
+}
+
+/// 相手が名乗った版。名乗らなければ gateway 自身の版。
+///
+/// 名乗らない相手に代わりの版を作らないのは、**古い版として扱われて空の
+/// 一覧が返る**ほうが、勝手に新しい版を騙って未知のモデルを見せるより
+/// 直せる形だから。
+fn client_version(query: Option<&str>) -> String {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "client_version")
+        .map(|(_, value)| value.to_owned())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
 }
 
 fn unknown_namespace(name: &str, known: &[&str]) -> Response {
@@ -3033,6 +3099,36 @@ auth_token = "secret-token"
             "work hides fable: {work:?}"
         );
         assert!(!work.contains(&"opus".to_owned()), "aliases are not shared");
+    }
+
+    /// 同じ口でも、名乗った相手によって返す形が変わる (DR-0025 追補)。
+    ///
+    /// codex CLI へ Anthropic 形式を返すと `missing field models` で一覧の
+    /// 更新に失敗する。逆に Claude Code / curl へ codex の形を返しても読めない。
+    #[tokio::test]
+    async fn the_list_takes_the_shape_the_client_can_read() {
+        let base = serve(TWO_NS).await;
+        let get = || reqwest::Client::new().get(format!("{base}/ns-personal/v1/models"));
+
+        let plain: Value = authed(get()).send().await.unwrap().json().await.unwrap();
+        assert_eq!(plain["object"], "list", "curl and Claude Code read this");
+        assert!(plain["data"].is_array());
+        assert!(plain.get("models").is_none());
+
+        for named in ["originator", "user-agent"] {
+            let codex: Value = authed(get().header(named, "codex_cli_rs/0.153.4 (Macos 25.5.0)"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                codex["models"].is_array(),
+                "`{named}` names a codex client: {codex}"
+            );
+            assert!(codex.get("data").is_none(), "{codex}");
+        }
     }
 
     /// 設定していない namespace は 404。使えるものを教える。

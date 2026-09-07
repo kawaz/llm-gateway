@@ -217,6 +217,10 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/models
 {"object": "list", "data": [{"id": "claude-opus-5", "object": "model", "type": "model"}]}
 ```
 
+`originator` か `User-Agent` で codex を名乗る相手 (codex CLI) には、同じ一覧を
+ChatGPT backend の形 (`{"models": […]}`) で返す。中身は backend の記述そのままで、
+並ぶのはこの namespace が見せるモデルだけ (DR-0025 §7)。
+
 ## 運用系
 
 `/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため

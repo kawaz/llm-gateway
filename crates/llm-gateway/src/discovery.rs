@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::credential::Credential;
 use crate::{Error, Result};
@@ -39,12 +40,75 @@ pub enum Flavor {
     OpenAiCodex,
 }
 
+impl Flavor {
+    /// 一覧と一緒に、モデル 1 件ずつの記述まで返ってくるか。
+    ///
+    /// これを聞くのは core (router)。**どの upstream がそうなのかを core が
+    /// 知らずに済ませる**ため、名前ではなくこの問いで分ける (DR-0014 §3)。
+    pub fn carries_model_details(self) -> bool {
+        matches!(self, Self::OpenAiCodex)
+    }
+}
+
 pub async fn fetch(
     http: &reqwest::Client,
     flavor: Flavor,
     base_url: &str,
     credential: &Credential,
 ) -> Result<Vec<Model>> {
+    let text = body(
+        http,
+        flavor,
+        base_url,
+        credential,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await?;
+    parse(flavor, &text)
+}
+
+/// codex backend が返すモデルの記述を、そのままの形で 1 件ずつ返す。
+///
+/// codex CLI は `GET /models` に backend と同じ形を期待する (DR-0025 追補)。
+/// 欄が 40 近くあり、その多くが enum なので、こちらで組み立てると版が上がる
+/// たびに追随が要る。**上流の記述を運ぶ**のが確実で、context window や
+/// reasoning の段位のように gateway が知らない値もそのまま届く。
+///
+/// `client_version` は聞いている**クライアントの**版。upstream はこれを
+/// 各モデルの `minimal_client_version` と突き合わせ、古すぎる相手には
+/// 空の一覧を返す (実測 2026-09-07: `0.43.0` で 0 件、`0.153.4` で 9 件)。
+/// ここでは gateway の版ではなく、聞きに来た codex の版をそのまま渡す。
+pub async fn model_details(
+    http: &reqwest::Client,
+    base_url: &str,
+    credential: &Credential,
+    client_version: &str,
+) -> Result<Vec<Value>> {
+    #[derive(Deserialize)]
+    struct List {
+        models: Vec<Value>,
+    }
+
+    let text = body(
+        http,
+        Flavor::OpenAiCodex,
+        base_url,
+        credential,
+        client_version,
+    )
+    .await?;
+    let list: List = serde_json::from_str(&text)?;
+    Ok(list.models)
+}
+
+/// 一覧の口を叩いて本文を読む。形の解釈は呼び出し側でする。
+async fn body(
+    http: &reqwest::Client,
+    flavor: Flavor,
+    base_url: &str,
+    credential: &Credential,
+    client_version: &str,
+) -> Result<String> {
     let root = base_url.trim_end_matches('/');
     let request = match flavor {
         Flavor::Anthropic => {
@@ -62,7 +126,7 @@ pub async fn fetch(
                 .header("anthropic-version", "2023-06-01")
         }
         Flavor::OpenAiCodex => {
-            let url = format!("{root}/models?client_version={}", env!("CARGO_PKG_VERSION"));
+            let url = format!("{root}/models?client_version={client_version}");
             let account_id = credential
                 .account_id
                 .as_deref()
@@ -98,7 +162,7 @@ pub async fn fetch(
         });
     }
 
-    parse(flavor, &text)
+    Ok(text)
 }
 
 pub fn parse(flavor: Flavor, body: &str) -> Result<Vec<Model>> {

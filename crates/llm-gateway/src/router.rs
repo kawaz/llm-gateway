@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
@@ -418,6 +419,54 @@ impl Router {
         all.sort_unstable();
         all.dedup();
         all
+    }
+
+    /// この namespace に見せるモデルを、codex backend の記述で返す (DR-0025 追補)。
+    ///
+    /// 記述そのものは upstream から取る。組み立てないので、gateway が知らない
+    /// 欄も正しいまま届く。**絞り込みは [`Router::models`] と同じ**なので、
+    /// codex のモデル選択に並ぶのはこの namespace で実際に使えるものだけになる。
+    ///
+    /// 聞きに行く先は最初の codex 経路 1 つだけ。同じ backend を見ている
+    /// 経路が複数あっても返る記述は同じで、聞く数だけ待たされる。
+    pub async fn codex_details<P: Persistence>(
+        &self,
+        http: &reqwest::Client,
+        credentials: &CredentialStore<P>,
+        ns: &Namespace,
+        client_version: &str,
+    ) -> Result<Vec<Value>> {
+        let visible = self.catalog.read().await.visible(ns, &self.config);
+
+        let Some((name, route)) = ns.usable_routes(&self.config).into_iter().find_map(|name| {
+            let route = self.config.routes.get(name)?;
+            route
+                .discovery_flavor(&self.config)
+                .is_some_and(discovery::Flavor::carries_model_details)
+                .then_some((name, route))
+        }) else {
+            return Ok(Vec::new());
+        };
+
+        let credential_name = route
+            .credential
+            .as_deref()
+            .ok_or_else(|| Error::Config(format!("route `{name}` has no discovery credential")))?;
+        let credential = credentials
+            .acquire(&CredentialId::new(credential_name))
+            .await?;
+        let details =
+            discovery::model_details(http, route.url(), &credential, client_version).await?;
+
+        Ok(details
+            .into_iter()
+            .filter(|detail| {
+                detail
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|slug| visible.contains_key(slug))
+            })
+            .collect())
     }
 
     /// エイリアスなら実際のモデル名に直す。
