@@ -1,6 +1,6 @@
 ---
 title: codex CLI 向けに GET /{ns}/v1/models を ChatGPT backend の形で返す
-status: wip
+status: resolved
 category: request
 created: 2026-09-07T13:15:09+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-07T13:16:20+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-07T13:43:40+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0025§7", "implemented", "done:change xvvyozsmozkpでoriginator/User-Agentがcodexのクライアントにはbackendの/backend-api/codex/modelsをパススルー(namespace絞り込みのみ、client_versionはcodexの版を転送)", "decision:ModelInfo必須欄10/全40欄弱の捏造になるためbackend組み立て案は不採用", "decision:取得失敗時は空一覧(codexは差し替え無しと読む)", "verified:実機(port 11399 + CODEX_HOME隔離)でrefresh ERROR 0件", "note:discoveryのfetchがgateway自身の版をclient_versionに送りcatalogが常に空だった件は別issue"]
 blocked_by:
 origin: 自リポ TODO
 ---
