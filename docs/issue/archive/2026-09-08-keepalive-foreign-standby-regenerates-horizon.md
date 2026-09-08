@@ -1,6 +1,6 @@
 ---
 title: 二重 gateway の keepalive 引き継ぎ (Foreign → standby) が horizon を再生成する
-status: open
+status: resolved
 category: bug
 created: 2026-09-08T17:17:24+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-08T17:42:57+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0024","implemented","done:v0.43.6 で修正 (追補「合図の終わりは合言葉が持ち歩く」)、nonce を16バイト乱数+since_ms+horizon_end_msの32バイトに変更、Foreign受信側が絶対終了を引き継ぎ過去なら standby を作らない、テスト4本追加、just ci 814 passed、両機(11301/11302)に2026-09-08展開済み。二重gatewayでの実地確認は次回のkeepalive観測時にfindings 2026-09-08-keepalive-field-observationへ追記予定"]
 blocked_by:
 origin: 自リポ TODO
 ---
