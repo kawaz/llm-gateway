@@ -862,9 +862,12 @@ models = ["m"]
         );
     }
 
-    /// 同じ秒に届いた失敗は、直前の成功へ埋もれず failing として残る。
+    /// 同じミリ秒に届いた失敗は、直前の成功へ埋もれず failing として残る。
+    ///
+    /// 時刻の一致は実時計に任せず観測を直接植える — 2 回の `now` が同じ目盛りに
+    /// 落ちるかは運で、境界を跨ぐと通し番号の出番が無いまま通ってしまう。
     #[tokio::test]
-    async fn a_failure_in_the_same_second_outranks_the_earlier_success() {
+    async fn a_failure_in_the_same_millisecond_outranks_the_earlier_success() {
         let m = manager(
             r#"
 [routes.route]
@@ -872,8 +875,20 @@ provider = "anthropic"
 models = ["m"]
 "#,
         );
-        m.observe_success("route").await;
-        m.observe_failure("route", "upstream_http", Some(529)).await;
+        let at = now_unix_ms();
+        {
+            let mut observations = m.inner.observations.lock().await;
+            let observation = observations.entry("route".to_owned()).or_default();
+            observation.success = Some(Stamp { at, seq: 0 });
+            observation.failure = Some((
+                Stamp { at, seq: 1 },
+                Failure {
+                    at,
+                    kind: "upstream_http".to_owned(),
+                    status: Some(529),
+                },
+            ));
+        }
         let observed = &m.report().await.services[0].observed;
         assert_eq!(observed.state, ObservedState::Failing);
         assert_eq!(
