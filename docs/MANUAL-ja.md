@@ -397,8 +397,8 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
 `cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと
 出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が
-並ぶ。合図の戻りだった 1 本には `keepalive` (`applied` / `late` / `foreign`)
-が付く。
+並ぶ。合図の戻りだった 1 本には `keepalive`
+(`applied` / `late` / `foreign` / `spent`) が付く。
 
 `keepalive` 戦略で見張っている系列には、合図の連鎖の姿が付く (見張りが
 無ければ欄ごと出ない):
@@ -456,7 +456,9 @@ data: {"type":"cache_keepalive","ts":1785326640000,"session_id":"s-1","prefix":"
 書く) で、`deadline` までに戻れば `applied`、過ぎていれば `late` として知らせに
 出る。**この gateway が出していない合言葉**が戻ってきた場合は `foreign` —
 同じ会話を見ている別プロセスの合図で、こちらは控えに回る (合図が 1 本に
-収束する仕組み、DR-0024)。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
+収束する仕組み、DR-0024)。合言葉は返事の後も会話に残るので、同じ会話の
+後続のリクエストが運んでくることがある。受け取り済みのものは `spent` で、
+見張りは何もしない。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
 (`webhook`) にも同じ形で届く。
 
 会話への合図を止めたとき (`POST /llm-gateway/keepalive/pause`) にも 1 通流れる。

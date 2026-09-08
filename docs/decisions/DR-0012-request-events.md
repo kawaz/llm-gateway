@@ -118,7 +118,8 @@ data: {"ts":1785600000000,"session_id":"s-1","ns":"personal",
 - `cache_expires_at` — `ts` + `cache_ttl_secs`。残りを数える側で足し算を
   させない。寿命が分からなければ欄ごと出さない
 - `keepalive` — この 1 本が cache の合図の戻りだったときの扱い
-  (`applied` / `late` / `foreign`、DR-0024 §2)。合図でなければ欄ごと出さない
+  (`applied` / `late` / `foreign` / `spent`、DR-0024 §2)。合図でなければ欄ごと
+  出さない
 - `cache_paused` — この会話への合図が止めてあるか (DR-0024 §2 追補)。
   **常に出す** — 見る側は毎回の知らせで塗り替えるので、欄が消えると
   「止まっていない」と区別が付かない
