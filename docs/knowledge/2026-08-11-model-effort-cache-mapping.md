@@ -13,7 +13,7 @@ Anthropic Messages API と OpenAI Responses API における model・effort (思
 |---|---|---|
 | 指定 | body `model` (毎リクエスト必須) | body `model` (毎リクエスト必須) |
 | ID 体系 | alias (`claude-opus-5`) と日付付き full ID (`claude-haiku-4-5-20251001`) の 2 層。alias 推奨 | 単一 ID (`gpt-5.6-sol` 等)。日付 suffix の慣習なし |
-| 一覧 API | `GET /v1/models` (capabilities 付き) | `GET /v1/models`。codex サブスク経路は `GET /backend-api/codex/models` (アカウントによっては空配列 — 2026-08-11 実測) |
+| 一覧 API | `GET /v1/models` (capabilities 付き) | `GET /v1/models`。codex サブスク経路は `GET /backend-api/codex/models` (`client_version` が各モデルの `minimal_client_version` に届かないと空配列 — 2026-09-07 実測、DR-0026) |
 
 gateway では client が送った model 名を discovery の catalog / aliases で解決し、
 route ごとの upstream 名に書き換えて送る (`router.rs` / `egress.rs`)。

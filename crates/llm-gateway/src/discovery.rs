@@ -17,6 +17,14 @@ use serde_json::Value;
 use crate::credential::Credential;
 use crate::{Error, Result};
 
+/// 定期 refresh で codex backend に名乗る版 (DR-0026)。
+///
+/// Design rationale: backend は各モデルの `minimal_client_version` と
+/// 突き合わせ、古すぎる相手には空の一覧を返す。gateway 自身の版
+/// (`CARGO_PKG_VERSION`) を名乗ると常に 0 件になるため、**codex CLI の版**を
+/// 名乗る。単価表と同じく、リリース時に手で更新する定数として持つ。
+const CODEX_CLIENT_VERSION: &str = "0.153.4";
+
 /// upstream が公開している 1 モデル。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
@@ -56,14 +64,7 @@ pub async fn fetch(
     base_url: &str,
     credential: &Credential,
 ) -> Result<Vec<Model>> {
-    let text = body(
-        http,
-        flavor,
-        base_url,
-        credential,
-        env!("CARGO_PKG_VERSION"),
-    )
-    .await?;
+    let text = body(http, flavor, base_url, credential, CODEX_CLIENT_VERSION).await?;
     parse(flavor, &text)
 }
 

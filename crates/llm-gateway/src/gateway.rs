@@ -6773,6 +6773,9 @@ routes = ["spare"]
     ///
     /// 記述を組み立てないので、gateway が持たない欄もそのまま届く。ここで
     /// `context_window` を見るのはその確認 — 欄を選んで写す実装だと落ちる。
+    ///
+    /// 絞り込みは `exclude` が担う (DR-0026)。catalog が取れた経路では
+    /// catalog が勝つので、config の `models` は隠す手段にならない。
     #[tokio::test]
     async fn codex_models_carry_the_backend_description_for_visible_models() {
         // 本物と同じく、古い版を名乗る相手には何も見せない (実測 2026-09-07:
@@ -6802,7 +6805,7 @@ type = "codex_oauth"
 provider = "openai"
 credential = "codex"
 url = "{}/backend-api/codex"
-models = ["m"]
+exclude = ["unlisted"]
 
 [ns.default]
 "#,
