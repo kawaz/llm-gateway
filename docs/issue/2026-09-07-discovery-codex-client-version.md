@@ -1,11 +1,11 @@
 ---
 title: codex 経路の discovery が gateway 自身の版を client_version に送り catalog が常に空
-status: open
+status: wip
 category: bug
 created: 2026-09-07T13:43:54+09:00
 last_read: 2026-09-08T13:41:02+09:00
 open_entered: 2026-09-07T13:43:54+09:00
-wip_entered:
+wip_entered: 2026-09-08T13:42:58+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
