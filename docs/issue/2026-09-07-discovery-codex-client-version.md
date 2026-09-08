@@ -3,7 +3,7 @@ title: codex 経路の discovery が gateway 自身の版を client_version に�
 status: open
 category: bug
 created: 2026-09-07T13:43:54+09:00
-last_read:
+last_read: 2026-09-08T13:41:02+09:00
 open_entered: 2026-09-07T13:43:54+09:00
 wip_entered:
 blocked_entered:
