@@ -21,28 +21,28 @@ origin: 自リポ TODO
 
 ## 概要
 
-v0.43.6 で keepalive が自己ループする (ping → 返信 → classifier → 即 ping、6 秒周期)。
+タイトルの「6 秒周期の自己ループ」は誤判定だった。実際の周期は 55 分で正しく配送されていたが、統括セッションが idle 中に Monitor 通知を受け取らず起床時に溜まった分をまとめて処理したため短周期に見えた。ただし誤判定の元になった Foreign 判定の不具合自体は実在する (タイトルの「fires-immediately」は誤りだが slug は維持)。
 
 ## 背景
 
-実測 2026-09-09 05:11 JST、llm-gateway セッション (fable 5.1、ns personal):
+ccmsg daemon.log (`cache keepalive <nonce> … delivered`) で確認したところ、8 通の ping は 13:46〜20:11 UTC の間 55 分間隔で正しく配送されていた。統括セッションが idle 中に Monitor 通知を受け取らず、20:11 に起きた時点で溜まっていた 7 通を 1 ターンずつ順に処理したため、gateway 側では「12 秒周期の返信」に見えただけ。
 
-- ping の返信 (fable、origin main) は Applied で rearm される
-- 直後に走る同セッションの classifier リクエスト (sonnet、origin main、本文に transcript 経由で同じ nonce を含む) が `keepalive: foreign` と判定される (nonce は返信で消費済み = 登録簿に無い)
-- v0.43.6 の `standby()` が nonce から復号した horizon_end (≈ 今) を引き継いで**即座に**次の ping を発火する
-- 8 周期観測、各周期 fable 1.3MB + sonnet 600KB
+暫定対処 (`main = "1h"`) は 2026-09-09 05:35 JST に `main = "keepalive"` へ戻して両機再起動済み。
 
-暫定対処: 両 config の `main = "keepalive"` を `main = "1h"` に変更して両機再起動 (2026-09-09 05:15 JST、修正後に戻す)。
+残る実在の不具合:
 
-原因候補 2 つ (両方直す):
+- 同一セッションの後続リクエスト (classifier 等) が消費済み nonce を transcript 経由で含み `foreign` と誤判定され、その系列に控え (standby) が立つ
+- v0.43.6 以前から続く二重 gateway の連鎖の一因 (issue archive keepalive-foreign-standby-regenerates-horizon)
 
-1. 同一セッションが消費済み nonce を含む本文を送ってきた場合 (classifier / 続くターン) を Foreign と誤判定する — 消費済み nonce を一定期間「自分が出した」として覚える必要がある (v0.43.5 以前も Foreign 判定はしていたが standby が now+horizon で 57 分後発火だったため顕在化しなかった)
-2. `standby()` は STANDBY_AFTER (57 分) より早く発火してはならない — 復号した horizon_end が STANDBY_AFTER より近いなら控えを作らない
+worker が対処を実装済み (change wvwzyrvu):
+
+- `Marker::Spent`: 消費済み nonce をその連鎖の終わりまで記憶 (上限 1024)
+- standby の防波堤: horizon_end が now + STANDBY_AFTER 以内なら控えを作らない
 
 関連: DR-0024 追補「合図の終わりは合言葉が持ち歩く」、issue archive keepalive-foreign-standby-regenerates-horizon。
 
 ## 受け入れ条件
 
-- [ ] 消費済み nonce を含む同一セッションの後続本文が Foreign 誤判定されない
-- [ ] `standby()` が STANDBY_AFTER (57 分) より早く次の ping を発火しない
-- [ ] 暫定対処 (`main = "1h"`) を元 (`main = "keepalive"`) に戻す
+- [ ] 消費済み nonce を含む同一セッションの後続本文が Foreign 誤判定されない (change wvwzyrvu の効果を確認)
+- [ ] `standby()` が STANDBY_AFTER (57 分) より早く次の ping を発火しない (change wvwzyrvu の効果を確認)
+- [x] 暫定対処 (`main = "1h"`) を元 (`main = "keepalive"`) に戻す (2026-09-09 05:35 JST 実施済み)
