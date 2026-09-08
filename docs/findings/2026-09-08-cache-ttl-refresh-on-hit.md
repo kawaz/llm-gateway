@@ -22,6 +22,17 @@
 - 延命リクエストの課金はヒット分の read のみ (0.1 倍、5.1 系は 0.025 倍)。write は発生しない。
   usage 上、read は `cache_read_input_tokens` の 1 本で **5m 由来か 1h 由来かは区別されない**
   (`cache_creation.ephemeral_{5m,1h}_input_tokens` は write 側だけの内訳)
+- **`max_tokens` は cache key に影響しない**。本文同一で `max_tokens` だけ 1024 → 1 に変えた
+  再送は全量 read。応答は `output_tokens: 1` / `stop_reason: max_tokens` で終わり、
+  非 stream の所要は 30K プレフィックスで **約 1.0 秒** (通常応答は 2.1〜2.4 秒)
+- **`thinking` パラメータを外しても messages 側の断点は無効にならなかった**。
+  `{"type":"adaptive","display":"omitted"}` 付きで書いた本文から thinking を削り
+  `max_tokens: 1` で再送しても、system / messages 両方の断点を含む全量が read
+  (公式仕様の「thinking の変更は messages 以降を無効化」は今回の probe では再現せず。
+  ただし応答に thinking ブロックが出た本文では未検証 — 下記「再送本文の変形」の留保参照)
+- **adaptive thinking を付けたままでも `max_tokens: 1` は通る**。旧形式
+  (`{"type":"enabled","budget_tokens":1024}`) でも `max_tokens` を budget 未満にして 200 が返る
+  (この形式は sonnet-5 では効いていないとみられる、下記参照)
 
 ## 実用的な示唆 / ベストプラクティス
 
@@ -38,6 +49,19 @@
     1 行応答は出るので差は小さい
   - 1h エントリでも成立することは実測済み (下記「1h の場合」)。現行運用 (常時 1h) の
     まま自送信 keepalive に置き換えられる
+
+### 再送本文をどこまで削れるか (DR-0027 の未確定への回答)
+
+- **`max_tokens` は 1 にしてよい**。cache key は tools / system / messages なので、
+  `max_tokens` を変えても全量ヒットする。応答は 1 トークンで打ち切られ、
+  非 stream の所要は約 1.0 秒。ping 1 本の出力課金は実質ゼロに落とせる
+- **`thinking` を外す必要はない**。adaptive thinking を付けたままでも `max_tokens: 1` が
+  通るので、DR-0027 が想定した「thinking があると max_tokens を絞れない」制約は
+  現行の Claude Code の本文 (adaptive) では発生しない。**本文をそのまま送り
+  `max_tokens` だけ 1 にする**のが、加工を最小にしつつ出力を最小化する形
+- 仮に外したとしても、実測では messages 側の断点は無効にならず全量 read だった。
+  ただしこれは公式仕様と食い違うので、**外す方には寄りかからない**方がよい
+  (そのまま送れば済むので、外す動機自体がない)
 
 ### 「常時 1h + 55 分ごと ping」vs「常時 5m + 4 分ごと ping」の費用
 
@@ -145,3 +169,38 @@ t+50 前後のヒットが TTL を更新した結果。C はヒット (t+50.5) �
 なお read の 27725 は tools + system[0..1] (Claude Code 側で温まっている共通部分)、
 30111 前後が probe の固定文。完全ヒット時の 57836 / 57838 は両者の合計で、末尾 3 桁の
 違いは変種名の文字数差による。
+
+### 再送本文の変形
+
+5m TTL、sonnet、`output_config: {effort: "low"}`。断点は 2 個 — system[2] (固定文 120 段落)
+と messages 末尾 user (固定文 60 段落 + 質問) — で、messages 側の無効化が
+`cache_creation` に現れるようにした。write 時の内訳は read 27725 (共通部分) +
+create 31980 (system[2] + user 本文)、完全ヒット時は read 59705。
+
+| 系統 | 書き込み | 1 分後の再送 | read | create | out | 所要 |
+|---|---|---|---|---|---|---|
+| E1 | mt=1024、thinking なし | 本文同一・**mt=1** | 59705 | 0 | 1 | 1.0s |
+| F | mt=2048、**adaptive** | 本文同一 (mt=2048) | 59705 | 0 | 73 | 2.1s |
+| G | mt=2048、**adaptive** | **thinking 削除**・mt=1 | 59705 | 0 | 1 | 0.9s |
+| H | mt=2048、**adaptive** | adaptive 維持・**mt=1** | 59705 | 0 | 1 | 0.9s |
+
+- E1: `max_tokens` は cache key に含まれない。応答は 1 トークンで打ち切られ、
+  通常応答の 2.1〜2.4 秒に対し 1.0 秒で返る
+- H: **adaptive thinking を付けたまま `max_tokens: 1` が通る** (400 にならない)。
+  DR-0027 が懸念した「`max_tokens` を `budget_tokens` 未満に絞れない」は、
+  `budget_tokens` を持たない adaptive 形式には当てはまらない
+- G: thinking を外しても messages 側の断点は生きていた (全量 read)。公式仕様の
+  「thinking パラメータの変更は messages 以降を無効化する」は再現しなかった
+
+G の留保: 今回の probe は **応答に thinking ブロックが 1 度も出なかった**
+(`blocks=['text']` のみ)。`{"type":"enabled","budget_tokens":1024}` の旧形式でも、
+effort high + 数学の証明問題でも、`claude -p` の実リクエスト (tap で response_body を
+確認) でも出ない。sonnet-5 の adaptive は「思考しない」判断を返せるので、
+**思考が実際に発火した本文での再検証は済んでいない**。keepalive は本文をそのまま
+送れば済む以上、この方向に依存する必要はない。
+
+旧形式についての付随観測: `{"type":"enabled","budget_tokens":1024}` に対して
+`max_tokens: 512` (budget 未満) を送っても 400 にならず 200 が返る。公式仕様では
+拒否されるはずなので、sonnet-5 ではこの形式自体が無視されているとみられる
+(gateway は ns の `thinking_display` に従い `display` を注入するだけで、
+type / budget_tokens には触っていない)。
