@@ -4,6 +4,10 @@
 //! `parent_session_id` が、そのリクエストを出したのが親から生えた
 //! サブエージェントかどうかを表す (実測: docs/knowledge/2026-09-02-…)。
 //!
+//! `claude -p` 経由のサブエージェントは親を名乗らないが、請求ヘッダに
+//! `cc_is_subagent=true` を載せてくる (実測 2026-09-08)。どちらか一方でも
+//! 立っていればサブエージェント。
+//!
 //! 親を持たない呼び出しは、さらに `system` の先頭ブロックに載る請求ヘッダで
 //! 分かれる。`cc_entrypoint=cli` が対話セッション、それ以外 (`sdk-cli` =
 //! `claude -p` 等) は 1 回きりの呼び出し。
@@ -36,10 +40,11 @@ impl CallerOrigin for MetadataOrigin {
         if fields
             .get("parent_session_id")
             .is_some_and(|parent| !parent.is_null())
+            || billing_field(body, "cc_is_subagent=") == Some("true")
         {
             return RequestOrigin::Sub;
         }
-        match entrypoint(body) {
+        match billing_field(body, "cc_entrypoint=") {
             // 対話セッション。続きが来る前提で扱ってよい。
             Some(INTERACTIVE) | None => RequestOrigin::Main,
             // `claude -p` のような 1 回きりの呼び出し。
@@ -51,20 +56,20 @@ impl CallerOrigin for MetadataOrigin {
 /// 対話セッションが名乗る入り口。
 const INTERACTIVE: &str = "cli";
 
-/// `system` の先頭ブロックの請求ヘッダが名乗る入り口。
+/// `system` の先頭ブロックの請求ヘッダが名乗る 1 つの欄。
 ///
-/// 形は `x-anthropic-billing-header: cc_version=<ver>; cc_entrypoint=<name>;`。
+/// 形は
+/// `x-anthropic-billing-header: cc_version=<ver>; cc_entrypoint=<name>; cc_is_subagent=true;`。
 /// 先頭ブロックだけを見るのは、そこがクライアントの固定行だから
 /// ([`crate::events::prefix`] と同じ理由)。
-fn entrypoint(body: &Value) -> Option<&str> {
+fn billing_field<'a>(body: &'a Value, field: &str) -> Option<&'a str> {
     const HEADER: &str = "x-anthropic-billing-header:";
-    const FIELD: &str = "cc_entrypoint=";
 
     let head = body.pointer("/system/0/text")?.as_str()?;
     if !head.trim_start().starts_with(HEADER) {
         return None;
     }
-    let value = head.split(FIELD).nth(1)?;
+    let value = head.split(field).nth(1)?;
     let name = value
         .split(|c: char| c == ';' || c.is_whitespace())
         .next()?
@@ -165,6 +170,26 @@ mod tests {
                 "{entrypoint}"
             );
         }
+    }
+
+    /// 親を名乗らなくても、請求ヘッダが名乗ればサブエージェント。
+    ///
+    /// `claude -p` から生えたサブエージェントは `parent_session_id` を持たず、
+    /// 入り口も `sdk-cli` なので、これが無いと 1 回きりの呼び出しに見える。
+    #[test]
+    fn a_request_that_bills_itself_as_a_subagent_is_a_subagent() {
+        assert_eq!(
+            MetadataOrigin.origin(&json!({
+                "metadata": {"user_id": r#"{"session_id":"8f17d3dd"}"#},
+                "system": [{
+                    "type": "text",
+                    "text": "x-anthropic-billing-header: cc_version=2.1.263.2ad; cc_entrypoint=sdk-cli; cc_is_subagent=true;",
+                }],
+            })),
+            RequestOrigin::Sub
+        );
+        // 名乗りが無ければ、これまでどおり入り口で振り分ける。
+        assert_eq!(from_entrypoint("sdk-cli"), RequestOrigin::Oneshot);
     }
 
     /// 名乗りが無い / 読めない形では見分けが付かない。

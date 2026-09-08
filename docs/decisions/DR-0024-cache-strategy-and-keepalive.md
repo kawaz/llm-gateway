@@ -64,7 +64,7 @@ core はその値だけを見る (DR-0014 の境界):
 
 | origin | 見分け方 | 当てる戦略 |
 |---|---|---|
-| `sub` | `metadata.user_id` に `parent_session_id` がある | `sub` |
+| `sub` | `metadata.user_id` に `parent_session_id` がある、または請求ヘッダに `cc_is_subagent=true` (追補 2026-09-08: `claude -p` から生えたサブエージェントは親を名乗らず、これでしか見分けられない) | `sub` |
 | `oneshot` | 親を持たず、`system` 先頭ブロックの請求ヘッダの `cc_entrypoint` が `cli` 以外 (`sdk-cli` = `claude -p` 等) | `sub` |
 | `main` | 親を持たず、`cc_entrypoint=cli` か請求ヘッダ無し | `main` |
 | `unknown` | `metadata.user_id` が無い / 読めない | `main` |
