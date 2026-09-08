@@ -1,6 +1,6 @@
 ---
 title: codex 経路の discovery が gateway 自身の版を client_version に送り catalog が常に空
-status: wip
+status: resolved
 category: bug
 created: 2026-09-07T13:43:54+09:00
 last_read: 2026-09-08T13:41:02+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-09-08T13:42:58+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-08T14:16:14+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0026","implemented","derived:pricing-gap-warning-hides-excluded-models"]
 blocked_by:
 origin: 自リポ TODO
 ---
@@ -37,6 +37,10 @@ discovery による自動 catalog 更新が codex 経路で機能していない
 
 ## 受け入れ条件
 
-- [ ] 起動時の discovery で codex 経路の catalog が非空になる (ログ `updated model catalog` の内訳で確認)
-- [ ] `/ns-personal/v1/models` の一覧が意図どおり (余計なモデルが出るなら filter で隠す)
-- [ ] config のコメント訂正、DR 追記
+- [x] 起動時の discovery で codex 経路の catalog が非空になる (ログ `updated model catalog` の内訳で確認)
+- [x] `/ns-personal/v1/models` の一覧が意図どおり (余計なモデルが出るなら filter で隠す)
+- [x] config のコメント訂正、DR 追記
+
+## 解決
+
+v0.43.3 で DR-0026 として実装 (`discovery::CODEX_CLIENT_VERSION` = codex CLI 版の定数、catalog 優先 + exclude で絞る)。2026-09-08 実機で受け入れ条件を全て確認: 起動時の catalog が 41 → 51 モデルに (codex 2 credential 分が非空)、`/ns-personal/v1/models` は両 config の exclude (gpt-reserve / gpt-5.5 / gpt-5.4-mini / gpt-5.3-codex-spark / codex-auto-review) で従来の 4 モデル + alias のまま、両 config のコメント訂正済み。派生 issue: [pricing-gap-warning-hides-excluded-models](./2026-09-08-pricing-gap-warning-hides-excluded-models.md)
