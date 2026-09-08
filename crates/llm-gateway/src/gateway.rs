@@ -933,6 +933,9 @@ impl<P: Persistence> Gateway<P> {
                 let signal = keepalive::signal_in(call.body);
                 self.keepalive.standby(series.clone(), bound, signal);
             }
+            // 受け取り済みの合言葉を運んできただけの 1 本。見張りは既にこの
+            // 合図の分を織り込んであるので、触らない。
+            Some(keepalive::Marker::Spent) => {}
             // 自分が出した合図の往復は「人が動かした 1 本」ではないので、
             // 見張る期間も通った先も延ばさない。
             Some(_) => self.keepalive.rearm(series.clone()),
@@ -6465,6 +6468,75 @@ sub = "5m"
         // 相手が居なくなれば引き継ぐ。
         idle(2 * 60).await;
         assert_eq!(signal(&mut watching).await.session_id, "s-1");
+    }
+
+    /// 使い切った合言葉が同じ会話の別系列で戻ってきても、次の合図は早まらない。
+    ///
+    /// 合図の返信を受けた直後、同じ会話の分類器が transcript ごと同じ合言葉を
+    /// 運んでくる (系列は `system` の先頭が違うので別)。そこで控えに入って
+    /// **すぐに**合図を出すと、その合図がまた分類器を呼び、数秒で回り続ける。
+    #[tokio::test]
+    async fn a_spent_marker_coming_back_elsewhere_does_not_bring_the_next_signal_forward() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&signalling_config(&up.url)).await;
+        let mut watching = gw.events().subscribe();
+
+        let send = async |body: Value, headers: Vec<(String, String)>| {
+            gw.forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                headers,
+            )
+            .await
+            .unwrap()
+        };
+
+        let (body, headers) = conversation(json!({}));
+        send(body, headers).await;
+
+        idle(55 * 60 + 5).await;
+        let ping = signal(&mut watching).await;
+
+        // 会話が合言葉を返す。合図は使い切られ、見張りは同じ 55 分で置き直る。
+        let (mut reply, headers) = conversation(json!({}));
+        reply["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": ping.marker.clone()},
+        ]}]);
+        assert_eq!(
+            send(reply, headers).await.keepalive.as_deref(),
+            Some("applied")
+        );
+
+        // 直後の分類器。同じ会話だが `system` の先頭が違うので別系列で、
+        // 本文には transcript 経由で同じ合言葉が残っている。
+        let (mut classifier, headers) = conversation(json!({}));
+        classifier["system"] = json!([{
+            "type": "text",
+            "text": "Analyze this conversation and pick a topic.",
+            "cache_control": {"type": "ephemeral"},
+        }]);
+        classifier["messages"] = json!([{"role": "user", "content": [
+            {"type": "text", "text": format!("transcript: {}", ping.marker)},
+        ]}]);
+        assert_eq!(
+            send(classifier, headers).await.keepalive.as_deref(),
+            Some("spent"),
+            "the marker is one this process already took, not another process's"
+        );
+
+        idle(2 * 60).await;
+        while let Ok(notice) = watching.try_recv() {
+            assert!(
+                !matches!(notice, events::Notice::CacheKeepalive(_)),
+                "a marker this process already spent must not start a new signal right away"
+            );
+        }
     }
 
     /// 受け口を `base_urls` で書いた設定でも、合図は出る。

@@ -84,6 +84,12 @@ const TIME_CEIL_MS: i64 = 4_100_000_000_000;
 /// 残せば足りる (horizon に上限は無いが、日単位で書く値ではない)。
 const PAUSE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// 受け取り終えた合言葉を覚えておける数の天井。
+///
+/// 覚えるのは連鎖の終わりまでなので、普段は会話の数だけしか溜まらない。
+/// それでも際限なく増やさないための蓋。
+const SPENT_LIMIT: usize = 1024;
+
 pub mod store;
 
 /// 会話系列。同じ会話でも、系列が違えば別の cache になる (DR-0012 の `prefix`)。
@@ -106,6 +112,10 @@ pub enum Marker {
     /// **こちらが出していない**合言葉。同じ会話を見ている別のプロセスが
     /// 出した合図で、cache はそちらが繋いでいる (DR-0024 §2)。
     Foreign,
+    /// こちらが出して、**既に受け取った**合言葉。返信の後も同じ会話の
+    /// transcript に残り続けるので、後から来る 1 本 (分類器・次のターン) が
+    /// そのまま運んでくる。合図としては用済みで、何もしない。
+    Spent,
 }
 
 impl Marker {
@@ -115,6 +125,7 @@ impl Marker {
             Self::Applied => "applied",
             Self::Late => "late",
             Self::Foreign => "foreign",
+            Self::Spent => "spent",
         }
     }
 }
@@ -268,6 +279,12 @@ struct State {
     watched: HashMap<Series, Watched>,
     /// 出したまま戻ってきていない合図。
     pending: HashMap<String, Pending>,
+    /// 受け取り終えた自分の合言葉と、その連鎖の終わり (Unix ミリ秒)。
+    ///
+    /// 合言葉は会話の transcript に残るので、返信の後も同じ会話の別の 1 本が
+    /// 運んでくる。覚えていないと**自分の合図を別のプロセスのものと読み違え**、
+    /// その系列に控えを立ててしまう。終わりを過ぎた分は用済みなので捨てる。
+    spent: HashMap<String, i64>,
     /// 合図を止めてある会話と、止めた時刻 (Unix 秒)。
     ///
     /// 鍵が会話の id だけなのは、止めるのが会話全体の意思だから — 系列
@@ -552,14 +569,18 @@ impl Keepalive {
     /// 見ていなかった側がここで数え直すと、2 プロセスが互いの合図を見るたびに
     /// 終わりを作り直して合図が止まらなくなる。終わりを過ぎた合図 (と、
     /// 起点を読めない合図) では控えに入らない — 繋ぐものが残っていない。
+    ///
+    /// 控えが出るのは [`STANDBY_AFTER`] の後なので、**そこまでに相手の期間が
+    /// 尽きる**なら控える意味がない。引き継いだ瞬間に出す羽目になるだけで、
+    /// 引き継ぐ相手も既に黙っている。
     pub fn standby(self: &Arc<Self>, series: Series, bound: Bound, signal: Option<Signal>) {
+        let now = Instant::now();
         let carried = match self.watch_of(&series) {
             Some(carried) => carried,
             None => {
                 let Some(signal) = signal else {
                     return;
                 };
-                let now = Instant::now();
                 let left = signal.horizon_end_ms - now_unix_ms();
                 if left <= 0 {
                     return;
@@ -574,6 +595,9 @@ impl Keepalive {
                 }
             }
         };
+        if carried.horizon_end <= now + STANDBY_AFTER {
+            return;
+        }
         self.schedule(
             series,
             STANDBY_AFTER,
@@ -747,14 +771,43 @@ impl Keepalive {
 
     /// 本文が合図の戻りなら、合言葉を使い切って扱いを返す。
     ///
-    /// 合言葉は 1 回だけ有効。**出した覚えのない合言葉も合図の戻り** —
-    /// 同じ会話を見ている別のプロセスが出したもので、2 度目に戻ってきた
-    /// 自分の合言葉も同じ扱いになる ([`Marker::Foreign`]、DR-0024 §2)。
+    /// 合言葉は 1 回だけ有効。受け取った後もその合言葉は会話に残るので、
+    /// **自分が受け取り終えた分は覚えておく** ([`Marker::Spent`]) — 覚えずに
+    /// いると、同じ会話の後続の 1 本 (分類器・次のターン) が運んでくるたびに
+    /// 別のプロセスの合図 ([`Marker::Foreign`]) と読み違える。出した覚えの
+    /// 無い合言葉だけが `Foreign` = 同じ会話を見ている別のプロセスの合図
+    /// (DR-0024 §2)。
     pub fn take_marker(&self, body: &Value) -> Option<Marker> {
         let nonce = nonce_in(body)?;
-        let Some(pending) = self.state.lock().unwrap().pending.remove(&nonce) else {
-            return Some(Marker::Foreign);
+        let now_ms = now_unix_ms();
+        let mut state = self.state.lock().unwrap();
+        let Some(pending) = state.pending.remove(&nonce) else {
+            return Some(if state.spent.contains_key(&nonce) {
+                Marker::Spent
+            } else {
+                Marker::Foreign
+            });
         };
+        // 覚えておくのは、その合言葉が持ち歩いている連鎖の終わりまで。そこを
+        // 過ぎれば控えに入る材料にもならない ([`Self::standby`])。読めない
+        // 合言葉は、それが置く cache の寿命だけ持つ。
+        let until_ms =
+            signal_of(&nonce).map_or(now_ms + lifetime_ms(), |signal| signal.horizon_end_ms);
+        state.spent.retain(|_, end_ms| *end_ms > now_ms);
+        // 終わりの遠い会話ばかりが並んでも、覚える数には天井を置く。落とすのは
+        // 先に終わるものから — 誤読の窓が短いものほど惜しくない。
+        while state.spent.len() >= SPENT_LIMIT {
+            let Some(earliest) = state
+                .spent
+                .iter()
+                .min_by_key(|(_, end_ms)| **end_ms)
+                .map(|(nonce, _)| nonce.clone())
+            else {
+                break;
+            };
+            state.spent.remove(&earliest);
+        }
+        state.spent.insert(nonce, until_ms);
         Some(if Instant::now() <= pending.deadline {
             Marker::Applied
         } else {
@@ -1118,8 +1171,8 @@ mod tests {
         );
         assert_eq!(
             keepalive.take_marker(&coming_back),
-            Some(Marker::Foreign),
-            "a nonce is spent once; what comes back after that is someone else's"
+            Some(Marker::Spent),
+            "a nonce is redeemed once; the conversation keeps carrying it afterwards"
         );
         assert_eq!(keepalive.waiting(), 0);
     }
@@ -1539,6 +1592,55 @@ mod tests {
             chain.until_ms <= carried.horizon_end_ms + lifetime_ms() + refresh_ms(),
             "and the end stays the one the other process set"
         );
+    }
+
+    /// 受け取り終えた合言葉が同じ会話の後から来る 1 本に残っていても、
+    /// 別のプロセスの合図とは読み違えない。
+    ///
+    /// 合言葉は返信の後も transcript に残る。読み違えると、その会話の別の
+    /// 系列 (分類器など) に控えが立ち、こちらの合図がまた分類器を呼ぶ。
+    #[tokio::test(start_paused = true)]
+    async fn a_marker_this_process_already_took_is_not_someone_else_s() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        let ping = signalled(watching.recv().await.unwrap());
+
+        let carrying = json!({"messages": [{"role": "user", "content": ping.marker}]});
+        assert_eq!(keepalive.take_marker(&carrying), Some(Marker::Applied));
+        keepalive.rearm(series());
+
+        // 同じ会話の分類器。系列は別 (`system` の先頭が違う) で、本文には
+        // transcript ごと同じ合言葉が載っている。
+        assert_eq!(
+            keepalive.take_marker(&carrying),
+            Some(Marker::Spent),
+            "it is our own marker coming back, not another process's"
+        );
+        assert_eq!(
+            keepalive.take_marker(&carrying),
+            Some(Marker::Spent),
+            "and it stays ours however many times the conversation carries it"
+        );
+    }
+
+    /// 控えに入っても間に合わない相手の合図では、控えを作らない。
+    ///
+    /// 出るのは 57 分後なので、それまでに相手の期間が尽きるなら繋ぐものが
+    /// 残っていない。
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_whose_end_comes_before_the_standby_wait_is_not_taken_over() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.standby(
+            series(),
+            bound(),
+            signal(STANDBY_AFTER - Duration::from_secs(60)),
+        );
+
+        assert_eq!(keepalive.armed(), 0, "nothing worth taking over");
+        tokio::time::advance(STANDBY_AFTER * 2).await;
+        settle().await;
+        assert!(watching.try_recv().is_err(), "so nothing is signalled");
     }
 
     /// 終わりを過ぎた合図では、控えに入らない。
