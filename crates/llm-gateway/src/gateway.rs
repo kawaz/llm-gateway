@@ -6779,9 +6779,11 @@ routes = ["spare"]
     #[tokio::test]
     async fn codex_models_carry_the_backend_description_for_visible_models() {
         // 本物と同じく、古い版を名乗る相手には何も見せない (実測 2026-09-07:
-        // `client_version=0.43.0` で 0 件、`0.153.4` で 9 件)。
+        // `client_version=0.43.0` で 0 件、`0.153.4` で 9 件)。新しい版の側は
+        // 定数を参照する — リリースで版を上げただけでここが落ちないように。
         let backend = FakeUpstream::start(|_, req| {
-            let body = if req.contains("client_version=0.153.4") {
+            let current = format!("client_version={}", crate::discovery::CODEX_CLIENT_VERSION);
+            let body = if req.contains(&current) {
                 concat!(
                     r#"{"models":["#,
                     r#"{"slug":"m","display_name":"M","context_window":272000},"#,
@@ -6815,7 +6817,10 @@ exclude = ["unlisted"]
         )
         .await;
 
-        let listed = gw.codex_models(ns(&gw), "0.153.4").await.unwrap();
+        let listed = gw
+            .codex_models(ns(&gw), crate::discovery::CODEX_CLIENT_VERSION)
+            .await
+            .unwrap();
         assert_eq!(
             listed.len(),
             1,

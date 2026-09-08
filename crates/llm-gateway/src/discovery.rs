@@ -23,7 +23,7 @@ use crate::{Error, Result};
 /// 突き合わせ、古すぎる相手には空の一覧を返す。gateway 自身の版
 /// (`CARGO_PKG_VERSION`) を名乗ると常に 0 件になるため、**codex CLI の版**を
 /// 名乗る。単価表と同じく、リリース時に手で更新する定数として持つ。
-const CODEX_CLIENT_VERSION: &str = "0.153.4";
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.153.4";
 
 /// upstream が公開している 1 モデル。
 #[derive(Debug, Clone, PartialEq, Eq)]
