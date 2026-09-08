@@ -49,6 +49,13 @@ gateway は系列 (DR-0012 の `prefix` + `session_id`) ごとに「最後に up
 書き換えを済ませた後の形 — つまり実際に線に乗った bytes — をそのまま出す。加工しないので
 プレフィックスが必ず一致し、ヒットする。応答は読み捨てる。
 
+再送で変えるのは **`max_tokens` を 1 にする** ことだけ (`stream` は付けない)。`max_tokens` は
+cache key に入らず、Claude Code の本文が持つ adaptive `thinking` を付けたままでも API は
+これを受理する。読み捨ての費用は output 1 トークン、所要は 30K prefix で約 1 秒
+(`docs/findings/2026-09-08-cache-ttl-refresh-on-hit.md` 「再送本文の変形」)。`thinking` を
+外す加工はしない — 外しても実測では messages 側の断点が生きたが、思考が実際に発火した
+本文では未検証で、外さない方が加工が少ない。
+
 これで不要になるもの: marker の文面、nonce、`cache_keepalive` webhook、`applied` /
 `late` / `foreign` の語彙と収束規則、合言葉への時刻埋め込み、`keepalive_paused` の
 通知、peers による停止 / 解除の中継。**DR-0024 §2 と、それに付く追補 (多プロセス収束 /
@@ -151,15 +158,6 @@ prefix が完全一致することを実測済み (`docs/knowledge/2026-09-02-pr
 
 ## 未確定 (実装前に確かめる)
 
-- **再送本文の `max_tokens` を最小化してよいか**。cache key は system / tools / messages
-  なので body の他の欄は影響しないはずだが未実測。効くなら応答の output を数トークンに
-  抑えられる
-- **`stream: false` での読み捨てのコスト**。output 数トークン分の課金と、応答を待つ間の
-  接続 1 本
-- **`thinking` の扱い**。本文に `thinking` が付いていると `max_tokens` を
-  `budget_tokens` 未満に絞れない (API が拒否する)。`thinking` を外して送ると、公式仕様では
-  messages 側の cache 断点が無効になる (system / tools は残る) ため、messages に断点を
-  持つ本流の延命に足りるかは実測が要る。そのまま送るなら思考トークンの費用が乗る
 - **Bedrock / OpenAI 経路で同じ延命が成立するか**。今日の実験は Anthropic OAuth のみ。
   OpenAI 方言は prompt cache の語彙が違う (DR-0024 §1 と同じ留保)
 - **系列ファイルのサイズ上限と掃除**。本文を持つので 1 系列が数 MB になりうる。
