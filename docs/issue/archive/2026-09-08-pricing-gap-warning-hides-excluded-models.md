@@ -1,6 +1,6 @@
 ---
 title: 単価表 gap warning が exclude で隠したモデルにも出る (ノイズ)
-status: open
+status: resolved
 category: bug
 created: 2026-09-08T13:59:42+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-08T16:48:57+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented: v0.43.5 (Catalog::reachable = いずれかの ns から allows されるモデルだけを gap 検査対象に)", "done: 2026-09-08 両機再起動後、exclude 済みモデル (gpt-reserve/gpt-5.5/gpt-5.4-mini/claude-opus-4-5 等) の warning が出ないことを実機ログで確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
