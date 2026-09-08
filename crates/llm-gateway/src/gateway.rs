@@ -6473,8 +6473,9 @@ sub = "5m"
     /// 使い切った合言葉が同じ会話の別系列で戻ってきても、次の合図は早まらない。
     ///
     /// 合図の返信を受けた直後、同じ会話の分類器が transcript ごと同じ合言葉を
-    /// 運んでくる (系列は `system` の先頭が違うので別)。そこで控えに入って
-    /// **すぐに**合図を出すと、その合図がまた分類器を呼び、数秒で回り続ける。
+    /// 運んでくる (系列は `system` の先頭が違うので別)。これを他所の合図と
+    /// 見て控えに入ると、その系列に誰も居ないのに 57 分後の合図が予定され、
+    /// 会話が本流だけで続いていても余計な 1 本が出る。
     #[tokio::test]
     async fn a_spent_marker_coming_back_elsewhere_does_not_bring_the_next_signal_forward() {
         let up = FakeUpstream::always(200).await;
