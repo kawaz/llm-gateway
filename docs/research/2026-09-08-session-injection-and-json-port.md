@@ -287,6 +287,13 @@ python3 relay.py /tmp/cc-socks/<pid>.sock /tmp/cc-socks/<pid>.sock.real sock-dum
   ダンプで protocol は確定できたので深追いしていない)
 - `XDG_RUNTIME_DIR` が設定された環境での socket path (コード上は優先されるが、macOS の
   既定では未設定なので tmpdir 経路しか実測していない)
+- **workspace trust dialog の機械的な通過**。未 trust のディレクトリで TUI を起動すると
+  `Accessing workspace: … No, exit / Yes, I trust this folder` で止まり、hook も ccmsg も
+  走らない (2026-09-08 tmux で実測)。`-p` / stream-json は出さない (bare 環境の
+  `.claude.json` で `/private/tmp/cli-research*` の `hasTrustDialogAccepted` が `false` の
+  まま全実験が動いた)。TUI 側は `$CLAUDE_CONFIG_DIR/.claude.json` の
+  `projects["<cwd>"].hasTrustDialogAccepted: true` の先書きで越えられる見込みだが未実測
+  (trust 済みディレクトリは全て `true`)。常駐セッションを hyoui 等から立てる時の前提
 
 ## 関連
 
