@@ -1,7 +1,10 @@
 # DR-0024: prompt cache 戦略の設定と idle keepalive
 
-- Status: Accepted
+- Status: Partially superseded by DR-0027
 - Date: 2026-09-03
+
+§2 (合図の注入で cache を繋ぐ仕組みと、その追補) は DR-0027 の自送信 replay が置き換える。
+§1 の戦略語彙・§3 の損益・pause API・禁則は生きている。
 
 ## 文脈
 
