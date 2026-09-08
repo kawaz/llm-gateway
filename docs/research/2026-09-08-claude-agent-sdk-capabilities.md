@@ -79,7 +79,7 @@ query({
 - `{type:"custom", prompt, snapshot}`
 - `{type:"preset", preset:"claude_code", append?, excludeDynamicSections?, snapshot?}`
 
-`snapshot: true` は conversation の system prompt を transcript に一度記録し、後続 request と resume/continue で同じ byte sequence を再利用する。SDK 型定義は prompt cache prefix と extended thinking の安定のためこれを推奨している。custom prompt の bare string は snapshot されないため、常駐用途では object form が必要である。
+`snapshot: true` は、system-prompt recording が有効な環境では conversation の system prompt を transcript に一度記録し、後続 request と resume/continue で同じ byte sequence を再利用する契約である。SDK 型定義は prompt cache prefix と extended thinking の安定のためこれを推奨している。custom prompt の bare string は snapshot されないため、opt-in するには object form が必要である。ただし recording は account 単位で rollout 中であり、未有効の環境では option が受理されても no-op になる。今回の実測環境では no-op だった（後述）。
 
 `settingSources` は `user` / `project` / `local`。省略時は全 source、`[]` は filesystem settings を読まない SDK isolation mode。`project` を含めないと CLAUDE.md も読まれない。`env` option は subprocess environment を置換し、merge しないため、通常は `{...process.env, ...overrides}` とする。
 
@@ -220,6 +220,30 @@ E-HOOK-COUNT 1
 
 判定: 成功。hook input には session ID、cwd、permission mode、tool input、tool use ID が含まれた。
 
+### `systemPrompt.snapshot` と gateway tap
+
+`systemPrompt: {type:"preset", preset:"claude_code", snapshot: <条件>}` について、`true` / `false` / 未指定の 3 条件を比較した。各条件で 1 ターン目の後に同一 SDK process の cwd を `git init` で変化させて 2 ターン目を送り、その process を終了して同じ session ID を `resume` した。tap では今回だけの marker を最後の user message から特定し、同一 marker のうち `request_body_size` 最大の main request を選んだ。本文は保存せず、system block ごとの byte length、SHA-256、`cache_control` だけを記録した。
+
+全条件で system は 3 blocks、`cache_control` は `[-, CC, CC]` だった。比較対象として変化を含む system[2] の観測値を示す。
+
+| `snapshot` | 1 ターン目 | 同一 process の 2 ターン目 | process 終了後 `resume` |
+|---|---|---|---|
+| `true` | 27,907 bytes / `d9fc00cd3bc1…` | 27,907 / `d9fc00cd3bc1…` | 28,233 / `f715336af327…` |
+| `false` | 27,909 / `38f2db324d91…` | 27,909 / `38f2db324d91…` | 28,235 / `1ea83d6205b9…` |
+| 未指定 | 27,913 / `5bc89768617f…` | 27,913 / `5bc89768617f…` | 28,239 / `879e8be81104…` |
+
+判定: **今回のアカウントでは `snapshot: true` は process 再起動を跨いで実効しなかった**。同一 process 内では 3 条件すべてが byte-for-byte 安定し、`resume` 後は 3 条件すべてで system[2] の長さと hash が変化した。したがって同一 process 内の安定は snapshot recording の効果ではなく、process 内で system prompt が固定される通常挙動である。これは型定義の「recording 未有効の account では option を受理しても no-op」という記述と一致する。
+
+SDK main request の system 構造は CLI `-p` の実測と同じ 3 blocks・`[-, CC, CC]` だった。system[0] の請求ヘッダは次の形で、`cc_is_subagent` は無かった。
+
+```text
+x-anthropic-billing-header: cc_version=2.1.263.272; cc_entrypoint=sdk-cli;
+```
+
+system[1] は Claude Agent SDK host であることを示す短い block、system[2] は Claude Code の主要 system prompt である。SDK も CLI `-p` も `cc_entrypoint=sdk-cli` を使うため、billing header だけでは両者を区別できない。
+
+なお、`CLAUDE_CONFIG_DIR=$HOME/.claude-bare` で起動した SDK request の tap event は `ns:"bare"` ではなく `ns:"personal"` だった。gateway namespace は `CLAUDE_CONFIG_DIR` と同一軸ではない。今回の request は namespace だけに頼らず固有 marker との積で同定した。
+
 ### 版と互換性
 
 0.3.263 の型と同梱 2.1.263 の組み合わせでは全 PoC が成功した。`pluginDelivery: "initialize"` は型定義上 Claude Code 2.1.261 以上を要求する。`pathToClaudeCodeExecutable` で別 CLI を指定できるが、新しい initialize/control capability を古い CLI が持つ保証はないため、常駐サービスでは SDK package と同梱 CLI を組として pin するのが安全である。
@@ -233,7 +257,7 @@ E-HOOK-COUNT 1
 - streaming input なら 1 process / 1 session を常駐させ、外部 prompt を async queue から yield し、構造化 event から応答を取り出せる。
 - process crash・更新後も `resume` で conversation を回復できる。部屋ごとの session ID と `CLAUDE_CONFIG_DIR` を永続管理すればよい。
 - permission UI は `canUseTool`、自前能力は in-process MCP、監査は hooks として同じ host process に実装できる。CLI の control JSON を直接実装する必要がない。
-- `systemPrompt.snapshot: true` は再起動を跨いだ system prompt と prompt-cache prefix の安定に直接効く。部屋固有の変動情報は安定 prefix の後ろへ置く設計が必要である。
+- `systemPrompt.snapshot: true` は system-prompt recording が有効な account では再起動を跨いだ prompt-cache prefix の安定に効くが、今回の account では no-op だった。常駐 process 内では指定値に関係なく system prompt が安定したため、現時点の cache 維持は process を常駐させる設計に依存する。
 - `settingSources: []` は予期しないローカル設定・CLAUDE.md・hooks の混入を防ぐ。ただし必要な permission rules や tools は SDK option で明示する必要がある。
 
 CLI 直叩きの利点は依存層が薄く wire protocol を完全に制御できる点である。一方、SDK は protocol version、control request、permission response、in-process MCP、session persistence を既に抽象化する。常駐サービスで CLI 直叩きを選ぶと SDK と同じ bridge を自前保守することになるため、CLI にしかない新機能の先行利用や SDK 外 protocol の研究でない限り得策ではない。
@@ -246,7 +270,6 @@ CLI 直叩きの利点は依存層が薄く wire protocol を完全に制御で�
 - 公式 CHANGELOG 全期間の破壊的変更一覧
 - `forkSession` / `continue` の実機 PoC
 - programmatic `agents` option から subagent を起動する実機 PoC
-- llm-gateway tap での SDK request の `system[0]` billing header と system block 配列。今回の PoC が gateway 経由で成功したことは確認したが、他セッションの本文を読まず `ns == "bare"` の当該 request だけを安全に同定する観測は完了していない
 - 長時間常駐時の stdin backpressure、再接続、compaction、prompt cache TTL と keepalive の実測
 
 ## 関連
