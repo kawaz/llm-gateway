@@ -82,6 +82,22 @@ Claude Code の実リクエスト (同日)。
   **無ければ main 系** (main、`claude --fork-session` の fork、main 直下の classifier)、
   **あれば subagent 系** (Agent tool / `/subtask` の fork 型 subagent とその classifier、
   値は親 session_id と同一)。fork は gateway からは独立セッションに見える
+- **subagent は main の prompt cache を共有できない**。system[0] の請求ヘッダが種別で異なる:
+  main `x-anthropic-billing-header: cc_version=2.1.263.9c1; cc_entrypoint=sdk-cli;`、
+  subagent `cc_version=2.1.263.2ad; cc_entrypoint=sdk-cli; cc_is_subagent=true;`、
+  classifier (security monitor) `cc_version=2.1.263.b6e; cc_entrypoint=sdk-cli;`。
+  system[0] は最初の cache_control 断点より前なので、prefix は先頭から不一致
+  (2026-09-08 実測、v0.43.3、`claude -p --model sonnet` から Agent tool (Explore) 起動の 1 プロセス 6 リクエストで比較)
+- system[1] は `-p` 経路では 62 字の「You are a Claude agent, built on Anthropic's Claude Agent SDK.」
+  (断点付き、main / sub 共通)。system[2] は agent 種別ごとの専用本文 (main 29217 字、
+  Explore 3768 字、classifier は system[1] が 127036 字の別物) で断点付き
+- 同種 subagent 同士 (Explore の 2 リクエスト) は system[0..2] が完全一致する =
+  同種 agent 間では cache が効く (9/3 集計で subagent 費用が 1 割に収まる理由)。sub を
+  1h にする効果は「同種 subagent の起動間隔が 5 分超 1 時間未満」の場合に限られる
+- `-p` 経路の `metadata.user_id` は `{device_id, account_uuid, session_id}` のみで
+  `parent_session_id` が無い (subagent でも同じ)。判別に使えるのは `cc_is_subagent=true`
+  (issue: docs/issue/2026-09-08-origin-cc-is-subagent-header.md)
+- cc_version の 3 桁 hex 接尾辞は同一プロセス内でも種別で変わる。意味は未解明
 - **`claude -p` (one-shot) は system[0] の請求ヘッダが `cc_entrypoint=sdk-cli;`**、
   対話セッションは `cc_entrypoint=cli;` (2026-09-03 実測)。`metadata.user_id` には
   parent が無いので、これを見ないと main と区別できない
@@ -93,3 +109,4 @@ Claude Code の実リクエスト (同日)。
 ## 未検証 (実験で確定させるべき点)
 
 - 200K 超 (1M context 領域) の input 単価割増の有無
+- cc_version の hex 接尾辞が何で決まるか (種別以外に起動ごとの差があるか)
