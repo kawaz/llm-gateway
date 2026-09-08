@@ -10,7 +10,7 @@
 //! 鍵にした締め出しの表を持たない — 断られ方の意味を知っているのは provider の
 //! 側で、こちらが要るのは「使えるか」と「駄目なら次はいつか」だけ。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -225,6 +225,26 @@ impl Catalog {
         visible
     }
 
+    /// どこか 1 つでも namespace から選べるモデル。
+    ///
+    /// どの namespace からも隠したモデルは呼ばれようがないので、単価表の
+    /// 抜けを気にしても請求には効かない。
+    fn reachable<'a>(&'a self, config: &Config) -> BTreeSet<&'a str> {
+        let mut reachable = BTreeSet::new();
+        for (credential, models) in &self.by_route {
+            for model in models.keys() {
+                if config
+                    .namespaces
+                    .values()
+                    .any(|ns| ns.allows(credential, model, config))
+                {
+                    reachable.insert(model.as_str());
+                }
+            }
+        }
+        reachable
+    }
+
     fn upstream_name(&self, credential: &str, model: &str) -> Option<&str> {
         self.by_route
             .get(credential)?
@@ -372,17 +392,13 @@ impl Router {
         );
         // 一覧を取り直した直後が、単価表の抜けに気づける唯一の場所。新しい
         // モデルは upstream に出てから表に載るまでのあいだ、黙って旧世代の
-        // 単価で計算されるか、コストの欄ごと消える。
-        for gap in crate::preset::pricing::gaps(
-            by_route
-                .values()
-                .flat_map(BTreeMap::keys)
-                .map(String::as_str),
-        ) {
+        // 単価で計算されるか、コストの欄ごと消える。見るのは呼べるモデルだけ。
+        let catalog = Catalog { by_route };
+        for gap in crate::preset::pricing::gaps(catalog.reachable(&self.config)) {
             warn!(%gap, "the price table does not describe this model");
         }
 
-        *self.catalog.write().await = Catalog { by_route };
+        *self.catalog.write().await = catalog;
     }
 
     /// 1 つの credential に一覧を聞く。
@@ -1099,6 +1115,50 @@ spend_down_within = "25%"
             .map(|id| id.as_str().to_owned())
             .collect();
         assert_eq!(ids, vec!["bedrock", "oauth-a", "oauth-b"]);
+    }
+
+    /// 単価表の抜けを探す相手は、どこかの namespace から呼べるモデルだけ。
+    ///
+    /// `exclude` で全 namespace から隠したモデルは請求され得ないので、
+    /// 表に無くても知らせる意味がない (起動ログのノイズになるだけ)。
+    #[tokio::test]
+    async fn the_price_table_is_only_checked_against_models_someone_can_call() {
+        const CONFIG: &str = r#"
+[ns.default.filter]
+exclude = ["ns-hidden-*"]
+
+[credentials.oauth]
+type = "claude_oauth"
+
+[routes.oauth]
+provider = "anthropic"
+credential = "oauth"
+exclude = ["route-hidden-*"]
+"#;
+        let config: Config = toml::from_str(CONFIG).unwrap();
+        config.validate().unwrap();
+        let r = build(config);
+        r.set_catalog(&[(
+            "oauth",
+            &[
+                ("ns-hidden-1", "ns-hidden-1"),
+                ("route-hidden-1", "route-hidden-1"),
+                ("visible-unpriced-1", "visible-unpriced-1"),
+            ],
+        )])
+        .await;
+
+        let catalog = r.catalog.read().await;
+        assert_eq!(
+            catalog.reachable(&r.config).into_iter().collect::<Vec<_>>(),
+            vec!["visible-unpriced-1"]
+        );
+        // 隠していないモデルの抜けは、これまでどおり見つかる。
+        let gaps = crate::preset::pricing::gaps(catalog.reachable(&r.config));
+        assert_eq!(
+            gaps.iter().map(|gap| gap.model).collect::<Vec<_>>(),
+            vec!["visible-unpriced-1"]
+        );
     }
 
     #[tokio::test]
