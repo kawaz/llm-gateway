@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-08 | request | open | [keepalive-daily-counters](./2026-09-08-keepalive-daily-counters.md) | keepalive ping の実発火回数を日別に永続化する |
 | 2026-09-08 | request | open | [origin-cc-is-subagent-header](./2026-09-08-origin-cc-is-subagent-header.md) | origin 判定に請求ヘッダの cc_is_subagent=true を parent_session_id 判定と併置する |
 | 2026-09-08 | bug | open | [pricing-gap-warning-hides-excluded-models](./2026-09-08-pricing-gap-warning-hides-excluded-models.md) | 単価表 gap warning が exclude で隠したモデルにも出る (ノイズ) |
 | 2026-09-07 | request | open | [stats-per-session-and-subagent](./2026-09-07-stats-per-session-and-subagent.md) | stats / event で subagent 別・effort 別のコストを分離できるようにする (ccmsg からの要望) |
