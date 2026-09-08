@@ -156,6 +156,10 @@ prefix が完全一致することを実測済み (`docs/knowledge/2026-09-02-pr
   抑えられる
 - **`stream: false` での読み捨てのコスト**。output 数トークン分の課金と、応答を待つ間の
   接続 1 本
+- **`thinking` の扱い**。本文に `thinking` が付いていると `max_tokens` を
+  `budget_tokens` 未満に絞れない (API が拒否する)。`thinking` を外して送ると、公式仕様では
+  messages 側の cache 断点が無効になる (system / tools は残る) ため、messages に断点を
+  持つ本流の延命に足りるかは実測が要る。そのまま送るなら思考トークンの費用が乗る
 - **Bedrock / OpenAI 経路で同じ延命が成立するか**。今日の実験は Anthropic OAuth のみ。
   OpenAI 方言は prompt cache の語彙が違う (DR-0024 §1 と同じ留保)
 - **系列ファイルのサイズ上限と掃除**。本文を持つので 1 系列が数 MB になりうる。
