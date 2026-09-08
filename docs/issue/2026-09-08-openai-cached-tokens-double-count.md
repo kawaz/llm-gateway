@@ -1,11 +1,11 @@
 ---
 title: OpenAI の usage で cached_tokens が input_tokens に含まれるのに二重課金している (gpt 系の USD が過大)
-status: open
+status: wip
 category: bug
 created: 2026-09-08T12:36:37+09:00
 last_read:
 open_entered: 2026-09-08T12:36:37+09:00
-wip_entered:
+wip_entered: 2026-09-08T12:37:30+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
