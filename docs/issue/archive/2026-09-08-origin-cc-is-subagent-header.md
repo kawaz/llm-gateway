@@ -1,6 +1,6 @@
 ---
 title: origin 判定に請求ヘッダの cc_is_subagent=true を使う
-status: open
+status: resolved
 category: request
 created: 2026-09-08T14:11:08+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-08T16:49:18+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: v0.43.5 で実装、DR-0024 判定表に追補済み、テスト a_request_that_bills_itself_as_a_subagent_is_a_subagent で実測確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
