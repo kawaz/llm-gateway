@@ -64,6 +64,17 @@ const MARGIN: Duration = Duration::from_secs(30);
 /// 合言葉の長さ (バイト)。
 const NONCE_BYTES: usize = 32;
 
+/// 合言葉の頭に置く乱数の長さ (バイト)。残りは連鎖の起点と終わり。
+const NONCE_RANDOM_BYTES: usize = 16;
+
+/// 合言葉に埋めた時刻として認める範囲 (Unix ミリ秒)。
+///
+/// 32 バイトの乱数はどれも 43 文字の base64url として読めてしまうので、
+/// 「時刻として通る値か」で見分ける。両方の欄がこの窓に収まる確率は 1e-14
+/// ほどで、乱数を時刻と読み違えることはない。
+const TIME_FLOOR_MS: i64 = 1_600_000_000_000;
+const TIME_CEIL_MS: i64 = 4_100_000_000_000;
+
 /// 止めた合図を覚えておく長さ。
 ///
 /// 解くのは実リクエストなので、二度と戻らない会話の停止は誰も片付けない。
@@ -106,6 +117,19 @@ impl Marker {
             Self::Foreign => "foreign",
         }
     }
+}
+
+/// 合言葉が持ち歩いている、その連鎖の起点と終わり (Unix ミリ秒)。
+///
+/// 別のプロセスが出した合図を見た側は、控えに入る前にこれを読む。合言葉
+/// そのものに書いてあるので、状態を配り合わなくても同じ終わりへ揃う
+/// (DR-0024 §2 追補)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Signal {
+    /// この連鎖の起点 = 最後に来た実リクエストの時刻。
+    pub since_ms: i64,
+    /// この連鎖で合図を出し続ける終わり。
+    pub horizon_end_ms: i64,
 }
 
 /// 直前の実リクエストが通った先。
@@ -523,24 +547,33 @@ impl Keepalive {
     /// [`STANDBY_AFTER`] で発火して引き継ぐ。共有する状態を持たずに、
     /// 見えているものだけで 1 本へ収束する。
     ///
-    /// この系列を見たことのないプロセスでは、その合図が通った先を起点にする
-    /// — 実リクエストを見ていなくても、控えには入れる。
-    pub fn standby(
-        self: &Arc<Self>,
-        series: Series,
-        bound: Bound,
-        horizon: Duration,
-        seen_at_ms: i64,
-    ) {
-        let carried = self.watch_of(&series).unwrap_or(Carried {
-            horizon_end: Instant::now() + horizon,
-            bound,
-            // 見たことのない系列は、相手の合図が見えたところを起点にする。
-            chain: Counted {
-                since_ms: seen_at_ms,
-                count: 0,
-            },
-        });
+    /// この系列を見たことのないプロセスでは、**相手の合言葉に書いてある**
+    /// 起点と終わりをそのまま引き継ぐ ([`Signal`])。期間は系列で 1 つなので、
+    /// 見ていなかった側がここで数え直すと、2 プロセスが互いの合図を見るたびに
+    /// 終わりを作り直して合図が止まらなくなる。終わりを過ぎた合図 (と、
+    /// 起点を読めない合図) では控えに入らない — 繋ぐものが残っていない。
+    pub fn standby(self: &Arc<Self>, series: Series, bound: Bound, signal: Option<Signal>) {
+        let carried = match self.watch_of(&series) {
+            Some(carried) => carried,
+            None => {
+                let Some(signal) = signal else {
+                    return;
+                };
+                let now = Instant::now();
+                let left = signal.horizon_end_ms - now_unix_ms();
+                if left <= 0 {
+                    return;
+                }
+                Carried {
+                    horizon_end: now + Duration::from_millis(left as u64),
+                    bound,
+                    chain: Counted {
+                        since_ms: signal.since_ms,
+                        count: 0,
+                    },
+                }
+            }
+        };
         self.schedule(
             series,
             STANDBY_AFTER,
@@ -736,14 +769,20 @@ impl Keepalive {
     /// 会話に無意味な 1 往復を挟むだけになる (DR-0024 §2)。塞がりは解ける
     /// ものなので、見張りは畳まずに次の予定だけ置き直す。
     async fn fire(self: &Arc<Self>, series: Series, deadline: Instant, deadline_ms: i64) {
-        let bound = self
+        let watching = self
             .state
             .lock()
             .unwrap()
             .watched
             .get(&series)
-            .map(|watched| watched.bound.clone());
-        let Some(bound) = bound else {
+            .map(|watched| {
+                (
+                    watched.bound.clone(),
+                    watched.chain.since_ms,
+                    watched.horizon_end,
+                )
+            });
+        let Some((bound, since_ms, horizon_end)) = watching else {
             return;
         };
         if !self.reach.usable(&bound).await {
@@ -757,9 +796,15 @@ impl Keepalive {
             return;
         }
 
-        let nonce = nonce();
+        // 合言葉には、この連鎖の起点と終わりを持たせる。受け取った別の
+        // プロセスは、これを読んで同じ終わりの控えに入る (DR-0024 §2 追補)。
+        let (now, now_ms) = (Instant::now(), now_unix_ms());
+        let nonce = nonce(Signal {
+            since_ms,
+            horizon_end_ms: unix_ms_of(horizon_end, now, now_ms),
+        });
         let notice = events::Keepalive::new(
-            now_unix_ms(),
+            now_ms,
             &series.session_id,
             &series.prefix,
             &nonce,
@@ -866,14 +911,56 @@ fn nonce_in(body: &Value) -> Option<String> {
     None
 }
 
-/// 1 回きりの合言葉。32 バイトの乱数を base64url にした 43 文字。
+/// 本文に載っている合言葉から読める、連鎖の起点と終わり。
 ///
-/// 推測できると、無関係なリクエストに 1 時間を付けさせられる。OS 由来の
-/// 種で回る乱数から起こす ([`crate::credential::oauth`] の token と同じ作り)。
-fn nonce() -> String {
+/// 別のプロセスが出した合図を受けた側が、控えに入る前に読む
+/// ([`Keepalive::standby`])。時刻として通らない値 (= 別の作りの合言葉) では
+/// `None`。
+pub fn signal_in(body: &Value) -> Option<Signal> {
+    signal_of(&nonce_in(body)?)
+}
+
+/// 1 回きりの合言葉。32 バイトを base64url にした 43 文字。
+///
+/// 中身は 16 バイトの乱数と、この連鎖の起点・終わり (それぞれ Unix ミリ秒を
+/// 8 バイトの big endian で)。合言葉に書いておけば、初めてこの会話を見た
+/// プロセスも状態を配ってもらわずに同じ終わりへ揃えられる (DR-0024 §2 追補)。
+///
+/// 推測できると、無関係なリクエストに 1 時間を付けさせられる。乱数は OS 由来
+/// の種で回る ([`crate::credential::oauth`] の token と同じ作り)。時刻の 16
+/// バイトは推測できるが、残る 128 ビットは総当たりできる量ではない。
+fn nonce(signal: Signal) -> String {
     let mut bytes = [0u8; NONCE_BYTES];
-    rand::fill(&mut bytes);
+    rand::fill(&mut bytes[..NONCE_RANDOM_BYTES]);
+    bytes[NONCE_RANDOM_BYTES..NONCE_RANDOM_BYTES + 8]
+        .copy_from_slice(&signal.since_ms.to_be_bytes());
+    bytes[NONCE_RANDOM_BYTES + 8..].copy_from_slice(&signal.horizon_end_ms.to_be_bytes());
     B64URL.encode(bytes)
+}
+
+/// 別のプロセスが出したことにする合言葉 (この crate の試験用)。
+#[cfg(test)]
+pub(crate) fn foreign_nonce(since_ms: i64, horizon: Duration) -> String {
+    nonce(Signal {
+        since_ms,
+        horizon_end_ms: since_ms + horizon.as_millis() as i64,
+    })
+}
+
+/// 合言葉に書いてある起点と終わり。読めなければ `None`。
+fn signal_of(nonce: &str) -> Option<Signal> {
+    let bytes = B64URL.decode(nonce).ok()?;
+    let bytes: [u8; NONCE_BYTES] = bytes.try_into().ok()?;
+    let at = |from: usize| i64::from_be_bytes(bytes[from..from + 8].try_into().unwrap());
+    let signal = Signal {
+        since_ms: at(NONCE_RANDOM_BYTES),
+        horizon_end_ms: at(NONCE_RANDOM_BYTES + 8),
+    };
+    let sane = |ms: i64| (TIME_FLOOR_MS..=TIME_CEIL_MS).contains(&ms);
+    (sane(signal.since_ms)
+        && sane(signal.horizon_end_ms)
+        && signal.horizon_end_ms >= signal.since_ms)
+        .then_some(signal)
 }
 
 #[cfg(test)]
@@ -889,6 +976,15 @@ mod tests {
             session_id: "s-1".to_owned(),
             prefix: "2cf24dba".to_owned(),
         }
+    }
+
+    /// 相手が出した合図が持ってくる、連鎖の起点と終わり。
+    fn signal(horizon: Duration) -> Option<Signal> {
+        let since_ms = now_unix_ms();
+        Some(Signal {
+            since_ms,
+            horizon_end_ms: since_ms + horizon.as_millis() as i64,
+        })
     }
 
     fn bound() -> Bound {
@@ -1351,7 +1447,8 @@ mod tests {
     /// 合言葉は毎回違い、長さが決まっていて、URL に置ける文字だけでできている。
     #[test]
     fn each_nonce_is_unpredictable_and_url_safe() {
-        let mint: Vec<String> = (0..8).map(|_| nonce()).collect();
+        let carried = signal(HORIZON).unwrap();
+        let mint: Vec<String> = (0..8).map(|_| nonce(carried)).collect();
         for one in &mint {
             assert_eq!(mint.iter().filter(|other| *other == one).count(), 1);
             assert_eq!(one.len(), 43, "32 bytes as base64url, without padding");
@@ -1363,13 +1460,118 @@ mod tests {
         }
     }
 
+    /// 合言葉は、連鎖の起点と終わりをそのまま持ち帰る。
+    ///
+    /// 別のプロセスはこれだけを頼りに控えへ入るので、往復して同じ値が読める
+    /// ことがこの仕掛けの土台になる (DR-0024 §2 追補)。
+    #[test]
+    fn a_nonce_carries_the_chain_it_belongs_to() {
+        for carried in [
+            Signal {
+                since_ms: 1_800_000_000_000,
+                horizon_end_ms: 1_800_000_000_000 + HORIZON.as_millis() as i64,
+            },
+            // 起点と終わりが同じ (期間 0) 合言葉も読める。
+            Signal {
+                since_ms: TIME_FLOOR_MS,
+                horizon_end_ms: TIME_FLOOR_MS,
+            },
+        ] {
+            let minted = nonce(carried);
+            assert_eq!(minted.len(), 43, "the shape does not change");
+            assert_eq!(signal_of(&minted), Some(carried));
+        }
+    }
+
+    /// 時刻を持たない合言葉は読めない。
+    ///
+    /// 別の作りの合言葉 (32 バイトの乱数) を時刻と読み違えると、でたらめな
+    /// 終わりの控えができる。
+    #[test]
+    fn a_nonce_without_a_chain_in_it_is_not_read() {
+        let mut random = [0u8; NONCE_BYTES];
+        rand::fill(&mut random);
+        for unreadable in [
+            B64URL.encode(random),
+            B64URL.encode([0u8; NONCE_BYTES]),
+            "not-base64url!".to_owned(),
+            // 長さが違う。
+            B64URL.encode([7u8; 16]),
+            // 終わりが起点より手前。
+            B64URL.encode({
+                let mut bytes = [0u8; NONCE_BYTES];
+                bytes[16..24].copy_from_slice(&(TIME_FLOOR_MS + 1).to_be_bytes());
+                bytes[24..].copy_from_slice(&TIME_FLOOR_MS.to_be_bytes());
+                bytes
+            }),
+        ] {
+            assert_eq!(signal_of(&unreadable), None, "{unreadable}");
+        }
+    }
+
+    /// 相手の合図を初めて見たプロセスは、相手の終わりをそのまま引き継ぐ。
+    ///
+    /// ここで期間を数え直すと、2 つのプロセスが互いの合図を見るたびに終わりを
+    /// 作り直し、実リクエストが 1 本も来ないまま合図が続く (DR-0024 §2 追補)。
+    #[tokio::test(start_paused = true)]
+    async fn standing_by_keeps_the_end_the_other_process_set() {
+        let (signalling, mut watching) = keepalive();
+        signalling.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        let sent = signalled(watching.recv().await.unwrap());
+        let carried = signal_of(&sent.nonce).expect("the signal carries its chain");
+
+        // 同じ会話を見ている別のプロセス。この系列は初めて見る。
+        let (standing_by, _) = keepalive();
+        standing_by.standby(series(), bound(), Some(carried));
+
+        let chain = standing_by.chain(&series()).unwrap();
+        assert_eq!(
+            chain.since_ms, carried.since_ms,
+            "the start comes from the other process, not from this one's clock"
+        );
+        assert_eq!(
+            chain.until_ms,
+            carried.since_ms + (REFRESH_AFTER * chain.until_count + LIFETIME).as_millis() as i64,
+        );
+        assert!(
+            // 期間を跨いだ 1 本が最後に出るので、終わりは 1 本分だけ先に伸びる。
+            chain.until_ms <= carried.horizon_end_ms + lifetime_ms() + refresh_ms(),
+            "and the end stays the one the other process set"
+        );
+    }
+
+    /// 終わりを過ぎた合図では、控えに入らない。
+    ///
+    /// 期間の尽きた会話へ引き継ぐものは無い。読めない合言葉も同じ扱い。
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_past_its_end_does_not_put_anyone_on_standby() {
+        let since_ms = now_unix_ms() - 2 * HORIZON.as_millis() as i64;
+        for spent in [
+            Some(Signal {
+                since_ms,
+                horizon_end_ms: since_ms + HORIZON.as_millis() as i64,
+            }),
+            // 読めない合言葉。
+            None,
+        ] {
+            let (keepalive, mut watching) = keepalive();
+            keepalive.standby(series(), bound(), spent);
+            assert_eq!(keepalive.armed(), 0, "nothing is left to hand over");
+
+            tokio::time::advance(STANDBY_AFTER * 2).await;
+            settle().await;
+            assert!(watching.try_recv().is_err(), "so nothing is signalled");
+        }
+    }
+
     /// 別のプロセスの合図を見たら、こちらは控えに回る (DR-0024 §2)。
     ///
     /// 相手が生きている限り出さない。相手が居なくなったときだけ引き継ぐ。
     #[tokio::test(start_paused = true)]
     async fn a_signal_from_elsewhere_puts_this_process_on_standby() {
         let (keepalive, mut watching) = keepalive();
-        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.standby(series(), bound(), signal(HORIZON));
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         settle().await;
@@ -1392,7 +1594,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
 
         for _ in 0..6 {
-            keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
+            keepalive.standby(series(), bound(), signal(HORIZON));
             // 相手は 55 分ごとに出す。こちらの控え (57 分) より先に届く。
             tokio::time::advance(REFRESH_AFTER).await;
             settle().await;
@@ -1429,7 +1631,7 @@ mod tests {
         let (keepalive, mut watching) = keepalive();
         assert_eq!(keepalive.armed(), 0);
 
-        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.standby(series(), bound(), signal(HORIZON));
         assert_eq!(keepalive.armed(), 1);
 
         tokio::time::advance(STANDBY_AFTER + Duration::from_secs(1)).await;
@@ -1455,7 +1657,7 @@ mod tests {
         keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
         assert_eq!(keepalive.armed(), 0, "a real request does not arm it");
 
-        keepalive.standby(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.standby(series(), bound(), signal(HORIZON));
         assert_eq!(
             keepalive.armed(),
             0,

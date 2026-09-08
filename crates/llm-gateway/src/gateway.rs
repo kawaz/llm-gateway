@@ -927,10 +927,11 @@ impl<P: Persistence> Gateway<P> {
         match call.keepalive {
             // 別のプロセスが同じ会話を見ている。cache はそちらが繋いでいるので、
             // こちらは一歩下がって控える (DR-0024 §2)。
+            // 期間は相手の合言葉に書いてあるものを引き継ぐ。こちらで数え直すと、
+            // 互いの合図を見るたびに終わりが伸びて止まらなくなる。
             Some(keepalive::Marker::Foreign) => {
-                let horizon = self.horizon_for(call, route);
-                self.keepalive
-                    .standby(series.clone(), bound, horizon, sent_at_ms);
+                let signal = keepalive::signal_in(call.body);
+                self.keepalive.standby(series.clone(), bound, signal);
             }
             // 自分が出した合図の往復は「人が動かした 1 本」ではないので、
             // 見張る期間も通った先も延ばさない。
@@ -6428,9 +6429,14 @@ sub = "5m"
         let gw = gateway(&signalling_config(&up.url)).await;
         let mut watching = gw.events().subscribe();
 
+        // 相手の合言葉が、その連鎖の起点と終わりを持ってくる (DR-0024 §2 追補)。
+        let theirs = keepalive::foreign_nonce(
+            crate::credential::time::now_unix_ms(),
+            std::time::Duration::from_secs(8 * 60 * 60),
+        );
         let (mut foreign, headers) = conversation(json!({}));
         foreign["messages"] = json!([{"role": "user", "content": [
-            {"type": "text", "text": events::marker("not-one-of-ours")},
+            {"type": "text", "text": events::marker(&theirs)},
         ]}]);
         let forwarded = gw
             .forward(
