@@ -272,14 +272,27 @@ impl UsageObserver for OpenAiJsonUsage {
 /// 内訳の欄は 2 通りある。通訳した Messages 形式では平らな欄になり、無変換で
 /// 流す Responses 形式では入れ子のまま来る (DR-0025)。同じ数を指す別表記なので、
 /// 両方を同じ区分へ読む。
+///
+/// `input` に入れるのは、どちらの形から読んでも**キャッシュ分を含む総数**
+/// (upstream が `usage.input_tokens` で言っている数)。記録の意味を経路で
+/// 変えると、単価側 (`preset::pricing` の `OPENAI_REFINEMENTS`) が内数を引く
+/// 相手を決められない。Messages 形式は Anthropic の意味 (キャッシュ分を含まない)
+/// で書かれているので、内訳を足し戻して総数へ揃える。
 fn read_usage(value: &Value, usage: &mut TokenUsage) {
     for (pointer, kind) in [
-        ("/input_tokens", TokenKind::INPUT_NAME),
         ("/output_tokens", TokenKind::OUTPUT_NAME),
         ("/cache_read_input_tokens", TokenKind::INPUT_CACHE_READ_NAME),
         (
             "/input_tokens_details/cached_tokens",
             TokenKind::INPUT_CACHE_READ_NAME,
+        ),
+        (
+            "/cache_creation_input_tokens",
+            TokenKind::INPUT_CACHE_CREATION_NAME,
+        ),
+        (
+            "/input_tokens_details/cache_write_tokens",
+            TokenKind::INPUT_CACHE_CREATION_NAME,
         ),
         ("/reasoning_output_tokens", TokenKind::OUTPUT_REASONING_NAME),
         (
@@ -291,6 +304,19 @@ fn read_usage(value: &Value, usage: &mut TokenUsage) {
             usage.set(kind, count);
         }
     }
+    let Some(input) = value.pointer("/input_tokens").and_then(Value::as_u64) else {
+        return;
+    };
+    // 入れ子の内訳がある = Responses 形式で、`input_tokens` は既に総数。
+    let total = match value.get("input_tokens_details").is_some() {
+        true => input,
+        false => {
+            let detail =
+                |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+            input + detail("/cache_read_input_tokens") + detail("/cache_creation_input_tokens")
+        }
+    };
+    usage.set(TokenKind::INPUT_NAME, total);
 }
 
 #[cfg(test)]
@@ -392,9 +418,12 @@ mod tests {
     }
 
     fn assert_all_usage_kinds(usage: &TokenUsage) {
-        assert_eq!(usage.get(&TokenKind::input()), Some(10));
+        // Messages 形式の 10 はキャッシュ以外の入力。記録は upstream の言う
+        // 総数に揃えるので、内訳の 3 と 1 を足し戻した 14 になる。
+        assert_eq!(usage.get(&TokenKind::input()), Some(14));
         assert_eq!(usage.get(&TokenKind::output()), Some(7));
         assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(3));
+        assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(1));
         assert_eq!(usage.get(&TokenKind::output_reasoning()), Some(2));
     }
 
@@ -404,7 +433,7 @@ mod tests {
         let mut observer = OpenAiMetering
             .usage_observer(Some("text/event-stream"))
             .unwrap();
-        observer.observe(br#"data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}
+        observer.observe(br#"data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":7,"cache_creation_input_tokens":1,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}
 
 "#);
         assert_all_usage_kinds(&observer.finish().usage.unwrap());
@@ -416,7 +445,26 @@ mod tests {
         let mut observer = OpenAiMetering
             .usage_observer(Some("application/json"))
             .unwrap();
-        observer.observe(br#"{"type":"message","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}"#);
+        observer.observe(br#"{"type":"message","usage":{"input_tokens":10,"output_tokens":7,"cache_creation_input_tokens":1,"cache_read_input_tokens":3,"reasoning_output_tokens":2}}"#);
         assert_all_usage_kinds(&observer.finish().usage.unwrap());
+    }
+
+    /// 無変換で流す Responses 形式の `input_tokens` は既に総数。足し戻さない。
+    ///
+    /// キャッシュの内訳 (`cached_tokens` / `cache_write_tokens`) はその内数で、
+    /// 単価側 (`preset::pricing`) が親から引いて 1 度だけ課金する。
+    #[test]
+    fn keeps_the_responses_input_total_as_it_arrives() {
+        let mut observer = OpenAiMetering
+            .usage_observer(Some("text/event-stream"))
+            .unwrap();
+        observer.observe(br#"data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":7,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":1},"output_tokens_details":{"reasoning_tokens":2}}}}
+
+"#);
+        let usage = observer.finish().usage.unwrap();
+        assert_eq!(usage.get(&TokenKind::input()), Some(10));
+        assert_eq!(usage.get(&TokenKind::input_cache_read()), Some(3));
+        assert_eq!(usage.get(&TokenKind::input_cache_creation()), Some(1));
+        assert_eq!(usage.get(&TokenKind::output_reasoning()), Some(2));
     }
 }

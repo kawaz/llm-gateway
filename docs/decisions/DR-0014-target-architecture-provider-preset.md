@@ -131,6 +131,10 @@ cached input 等)。ここを規約化しないと、provider ごとに集計フ
   対応 (`Pricing::refines`) を併せ持ち、親は**単価を持つ内訳を引いた残り**だけを
   負担する。内訳の届かない記録 (内訳を返さない provider、内訳を持たない過去日)
   では親が全量を負担するので、同じ表が両方を正しく値付けする
+- **親子の宣言は行ごと。** 同じ綴りの区分でも、内数かどうかは upstream で違う。
+  Anthropic の `input` はキャッシュ分を含まないが、OpenAI の `input_tokens` は
+  cached も cache write も含む総数で、両方が `input` の内訳になる。
+  `Metering` が写像の意味を決め、単価表の行がそれに対応する宣言を持つ
 - **USD は読み出し時に換算する。** DR-0011 の日次集計と単価適用の時点を維持する
 
 ### 5. 内部正規形 = Anthropic Messages 形式

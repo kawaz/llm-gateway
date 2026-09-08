@@ -320,13 +320,22 @@ fn error_type(message: &str) -> &'static str {
     }
 }
 
+/// Responses の usage を Messages の usage へ写す。
+///
+/// `input_tokens` の意味が方言で違う。OpenAI はキャッシュ分を含む総数、Anthropic
+/// は**キャッシュ以外**の入力で、キャッシュ分は別欄に並ぶ。受け取る側は
+/// Anthropic の意味で足し合わせるので、内訳を引いてから渡す。
 fn usage(value: Option<&Value>) -> Value {
     let value = value.unwrap_or(&Value::Null);
+    let field = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64).unwrap_or(0);
+    let cache_read = field("/input_tokens_details/cached_tokens");
+    let cache_write = field("/input_tokens_details/cache_write_tokens");
     json!({
-        "input_tokens": value.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-        "output_tokens": value.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-        "cache_read_input_tokens": value.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0),
-        "reasoning_output_tokens": value.pointer("/output_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0)
+        "input_tokens": field("/input_tokens").saturating_sub(cache_read).saturating_sub(cache_write),
+        "output_tokens": field("/output_tokens"),
+        "cache_creation_input_tokens": cache_write,
+        "cache_read_input_tokens": cache_read,
+        "reasoning_output_tokens": field("/output_tokens_details/reasoning_tokens")
     })
 }
 
@@ -367,6 +376,23 @@ mod tests {
         assert!(output.contains("\"stop_reason\":\"tool_use\""), "{output}");
         assert!(output.contains("\"cache_read_input_tokens\":3"), "{output}");
         assert!(output.contains("\"reasoning_output_tokens\":2"), "{output}");
+    }
+
+    /// `input_tokens` は Anthropic の意味 — キャッシュ分を含まない入力で返す。
+    ///
+    /// OpenAI の総数 (10) から cached (3) と cache write (2) を引いた 5。
+    #[tokio::test]
+    async fn reports_input_tokens_without_the_cached_share() {
+        let output = translated(vec![
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":3,\"cache_write_tokens\":2}}}}\n\n",
+        ]).await;
+
+        assert!(output.contains("\"input_tokens\":5"), "{output}");
+        assert!(output.contains("\"cache_read_input_tokens\":3"), "{output}");
+        assert!(
+            output.contains("\"cache_creation_input_tokens\":2"),
+            "{output}"
+        );
     }
 
     /// 同じ upstream failure を表す error と response.failed は、クライアントへ 1 件だけ返す。

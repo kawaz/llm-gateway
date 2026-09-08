@@ -36,18 +36,21 @@
 //! 並べる区分は**互いに重ならないもの**だけにする。合計は行に挙げた区分の
 //! 足し算なので、親区分とその内訳を両方書くと二重に課金される。
 //!
-//! 例外は [`REFINEMENTS`] に親を宣言した内訳で、こちらは親と一緒に並べてよい。
-//! 親は内訳を引いた残りだけを負担する ([`Pricing::cost`])。単価の違う内訳
-//! (TTL で値段の変わるキャッシュ書き込み) を、内訳の届かない記録との互換を
-//! 保ったまま課金するための逃げ道なので、**単価が親と同じ内訳は書かない** —
-//! 書かなければ親が全量を負担して同じ額になる。
+//! 例外は行の第 3 引数に親を宣言した内訳で、こちらは親と一緒に並べてよい。
+//! 親は内訳を引いた残りだけを負担する ([`Pricing::cost`])。単価の違う内訳を、
+//! 内訳の届かない記録との互換を保ったまま課金するための逃げ道なので、
+//! **単価が親と同じ内訳は書かない** — 書かなければ親が全量を負担して同じ額になる。
+//!
+//! 宣言が**行ごと**なのは、同じ綴りの区分でも upstream によって内数かどうかが
+//! 違うため。Anthropic の `input_tokens` はキャッシュ分を含まないが、OpenAI の
+//! それは cached も cache write も含む総数 ([`OPENAI_REFINEMENTS`])。
 //!
 //! # 倍率でなく実値で持つ
 //!
 //! Anthropic の cache write (5 分) は input の 1.25 倍、cache read は 0.1 倍だが、
 //! 倍率としてではなく計算済みの実値を書く。倍率をコードに埋めると、倍率の違う
-//! upstream (OpenAI 系には cache write の割増が無い) を足したときに
-//! 表とコードの両方を直すことになる。
+//! upstream (Anthropic の 1 時間 TTL は 2 倍、OpenAI に TTL 別の値付けは無い) を
+//! 足したときに表とコードの両方を直すことになる。
 
 use crate::metering::{Pricing, TokenKind};
 use crate::pattern;
@@ -59,7 +62,7 @@ const CACHE_WRITE: &str = TokenKind::INPUT_CACHE_CREATION_NAME;
 const CACHE_WRITE_1H: &str = TokenKind::INPUT_CACHE_CREATION_1H_NAME;
 const CACHE_READ: &str = TokenKind::INPUT_CACHE_READ_NAME;
 
-/// 内訳区分と、その値を含んでいる親区分。
+/// Anthropic の内訳と親。
 ///
 /// 1 時間キャッシュ書き込みは 5 分のものより高い (input の 2 倍 / 1.25 倍) が、
 /// upstream の合計 (`cache_creation_input_tokens`) には両方が入っている。親を
@@ -67,17 +70,37 @@ const CACHE_READ: &str = TokenKind::INPUT_CACHE_READ_NAME;
 ///
 /// 5 分の内訳 ([`TokenKind::INPUT_CACHE_CREATION_5M_NAME`]) は単価が親と同じ
 /// なので挙げない。観測値としては残り、課金は親が受け持つ。
-static REFINEMENTS: &[(&str, &str)] = &[(CACHE_WRITE_1H, CACHE_WRITE)];
+///
+/// キャッシュ書き込み・読み出しは `input_tokens` の外数なので、親は宣言しない。
+static ANTHROPIC_REFINEMENTS: &[(&str, &str)] = &[(CACHE_WRITE_1H, CACHE_WRITE)];
+
+/// OpenAI の内訳と親。
+///
+/// `usage.input_tokens` は**総数**で、`input_tokens_details` の `cached_tokens`
+/// と `cache_write_tokens` はその内数 (2026-09-08 確認 / prompt caching guide の
+/// 費用計算例が `inputTokens - cachedTokens - cacheWriteTokens` で普通の入力を
+/// 出している)。3 つを並べて足すと、キャッシュ分を 2 度課金することになる。
+static OPENAI_REFINEMENTS: &[(&str, &str)] = &[(CACHE_READ, INPUT), (CACHE_WRITE, INPUT)];
 
 /// 単価表の 1 行。`patterns` のどれかに当たれば `rates` を使う。
 struct Row {
     patterns: &'static [&'static str],
     /// 課金する区分と、その 100 万トークンあたりの USD。
     rates: &'static [(&'static str, f64)],
+    /// 内訳区分 → その値を含んでいる親区分。
+    refinements: &'static [(&'static str, &'static str)],
 }
 
-const fn row(patterns: &'static [&'static str], rates: &'static [(&'static str, f64)]) -> Row {
-    Row { patterns, rates }
+const fn row(
+    patterns: &'static [&'static str],
+    rates: &'static [(&'static str, f64)],
+    refinements: &'static [(&'static str, &'static str)],
+) -> Row {
+    Row {
+        patterns,
+        rates,
+        refinements,
+    }
 }
 
 /// 単価表。上から順に見て、最初に当たった行を使う。
@@ -99,12 +122,13 @@ static TABLE: &[Row] = &[
             "codex-*",
         ],
         &[(INPUT, 0.0), (OUTPUT, 0.0), (CACHE_READ, 0.0)],
+        OPENAI_REFINEMENTS,
     ),
     // --- Anthropic (2026-07-31 確認 / claude-api skill の Current Models 表)
     //     cache write = input x1.25 (5m TTL) / x2 (1h TTL)、cache read = input x0.1
     //     (1h の倍率は 2026-09-02 確認 / prompt-caching doc)。input はキャッシュ分を
-    //     含まないので重ならない。1h だけは cache write の内数で、[`REFINEMENTS`] が
-    //     親を宣言している。
+    //     含まないので重ならない。1h だけは cache write の内数で、
+    //     [`ANTHROPIC_REFINEMENTS`] が親を宣言している。
     // Fable 5.1 / Mythos 5.1 は cache read だけ 0.025 倍 ($0.25/MTok)。
     // 5 系の glob より前に置いて先に当てる (2026-09-02 確認 / prompt-caching doc)。
     row(
@@ -121,6 +145,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 0.25),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-fable-5", "claude-fable-5-*"],
@@ -131,6 +156,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 1.0),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-mythos-5", "claude-mythos-5-*"],
@@ -141,6 +167,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 20.0),
             (CACHE_READ, 1.0),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-opus-5", "claude-opus-5-*"],
@@ -151,6 +178,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-opus-4-8", "claude-opus-4-8-*"],
@@ -161,6 +189,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-opus-4-7", "claude-opus-4-7-*"],
@@ -171,6 +200,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-opus-4-6", "claude-opus-4-6-*"],
@@ -181,6 +211,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 10.0),
             (CACHE_READ, 0.5),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     // sonnet-5 は 2026-08-31 まで導入価格 ($2/$10) が案内されている。表には
     // 通常価格を置く — 導入価格が自分の契約に効いているか確認できておらず、
@@ -194,6 +225,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 6.0),
             (CACHE_READ, 0.3),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-sonnet-4-6", "claude-sonnet-4-6-*"],
@@ -204,6 +236,7 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 6.0),
             (CACHE_READ, 0.3),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
     row(
         &["claude-haiku-4-5", "claude-haiku-4-5-*"],
@@ -214,49 +247,59 @@ static TABLE: &[Row] = &[
             (CACHE_WRITE_1H, 2.0),
             (CACHE_READ, 0.1),
         ],
+        ANTHROPIC_REFINEMENTS,
     ),
-    // --- OpenAI gpt-6 (2026-09-06 確認 / OpenAI API docs 2026-09-03 時点の値)
-    //     区分の扱いは gpt-5.6 系と同じ (下記)。
+    // --- OpenAI gpt-6 / gpt-5.6 系
+    //     (2026-09-08 確認 / developers.openai.com/api/docs/pricing の Standard 表)
+    //     Standard tier・短コンテキストの値。長コンテキスト (272K 超入力) は
+    //     別料金だが、応答からは判別できないので採らない。reasoning は output に
+    //     含めて請求されるので、別区分では課金しない。
+    //     cache write は gpt-5.6 世代から課金され、input の 1.25 倍
+    //     (prompt caching guide: "For GPT-5.6 and later, cache writes cost 1.25x
+    //     the standard, uncached input-token rate")。cache read は 0.1 倍。
+    //     3 つとも `input_tokens` の内数なので [`OPENAI_REFINEMENTS`] が親を宣言する。
     row(
         &["gpt-6-astra", "gpt-6-astra-*"],
         &[
             (INPUT, 10.0),
             (OUTPUT, 50.0),
-            (CACHE_WRITE, 10.0),
+            (CACHE_WRITE, 12.5),
             (CACHE_READ, 1.0),
         ],
+        OPENAI_REFINEMENTS,
     ),
-    // --- OpenAI gpt-5.6 系 (2026-07-31 確認 / developers.openai.com/api/docs/pricing)
-    //     Standard tier・短コンテキストの値。cache write の割増は無いので
-    //     input と同額、cache read は cached input の値。長コンテキスト
-    //     (272K 超入力) は別料金だが、応答からは判別できないので採らない。
-    //     reasoning は output に含めて請求されるので、別区分では課金しない。
+    // sol の $4/$20 は 2026-11-21 まで案内されている導入価格。通常価格は公表が
+    // 無く、表に置ける事実がこれしかない (推測した数字は置かない)。期限が来たら
+    // 改定を確認する。
     row(
         &["gpt-5.6-sol", "gpt-5.6-sol-*"],
         &[
-            (INPUT, 5.0),
-            (OUTPUT, 30.0),
+            (INPUT, 4.0),
+            (OUTPUT, 20.0),
             (CACHE_WRITE, 5.0),
-            (CACHE_READ, 0.5),
+            (CACHE_READ, 0.4),
         ],
+        OPENAI_REFINEMENTS,
     ),
     row(
         &["gpt-5.6-terra", "gpt-5.6-terra-*"],
         &[
             (INPUT, 2.0),
             (OUTPUT, 12.0),
-            (CACHE_WRITE, 2.0),
+            (CACHE_WRITE, 2.5),
             (CACHE_READ, 0.2),
         ],
+        OPENAI_REFINEMENTS,
     ),
     row(
         &["gpt-5.6-luna", "gpt-5.6-luna-*"],
         &[
             (INPUT, 0.2),
             (OUTPUT, 1.2),
-            (CACHE_WRITE, 0.2),
+            (CACHE_WRITE, 0.25),
             (CACHE_READ, 0.02),
         ],
+        OPENAI_REFINEMENTS,
     ),
 ];
 
@@ -272,7 +315,8 @@ pub fn for_model(model: &str) -> Option<Pricing> {
         .collect();
     Some(Pricing {
         // 親子の関係は、両方に単価を書いた行にだけ要る。
-        refines: REFINEMENTS
+        refines: row
+            .refinements
             .iter()
             .map(|(child, parent)| (TokenKind::new(*child), TokenKind::new(*parent)))
             .filter(|(child, parent)| rates.contains_key(child) && rates.contains_key(parent))
@@ -531,6 +575,44 @@ mod tests {
             all.set(kind, 1_000_000);
         }
         assert_eq!(p.cost(&all), 36.75);
+    }
+
+    /// OpenAI 行ではキャッシュ分が `input` の内数。親から引いて 1 度だけ課金する。
+    #[test]
+    fn openai_cache_kinds_are_part_of_the_input_total() {
+        let p = for_model("gpt-5.6-sol").unwrap();
+        let mut observed = TokenUsage::default();
+        observed.set(TokenKind::input(), 1_000_000);
+        observed.set(TokenKind::input_cache_read(), 300_000);
+        observed.set(TokenKind::input_cache_creation(), 200_000);
+
+        // 普通の入力 50 万 x $4 + read 30 万 x $0.4 + write 20 万 x $5。
+        assert_eq!(p.cost(&observed), 2.0 + 0.12 + 1.0);
+    }
+
+    /// cache write の届かない記録でも、cached の分だけは引かれる。
+    ///
+    /// 内訳を読んでいなかった頃の記録 (`input` = 総数、`cache_read` だけ) が、
+    /// 閲覧時計算 (DR-0011) で正しい額になる。
+    #[test]
+    fn an_older_openai_record_still_subtracts_its_cached_share() {
+        let p = for_model("gpt-5.6-sol").unwrap();
+        let mut observed = TokenUsage::default();
+        observed.set(TokenKind::input(), 1_000_000);
+        observed.set(TokenKind::input_cache_read(), 300_000);
+
+        assert_eq!(p.cost(&observed), 2.8 + 0.12);
+    }
+
+    /// Anthropic 行の `input` はキャッシュ分を含まない。引かずに足す。
+    #[test]
+    fn anthropic_cache_kinds_stand_beside_the_input_total() {
+        let p = for_model("claude-opus-5").unwrap();
+        let mut observed = TokenUsage::default();
+        observed.set(TokenKind::input(), 1_000_000);
+        observed.set(TokenKind::input_cache_read(), 1_000_000);
+
+        assert_eq!(p.cost(&observed), 5.5);
     }
 
     /// 表に無い区分は課金に入らない。
