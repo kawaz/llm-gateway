@@ -1,6 +1,6 @@
 ---
 title: keepalive-foreign-standby-fires-immediately
-status: open
+status: resolved
 category: bug
 created: 2026-09-09T05:16:03+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-09T07:18:14+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented:v0.43.7 Marker::Spent (消費済みnonceを連鎖の終わりまで記憶) + standby防波堤 (horizon_endがnow+STANDBY_AFTER以内なら控えない)、両機2026-09-09展開済み"]
 blocked_by:
 origin: 自リポ TODO
 ---
