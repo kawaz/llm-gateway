@@ -619,6 +619,11 @@ OS は知らない。
 `register --dry-run` は、書く unit ファイルの中身と叩くコマンド列を出すだけで何も
 触らない。Linux 側は書いてあるが未検証 (手元に systemd が無い)。
 
+`register` は何度実行しても同じ姿に落ち着く。同じ unit が既に載っていれば何もせず
+(`changed: false`)、違えば降ろして置き換えて載せ直す (`changed: true`)。焼き込む binary は
+今の自分と同じものを指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway` 等) を選び、
+そこが無ければ今の自分を焼いて `warning` を添える (`--executable <path>` で明示もできる)。
+
 移行手順は [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md) にある。
 
 オプション:
@@ -631,6 +636,7 @@ OS は知らない。
 | `--all` | `daemon` の上げ下げ・状態・ログ | 登録されている全部 |
 | `--follow` | `daemon log` / `service log` | 書かれ続けるものを追う |
 | `--dry-run` | `service register` | 何が起きるかを出すだけで登録しない |
+| `--executable <path>` | `service register` | 焼き込む実行ファイル (既定: 同じ binary を指す PATH 上の安定な場所) |
 | `--refresh` | `usage` / `upstream status` | 読み直してから表示する (`usage` では少し消費する) |
 | `--days <N>` | `stats` | 直近 N 日 (既定: 7、`0` で全期間) |
 | `--type <type>` | `login` | `claude_oauth` または `codex_oauth` |

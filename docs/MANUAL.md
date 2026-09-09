@@ -632,6 +632,12 @@ the registry's business, not the operating system's.
 `register --dry-run` prints the unit file it would write and the commands it would run,
 and touches nothing. The Linux side is written but unverified (there is no systemd here).
 
+`register` settles on the same shape however many times it is run: it does nothing when
+the same unit is already loaded (`changed: false`), and swaps the unit in place when it
+differs (`changed: true`). The binary it bakes in is the stable place on PATH that points
+at this same binary (`/opt/homebrew/bin/llm-gateway` and the like); with no such place it
+bakes in the running binary and adds a `warning` (`--executable <path>` names one).
+
 The migration steps are in the
 [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md).
 
@@ -645,6 +651,7 @@ Options:
 | `--all` | `daemon` start/stop/restart/status/log | Everything that is registered |
 | `--follow` | `daemon log` / `service log` | Keep printing as more is written |
 | `--dry-run` | `service register` | Print what would happen instead of registering |
+| `--executable <path>` | `service register` | The binary to bake in (default: the stable path on PATH pointing at this same binary) |
 | `--refresh` | `usage` / `upstream status` | Read again before showing (with `usage` this consumes a little) |
 | `--days <N>` | `stats` | The last N days (default: 7, `0` for everything) |
 | `--type <type>` | `login` | `claude_oauth` or `codex_oauth` |

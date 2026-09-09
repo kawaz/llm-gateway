@@ -22,9 +22,11 @@ Caddy は 11301 を優先し、落ちていれば 11302 に回す。
 - **`just ci` が走っていないこと**。`cargo build --release` が
   `target/release/llm-gateway` を差し替えている最中に 11301 を起こすと起動に失敗する
   (2026-09-06 の実事故、10 分ダウン)
-- 監督者にするのは **brew の binary** (`/opt/homebrew/bin/llm-gateway`)。`service register` は
-  「今の自分」の絶対パスを plist に焼くので、repo の `target/release` から register すると
-  ビルドのたびに監督者そのものが差し替わる
+- 監督者にする binary は `service register` が自分で選ぶ。今の自分と同じ binary を指す
+  PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそれを焼くので、brew の
+  binary から実行しても repo の build から実行しても、焼かれるのは brew のパスになる。
+  安定な場所が無い (= dev build しかない) ときは警告が出るが、登録は止まらない。
+  明示したいときは `--executable <path>`
 - `~/.config` は dotfiles (`~/.dotfiles`) の working copy。config を触ったら向こうで
   コミットする
 
@@ -74,10 +76,18 @@ brew の binary が 11301 を持つ (= 壊れた変更を 11301 に閉じ込め�
 /opt/homebrew/bin/llm-gateway service register --dry-run
 ```
 
-`contents` の `ProgramArguments` が `/opt/homebrew/bin/llm-gateway daemon supervise` の 3 語で、
-`EnvironmentVariables` に `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が入っていることを確かめる
-(OS が起こす監督者は shell を通らないので、これが無いと別の状態ディレクトリを見る)。
-`commands` は `launchctl bootstrap gui/<uid> <plist>` の 1 本だけ。
+見るところ:
+
+- `executable` が `/opt/homebrew/bin/llm-gateway` になっていること。`warning` が付いていたら、
+  焼かれるのは消えうるパス (dev build 等) なので、`--executable` で指すか brew の binary を入れる
+- `contents` の `ProgramArguments` が `<executable> daemon supervise` の 3 語であること
+- `EnvironmentVariables` に `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が入っていること
+  (OS が起こす監督者は shell を通らないので、これが無いと別の状態ディレクトリを見る)
+- `commands` が `launchctl bootout …` → `launchctl bootstrap gui/<uid> <plist>` の 2 本
+  (載っていなければ bootout は空振りする)
+
+`register` は何度実行しても同じ姿に落ち着く。同じ plist が既に載っていれば何もせず
+`{"changed": false}`、違えば降ろして置き換えて載せ直す (`{"changed": true}`)。
 
 ### (d) 1 台ずつ入れ替える
 

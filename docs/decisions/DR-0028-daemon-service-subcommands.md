@@ -158,6 +158,19 @@ llm-gateway service log [--follow]
 
 既存 2 plist は runbook の手順で `launchctl bootout` してからファイルを消す。
 
+**焼き込む binary のパスは stable-which に選ばせる**。`current_exe` をそのまま焼くと
+`target/debug` や `Cellar/<version>` が plist に残り、次のビルド・次の `brew upgrade` で
+指す先が消える。`resolve_stable_path(current_exe, SameBinary)` で、同じ binary を指す
+PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそちらを焼く。安定な場所が
+無くても登録は止めず (開発中は `target/release` を常駐させるのが正しい)、警告を出力の
+`warning` と stderr に添える。`--executable <path>` で明示もできる。hyoui DR-0031 /
+cache-warden DR-0019 §2.5 と同じ方針で、`daemon add` の `binary_path` 既定も同じ解決を通す。
+
+**`register` は冪等**。描いた unit ファイルが既にそのまま置いてあり、OS 側にも載っていれば
+何もしない (`changed: false`)。違えば同じ label を降ろして置き換え、載せ直す
+(`changed: true`)。「既に登録されている」を理由に断ると、中身を直したいだけの人に
+`unregister` を挟ませることになる。
+
 ### 8. 出力は JSON、help はテキスト
 
 単発の結果は JSON、`log --follow` のような追従は JSONL。エラーは JSON を stderr に出し、
