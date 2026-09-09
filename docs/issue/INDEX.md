@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-09 | request | open | [daemon-restart-order-and-grace](./2026-09-09-daemon-restart-order-and-grace.md) | daemon restart --all の順序と停止猶予を設定可能にする |
 | 2026-09-09 | bug | open | [service-status-running-false-while-loaded](./2026-09-09-service-status-running-false-while-loaded.md) | service status の service.running が稼働中でも false になる |
 | 2026-09-09 | request | open | [subscription-inactive-credential-state](./2026-09-09-subscription-inactive-credential-state.md) | サブスク停止中の credential を「支払い待ちで利用不可」として扱う |
 | 2026-09-08 | design | open | [keepalive-via-messaging-socket](./2026-09-08-keepalive-via-messaging-socket.md) | keepalive の合図を ccmsg 経由でなく messaging socket へ直接注入する |
