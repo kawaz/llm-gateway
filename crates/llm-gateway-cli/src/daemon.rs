@@ -338,6 +338,32 @@ mod tests {
         assert!(status_of(None, "a").is_none());
     }
 
+    /// 受け付ける命令と、help に並ぶ命令は同じ (cli-design-preferences)。
+    #[test]
+    fn every_command_it_takes_is_written_in_the_help() {
+        for command in [
+            "run",
+            "supervise",
+            "add",
+            "remove",
+            "list",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "log",
+        ] {
+            assert!(
+                help::DAEMON.contains(&format!("  {command} "))
+                    || help::DAEMON.contains(&format!("  {command}\n")),
+                "the help does not offer `{command}`"
+            );
+        }
+        // 逆向き: help に無いものは受け付けない。
+        let e = dispatch(&args(&["reload"])).unwrap_err();
+        assert!(e.message().contains("there is no"), "{e:?}");
+    }
+
     #[test]
     fn an_unknown_subcommand_points_at_the_level_help() {
         let e = dispatch(&args(&["lst"])).unwrap_err();

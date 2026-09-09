@@ -80,7 +80,8 @@ add options:
                     (default: the configuration file name without its extension)
 
 log options:
-  --follow          keep printing as more is written
+  --follow          keep printing as more is written (this one needs the supervisor,
+                    since what comes next is written by the units it holds)
 
 output:
   results are JSON on stdout, errors are JSON on stderr, and this help is text
