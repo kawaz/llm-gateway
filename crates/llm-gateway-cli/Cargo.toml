@@ -24,6 +24,8 @@ tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # usage は server の HTTP 越しに取る (CLI 単独では持たない、DR-0007)。
 reqwest = { workspace = true }
+# service register / daemon add が焼き込むパスの安定化。
+stable-which = { workspace = true }
 
 [dev-dependencies]
 # 設定ファイルを試験ごとに使い捨てる (実運用の設定を触らせない)。

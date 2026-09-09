@@ -68,6 +68,9 @@ futures-util = { version = "0.3", default-features = false }
 # SSE のバイト列中継。reqwest の bytes_stream が返す型に合わせる。
 bytes = "1"
 tempfile = "3"
+# OS に焼き込む実行ファイルのパスを、同じ binary を指す PATH 上の安定な
+# symlink に解決する (dev build / Cellar 直を焼くと再ビルド・upgrade で壊れる)。
+stable-which = "0.5"
 # 認証情報のプロセス間排他 (flock)。std に口が無く、libc を直に叩くより
 # 型が付く。fs feature だけで足りる。
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }

@@ -57,10 +57,22 @@ fn add(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
         Some(name) => name,
         None => registry::name_from_config(&config)?,
     };
+    // 設定に書いてあればそれ、無ければ「今の自分」を焼く。ただし今の自分が
+    // `target/debug` のような消えるパスなら、同じ binary を指す PATH 上の
+    // 安定な場所を選ぶ (焼いたパスが消えると、監督者は上げ直せない)。
+    let mut warning = None;
     let binary_path = match loaded.server.binary_path {
         Some(binary) => absolute(&binary),
-        None => std::env::current_exe()
-            .map_err(|e| Failure::from(format!("could not find my own path: {e}")))?,
+        None => {
+            let me = std::env::current_exe()
+                .map_err(|e| Failure::from(format!("could not find my own path: {e}")))?;
+            let resolved = crate::executable::resolve(&me, None)?;
+            if let Some(said) = &resolved.warning {
+                eprintln!("llm-gateway daemon add: warning: {said}");
+            }
+            warning = resolved.warning;
+            resolved.path
+        }
     };
 
     let unit = Unit {
@@ -72,7 +84,11 @@ fn add(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
         ),
     };
     registry.add(&name, &unit)?;
-    println!("{}", json!(entry(&name, &unit)));
+    let mut row = entry(&name, &unit);
+    if let Some(warning) = warning {
+        row.insert("warning".to_owned(), json!(warning));
+    }
+    println!("{}", json!(row));
     Ok(ExitCode::SUCCESS)
 }
 

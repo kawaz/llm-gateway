@@ -16,6 +16,7 @@ use llm_gateway::daemon::protocol::{self, LogLine, Request, Which};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
+use crate::executable;
 use crate::failure::Failure;
 use crate::help;
 use crate::options::split;
@@ -72,24 +73,33 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     let rest = &args[1..];
     match args[0].as_str() {
         "register" => {
-            let dry_run = flag(rest, "dry-run")?;
-            register(&here()?, &System, dry_run)
+            let (dry_run, executable) = register_options(rest)?;
+            let resolved = executable::resolve(&current_exe()?, executable.as_deref())?;
+            if let Some(warning) = &resolved.warning {
+                eprintln!("llm-gateway service register: warning: {warning}");
+            }
+            register(
+                &here(&resolved)?,
+                &System,
+                dry_run,
+                resolved.warning.as_deref(),
+            )
         }
         "unregister" => {
             no_options(rest)?;
-            unregister(&here()?, &System)
+            unregister(&placed()?, &System)
         }
         "start" => {
             no_options(rest)?;
-            start(&here()?, &System)
+            start(&placed()?, &System)
         }
         "stop" => {
             no_options(rest)?;
-            stop(&here()?, &System)
+            stop(&placed()?, &System)
         }
         "status" => {
             no_options(rest)?;
-            status(&here()?, &System, running_units())
+            status(&placed()?, &System, running_units())
         }
         "log" => log(&log_path(), flag(rest, "follow")?),
         other => Err(Failure::from(format!(
@@ -99,19 +109,25 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
 }
 
 /// この端末での登録の形。
-fn here() -> Result<Plan, Failure> {
-    Ok(platform::plan(platform::kind(), &env()?))
+fn here(exe: &executable::Resolved) -> Result<Plan, Failure> {
+    Ok(platform::plan(platform::kind(), &env(exe.path.clone())?))
 }
 
-fn env() -> Result<Env, Failure> {
+/// 焼き込む binary を決めずに済む命令 (start / stop / status / unregister) 用。
+///
+/// これらが見るのは label と unit ファイルの場所だけで、中身は見ない。
+fn placed() -> Result<Plan, Failure> {
+    env(PathBuf::new()).map(|env| platform::plan(platform::kind(), &env))
+}
+
+fn current_exe() -> Result<PathBuf, Failure> {
+    std::env::current_exe().map_err(|e| Failure::from(format!("could not find my own path: {e}")))
+}
+
+fn env(exe: PathBuf) -> Result<Env, Failure> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| Failure::from("HOME is not set, so I cannot tell where to register"))?;
-
-    // 走らせるのは今の自分。`daemon add` が台ごとの binary を焼き込むのと同じで、
-    // 「登録した時点のもの」を指す (どのビルドを常駐させたかが後から分かる)。
-    let exe = std::env::current_exe()
-        .map_err(|e| Failure::from(format!("could not find my own path: {e}")))?;
 
     // OS が起こす監督者は shell を通らない。手元の面 (XDG の指し先) を渡さないと、
     // 別の状態ディレクトリを見たまま上がる。PATH は渡さない — 走らせる binary は
@@ -152,35 +168,58 @@ fn log_path() -> PathBuf {
     protocol::log_dir().join("supervise.log")
 }
 
-/// OS に載せる。
+/// OS に載せる。何度やっても同じ姿に落ち着く。
 ///
-/// `--dry-run` なら、書く中身と叩く並びを出すだけで何も触らない。本番の手前で
+/// 描いた unit ファイルが既にそのまま置いてあって、OS 側にも載っているなら
+/// 何もしない (`changed: false`)。違えば、同じ label を一度降ろしてから
+/// 置き換えて載せ直す (`changed: true`)。「既に登録されている」を理由に断ると、
+/// 中身を直したいときに人が `unregister` を挟むことになる。
+///
+/// `--dry-run` は、書く中身と叩く並びを出すだけで何も触らない。本番の手前で
 /// 「何が起きるか」を全部見られるようにしてある (移行の runbook がこれを使う)。
-pub fn register(plan: &Plan, runner: &dyn Runner, dry_run: bool) -> Result<ExitCode, Failure> {
+pub fn register(
+    plan: &Plan,
+    runner: &dyn Runner,
+    dry_run: bool,
+    warning: Option<&str>,
+) -> Result<ExitCode, Failure> {
     if dry_run {
+        let commands: Vec<_> = plan
+            .before_write
+            .iter()
+            .chain(&plan.register)
+            .map(Step::to_json)
+            .collect();
         println!(
             "{}",
             json!({
                 "dry_run": true,
                 "label": plan.label,
                 "path": plan.unit_path.display().to_string(),
+                "executable": plan.exe.display().to_string(),
+                "warning": warning,
                 "contents": plan.unit_text,
-                "commands": plan.register.iter().map(Step::to_json).collect::<Vec<_>>(),
+                "commands": commands,
             })
         );
         return Ok(ExitCode::SUCCESS);
     }
 
-    if plan.unit_path.exists() {
-        return Err(Failure::new(
-            "already_registered",
-            format!(
-                "`{}` is already registered at {}",
-                plan.label,
-                plan.unit_path.display()
-            ),
-        )
-        .with("hint", "run `llm-gateway service unregister` first"));
+    // 既にこの姿で載っているなら、触らない。載せ直すと監督者が畳まれて
+    // 子が全部落ちるので、「変わっていない」ことを確かめる値打ちがある。
+    let written = std::fs::read_to_string(&plan.unit_path).unwrap_or_default();
+    if written == plan.unit_text && loaded(plan, runner) {
+        println!(
+            "{}",
+            json!({
+                "registered": true,
+                "changed": false,
+                "label": plan.label,
+                "path": plan.unit_path.display().to_string(),
+                "warning": warning,
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
     }
 
     if let Some(dir) = plan.unit_path.parent() {
@@ -191,12 +230,17 @@ pub fn register(plan: &Plan, runner: &dyn Runner, dry_run: bool) -> Result<ExitC
     if let Some(dir) = plan.log.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+
+    // 載ったままだと載せ直せない。載っていなければ断られるが、それでよい。
+    for step in &plan.before_write {
+        let _ = runner.run(step);
+    }
     std::fs::write(&plan.unit_path, &plan.unit_text)
         .map_err(|e| Failure::from(format!("could not write {}: {e}", plan.unit_path.display())))?;
 
     if let Err(failure) = run_all(runner, &plan.register) {
-        // 載せられなかった unit ファイルを残すと、次の `register` が
-        // `already_registered` で断る。書く前の姿に戻す。
+        // 載せられなかった unit ファイルを残すと、載っていないのに登録済みに
+        // 見える。書く前の姿に戻す。
         let _ = std::fs::remove_file(&plan.unit_path);
         return Err(failure);
     }
@@ -205,11 +249,21 @@ pub fn register(plan: &Plan, runner: &dyn Runner, dry_run: bool) -> Result<ExitC
         "{}",
         json!({
             "registered": true,
+            "changed": true,
             "label": plan.label,
             "path": plan.unit_path.display().to_string(),
+            "executable": plan.exe.display().to_string(),
+            "warning": warning,
         })
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// OS から見て、この label が載っているか。
+fn loaded(plan: &Plan, runner: &dyn Runner) -> bool {
+    runner
+        .run(&plan.status)
+        .is_ok_and(|out| service_status(plan.kind, &out)["loaded"] == json!(true))
 }
 
 /// OS から降ろす。
@@ -512,6 +566,23 @@ fn flag(args: &[String], name: &str) -> Result<bool, Failure> {
     Ok(found)
 }
 
+/// `register` が受けるもの: `--dry-run` と `--executable <path>`。
+fn register_options(args: &[String]) -> Result<(bool, Option<String>), Failure> {
+    let mut dry_run = false;
+    let mut executable = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match split(arg) {
+            Some(("dry-run", None)) => dry_run = true,
+            Some(("executable", inline)) => {
+                executable = Some(crate::options::take_value("executable", inline, &mut it)?);
+            }
+            _ => return Err(Failure::from(format!("could not understand `{arg}`"))),
+        }
+    }
+    Ok((dry_run, executable))
+}
+
 fn no_options(args: &[String]) -> Result<(), Failure> {
     match args.first() {
         Some(unexpected) => Err(Failure::from(format!(
@@ -557,14 +628,43 @@ mod tests {
 
     impl Runner for Recorder {
         fn run(&self, step: &Step) -> Result<Output, Failure> {
-            self.calls.borrow_mut().push(
-                std::iter::once(step.program.clone())
-                    .chain(step.args.clone())
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            self.calls.borrow_mut().push(said(step));
             Ok(self.answer.clone())
         }
+    }
+
+    /// 「載っていない」と答える人。それ以外の命令は通す。
+    #[derive(Default)]
+    struct NotLoaded {
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl NotLoaded {
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl Runner for NotLoaded {
+        fn run(&self, step: &Step) -> Result<Output, Failure> {
+            self.calls.borrow_mut().push(said(step));
+            if step.args.first().map(String::as_str) == Some("print") {
+                return Ok(Output {
+                    code: 113,
+                    stdout: String::new(),
+                    stderr: "Could not find service".to_owned(),
+                });
+            }
+            Ok(Output::default())
+        }
+    }
+
+    /// 叩いた 1 本を、人が読む形に。
+    fn said(step: &Step) -> String {
+        std::iter::once(step.program.clone())
+            .chain(step.args.clone())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// 何を叩いても断る人。
@@ -580,6 +680,15 @@ mod tests {
         }
     }
 
+    /// 載っていると答える人 (`launchctl print` が state を返す)。
+    fn loaded_recorder() -> Recorder {
+        Recorder::saying(Output {
+            code: 0,
+            stdout: "\tstate = running\n\tpid = 4242\n".to_owned(),
+            stderr: String::new(),
+        })
+    }
+
     fn plan_in(dir: &Path) -> Plan {
         platform::plan(
             Kind::Launchd,
@@ -593,23 +702,90 @@ mod tests {
         )
     }
 
-    /// 載せるのは「書いてから叩く」。順序が逆だと、まだ無いファイルを指す。
+    /// 載せるのは「降ろしてから書いて、それから叩く」。
+    ///
+    /// 先に叩くとまだ無いファイルを指し、降ろさずに載せると同じ label が
+    /// 二重になる。
     #[test]
     fn registering_writes_the_unit_and_then_tells_the_system() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(&plan, &runner, false).unwrap();
+        register(&plan, &runner, false, None).unwrap();
 
         let written = std::fs::read_to_string(&plan.unit_path).unwrap();
         assert_eq!(written, plan.unit_text);
         assert_eq!(
             runner.calls(),
-            vec![format!(
-                "launchctl bootstrap gui/501 {}",
-                plan.unit_path.display()
-            )]
+            vec![
+                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
+            ]
+        );
+    }
+
+    /// 同じ姿で載っているなら、何もしない。載せ直すと監督者が畳まれ、
+    /// 抱えている台が全部落ちる。
+    #[test]
+    fn registering_the_same_thing_again_changes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan = plan_in(dir.path());
+        std::fs::create_dir_all(plan.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan.unit_path, &plan.unit_text).unwrap();
+
+        let runner = loaded_recorder();
+        register(&plan, &runner, false, None).unwrap();
+
+        // 見に行っただけで、降ろしも載せもしていない。
+        assert_eq!(
+            runner.calls(),
+            vec!["launchctl print gui/501/jp.kawaz.llm-gateway.supervise"]
+        );
+    }
+
+    /// 中身が変わっていれば、載っていても置き換える (`unregister` を挟ませない)。
+    #[test]
+    fn a_changed_unit_is_swapped_in_place() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan = plan_in(dir.path());
+        std::fs::create_dir_all(plan.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan.unit_path, "<plist>the one from before</plist>").unwrap();
+
+        let runner = loaded_recorder();
+        register(&plan, &runner, false, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&plan.unit_path).unwrap(),
+            plan.unit_text
+        );
+        assert_eq!(
+            runner.calls(),
+            vec![
+                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
+            ]
+        );
+    }
+
+    /// ファイルはそのままでも、OS から降りているなら載せ直す。
+    #[test]
+    fn a_unit_file_that_is_no_longer_loaded_is_put_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan = plan_in(dir.path());
+        std::fs::create_dir_all(plan.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan.unit_path, &plan.unit_text).unwrap();
+
+        // `launchctl print` だけが断る = ファイルはあるが載っていない。
+        let runner = NotLoaded::default();
+        register(&plan, &runner, false, None).unwrap();
+        assert_eq!(
+            runner.calls(),
+            vec![
+                "launchctl print gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
+            ]
         );
     }
 
@@ -620,22 +796,10 @@ mod tests {
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(&plan, &runner, true).unwrap();
+        register(&plan, &runner, true, Some("a dev build")).unwrap();
 
         assert!(!plan.unit_path.exists());
         assert!(runner.calls().is_empty());
-    }
-
-    /// 二重に載せない。既にあるものを黙って上書きすると、載っているものと
-    /// ファイルの中身がずれる。
-    #[test]
-    fn registering_twice_is_refused_by_name() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
-
-        let e = register(&plan, &Recorder::default(), false).unwrap_err();
-        assert_eq!(e.kind(), "already_registered");
     }
 
     /// 載せられなかったら、書いたファイルも残さない。
@@ -644,7 +808,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
 
-        let e = register(&plan, &Refuses, false).unwrap_err();
+        let e = register(&plan, &Refuses, false, None).unwrap_err();
         assert_eq!(e.kind(), "command_failed");
         assert!(e.message().contains("Bootstrap failed"), "{e:?}");
         assert!(!plan.unit_path.exists());
@@ -656,7 +820,7 @@ mod tests {
     fn unregistering_tells_the_system_before_removing_the_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
+        register(&plan, &Recorder::default(), false, None).unwrap();
 
         let refused = unregister(&plan, &Refuses).unwrap_err();
         assert_eq!(refused.kind(), "command_failed");
@@ -699,7 +863,7 @@ mod tests {
     fn starting_kickstarts_the_registered_label() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
+        register(&plan, &Recorder::default(), false, None).unwrap();
 
         let runner = Recorder::default();
         start(&plan, &runner).unwrap();
@@ -714,7 +878,7 @@ mod tests {
     fn stopping_something_that_holds_nothing_returns_at_once() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
+        register(&plan, &Recorder::default(), false, None).unwrap();
 
         let runner = Recorder::default();
         stop(&plan, &runner).unwrap();
@@ -745,7 +909,7 @@ mod tests {
     fn the_status_separates_registration_from_running_from_units() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
+        register(&plan, &Recorder::default(), false, None).unwrap();
 
         let runner = Recorder::saying(Output {
             code: 0,
@@ -816,7 +980,7 @@ mod tests {
     fn the_log_directory_is_made_before_the_service_is_loaded() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false).unwrap();
+        register(&plan, &Recorder::default(), false, None).unwrap();
         assert!(dir.path().join("logs").is_dir());
     }
 
@@ -841,10 +1005,31 @@ mod tests {
     /// 受け付けるのは名指しした旗だけ。読めない指定を黙って捨てない。
     #[test]
     fn only_the_flag_that_belongs_to_the_command_is_taken() {
-        assert!(flag(&args(&["--dry-run"]), "dry-run").unwrap());
-        assert!(!flag(&[], "dry-run").unwrap());
-        assert!(flag(&args(&["--follow"]), "dry-run").is_err());
+        assert!(flag(&args(&["--follow"]), "follow").unwrap());
+        assert!(!flag(&[], "follow").unwrap());
+        assert!(flag(&args(&["--dry-run"]), "follow").is_err());
         assert!(no_options(&args(&["--all"])).is_err());
+    }
+
+    /// `register` は焼き込む実行ファイルを指させる。
+    #[test]
+    fn register_takes_a_dry_run_and_an_executable() {
+        assert_eq!(register_options(&[]).unwrap(), (false, None));
+        assert_eq!(
+            register_options(&args(&[
+                "--dry-run",
+                "--executable",
+                "/opt/homebrew/bin/llm-gateway"
+            ]))
+            .unwrap(),
+            (true, Some("/opt/homebrew/bin/llm-gateway".to_owned()))
+        );
+        assert_eq!(
+            register_options(&args(&["--executable=/usr/local/bin/llm-gateway"])).unwrap(),
+            (false, Some("/usr/local/bin/llm-gateway".to_owned()))
+        );
+        assert!(register_options(&args(&["--follow"])).is_err());
+        assert!(register_options(&args(&["--executable"])).is_err());
     }
 
     /// 受け付ける命令と、help に並ぶ命令は同じ (cli-design-preferences)。
@@ -859,6 +1044,7 @@ mod tests {
         }
         // 旗も同じ (打てるのに書いていない、を作らない)。
         assert!(help::SERVICE.contains("--dry-run"), "{}", help::SERVICE);
+        assert!(help::SERVICE.contains("--executable"), "{}", help::SERVICE);
         assert!(help::SERVICE.contains("--follow"), "{}", help::SERVICE);
 
         let e = dispatch(&args(&["reload"])).unwrap_err();

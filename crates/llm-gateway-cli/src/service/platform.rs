@@ -72,8 +72,12 @@ pub struct Plan {
     pub label: String,
     pub unit_path: PathBuf,
     pub unit_text: String,
+    /// 焼き込んだ実行ファイル (出力に添える)。
+    pub exe: PathBuf,
     /// 監督者が書く先 (OS がここへ流す)。
     pub log: PathBuf,
+    /// unit ファイルを置き換える前に叩くもの (best-effort、載っていなければ断られる)。
+    pub before_write: Vec<Step>,
     /// unit ファイルを書いた後に叩くもの。
     pub register: Vec<Step>,
     /// unit ファイルを消す前に叩くもの。
@@ -109,7 +113,11 @@ fn launchd(env: &Env) -> Plan {
         kind: Kind::Launchd,
         label: LABEL.to_owned(),
         log: env.log.clone(),
+        exe: env.exe.clone(),
         unit_text: plist(env),
+        // 同じ label が載ったままだと bootstrap が断る。手書きの plist が
+        // 載っている場合も含めて、置き換えるときは先に降ろす。
+        before_write: vec![Step::new("launchctl", &["bootout", &target])],
         register: vec![Step::new(
             "launchctl",
             &["bootstrap", &domain, &unit_path.display().to_string()],
@@ -181,10 +189,14 @@ fn systemd(env: &Env) -> Plan {
         kind: Kind::Systemd,
         label: UNIT_NAME.to_owned(),
         log: env.log.clone(),
+        exe: env.exe.clone(),
         unit_text: service_unit(env),
+        // systemd は書き換えたファイルを読み直せば済む。降ろす必要はない。
+        before_write: Vec::new(),
         register: vec![
             Step::new("systemctl", &[user[0], "daemon-reload"]),
             Step::new("systemctl", &[user[0], "enable", UNIT_NAME]),
+            Step::new("systemctl", &[user[0], "restart", UNIT_NAME]),
         ],
         unregister: vec![Step::new("systemctl", &[user[0], "disable", UNIT_NAME])],
         after_remove: vec![Step::new("systemctl", &[user[0], "daemon-reload"])],
@@ -307,6 +319,7 @@ mod tests {
     fn every_launchctl_call_stays_in_the_user_domain() {
         let plan = plan(Kind::Launchd, &env());
         let calls: Vec<Vec<String>> = [
+            plan.before_write.clone(),
             plan.register.clone(),
             plan.unregister.clone(),
             plan.start.clone(),
@@ -333,6 +346,14 @@ mod tests {
             calls[0],
             vec![
                 "launchctl",
+                "bootout",
+                "gui/501/jp.kawaz.llm-gateway.supervise"
+            ]
+        );
+        assert_eq!(
+            calls[1],
+            vec![
+                "launchctl",
                 "bootstrap",
                 "gui/501",
                 "/home/u/LaunchAgents/jp.kawaz.llm-gateway.supervise.plist"
@@ -352,6 +373,11 @@ mod tests {
         assert_eq!(
             plan.register[1].args,
             vec!["--user", "enable", "llm-gateway-supervise.service"]
+        );
+        // 書き換えた unit で走り直させる (古い定義のまま生き続けない)。
+        assert_eq!(
+            plan.register[2].args,
+            vec!["--user", "restart", "llm-gateway-supervise.service"]
         );
         // 消した後にも読み直させる (消えたことに気づかせる)。
         assert_eq!(plan.after_remove[0].args, vec!["--user", "daemon-reload"]);

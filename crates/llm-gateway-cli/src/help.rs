@@ -107,6 +107,12 @@ commands:
 
 register options:
   --dry-run         print the unit file and the commands instead of running them
+  --executable <path>
+                    the binary to bake in (default: the stable path on PATH that
+                    points at this same binary, or this binary itself)
+
+register is idempotent: it does nothing when the same unit is already loaded, and
+swaps the unit in place when it differs.
 
 log options:
   --follow          keep printing as more is written

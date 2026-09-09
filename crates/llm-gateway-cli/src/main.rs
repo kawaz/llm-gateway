@@ -11,6 +11,7 @@
 mod check;
 mod daemon;
 mod destination;
+mod executable;
 mod failure;
 mod help;
 mod login;
