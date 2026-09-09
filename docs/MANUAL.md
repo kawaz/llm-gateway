@@ -300,7 +300,10 @@ scope (DR-0020). `limits` holds quotas asked for through the quota API, kept sep
 from the header-derived `snapshot` (the two do not necessarily describe the same
 quota). Fields with nothing to report are omitted entirely. When `auth.status` is
 `relogin_required` for a `claude_oauth` credential, `auth.login_path` gives the relative
-Web login page.
+Web login page. `auth.status` is `org_not_allowed` when the upstream refuses OAuth use
+for the whole organization: the login still works, so no `login_path` is offered, and
+`auth.hint` carries a guess at the cause (an inactive subscription is one) rather than a
+verdict.
 
 ### `GET /llm-gateway/status`
 

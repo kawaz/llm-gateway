@@ -1599,7 +1599,7 @@ const COUNT_TOKENS: &str = "/count_tokens";
 /// どこにも無い。契約が止まっているのはよくある原因の 1 つでしかないので、
 /// 断定せずに確かめ先を示す。
 const ORG_NOT_ALLOWED_HINT: &str =
-    "the organization refuses OAuth use — an inactive subscription is one cause; check the account";
+    "the organization refuses OAuth use (an inactive subscription is one cause); check the account";
 
 /// この 1 本は会話の往復か (DR-0012)。
 ///

@@ -87,7 +87,7 @@ fn render(report: &Report) -> String {
                     .as_ref()
                     .and_then(|auth| auth.hint.as_deref().or(auth.reason.as_deref()))
                     .unwrap_or("the upstream refuses OAuth use for this organization");
-                out.push_str(&format!("(org not allowed) {hint}"));
+                out.push_str(&format!("org not allowed — {hint}"));
             }
             Some(llm_gateway::quota::AuthStatus::Degraded) => {
                 let reason = c
@@ -388,7 +388,7 @@ mod tests {
             observed_at: NOW,
         });
         let out = render(&report(vec![credential]));
-        assert!(out.contains("(org not allowed)"), "{out}");
+        assert!(out.contains("org not allowed — "), "{out}");
         assert!(
             out.contains("one cause"),
             "the guess is offered, not asserted: {out}"

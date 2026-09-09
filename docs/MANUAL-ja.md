@@ -295,7 +295,9 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 `limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として
 持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`claude_oauth` の
 `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの
-相対パスが入る。
+相対パスが入る。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、
+ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの
+停止はその一例) が `auth.hint` に入る。
 
 ### `GET /llm-gateway/status`
 
