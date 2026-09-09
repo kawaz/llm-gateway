@@ -24,6 +24,8 @@ tokio = { version = "1", features = [
     "sync",
     "time",
     "fs",
+    # 監督者が子を起こして見送る (DR-0028 決定 3)。
+    "process",
 ] }
 # サーバ側。http1 のみ (バインド先は 127.0.0.1、h2 を話す相手がいない)。
 axum = { version = "0.8", default-features = false, features = [

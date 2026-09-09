@@ -115,6 +115,22 @@ impl Registry {
         std::fs::remove_file(&path).map_err(|e| self.broken(&path, &e))
     }
 
+    /// 居てほしいかどうかだけを書き換える (desired state)。
+    ///
+    /// 書き換えるのは監督者で、CLI の `start` / `stop` はその要求にすぎない。
+    /// ここに残るから、監督者を上げ直しても前回の望みから始められる。
+    pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<Unit> {
+        let mut unit = self.get(name)?;
+        if unit.enabled == enabled {
+            return Ok(unit);
+        }
+        unit.enabled = enabled;
+        let path = self.path_of(name);
+        let text = toml::to_string_pretty(&unit).map_err(|e| self.broken(&path, &e))?;
+        std::fs::write(&path, text).map_err(|e| self.broken(&path, &e))?;
+        Ok(unit)
+    }
+
     /// 名前で 1 台を引く。
     pub fn get(&self, name: &str) -> Result<Unit> {
         check_name(name)?;
@@ -318,6 +334,28 @@ mod tests {
         registry.remove("a").unwrap();
 
         assert!(registry.list().unwrap().is_empty());
+    }
+
+    /// 望みだけを書き換える。設定も実行ファイルも、登録した時のまま残る。
+    #[test]
+    fn only_the_desired_state_is_rewritten() {
+        let (_dir, registry) = registry();
+        registry.add("a", &unit("/tmp/a.toml")).unwrap();
+
+        assert!(!registry.set_enabled("a", false).unwrap().enabled);
+        let stored = registry.get("a").unwrap();
+        assert!(!stored.enabled);
+        assert_eq!(stored.config, PathBuf::from("/tmp/a.toml"));
+        assert_eq!(stored.added_at, unit("/tmp/a.toml").added_at);
+
+        // 同じ値を書き直しても壊れない (`start` を 2 回受けても同じ)。
+        assert!(!registry.set_enabled("a", false).unwrap().enabled);
+        assert!(registry.set_enabled("a", true).unwrap().enabled);
+
+        assert_eq!(
+            registry.set_enabled("nope", true).unwrap_err().kind(),
+            "unknown_unit"
+        );
     }
 
     /// 名前はファイル名になる。置き場の外を指す形を通さない。
