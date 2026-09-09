@@ -1269,11 +1269,15 @@ mod tests {
         world.register("stable", &binary, true);
         world.register("unstable", &binary, true);
 
+        // 立ち上がりの分から聞いておく。走り始めた後に聞き始めると、最初の子が
+        // 書いた行がまだ届いておらず、起こし直しの分と混ざる。
+        let mut written = world.supervisor.lines.subscribe();
         world.supervisor.reload().await;
         let first = world.until("stable", |s| s.running).await;
         let second = world.until("unstable", |s| s.running).await;
+        // 1 台につき stdout / stderr の 2 行。読み切ってから頼む。
+        heard(&mut written, 4).await;
 
-        let mut written = world.supervisor.lines.subscribe();
         world
             .supervisor
             .handle(Request::Restart(Which::all()))
