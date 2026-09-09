@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-24
+- CLI 名は DR-0028 で `upstream status` (endpoint `/llm-gateway/status` は変わらない)
 
 ## 背景
 
