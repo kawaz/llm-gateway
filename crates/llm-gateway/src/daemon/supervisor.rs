@@ -39,6 +39,12 @@ const SPAWN_WAIT: Duration = Duration::from_secs(10);
 /// 起こしてから healthz が返るのを待つ上限。
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
+/// 走っている台に版を聞くときの待ち上限。
+///
+/// 答えないなら「分からない」でよい。状態を出す道の途中なので、長く待つと
+/// `daemon status` 自体が返らなくなる。
+const VERSION_WAIT: Duration = Duration::from_secs(2);
+
 /// healthz を叩き直す間隔。
 ///
 /// 子は別プロセスで、待ち受けを始めた合図を寄越す口が HTTP しかない。
@@ -240,12 +246,12 @@ impl Supervisor {
             Request::Restart(which) => self.act(&which, Action::Restart).await,
             Request::Status(which) => {
                 let names = self.choose(&which, true)?;
-                Ok(serde_json::json!({ "units": self.status_of(&names).await? }))
+                Ok(units_answer(self.status_of(&names).await?))
             }
             Request::Reload => {
                 self.reload().await;
                 let names = self.registry.names();
-                Ok(serde_json::json!({ "units": self.status_of(&names).await? }))
+                Ok(units_answer(self.status_of(&names).await?))
             }
             // 追従は [`Self::answer`] が先に拾っている。
             Request::Log(_) => Err(Refused::new(
@@ -290,7 +296,7 @@ impl Supervisor {
         }
 
         names.sort();
-        Ok(serde_json::json!({ "units": self.status_of(&names).await? }))
+        Ok(units_answer(self.status_of(&names).await?))
     }
 
     /// 居てほしい状態にして、居なければ起こす。
@@ -630,26 +636,38 @@ impl Supervisor {
     /// 頼まれた台の今。
     pub async fn status_of(&self, names: &[String]) -> Result<Vec<UnitStatus>, Refused> {
         let registered = self.registry.list()?;
-        let watched = self.watched.lock().await;
+        let mut rows: Vec<UnitStatus> = {
+            let watched = self.watched.lock().await;
+            registered
+                .iter()
+                .enumerate()
+                .filter(|(_, (name, _))| names.iter().any(|n| n == name))
+                .map(|(id, (name, unit))| {
+                    let state = watched.get(name);
+                    UnitStatus {
+                        id,
+                        unit: name.clone(),
+                        enabled: unit.enabled,
+                        running: state.and_then(|s| s.pid).is_some(),
+                        pid: state.and_then(|s| s.pid),
+                        since_ms: state.and_then(|s| s.since_ms),
+                        version: None,
+                        restarts: state.map_or(0, |s| s.restarts),
+                        last_exit: state.and_then(|s| s.last_exit.clone()),
+                    }
+                })
+                .collect()
+        };
 
-        Ok(registered
-            .iter()
-            .enumerate()
-            .filter(|(_, (name, _))| names.iter().any(|n| n == name))
-            .map(|(id, (name, unit))| {
-                let state = watched.get(name);
-                UnitStatus {
-                    id,
-                    unit: name.clone(),
-                    enabled: unit.enabled,
-                    running: state.and_then(|s| s.pid).is_some(),
-                    pid: state.and_then(|s| s.pid),
-                    since_ms: state.and_then(|s| s.since_ms),
-                    restarts: state.map_or(0, |s| s.restarts),
-                    last_exit: state.and_then(|s| s.last_exit.clone()),
-                }
-            })
-            .collect())
+        // 版は走っている本人にしか言えないので、聞きに行く。錠は放してから
+        // 聞く (返事を待つ間、上げ下げが止まってしまう)。
+        for row in rows.iter_mut().filter(|row| row.running) {
+            let Some(listen) = self.listen_of(&row.unit) else {
+                continue;
+            };
+            row.version = running_version(&listen).await;
+        }
+        Ok(rows)
     }
 
     /// 書いたものを流し続ける。
@@ -714,6 +732,36 @@ impl Supervisor {
             .ok()
             .map(|config| config.server.listen)
     }
+}
+
+/// 台の様子に、監督者自身の版を添えて返す。
+///
+/// 監督者の版を毎回添えるのは、聞く側が「今この頼みに答えた監督者」の版を
+/// 別の問いなしに知れるようにするため (DR-0028 決定 9)。
+fn units_answer(units: Vec<UnitStatus>) -> serde_json::Value {
+    serde_json::json!({
+        "supervisor_version": env!("CARGO_PKG_VERSION"),
+        "units": units,
+    })
+}
+
+/// 走っている台に、載せている版を聞く。
+///
+/// 答えない版が走っていることもある (この口が無かった頃の binary)。その時は
+/// 「分からない」であって、異常ではない。
+async fn running_version(listen: &str) -> Option<String> {
+    let url = format!("http://{}/llm-gateway/version", reachable_authority(listen));
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(VERSION_WAIT)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("version")?.as_str().map(str::to_owned)
 }
 
 /// 1 台に対してすること。
@@ -1322,6 +1370,78 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// 答えには監督者自身の版が載り、台の版は走っている本人から取る。
+    ///
+    /// ディスクを読まないので、入れ替えたのに上げ直していない台は
+    /// 「古い版が走っている」とそのまま出る (DR-0028 決定 9)。
+    #[tokio::test]
+    async fn the_answer_carries_the_versions_that_are_actually_running() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+
+        // 走っている台の代わりに、版だけ答える相手を立てる。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/llm-gateway/version",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"version": "0.1.2"}))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        std::fs::write(
+            world.root.join("stable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+        world.register("stable", &binary, true);
+
+        world.supervisor.reload().await;
+        world.until("stable", |s| s.running).await;
+
+        let answer = world
+            .supervisor
+            .handle(Request::Status(Which::all()))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer["supervisor_version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(answer["units"][0]["version"], serde_json::json!("0.1.2"));
+
+        // 止まっている台には聞きに行かない (答えようがない)。
+        world.supervisor.stop("stable").await.unwrap();
+        let answer = world
+            .supervisor
+            .handle(Request::Status(Which::all()))
+            .await
+            .unwrap();
+        assert_eq!(answer["units"][0]["version"], serde_json::Value::Null);
+    }
+
+    /// 版を答えない台が走っていても、状態そのものは出る。
+    ///
+    /// この口が無かった頃の binary が走っている状態は、異常ではない。
+    #[tokio::test]
+    async fn a_unit_that_does_not_answer_its_version_is_still_reported() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("silent", &binary, true);
+
+        world.supervisor.reload().await;
+        world.until("silent", |s| s.running).await;
+
+        // 設定が読めないので、聞きに行く先すら分からない。
+        let status = world.status("silent").await;
+        assert!(status.running);
+        assert_eq!(status.version, None);
+
+        world.supervisor.shutdown().await;
     }
 
     /// healthz が返るまでが「起きた」。返らなければ待ちきって諦める。

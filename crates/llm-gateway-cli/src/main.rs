@@ -7,6 +7,7 @@
 //! - [`check`] / [`models`] 設定ファイルそのものを対象にする確認
 //! - [`usage`] / [`stats`] 走っている台に聞いて整形する
 //! - [`login`] ブラウザで認可を通して認証情報を置く
+//! - [`version`] 置いてある版と走っている版を並べる
 
 mod check;
 mod daemon;
@@ -22,6 +23,7 @@ mod stats;
 mod text;
 mod upstream;
 mod usage;
+mod version;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -76,6 +78,7 @@ fn run(args: &[String]) -> Result<ExitCode, Failure> {
         "usage" => usage::run(rest),
         "stats" => stats::run(rest),
         "login" => login::run(rest),
+        "version" => version::run(rest),
         other => Err(Failure::from(format!(
             "there is no `{other}` command. see `llm-gateway --help`"
         ))),
@@ -112,6 +115,17 @@ mod tests {
                 "{removed}: {e:?}"
             );
         }
+    }
+
+    /// `--version` は 1 行のテキスト、`version` は JSON で 2 つの版を並べる。
+    ///
+    /// 別々の口なのは答えが違うため。`--version` が言えるのは今動いている
+    /// この CLI の版だけで、置いてある版・走っている版は言えない。
+    #[test]
+    fn the_two_ways_of_asking_about_versions_are_different_commands() {
+        assert_eq!(run(&args(&["--version"])).unwrap(), ExitCode::SUCCESS);
+        // 引数を足したら黙って無視せず断る (version の下に子は無い)。
+        assert!(run(&args(&["version", "--all"])).is_err());
     }
 
     /// 引数なしは help。何も起こさない。

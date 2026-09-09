@@ -50,6 +50,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         .route("/v1/responses", post(responses))
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
+        .route("/llm-gateway/version", get(version))
         .route("/llm-gateway/usage", get(usage))
         .route("/llm-gateway/status", get(status))
         .route("/llm-gateway/stats", get(stats))
@@ -255,6 +256,20 @@ fn login_error(error: Error) -> Response {
 /// こちらが避難することになる。
 async fn healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+/// この**プロセスが載せている**版を返す。
+///
+/// ディスクの binary を読み直すのではなく、走っている自分が焼き込まれた版を
+/// 答える。入れ替えたのに上げ直していない台を見つけられるのは、走っている側
+/// にしか言えないこの答えがあるからである (DR-0028 決定 9)。
+///
+/// 認証を掛けないのは healthz と同じ扱い。版そのものは秘密ではなく、境界は
+/// 手前で引く。
+async fn version() -> Response {
+    json_utf8(Json(
+        serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+    ))
 }
 
 /// credential ごとの利用状況を返す。
@@ -3426,6 +3441,25 @@ models = ["claude-opus-5"]
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    /// 走っている版は、認証なしでそのまま聞ける。
+    ///
+    /// ディスクに置かれた binary の版と食い違っていれば「入れ替えたのに
+    /// 上げ直していない」が分かる。それを言えるのは走っている側だけ。
+    #[tokio::test]
+    async fn the_running_version_can_be_asked_for() {
+        let base = serve(TWO_NS).await;
+        let resp = reqwest::get(format!("{base}/llm-gateway/version"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["version"],
+            serde_json::json!(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     /// 死活監視の口は namespace を取らない。

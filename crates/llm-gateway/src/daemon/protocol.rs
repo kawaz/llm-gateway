@@ -95,6 +95,13 @@ pub struct UnitStatus {
     /// 今の子が起きた時刻 (epoch ミリ秒)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_ms: Option<u64>,
+    /// 今動いているプロセスが載せている版。
+    ///
+    /// ディスクの binary ではなく、走っている本人 (`GET /llm-gateway/version`)
+    /// が答えたもの。答えられない版が走っていることもあるので `null` を許す。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
     /// 監督者が起こし直した回数。
     pub restarts: u32,
     /// 最後に終わったときの様子。

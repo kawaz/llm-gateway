@@ -120,6 +120,16 @@ fn placed() -> Result<Plan, Failure> {
     env(PathBuf::new()).map(|env| platform::plan(platform::kind(), &env))
 }
 
+/// 置いてある登録ファイルの場所。まだ登録していなければ `None`。
+///
+/// 中身を知りたい人 (= `version` が「次に上がる binary は何か」を見る場面)
+/// のために、場所だけを外に出す。何が書いてあるかを読むのは
+/// [`platform::executable_of`] の仕事。
+pub fn unit_path() -> Option<PathBuf> {
+    let path = placed().ok()?.unit_path;
+    path.exists().then_some(path)
+}
+
 fn current_exe() -> Result<PathBuf, Failure> {
     std::env::current_exe().map_err(|e| Failure::from(format!("could not find my own path: {e}")))
 }

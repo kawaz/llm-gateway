@@ -19,6 +19,7 @@ commands:
   usage       list usage per credential (asks a running unit)
   stats       list token usage and USD cost per credential x model x day
   login       authorize in a browser and save the credential to <name>.json
+  version     show what is installed and what is running (and whether they differ)
 
 global options:
   --help, -h        show the help of the level it is given at
@@ -164,6 +165,7 @@ mod tests {
     fn the_top_help_lists_every_command() {
         for command in [
             "daemon", "service", "upstream", "check", "models", "usage", "stats", "login",
+            "version",
         ] {
             assert!(TOP.contains(command), "missing {command}");
         }

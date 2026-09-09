@@ -175,11 +175,41 @@ fn plist(env: &Env) -> String {
     text
 }
 
+/// 置いてある unit ファイルから、焼き込まれている実行ファイルを読む。
+///
+/// 書いた側 ([`plan`]) と読む側をここに並べておく。登録の中身を知りたい
+/// (= 何の版が次に上がるのか) のは `version` で、その時に見るのは
+/// **今ディスクに置かれている登録**であって、組み立て直した Plan ではない。
+pub fn executable_of(kind: Kind, unit_text: &str) -> Option<PathBuf> {
+    match kind {
+        // ProgramArguments の先頭が実行ファイル。
+        Kind::Launchd => {
+            let arguments = unit_text.split("<key>ProgramArguments</key>").nth(1)?;
+            let first = arguments.split("<string>").nth(1)?;
+            let path = first.split("</string>").next()?;
+            Some(PathBuf::from(unescape(path.trim())))
+        }
+        Kind::Systemd => {
+            let line = unit_text
+                .lines()
+                .find_map(|line| line.strip_prefix("ExecStart="))?;
+            Some(PathBuf::from(line.split_whitespace().next()?))
+        }
+    }
+}
+
 /// plist は XML なので、パスに `&` や `<` が居ると壊れる。
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// [`escape`] を戻す。`&amp;` を最後に戻さないと `&amp;lt;` が壊れる。
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn systemd(env: &Env) -> Plan {
@@ -242,6 +272,7 @@ Description=llm-gateway supervisor\n\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn env() -> Env {
         Env {
@@ -397,6 +428,31 @@ mod tests {
                 .unit_text
                 .contains("<string>/home/a&amp;b/llm-gateway</string>")
         );
+    }
+
+    /// 書いた unit ファイルから、焼き込んだ実行ファイルを読み戻せる。
+    #[test]
+    fn the_executable_can_be_read_back_out_of_the_unit_file() {
+        for kind in [Kind::Launchd, Kind::Systemd] {
+            let plan = plan(kind, &env());
+            assert_eq!(
+                executable_of(kind, &plan.unit_text).as_deref(),
+                Some(Path::new("/opt/homebrew/bin/llm-gateway")),
+                "{kind:?}"
+            );
+        }
+
+        // 記号の入ったパスも、書いた形のまま戻る。
+        let mut env = env();
+        env.exe = PathBuf::from("/home/a&b/llm-gateway");
+        assert_eq!(
+            executable_of(Kind::Launchd, &plan(Kind::Launchd, &env).unit_text).as_deref(),
+            Some(Path::new("/home/a&b/llm-gateway"))
+        );
+
+        // 読めない中身は「分からない」。手書きの plist が置いてあることもある。
+        assert_eq!(executable_of(Kind::Launchd, "<plist/>"), None);
+        assert_eq!(executable_of(Kind::Systemd, "[Service]\n"), None);
     }
 
     #[test]
