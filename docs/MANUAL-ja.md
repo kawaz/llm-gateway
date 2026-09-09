@@ -568,20 +568,70 @@ llm-gateway <command> [options]
 
 | コマンド | 内容 | 対応する口 |
 | --- | --- | --- |
-| `serve` | 待ち受けを開始する | (全部) |
+| `daemon` | この端末で走らせる台 (登録簿と起動) | — |
+| `service` | OS への常駐登録 (監督者 1 つ) | — |
+| `upstream status` | upstream サービスの状態 (走っている台に問い合わせる) | `/llm-gateway/status` |
 | `check` | 設定を読んで検証する (起動はしない) | — |
 | `models` | 設定に書かれたモデルを一覧する | — |
-| `usage` | credential ごとの利用状況 (サーバに問い合わせる) | `/llm-gateway/usage` |
-| `status` | upstream サービスの状態 (サーバに問い合わせる) | `/llm-gateway/status` |
+| `usage` | credential ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
 | `stats` | credential × モデル × 日のトークン数と USD | `/llm-gateway/stats` |
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |
+
+出力は JSON (追従は JSONL)、エラーは JSON を stderr に出して exit が非 0。help だけは
+テキストで、引数なしでも出る (DR-0028)。
+
+### `daemon` — 台の操作
+
+**unit** は設定ファイル 1 つ。名前を付けて登録簿
+(`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`) に置き、以後はその名前で指す。
+unit は設定ファイルのパスと、走らせる binary のパス (`[server] binary_path`、省略時は
+登録した時点の自分自身) を持つ。
+
+| コマンド | 内容 |
+| --- | --- |
+| `daemon run [unit]` | 1 台を foreground で走らせる |
+| `daemon supervise` | 監督者を foreground で走らせる (登録された台を子として抱える) |
+| `daemon add <config>` | 設定ファイルを unit として登録する (`--name <name>`) |
+| `daemon remove <unit>` | 登録簿から外す |
+| `daemon list` | 登録されている台を並べる |
+| `daemon start\|stop\|restart <unit>\|--all` | 監督者に頼んで上げ下げする |
+| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `restarts` / `last_exit`) |
+| `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
+
+`start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ
+`supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が
+分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから
+次へ進む。
+
+### `service` — OS への常駐登録
+
+OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を抱えるかは登録簿の話で、
+OS は知らない。
+
+| コマンド | 内容 |
+| --- | --- |
+| `service register` | 監督者を登録する (macOS = launchd、Linux = systemd `--user`) |
+| `service unregister` | 登録を外す |
+| `service start` / `stop` | 登録した監督者を上げ下げする |
+| `service status` | 登録の有無・生死・抱えている台 |
+| `service log` | 監督者が書いたものを出す (`--follow` で追う) |
+
+`register --dry-run` は、書く unit ファイルの中身と叩くコマンド列を出すだけで何も
+触らない。Linux 側は書いてあるが未検証 (手元に systemd が無い)。
+
+移行手順は [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md) にある。
 
 オプション:
 
 | オプション | 対象 | 意味 |
 | --- | --- | --- |
-| `--config <path>` | 全コマンド | 設定ファイル (既定: `$XDG_CONFIG_HOME/llm-gateway/config.toml`) |
-| `--refresh` | `usage` / `status` | 読み直してから表示する (`usage` では少し消費する) |
+| `--config <path>` | `check` / `models` / `daemon add` / `login` | 設定ファイルそのものを対象にするコマンドだけが取る |
+| `--unit <name>` | `usage` / `stats` / `upstream status` | どの台に聞くか (登録が 1 つならその台) |
+| `--name <name>` | `daemon add` | unit の名前 (既定: 設定ファイル名から拡張子を落としたもの) |
+| `--all` | `daemon` の上げ下げ・状態・ログ | 登録されている全部 |
+| `--follow` | `daemon log` / `service log` | 書かれ続けるものを追う |
+| `--dry-run` | `service register` | 何が起きるかを出すだけで登録しない |
+| `--refresh` | `usage` / `upstream status` | 読み直してから表示する (`usage` では少し消費する) |
 | `--days <N>` | `stats` | 直近 N 日 (既定: 7、`0` で全期間) |
 | `--type <type>` | `login` | `claude_oauth` または `codex_oauth` |
 | `--help`, `-h` | 全コマンド | ヘルプ |
@@ -593,4 +643,4 @@ llm-gateway <command> [options]
 | --- | --- |
 | `LLM_GATEWAY_LOG` | ログの詳細度 (既定: `info`) |
 | `XDG_CONFIG_HOME` | 設定ファイルの既定の置き場 |
-| `XDG_STATE_HOME` | credential とログの既定の置き場 |
+| `XDG_STATE_HOME` | credential・登録簿・ログの既定の置き場 |

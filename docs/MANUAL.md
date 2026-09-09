@@ -581,20 +581,71 @@ llm-gateway <command> [options]
 
 | Command | What it does | Matching endpoint |
 | --- | --- | --- |
-| `serve` | Start listening | (all of them) |
+| `daemon` | The gateway processes of this installation (registry and running) | — |
+| `service` | Registration with the operating system (the supervisor alone) | — |
+| `upstream status` | Upstream service status (asks a running unit) | `/llm-gateway/status` |
 | `check` | Read and verify the configuration (without starting) | — |
 | `models` | List the models written in the configuration | — |
-| `usage` | Usage per credential (asks the server) | `/llm-gateway/usage` |
-| `status` | Upstream service status (asks the server) | `/llm-gateway/status` |
+| `usage` | Usage per credential (asks a running unit) | `/llm-gateway/usage` |
 | `stats` | Token counts and USD per credential × model × day | `/llm-gateway/stats` |
 | `login` | Authorize in a browser and save to `<name>.json` | `/llm-gateway/login` |
+
+Results are JSON (JSONL when following), errors are JSON on stderr with a non-zero
+exit, and only the help is text — printed even with no arguments (DR-0028).
+
+### `daemon` — running the units
+
+A **unit** is one configuration file. It is registered under a name in
+`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`, and pointed at by that name
+from then on. A unit holds the path of its configuration file and the path of the
+binary to run (`[server] binary_path`, defaulting to whatever registered it).
+
+| Command | What it does |
+| --- | --- |
+| `daemon run [unit]` | Run one unit in the foreground |
+| `daemon supervise` | Run the supervisor in the foreground (it holds the registered units) |
+| `daemon add <config>` | Register a configuration file as a unit (`--name <name>`) |
+| `daemon remove <unit>` | Drop a unit from the registry |
+| `daemon list` | List the registered units |
+| `daemon start\|stop\|restart <unit>\|--all` | Ask the supervisor to move them |
+| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `restarts` / `last_exit`) |
+| `daemon log [<unit>]\|--all` | Show what they wrote (`--follow` to keep reading) |
+
+`start` / `stop` / `restart` / `status` ask the supervisor. If it is not running they
+refuse with `supervisor_not_running` rather than starting a child themselves — otherwise
+there would be no telling who owns the process. `restart --all` goes one at a time,
+waiting for `/llm-gateway/healthz` before moving on.
+
+### `service` — registering with the operating system
+
+What is registered is the supervisor (`daemon supervise`) alone. Which units it holds is
+the registry's business, not the operating system's.
+
+| Command | What it does |
+| --- | --- |
+| `service register` | Register the supervisor (launchd on macOS, systemd `--user` on Linux) |
+| `service unregister` | Take it off again |
+| `service start` / `stop` | Start or stop the registered supervisor |
+| `service status` | Whether it is registered, whether it runs, and what it holds |
+| `service log` | Show what the supervisor wrote (`--follow` to keep reading) |
+
+`register --dry-run` prints the unit file it would write and the commands it would run,
+and touches nothing. The Linux side is written but unverified (there is no systemd here).
+
+The migration steps are in the
+[runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md).
 
 Options:
 
 | Option | Applies to | Meaning |
 | --- | --- | --- |
-| `--config <path>` | all commands | Configuration file (default: `$XDG_CONFIG_HOME/llm-gateway/config.toml`) |
-| `--refresh` | `usage` / `status` | Read again before showing (with `usage` this consumes a little) |
+| `--config <path>` | `check` / `models` / `daemon add` / `login` | Only the commands that take a configuration file itself |
+| `--unit <name>` | `usage` / `stats` / `upstream status` | Which running unit to ask (the only one, if only one is registered) |
+| `--name <name>` | `daemon add` | Name of the unit (default: the configuration file name without its extension) |
+| `--all` | `daemon` start/stop/restart/status/log | Everything that is registered |
+| `--follow` | `daemon log` / `service log` | Keep printing as more is written |
+| `--dry-run` | `service register` | Print what would happen instead of registering |
+| `--refresh` | `usage` / `upstream status` | Read again before showing (with `usage` this consumes a little) |
 | `--days <N>` | `stats` | The last N days (default: 7, `0` for everything) |
 | `--type <type>` | `login` | `claude_oauth` or `codex_oauth` |
 | `--help`, `-h` | all commands | Show help |
@@ -606,4 +657,4 @@ Environment variables:
 | --- | --- |
 | `LLM_GATEWAY_LOG` | Log verbosity (default: `info`) |
 | `XDG_CONFIG_HOME` | Default location for the configuration |
-| `XDG_STATE_HOME` | Default location for credentials and logs |
+| `XDG_STATE_HOME` | Default location for credentials, the unit registry, and logs |

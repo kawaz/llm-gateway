@@ -38,7 +38,11 @@ device profile) を行い、それが実障害の原因になった。Anthropic 
 
 ## ステータス
 
-**稼働中。** 転送 (claude / codex / Bedrock)・運用観測 (usage / stats / status / tap)・Web 再認証まで実装済み (詳細は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md))。
+**稼働中。** 転送 (claude / codex / Bedrock)・運用観測 (usage / stats / upstream status / tap)・
+Web 再認証まで実装済み (詳細は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md))。
+
+常駐は CLI が持つ。設定ファイル 1 つを unit として登録し (`llm-gateway daemon add`)、
+それらを抱える監督者 1 つを OS に載せる (`llm-gateway service register`、DR-0028)。
 
 ## ドキュメント
 

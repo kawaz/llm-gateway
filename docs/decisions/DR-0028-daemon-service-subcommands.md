@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-09
+- 実装: v0.44.0 (段階 A: 登録簿と命令の割り、B: 監督者と `daemon`、C: `service` と移行 runbook)
 
 ## 文脈
 
@@ -189,6 +190,8 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
   拾うなら pid の引き継ぎ方が要る
 - **systemd 側の検証環境**。手元は macOS のみで、user unit の登録は書けても実機で確かめ
   られていない
+- **`daemon status` に版を載せるか**。決定 5 の例示は `{id,unit,running,pid,version,...}` だが、
+  監督者は子に版を聞く口を持たない。載せるなら `daemon run` 側が名乗る形が要る
 
 ## 影響
 
