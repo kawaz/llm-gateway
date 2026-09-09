@@ -637,11 +637,15 @@ because there are two more versions worth knowing and they can disagree: what is
 ```bash
 llm-gateway version
 {"cli":"0.44.0",
- "supervisor":{"running":"0.43.7","on_disk":"0.44.0","restart_needed":true},
- "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0","restart_needed":true}]}
+ "supervisor":{"running":"0.43.7","on_disk":"0.44.0",
+               "binary_path":"/opt/homebrew/bin/llm-gateway","restart_needed":true},
+ "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0",
+           "binary_path":"/opt/homebrew/bin/llm-gateway","restart_needed":true}]}
 ```
 
-`restart_needed` is true only when both versions are known and differ. A `null` means
+`binary_path` is the file whose `--version` was read, because a version alone does not say
+which of several installed binaries to replace. `restart_needed` is true only when both
+versions are known and differ. A `null` means
 nobody could answer — the supervisor is not running, the binary is gone, or an older
 build without `/llm-gateway/version` is up — and that is not a reason to restart anything.
 `supervisor` is null when nothing is registered with the operating system.

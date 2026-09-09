@@ -184,13 +184,17 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
 `llm-gateway version` が両方を出す。**置いてある版** (`on_disk`) はディスクの実行ファイルに
 `--version` を聞いたもので、次に上がるときの版。**走っている版** (`running`) は動いている
 プロセス自身が答えたもので、今処理している版。`restart_needed` は両方が分かって食い違うとき
-だけ真になる (片方が `null` なのは「比べられない」であって、食い違いではない)。
+だけ真になる (片方が `null` なのは「比べられない」であって、食い違いではない)。`on_disk` を
+読んだファイルは `binary_path` として並べる — 版だけでは、何箇所にも置かれた binary の
+どれを入れ替えればよいのか分からない。
 
 ```
 llm-gateway version
 {"cli": "0.44.0",
- "supervisor": {"running": "0.43.7", "on_disk": "0.44.0", "restart_needed": true},
- "units": [{"unit": "stable", "running": "0.43.7", "on_disk": "0.44.0", "restart_needed": true}]}
+ "supervisor": {"running": "0.43.7", "on_disk": "0.44.0",
+                "binary_path": "/opt/homebrew/bin/llm-gateway", "restart_needed": true},
+ "units": [{"unit": "stable", "running": "0.43.7", "on_disk": "0.44.0",
+            "binary_path": "/opt/homebrew/bin/llm-gateway", "restart_needed": true}]}
 ```
 
 走っている版を答えるのは走っている本人である。監督者は socket の `status` 応答に

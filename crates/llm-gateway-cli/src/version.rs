@@ -61,7 +61,7 @@ fn report(
             .and_then(|answer| answer.get("supervisor_version"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        pair(running, read(exe))
+        pair(running, exe, read)
     });
 
     let units: Vec<Value> = units
@@ -69,7 +69,7 @@ fn report(
         .map(|(name, binary)| {
             let running = running_version(answer, name);
             let mut row = json!({ "unit": name });
-            let versions = pair(running, read(binary));
+            let versions = pair(running, binary, read);
             if let (Some(row), Some(versions)) = (row.as_object_mut(), versions.as_object()) {
                 row.extend(versions.clone());
             }
@@ -90,7 +90,13 @@ fn report(
 /// 要ると言えるのは**両方が分かったとき**だけ。片方が `null` なのは
 /// 「食い違っていない」ではなく「比べられない」であって、そこで
 /// `restart_needed: true` を出すと、答えない古い台を毎回上げ直させる。
-fn pair(running: Option<String>, on_disk: Option<String>) -> Value {
+///
+/// `binary_path` を並べるのは、`on_disk` が**どのファイルの版なのか**が
+/// 答えの側から分からないため。同じ名前の binary が何箇所にも置かれる
+/// (brew / repo の build / 手で置いたもの) 環境では、版だけを見ても
+/// 「では何を入れ替えればよいのか」に届かない。
+fn pair(running: Option<String>, binary: &Path, read: &dyn Fn(&Path) -> Option<String>) -> Value {
+    let on_disk = read(binary);
     let needed = match (&running, &on_disk) {
         (Some(running), Some(on_disk)) => running != on_disk,
         _ => false,
@@ -98,6 +104,7 @@ fn pair(running: Option<String>, on_disk: Option<String>) -> Value {
     json!({
         "running": running,
         "on_disk": on_disk,
+        "binary_path": binary.display().to_string(),
         "restart_needed": needed,
     })
 }
@@ -204,6 +211,9 @@ mod tests {
         assert_eq!(value["units"][0]["unit"], json!("stable"));
         assert_eq!(value["units"][0]["running"], json!("0.43.7"));
         assert_eq!(value["units"][0]["restart_needed"], json!(true));
+        // どのファイルの版を読んだのかまで言う (入れ替える先が分かる)。
+        assert_eq!(value["supervisor"]["binary_path"], json!("/bin/lg"));
+        assert_eq!(value["units"][0]["binary_path"], json!("/bin/unit"));
     }
 
     /// 揃っているなら、上げ直しは要らない。
@@ -266,6 +276,8 @@ mod tests {
 
         assert_eq!(value["supervisor"]["on_disk"], Value::Null);
         assert_eq!(value["supervisor"]["running"], json!("0.44.0"));
+        // 答えなかった相手でも、どこを見に行ったのかは残る。
+        assert_eq!(value["supervisor"]["binary_path"], json!("/bin/gone"));
         assert_eq!(value["supervisor"]["restart_needed"], json!(false));
     }
 

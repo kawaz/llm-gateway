@@ -624,11 +624,15 @@ binary に `--version` を聞いたもの = 次に上がる版) と **走って�
 ```bash
 llm-gateway version
 {"cli":"0.44.0",
- "supervisor":{"running":"0.43.7","on_disk":"0.44.0","restart_needed":true},
- "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0","restart_needed":true}]}
+ "supervisor":{"running":"0.43.7","on_disk":"0.44.0",
+               "binary_path":"/opt/homebrew/bin/llm-gateway","restart_needed":true},
+ "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0",
+           "binary_path":"/opt/homebrew/bin/llm-gateway","restart_needed":true}]}
 ```
 
-`restart_needed` が真になるのは、両方が分かって食い違うときだけ。`null` は誰も答え
+`binary_path` は `on_disk` を読んだファイルそのもの。版だけでは「では何を入れ替えれば
+よいのか」に届かない (同じ名前の binary が何箇所にも置かれる)。`restart_needed` が真に
+なるのは、両方が分かって食い違うときだけ。`null` は誰も答え
 られなかったということ (監督者が居ない / binary が消えている / `/llm-gateway/version`
 を持たない古い build が走っている) で、上げ直す理由にはならない。OS に何も登録して
 いなければ `supervisor` は `null`。
