@@ -10,6 +10,7 @@
 //! - [`egress`] upstream へ出るときの provider-neutral な HTTP の形と、出口の手順
 //! - [`session`] クライアントの言い分から会話を見分ける (入口)
 //! - [`credential`] token の取得とリフレッシュ。永続化はプラガブル
+//! - [`daemon`] この端末で走らせる台の登録簿 (DR-0028)
 //! - [`denial`] 1 経路の状態機構 — 締め出しの印・枠・様子見 (DR-0009)
 //! - [`exchange`] 本文を流し終えた (途切れた) ところの記録
 //! - [`events`] 転送のたびに起きたことを見ている人へ流す (DR-0012)
@@ -21,6 +22,7 @@
 pub mod cache;
 pub mod config;
 pub mod credential;
+pub mod daemon;
 pub mod denial;
 pub mod discovery;
 pub mod egress;

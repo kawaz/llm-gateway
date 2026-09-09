@@ -714,6 +714,14 @@ pub struct Server {
     /// どおり互いの存在を知らないまま進む。
     #[serde(default)]
     pub peers: Vec<String>,
+
+    /// この設定を走らせる実行ファイル (DR-0028 決定 2)。
+    ///
+    /// `daemon add` が登録簿へ焼き込む値の元。書かなければ、登録した時点の
+    /// 自分自身の絶対パスを使う。面ごとに別のビルドを走らせる (stable は
+    /// brew、unstable は repo の build) 運用があるので、台ごとに指せる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<PathBuf>,
 }
 
 impl Server {
@@ -743,6 +751,7 @@ impl Default for Server {
             listen: default_listen(),
             disabled: false,
             peers: Vec::new(),
+            binary_path: None,
         }
     }
 }
@@ -1551,9 +1560,12 @@ pub enum Authorization {
 /// cache でなく state に置く。refresh token は消えると再ログインが要るので、
 /// 「消えても再生成できる」cache の扱いに合わない。
 pub fn default_credentials_dir() -> PathBuf {
-    xdg_dir("XDG_STATE_HOME", ".local/state")
-        .join("llm-gateway")
-        .join("credentials")
+    default_state_dir().join("credentials")
+}
+
+/// 消えると作り直せないものの置き場。
+pub fn default_state_dir() -> PathBuf {
+    xdg_dir("XDG_STATE_HOME", ".local/state").join("llm-gateway")
 }
 
 /// 既定の日次集計の置き場。
@@ -1561,9 +1573,7 @@ pub fn default_credentials_dir() -> PathBuf {
 /// 認証情報と同じく state に置く。過去日の集計は消えると**作り直せない**
 /// (upstream に聞き直す口が無い) ので、cache の扱いに合わない (DR-0011)。
 pub fn default_stats_dir() -> PathBuf {
-    xdg_dir("XDG_STATE_HOME", ".local/state")
-        .join("llm-gateway")
-        .join("stats")
+    default_state_dir().join("stats")
 }
 
 fn xdg_dir(env: &str, fallback: &str) -> PathBuf {
@@ -2790,6 +2800,7 @@ main = "keepalive"
             listen: listen.to_owned(),
             disabled: false,
             peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
+            ..Server::default()
         };
 
         assert_eq!(
