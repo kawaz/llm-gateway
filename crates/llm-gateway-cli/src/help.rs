@@ -101,12 +101,20 @@ commands:
   register          register the supervisor (launchd on macOS, systemd --user on Linux)
   unregister        take it off again
   start             start the registered supervisor
-  stop              stop it
-  status            show whether it is registered and running
+  stop              stop it, and wait until it has let its units go
+  status            show whether it is registered and running, and what it holds
   log               show what it wrote
+
+register options:
+  --dry-run         print the unit file and the commands instead of running them
 
 log options:
   --follow          keep printing as more is written
+
+the Linux side is written but unverified: there is no systemd here to try it on.
+
+output:
+  results are JSON on stdout, errors are JSON on stderr, and this help is text
 ";
 
 /// `upstream` の下。

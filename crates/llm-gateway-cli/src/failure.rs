@@ -82,17 +82,6 @@ impl From<llm_gateway::daemon::registry::Error> for Failure {
     }
 }
 
-/// まだ実装していない口。
-///
-/// 段階を分けて入れる間、help には載っているが動かない命令がある。黙って
-/// 何もしないと「効かない理由」を探すことになるので、名指しで断る。
-pub fn not_implemented(command: &str) -> Failure {
-    Failure::new(
-        "not_implemented",
-        format!("`llm-gateway {command}` is not implemented yet"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,12 +126,5 @@ mod tests {
         assert_eq!(failure.kind(), "unknown_unit");
         let value: Value = serde_json::from_str(&failure.to_json()).unwrap();
         assert_eq!(value["error"]["units"], json!(["stable"]));
-    }
-
-    #[test]
-    fn an_unimplemented_command_names_itself() {
-        let failure = not_implemented("daemon start");
-        assert_eq!(failure.kind(), "not_implemented");
-        assert!(failure.message().contains("daemon start"), "{failure:?}");
     }
 }
