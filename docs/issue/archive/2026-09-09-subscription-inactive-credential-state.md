@@ -1,6 +1,6 @@
 ---
 title: サブスク停止中の credential を「支払い待ちで利用不可」として扱う
-status: open
+status: resolved
 category: request
 created: 2026-09-09T16:21:18+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-09T17:01:03+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0009","done:v0.44.2 で実装。状態名は観測事実で org_not_allowed (kawaz 裁定: 同じ文言はサブスク停止以外でも出うる)、原因の推定は auth.hint に分離。403 + 締め出し文言を 1h cooldown (既存 RouteState に乗せ、明けに 1 本 probe で復帰)、model一覧/usage/quota の定期照会は cooldown 中スキップ、refresh は継続、login_path は付けない。MANUAL 更新、両 unit に 2026-09-09 展開済み"]
 blocked_by:
 origin: 自リポ TODO
 ---
