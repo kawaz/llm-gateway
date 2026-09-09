@@ -239,6 +239,16 @@ ChatGPT backend の形 (`{"models": […]}`) で返す。中身は backend の�
 curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 ```
 
+### `GET /llm-gateway/version`
+
+**このプロセスが載せている版**を返す (`{"version": "0.44.0"}`)。ディスクに置かれた
+binary の版ではない。2 つを並べれば「入れ替えたのに上げ直していない」が分かる —
+`llm-gateway version` がやっているのはそれである。
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
+```
+
 ### `GET /llm-gateway/usage`
 
 credential ごとの利用状況 (DR-0007)。出すのは使用率・リセット時刻・締め出しの
@@ -576,6 +586,7 @@ llm-gateway <command> [options]
 | `usage` | credential ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
 | `stats` | credential × モデル × 日のトークン数と USD | `/llm-gateway/stats` |
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |
+| `version` | 置いてある版と走っている版、食い違っているか | `/llm-gateway/version` |
 
 出力は JSON (追従は JSONL)、エラーは JSON を stderr に出して exit が非 0。help だけは
 テキストで、引数なしでも出る (DR-0028)。
@@ -595,13 +606,32 @@ unit は設定ファイルのパスと、走らせる binary のパス (`[server
 | `daemon remove <unit>` | 登録簿から外す |
 | `daemon list` | 登録されている台を並べる |
 | `daemon start\|stop\|restart <unit>\|--all` | 監督者に頼んで上げ下げする |
-| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `restarts` / `last_exit`) |
 | `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
 
 `start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ
 `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が
 分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから
 次へ進む。
+
+### `version` — 置いてある版と走っている版
+
+`--version` はテキスト 1 行で、今叩いた CLI 自身の版を言う。`version` が JSON なのは、
+知りたい版がもう 2 つあって、しかも食い違いうるため: **置いてある版** (`on_disk`、
+binary に `--version` を聞いたもの = 次に上がる版) と **走っている版** (`running`、
+動いているプロセスに聞いたもの = 今処理している版)。
+
+```bash
+llm-gateway version
+{"cli":"0.44.0",
+ "supervisor":{"running":"0.43.7","on_disk":"0.44.0","restart_needed":true},
+ "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0","restart_needed":true}]}
+```
+
+`restart_needed` が真になるのは、両方が分かって食い違うときだけ。`null` は誰も答え
+られなかったということ (監督者が居ない / binary が消えている / `/llm-gateway/version`
+を持たない古い build が走っている) で、上げ直す理由にはならない。OS に何も登録して
+いなければ `supervisor` は `null`。
 
 ### `service` — OS への常駐登録
 

@@ -179,6 +179,28 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
 `--help` の文面・実装・zsh completion の 3 者を揃えることを受け入れ条件に入れる
 (cli-design-preferences)。
 
+### 9. 版は「置いてある版」と「走っている版」を並べて出す
+
+`llm-gateway version` が両方を出す。**置いてある版** (`on_disk`) はディスクの実行ファイルに
+`--version` を聞いたもので、次に上がるときの版。**走っている版** (`running`) は動いている
+プロセス自身が答えたもので、今処理している版。`restart_needed` は両方が分かって食い違うとき
+だけ真になる (片方が `null` なのは「比べられない」であって、食い違いではない)。
+
+```
+llm-gateway version
+{"cli": "0.44.0",
+ "supervisor": {"running": "0.43.7", "on_disk": "0.44.0", "restart_needed": true},
+ "units": [{"unit": "stable", "running": "0.43.7", "on_disk": "0.44.0", "restart_needed": true}]}
+```
+
+走っている版を答えるのは走っている本人である。監督者は socket の `status` 応答に
+`supervisor_version` を載せ、台は `GET /llm-gateway/version` (`{"version": "..."}`) で答える。
+監督者は台の `listen` へそれを聞き、`daemon status` の各行に `version` として載せる。
+この口を持たない版が走っていることもあるので、答えられなければ `null` — 異常ではない。
+
+ディスクを読んで版を推し量る経路は持たない。走っているプロセスがメモリに載せている版は、
+本人にしか言えない。`--version` (テキスト 1 行) はこの CLI 自身の版だけを言う口として残す。
+
 ## 却下した案
 
 - **plist を 2 本のまま置き、CLI からは触らない**: 台数を増やすたびに人が plist を書く。
@@ -194,6 +216,9 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
   停止・再起動・状態確認の経路が分岐する
 - **`daemon restart --all` を同時再起動にする**: 短くても全断が出る。rolling で避けられる
   ものを受け入れる理由がない
+- **版を binary のファイルから読み取る**: 走っているプロセスが載せている版は、置いてある
+  ファイルからは分からない (入れ替えても走っている側は変わらない)。それが分からないなら、
+  そもそも 2 つを並べる意味が無い
 
 ## 未確定 (実装前に確かめる)
 
@@ -203,9 +228,6 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
   拾うなら pid の引き継ぎ方が要る
 - **systemd 側の検証環境**。手元は macOS のみで、user unit の登録は書けても実機で確かめ
   られていない
-- **`daemon status` に版を載せるか**。決定 5 の例示は `{id,unit,running,pid,version,...}` だが、
-  監督者は子に版を聞く口を持たない。載せるなら `daemon run` 側が名乗る形が要る
-
 ## 影響
 
 - `serve` が消え、`status` が `upstream status` に動く。README / MANUAL / zsh completion の
@@ -214,6 +236,7 @@ exit を非 0 にする。help だけはテキストで、引数なしでも出�
 - launchd の 2 plist を外し、`service register` 1 本に移す runbook が要る
 - DR-0021 の endpoint (`/llm-gateway/status`) はそのまま。変わるのは CLI の語だけ
 - `[server]` に `binary_path` が増える
+- `GET /llm-gateway/version` が増える (認証なし、healthz と同じ扱い)
 
 ## 関連
 

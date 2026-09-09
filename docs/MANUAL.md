@@ -242,6 +242,16 @@ Intended to be polled by a load balancer every few seconds.
 curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 ```
 
+### `GET /llm-gateway/version`
+
+Reports the version **this process is running**, not what is installed on disk
+(`{"version": "0.44.0"}`). Comparing the two is how `llm-gateway version` tells that a
+binary was replaced but never restarted.
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
+```
+
 ### `GET /llm-gateway/usage`
 
 Per-credential usage (DR-0007). It reports utilization, reset times, and denial
@@ -589,6 +599,7 @@ llm-gateway <command> [options]
 | `usage` | Usage per credential (asks a running unit) | `/llm-gateway/usage` |
 | `stats` | Token counts and USD per credential × model × day | `/llm-gateway/stats` |
 | `login` | Authorize in a browser and save to `<name>.json` | `/llm-gateway/login` |
+| `version` | What is installed, what is running, and whether they differ | `/llm-gateway/version` |
 
 Results are JSON (JSONL when following), errors are JSON on stderr with a non-zero
 exit, and only the help is text — printed even with no arguments (DR-0028).
@@ -608,13 +619,32 @@ binary to run (`[server] binary_path`, defaulting to whatever registered it).
 | `daemon remove <unit>` | Drop a unit from the registry |
 | `daemon list` | List the registered units |
 | `daemon start\|stop\|restart <unit>\|--all` | Ask the supervisor to move them |
-| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `restarts` / `last_exit`) |
 | `daemon log [<unit>]\|--all` | Show what they wrote (`--follow` to keep reading) |
 
 `start` / `stop` / `restart` / `status` ask the supervisor. If it is not running they
 refuse with `supervisor_not_running` rather than starting a child themselves — otherwise
 there would be no telling who owns the process. `restart --all` goes one at a time,
 waiting for `/llm-gateway/healthz` before moving on.
+
+### `version` — installed against running
+
+`--version` prints one line: the version of the CLI you just ran. `version` prints JSON,
+because there are two more versions worth knowing and they can disagree: what is
+**on disk** (asked of the binary with `--version`, so what comes up next) and what is
+**running** (asked of the live process, so what is being served right now).
+
+```bash
+llm-gateway version
+{"cli":"0.44.0",
+ "supervisor":{"running":"0.43.7","on_disk":"0.44.0","restart_needed":true},
+ "units":[{"unit":"stable","running":"0.43.7","on_disk":"0.44.0","restart_needed":true}]}
+```
+
+`restart_needed` is true only when both versions are known and differ. A `null` means
+nobody could answer — the supervisor is not running, the binary is gone, or an older
+build without `/llm-gateway/version` is up — and that is not a reason to restart anything.
+`supervisor` is null when nothing is registered with the operating system.
 
 ### `service` — registering with the operating system
 
