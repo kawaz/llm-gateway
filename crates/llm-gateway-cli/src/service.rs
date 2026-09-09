@@ -95,7 +95,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
         }
         "stop" => {
             no_options(rest)?;
-            stop(&placed()?, &System)
+            stop(&placed()?, &System, &protocol::socket_path())
         }
         "status" => {
             no_options(rest)?;
@@ -309,9 +309,12 @@ pub fn start(plan: &Plan, runner: &dyn Runner) -> Result<ExitCode, Failure> {
 ///
 /// 「命令が戻った = 止まった」ではない。監督者は SIGTERM を受けてから子を
 /// 1 台ずつ止めるので、戻った直後はまだ全部生きていることがある。
-pub fn stop(plan: &Plan, runner: &dyn Runner) -> Result<ExitCode, Failure> {
+///
+/// 待つ先 (`socket`) を渡してもらうのは、この命令が**手元で本当に動いている
+/// 監督者**を掴むため。既定を内側で引くと、試験がその場に居る本物を掴む。
+pub fn stop(plan: &Plan, runner: &dyn Runner, socket: &Path) -> Result<ExitCode, Failure> {
     registered(plan)?;
-    let gone = wait_while_stopping(&protocol::socket_path(), || run_all(runner, &plan.stop))?;
+    let gone = wait_while_stopping(socket, || run_all(runner, &plan.stop))?;
     if !gone {
         return Err(Failure::new(
             "stop_timeout",
@@ -860,10 +863,14 @@ mod tests {
                 .unwrap_err()
                 .kind()
                 .to_owned(),
-            stop(&plan, &Recorder::default())
-                .unwrap_err()
-                .kind()
-                .to_owned(),
+            stop(
+                &plan,
+                &Recorder::default(),
+                &dir.path().join("supervisor.sock"),
+            )
+            .unwrap_err()
+            .kind()
+            .to_owned(),
         ] {
             assert_eq!(kind, "not_registered");
         }
@@ -883,6 +890,31 @@ mod tests {
         );
     }
 
+    /// 待つ先は、渡された socket。
+    ///
+    /// 掴んだ繋がりが切れた時点で「止まった」になる。既定の置き場を内側で
+    /// 引いていると、手元で本物が動いているときに試験がそれを掴んでしまう。
+    #[test]
+    fn stopping_waits_on_the_socket_it_was_given() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plan = plan_in(dir.path());
+        register(&plan, &Recorder::default(), false, None).unwrap();
+
+        // 掴ませてから離す監督者役。
+        let socket = dir.path().join("supervisor.sock");
+        let listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let held = std::thread::spawn(move || {
+            // 受けてすぐ手放す = 監督者が畳み終わった時と同じ EOF。
+            drop(listening.accept());
+        });
+
+        assert_eq!(
+            stop(&plan, &Recorder::default(), &socket).unwrap(),
+            ExitCode::SUCCESS
+        );
+        held.join().unwrap();
+    }
+
     /// 監督者が居なければ、止めた瞬間に終わっている。
     #[test]
     fn stopping_something_that_holds_nothing_returns_at_once() {
@@ -891,7 +923,7 @@ mod tests {
         register(&plan, &Recorder::default(), false, None).unwrap();
 
         let runner = Recorder::default();
-        stop(&plan, &runner).unwrap();
+        stop(&plan, &runner, &dir.path().join("supervisor.sock")).unwrap();
         assert_eq!(
             runner.calls(),
             vec!["launchctl kill SIGTERM gui/501/jp.kawaz.llm-gateway.supervise"]
