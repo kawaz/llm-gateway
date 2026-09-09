@@ -149,5 +149,6 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kawaz.llm-gateway-un
 ## 関連
 
 - DR-0028 (`daemon` / `service` の体系)
-- `just install` / `uninstall` / `restart` / `status` / `logs` は旧体制のまま
-  (`dist/com.kawaz.llm-gateway.plist.in` が `serve` を呼ぶ)。この移行とは別に直す
+- justfile の旧 `install` / `uninstall` / `restart` / `status` / `logs` recipe と
+  `dist/com.kawaz.llm-gateway.plist.in` は削除済み。稼働機の登録・切替は
+  `llm-gateway service register` / `daemon` サブコマンドで行う
