@@ -685,14 +685,15 @@ impl<P: Persistence> Gateway<P> {
                             &model,
                             now,
                         ) {
-                            // 支払い待ちは upstream の異常ではないので、
+                            // 組織ごとの断りは upstream の異常ではないので、
                             // 警告では出さない。1 時間に 1 度、締め出しを
                             // 付け直したときだけ状況を知らせる。
-                            if denial.reason == crate::denial::Reason::SubscriptionInactive {
+                            if denial.reason == crate::denial::Reason::OrgNotAllowed {
                                 info!(
                                     route = route.name(),
                                     seconds = denial.until - now,
-                                    "the subscription is inactive; holding this route until payment resumes"
+                                    hint = ORG_NOT_ALLOWED_HINT,
+                                    "the upstream refuses OAuth use for this organization; holding this route"
                                 );
                             } else {
                                 warn!(
@@ -1228,19 +1229,21 @@ impl<P: Persistence> Gateway<P> {
                     },
                 })
                 .collect();
-            // 支払い待ちは「ログインは生きている」状態なので、refresh の
-            // 結果より新しい観測になる。再ログインでは直らないので
+            // 組織ごと断られているのは「ログインは生きている」状態なので、
+            // refresh の結果より新しい観測になる。断りの理由までは観測できない
+            // ので、推定は hint へ回す。再ログインでは直らないので
             // `login_path` は付けない。
             if preset
-                .and_then(|preset| preset.subscription_inactive(now_secs))
+                .and_then(|preset| preset.org_not_allowed(now_secs))
                 .is_some()
             {
                 entry.auth = Some(quota::AuthState {
-                    status: quota::AuthStatus::SubscriptionInactive,
+                    status: quota::AuthStatus::OrgNotAllowed,
                     reason: Some(
-                        "the login still works; the upstream refuses it until the subscription is paid"
+                        "the login still works, but the upstream refuses OAuth use for this organization"
                             .to_owned(),
                     ),
+                    hint: Some(ORG_NOT_ALLOWED_HINT.to_owned()),
                     login_path: None,
                     observed_at: now_ms,
                 });
@@ -1272,9 +1275,9 @@ impl<P: Persistence> Gateway<P> {
             if preset.quota_api().is_none() {
                 continue;
             }
-            // 支払いが止まっている間は聞いても断られる。空くのは cooldown が
+            // 組織ごと断られている間は聞いても断られる。空くのは cooldown が
             // 明けて実リクエストが 1 本通ったときなので、ここでは黙って飛ばす。
-            if preset.subscription_inactive(now_unix()).is_some() {
+            if preset.org_not_allowed(now_unix()).is_some() {
                 continue;
             }
             let Some(credential_name) = self
@@ -1333,7 +1336,7 @@ impl<P: Persistence> Gateway<P> {
     /// 相手に毎リクエスト当たり続けることはない。
     async fn fill_quota_for_capped(&self, routes: &[Arc<Route>], now: i64) {
         for route in routes {
-            if !route.needs_quota(now) || route.preset.subscription_inactive(now).is_some() {
+            if !route.needs_quota(now) || route.preset.org_not_allowed(now).is_some() {
                 continue;
             }
             let Some(id) = &route.credential else {
@@ -1589,6 +1592,14 @@ struct Sent {
 
 /// トークンを数えるだけの口。会話の往復ではない。
 const COUNT_TOKENS: &str = "/count_tokens";
+
+/// 組織ごと断られたときに添える推定 (`auth.hint`)。
+///
+/// 観測できるのは「この組織には許可されていない」までで、その理由は応答の
+/// どこにも無い。契約が止まっているのはよくある原因の 1 つでしかないので、
+/// 断定せずに確かめ先を示す。
+const ORG_NOT_ALLOWED_HINT: &str =
+    "the organization refuses OAuth use — an inactive subscription is one cause; check the account";
 
 /// この 1 本は会話の往復か (DR-0012)。
 ///
@@ -2317,11 +2328,11 @@ routes = ["a"]
         );
     }
 
-    /// 支払いが止まった 403 は、その場で経路を締め出す (実測 2026-09-09)。
+    /// 組織ごと断る 403 は、その場で経路を締め出す (実測 2026-09-09)。
     ///
     /// 印を付けないと、以降のすべてのリクエストがここへ当たってから次へ回る。
     #[tokio::test]
-    async fn an_inactive_subscription_holds_the_route_after_the_first_refusal() {
+    async fn an_org_refusal_holds_the_route_after_the_first_refusal() {
         let up = FakeUpstream::start(|_, _| {
             (
                 403,
@@ -2353,8 +2364,8 @@ routes = ["a"]
         );
         let now = now_unix();
         assert_eq!(
-            preset_of(&gw, "a").subscription_inactive(now),
-            Some(now + crate::denial::SUBSCRIPTION_COOLDOWN),
+            preset_of(&gw, "a").org_not_allowed(now),
+            Some(now + crate::denial::ORG_NOT_ALLOWED_COOLDOWN),
             "the next request does not pay another round trip to learn the same thing"
         );
     }
@@ -4797,19 +4808,19 @@ models = ["m"]
         );
     }
 
-    /// 支払い待ちの経路は、期限切れではなくその実態として一覧に出る。
+    /// 組織ごと断られた経路は、期限切れではなく観測した事実として一覧に出る。
     ///
-    /// トークンは生きているので refresh の結果は `ok` のまま。再ログインでは
-    /// 直らないので、案内の口 (`login_path`) も出さない。
+    /// トークンは生きているので refresh の結果は `ok` のまま。原因の推定は
+    /// hint に回し、再ログインでは直らないので案内の口 (`login_path`) も出さない。
     #[tokio::test]
-    async fn usage_report_names_an_inactive_subscription() {
+    async fn usage_report_names_the_org_refusal() {
         let up = FakeUpstream::always(200).await;
         let gw = gateway(&one_credential(&up.url)).await;
         let now = now_unix();
         preset_of(&gw, "a").deny(
             Denial {
-                until: now + crate::denial::SUBSCRIPTION_COOLDOWN,
-                reason: Reason::SubscriptionInactive,
+                until: now + crate::denial::ORG_NOT_ALLOWED_COOLDOWN,
+                reason: Reason::OrgNotAllowed,
                 scope: Scope::Everything,
             },
             now,
@@ -4822,10 +4833,15 @@ models = ["m"]
             .find(|entry| entry.name == "a")
             .unwrap();
         let auth = entry.auth.as_ref().expect("the state is observed");
-        assert_eq!(auth.status, quota::AuthStatus::SubscriptionInactive);
+        assert_eq!(auth.status, quota::AuthStatus::OrgNotAllowed);
+        assert_eq!(
+            auth.hint.as_deref(),
+            Some(ORG_NOT_ALLOWED_HINT),
+            "the cause is a guess, so it rides in the hint rather than the state"
+        );
         assert_eq!(
             auth.login_path, None,
-            "logging in again does not pay a bill"
+            "logging in again does not lift an organization-wide refusal"
         );
     }
 
@@ -5355,6 +5371,7 @@ routes = ["route"]
             Some(crate::quota::AuthState {
                 status,
                 reason: None,
+                hint: None,
                 login_path: None,
                 observed_at: 100_000,
             })

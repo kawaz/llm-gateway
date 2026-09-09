@@ -80,13 +80,14 @@ fn render(report: &Report) -> String {
                     .unwrap_or("token rejected; log in again");
                 out.push_str(&format!("token rejected — relogin required: {reason}"));
             }
-            Some(llm_gateway::quota::AuthStatus::SubscriptionInactive) => {
-                let reason = c
+            Some(llm_gateway::quota::AuthStatus::OrgNotAllowed) => {
+                // 名乗るのは観測した事実だけ。原因の推定は hint として続ける。
+                let hint = c
                     .auth
                     .as_ref()
-                    .and_then(|auth| auth.reason.as_deref())
-                    .unwrap_or("the upstream refuses this subscription");
-                out.push_str(&format!("subscription inactive — {reason}"));
+                    .and_then(|auth| auth.hint.as_deref().or(auth.reason.as_deref()))
+                    .unwrap_or("the upstream refuses OAuth use for this organization");
+                out.push_str(&format!("(org not allowed) {hint}"));
             }
             Some(llm_gateway::quota::AuthStatus::Degraded) => {
                 let reason = c
@@ -358,6 +359,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth claude-personal`".to_owned()),
+            hint: None,
             login_path: None,
             observed_at: NOW,
         });
@@ -373,22 +375,28 @@ mod tests {
         );
     }
 
-    /// 支払い待ちは期限切れでも再認可でもない。実態のまま出し、login は勧めない。
+    /// 組織ごとの断りは期限切れでも再認可でもない。観測した事実を名乗り、
+    /// 原因の推定は hint として添える。
     #[test]
-    fn an_inactive_subscription_is_not_shown_as_expired() {
+    fn an_org_refusal_is_not_shown_as_expired() {
         let mut credential = observed();
         credential.auth = Some(llm_gateway::quota::AuthState {
-            status: llm_gateway::quota::AuthStatus::SubscriptionInactive,
-            reason: Some("the login still works; the subscription is unpaid".to_owned()),
+            status: llm_gateway::quota::AuthStatus::OrgNotAllowed,
+            reason: Some("the login still works, but the upstream refuses it".to_owned()),
+            hint: Some("an inactive subscription is one cause; check the account".to_owned()),
             login_path: None,
             observed_at: NOW,
         });
         let out = render(&report(vec![credential]));
-        assert!(out.contains("subscription inactive"), "{out}");
+        assert!(out.contains("(org not allowed)"), "{out}");
+        assert!(
+            out.contains("one cause"),
+            "the guess is offered, not asserted: {out}"
+        );
         assert!(!out.contains("expired"), "{out}");
         assert!(
             !out.contains("relogin required"),
-            "logging in again does not pay the bill: {out}"
+            "logging in again does not lift an organization-wide refusal: {out}"
         );
     }
 
@@ -399,6 +407,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::Degraded,
             reason: Some("the refresh endpoint returned 503".to_owned()),
+            hint: None,
             login_path: None,
             observed_at: NOW,
         });

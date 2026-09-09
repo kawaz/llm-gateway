@@ -355,11 +355,11 @@ impl Router {
 
         let now = crate::credential::time::now_unix();
         for (name, route) in &self.config.routes {
-            // 支払いが止まっている経路は、聞いても同じ 403 が返る。前回の
+            // 組織ごと断られている経路は、聞いても同じ 403 が返る。前回の
             // 一覧をそのまま持ち越して、1 時間ごとの警告を出さない。
             let paused = self
                 .preset(name)
-                .and_then(|preset| preset.subscription_inactive(now))
+                .and_then(|preset| preset.org_not_allowed(now))
                 .is_some();
             let declared = || -> BTreeMap<String, String> {
                 route

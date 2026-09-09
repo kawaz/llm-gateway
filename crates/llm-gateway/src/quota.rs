@@ -400,10 +400,12 @@ pub enum AuthStatus {
     Ok,
     ReloginRequired,
     Degraded,
-    /// ログインは生きているが、契約が止まっていて上流が断る (DR-0009 追補)。
+    /// この組織には OAuth の利用が許可されていない、と上流が答えた
+    /// (DR-0009 追補)。
     ///
-    /// 再ログインでは直らないので、案内も `login_path` も付けない。
-    SubscriptionInactive,
+    /// ログインは生きている。断りの理由は観測できないので [`AuthState::hint`]
+    /// へ回し、再ログインでは直らないので `login_path` も付けない。
+    OrgNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +413,13 @@ pub struct AuthState {
     pub status: AuthStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// 観測から推し量れる原因と、確かめ方。
+    ///
+    /// [`Self::status`] が観測した事実だけを名乗るのに対し、こちらは**推定**を
+    /// 置く場所。断定できない原因 (例: 組織ごと断られている理由) を状態名へ
+    /// 混ぜると、当たっていないときに読み手を誤った対処へ送る。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_path: Option<String>,
     /// この状態を観測した時刻 (Unix ミリ秒)。
@@ -969,6 +978,7 @@ mod tests {
         credential.auth = Some(AuthState {
             status: AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth a`".to_owned()),
+            hint: None,
             login_path: None,
             observed_at: NOW,
         });
@@ -983,32 +993,53 @@ mod tests {
         );
     }
 
-    /// 支払い待ちは、再ログインでは直らないので案内の口を出さない。
+    /// 状態は観測した事実だけを名乗り、原因の推定は hint として並ぶ。
+    /// 再ログインでは直らないので案内の口は出さない。
     #[test]
-    fn an_inactive_subscription_is_reported_without_a_login_path() {
+    fn an_org_refusal_is_reported_with_a_hint_and_no_login_path() {
         let mut credential = CredentialUsage::new("a", "claude_oauth", Support::Unobserved, None);
         credential.auth = Some(AuthState {
-            status: AuthStatus::SubscriptionInactive,
-            reason: Some("the login still works; the subscription is unpaid".to_owned()),
+            status: AuthStatus::OrgNotAllowed,
+            reason: Some("the login still works, but the upstream refuses it".to_owned()),
+            hint: Some("an inactive subscription is one cause; check the account".to_owned()),
             login_path: None,
             observed_at: NOW,
         });
         let json = serde_json::to_value(&credential).unwrap();
-        assert_eq!(json["auth"]["status"], "subscription_inactive");
+        assert_eq!(json["auth"]["status"], "org_not_allowed");
+        assert!(
+            json["auth"]["hint"].as_str().unwrap().contains("one cause"),
+            "the cause is offered as a guess, never as the state itself"
+        );
         assert!(json["auth"].get("login_path").is_none());
+    }
+
+    /// 推定を持たない状態では hint の欄ごと出さない (additive な optional 欄)。
+    #[test]
+    fn a_state_without_a_guess_omits_the_hint() {
+        let mut credential = CredentialUsage::new("a", "claude_oauth", Support::Unobserved, None);
+        credential.auth = Some(AuthState {
+            status: AuthStatus::Ok,
+            reason: None,
+            hint: None,
+            login_path: None,
+            observed_at: NOW,
+        });
+        let json = serde_json::to_value(&credential).unwrap();
+        assert!(json["auth"].get("hint").is_none());
     }
 
     /// 締め出しの理由も同じ語で出る。表示側は auth と denial を突き合わせる。
     #[test]
-    fn a_denial_names_the_inactive_subscription() {
+    fn a_denial_names_the_org_refusal() {
         let denial = CredentialDenial {
-            reason: crate::denial::Reason::SubscriptionInactive,
+            reason: crate::denial::Reason::OrgNotAllowed,
             until: NOW,
             model: None,
         };
         assert_eq!(
             serde_json::to_value(&denial).unwrap()["reason"],
-            "subscription_inactive"
+            "org_not_allowed"
         );
     }
 
