@@ -45,9 +45,17 @@ pub const RESET_SLACK: i64 = 60;
 /// 付けている間は永久に気づけない。
 pub const PROBE_INTERVAL: i64 = 60 * 60;
 
+/// 支払いが止まっている経路を空ける長さ (秒)。
+///
+/// 上限と違って開く時刻が応答に載らない。開くのは人が支払いを直したときで、
+/// その所要時間は upstream ではなく利用者の都合で決まる。1 時間にするのは、
+/// 待ちの上限としては直した人が気づける長さで、締め出しとしては 1 時間に
+/// 1 本の空振りしか払わない長さだから。
+pub const SUBSCRIPTION_COOLDOWN: i64 = 60 * 60;
+
 /// 断られた理由。空ける長さと、様子を聞きに行くかが変わる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Reason {
     /// 上限に当たった。いつ開くかが分かっている。
     Limited,
@@ -58,6 +66,12 @@ pub enum Reason {
     /// 経過した時間ぶんを超えて使った経路を、次に予算が増えるまで外す。
     /// 断られたのではないので、様子を聞きに行っても状況は変わらない。
     Paced,
+    /// 契約が止まっている。ログインは生きていて、支払いだけが止まっている。
+    ///
+    /// トークンの更新は通り続けるので認証としては正常に見えるが、上流は
+    /// すべてのリクエストを断る。上限と違って開く時刻が分からないので
+    /// [`SUBSCRIPTION_COOLDOWN`] だけ空け、明けた 1 本で復帰を判定する。
+    SubscriptionInactive,
 }
 
 /// 締め出しが効く範囲。
@@ -229,6 +243,19 @@ impl RouteState {
             .collect();
         denials.sort_by(|a, b| a.scope.output_order().cmp(&b.scope.output_order()));
         denials
+    }
+
+    /// 支払い待ちで止まっているか。止まっているなら、空ける時刻。
+    ///
+    /// 実リクエスト以外の用 (モデル一覧・枠照会) も、これが立っている間は
+    /// 聞きに行かない。断られると分かっている相手に定期的に当たると、
+    /// 1 時間ごとの警告だけが積み上がる。
+    pub fn subscription_inactive(&self, now: i64) -> Option<i64> {
+        self.marks()
+            .values()
+            .filter(|d| d.reason == Reason::SubscriptionInactive && d.until > now)
+            .map(|d| d.until)
+            .max()
     }
 
     /// このモデルを今この経路へ流せるか。
@@ -657,6 +684,61 @@ mod tests {
         drop(state.claim_ask(NOW).expect("first time"));
         assert!(state.claim_ask(NOW + DEFAULT_BACKOFF - 1).is_none());
         assert!(state.claim_ask(NOW + DEFAULT_BACKOFF).is_some());
+    }
+
+    /// 支払い待ちは経路全体を止め、cooldown が明けたら黙って候補へ戻る。
+    ///
+    /// 戻った先で 1 本試すのが復帰の判定そのもので、通れば印は消え、また
+    /// 断られれば印が付き直す。
+    #[test]
+    fn an_inactive_subscription_holds_every_model_until_the_cooldown_ends() {
+        let state = RouteState::new();
+        state.deny(
+            Denial {
+                until: NOW + SUBSCRIPTION_COOLDOWN,
+                reason: Reason::SubscriptionInactive,
+                scope: Scope::Everything,
+            },
+            NOW,
+        );
+        for model in [FABLE, HAIKU] {
+            assert!(state.denial(model, NOW).is_some(), "{model}");
+        }
+        assert_eq!(
+            state.subscription_inactive(NOW),
+            Some(NOW + SUBSCRIPTION_COOLDOWN)
+        );
+
+        let after = NOW + SUBSCRIPTION_COOLDOWN;
+        assert_eq!(state.availability(FABLE, after), Availability::Ready);
+        assert_eq!(
+            state.subscription_inactive(after),
+            None,
+            "nothing is held back once the cooldown ends"
+        );
+    }
+
+    /// 支払いを直したかは聞いても分からないので、定期の様子見はしない。
+    #[test]
+    fn an_inactive_subscription_is_not_probed() {
+        let state = RouteState::new();
+        state.deny(
+            Denial {
+                until: NOW + 100_000,
+                reason: Reason::SubscriptionInactive,
+                scope: Scope::Everything,
+            },
+            NOW,
+        );
+        assert!(state.claim_probe(NOW + PROBE_INTERVAL).is_none());
+    }
+
+    /// 上限で止まっている経路は、支払い待ちとは別物。
+    #[test]
+    fn a_limit_is_not_reported_as_an_inactive_subscription() {
+        let state = RouteState::new();
+        state.deny(limited(NOW + 5000), NOW);
+        assert_eq!(state.subscription_inactive(NOW), None);
     }
 
     #[test]

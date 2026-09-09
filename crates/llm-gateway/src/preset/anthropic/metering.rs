@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, Scope};
+use crate::denial::{DEFAULT_BACKOFF, Denial, RESET_SLACK, Reason, SUBSCRIPTION_COOLDOWN, Scope};
 use crate::egress::Headers;
 use crate::metering::{Outcome, Pricing, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::Metering;
@@ -46,8 +46,11 @@ impl Metering for AnthropicMetering {
     /// - **429 で窓が読めない / 529** → `retry-after`、無ければ
     ///   [`DEFAULT_BACKOFF`] だけ、頼んだモデルにだけ
     ///   ([`Reason::Busy`] / [`Scope::Model`])
-    /// - それ以外の状態 → 締め出さない。401 / 403 は待っても直らないので、
-    ///   時間で空ける印を付ける意味がない
+    /// - **403 + 契約が止まっているという本文** → [`SUBSCRIPTION_COOLDOWN`]
+    ///   だけ、経路全体を ([`Reason::SubscriptionInactive`] /
+    ///   [`Scope::Everything`])。組織単位の話なのでモデルでは分かれない
+    /// - それ以外の状態 → 締め出さない。401 / 文言の違う 403 は待っても
+    ///   直らないので、時間で空ける印を付ける意味がない
     ///
     /// 範囲を応答から決めるのは、**モデル別の制限がヘッダに出てこない**ため
     /// (実測 2026-07-31、DR-0009)。窓が塞がったという証拠があるときだけ
@@ -56,10 +59,17 @@ impl Metering for AnthropicMetering {
         &self,
         status: u16,
         headers: &Headers,
-        _body: Option<&[u8]>,
+        body: Option<&[u8]>,
         model: &str,
         observed_at_secs: i64,
     ) -> Option<Denial> {
+        if status == 403 {
+            return subscription_inactive(body?).then(|| Denial {
+                until: observed_at_secs + SUBSCRIPTION_COOLDOWN,
+                reason: Reason::SubscriptionInactive,
+                scope: Scope::Everything,
+            });
+        }
         if !matches!(status, 429 | 529) {
             return None;
         }
@@ -96,6 +106,30 @@ impl Metering for AnthropicMetering {
     fn pricing(&self, model: &str) -> Option<Pricing> {
         crate::preset::pricing::for_model(model)
     }
+}
+
+/// 契約が止まっているという 403 の本文か (実測 2026-09-09、DR-0009 追補)。
+///
+/// ```json
+/// {"type":"error","error":{"type":"permission_error",
+///  "message":"OAuth authentication is currently not allowed for this organization."}}
+/// ```
+///
+/// 文言は前方一致で見る。組織名や案内の続きが後ろに足されても、頭は
+/// 「この組織では OAuth 認証が許可されていない」の 1 文で始まる。
+/// `permission_error` だけでは足りない — 同じ型で「この API を使う権限が
+/// ない」も返り、そちらは待っても直らない。
+fn subscription_inactive(body: &[u8]) -> bool {
+    const PREFIX: &str = "OAuth authentication is currently not allowed";
+
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    error["type"] == "permission_error"
+        && error["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with(PREFIX))
 }
 
 /// `anthropic-ratelimit-unified-*` を読む (実測値は DR-0007)。
@@ -796,6 +830,45 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    /// 契約が止まった 403 は、経路全体を 1 時間空ける (実測 2026-09-09)。
+    ///
+    /// 毎回当たりに行くと、全リクエストに 1 往復ぶんの遅れが乗る。
+    #[test]
+    fn an_inactive_subscription_holds_the_whole_route() {
+        let body = br#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."}}"#;
+        assert_eq!(
+            AnthropicMetering.rejection(403, &Headers::default(), Some(body), FABLE, NOW),
+            Some(Denial {
+                until: NOW + SUBSCRIPTION_COOLDOWN,
+                reason: Reason::SubscriptionInactive,
+                scope: Scope::Everything,
+            }),
+            "the organization is refused whatever model is asked for"
+        );
+    }
+
+    /// 同じ型の別の 403 は、待っても直らないので締め出さない。
+    #[test]
+    fn another_permission_error_is_not_a_subscription_problem() {
+        for body in [
+            &br#"{"type":"error","error":{"type":"permission_error","message":"This credential does not have access to the requested resource."}}"#[..],
+            &br#"{"type":"error","error":{"type":"authentication_error","message":"OAuth authentication is currently not allowed for this organization."}}"#[..],
+            &b"not json at all"[..],
+        ] {
+            assert_eq!(
+                AnthropicMetering.rejection(403, &Headers::default(), Some(body), FABLE, NOW),
+                None,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        assert_eq!(
+            rejection(403, &Headers::default(), FABLE),
+            None,
+            "a 403 whose body could not be read says nothing"
+        );
     }
 
     /// 桁の壊れた `retry-after` で時刻の足し算を溢れさせない。

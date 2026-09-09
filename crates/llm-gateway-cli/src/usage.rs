@@ -80,6 +80,14 @@ fn render(report: &Report) -> String {
                     .unwrap_or("token rejected; log in again");
                 out.push_str(&format!("token rejected — relogin required: {reason}"));
             }
+            Some(llm_gateway::quota::AuthStatus::SubscriptionInactive) => {
+                let reason = c
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.reason.as_deref())
+                    .unwrap_or("the upstream refuses this subscription");
+                out.push_str(&format!("subscription inactive — {reason}"));
+            }
             Some(llm_gateway::quota::AuthStatus::Degraded) => {
                 let reason = c
                     .auth
@@ -362,6 +370,25 @@ mod tests {
         assert!(
             !out.contains("71%"),
             "stale quota must not hide the auth failure: {out}"
+        );
+    }
+
+    /// 支払い待ちは期限切れでも再認可でもない。実態のまま出し、login は勧めない。
+    #[test]
+    fn an_inactive_subscription_is_not_shown_as_expired() {
+        let mut credential = observed();
+        credential.auth = Some(llm_gateway::quota::AuthState {
+            status: llm_gateway::quota::AuthStatus::SubscriptionInactive,
+            reason: Some("the login still works; the subscription is unpaid".to_owned()),
+            login_path: None,
+            observed_at: NOW,
+        });
+        let out = render(&report(vec![credential]));
+        assert!(out.contains("subscription inactive"), "{out}");
+        assert!(!out.contains("expired"), "{out}");
+        assert!(
+            !out.contains("relogin required"),
+            "logging in again does not pay the bill: {out}"
         );
     }
 

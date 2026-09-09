@@ -685,13 +685,24 @@ impl<P: Persistence> Gateway<P> {
                             &model,
                             now,
                         ) {
-                            warn!(
-                                route = route.name(),
-                                status = resp.status,
-                                reason = ?denial.reason,
-                                seconds = denial.until - now,
-                                "excluding this route from candidates"
-                            );
+                            // 支払い待ちは upstream の異常ではないので、
+                            // 警告では出さない。1 時間に 1 度、締め出しを
+                            // 付け直したときだけ状況を知らせる。
+                            if denial.reason == crate::denial::Reason::SubscriptionInactive {
+                                info!(
+                                    route = route.name(),
+                                    seconds = denial.until - now,
+                                    "the subscription is inactive; holding this route until payment resumes"
+                                );
+                            } else {
+                                warn!(
+                                    route = route.name(),
+                                    status = resp.status,
+                                    reason = ?denial.reason,
+                                    seconds = denial.until - now,
+                                    "excluding this route from candidates"
+                                );
+                            }
 
                             // 断られたのに理由が応答に無いなら、枠を聞きに行く。
                             // 当て推量の 60 秒を、どの枠がいつ開くかという
@@ -1217,6 +1228,23 @@ impl<P: Persistence> Gateway<P> {
                     },
                 })
                 .collect();
+            // 支払い待ちは「ログインは生きている」状態なので、refresh の
+            // 結果より新しい観測になる。再ログインでは直らないので
+            // `login_path` は付けない。
+            if preset
+                .and_then(|preset| preset.subscription_inactive(now_secs))
+                .is_some()
+            {
+                entry.auth = Some(quota::AuthState {
+                    status: quota::AuthStatus::SubscriptionInactive,
+                    reason: Some(
+                        "the login still works; the upstream refuses it until the subscription is paid"
+                            .to_owned(),
+                    ),
+                    login_path: None,
+                    observed_at: now_ms,
+                });
+            }
             entry.limits = probed
                 .as_ref()
                 .and_then(|p| p.limits.get(name.as_str()).cloned());
@@ -1242,6 +1270,11 @@ impl<P: Persistence> Gateway<P> {
 
         for (name, preset) in self.router.presets() {
             if preset.quota_api().is_none() {
+                continue;
+            }
+            // 支払いが止まっている間は聞いても断られる。空くのは cooldown が
+            // 明けて実リクエストが 1 本通ったときなので、ここでは黙って飛ばす。
+            if preset.subscription_inactive(now_unix()).is_some() {
                 continue;
             }
             let Some(credential_name) = self
@@ -1300,7 +1333,7 @@ impl<P: Persistence> Gateway<P> {
     /// 相手に毎リクエスト当たり続けることはない。
     async fn fill_quota_for_capped(&self, routes: &[Arc<Route>], now: i64) {
         for route in routes {
-            if !route.needs_quota(now) {
+            if !route.needs_quota(now) || route.preset.subscription_inactive(now).is_some() {
                 continue;
             }
             let Some(id) = &route.credential else {
@@ -2281,6 +2314,48 @@ routes = ["a"]
         assert!(
             forwarded.usage.is_none(),
             "does not peek at what cannot be read anyway"
+        );
+    }
+
+    /// 支払いが止まった 403 は、その場で経路を締め出す (実測 2026-09-09)。
+    ///
+    /// 印を付けないと、以降のすべてのリクエストがここへ当たってから次へ回る。
+    #[tokio::test]
+    async fn an_inactive_subscription_holds_the_route_after_the_first_refusal() {
+        let up = FakeUpstream::start(|_, _| {
+            (
+                403,
+                r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization."}}"#
+                    .to_owned(),
+            )
+        })
+        .await;
+        let gw = gateway(&one_credential(&up.url)).await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            forwarded.response.status, 403,
+            "the refusal still reaches the client as-is"
+        );
+        let now = now_unix();
+        assert_eq!(
+            preset_of(&gw, "a").subscription_inactive(now),
+            Some(now + crate::denial::SUBSCRIPTION_COOLDOWN),
+            "the next request does not pay another round trip to learn the same thing"
         );
     }
 
@@ -4719,6 +4794,38 @@ models = ["m"]
                 {"reason": "busy", "until": (now + 60) * 1000, "model": "m-fable"},
             ]),
             "締め出しが解ける時刻も Unix ミリ秒で出す"
+        );
+    }
+
+    /// 支払い待ちの経路は、期限切れではなくその実態として一覧に出る。
+    ///
+    /// トークンは生きているので refresh の結果は `ok` のまま。再ログインでは
+    /// 直らないので、案内の口 (`login_path`) も出さない。
+    #[tokio::test]
+    async fn usage_report_names_an_inactive_subscription() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+        let now = now_unix();
+        preset_of(&gw, "a").deny(
+            Denial {
+                until: now + crate::denial::SUBSCRIPTION_COOLDOWN,
+                reason: Reason::SubscriptionInactive,
+                scope: Scope::Everything,
+            },
+            now,
+        );
+
+        let report = gw.usage_report(false).await;
+        let entry = report
+            .credentials
+            .iter()
+            .find(|entry| entry.name == "a")
+            .unwrap();
+        let auth = entry.auth.as_ref().expect("the state is observed");
+        assert_eq!(auth.status, quota::AuthStatus::SubscriptionInactive);
+        assert_eq!(
+            auth.login_path, None,
+            "logging in again does not pay a bill"
         );
     }
 

@@ -400,6 +400,10 @@ pub enum AuthStatus {
     Ok,
     ReloginRequired,
     Degraded,
+    /// ログインは生きているが、契約が止まっていて上流が断る (DR-0009 追補)。
+    ///
+    /// 再ログインでは直らないので、案内も `login_path` も付けない。
+    SubscriptionInactive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -976,6 +980,35 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("llm-gateway login")
+        );
+    }
+
+    /// 支払い待ちは、再ログインでは直らないので案内の口を出さない。
+    #[test]
+    fn an_inactive_subscription_is_reported_without_a_login_path() {
+        let mut credential = CredentialUsage::new("a", "claude_oauth", Support::Unobserved, None);
+        credential.auth = Some(AuthState {
+            status: AuthStatus::SubscriptionInactive,
+            reason: Some("the login still works; the subscription is unpaid".to_owned()),
+            login_path: None,
+            observed_at: NOW,
+        });
+        let json = serde_json::to_value(&credential).unwrap();
+        assert_eq!(json["auth"]["status"], "subscription_inactive");
+        assert!(json["auth"].get("login_path").is_none());
+    }
+
+    /// 締め出しの理由も同じ語で出る。表示側は auth と denial を突き合わせる。
+    #[test]
+    fn a_denial_names_the_inactive_subscription() {
+        let denial = CredentialDenial {
+            reason: crate::denial::Reason::SubscriptionInactive,
+            until: NOW,
+            model: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&denial).unwrap()["reason"],
+            "subscription_inactive"
         );
     }
 

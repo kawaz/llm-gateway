@@ -368,6 +368,11 @@ impl Preset {
         self.state.observe_quota(snapshot);
     }
 
+    /// 支払い待ちで止まっているか。止まっているなら、空ける時刻。
+    pub fn subscription_inactive(&self, now: i64) -> Option<i64> {
+        self.state.subscription_inactive(now)
+    }
+
     /// 現在有効な締め出しの印。
     pub fn denials(&self, now: i64) -> Vec<Denial> {
         self.state.denials(now)

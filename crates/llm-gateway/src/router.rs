@@ -353,32 +353,40 @@ impl Router {
         let mut by_route: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let previous = self.catalog.read().await;
 
+        let now = crate::credential::time::now_unix();
         for (name, route) in &self.config.routes {
+            // 支払いが止まっている経路は、聞いても同じ 403 が返る。前回の
+            // 一覧をそのまま持ち越して、1 時間ごとの警告を出さない。
+            let paused = self
+                .preset(name)
+                .and_then(|preset| preset.subscription_inactive(now))
+                .is_some();
+            let declared = || -> BTreeMap<String, String> {
+                route
+                    .declared_models()
+                    .iter()
+                    .map(|model| (model.clone(), model.clone()))
+                    .collect()
+            };
+            let keep_previous = || {
+                previous
+                    .by_route
+                    .get(name)
+                    .filter(|models| !models.is_empty())
+                    .cloned()
+                    .unwrap_or_else(declared)
+            };
             let found = match route.discovery_flavor(&self.config) {
+                Some(_) if paused => keep_previous(),
                 Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
                     Ok(found) => found,
                     Err(e) => {
                         warn!(route = %name, %e, "cannot fetch the model list; using the saved or configured list");
-                        previous
-                            .by_route
-                            .get(name)
-                            .filter(|models| !models.is_empty())
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                route
-                                    .declared_models()
-                                    .iter()
-                                    .map(|model| (model.clone(), model.clone()))
-                                    .collect()
-                            })
+                        keep_previous()
                     }
                 },
                 // 聞けない upstream は設定に書かれたものを使う。
-                None => route
-                    .declared_models()
-                    .iter()
-                    .map(|m| (m.clone(), m.clone()))
-                    .collect(),
+                None => declared(),
             };
             by_route.insert(name.clone(), with_declared_fallback(found, route));
         }
