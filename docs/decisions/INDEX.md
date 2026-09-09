@@ -29,6 +29,7 @@
 - [DR-0025](./DR-0025-responses-ingress.md) — Responses 形式の受け口を無変換パススルーで生やす (認証だけ差し替え、運べる形は経路が答える、origin=codex、cache 戦略は当てない)
 - [DR-0026](./DR-0026-discovery-client-version.md) — discovery が codex backend に名乗る `client_version` は codex CLI の版を定数で持つ (gateway の版だと catalog が常に空。公開一覧の絞り込みは `exclude`、config `models` はフォールバック専用のまま)
 - [DR-0027](./DR-0027-keepalive-by-replay.md) — keepalive は合図の注入をやめ、gateway が最後に転送した本文を自送信 (replay) して cache の TTL を延ばす (ヒットで TTL が更新される実測が根拠。本文はファイルに置き flock で 1 台に絞る、sub も対象にできる、DR-0024 §2 を supersede) [Proposed]
+- [DR-0028](./DR-0028-daemon-service-subcommands.md) — プロセスの起動と常駐を `daemon` (instance の操作) / `service` (OS への登録) に分ける (`serve --config` は `daemon run <unit>` へ、unit = 設定ファイル + `binary_path`、監督者 1 つを launchd/systemd に載せる、`status` は `upstream status` へ、問い合わせ系は登録簿から宛先を引く)
 
 ## Archived
 
