@@ -2,7 +2,6 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
-| 2026-09-09 | design | open | [daemon-service-subcommands](./2026-09-09-daemon-service-subcommands.md) | CLI に daemon / service サブコマンド体系を採用する (kawaz 提案 2026-09-09、ccmsg v… |
 | 2026-09-09 | bug | open | [service-status-running-false-while-loaded](./2026-09-09-service-status-running-false-while-loaded.md) | service status の service.running が稼働中でも false になる |
 | 2026-09-08 | design | open | [keepalive-via-messaging-socket](./2026-09-08-keepalive-via-messaging-socket.md) | keepalive の合図を ccmsg 経由でなく messaging socket へ直接注入する |
 | 2026-09-08 | request | open | [keepalive-daily-counters](./2026-09-08-keepalive-daily-counters.md) | keepalive ping の実発火回数を日別に永続化する |

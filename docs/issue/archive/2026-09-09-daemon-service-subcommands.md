@@ -1,6 +1,6 @@
 ---
 title: CLI に daemon / service サブコマンド体系を採用する
-status: open
+status: resolved
 category: design
 created: 2026-09-09T09:31:21+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-09T16:13:13+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0028","implemented","runbook/2026-09-09-migrate-launchd-to-service","done:v0.44.0〜v0.44.1で段階A/B/C実装、2026-09-09 16時台に稼働機を全断なくmigrate完了","derived:service-status-running-false-while-loaded"]
 blocked_by:
 origin: kawaz 提案 (2026-09-09)
 ---
