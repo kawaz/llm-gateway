@@ -784,6 +784,7 @@ dependencies = [
  "llm-gateway",
  "llm-gateway-server",
  "reqwest",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
