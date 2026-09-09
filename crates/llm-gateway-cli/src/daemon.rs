@@ -4,6 +4,7 @@
 //! `start` / `stop` / `restart` / `status` は監督者への要求で、監督者が居ない
 //! なら断る — 代わりに自分で起こしたりはしない (所有者が 2 つになる)。
 
+pub mod control;
 pub mod run;
 
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use std::process::ExitCode;
 use llm_gateway::daemon::registry::{self, Registry, Unit};
 use serde_json::json;
 
-use crate::failure::{Failure, not_implemented};
+use crate::failure::Failure;
 use crate::help;
 use crate::options::{split, take_value};
 
@@ -27,11 +28,10 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
         "run" => run::foreground(&Registry::open(), rest),
         "add" => add(&Registry::open(), rest),
         "remove" => remove(&Registry::open(), rest),
-        "list" => list(&Registry::open()),
-        // 監督者まわりは段階を分けて入れる。help には並ぶが、まだ動かない。
-        command @ ("supervise" | "start" | "stop" | "restart" | "status" | "log") => {
-            Err(not_implemented(&format!("daemon {command}")))
-        }
+        "list" => list(&Registry::open(), control::running_now()),
+        "supervise" => control::supervise(rest),
+        op @ ("start" | "stop" | "restart" | "status") => control::ask(op, rest),
+        "log" => control::log(rest),
         other => Err(Failure::from(format!(
             "there is no `daemon {other}` command. see `llm-gateway daemon --help`"
         ))),
@@ -122,9 +122,11 @@ fn remove(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
 
 /// 登録されている台を並べる。
 ///
-/// 動いているかはここでは言わない。それを知っているのは監督者だけで、
-/// 登録簿を読んだだけで「動いている」と書くと嘘になる。
-fn list(registry: &Registry) -> Result<ExitCode, Failure> {
+/// 動いているかを言えるのは監督者に聞けたときだけ。聞けなければ登録簿の
+/// 中身だけを出す — `list` は登録を見る命令なので、監督者が居ないことを
+/// 理由に断らない (DR-0028 決定 3)。登録簿を読んだだけで「動いている」と
+/// 書くこともしない (知らないので)。
+fn list(registry: &Registry, running: Option<serde_json::Value>) -> Result<ExitCode, Failure> {
     let units: Vec<_> = registry
         .list()?
         .iter()
@@ -132,11 +134,29 @@ fn list(registry: &Registry) -> Result<ExitCode, Failure> {
         .map(|(i, (name, unit))| {
             let mut row = entry(name, unit);
             row.insert("id".to_owned(), json!(i));
+            if let Some(status) = status_of(running.as_ref(), name) {
+                row.insert("running".to_owned(), json!(status["running"]));
+                if let Some(pid) = status.get("pid") {
+                    row.insert("pid".to_owned(), pid.clone());
+                }
+            }
             row
         })
         .collect();
     println!("{}", json!(units));
     Ok(ExitCode::SUCCESS)
+}
+
+/// 監督者が答えた行から、1 台ぶんを探す。
+fn status_of<'a>(
+    running: Option<&'a serde_json::Value>,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
+    running?
+        .get("units")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("unit").and_then(|u| u.as_str()) == Some(name))
 }
 
 /// 1 台ぶんの JSON。
@@ -304,17 +324,18 @@ mod tests {
             row.keys().collect::<Vec<_>>(),
             vec!["unit", "enabled", "config", "binary_path"]
         );
-        assert!(list(&registry).is_ok());
+        assert!(list(&registry, None).is_ok());
     }
 
-    /// 監督者に頼む口は、まだ無いことを名指しで言う。
+    /// 監督者に聞けたときだけ、行に「今いるか」が足される。
     #[test]
-    fn the_supervisor_commands_say_they_are_not_there_yet() {
-        for command in ["supervise", "start", "stop", "restart", "status", "log"] {
-            let e = dispatch(&args(&[command])).unwrap_err();
-            assert_eq!(e.kind(), "not_implemented", "{command}");
-            assert!(e.message().contains(command), "{command}: {e:?}");
-        }
+    fn what_is_running_comes_from_the_supervisor() {
+        let answer = json!({"units": [{"unit": "a", "running": true, "pid": 42}]});
+        let row = status_of(Some(&answer), "a").unwrap();
+        assert_eq!(row["pid"], json!(42));
+        // 聞けていない / 知らない台については、何も足さない。
+        assert!(status_of(Some(&answer), "b").is_none());
+        assert!(status_of(None, "a").is_none());
     }
 
     #[test]
