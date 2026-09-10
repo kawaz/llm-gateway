@@ -1105,6 +1105,7 @@ spend_down_within = "25%"
             breakeven: None,
             origin: crate::provider::RequestOrigin::Unknown.as_str(),
             cache_ttl_secs: None,
+            cache_notice: None,
         }
     }
 

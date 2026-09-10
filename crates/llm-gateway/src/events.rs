@@ -68,6 +68,12 @@ pub struct Event {
     /// その寿命が尽きる時刻。`ts` + [`Self::cache_ttl_secs`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_expires_at: Option<i64>,
+    /// この 1 本が約束した寿命の id (DR-0012)。
+    ///
+    /// [`Self::cache_expires_at`] を出す 1 本だけが持つ。約束が果たされずに
+    /// 終わったとき、`cache_expired` がこの id を名指しで取り消す。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_notice: Option<String>,
     /// 経路選定で外した経路。無ければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
@@ -141,6 +147,8 @@ pub struct Origin<'a> {
     pub keepalive: Option<&'a str>,
     /// この会話への合図が止めてあるか ([`Event::cache_paused`])。
     pub cache_paused: bool,
+    /// この 1 本が約束した寿命の id ([`Event::cache_notice`])。
+    pub cache_notice: Option<&'a str>,
     /// この系列に立っている合図の連鎖 ([`Event::cache_since`] 以下)。
     pub chain: Option<Chain>,
     /// 損益分岐時間から起こした連鎖 ([`Event::cache_breakeven_until`])。
@@ -173,6 +181,11 @@ impl Event {
             cache_expires_at: origin
                 .cache_ttl_secs
                 .map(|ttl_secs| ts_ms + (ttl_secs * 1_000) as i64),
+            // 約束していない 1 本に id は要らない。取り消す相手が無い。
+            cache_notice: origin
+                .cache_ttl_secs
+                .and(origin.cache_notice)
+                .map(str::to_owned),
             skipped,
             keepalive: origin.keepalive.map(str::to_owned),
             cache_paused: origin.cache_paused,
@@ -390,6 +403,12 @@ pub struct Keepalive {
     pub nonce: String,
     /// これを過ぎて届いたら 1 時間は付かない (Unix ミリ秒)。
     pub deadline: i64,
+    /// この合図が約束した寿命の id (DR-0012)。値は [`Self::nonce`] と同じ。
+    ///
+    /// 同じ値を 2 つの欄に出すのは、役が別だから — `nonce` は**会話に返させる
+    /// 語**、`cache_notice` は**この約束の名前**。受け取る側は、どの種類の
+    /// 知らせでも同じ 1 欄を見て取り消し (`cache_expired`) と突き合わせられる。
+    pub cache_notice: String,
     /// そのまま会話へ流し込む文面。
     pub marker: String,
 }
@@ -406,7 +425,48 @@ impl Keepalive {
             prefix: prefix.to_owned(),
             nonce: nonce.to_owned(),
             deadline: deadline_ms,
+            cache_notice: nonce.to_owned(),
             marker: marker(nonce),
+        }
+    }
+}
+
+/// 約束した寿命が果たされずに終わった、という取り消し (DR-0012)。
+///
+/// `cache_expires_at` は送る前に立てた見込みで、上流の都合や機械のサスペンドで
+/// cache が先に消えることがある。見る側 (ccmsg) は最後に受けた約束の残りを
+/// 描き続けるので、消えたことを伝える口がないと嘘のまま残る。
+///
+/// 取り消すのは [`Self::of`] が指す**その約束 1 つ**だけ。受け取る側は
+/// (会話, 系列) ごとに最後の `cache_notice` を覚えておき、一致したときだけ
+/// 残りを 0 にする。一致しなければ、その約束は既に新しいもので置き換わって
+/// いる (別の gateway が先に延ばした等) ので、何もしない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheExpired {
+    /// 受け取る側が種類を見分ける印。値は常に `cache_expired`。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 消えたと分かった時刻 (Unix ミリ秒)。
+    pub ts: i64,
+    /// どの会話か。
+    pub session_id: String,
+    /// その会話のどの系列か ([`prefix`])。
+    pub prefix: String,
+    /// 取り消す約束の id ([`Event::cache_notice`] / [`Keepalive::cache_notice`])。
+    pub of: String,
+}
+
+impl CacheExpired {
+    /// 種類の印。
+    pub const KIND: &'static str = "cache_expired";
+
+    pub fn new(ts_ms: i64, session_id: &str, prefix: &str, of: &str) -> Self {
+        Self {
+            kind: Self::KIND.to_owned(),
+            ts: ts_ms,
+            session_id: session_id.to_owned(),
+            prefix: prefix.to_owned(),
+            of: of.to_owned(),
         }
     }
 }
@@ -451,6 +511,8 @@ pub fn marker(nonce: &str) -> String {
 pub enum Notice {
     CacheKeepalive(Keepalive),
     KeepalivePaused(KeepalivePaused),
+    /// 約束した寿命の取り消し。
+    CacheExpired(CacheExpired),
     /// 応答が閉じた知らせ。
     Response(Box<Response>),
     /// 転送の知らせ。欄が多く、他の 3 種より大きいので箱に入れる
@@ -466,6 +528,7 @@ impl Notice {
             Self::Response(_) => Response::KIND,
             Self::CacheKeepalive(_) => Keepalive::KIND,
             Self::KeepalivePaused(_) => KeepalivePaused::KIND,
+            Self::CacheExpired(_) => CacheExpired::KIND,
         }
     }
 
@@ -473,7 +536,10 @@ impl Notice {
     pub fn request(&self) -> Option<&Event> {
         match self {
             Self::Request(event) => Some(event),
-            Self::Response(_) | Self::CacheKeepalive(_) | Self::KeepalivePaused(_) => None,
+            Self::Response(_)
+            | Self::CacheKeepalive(_)
+            | Self::KeepalivePaused(_)
+            | Self::CacheExpired(_) => None,
         }
     }
 
@@ -481,7 +547,10 @@ impl Notice {
     pub fn response(&self) -> Option<&Response> {
         match self {
             Self::Response(response) => Some(response),
-            Self::Request(_) | Self::CacheKeepalive(_) | Self::KeepalivePaused(_) => None,
+            Self::Request(_)
+            | Self::CacheKeepalive(_)
+            | Self::KeepalivePaused(_)
+            | Self::CacheExpired(_) => None,
         }
     }
 }
@@ -507,6 +576,12 @@ impl From<Keepalive> for Notice {
 impl From<KeepalivePaused> for Notice {
     fn from(paused: KeepalivePaused) -> Self {
         Self::KeepalivePaused(paused)
+    }
+}
+
+impl From<CacheExpired> for Notice {
+    fn from(expired: CacheExpired) -> Self {
+        Self::CacheExpired(expired)
     }
 }
 
@@ -610,6 +685,7 @@ mod tests {
             breakeven: None,
             origin: "main",
             cache_ttl_secs: None,
+            cache_notice: None,
         }
     }
 
@@ -953,6 +1029,7 @@ mod tests {
                 model: "claude-opus-5",
                 origin: "main",
                 cache_ttl_secs: Some(3600),
+                cache_notice: Some("n0tice"),
                 chain: Some(Chain {
                     since_ms: NOW,
                     count: 0,
@@ -981,6 +1058,7 @@ mod tests {
                 "origin": "main",
                 "cache_ttl_secs": 3600,
                 "cache_expires_at": NOW + HOUR,
+                "cache_notice": "n0tice",
                 "cache_paused": false,
                 "cache_since": NOW,
                 "next_keepalive_at": NOW + 55 * MINUTE,
@@ -1052,6 +1130,7 @@ mod tests {
                 "prefix": "2cf24dba",
                 "nonce": "5Qv",
                 "deadline": NOW + HOUR - 30 * 1_000,
+                "cache_notice": "5Qv",
                 "marker": marker("5Qv"),
             })
         );
@@ -1063,6 +1142,28 @@ mod tests {
                 "session_id": "s-1",
                 "paused_at": NOW,
             })
+        );
+
+        let withdrawn = Notice::from(CacheExpired::new(NOW + HOUR, "s-1", "2cf24dba", "n0tice"));
+        assert_eq!(
+            serde_json::to_value(&withdrawn).unwrap(),
+            json!({
+                "type": "cache_expired",
+                "ts": NOW + HOUR,
+                "session_id": "s-1",
+                "prefix": "2cf24dba",
+                "of": "n0tice",
+            })
+        );
+        assert_eq!(withdrawn.name(), "cache_expired");
+        assert_eq!(
+            serde_json::from_value::<Notice>(serde_json::to_value(&withdrawn).unwrap()).unwrap(),
+            withdrawn,
+            "a withdrawal reads back as itself, not as another kind of notice"
+        );
+        assert!(
+            withdrawn.request().is_none() && withdrawn.response().is_none(),
+            "it is neither a forward nor a completion"
         );
     }
 

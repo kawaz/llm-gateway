@@ -199,6 +199,9 @@ struct Plan {
     kind: store::Kind,
     /// この連鎖の起点と、ここまでに出した本数。
     chain: Counted,
+    /// 最後に約束した寿命の id ([`Watched::promised`])。予定を置き直しても
+    /// 引き継ぐ — 約束したのは系列に対してで、予定 1 つに対してではない。
+    promised: Option<String>,
 }
 
 /// 合図の連鎖のうち、予定を置き直しても引き継ぐもの。
@@ -231,6 +234,8 @@ struct Carried {
     horizon_end: Moment,
     bound: Bound,
     chain: Counted,
+    /// 最後に約束した寿命の id ([`Watched::promised`])。
+    promised: Option<String>,
 }
 
 /// この系列に立っている合図の連鎖の見立て (時刻は Unix ミリ秒)。
@@ -334,6 +339,12 @@ struct Watched {
     kind: store::Kind,
     /// この連鎖の起点と、ここまでに出した本数。
     chain: Counted,
+    /// この系列について最後に約束した寿命の id (`cache_notice`、DR-0012)。
+    ///
+    /// 約束が果たされずに終わったとき、取り消し (`cache_expired`) はこの id を
+    /// 名指しする。まだ何も約束していない系列 (控え) では `None` — 取り消す
+    /// 相手が無いので、消えても黙る。
+    promised: Option<String>,
 }
 
 /// 予定の実体。畳まれたら止まる。
@@ -392,6 +403,18 @@ impl Keepalive {
         let mut restored = 0;
         for saved in kept.watched {
             if saved.expires_at <= now_unix || saved.horizon_end <= now_unix {
+                // 落ちている間に cache が消えていたら、見る側はまだその寿命を
+                // 描いている。期間が終わっただけの系列では黙る — 最後の合図が
+                // 置いた cache はまだ生きている。
+                if saved.expires_at <= now_unix {
+                    self.expired(
+                        &Series {
+                            session_id: saved.session_id,
+                            prefix: saved.prefix,
+                        },
+                        saved.promised.as_deref(),
+                    );
+                }
                 continue;
             }
             if self.is_paused(&saved.session_id) {
@@ -427,6 +450,7 @@ impl Keepalive {
                 },
                 bound,
                 kind: saved.kind,
+                promised: saved.promised,
                 chain: Counted {
                     // 起点を持たないファイルでは、予定の 1 つ手前を起点と
                     // 見なす。数え直せる材料が他に無い。
@@ -469,6 +493,7 @@ impl Keepalive {
                 since_ms: watched.chain.since_ms,
                 count: watched.chain.count,
                 kind: watched.kind,
+                promised: watched.promised.clone(),
             })
             .collect();
         let paused: Vec<store::Paused> = state
@@ -555,24 +580,79 @@ impl Keepalive {
         horizon: Duration,
         sent_at_ms: i64,
     ) {
-        // 人が会話を動かした。連鎖はここから数え直す。
-        let chain = Counted {
-            since_ms: sent_at_ms,
-            count: 0,
-        };
-        self.schedule(
-            series,
-            REFRESH_AFTER,
+        // 人が会話を動かした。連鎖はここから数え直す。約束もここで切れる —
+        // この 1 本が出す知らせが、新しい約束を持ってくる ([`Self::promise`])。
+        let carried = Carried {
             // 期間の終わりは、壁時計では連鎖の起点から数える (欄ごとに時計を
             // 読み直さない)。
-            Moment {
+            horizon_end: Moment {
                 at: Instant::now() + horizon,
                 ms: sent_at_ms + horizon.as_millis() as i64,
             },
             bound,
-            store::Kind::Primary,
-            chain,
+            chain: Counted {
+                since_ms: sent_at_ms,
+                count: 0,
+            },
+            promised: self.promised_of(&series),
+        };
+        self.schedule(series, REFRESH_AFTER, store::Kind::Primary, carried);
+    }
+
+    /// 約束した寿命が果たされずに終わったことを知らせる (DR-0012)。
+    ///
+    /// 見る側は最後に受けた約束の残りを描き続けるので、消えたことを伝える口が
+    /// ないと嘘のまま残る。取り消すのは**その約束 1 つ**だけなので、受け取った
+    /// 側は自分が覚えている id と一致したときだけ残りを 0 にできる (別の
+    /// gateway が先に延ばしていれば、id が合わずに素通しになる)。
+    ///
+    /// 何も約束していない系列 (控え・約束の前に終わった系列) では黙る。
+    fn expired(&self, series: &Series, promised: Option<&str>) {
+        let Some(of) = promised else {
+            return;
+        };
+        debug!(
+            session = %series.session_id,
+            prefix = %series.prefix,
+            of,
+            "the promised cache is gone; withdrawing the notice"
         );
+        self.events.publish(events::CacheExpired::new(
+            now_unix_ms(),
+            &series.session_id,
+            &series.prefix,
+            of,
+        ));
+    }
+
+    /// この 1 本が約束する寿命に名前を付ける (`cache_notice`、DR-0012)。
+    ///
+    /// 見張っている系列なら、その名前を覚えておく — 約束が果たされずに終わった
+    /// とき、取り消し (`cache_expired`) がこの名前を名指しする。見張りの無い
+    /// 系列でも名前は返す (知らせには載る)。覚える先が無いだけで、そこは誰も
+    /// 取り消さない。
+    pub fn promise(&self, series: &Series) -> String {
+        let id = notice_id();
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(watched) = state.watched.get_mut(series) {
+                watched.promised = Some(id.clone());
+            } else {
+                return id;
+            }
+        }
+        self.save();
+        id
+    }
+
+    /// この系列について最後に約束した id。
+    fn promised_of(&self, series: &Series) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .watched
+            .get(series)
+            .and_then(|watched| watched.promised.clone())
     }
 
     /// 自分が出した合図が戻ってきた。同じ期間の中で次の予定だけ置き直す。
@@ -584,14 +664,7 @@ impl Keepalive {
         let Some(carried) = self.watch_of(&series) else {
             return;
         };
-        self.schedule(
-            series,
-            REFRESH_AFTER,
-            carried.horizon_end,
-            carried.bound,
-            store::Kind::Primary,
-            carried.chain,
-        );
+        self.schedule(series, REFRESH_AFTER, store::Kind::Primary, carried);
     }
 
     /// 別のプロセスが出した合図を見た。一歩下がって控える (DR-0024 §2)。
@@ -632,20 +705,16 @@ impl Keepalive {
                         since_ms: signal.since_ms,
                         count: 0,
                     },
+                    // 控えは何も約束していない。約束したのは合図を出している
+                    // 側で、取り消すのもその側の仕事。
+                    promised: None,
                 }
             }
         };
         if carried.horizon_end.at <= now + STANDBY_AFTER {
             return;
         }
-        self.schedule(
-            series,
-            STANDBY_AFTER,
-            carried.horizon_end,
-            carried.bound,
-            store::Kind::Standby,
-            carried.chain,
-        );
+        self.schedule(series, STANDBY_AFTER, store::Kind::Standby, carried);
     }
 
     /// 見張っている系列から、次の予定へ引き継ぐもの。期間を過ぎていれば畳む。
@@ -662,9 +731,14 @@ impl Keepalive {
                     horizon_end: watched.horizon_end,
                     bound: watched.bound.clone(),
                     chain: watched.chain,
+                    promised: watched.promised.clone(),
                 })
             }
             Some(_) => {
+                // 期間が尽きただけで、最後の合図が置いた cache はまだ生きて
+                // いる (それが `cache_until`)。ここで取り消すと、見る側は本当に
+                // 残っている分まで 0 にしてしまう — 取り消すのは**寿命が過ぎた
+                // とき**だけ ([`Self::expired`])。
                 state.watched.remove(series);
                 drop(state);
                 self.save();
@@ -683,10 +757,8 @@ impl Keepalive {
         self: &Arc<Self>,
         series: Series,
         after: Duration,
-        horizon_end: Moment,
-        bound: Bound,
         kind: store::Kind,
-        chain: Counted,
+        carried: Carried,
     ) {
         if self.is_paused(&series.session_id) {
             return;
@@ -697,10 +769,11 @@ impl Keepalive {
             // この 1 本が置いた cache が消える時刻。合図が間に合ったかの
             // 判定にも、置き場から読み戻すかの判定にも使う。
             expires_at: Moment::after(Instant::now(), now_unix_ms(), LIFETIME - MARGIN),
-            horizon_end,
-            bound,
+            horizon_end: carried.horizon_end,
+            bound: carried.bound,
             kind,
-            chain,
+            chain: carried.chain,
+            promised: carried.promised,
         });
     }
 
@@ -725,6 +798,7 @@ impl Keepalive {
                 bound: plan.bound,
                 kind: plan.kind,
                 chain: plan.chain,
+                promised: plan.promised,
             },
         );
         self.save();
@@ -914,25 +988,31 @@ impl Keepalive {
                     watched.chain.since_ms,
                     watched.expires_at,
                     watched.horizon_end,
+                    watched.promised.clone(),
                 )
             });
-        let Some((bound, since_ms, expires_at, horizon_end)) = watching else {
+        let Some((bound, since_ms, expires_at, horizon_end, promised)) = watching else {
             return;
         };
+        // 寿命が過ぎていたら、約束も果たされていない (取り消す)。期間が
+        // 終わっただけなら、置いた cache はまだ生きているので黙って畳む。
         let gone = if expires_at.passed(now_ms) {
-            Some(("the cache it was extending has expired", expires_at))
+            Some(("the cache it was extending has expired", expires_at, true))
         } else if horizon_end.passed(now_ms) {
-            Some(("the horizon has passed", horizon_end))
+            Some(("the horizon has passed", horizon_end, false))
         } else {
             None
         };
-        if let Some((why, end)) = gone {
+        if let Some((why, end, withdraw)) = gone {
             debug!(
                 session = %series.session_id,
                 prefix = %series.prefix,
                 behind_ms = now_ms - end.ms,
                 "{why}; dropping the watch instead of signalling"
             );
+            if withdraw {
+                self.expired(&series, promised.as_deref());
+            }
             self.forget(&series);
             return;
         }
@@ -966,6 +1046,9 @@ impl Keepalive {
         if let Some(watched) = state.watched.get_mut(&series) {
             watched.timer = None;
             watched.chain.count += 1;
+            // この合図が新しい約束になる。名前は合言葉そのもの — 見る側は
+            // どの種類の知らせでも `cache_notice` 1 欄を見れば済む。
+            watched.promised = Some(nonce.clone());
         }
         state.pending.insert(
             nonce,
@@ -1080,6 +1163,18 @@ fn nonce(signal: Signal) -> String {
     bytes[NONCE_RANDOM_BYTES..NONCE_RANDOM_BYTES + 8]
         .copy_from_slice(&signal.since_ms.to_be_bytes());
     bytes[NONCE_RANDOM_BYTES + 8..].copy_from_slice(&signal.horizon_end_ms.to_be_bytes());
+    B64URL.encode(bytes)
+}
+
+/// 約束 1 つの名前 (`cache_notice`、DR-0012)。16 バイトの乱数を base64url に
+/// した 22 文字。
+///
+/// 取り消し (`cache_expired`) が名指しで指すためだけの id なので、中身は持た
+/// せない。当てられると他所の約束を取り消させられるので、合言葉と同じ強さの
+/// 乱数から作る。
+pub fn notice_id() -> String {
+    let mut bytes = [0u8; NONCE_RANDOM_BYTES];
+    rand::fill(&mut bytes);
     B64URL.encode(bytes)
 }
 
@@ -1369,6 +1464,114 @@ mod tests {
         let (keepalive, _watching) = keepalive();
         keepalive.rewritten(&series(), now_unix_ms());
         assert!(keepalive.chain(&series()).is_none());
+    }
+
+    /// 流れた取り消し 1 件。
+    fn withdrawn(notice: Notice) -> events::CacheExpired {
+        match notice {
+            Notice::CacheExpired(expired) => expired,
+            other => panic!("expected a withdrawal, got {other:?}"),
+        }
+    }
+
+    /// 約束の名前は、1 回きりで当てられない。
+    #[test]
+    fn each_notice_id_is_unpredictable_and_url_safe() {
+        let ids: std::collections::HashSet<String> = (0..64).map(|_| notice_id()).collect();
+        assert_eq!(ids.len(), 64, "no two promises share a name");
+        for id in &ids {
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "the id travels in JSON as it is: {id}"
+            );
+        }
+    }
+
+    /// 寿命が過ぎて畳むときは、最後に約束した id で取り消しが出る。
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_cache_withdraws_the_notice_it_promised() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        let promised = keepalive.promise(&series());
+        slept_through(&keepalive, &series(), |watched| {
+            watched.expires_at.ms = now_unix_ms() - 1;
+        });
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+
+        let expired = withdrawn(watching.try_recv().expect("a withdrawal went out"));
+        assert_eq!(expired.of, promised, "it names the promise it takes back");
+        assert_eq!(expired.session_id, "s-1");
+        assert_eq!(expired.prefix, "2cf24dba");
+        assert!(
+            watching.try_recv().is_err(),
+            "and no signal went out alongside it"
+        );
+    }
+
+    /// 合図を出した後は、その合言葉が約束の名前になる。
+    #[tokio::test(start_paused = true)]
+    async fn the_signal_becomes_the_promise_it_withdraws() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.promise(&series());
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        let signal = signalled(watching.recv().await.unwrap());
+        assert_eq!(
+            signal.cache_notice, signal.nonce,
+            "the signal names its own promise"
+        );
+
+        // その合図が置くはずだった cache が、戻ってくる前に消えた。
+        keepalive.rearm(series());
+        slept_through(&keepalive, &series(), |watched| {
+            watched.expires_at.ms = now_unix_ms() - 1;
+        });
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+
+        assert_eq!(
+            withdrawn(watching.try_recv().expect("a withdrawal went out")).of,
+            signal.nonce,
+            "the last promise was the signal's own nonce"
+        );
+    }
+
+    /// 期限内の系列は何も取り消さない。
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_still_alive_withdraws_nothing() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.promise(&series());
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+
+        // 出たのは合図だけ。
+        signalled(watching.try_recv().expect("the signal went out"));
+        assert!(watching.try_recv().is_err(), "nothing was withdrawn");
+    }
+
+    /// 期間が終わっただけの系列も取り消さない (置いた cache はまだ生きている)。
+    #[tokio::test(start_paused = true)]
+    async fn a_horizon_that_ran_out_withdraws_nothing() {
+        let (keepalive, mut watching) = keepalive();
+        keepalive.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        keepalive.promise(&series());
+        slept_through(&keepalive, &series(), |watched| {
+            watched.horizon_end.ms = now_unix_ms() - 1;
+        });
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+
+        assert!(
+            watching.try_recv().is_err(),
+            "the last signal's hour outlives the horizon; withdrawing it would zero a live ring"
+        );
     }
 
     /// 機械が眠っている間に壁時計だけが進んだ状況を作る。
@@ -2108,6 +2311,7 @@ mod tests {
             since_ms: now * 1_000,
             count: 0,
             kind: store::Kind::Primary,
+            promised: None,
         }]));
 
         let (keepalive, mut watching) = keepalive_storing(dir.path());
@@ -2139,6 +2343,7 @@ mod tests {
             since_ms: now * 1_000,
             count: 0,
             kind: store::Kind::Primary,
+            promised: None,
         };
 
         for gone in [
@@ -2152,6 +2357,85 @@ mod tests {
             keepalive.restore();
             assert_eq!(keepalive.armed(), 0);
         }
+    }
+
+    /// 落ちている間に cache が消えていたら、読み戻した側が取り消しを出す。
+    ///
+    /// 期間が終わっただけの系列では黙る — 最後の合図が置いた cache はまだ
+    /// 生きているので、取り消すと見る側が本当に残っている分まで 0 にする。
+    #[tokio::test(start_paused = true)]
+    async fn a_watch_that_died_while_down_withdraws_its_notice() {
+        let now = now_unix();
+        let saved = |expires_at: i64, horizon_end: i64| store::Saved {
+            session_id: "s-1".to_owned(),
+            prefix: "2cf24dba".to_owned(),
+            ns: "default".to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+            fires_at: now + 60,
+            expires_at,
+            horizon_end,
+            since_ms: now * 1_000,
+            count: 0,
+            kind: store::Kind::Primary,
+            promised: Some("n0tice".to_owned()),
+        };
+
+        for (gone, withdraws) in [
+            // cache が消えている。
+            (saved(now - 1, now + 3600), true),
+            // 見張る期間が終わっただけ。
+            (saved(now + 120, now - 1), false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store::Store::new(dir.path(), "127.0.0.1:11301");
+            store.save(&kept(vec![gone]));
+
+            let (keepalive, mut watching) = keepalive_storing(dir.path());
+            keepalive.restore();
+            settle().await;
+
+            match watching.try_recv() {
+                Ok(notice) => {
+                    assert!(withdraws, "nothing should have been withdrawn");
+                    assert_eq!(withdrawn(notice).of, "n0tice");
+                }
+                Err(_) => assert!(!withdraws, "the expired promise was never taken back"),
+            }
+        }
+    }
+
+    /// 約束の id は置き場に残り、読み戻せる。
+    #[tokio::test(start_paused = true)]
+    async fn the_promise_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (before, _) = keepalive_storing(dir.path());
+        before.armed_by_request(series(), bound(), HORIZON, now_unix_ms());
+        let promised = before.promise(&series());
+        assert_eq!(
+            store::Store::new(dir.path(), "127.0.0.1:11301")
+                .load()
+                .watched[0]
+                .promised,
+            Some(promised.clone()),
+            "the promise is written down as it is made"
+        );
+        drop(before);
+
+        let (after, mut watching) = keepalive_storing(dir.path());
+        after.restore();
+        // 読み戻した見張りが、その約束のまま寿命切れを迎える。
+        slept_through(&after, &series(), |watched| {
+            watched.expires_at.ms = now_unix_ms() - 1;
+        });
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        settle().await;
+
+        assert_eq!(
+            withdrawn(watching.try_recv().expect("a withdrawal went out")).of,
+            promised,
+            "the id it withdraws is the one it read back"
+        );
     }
 
     /// 止めた合図は再起動を跨いで残り、見張りも読み戻さない。
@@ -2196,6 +2480,7 @@ mod tests {
                 since_ms: now * 1_000,
                 count: 0,
                 kind: store::Kind::Primary,
+                promised: None,
             }],
             paused: vec![store::Paused {
                 session_id: "s-1".to_owned(),

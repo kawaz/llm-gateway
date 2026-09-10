@@ -1065,6 +1065,7 @@ mod tests {
             chain: None,
             breakeven: None,
             cache_ttl_secs: None,
+            cache_notice: None,
         }
     }
 

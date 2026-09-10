@@ -501,6 +501,24 @@ event: keepalive_paused
 data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
 ```
 
+Every notice that promises a lifetime (a `request` carrying `cache_expires_at`, a
+`cache_keepalive` carrying `deadline`) names that promise in `cache_notice`: 22
+characters, freshly drawn per request, and equal to the signal's own `nonce` on a
+`cache_keepalive`. When a promised lifetime ends without being kept — the cache died
+first, across a suspend or a restart — a notice withdraws that name.
+
+```
+event: cache_expired
+data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
+```
+
+A receiver keeps the latest `cache_notice` per (conversation, series) and zeroes its
+countdown only when `of` matches it; otherwise it does nothing, because that promise has
+already been replaced by a newer one. Several gateways can watch the same series without
+confusing each other, since each names only its own promises. The end of the watching
+window (`keepalive_horizon`) does not produce this notice: signalling merely stops, and
+the cache the last signal bought lives on until `cache_until`.
+
 To receive the same stream without holding a connection open (ccmsg on another host,
 say), write the endpoint roots under `[webhook]` and the gateway POSTs to them. Both
 `base_url` (one) and `base_urls` (several) are accepted, and **every notice goes to

@@ -490,6 +490,24 @@ event: keepalive_paused
 data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
 ```
 
+寿命を約束した知らせ (`cache_expires_at` を出す `request`、`deadline` を出す
+`cache_keepalive`) には、その約束の名前 `cache_notice` が載る。リクエストごとに
+新しく振る 22 文字で、`cache_keepalive` では合言葉 (`nonce`) と同じ値になる。
+約束した寿命が果たされずに終わったとき (機械のサスペンドや停止を跨いで cache が
+先に消えたとき) は、その名前を名指しで取り消す 1 通が流れる。
+
+```
+event: cache_expired
+data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
+```
+
+受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚えておき、`of` が
+それと一致したときだけ残りを 0 にする。一致しなければ何もしない — その約束は
+既に新しいもので置き換わっている (同じ系列を複数の gateway が見ていても、
+各 gateway は自分の約束にしか名前を振らないので取り違えない)。見張る期間
+(`keepalive_horizon`) が終わっただけでは流れない。継ぎ足すのをやめるだけで、
+最後の合図が置いた cache は `cache_until` まで生きているため。
+
 同じ内容を待たずに受け取りたい相手 (別ホストの ccmsg 等) には、`[webhook]` に
 受け口の根を書くと gateway 側から POST で届く。`base_url` (1 つ) と `base_urls`
 (複数) の両方が書け、**書いた全部へ同じ知らせを流す** — どの受け口宛かは

@@ -41,6 +41,13 @@ pub struct Saved {
     pub count: u32,
     /// 自分が出す番か ([`Kind::Primary`])、別のプロセスの後ろに控えているか。
     pub kind: Kind,
+    /// この系列について最後に約束した寿命の id (`cache_notice`、DR-0012)。
+    ///
+    /// 落ちている間に cache が消えていたら、読み戻した側が取り消し
+    /// (`cache_expired`) を出す。どの約束を取り消すのかはこの id で指す。
+    /// 約束を出していない系列 (控え) や、この欄を持たないファイルでは `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promised: Option<String>,
 }
 
 /// 合図を止めてある会話 1 つ。
@@ -175,6 +182,7 @@ mod tests {
             since_ms: 1_800_000_000_000,
             count: 2,
             kind: Kind::Primary,
+            promised: None,
         }
     }
 

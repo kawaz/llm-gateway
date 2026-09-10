@@ -998,6 +998,13 @@ impl<P: Persistence> Gateway<P> {
             .map(|(chain, breakeven)| keepalive::Breakeven::from(chain.since_ms, breakeven));
         // 送る本文が決まったので、この 1 本が残す cache の寿命も決まる。
         let cache_ttl_secs = cache::ttl_secs(strategy, &body);
+        // 寿命を約束する 1 本には名前を付ける (DR-0012)。見張っている系列なら
+        // その名前を覚えるので、果たせずに終わったときに名指しで取り消せる。
+        let cache_notice = cache_ttl_secs.and_then(|_| {
+            call.series
+                .as_ref()
+                .map(|series| self.keepalive.promise(series))
+        });
 
         let resp = match egress::send(
             &self.http,
@@ -1039,6 +1046,7 @@ impl<P: Persistence> Gateway<P> {
             &events::Origin {
                 origin: origin.as_str(),
                 cache_ttl_secs,
+                cache_notice: cache_notice.as_deref(),
                 chain,
                 breakeven,
                 ..call.origin(route.name())
@@ -1566,6 +1574,7 @@ impl<'a> Call<'a> {
             // 載らない。
             origin: crate::provider::RequestOrigin::Unknown.as_str(),
             cache_ttl_secs: None,
+            cache_notice: None,
             chain: None,
             breakeven: None,
         }
@@ -5770,7 +5779,8 @@ keepalive_horizon = "8h"
                 events::Notice::CacheKeepalive(signal) => return signal,
                 events::Notice::Request(_)
                 | events::Notice::Response(_)
-                | events::Notice::KeepalivePaused(_) => continue,
+                | events::Notice::KeepalivePaused(_)
+                | events::Notice::CacheExpired(_) => continue,
             }
         }
     }
@@ -5897,7 +5907,8 @@ keepalive_horizon = "8h"
                 events::Notice::Request(event) => return *event,
                 events::Notice::CacheKeepalive(_)
                 | events::Notice::Response(_)
-                | events::Notice::KeepalivePaused(_) => continue,
+                | events::Notice::KeepalivePaused(_)
+                | events::Notice::CacheExpired(_) => continue,
             }
         }
     }
@@ -6036,6 +6047,32 @@ keepalive_horizon = "8h"
         // 分岐点は単価から出る。この試験の経路は単価を知らないので出ない。
         assert_eq!(forwarded.cache_breakeven_count, None);
         assert_eq!(forwarded.cache_breakeven_until, None);
+
+        // 寿命を約束した 1 本には名前が付く (DR-0012)。取り消しはこれを指す。
+        let promised = forwarded.cache_notice.expect("the promise has a name");
+        assert!(!promised.is_empty());
+
+        // 次の 1 本は別の約束になる。名前を使い回すと、古い約束の取り消しが
+        // 新しい寿命まで消してしまう。
+        let (body, headers) = conversation(json!({}));
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body,
+            headers,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            forwarding(&mut watching).await.cache_notice,
+            Some(promised),
+            "each promise gets its own name"
+        );
     }
 
     /// 単価の分かるモデルでは、損益分岐点も添える (DR-0024 §3)。

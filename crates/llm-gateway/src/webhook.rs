@@ -258,6 +258,7 @@ mod tests {
                 breakeven: None,
                 origin: "main",
                 cache_ttl_secs: None,
+                cache_notice: None,
             },
             200,
         ))
@@ -279,6 +280,7 @@ mod tests {
                 breakeven: None,
                 origin: "main",
                 cache_ttl_secs: None,
+                cache_notice: None,
             },
             200,
         );
