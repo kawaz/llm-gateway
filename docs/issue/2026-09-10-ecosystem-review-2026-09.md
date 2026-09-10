@@ -1,19 +1,19 @@
 ---
 title: エコシステム外部レビュー (2026-09) の指摘への対応検討
-status: open
+status: blocked
 category: task
 created: 2026-09-10T14:57:18+09:00
 last_read:
 open_entered: 2026-09-10T14:57:18+09:00
 wip_entered:
-blocked_entered:
+blocked_entered: 2026-09-10T15:30:00+09:00
 pending_entered:
 discarded_entered:
 resolved_entered:
 discard_reason:
 pending_reason:
 close_reason:
-blocked_by:
+blocked_by: kawaz 裁定 (L-3: DR-0027 を Accepted にするか)
 origin: kawaz 依頼 (2026-09-10、claude-rules-personal セッション経由)
 ---
 
@@ -32,6 +32,41 @@ kawaz からの依頼 (2026-09-10、claude-rules-personal セッション経由)
 
 ## 受け入れ条件
 
-- [ ] 個別ファイル・共通ファイルの指摘を実物 (本リポのコード・DR・issue) と照合する
-- [ ] 各指摘について採用 / 却下と理由を判定する (裁定が要るものは「裁定待ち」として明示)
-- [ ] 採否の結果を本 issue に追記して close する
+- [x] 個別ファイル・共通ファイルの指摘を実物 (本リポのコード・DR・issue) と照合する
+- [x] 各指摘について採用 / 却下と理由を判定する (裁定が要るものは「裁定待ち」として明示)
+- [ ] 採否の結果を本 issue に追記して close する (裁定待ち 1 件のため blocked)
+
+## 採否の結果 (2026-09-10)
+
+照合は `docs/findings/2026-09-10-ecosystem-review-triage.md`。
+
+### 採用 (4)
+
+- **L-1**: README の ja/en ペア化 → 実施済み (v0.44.3)
+- **L-4**: DR-0028 の未確定 3 項目を決定 10〜12 に昇格 → 実施済み
+- **L-5**: gateway.rs / server lib.rs の分割 → 採用。着手は次に大きく触るタイミング、分割だけの PR は作らない
+- **C-1**: 外部コマンドの `--` → 実施済み (tail と open)
+
+### 既に対応済み (1)
+
+- 詳細は triage findings 参照
+
+### 却下 (0)
+
+該当なし
+
+### 派生起票
+
+- `supervisor-crash-leaves-orphan-children`
+- `supervisor-log-reopen-on-rotation`
+
+### 裁定待ち (1)
+
+- **L-3**: DR-0027 (keepalive を自送信に置き換える) を Accepted にするか。統括推しは採択。
+  採択が決まれば `keepalive-via-messaging-socket` は discard、
+  `keepalive-daily-counters` は「ping 本数と read トークンを日別に」へ書き換え
+
+### レビューの誤り
+
+「DR-0027 の未確定は 9/9 の findings で回答済み」は不成立。残る未確定は
+Bedrock/OpenAI 経路・ファイル上限・sub 既定。
