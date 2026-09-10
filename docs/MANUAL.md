@@ -65,6 +65,7 @@ The strategies:
 | `5m` | Every breakpoint loses its `ttl` (= the default five minutes) |
 | `1h` | Every breakpoint gets `ttl: "1h"` |
 | `keepalive` | The body is written like `1h`, and when the conversation stops a signal goes out to draw one round trip that carries the cache into the next hour. **`main` only** — writing it under `sub` is a config error |
+| `replay` | The body is written like `1h`, and when the conversation stops **the gateway sends the last forwarded body again, unchanged**, carrying the cache into the next hour. Nothing has to receive it and no answer is expected, so it works under `sub` too (DR-0027) |
 
 `keepalive_horizon` can be written two ways:
 
@@ -97,6 +98,30 @@ nothing back.
 `keepalive` can only reach a conversation through the `webhook` destination. With
 no `webhook.base_url` configured no signal is raised (so it behaves exactly like
 `1h`), and `llm-gateway check` lists that namespace as a warning.
+
+### Running replay
+
+A `replay` series keeps its last forwarded request in
+`<stats dir>/keepalive/<session>.<series>.json` and sends it again every 55 idle
+minutes with `max_tokens` set to 1. The answer is discarded (the cost is one output
+token plus a cache read of the whole prefix). What is kept is picked up again after a
+restart; a series is dropped once its cache has expired or its `keepalive_horizon`
+has passed.
+
+**What is kept is the conversation body itself** (DR-0027 decision 4). There is no
+consent flag, no encryption, no masking — the same host already holds the session
+transcripts in full and the tap (`?include=request_body`) serves the same bodies, so
+guarding only this one place would protect nothing. Treat the directory as holding
+conversation content. A series whose body exceeds 8MB is not kept, and is not
+extended.
+
+Several processes may share the directory. The `.lock` beside a series is taken right
+before sending, so only one of them ever touches it.
+`POST /llm-gateway/keepalive/pause` drops the kept request too, and one real request
+from that conversation resumes it.
+
+A replayed request appears in the forwarding notices (DR-0012) with
+`origin: "keepalive"`, and is counted in usage / stats like any other request.
 
 ### Running keepalive
 
