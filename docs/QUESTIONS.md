@@ -20,26 +20,7 @@
 
 ## 裁定待ち
 
-### 👺KA-Q1: DR-0027 (keepalive を自送信に置き換える) を Accepted にして実装に進めるか
-
-- [ ] a (推奨): Accepted。実装 (保持層 = state dir のファイル、自送信 = 本文そのまま + `max_tokens: 1`、`origin: keepalive`、sub は設定で opt-in) に着手し、`keepalive-via-messaging-socket` は discard、`keepalive-daily-counters` は「ping 本数と read トークンを日別に」へ書き換えて吸収
-- [ ] b: 見送り (Status を Rejected/Deferred に、理由を記録)。合図方式のまま運用継続
-
-推奨理由: 実測で同一本文の replay が 5m / 1h とも TTL を更新すると確定 ([findings](./findings/2026-09-08-cache-ttl-refresh-on-hit.md))。合図方式の複雑さ (nonce / Foreign / 兄弟中継 / 起点別の hook / サスペンド後の盲目 ping) が丸ごと消え、sub の prefix も延命できる。[DR-0027](./decisions/DR-0027-keepalive-by-replay.md)。外部レビュー L-3 ([issue](./issue/2026-09-10-ecosystem-review-2026-09.md)) の blocked 解除条件。
-
-### 👺KA-Q2: context 使用率通知 plugin の置き場
-
-- [ ] a (推奨): 新規リポ `kawaz/claude-context-notify` (hook 3 本 + スクリプト + 7 段階文面 + README。依存なし、誰でも導入可)
-- [ ] b: 既存 plugin に同梱 (`claude-rules-personal` の hooks / `ccmsg` plugin)
-
-推奨理由: 要件が「hook だけで完結、誰でも導入できる」なので単機能の独立 plugin が素直。参照実装は [research](./research/2026-09-10-context-usage-notification.md) 付録に動作確認済み。`caffeinate` hook (スリープ抑止) も同じ形なので、同リポに 2 本目として置くか別リポかは a を選んだ時に併せて決める。
-
-### 👺KA-Q3: claude-plugin-reference の未 push commit (7 件) を push / リリースするか
-
-- [ ] a (推奨): push してリリース (CLI 新オプション 11 個 / stream-json 双方向 / `--permission-prompt-tool stdio` 等の公式挙動検証。非公式部分は llm-gateway research へ移設済み)
-- [ ] b: 保留
-
-推奨理由: 内容は公式挙動の実機検証で、hook 一覧の不足 (別 issue `hook-events-missing-from-reference`) とは独立。
+（現在なし）
 
 ## 確認待ち
 
