@@ -1,6 +1,6 @@
 ---
 title: keepalive がサスペンド復帰後に期限切れ cache へ盲目的に合図を撃つ
-status: open
+status: resolved
 category: bug
 created: 2026-09-10T19:28:29+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-10T21:40:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented", "dr/DR-0012", "dr/DR-0024", "done: v0.45.0 で fire()/restore()/watch_of() を Moment (単調時計+壁時計の対) 判定に変更、期限切れなら合図を出さず系列を畳む", "done: type:response event に cache フィールド (hit/written/partial/none/unknown) を usage の実結果として追加、writtenで系列起点を置き直し", "done: cache_notice (約束id) と type:cache_expired {of} (取り消し、期限切れのみ) イベントを追加", "done: MANUAL 更新、両 unit へ 2026-09-10 展開済み", "done: ccmsg 側追従は kawaz/ccmsg docs/issue/2026-09-10-gateway-cache-notice-and-expired.md に依頼済み", "note: Marker::Late 判定 (Pending.deadline: Instant) は単調時計のまま残留、別issue候補"]
 blocked_by:
 origin: 自リポ TODO
 ---
