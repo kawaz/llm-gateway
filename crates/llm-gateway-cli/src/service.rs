@@ -505,6 +505,8 @@ fn follow_log(path: &Path) -> Result<ExitCode, Failure> {
             .arg("-n")
             .arg("+1")
             .arg("-F")
+            // パスが `-` で始まってもオプションとして読まれないように区切る。
+            .arg("--")
             .arg(&path)
             .stdout(std::process::Stdio::piped())
             .spawn()

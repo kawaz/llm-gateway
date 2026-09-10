@@ -209,7 +209,11 @@ fn print_config_hint(name: &str, kind: Kind) {
 
 /// ブラウザを開く。開けなくても止めない (URL は既に出してある)。
 fn open_browser(url: &str) {
-    let outcome = std::process::Command::new("open").arg(url).status();
+    // `--` は URL が `-` で始まってもオプションとして読まれないため。
+    let outcome = std::process::Command::new("open")
+        .arg("--")
+        .arg(url)
+        .status();
     let reason = match outcome {
         Ok(status) if status.success() => return,
         Ok(status) => format!("open exited with {status}"),
