@@ -21,20 +21,21 @@ origin: 自リポ TODO
 
 ## 概要
 
-keepalive ping の実発火回数 (`applied` / `late` / `foreign` 等) を日別に永続化する。現状の `count` 系メトリクスは生きている系列の現在値のみで、履歴は消えてしまう。
+keepalive ping の実発火回数を origin 別 (main / sub / keepalive) に日別で `llm-gateway stats` から確認できるようにする。
 
 ## 背景
 
 `docs/findings/2026-09-08-keepalive-field-observation.md` の実運用評価で、keepalive の効果 (fable 5.1 の write 費用 / read 1M が 0.759 → 0.152) は stats から確認できたが、ping の発火回数そのものは永続化されていない。このため ping 費用の実額と収束の健全性を事後に検証できない。
 
-方針案: 日次 stats と同じ流儀で `~/.local/state/llm-gateway/stats/` 相当に `keepalive-counters/<待ち受け>.json` (日別、writer 毎) を積み、`/llm-gateway/stats` か専用 endpoint で読めるようにする。
+DR-0027 (自送信 replay、2026-09-10 Accepted) 決定 6 により、自送信は request event に `origin: keepalive` で出て usage / stats に通常計上される。したがって専用カウンタ (`keepalive-counters/*.json` 等) は不要で、既存の stats 集計に origin 軸を足すだけで済む。旧方針案の `applied` / `late` / `foreign` は合図方式 (DR-0024) の語彙であり、replay 方式では消える。
 
-findings の「追加計測案」3 点を正本とする。
+findings の「追加計測案」3 点は、origin 軸での集計に置き換えられる範囲で正本とする。
 
-関連: DR-0024, DR-0011
+関連: DR-0027, DR-0024, DR-0011
+
+**DR-0027 段階 A の実装後に着手。**
 
 ## 受け入れ条件
 
-- [ ] keepalive ping の `applied` / `late` / `foreign` 等の発火回数が日別・writer 別に永続化される
-- [ ] 永続化された値が `/llm-gateway/stats` か専用 endpoint 経由で読める
+- [ ] `llm-gateway stats` (または `/llm-gateway/stats`) が origin 別 (main / sub / keepalive) に日別の本数・in/out/cache_read/cache_creation トークン・USD を割って出せる
 - [ ] `docs/findings/2026-09-08-keepalive-field-observation.md` の「追加計測案」3 点との整合を確認する
