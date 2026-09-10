@@ -52,21 +52,110 @@ statusline は使わない。`used_percentage` を完成品で持っている (A
 ```json
 {
   "hooks": {
-    "PostToolUse":      [{"matcher": "*", "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py"}]}],
-    "SessionStart":     [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py"}]}]
+    "Stop":             [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py measure"}]}],
+    "PostToolUse":      [{"matcher": "*", "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py deliver"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py deliver"}]}]
   }
 }
 ```
 
-- **`PostToolUse` が主役**。閾値を跨ぐのは必ずリクエストの直後なので、ここに載せると
-  同じターンの続きでモデルが読む。自走 trigger は存在しない (reference) ので、
-  「次にモデルが動くとき」より早くは届かない
-- **`UserPromptSubmit` は取りこぼしの受け皿**。tool を 1 つも使わずにターンが終わった
-  場合、次のユーザ発言で拾う
-- **`SessionStart` は状態の初期化**。`source` が `clear` / `compact` のときに latch を
-  戻す。ただし後述の「下がったら黙って戻す」があるので必須ではない
-- `Stop` は使わない — `PostToolUse` と二重に撃つだけで、届く早さは変わらない
+`measure` / `deliver` は**話すタイミングの違いだけ**で、**測定は 3 event すべてで走る**
+(理由は下の「Stop 時点の transcript は競合する」):
+
+- **`Stop` は測って黙る**。ターンの起点が何であれ必ず発火する (下表) ので、閾値を
+  跨いだことを取りこぼさない
+- **配るのは次の `PostToolUse` / `UserPromptSubmit`**。跨ぎを state に書いておき、
+  次にモデルが動くときに `additionalContext` で出す。**注入のためだけのリクエストを
+  1 本増やさない**
+- **90 % 以上だけは `Stop` から直接出す**。この場合だけ継続ターンが 1 本増えるが、
+  残り 10 % を切ってから次のターンまで黙っているほうが害が大きい。
+  `decision: "block"` ではなく `additionalContext` を使う (理由は後述)
+- `SessionStart` は不要。「下がったら黙って latch を戻す」で clear / compact を吸収できる
+
+### Stop 時点の transcript は競合する
+
+**`Stop` hook が走る時点で、そのターンの assistant 行がまだ transcript に無いことが
+ある。** 1 往復だけの `claude -p` を同じ設定で 4 回走らせたところ、3 回は Stop での
+読み取りが空振りし (state ファイルが作られない)、1 回だけ間に合った。hook スクリプトに
+`tee` を 1 段挟んだ (= 数 ms 遅れた) 回は成功しており、**タイミング依存の競合**で
+あって設定の問題ではない。
+
+したがって **`Stop` だけで測る設計にしない**。3 event すべてで測れば、Stop が
+空振りしても次の `UserPromptSubmit` / `PostToolUse` が拾う (そちらはターンの頭なので
+transcript が落ち着いている)。measure は state を進めるだけなので、多重に走っても
+`band == prev` で黙る。
+
+なお使用量はもともと **1 リクエスト遅れ**の値なので、この競合で 1 ターン遅れても
+性質は変わらない。
+
+### 起点別の hook 発火 (実機)
+
+「user prompt 無しでターンが進む経路で hook が発火しないのでは」という懸念を、
+起点 5 種で実測した。結果は **`UserPromptSubmit` と `Stop` はどの起点でも必ず発火する**:
+
+| 起点 | UserPromptSubmit | PreToolUse | PostToolUse | PostToolBatch | Stop |
+|---|---|---|---|---|---|
+| (a) TUI の user prompt (tool あり) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| (e) TUI の user prompt (tool なし) | ✓ | – | – | – | ✓ |
+| (b) messaging socket への外部注入 | ✓ | – | – | – | ✓ |
+| (c) 別セッションからの SendMessage | ✓ | – | – | – | ✓ |
+| (d) background task の完了通知 | ✓ | – | – | – | ✓ |
+
+理由は wire protocol 側にある。socket に届いた `{"type":"user",...}` は
+`mode:"prompt"` として**プロンプトキューに入る** (research 2026-09-08 の
+`[uds-messaging]` 実装) ので、人が打った prompt と同じ経路を通る。実際、
+(b) 〜 (d) の `UserPromptSubmit` の `prompt` 欄には本文がそのまま入っていた:
+
+```
+(c) "<cross-session-message from=\"uds:/tmp/cc-socks/24634.sock\" from-name=\"ctxprobe-16\"
+     from-mode=\"prompting\">\nReply with exactly ECHO-FOX. ...\n</cross-session-message>"
+(d) "...<tool-use-id>...</tool-use-id>\n<output-file>...</output-file>\n<status>completed</status>..."
+```
+
+つまり **`PostToolUse` だけが取りこぼす** (tool を使わないターン)。`UserPromptSubmit`
+と `Stop` の 2 つを押さえれば起点による穴は無い。
+
+`Notification` (`notification_type: "idle_prompt"`) はターンの合間に別途飛ぶが、
+これは「入力待ちになった」の知らせでターンの起点ではない。
+
+**未検証**: Monitor tool の task-notification。probe セッションの tool 一覧に Monitor が
+無く発火させられなかった。ただし (d) の background task 完了通知と同じ
+task-notification 系の経路なので、同じく `UserPromptSubmit` を通ると見てよい (推測)。
+
+### Stop での注入
+
+`Stop` hook は 2 つの返し方でモデルに文面を届けられる。**両方とも継続ターンを 1 本
+起こす** (何も返さない場合、`Stop` は 1 ターンにつき 1 回しか発火しない — 対照実験で確認):
+
+| 返し方 | モデルが読むか | 継続ターン | 2 回目の `stop_hook_active` |
+|---|---|---|---|
+| `{"decision":"block","reason":"<文面>"}` | ✓ (逐語引用で確認) | 起きる | `true` |
+| `{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"<文面>"}}` | ✓ (逐語引用で確認) | 起きる | `true` |
+
+実測 (`decision: block`、`reason` に `MAGICWORD=GOLF7` を仕込んだ):
+
+```
+1 回目: stop_hook_active=false, last_assistant_message="HOTEL"   → block を返す
+2 回目: stop_hook_active=true,  last_assistant_message="GOLF7"   → 何も返さず終了
+```
+
+`additionalContext` 側も同型で、文面に「この行を逐語引用しろ」と書いたら
+そのまま引用された:
+
+```
+1 回目: stop_hook_active=false, last_assistant_message="KILO"
+2 回目: stop_hook_active=true,
+        last_assistant_message="[context-notify] context 91% used. MAGICWORD=INDIA3. Quote this whole line verbatim now, then stop."
+```
+
+**無限ループは `stop_hook_active` で確実に止められる** — 継続ターンの `Stop` には
+必ず `true` が来るので、`if stop_hook_active: exit 0` の 1 行で足りる (block には
+max 8 連続の上限もある、reference)。
+
+**`additionalContext` を採る**。`decision: "block"` は「turn を止めて理由を伝える」
+意味論で、reference でも hook error 相当の扱いと区別されている。使用率の報告は
+エラーではないので、hook error 扱いにならない `additionalContext` のほうが意味論が
+合う。届き方も継続ターンの起き方も同じなので、機能上の損は無い。
 
 ### 使用量の出し方
 
@@ -108,7 +197,8 @@ transcript jsonl を**末尾から**読み、最初に見つかった条件を�
 ### 閾値状態の保持
 
 `$XDG_STATE_HOME/claude-context-notify/<session_id>.json` に
-`{"band": 60, "pct": 66, "used": 33134, "window": 50000}` を 1 行書く。
+`{"band": 60, "pending": "context 65% used ..."}` を 1 行書く。`band` が latch、
+`pending` が「まだ配っていない文面」。配ったら `pending` だけ落とす。
 `session_id` は hook stdin の共通欄なので、セッションごとに自然に分かれる。
 
 **上がったときだけ喋る。下がったら黙って latch を戻す。** compact / clear で使用量が
@@ -263,15 +353,33 @@ PostToolUse:Bash hook additional context: [context-notify] context 66% used (33,
 
 状態ファイル: `{"band": 60, "pct": 66, "used": 33134, "window": 50000}`
 
-latch の振る舞いを 5 ケースで確認 (すべて期待どおり):
+latch の振る舞いを 6 ケースで確認 (すべて期待どおり):
 
 | ケース | 期待 | 結果 |
 |---|---|---|
-| 状態なし → 56 % | band 40 を撃つ | 撃った、state に 40 |
-| 同じ band で再実行 | 黙る | 黙った |
-| state が 90、実測 56 % (= compact 相当) | 黙って 40 へ戻す | 黙った、state 40 |
-| 戻した直後の再実行 | 黙る | 黙った |
-| window 1M で 3 % | band 0、黙る | 黙った |
+| `Stop`、band 60 に到達 | 測るだけで黙る、pending に積む | 黙った、state に band 60 + pending |
+| 次の `PostToolUse` | 積んだ文面を出す | 出した、pending が消えた |
+| さらに次の `PostToolUse` | 黙る | 黙った |
+| `Stop`、band 97 に到達 | その場で出す | 出した、state に band 97 |
+| その継続ターンの `Stop` (`stop_hook_active: true`) | 黙る | 黙った |
+| 使用率が下がった (window 1M 相当) | 黙って latch を 0 へ戻す | 黙った、state に band 0 |
+
+**推奨構成そのままの 2 ターンを TUI で通した** (window 60,000)。1 ターン目の `Stop` が
+band 60 を積み、2 ターン目の `UserPromptSubmit` が配り、モデルが逐語引用した:
+
+```
+UserPromptSubmit hook additional context: [context-notify] context 60% used (36,242 / 60,000 tokens). 大きな読み込みは要点だけに絞る。
+```
+
+90 % 以上の即時経路も実セッションで確認した。`Stop` の `additionalContext` が
+transcript に `hook_additional_context` attachment として載り、継続ターンでモデルが
+反応した:
+
+```
+TEXT: OSCAR
+ATTACH hook_additional_context ['[context-notify] context 97% used (33,025 / 34,000 tokens). 直ちに引き継ぎを確定して /compact か /clear へ。']
+TEXT: コンテキストが97%使用されています。`/compact` または `/clear` を実行してください。
+```
 
 所要時間は 1 回 ~76 ms (5 回 0.38 s、大半が python 起動)。`PostToolUse` ごとに
 走らせても体感には出ない。
@@ -319,6 +427,11 @@ data: {"type":"response","ts":1789017908458,"request_ts":1789017906873,...,
 - 自動 compact の既定閾値と `autoCompactWindow` 設定の実効範囲
 - 200k を超えたセッションでの `exceeds_200k_tokens` の値
 - セッション途中で `/model` を切り替えたとき、window 推定 (2 段目) がどう外れるか
+- Monitor tool の task-notification で `UserPromptSubmit` が発火するか
+  (probe セッションに Monitor tool が無く発火させられなかった)
+- Stop 時点の transcript 競合が、長い会話 (= 書き込み量が多い) でも同じ頻度で
+  起きるか。観測したのは 1 往復の `claude -p` 4 回だけ
+- `PreCompact` / `PostCompact` の発火 (latch を明示的に戻す経路として使えるか)
 - 巨大な transcript (数十 MB) での末尾 400 KB 読みの妥当性 — 末尾に非 sidechain の
   assistant 行が 1 つも無いケース (subagent を連発した直後) で読み幅が足りるか
 - `SessionStart` の `source: "compact"` が実際に発火するか (latch 初期化の裏取り)
@@ -330,10 +443,20 @@ plugin にするなら `bin/ctx-notify.py` として置き、上記 `hooks/hooks
 
 ```python
 #!/usr/bin/env python3
-"""Notify the session when its context usage crosses a threshold."""
+"""Notify the session when its context usage crosses a threshold.
+
+argv[1] is the role:
+  measure  -- wire to Stop. Reads usage, moves the latch, queues the message.
+              At 90%+ it also speaks immediately (Stop can inject).
+  deliver  -- wire to PostToolUse / UserPromptSubmit. Speaks whatever measure
+              queued, so the report rides a turn that was happening anyway.
+
+stdin: hook JSON. stdout: hookSpecificOutput.additionalContext, or nothing.
+"""
 import json, os, sys, pathlib
 
 BANDS = [20, 40, 60, 80, 90, 95, 97]
+URGENT_FROM = 90  # bands at or above this are worth their own turn
 MESSAGES = {
     20: "context {pct}% used ({used} / {win} tokens).",
     40: "context {pct}% used ({used} / {win} tokens).",
@@ -346,11 +469,18 @@ MESSAGES = {
 DEFAULT_WINDOW = 200_000
 
 
-def state_dir():
+def state_path(session_id):
     base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     d = pathlib.Path(base) / "claude-context-notify"
     d.mkdir(parents=True, exist_ok=True)
-    return d
+    return d / f"{session_id}.json"
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 def tail_lines(path, budget=400_000):
@@ -409,16 +539,23 @@ def band_of(pct):
     return hit
 
 
-def main():
-    try:
-        ev = json.load(sys.stdin)
-    except ValueError:
-        return
-    sid = ev.get("session_id")
-    tp = ev.get("transcript_path")
-    if not sid or not tp or not os.path.exists(tp):
-        return
+def speak(event, text):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": event,
+        "additionalContext": f"[context-notify] {text}",
+    }}))
 
+
+def measure(ev):
+    """Move the latch to match current usage. Returns the band just crossed.
+
+    The transcript is written asynchronously, so at Stop the newest assistant
+    line is sometimes not there yet. Measuring on every event instead of only
+    at Stop means a missed read is picked up by the next one.
+    """
+    tp = ev.get("transcript_path")
+    if not tp or not os.path.exists(tp):
+        return
     got = last_main_usage(tp)
     if not got:
         return
@@ -427,27 +564,56 @@ def main():
     pct = round(used * 100 / win)
     band = band_of(pct)
 
-    sf = state_dir() / f"{sid}.json"
-    try:
-        prev = json.loads(sf.read_text()).get("band", 0)
-    except (OSError, ValueError):
-        prev = 0
+    sp = state_path(ev["session_id"])
+    st = load(sp)
+    prev = st.get("band", 0)
+    if band == prev:
+        return
 
-    if band != prev:
-        sf.write_text(json.dumps({"band": band, "pct": pct, "used": used, "window": win}))
-
-    # Only announce on the way up. Going down means a compact/clear reset the
-    # latch, which must stay silent.
-    if band <= prev:
+    # Going down means a compact or clear reset the usage. Move the latch back
+    # without saying anything.
+    if band < prev:
+        sp.write_text(json.dumps({"band": band}))
         return
 
     text = MESSAGES[band].format(pct=pct, used=f"{used:,}", win=f"{win:,}")
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": ev.get("hook_event_name"),
-            "additionalContext": f"[context-notify] {text}",
-        }
-    }))
+    sp.write_text(json.dumps({"band": band, "pending": text}))
+    return band
+
+
+def take_pending(session_id):
+    sp = state_path(session_id)
+    st = load(sp)
+    text = st.pop("pending", None)
+    if text:
+        sp.write_text(json.dumps(st))
+    return text
+
+
+def main():
+    role = sys.argv[1] if len(sys.argv) > 1 else "deliver"
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    sid = ev.get("session_id")
+    if not sid:
+        return
+
+    # A continuation turn this hook caused. Measuring again is fine; speaking
+    # again would loop.
+    if ev.get("stop_hook_active"):
+        measure(ev)
+        return
+
+    band = measure(ev)
+    # Stop only interrupts for a band worth its own turn; anything milder waits
+    # for a turn that was going to happen anyway.
+    if role == "measure" and not (band and band >= URGENT_FROM):
+        return
+    text = take_pending(sid)
+    if text:
+        speak(ev.get("hook_event_name"), text)
 
 
 if __name__ == "__main__":
