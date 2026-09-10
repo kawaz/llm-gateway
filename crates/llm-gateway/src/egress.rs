@@ -120,7 +120,8 @@ impl Headers {
 /// クライアント (codex CLI) をそのまま上流へ通す口も持つ。どちらの形で
 /// 受けたかは **path から復元しない** — 受け口を生やした側だけが知っている
 /// ことで、方言を判る経路 (`Wire`) へ最後まで運ぶ必要がある。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RequestShape {
     /// 正規形。
     #[default]

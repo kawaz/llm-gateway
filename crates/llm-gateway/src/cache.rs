@@ -9,6 +9,7 @@
 //! どの試行でも同じ本文になる。
 
 pub mod keepalive;
+pub mod replay;
 
 use serde_json::{Map, Value};
 
@@ -29,6 +30,10 @@ pub fn strategy_of(rule: &CacheRule, origin: RequestOrigin) -> CacheStrategy {
         RequestOrigin::Sub | RequestOrigin::Oneshot => rule.sub,
         RequestOrigin::Main | RequestOrigin::Unknown => rule.main,
         RequestOrigin::Codex => CacheStrategy::Passthrough,
+        // 自送信の本文は、前の 1 本で規則を当て終えた形そのもの (DR-0027)。
+        // ここで当て直すと、規則が書き換わった後の再送だけ別の本文になり、
+        // 繋ぎたいプレフィックスから外れる。
+        RequestOrigin::Keepalive => CacheStrategy::Passthrough,
     }
 }
 
@@ -47,7 +52,9 @@ pub fn apply(body: &mut Value, strategy: CacheStrategy) {
                 control.remove("ttl");
             }
         }),
-        CacheStrategy::OneHour | CacheStrategy::Keepalive => apply_one_hour(body),
+        CacheStrategy::OneHour | CacheStrategy::Keepalive | CacheStrategy::Replay => {
+            apply_one_hour(body)
+        }
     }
 }
 
@@ -77,7 +84,9 @@ pub fn ttl_secs(strategy: Option<CacheStrategy>, body: &Value) -> Option<u64> {
     match strategy {
         Some(CacheStrategy::None) => None,
         Some(CacheStrategy::FiveMinutes) => Some(FIVE_MINUTES),
-        Some(CacheStrategy::OneHour | CacheStrategy::Keepalive) => Some(ONE_HOUR),
+        Some(CacheStrategy::OneHour | CacheStrategy::Keepalive | CacheStrategy::Replay) => {
+            Some(ONE_HOUR)
+        }
         Some(CacheStrategy::Passthrough) | None => {
             let mut longest = None;
             visit(&mut body.clone(), &mut |holder| {

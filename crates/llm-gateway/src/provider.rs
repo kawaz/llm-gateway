@@ -107,6 +107,11 @@ pub enum RequestOrigin {
     /// 見る側にとって「codex CLI から来た」は `unknown` より確かな情報で、
     /// prompt cache の扱いが Messages とは別であることもこの 1 語で分かる。
     Codex,
+    /// gateway 自身が cache を繋ぐために送り直した 1 本 (DR-0027)。
+    ///
+    /// 本文は最後に転送したものそのままで、人も subagent も出していない。
+    /// 見る側が ping 分を実際の会話と分けて数えられるように、素性で名指しする。
+    Keepalive,
 }
 
 impl RequestOrigin {
@@ -118,6 +123,7 @@ impl RequestOrigin {
             Self::Sub => "sub",
             Self::Oneshot => "oneshot",
             Self::Codex => "codex",
+            Self::Keepalive => "keepalive",
         }
     }
 }

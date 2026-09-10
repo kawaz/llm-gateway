@@ -440,6 +440,12 @@ pub enum CacheStrategy {
     #[serde(rename = "1h")]
     OneHour,
     Keepalive,
+    /// 1h + 自送信で継ぎ足す (DR-0027)。
+    ///
+    /// 本文の扱いは `1h` と同じ。違うのは、会話が止まったときに **gateway が
+    /// 最後に転送した本文をそのまま送り直して** cache を繋ぐこと。会話を
+    /// 起こさないので、届け先も戻りも要らず、subagent にも当てられる。
+    Replay,
 }
 
 impl CacheStrategy {
@@ -450,6 +456,7 @@ impl CacheStrategy {
             Self::FiveMinutes => "5m",
             Self::OneHour => "1h",
             Self::Keepalive => "keepalive",
+            Self::Replay => "replay",
         }
     }
 }
