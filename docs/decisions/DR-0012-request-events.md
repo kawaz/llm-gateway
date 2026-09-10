@@ -177,7 +177,7 @@ event: response
 data: {"type":"response","ts":1785600012000,"request_ts":1785600000000,
        "session_id":"s-1","prefix":"2cf24dba","ns":"personal",
        "model":"claude-opus-5","credential":"claude-kawazzz","origin":"main",
-       "status":200,"stop_reason":"end_turn","aborted":false}
+       "status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
 - `type` — 種類の印。`request` の知らせだけが印を持たない (先にあったので、
@@ -192,6 +192,8 @@ data: {"type":"response","ts":1785600012000,"request_ts":1785600000000,
   切れた場合がこれ)
 - `aborted` — 本文が最後まで流れなかったか。**常に出す** — 欄が消えると
   「切れていない」と区別が付かない
+- `cache` — この 1 本で prompt cache が実際にどう働いたか。**常に出す**
+  (下記)
 
 **出すのは会話の往復だけ**。見分けるのは受けた口で、トークンを数える口
 (`/v1/messages/count_tokens`) は転送ではあっても会話ではないので流さない —
@@ -204,6 +206,35 @@ data: {"type":"response","ts":1785600012000,"request_ts":1785600000000,
 はどちらも本文にしか載らないので、役を 2 つ立てて同じバイト列を 2 度なぞる
 ことはしない。`stop_reason` にあたる 1 語を持たない方言 (OpenAI) では欄ごと
 出さない。
+
+### cache の結果は、見込みではなく実際を出す
+
+`request` の `cache_expires_at` や `cache_until` は、送る**前**に立てた見込み。
+上流の都合で cache が消えていても、こちらからは送る時点で分からない。見る側が
+見込みのまま残りを描くと、消えた cache に「7 割残っている」というリングが出る
+(実測 2026-09-10: サスペンド復帰後の合図がこれを起こした)。
+
+そこで応答の usage を読み終えた時点で、**結果の語**を `response` に載せる:
+
+| 語 | 読んだ usage | 意味 |
+|---|---|---|
+| `hit` | 読みだけ | 置いてあった cache が効いた = 狙いどおり延びた |
+| `written` | 書きだけ | 繋ぐものが無く全量を書いた = 作り直し (1h なら 2 倍単価) |
+| `partial` | 読み + 書き | 一部は効いて、伸びた分を書き足した |
+| `none` | どちらも 0 | cache を使わなかった 1 本 |
+| `unknown` | 読めない | 切れた応答・usage を報告しない口 |
+
+**数は載せない**。トークン数を出さないのはこの DR の決めごとで、見る側が要る
+のは「延びたのか、書き直したのか」だけ。見るのは core の区分
+(`input.cache_read` / `input.cache_creation`) なので、どの provider の方言で
+届いたかに依らない。
+
+合図の往復 (DR-0024 §2) もこの知らせを通るので、`keepalive: "applied"` なのに
+`cache: "written"` の 1 本は「延命のつもりが作り直しだった」と読める。gateway
+自身も同じ観測で連鎖の起点 (`cache_since`) を書き直しの瞬間へ置き直す — 起点が
+古いままだと、次の `request` が延びてもいない残りを申告する。`applied` / `late`
+は**合図が期限内に戻ったか**の判定でしかなく、cache が実際に生きていたかは
+この語だけが答える。
 
 ### 会話の id だけでは系列を分けられない
 

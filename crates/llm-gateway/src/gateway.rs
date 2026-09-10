@@ -1049,15 +1049,26 @@ impl<P: Persistence> Gateway<P> {
         // 応答が閉じたときの知らせは、素性がここで揃う。終わり方が分かるのは
         // 本文を流し切ったところ ([`crate::exchange`]) なので、下書きだけを
         // 作って持たせる。会話でない口 (`count_tokens`) には作らない。
-        let completion = is_conversation(call.path).then(|| {
-            events::Response::pending(
+        let completion = is_conversation(call.path).then(|| exchange::Completion {
+            events: Arc::clone(&self.events),
+            notice: events::Response::pending(
                 sent_at_ms,
                 &events::Origin {
                     origin: origin.as_str(),
                     ..call.origin(route.name())
                 },
                 resp.response.status,
-            )
+            ),
+            // 見張りの付いている系列だけが、書き直しを連鎖へ反映できる。
+            cache: (strategy == Some(CacheStrategy::Keepalive))
+                .then(|| call.series.clone())
+                .flatten()
+                .map(|series| {
+                    Arc::new(Rebuilt {
+                        keepalive: Arc::clone(&self.keepalive),
+                        series,
+                    }) as Arc<dyn exchange::CacheWitness>
+                }),
         });
         Ok(Sent {
             response: resp,
@@ -1587,7 +1598,7 @@ impl<'a> Call<'a> {
 /// 埋まっていない欄を持ったまま応答に付いて回る。
 struct Sent {
     response: SentResponse,
-    completion: Option<events::Response>,
+    completion: Option<exchange::Completion>,
 }
 
 /// トークンを数えるだけの口。会話の往復ではない。
@@ -1610,17 +1621,32 @@ fn is_conversation(path: &str) -> bool {
     !path.ends_with(COUNT_TOKENS)
 }
 
+/// cache の書き直しを見張りへ返す役 (DR-0024 §2 追補)。
+///
+/// 書き直しが分かるのは応答を読み終えた後で、そこは会話の系列を知らない。
+/// 送る時点で系列を捕まえておき、分かった時点で連鎖を数え直す。
+struct Rebuilt {
+    keepalive: Arc<keepalive::Keepalive>,
+    series: keepalive::Series,
+}
+
+impl exchange::CacheWitness for Rebuilt {
+    fn rewrote(&self, at_ms: i64) {
+        self.keepalive.rewritten(&self.series, at_ms);
+    }
+}
+
 /// 1 経路を試した結果。受け入れた応答と、応答完了の知らせの下書き。
 struct Attempt {
     response: Response,
-    completion: Option<events::Response>,
+    completion: Option<exchange::Completion>,
 }
 
 impl Attempt {
     /// 受け入れられる応答なら [`Attempt`]、そうでなければ次の経路へ。
     fn of(
         response: Response,
-        completion: Option<events::Response>,
+        completion: Option<exchange::Completion>,
     ) -> std::result::Result<Self, Switch> {
         accept_or_switch(response).map(|response| Self {
             response,
@@ -1702,7 +1728,7 @@ pub struct Forwarded {
     /// 埋まっていないのは終わった時刻と終わり方だけで、受け取り口が本文の
     /// 終端で閉じて流す。upstream へ送っていない応答 (経路の手前で組んだ
     /// 断り) では `None` — 閉じる本文が無い。
-    pub completion: Option<events::Response>,
+    pub completion: Option<exchange::Completion>,
 }
 
 impl std::fmt::Debug for Forwarded {

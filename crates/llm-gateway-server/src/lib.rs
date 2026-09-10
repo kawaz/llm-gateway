@@ -777,10 +777,7 @@ async fn forward<P: Persistence + 'static>(
             });
             // 応答が閉じたら 1 通流す (DR-0012)。下書きは経路が決まった時点で
             // 作ってあり、終わり方を入れるのは本文の終端。
-            let completion = forwarded.completion.map(|notice| exchange::Completion {
-                events: Arc::clone(gateway.events()),
-                notice,
-            });
+            let completion = forwarded.completion;
             let mut resp = Response::builder().status(upstream.status);
             for (name, value) in upstream.headers.iter() {
                 resp = resp.header(name, value);

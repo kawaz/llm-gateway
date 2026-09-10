@@ -18,6 +18,7 @@ use tokio::sync::broadcast;
 
 use crate::cache::keepalive::{Breakeven, Chain};
 use crate::denial::Reason;
+use crate::metering::{Outcome, TokenKind, TokenUsage};
 
 /// 系列の識別子として出すハッシュの長さ (16 進の桁数)。
 ///
@@ -186,6 +187,64 @@ impl Event {
     }
 }
 
+/// この 1 本で prompt cache が実際にどう働いたか (DR-0012)。
+///
+/// [`Event::cache_expires_at`] は送る前に**見込み**で出す欄で、上流の都合で
+/// cache が消えていたかどうかは、応答の usage を読むまで分からない。見る側
+/// (ccmsg) が見込みのまま残りを描くと、消えた cache に「7 割残っている」と
+/// いう嘘のリングが出る (実測 2026-09-10)。結果の語だけをここで渡す。
+///
+/// **数は載せない** — トークン数を出さないのは DR-0012 の決めごとで、
+/// 見る側が要るのは「延びたのか、書き直したのか」だけ。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cache {
+    /// 置いてあった cache から読めた = 狙いどおり延びた。
+    Hit,
+    /// 全量を書いた = 繋ぐものが無く、作り直した (1h なら 2 倍単価)。
+    Written,
+    /// 一部は読めて、残りを書き足した。会話が伸びた分がここに出る。
+    Partial,
+    /// cache を使わなかった 1 本 (戦略の当たらない経路がこれ)。
+    None,
+    /// usage が読めなかった。切れた応答・報告しない口がこれ。
+    #[default]
+    Unknown,
+}
+
+impl Cache {
+    /// 読めた usage から、この 1 本の結果を決める。
+    ///
+    /// 見るのは core の区分 ([`crate::metering::TokenKind`]) なので、どの
+    /// provider の方言で届いたかに依らない。
+    pub fn of(usage: Option<&TokenUsage>) -> Self {
+        let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
+            return Self::Unknown;
+        };
+        let read = usage.get(&TokenKind::input_cache_read()).unwrap_or(0);
+        let written = usage
+            .get(&TokenKind::input_cache_creation())
+            .unwrap_or_default();
+        match (read > 0, written > 0) {
+            (true, false) => Self::Hit,
+            (false, true) => Self::Written,
+            (true, true) => Self::Partial,
+            (false, false) => Self::None,
+        }
+    }
+
+    /// 知らせに出す 1 語。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Written => "written",
+            Self::Partial => "partial",
+            Self::None => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// 応答本文が終わった、という知らせ。
 ///
 /// [`Event`] が「upstream へ送り始めた」を伝えるのに対して、こちらは
@@ -231,6 +290,11 @@ pub struct Response {
     /// 本文が最後まで流れなかったか。**常に出す** — 欄が消えると、見る側が
     /// 「切れていない」と区別できない。
     pub aborted: bool,
+    /// この 1 本で prompt cache がどう働いたか。**常に出す** — 読めなかった
+    /// ことも [`Cache::Unknown`] として伝わる必要がある (欄が消えると、
+    /// 見る側は送る前の見込みを信じ続ける)。
+    #[serde(default)]
+    pub cache: Cache,
 }
 
 impl Response {
@@ -257,13 +321,18 @@ impl Response {
             status,
             stop_reason: None,
             aborted: false,
+            cache: Cache::Unknown,
         }
     }
 
-    /// 本文が終わった。時刻と終わり方を入れて、流せる形にする。
-    pub fn settle(&mut self, ts_ms: i64, stop_reason: Option<String>, aborted: bool) {
+    /// 本文が終わった。時刻と、本文から読めたことを入れて流せる形にする。
+    ///
+    /// 終わり方も cache の結果も同じ観測 ([`Outcome`]) から出るので、まとめて
+    /// 受け取る。
+    pub fn settle(&mut self, ts_ms: i64, outcome: Outcome, aborted: bool) {
         self.ts = ts_ms;
-        self.stop_reason = stop_reason;
+        self.cache = Cache::of(outcome.usage.as_ref());
+        self.stop_reason = outcome.stop_reason;
         self.aborted = aborted;
     }
 }
@@ -997,6 +1066,85 @@ mod tests {
         );
     }
 
+    /// cache から読んだだけの usage。
+    fn read(tokens: u64) -> TokenUsage {
+        let mut usage = TokenUsage::default();
+        usage.set(TokenKind::input_cache_read(), tokens);
+        usage
+    }
+
+    /// upstream が返した usage の形が、そのまま cache の結果になる。
+    ///
+    /// 見る側 (ccmsg) は送る前の見込み (`cache_expires_at`) をこの語で
+    /// 上書きするので、4 通りの読み分けが契約そのものになる。
+    #[test]
+    fn the_usage_says_how_the_cache_worked() {
+        let usage = |read: u64, written: u64| {
+            let mut usage = TokenUsage::default();
+            usage.set(TokenKind::input_cache_read(), read);
+            usage.set(TokenKind::input_cache_creation(), written);
+            usage.set(TokenKind::input(), 12);
+            Some(usage)
+        };
+
+        // 読めた = 狙いどおり延びた。書いた = 繋ぐものが無く作り直した。
+        assert_eq!(Cache::of(usage(3_000, 0).as_ref()), Cache::Hit);
+        assert_eq!(Cache::of(usage(0, 3_000).as_ref()), Cache::Written);
+        // 会話が伸びた分を書き足した 1 本は、どちらでもない。
+        assert_eq!(Cache::of(usage(3_000, 40).as_ref()), Cache::Partial);
+        // usage は読めたが、cache には触っていない 1 本。
+        assert_eq!(Cache::of(usage(0, 0).as_ref()), Cache::None);
+        // 読めなかったことは、当てずっぽうを返さずにそのまま伝える。
+        assert_eq!(Cache::of(None), Cache::Unknown);
+        assert_eq!(Cache::of(Some(&TokenUsage::default())), Cache::Unknown);
+
+        // 語は見る側との契約。綴りを変えると読めなくなる。
+        assert_eq!(
+            [
+                Cache::Hit,
+                Cache::Written,
+                Cache::Partial,
+                Cache::None,
+                Cache::Unknown
+            ]
+            .map(Cache::as_str),
+            ["hit", "written", "partial", "none", "unknown"]
+        );
+        assert_eq!(
+            serde_json::to_value(Cache::Written).unwrap(),
+            "written",
+            "the word goes out as it is spelled"
+        );
+    }
+
+    /// 数は載せない (DR-0012)。出すのは結果の語だけ。
+    #[test]
+    fn the_completion_notice_carries_no_token_counts() {
+        let mut notice = Response::pending(NOW, &from("personal"), 200);
+        notice.settle(
+            NOW + 1,
+            Outcome {
+                usage: Some(read(123_456)),
+                stop_reason: Some("end_turn".to_owned()),
+            },
+            false,
+        );
+
+        let json = serde_json::to_value(&notice).unwrap();
+        assert_eq!(json["cache"], "hit");
+        assert!(
+            !json.to_string().contains("123456"),
+            "the token counts stay out of the notice: {json}"
+        );
+        assert!(
+            json.as_object()
+                .unwrap()
+                .keys()
+                .all(|key| !key.contains("token")),
+            "no token field at all: {json}"
+        );
+    }
+
     /// 応答が閉じた知らせの全文。欄の名前・並び・単位が、見る側との契約になる。
     #[test]
     fn a_completion_notice_is_settled() {
@@ -1011,7 +1159,14 @@ mod tests {
             },
             200,
         );
-        notice.settle(NOW + 8 * 1_000, Some("end_turn".to_owned()), false);
+        notice.settle(
+            NOW + 8 * 1_000,
+            Outcome {
+                usage: Some(read(3_000)),
+                stop_reason: Some("end_turn".to_owned()),
+            },
+            false,
+        );
 
         assert_eq!(
             serde_json::to_value(&notice).unwrap(),
@@ -1028,12 +1183,18 @@ mod tests {
                 "status": 200,
                 "stop_reason": "end_turn",
                 "aborted": false,
+                "cache": "hit",
             })
         );
 
         // 切れた 1 本には終わり方が無い。切れたことは常に出す。
         let mut cut = Response::pending(NOW, &from("personal"), 200);
-        cut.settle(NOW + 3 * 1_000, None, true);
+        cut.settle(NOW + 3 * 1_000, Outcome::default(), true);
+        assert_eq!(
+            serde_json::to_value(&cut).unwrap()["cache"],
+            "unknown",
+            "a body that never reported its usage says so, rather than going quiet"
+        );
         let json = serde_json::to_value(&cut).unwrap();
         assert_eq!(json["aborted"], true);
         assert!(
@@ -1063,7 +1224,14 @@ mod tests {
     #[test]
     fn a_completion_is_told_apart_from_a_forward() {
         let mut response = Response::pending(NOW, &from("a"), 200);
-        response.settle(NOW + 1, Some("end_turn".to_owned()), false);
+        response.settle(
+            NOW + 1,
+            Outcome {
+                usage: None,
+                stop_reason: Some("end_turn".to_owned()),
+            },
+            false,
+        );
         let notice = Notice::from(response);
 
         assert_eq!(notice.name(), "response");

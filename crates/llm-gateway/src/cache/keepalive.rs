@@ -790,6 +790,35 @@ impl Keepalive {
         })
     }
 
+    /// この系列の cache が書き直された (DR-0024 §2 追補)。
+    ///
+    /// 合図の往復は「延びたはず」で数え続けるが、上流の都合で cache が消えて
+    /// いれば、その 1 本は延命ではなく**作り直し**になる。それが分かるのは
+    /// 応答の usage を読んだ後なので、分かった時点で連鎖を数え直す — 起点は
+    /// 書き終えたこの瞬間、そこから 1 時間が新しい cache の寿命。
+    ///
+    /// 期間 (`horizon_end`) は延ばさない。延ばせるのは人が動かした 1 本だけで、
+    /// 書き直しが起きた事実はそれとは別 ([`Self::armed_by_request`])。
+    pub fn rewritten(&self, series: &Series, at_ms: i64) {
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(watched) = state.watched.get_mut(series) else {
+                return;
+            };
+            watched.chain = Counted {
+                since_ms: at_ms,
+                count: 0,
+            };
+            watched.expires_at = Moment::after(Instant::now(), at_ms, LIFETIME - MARGIN);
+        }
+        debug!(
+            session = %series.session_id,
+            prefix = %series.prefix,
+            "the cache was rebuilt; counting the chain from here"
+        );
+        self.save();
+    }
+
     /// この系列の実リクエストが最後に通った先。
     pub fn bound(&self, series: &Series) -> Option<Bound> {
         self.state
@@ -1301,6 +1330,45 @@ mod tests {
         assert_eq!(keepalive.armed(), 0, "no plan is left past the horizon");
         tokio::time::advance(REFRESH_AFTER * 2).await;
         assert!(watching.try_recv().is_err(), "and none fires afterwards");
+    }
+
+    /// cache が書き直されたら、連鎖はそこから数え直す。
+    ///
+    /// 見る側 (ccmsg) が描く残りは連鎖の起点 (`cache_since`) から起こすので、
+    /// 起点が古いままだと「延びている」という嘘の絵になる。
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuilt_cache_restarts_the_chain() {
+        let (keepalive, mut watching) = keepalive();
+        let armed_at_ms = now_unix_ms();
+        keepalive.armed_by_request(series(), bound(), HORIZON, armed_at_ms);
+
+        // 合図を 1 本出したところで、その 1 本が書き直しだったと分かる。
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        watching.recv().await.unwrap();
+        assert_eq!(keepalive.chain(&series()).unwrap().count, 1);
+
+        let rebuilt_at_ms = armed_at_ms + REFRESH_AFTER.as_millis() as i64 + 2_000;
+        keepalive.rewritten(&series(), rebuilt_at_ms);
+
+        let chain = keepalive.chain(&series()).unwrap();
+        assert_eq!(
+            chain.since_ms, rebuilt_at_ms,
+            "the chain starts where the cache was actually written"
+        );
+        assert_eq!(chain.count, 0, "and the signals so far bought nothing");
+        assert_eq!(
+            chain.until_ms,
+            rebuilt_at_ms + (REFRESH_AFTER * chain.until_count + LIFETIME).as_millis() as i64,
+            "the end is counted from the new start"
+        );
+    }
+
+    /// 見張っていない系列の書き直しは、何も起こさない。
+    #[tokio::test(start_paused = true)]
+    async fn a_rebuilt_cache_nobody_watches_is_ignored() {
+        let (keepalive, _watching) = keepalive();
+        keepalive.rewritten(&series(), now_unix_ms());
+        assert!(keepalive.chain(&series()).is_none());
     }
 
     /// 機械が眠っている間に壁時計だけが進んだ状況を作る。

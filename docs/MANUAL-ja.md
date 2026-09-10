@@ -436,7 +436,7 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 
 ```
 event: response
-data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false}
+data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
 `request_ts` は対応する `request` の `ts` で、同じ会話で何本も走っていても
@@ -446,6 +446,12 @@ data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_
 で、`end_turn` ならそのクライアントは入力待ちに戻っている。`aborted` は本文が
 最後まで流れなかったか (クライアントが Esc で切った場合がこれ) で、**常に**
 出る。切れた 1 本に終わり方は載らないので、`stop_reason` は欄ごと出ない。
+
+`cache` は、この 1 本で prompt cache が実際にどう働いたか。`hit` (置いてあった
+cache が効いた) / `written` (繋ぐものが無く全量を書いた) / `partial` (一部が
+効いて残りを書き足した) / `none` (cache を使わなかった) / `unknown` (usage を
+読めなかった) の 1 語で、**常に**出る。`request` の `cache_expires_at` は送る
+前の見込みなので、実際に効いたかはこの語で上書きする。トークン数は載らない。
 
 流れるのは**会話の口 (`/v1/messages`) への 1 本だけ**。トークンを数える口
 (`/v1/messages/count_tokens`) は転送ではあっても会話ではないので流れない。

@@ -157,6 +157,20 @@ pub struct TapObservation {
 pub struct Completion {
     pub events: Arc<Events>,
     pub notice: events::Response,
+    /// cache の書き直しを伝える先。見張りの付いていない 1 本では `None`。
+    pub cache: Option<Arc<dyn CacheWitness>>,
+}
+
+/// cache が書き直されたことを受け取る先 (DR-0024 §2 追補)。
+///
+/// 書き直しが分かるのは応答の usage を読み終えた時点だが、そこ
+/// ([`crate::exchange`]) は会話の系列も見張りも知らない。知っている側
+/// (gateway) が、この 1 本の系列を捕まえた実装を持たせる。
+pub trait CacheWitness: Send + Sync {
+    /// この 1 本が cache を書き直した (= 延命に失敗して作り直した)。
+    ///
+    /// `at_ms` は書き終えた時刻 = 新しい cache が始まった瞬間。
+    fn rewrote(&self, at_ms: i64);
 }
 
 /// 終端を記録し、usage を抽出しながら流すストリーム。
@@ -261,9 +275,14 @@ impl BodyObservation {
         let Some(mut completion) = self.completion.take() else {
             return;
         };
-        completion
-            .notice
-            .settle(now_unix_ms(), outcome.stop_reason, !completed);
+        completion.notice.settle(now_unix_ms(), outcome, !completed);
+        // 書き直しが起きていたら、繋いでいた cache はもう無い。次の知らせが
+        // 出す連鎖の起点を、この 1 本へ置き直す (DR-0024 §2 追補)。
+        if completion.notice.cache == events::Cache::Written
+            && let Some(witness) = &completion.cache
+        {
+            witness.rewrote(completion.notice.ts);
+        }
         completion.events.publish(completion.notice);
     }
 
@@ -1028,6 +1047,7 @@ mod tests {
         .with_completion(Some(Completion {
             events: Arc::clone(events),
             notice: events::Response::pending(REQUEST_TS, &notice_origin(), 200),
+            cache: None,
         }))
     }
 
@@ -1154,10 +1174,82 @@ mod tests {
         .with_completion(Some(Completion {
             events: Arc::clone(&events),
             notice: events::Response::pending(REQUEST_TS, &notice_origin(), 200),
+            cache: None,
         }));
         while obs.next().await.is_some() {}
 
         assert!(completed(&mut watching).aborted);
+    }
+
+    /// cache の様子を返す観測役。
+    struct CacheCounter {
+        read: u64,
+        written: u64,
+    }
+
+    impl UsageObserver for CacheCounter {
+        fn observe(&mut self, _chunk: &[u8]) {}
+
+        fn finish(self: Box<Self>) -> Outcome {
+            let mut usage = TokenUsage::default();
+            usage.set(TokenKind::input_cache_read(), self.read);
+            usage.set(TokenKind::input_cache_creation(), self.written);
+            Outcome {
+                usage: Some(usage),
+                stop_reason: Some("end_turn".to_owned()),
+            }
+        }
+    }
+
+    /// 書き直しを聞かされた回数。
+    #[derive(Default)]
+    struct Witness(std::sync::atomic::AtomicUsize);
+
+    impl CacheWitness for Witness {
+        fn rewrote(&self, _at_ms: i64) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 全量を書いた 1 本だけが、書き直しとして見張りへ返る。
+    ///
+    /// 合図の往復が `written` で終わったなら、繋いでいたはずの cache は
+    /// 上流の都合で消えていた = 延命ではなく作り直し (DR-0024 §2 追補)。
+    #[tokio::test]
+    async fn a_rebuilt_cache_is_reported_back() {
+        for (read, written, told, verdict) in [
+            (0, 3_000, 1, events::Cache::Written),
+            (3_000, 0, 0, events::Cache::Hit),
+            (3_000, 40, 0, events::Cache::Partial),
+        ] {
+            let events = Arc::new(Events::new());
+            let mut watching = events.subscribe();
+            let witness = Arc::new(Witness::default());
+            let dir = tempfile::tempdir().unwrap();
+
+            let mut obs = observe(
+                stream_of(vec![b"data".to_vec()]),
+                Some(Box::new(CacheCounter { read, written })),
+                Arc::new(Stats::new(dir.path(), "test")),
+                USAGE_NOW,
+                Some("a"),
+                "m",
+                request_span(),
+            )
+            .with_completion(Some(Completion {
+                events: Arc::clone(&events),
+                notice: events::Response::pending(REQUEST_TS, &notice_origin(), 200),
+                cache: Some(Arc::clone(&witness) as Arc<dyn CacheWitness>),
+            }));
+            while obs.next().await.is_some() {}
+
+            assert_eq!(completed(&mut watching).cache, verdict);
+            assert_eq!(
+                witness.0.load(std::sync::atomic::Ordering::SeqCst),
+                told,
+                "a {verdict:?} response tells the watch {told} time(s)"
+            );
+        }
     }
 
     /// 1 バイトも届かないうちに切られても流す。

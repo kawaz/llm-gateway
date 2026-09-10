@@ -444,7 +444,7 @@ When the response body closes, a second notice says how the turn ended.
 
 ```
 event: response
-data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false}
+data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
 `request_ts` is the `ts` of the matching `request` notice, so the two pair up one to
@@ -455,6 +455,13 @@ same values as that notice. `stop_reason` is whatever word the upstream used
 that client is back to waiting for input. `aborted` says whether the body failed to
 reach its end (a client pressing Esc lands here) and is **always** present. A body that
 was cut short says nothing about how it ended, so `stop_reason` is omitted there.
+
+`cache` says how the prompt cache actually worked for this request: `hit` (the cache
+that was there was read), `written` (nothing was left to extend, so the whole prefix was
+written), `partial` (part was read and the rest written on top), `none` (this request
+used no cache) or `unknown` (the usage could not be read). It is **always** present. The
+`cache_expires_at` of the `request` notice is an estimate made before sending, so a
+watcher overwrites it with this word. No token counts are included.
 
 The notice goes out **only for the conversational endpoint** (`/v1/messages`). Counting
 tokens (`/v1/messages/count_tokens`) is a forward but not a turn, so it streams nothing.
