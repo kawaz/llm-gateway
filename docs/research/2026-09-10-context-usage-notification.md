@@ -32,11 +32,13 @@ plugin として配れる粒度で成立するかを最優先で確定する。
 | 要る部品 | どこから取るか | 確定度 |
 |---|---|---|
 | 使用量 (tokens) | `transcript_path` の最後の非 sidechain assistant 行の `usage` を合算 | 実機確定 (A1) |
+| window の大きさ | `SessionStart` の `model` 欄 (`claude-opus-5[1m]` と `[1m]` 付きで来る)、以降の変更は `PostModelSwitch` の `to_model` | 実機確定 (A7) |
 | 閾値状態 | `session_id` ごとのファイル (`$XDG_STATE_HOME/...`) | 実装して実機確定 (A6) |
 | 文面の注入 | hook stdout の `hookSpecificOutput.additionalContext` | 実機確定 (A4) |
 
-唯一の穴が **window の大きさ** で、`[1m]` は transcript にも hook の stdin にも
-env にも来ない (A3)。ここだけ設定値で補う (後述)。
+**穴は無い。** window は当初 transcript / upstream リクエスト / env のどこにも `[1m]` が
+来ず設定値で補う設計だったが、公式ドキュメントで `SessionStart` だけが `model` 欄を
+持つと分かり、実機で `[1m]` 付きの値が来ることを確認した (A7)。
 
 statusline は使わない。`used_percentage` を完成品で持っている (A2) 反面、
 **plugin の `settings.json` は `agent` と `subagentStatusLine` の 2 key しか
@@ -52,6 +54,8 @@ statusline は使わない。`used_percentage` を完成品で持っている (A
 ```json
 {
   "hooks": {
+    "SessionStart":     [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py model"}]}],
+    "PostModelSwitch":  [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py model"}]}],
     "Stop":             [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py measure"}]}],
     "PostToolUse":      [{"matcher": "*", "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py deliver"}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/ctx-notify.py deliver"}]}]
@@ -59,9 +63,13 @@ statusline は使わない。`used_percentage` を完成品で持っている (A
 }
 ```
 
-`measure` / `deliver` は**話すタイミングの違いだけ**で、**測定は 3 event すべてで走る**
+`model` が window を state に記録し、`measure` / `deliver` は**話すタイミングの違いだけ**
+で、**測定は Stop / PostToolUse / UserPromptSubmit の 3 event すべてで走る**
 (理由は下の「Stop 時点の transcript は競合する」):
 
+- **`SessionStart` / `PostModelSwitch` が window を決める**。この 2 つだけが model 名を
+  `[1m]` 付きで持つ。`PostModelSwitch` はユーザの `/model` だけでなく Claude Code 自身
+  による復元でも飛ぶ (公式 docs) ので、セッション途中の切り替えにも追随する
 - **`Stop` は測って黙る**。ターンの起点が何であれ必ず発火する (下表) ので、閾値を
   跨いだことを取りこぼさない
 - **配るのは次の `PostToolUse` / `UserPromptSubmit`**。跨ぎを state に書いておき、
@@ -70,7 +78,8 @@ statusline は使わない。`used_percentage` を完成品で持っている (A
 - **90 % 以上だけは `Stop` から直接出す**。この場合だけ継続ターンが 1 本増えるが、
   残り 10 % を切ってから次のターンまで黙っているほうが害が大きい。
   `decision: "block"` ではなく `additionalContext` を使う (理由は後述)
-- `SessionStart` は不要。「下がったら黙って latch を戻す」で clear / compact を吸収できる
+- latch の明示リセットは不要。「下がったら黙って latch を戻す」で clear / compact を
+  吸収できる (`PreCompact` / `PostCompact` を足してもよいが、無くても動く)
 
 ### Stop 時点の transcript は競合する
 
@@ -91,7 +100,7 @@ transcript が落ち着いている)。measure は state を進めるだけな�
 ### 起点別の hook 発火 (実機)
 
 「user prompt 無しでターンが進む経路で hook が発火しないのでは」という懸念を、
-起点 5 種で実測した。結果は **`UserPromptSubmit` と `Stop` はどの起点でも必ず発火する**:
+起点 7 種で実測した。結果は **`UserPromptSubmit` と `Stop` はどの起点でも必ず発火する**:
 
 | 起点 | UserPromptSubmit | PreToolUse | PostToolUse | PostToolBatch | Stop |
 |---|---|---|---|---|---|
@@ -100,17 +109,26 @@ transcript が落ち着いている)。measure は state を進めるだけな�
 | (b) messaging socket への外部注入 | ✓ | – | – | – | ✓ |
 | (c) 別セッションからの SendMessage | ✓ | – | – | – | ✓ |
 | (d) background task の完了通知 | ✓ | – | – | – | ✓ |
+| (f) `CronCreate` の one-shot 発火 | ✓ | – | – | – | ✓ |
+| (g) `ScheduleWakeup` の wakeup | ✓ | – | – | – | ✓ |
 
 理由は wire protocol 側にある。socket に届いた `{"type":"user",...}` は
 `mode:"prompt"` として**プロンプトキューに入る** (research 2026-09-08 の
-`[uds-messaging]` 実装) ので、人が打った prompt と同じ経路を通る。実際、
-(b) 〜 (d) の `UserPromptSubmit` の `prompt` 欄には本文がそのまま入っていた:
+`[uds-messaging]` 実装) ので、人が打った prompt と同じ経路を通る。cron / wakeup も
+同じ形で、`UserPromptSubmit` の `prompt` 欄には登録した文面がそのまま入っていた:
 
 ```
 (c) "<cross-session-message from=\"uds:/tmp/cc-socks/24634.sock\" from-name=\"ctxprobe-16\"
      from-mode=\"prompting\">\nReply with exactly ECHO-FOX. ...\n</cross-session-message>"
 (d) "...<tool-use-id>...</tool-use-id>\n<output-file>...</output-file>\n<status>completed</status>..."
+(f) "Reply with the single word CRONFIRE"     ← CronCreate に渡した prompt そのもの
+(g) "Reply with the single word WAKEFIRE"     ← ScheduleWakeup に渡した文面そのもの
 ```
+
+(f) / (g) は probe セッション自身に `CronCreate` / `ScheduleWakeup` を使わせて起こした
+(bare の TUI セッションには両 tool がある)。cron は `recurring=false` の one-shot、
+wakeup は約 90 秒後を指定し、どちらも予定時刻に `UserPromptSubmit` → `Stop` の 2 つ
+だけが飛んだ。
 
 つまり **`PostToolUse` だけが取りこぼす** (tool を使わないターン)。`UserPromptSubmit`
 と `Stop` の 2 つを押さえれば起点による穴は無い。
@@ -119,8 +137,9 @@ transcript が落ち着いている)。measure は state を進めるだけな�
 これは「入力待ちになった」の知らせでターンの起点ではない。
 
 **未検証**: Monitor tool の task-notification。probe セッションの tool 一覧に Monitor が
-無く発火させられなかった。ただし (d) の background task 完了通知と同じ
-task-notification 系の経路なので、同じく `UserPromptSubmit` を通ると見てよい (推測)。
+無く発火させられなかった (`CronCreate` / `ScheduleWakeup` はあった)。ただし (d) の
+background task 完了通知と同じ task-notification 系の経路なので、同じく
+`UserPromptSubmit` を通ると見てよい (推測)。
 
 ### Stop での注入
 
@@ -175,24 +194,23 @@ transcript jsonl を**末尾から**読み、最初に見つかった条件を�
 ファイル全体を読む必要はない。**末尾 400 KB だけ読んで行に割り、逆順に走査**すれば
 足りる (実測: 1 回 ~76 ms、大半が python の起動時間)。
 
-### window の判定 (唯一の穴)
+### window の判定
 
-**`[1m]` は client 側で落ちる。** upstream に出るリクエストの `model` は
-`claude-opus-5`、transcript に記録される `message.model` も `claude-opus-5` で、
-`[1m]` の有無をどちらからも読めない (A3)。hook の env にも model / window の変数は
-無い (A3)。
+**`SessionStart` の `model` 欄だけが `[1m]` を保っている。** transcript の
+`message.model` も upstream へ出るリクエストの `model` も `claude-opus-5` に
+潰れている (A3) 一方、`SessionStart` は `"model":"claude-opus-5[1m]"` を渡してくる
+(A7)。セッション途中の変更は `PostModelSwitch` の `to_model` が同じ形で持つ。
 
-したがって設定値で補う。優先順:
+したがって:
 
-1. `CLAUDE_CONTEXT_WINDOW_TOKENS` env があればそれ (plugin 利用者の明示指定)
-2. `ANTHROPIC_DEFAULT_{OPUS,SONNET,FABLE,HAIKU}_MODEL` が
-   `<transcript の model>[1m]` の形なら 1,000,000
-   (kawaz 環境はこれで自動的に当たる。設定していない人には効かない)
-3. 既定 200,000
+1. `CLAUDE_CONTEXT_WINDOW_TOKENS` env があればそれ (明示指定の逃げ道)
+2. state に記録した window (`SessionStart` / `PostModelSwitch` が書く)。
+   model 名に `[1m]` を含めば 1,000,000、含まなければ 200,000
+3. 既定 200,000 (`SessionStart` が `model` を寄越さなかった場合)
 
-2 は「その family の既定 alias が 1M なら、このセッションも 1M だろう」という
-**推測**で、セッション途中で `/model` を切り替えた場合に外れる。外れても効果は
-「閾値が早く / 遅く鳴る」だけなので、1 の明示指定を案内した上で許容する。
+**`model` 欄は常に来るとは限らない**。公式ドキュメントに「Claude Code doesn't always
+include it」とあり、実際 `claude -p` の `SessionStart` には来なかった (TUI では来た)。
+`-p` は 1 回きりの実行で閾値通知の対象でもないので実害は無いが、3 段目の既定値は残す。
 
 ### 閾値状態の保持
 
@@ -255,7 +273,7 @@ TUI を起動して捕まえた実物 (opus[1m]、1 往復後):
 ```json
 {
   "session_id": "b7faad07-...",
-  "transcript_path": "/Users/kawaz/.claude-bare/projects/-private-tmp-ctxprobe/....jsonl",
+  "transcript_path": "~/.claude-bare/projects/-private-tmp-ctxprobe/....jsonl",
   "cwd": "/private/tmp/ctxprobe",
   "model": { "id": "claude-opus-5[1m]", "display_name": "Opus 5 (1M context)" },
   "workspace": { "current_dir": "...", "project_dir": "...", "added_dirs": [...] },
@@ -302,13 +320,16 @@ statusline から見た値:
 bare の settings には `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000` が入っているが
 haiku では 200000 が出た。**この env は `context_window_size` を動かしていない**。
 
-一方 hook 側から見えるものはすべて `[1m]` を失っている:
+hook 側から見えるもののうち、`[1m]` を失っているのは次の 3 つ:
 
 - upstream へ出るリクエスト本文の `model` は `claude-opus-5` (ダンプサーバで実測)
 - transcript の `message.model` も `claude-opus-5`
 - hook プロセスの env に model / window の変数は無い
   (`CLAUDE_CODE_MAX_CONTEXT_TOKENS` は settings 由来でたまたま居るだけ。
   `CLAUDE_EFFORT` / `CLAUDE_PID` / `CLAUDE_CODE_SESSION_ID` 等はある)
+
+**保っているのは `SessionStart` の `model` 欄と `Pre`/`PostModelSwitch` の
+`from_model` / `to_model` だけ** (A7 で判明)。
 
 `--model 'opus[1m]'` のときだけ `anthropic-beta` に `context-1m-2025-08-07` が入る
 ことは確認したが、これは **upstream へ出る HTTP ヘッダ**なので hook からは見えない
@@ -384,6 +405,65 @@ TEXT: コンテキストが97%使用されています。`/compact` または `/
 所要時間は 1 回 ~76 ms (5 回 0.38 s、大半が python 起動)。`PostToolUse` ごとに
 走らせても体感には出ない。
 
+### 2026-09-10 (A7): 公式一次情報で hook 一覧を取り直した
+
+ローカルの `claude-plugin-reference` skill は更新が滞っていて、**event を 10 個以上
+取りこぼしていた**。一次情報で取り直した:
+
+- `https://code.claude.com/docs/en/hooks` (2026-09-10 取得。
+  `docs.claude.com/en/docs/claude-code/hooks` は 301 でここへ転送される)
+- `https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md`
+  (2026-09-10 取得。先頭は v2.1.267 = 実機と同版)
+
+ローカル reference に無く、公式一覧にある event: `PreModelSwitch` / `PostModelSwitch` /
+`MessageDisplay` / `DirectoryAdded` / `StopFailure` / `PermissionDenied` /
+`Elicitation` / `ElicitationResult` / `UserPromptExpansion` / `TaskCreated` /
+`TaskCompleted` / `TeammateIdle`。
+
+#### 設計に効いた 5 点
+
+1. **`SessionStart` だけが `model` 欄を受け取れる** ("Only `SessionStart` hooks can
+   receive a `model` field, and Claude Code doesn't always include it")。実機で
+   `"model":"claude-opus-5[1m]"` を確認 — **window の穴がこれで塞がった**
+2. **`PreModelSwitch` / `PostModelSwitch` は `from_model` / `to_model` を持つ**
+   (v2.1.251 で追加)。実機の payload は `[1m]` 付きで、さらに **`context_tokens` を
+   持っていた**:
+
+   ```json
+   {"hook_event_name":"PostModelSwitch","from_model":"claude-sonnet-5[1m]",
+    "to_model":"claude-opus-5[1m]","requested_model":"opus","source":"command",
+    "context_tokens":45173,"prompt_cache_warm":true,"cache_ttl":"5m",
+    "estimated_cache_write_usd":0.2823,"pricing":"catalog"}
+   ```
+
+   同じ瞬間の transcript から出した値は 45,167 で **差は 6 tokens**。A1 の合算式が
+   Claude Code 自身の数え方と一致していることの裏取りになる。ただし
+   `context_tokens` が来るのは model 切り替えのときだけなので、常時の測定には使えない
+3. **`transcript_path` は「written asynchronously, may lag」と明記されている**。
+   実測した Stop 時点の競合 (前述) は仕様どおりの挙動で、回避策を持つ設計が正しい
+4. **`last_assistant_message` は Stop / SubagentStop の正式な欄**で、docs は
+   「最終 assistant テキストが要るなら transcript を読まずこれを使え」と言っている。
+   ただし**トークン数は持たない**ので、使用量の測定は transcript 経由のままになる
+5. **`PreCompact` / `PostCompact` の matcher は `manual` / `auto`**。latch の明示
+   リセットに使えるが、「下がったら黙って戻す」で足りるので必須ではない
+
+#### CHANGELOG から拾えた数値と注意
+
+- **v2.1.247**: Sonnet 5 の auto-compact 窓が 1M 全体になり、**約 967K tokens で
+  compact** するようになった (従来 ~934K)。= **1M では 96.7 % 前後で auto-compact が
+  走る**ので、kawaz の 97 % 帯はほぼ auto-compact と同着になる。95 % 帯までが
+  「本人が畳む」ための実効的な最終警告
+- **v2.1.260**: 1M context の Opus / Fable セッションも「1M の直前で」compact する
+- **v2.1.259**: **blocking Stop hook が「block 直後のターンで model の reasoning を
+  失わせ、モデルによっては prompt cache を外す」不具合が修正された**。修正済みとはいえ
+  `decision: "block"` がターンの継続に副作用を持ちうる経路だったことは、
+  `additionalContext` を選ぶ判断を裏づける
+- **v2.1.261**: `/context` のトークン計算は、count API が使えないとローカル推定に
+  切り替わる (= `/context` の表示自体が常に厳密とは限らない)
+- **v2.1.257**: 共通欄に `scratchpad_dir` が入った。state の置き場として
+  `$XDG_STATE_HOME` の代わりに使う選択肢があるが、**セッション終了で消える前提**の
+  場所なので latch には向かない (セッションと寿命を揃えたいなら可)
+
 ### 2026-09-10 (B): hook では取れない情報は何か
 
 gateway 側でしか読めないものは 2 つだけだった:
@@ -424,9 +504,8 @@ data: {"type":"response","ts":1789017908458,"request_ts":1789017906873,...,
 
 - compact 後に使用率がどう戻るか (会話が短く `/compact` が拒否された)
 - `used_percentage` に `Compact buffer` が含まれるか
-- 自動 compact の既定閾値と `autoCompactWindow` 設定の実効範囲
+- `autoCompactWindow` 設定の実効範囲 (既定の閾値は CHANGELOG から拾えた: 1M で ~967K)
 - 200k を超えたセッションでの `exceeds_200k_tokens` の値
-- セッション途中で `/model` を切り替えたとき、window 推定 (2 段目) がどう外れるか
 - Monitor tool の task-notification で `UserPromptSubmit` が発火するか
   (probe セッションに Monitor tool が無く発火させられなかった)
 - Stop 時点の transcript 競合が、長い会話 (= 書き込み量が多い) でも同じ頻度で
@@ -435,6 +514,10 @@ data: {"type":"response","ts":1789017908458,"request_ts":1789017906873,...,
 - 巨大な transcript (数十 MB) での末尾 400 KB 読みの妥当性 — 末尾に非 sidechain の
   assistant 行が 1 つも無いケース (subagent を連発した直後) で読み幅が足りるか
 - `SessionStart` の `source: "compact"` が実際に発火するか (latch 初期化の裏取り)
+- `SessionStart` が `model` を寄越さない条件 (公式は「always ではない」とだけ書く。
+  実測では TUI で来て `claude -p` では来なかった)
+- 公式一覧にある未確認 event の入出力: `MessageDisplay` / `StopFailure` /
+  `DirectoryAdded` / `UserPromptExpansion` / `Elicitation` 系 / `TeammateIdle`
 
 ## 付録: 参照実装 (A6 で実際に動かしたもの)
 
@@ -446,6 +529,8 @@ plugin にするなら `bin/ctx-notify.py` として置き、上記 `hooks/hooks
 """Notify the session when its context usage crosses a threshold.
 
 argv[1] is the role:
+  model    -- wire to SessionStart / PostModelSwitch. Records the context
+              window, which only these events spell with the `[1m]` suffix.
   measure  -- wire to Stop. Reads usage, moves the latch, queues the message.
               At 90%+ it also speaks immediately (Stop can inject).
   deliver  -- wire to PostToolUse / UserPromptSubmit. Speaks whatever measure
@@ -517,18 +602,29 @@ def last_main_usage(path):
     return None
 
 
-def window_for(model):
+def window_of(model_name):
+    """Context window implied by a model name as SessionStart spells it."""
+    return 1_000_000 if "[1m]" in (model_name or "") else DEFAULT_WINDOW
+
+
+def window_for(st):
     override = os.environ.get("CLAUDE_CONTEXT_WINDOW_TOKENS")
     if override and override.isdigit():
         return int(override)
-    # `[1m]` never reaches the transcript, so infer it from the alias the user
-    # configured for this model family.
-    if model:
-        for key in ("OPUS", "SONNET", "FABLE", "HAIKU"):
-            alias = os.environ.get(f"ANTHROPIC_DEFAULT_{key}_MODEL", "")
-            if alias.startswith(model) and "[1m]" in alias:
-                return 1_000_000
-    return DEFAULT_WINDOW
+    # Recorded by the `model` role. The transcript spells the model without its
+    # `[1m]` suffix, so this is the only place the real window is known.
+    return st.get("window") or DEFAULT_WINDOW
+
+
+def remember_window(ev):
+    """SessionStart / PostModelSwitch: record the window for later events."""
+    name = ev.get("to_model") or ev.get("model")
+    if not name:
+        return
+    sp = state_path(ev["session_id"])
+    st = load(sp)
+    st["window"] = window_of(name)
+    sp.write_text(json.dumps(st))
 
 
 def band_of(pct):
@@ -559,26 +655,25 @@ def measure(ev):
     got = last_main_usage(tp)
     if not got:
         return
-    used, model = got
-    win = window_for(model)
+    used, _model = got
+    sp = state_path(ev["session_id"])
+    st = load(sp)
+    win = window_for(st)
     pct = round(used * 100 / win)
     band = band_of(pct)
 
-    sp = state_path(ev["session_id"])
-    st = load(sp)
     prev = st.get("band", 0)
     if band == prev:
         return
 
+    st["band"] = band
+    st.pop("pending", None)
     # Going down means a compact or clear reset the usage. Move the latch back
     # without saying anything.
-    if band < prev:
-        sp.write_text(json.dumps({"band": band}))
-        return
-
-    text = MESSAGES[band].format(pct=pct, used=f"{used:,}", win=f"{win:,}")
-    sp.write_text(json.dumps({"band": band, "pending": text}))
-    return band
+    if band > prev:
+        st["pending"] = MESSAGES[band].format(pct=pct, used=f"{used:,}", win=f"{win:,}")
+    sp.write_text(json.dumps(st))
+    return band if band > prev else None
 
 
 def take_pending(session_id):
@@ -598,6 +693,10 @@ def main():
         return
     sid = ev.get("session_id")
     if not sid:
+        return
+
+    if role == "model":
+        remember_window(ev)
         return
 
     # A continuation turn this hook caused. Measuring again is fine; speaking
@@ -626,5 +725,11 @@ if __name__ == "__main__":
 - `docs/knowledge/2026-09-02-prompt-cache-and-thinking-facts.md` — main / sub の判別、system ブロック構造
 - `docs/decisions/DR-0012-request-events.md` — request / response イベントの欄と「状態を持たない」方針
 - `docs/decisions/DR-0024-cache-strategy-and-keepalive.md` — origin (`main` / `sub` / `oneshot` / `unknown`) の判定表
-- `claude-plugin-reference` skill の `reference/hooks.md` — hook の stdin / stdout schema
-- `claude-plugin-reference` skill の `reference/agents.md` — plugin の `settings.json` が持てる key
+- `https://code.claude.com/docs/en/hooks` — hook event の一次情報 (2026-09-10 取得)。
+  `docs.claude.com/en/docs/claude-code/hooks` からは 301 で転送される
+- `https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md` —
+  auto-compact 閾値 / `Pre`・`PostModelSwitch` 追加 / Stop block の不具合修正
+  (2026-09-10 取得、先頭 v2.1.267)
+- `claude-plugin-reference` skill の `reference/agents.md` — plugin の `settings.json` が持てる key。
+  同 skill の `reference/hooks.md` は event を 10 個以上取りこぼしているので、
+  hook 一覧は上の一次情報を見る
