@@ -1,6 +1,6 @@
 ---
 title: エコシステム外部レビュー (2026-09) の指摘への対応検討
-status: blocked
+status: resolved
 category: task
 created: 2026-09-10T14:57:18+09:00
 last_read:
@@ -9,11 +9,11 @@ wip_entered:
 blocked_entered: 2026-09-10T15:30:00+09:00
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-10T23:28:32+09:00
 discard_reason:
 pending_reason:
-close_reason:
-blocked_by: kawaz 裁定 (L-3: DR-0027 を Accepted にするか)
+close_reason: ["finding/2026-09-10-ecosystem-review-triage","dr/DR-0027:implemented","done:採用4件実施済み(README/DR-0028/--/L-5は次の大改修時)","done:派生issue起票済み(supervisor-crash-leaves-orphan-children, supervisor-log-reopen-on-rotation)","done:keepalive-via-messaging-socket discard","done:keepalive-daily-counters 書き換え済み"]
+blocked_by: kawaz 裁定 (L-3: DR-0027 を Accepted にするか) — 2026-09-10 裁定完了 (QUESTIONS KA-Q1=a) で解消
 origin: kawaz 依頼 (2026-09-10、claude-rules-personal セッション経由)
 ---
 
@@ -34,7 +34,7 @@ kawaz からの依頼 (2026-09-10、claude-rules-personal セッション経由)
 
 - [x] 個別ファイル・共通ファイルの指摘を実物 (本リポのコード・DR・issue) と照合する
 - [x] 各指摘について採用 / 却下と理由を判定する (裁定が要るものは「裁定待ち」として明示)
-- [ ] 採否の結果を本 issue に追記して close する (裁定待ち 1 件のため blocked)
+- [x] 採否の結果を本 issue に追記して close する
 
 ## 採否の結果 (2026-09-10)
 
@@ -60,11 +60,11 @@ kawaz からの依頼 (2026-09-10、claude-rules-personal セッション経由)
 - `supervisor-crash-leaves-orphan-children`
 - `supervisor-log-reopen-on-rotation`
 
-### 裁定待ち (1)
+### 裁定完了 (1)
 
-- **L-3**: DR-0027 (keepalive を自送信に置き換える) を Accepted にするか。統括推しは採択。
-  採択が決まれば `keepalive-via-messaging-socket` は discard、
-  `keepalive-daily-counters` は「ping 本数と read トークンを日別に」へ書き換え
+- **L-3**: DR-0027 (keepalive を自送信に置き換える) は kawaz 裁定 (2026-09-10、
+  QUESTIONS KA-Q1 = a) で Accepted、実装着手済み。`keepalive-via-messaging-socket`
+  は discard、`keepalive-daily-counters` は書き換え済み
 
 ### レビューの誤り
 
