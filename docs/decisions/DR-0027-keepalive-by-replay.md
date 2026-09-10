@@ -1,7 +1,7 @@
 # DR-0027: keepalive は gateway の自送信 (replay) で行う
 
-- Status: Proposed
-- Date: 2026-09-08
+- Status: Accepted
+- Date: 2026-09-08 (Accepted: 2026-09-10)
 
 ## 文脈
 
