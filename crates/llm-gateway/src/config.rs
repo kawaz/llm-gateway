@@ -2680,6 +2680,54 @@ main = "keepalive"
             vec!["default".to_owned()]
         );
     }
+    /// 自送信 (`replay`) は sub にも書ける (DR-0027 決定 5)。
+    ///
+    /// 合図方式と違い、応答を返す相手を当てにしない — 送るのは gateway 自身
+    /// なので、合図を返さない subagent でも成立する。
+    #[test]
+    fn sub_may_ask_for_replay_but_not_for_the_signal() {
+        let replay = parse(
+            r#"
+[[ns.work.cache]]
+models = ["*"]
+sub = "replay"
+"#,
+        );
+        assert_eq!(
+            replay.unwrap().namespace("work").unwrap().cache[0].sub,
+            CacheStrategy::Replay
+        );
+
+        let signal = parse(
+            r#"
+[[ns.work.cache]]
+models = ["*"]
+sub = "keepalive"
+"#,
+        );
+        assert!(
+            signal.is_err(),
+            "the signal needs a session to answer it; sub cannot"
+        );
+    }
+
+    /// 自送信は届け先を要らない。書いていなくても警告しない。
+    #[test]
+    fn replay_needs_no_webhook_destination() {
+        let config = parse(
+            r#"
+[[ns.work.cache]]
+models = ["*"]
+main = "replay"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config.keepalive_without_destination().is_empty(),
+            "nothing has to receive a replay; the gateway sends it itself"
+        );
+    }
 }
 
 #[cfg(test)]

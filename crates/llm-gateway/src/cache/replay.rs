@@ -381,10 +381,7 @@ impl Replay {
         let outcome = sender.replay(&kept).await;
         let sent_at_ms = now_unix_ms();
         match outcome {
-            Outcome::Unsent => {
-                self.postpone(series, kept, expected_ms);
-                return;
-            }
+            Outcome::Unsent => self.postpone(series, kept, expected_ms),
             Outcome::Sent(cache) => {
                 let mut next = kept;
                 // 書き直しになっていたら、繋いだのではなく作り直した

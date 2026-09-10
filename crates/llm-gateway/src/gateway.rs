@@ -15,7 +15,7 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::cache::{self, keepalive};
+use crate::cache::{self, keepalive, replay};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms};
@@ -55,6 +55,11 @@ pub struct Gateway<P: Persistence> {
     /// 間は誰も受け取れない。書いていない設定では合図を出さない。
     keepalive: Arc<keepalive::Keepalive>,
     signalling: bool,
+    /// 止まった会話へ、最後に転送した本文を送り直す役 (DR-0027)。
+    ///
+    /// 合図方式と違い、届け先も戻りも要らない — 送る相手は upstream で、
+    /// 1 リクエストで完結する。
+    replay: Arc<replay::Replay>,
     tap: Arc<Tap>,
     status: crate::status::Manager,
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
@@ -164,6 +169,14 @@ impl<P: Persistence> Gateway<P> {
             )),
         );
 
+        // 送り直しの控えは待ち受けごとに分けない。兄弟は同じ置き場を共有し、
+        // 系列の `.lock` を掴んだ 1 台だけが撫でる (DR-0027 決定 3)。
+        let replay = Arc::new(replay::Replay::new(
+            config.stats.resolve_dir(),
+            Arc::clone(&events),
+            Arc::new(RouterReach(Arc::clone(&router))),
+        ));
+
         Ok(Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             watch_interval: std::time::Duration::from_secs(config.discovery.watch_secs),
@@ -184,6 +197,7 @@ impl<P: Persistence> Gateway<P> {
             )),
             keepalive,
             signalling: config.keepalive_without_destination().is_empty(),
+            replay,
             events,
             tap,
             status: crate::status::Manager::new(config),
@@ -959,6 +973,188 @@ impl<P: Persistence> Gateway<P> {
         }
     }
 
+    /// この 1 本の系列 (送り直しの控えの鍵)。名乗りか prefix が無ければ `None`。
+    fn replay_series(&self, call: &Call<'_>) -> Option<replay::Series> {
+        call.series.as_ref().map(|series| replay::Series {
+            session_id: series.session_id.clone(),
+            prefix: series.prefix.clone(),
+        })
+    }
+
+    /// 届いた 1 本を、そのまま送り直せる形で控える (DR-0027 決定 1)。
+    ///
+    /// 道具を渡していないリクエスト (分類器・要約など) は控えない。本流とは
+    /// 別のプレフィックスで走るので、そこを撫でても延ばしたい cache は延びない
+    /// (DR-0024 §2 の横断条件をそのまま引き継ぐ)。
+    fn keep_for_replay(
+        &self,
+        call: &Call<'_>,
+        route: &Route,
+        body: Value,
+        headers: Vec<(String, String)>,
+        sent_at_ms: i64,
+        cache_notice: Option<String>,
+    ) {
+        let Some(series) = self.replay_series(call) else {
+            return;
+        };
+        if !keepalive::carries_tools(call.body) {
+            return;
+        }
+        self.replay.armed_by_request(replay::Sent {
+            series,
+            ns: call.ns.to_owned(),
+            model: call.model.to_owned(),
+            route: route.name().to_owned(),
+            body,
+            // 認証は控えない。送り直すときに経路が付け直すので、持っていると
+            // 期限の切れた token を持ち回ることになる。
+            headers: headers
+                .into_iter()
+                .filter(|(name, _)| !is_authorization(name))
+                .collect(),
+            path: call.path.to_owned(),
+            query: call.query.map(str::to_owned),
+            shape: call.shape,
+            sent_at_ms,
+            horizon: self.horizon_for(call, route),
+            cache_notice,
+        });
+    }
+
+    /// 控えた 1 本を送り直す (DR-0027)。
+    ///
+    /// 経路は名前で引き直す。控えた時点の `Arc<Route>` を持ち回ると、締め出しも
+    /// 候補の入れ替わりも見ないまま古い経路へ出し続けることになる。
+    async fn send_replay(&self, kept: &replay::Kept) -> replay::Outcome {
+        let Some(ns) = self.config.namespace(&kept.ns) else {
+            warn!(ns = %kept.ns, "the namespace this conversation used is gone; not replaying");
+            return replay::Outcome::Unsent;
+        };
+        let body = replay::body_to_send(kept);
+        let session = session::derive(&body, &kept.headers);
+        let routes = match self
+            .router
+            .routes_for(ns, &kept.ns, &kept.model, &session)
+            .await
+        {
+            Ok(routes) => routes,
+            Err(e) => {
+                warn!(model = %kept.model, %e, "cannot pick a route to replay on");
+                return replay::Outcome::Unsent;
+            }
+        };
+        let Some(route) = routes.iter().find(|route| route.name() == kept.route) else {
+            warn!(route = %kept.route, "the route this conversation was cached on is gone; not replaying");
+            return replay::Outcome::Unsent;
+        };
+        let credential = match &route.credential {
+            Some(id) => match self.credentials.acquire(id).await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!(credential = %id, %e, "cannot use this credential to replay");
+                    return replay::Outcome::Unsent;
+                }
+            },
+            None => None,
+        };
+
+        let mut body = body;
+        if let Some(upstream) = &route.upstream_model {
+            egress::rewrite_model(&mut body, upstream);
+        }
+        let learned: Vec<String> = credential
+            .as_ref()
+            .map(|c| c.denied_beta.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut headers = Headers::new(kept.headers.clone());
+        if let Some(negotiation) = route.preset.negotiation() {
+            negotiation.prepare(&mut headers, &learned);
+        }
+
+        let sent_at_ms = now_unix_ms();
+        let sent = match egress::send(
+            &self.http,
+            route.preset.as_ref(),
+            credential.as_ref(),
+            EgressRequest {
+                path: kept.path.clone(),
+                query: kept.query.clone(),
+                body,
+                headers,
+                shape: kept.shape,
+            },
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                warn!(route = route.name(), %error, "the replay could not be sent");
+                return replay::Outcome::Unsent;
+            }
+        };
+        let status = sent.response.status;
+        let usage = usage_observer(route.preset.as_ref(), &sent.response);
+        // 応答は読み捨てる。読むのは usage だけ — 繋がったのか書き直したのかは
+        // そこにしか出ない。
+        let outcome = match egress::buffer(sent.response).await {
+            Ok((_, raw)) => usage.map(|mut observer| {
+                observer.observe(&raw);
+                Box::new(observer).finish()
+            }),
+            Err(error) => {
+                warn!(route = route.name(), %error, "the replayed response could not be read");
+                None
+            }
+        };
+        let usage = outcome.and_then(|outcome| outcome.usage);
+        // 自送信も普通の 1 本として数える (DR-0027 決定 6)。日別の発火回数も
+        // 費用も、素性で割れば集計から自然に取れる。
+        if let Some(usage) = &usage {
+            self.stats.record(
+                sent_at_ms,
+                route.credential.as_ref().map(CredentialId::as_str),
+                &kept.model,
+                usage,
+            );
+        }
+        let cache = events::Cache::of(usage.as_ref());
+        self.events.publish(events::Event::new(
+            sent_at_ms,
+            &events::Origin {
+                session_id: Some(&kept.session_id),
+                prefix: Some(&kept.prefix),
+                ns: &kept.ns,
+                model: &kept.model,
+                credential: route.name(),
+                origin: RequestOrigin::Keepalive.as_str(),
+                cache_ttl_secs: cache::ttl_secs(Some(CacheStrategy::Replay), &kept.body),
+                keepalive: None,
+                cache_paused: false,
+                cache_notice: kept.cache_notice.as_deref(),
+                chain: None,
+                breakeven: None,
+            },
+            status,
+        ));
+        if status / 100 != 2 {
+            warn!(
+                route = route.name(),
+                status, "the replay was refused; trying again on the next turn"
+            );
+            return replay::Outcome::Unsent;
+        }
+        info!(
+            session = %kept.session_id,
+            prefix = %kept.prefix,
+            model = %kept.model,
+            route = route.name(),
+            cache = cache.as_str(),
+            "replayed the last request to keep the cache alive"
+        );
+        replay::Outcome::Sent(cache)
+    }
+
     async fn send(
         &self,
         route: &Arc<Route>,
@@ -991,6 +1187,13 @@ impl<P: Persistence> Gateway<P> {
                     .as_ref()
                     .and_then(|series| self.keepalive.chain(series));
             }
+            if strategy == CacheStrategy::Replay {
+                // 控えを置くのは応答を見た後 (この 1 本が upstream に届いた
+                // ことを確かめてから)。見立てはこの時点の控えから出す。
+                chain = self
+                    .replay_series(call)
+                    .and_then(|series| self.replay.chain(&series));
+            }
         }
         // 分岐点は連鎖の起点から数える。単価を持たないモデルでは出せない。
         let breakeven = chain
@@ -1000,11 +1203,19 @@ impl<P: Persistence> Gateway<P> {
         let cache_ttl_secs = cache::ttl_secs(strategy, &body);
         // 寿命を約束する 1 本には名前を付ける (DR-0012)。見張っている系列なら
         // その名前を覚えるので、果たせずに終わったときに名指しで取り消せる。
-        let cache_notice = cache_ttl_secs.and_then(|_| {
-            call.series
+        let cache_notice = cache_ttl_secs.and_then(|_| match strategy {
+            // 送り直しの系列では、約束は控えに載って再起動を跨ぐ。名前を
+            // 付けるのはここで、覚えるのは控えを置くとき。
+            Some(CacheStrategy::Replay) => Some(self.replay.promise()),
+            _ => call
+                .series
                 .as_ref()
-                .map(|series| self.keepalive.promise(series))
+                .map(|series| self.keepalive.promise(series)),
         });
+        // 送り直しに備えて、線に乗る形のまま控えておく (DR-0027 決定 1)。
+        // 応答を見てから置くので、ここでは写しを持つだけ。
+        let keeping = (strategy == Some(CacheStrategy::Replay))
+            .then(|| (body.clone(), headers.as_slice().to_vec()));
 
         let resp = match egress::send(
             &self.http,
@@ -1036,6 +1247,14 @@ impl<P: Persistence> Gateway<P> {
             && let Some(snapshot) = route.preset.observe_quota(&resp.response.headers, now_ms)
         {
             self.usage.observe(id, snapshot).await;
+        }
+
+        // 届いた 1 本だけを控える。断られた応答の経路を控えると、送り直しは
+        // その塞がった先へ行くことになる。
+        if let Some((body, headers)) = keeping
+            && resp.response.status / 100 == 2
+        {
+            self.keep_for_replay(call, route, body, headers, sent_at_ms, cache_notice.clone());
         }
 
         // 見ている人へ知らせる (DR-0012)。prompt cache の起点に合わせて、
@@ -1090,9 +1309,19 @@ impl<P: Persistence> Gateway<P> {
     /// 会話は、こちらの置き場には無い — 聞かないと、起き上がった側だけが
     /// 合図を出し続けることになる (DR-0024 §2 追補)。
     pub fn start_keepalive(self: &Arc<Self>) {
+        self.start_replay();
         self.keepalive.restore();
         let gateway = Arc::clone(self);
         tokio::spawn(async move { gateway.sync_paused_keepalive().await });
+    }
+
+    /// 送り直しの控えを読み戻して、予定を張り直す (DR-0027)。
+    ///
+    /// 送る役として自分を渡す。控えは弱い参照で持たれるので、輪にはならない。
+    fn start_replay(self: &Arc<Self>) {
+        self.replay
+            .served_by(Arc::downgrade(self) as std::sync::Weak<dyn replay::Sender>);
+        self.replay.restore();
     }
 
     /// 兄弟が止めている会話を、こちらにも取り込む。
@@ -1123,6 +1352,10 @@ impl<P: Persistence> Gateway<P> {
     pub fn pause_keepalive(&self, session_id: &str, relayed: bool) {
         info!(session = session_id, "pausing the cache keepalive signal");
         self.keepalive.pause(session_id);
+        // 送り直しの控えも落とす (DR-0027 決定 1)。置き場は兄弟と共有して
+        // いるので、落とした時点で相手からも消える — 回す必要があるのは
+        // 合図方式の停止だけ。解除は実リクエスト 1 本で自動。
+        self.replay.pause(session_id);
         if relayed {
             return;
         }
@@ -1683,6 +1916,28 @@ struct Sample {
 ///
 /// 締め出しや候補の入れ替わりを知っているのは経路を選ぶ側で、合図を出す側は
 /// 答えだけを要る。
+impl<P: Persistence> replay::Sender for Gateway<P> {
+    fn replay<'a>(&'a self, kept: &'a replay::Kept) -> egress::BoxFuture<'a, replay::Outcome> {
+        Box::pin(async move { self.send_replay(kept).await })
+    }
+}
+
+/// 控えに持ち回してはいけないヘッダか。
+///
+/// 認証は送るたびに経路が付け直す (DR-0027 決定 1 の「認証差し替え後の形」)。
+/// 控えに残すと、期限の切れた token を抱えたまま送り直すことになる。
+fn is_authorization(name: &str) -> bool {
+    const SECRETS: [&str; 4] = [
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "cookie",
+    ];
+    SECRETS
+        .iter()
+        .any(|secret| name.eq_ignore_ascii_case(secret))
+}
+
 struct RouterReach(Arc<Router>);
 
 impl keepalive::Reachable for RouterReach {
@@ -5103,6 +5358,163 @@ url = "https://bedrock.invalid/anthropic"
             by_name("bedrock").probe_error.is_none(),
             "a failure is not recorded for a target that was never probed"
         );
+    }
+
+    /// `replay` を書いた系列は、送った 1 本がそのまま控えられる (DR-0027)。
+    ///
+    /// 控えるのは**線に乗った形**。認証だけは持ち回さない — 送り直すときに
+    /// 経路が付け直すので、控えに残すと期限の切れた token を抱えることになる。
+    #[tokio::test]
+    async fn a_replayed_series_keeps_what_went_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "replay"
+"#,
+            dir.path().display(),
+            up.url
+        ))
+        .await;
+
+        let mut body = request();
+        body["tools"] = json!([{"name": "read"}]);
+        body["system"] = json!([{"type": "text", "text": "you are here", "cache_control": {"type": "ephemeral"}}]);
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body.clone(),
+                vec![
+                    (crate::session::SESSION_HEADER.to_owned(), "s1".to_owned()),
+                    (
+                        "authorization".to_owned(),
+                        "Bearer client-secret".to_owned(),
+                    ),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.response.status, 200);
+
+        let series = replay::Series {
+            session_id: "s1".to_owned(),
+            prefix: events::prefix(&body).unwrap(),
+        };
+        let kept = replay::store::Store::new(dir.path())
+            .load(&series)
+            .expect("the request was kept for replay");
+        assert_eq!(
+            kept.body["system"][0]["cache_control"]["ttl"], "1h",
+            "what was kept is the form that went out, cache_control and all"
+        );
+        assert_eq!(kept.route, "a");
+        assert!(
+            !kept.headers.iter().any(|(name, _)| name == "authorization"),
+            "the credential is put back on when it is sent again, so it is not kept"
+        );
+        assert!(kept.cache_notice.is_some(), "the promise is kept with it");
+    }
+
+    /// 控えた 1 本は、`max_tokens` だけを変えて出ていく (DR-0027 決定 1)。
+    ///
+    /// 素性は `keepalive` で、この 1 本を出したのが人でも subagent でもない
+    /// ことが見る側に伝わる。
+    #[tokio::test]
+    async fn the_replay_goes_out_with_only_max_tokens_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = FakeUpstream::always(200).await;
+        let gw = Arc::new(
+            gateway(&format!(
+                r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "replay"
+"#,
+                dir.path().display(),
+                up.url
+            ))
+            .await,
+        );
+
+        let mut body = request();
+        body["tools"] = json!([{"name": "read"}]);
+        body["system"] = json!([{"type": "text", "text": "you are here"}]);
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body.clone(),
+            vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+        )
+        .await
+        .unwrap();
+
+        let series = replay::Series {
+            session_id: "s1".to_owned(),
+            prefix: events::prefix(&body).unwrap(),
+        };
+        let kept = replay::store::Store::new(dir.path()).load(&series).unwrap();
+        let mut watching = gw.events().subscribe();
+        let before = up.requests().len();
+
+        let outcome = gw.send_replay(&kept).await;
+        assert!(
+            matches!(outcome, replay::Outcome::Sent(_)),
+            "the replay went through"
+        );
+
+        let sent = up.requests();
+        assert_eq!(sent.len(), before + 1, "one more request reached upstream");
+        let last = &sent[sent.len() - 1];
+        assert!(
+            last.contains("\"max_tokens\":1"),
+            "only max_tokens changed; got {last}"
+        );
+        assert!(
+            last.contains("\"tools\""),
+            "the rest of the body went out untouched"
+        );
+
+        let event = announced(watching.try_recv().expect("the replay was announced"));
+        assert_eq!(event.origin, "keepalive", "it is not a call anyone made");
+        assert_eq!(event.session_id.as_deref(), Some("s1"));
+        assert_eq!(event.cache_ttl_secs, Some(60 * 60));
     }
 
     /// 集計の USD は、その行を出した経路の単価で換算する。
