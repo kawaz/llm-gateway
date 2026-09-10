@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-11 | bug | open | [replay-store-dir-collides-with-signal-store](./2026-09-11-replay-store-dir-collides-with-signal-store.md) | replay store の置き場が合図方式の見張り置き場と衝突している |
 | 2026-09-11 | bug | open | [daemon-status-version-stuck-null](./2026-09-11-daemon-status-version-stuck-null.md) | unit 起動直後の version 問い合わせ失敗が status に null のまま残る |
 | 2026-09-10 | request | open | [supervisor-log-reopen-on-rotation](./2026-09-10-supervisor-log-reopen-on-rotation.md) | 監督者のログ fd をログローテーション後に開き直す |
 | 2026-09-10 | bug | open | [supervisor-crash-leaves-orphan-children](./2026-09-10-supervisor-crash-leaves-orphan-children.md) | 監督者クラッシュ後に子プロセスが残り新監督者とポート衝突する |
