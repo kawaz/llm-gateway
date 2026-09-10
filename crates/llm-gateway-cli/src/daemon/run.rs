@@ -20,6 +20,10 @@ use crate::help;
 /// 失うのはこの間に通った分だけで、終了の合図では待たずに落とす。
 const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 既存の応答を畳む猶予。監督者が SIGKILL へ進む 10 秒より短くして、
+/// 最後の保存までを子自身の終了処理として完遂する。
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn foreground(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
     let Some(name) = args.first() else {
         // 必須の引数があるコマンドは、引数なしなら help を出す。
@@ -138,12 +142,22 @@ remove disabled from [server], or register another configuration",
         });
 
         let serving = Arc::clone(&gateway);
-        let result = axum::serve(
+        let shutdown_started = Arc::new(tokio::sync::Notify::new());
+        let notifying = Arc::clone(&shutdown_started);
+        let server = axum::serve(
             listener,
             llm_gateway_server::router(serving)
                 .into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            notifying.notify_one();
+        });
+        let result = finish_serving(
+            async move { server.await },
+            shutdown_started,
+            SHUTDOWN_GRACE,
+        )
         .await
         .map_err(|e| Failure::from(format!("the server stopped listening: {e}")));
 
@@ -164,6 +178,29 @@ remove disabled from [server], or register another configuration",
 
         Ok(ExitCode::SUCCESS)
     })
+}
+
+async fn finish_serving<F, E>(
+    server: F,
+    shutdown_started: Arc<tokio::sync::Notify>,
+    grace: std::time::Duration,
+) -> Result<(), E>
+where
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = shutdown_started.notified() => {
+            match tokio::time::timeout(grace, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(?grace, "graceful shutdown timed out; closing active connections");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 fn init_logging() {
@@ -254,6 +291,63 @@ mod tests {
         assert!(e.message().contains("quiet"), "names the unit: {e:?}");
         assert!(e.message().contains("disabled"), "{e:?}");
         assert!(e.message().contains("quiet.toml"), "names the file: {e:?}");
+    }
+
+    /// signal より先に server が終わった場合は、猶予待ちを始めず結果を返す。
+    #[tokio::test]
+    async fn a_server_that_finished_before_shutdown_returns_its_result() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let result = finish_serving(
+            async { Err::<(), _>("listener failed") },
+            shutdown,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(result, Err("listener failed"));
+    }
+
+    /// signal 後に既存接続が猶予内で畳めた場合は、その正常終了を待つ。
+    #[tokio::test]
+    async fn active_connections_can_finish_during_shutdown_grace() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        shutdown.notify_one();
+
+        let result = finish_serving(
+            async {
+                tokio::task::yield_now().await;
+                Ok::<(), ()>(())
+            },
+            shutdown,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+    }
+
+    /// SSE や tap のような無期限接続が残っても、猶予の上限で待機を終える。
+    /// 監督者の 10 秒上限より先に最後の保存へ進めることが必要である。
+    #[tokio::test]
+    async fn an_active_connection_cannot_outlive_shutdown_grace() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        shutdown.notify_one();
+        let grace = std::time::Duration::from_millis(20);
+        let started = std::time::Instant::now();
+
+        let result =
+            finish_serving(std::future::pending::<Result<(), ()>>(), shutdown, grace).await;
+
+        let elapsed = started.elapsed();
+        assert_eq!(result, Ok(()));
+        assert!(
+            elapsed >= grace,
+            "returned before the grace elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "did not stop promptly after the grace: {elapsed:?}"
+        );
     }
 
     /// 余分な引数を黙って捨てない (打ち間違えた名前で別の台が走る)。
