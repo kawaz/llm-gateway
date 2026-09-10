@@ -244,7 +244,7 @@ jobs:
           # (アーカイブの中身を平らに保つため)
           STAGE=$(mktemp -d)
           cp "target/${TARGET}/release/llm-gateway" "$STAGE/"
-          cp LICENSE README.md "$STAGE/"
+          cp LICENSE README.md README-ja.md "$STAGE/"
           tar czf "$ARCHIVE" -C "$STAGE" .
           rm -rf "$STAGE"
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"

@@ -4,7 +4,8 @@
 # workspace.package.version で、push 時に check-version-bumped が
 # 「crates/ の src を変えたのに version が据え置き」を止める。
 # tag と GitHub Release は .github/workflows/release.yml が作る。
-# 翻訳ペアは持たない (public 化の判断待ち、DR-0005「未確定」)。
+# README は ja が正本、en が翻訳先。push 時に check-outdated-translations が
+# 「en が ja より古い」を止める。
 # 参考: kawaz/bump-semver の justfile が canonical、
 #       kawaz/hyoui が axum + workspace 分割の実例。
 
@@ -116,6 +117,15 @@ check-on-default-branch:
         exit 1
     fi
 
+# 翻訳ペアの鮮度 (正本 = README-ja.md、翻訳先 = README.md)。
+#
+# 対象を README に絞るのは、対になっているのが README だけだから。
+# `glob:**/*-ja.md` にすると相方を持たない docs/MANUAL-ja.md まで拾い、
+# 存在しない docs/MANUAL.md を要求して落ちる。
+[private]
+check-outdated-translations: ensure-clean
+    bump-semver vcs outdated README-ja.md README.md
+
 # crates/ の src が main@origin から変わっているのに Cargo.toml の version が
 # 上がっていなければ fail。
 #
@@ -177,7 +187,7 @@ promote:
     bump-semver vcs promote
 
 # push (version が上がっていれば release workflow が tag と artifact を作る)
-push: ci check-on-default-branch ensure-clean check-version-bumped
+push: ci check-on-default-branch ensure-clean check-outdated-translations check-version-bumped
     bump-semver vcs push --branch main --jj-bookmark-auto-advance
     ccmsg notify --self --text "Monitor で 'just watch' を起動して" 2>/dev/null || true
 
