@@ -1,6 +1,6 @@
 ---
 title: keepalive の合図を messaging socket へ直接注入する
-status: open
+status: discarded
 category: design
 created: 2026-09-08T16:50:47+09:00
 last_read:
@@ -8,9 +8,9 @@ open_entered: 2026-09-08T16:50:47+09:00
 wip_entered:
 blocked_entered:
 pending_entered:
-discarded_entered:
+discarded_entered: 2026-09-10T23:28:28+09:00
 resolved_entered:
-discard_reason:
+discard_reason: ["DR-0027 (自送信 replay、2026-09-10 Accepted) の却下案に含まれる。届け先を socket に替えてもセッションを起こす点は同じで、session→pid の解決が CONFIG_DIR スコープに阻まれる。自送信ならセッション自体が不要"]
 pending_reason:
 close_reason:
 blocked_by:
