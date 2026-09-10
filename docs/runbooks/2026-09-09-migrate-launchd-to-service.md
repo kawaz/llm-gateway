@@ -138,6 +138,31 @@ rm ~/.config/llm-gateway/config.toml   # 待ち受けないダミー (DR-0028 �
 
 dotfiles 側で config の変更 (a) と `config.toml` の削除をコミットする。
 
+## ログの回転を仕込む (macOS)
+
+監督者は `~/.local/state/llm-gateway/logs/<unit>.log` へ追記するだけで、回転は持たない
+(DR-0028 決定 10)。macOS では newsyslog に任せる。
+
+```bash
+# newsyslog は ~ を展開しないので、絶対パスを自分で埋める。
+sudo tee /etc/newsyslog.d/llm-gateway.conf >/dev/null <<EOF
+# logfilename                     [owner:group]  mode count size time  flags
+$HOME/.local/state/llm-gateway/logs/*.log  $(id -un):$(id -gn)  644  7  5120  *  GNZ
+EOF
+sudo newsyslog -nv     # 何をするつもりか確かめる (実行はしない)
+```
+
+- `G` = ファイル名を glob として読む (unit が増えても書き足さなくて済む)
+- `N` = 回転の後にシグナルを送らない (監督者に受け口が無いため。送っても意味がない)
+- `Z` = 回転した世代を gzip する。`size` は KB なので上の例は 5 MB
+- owner を自分にするのは、`/etc/newsyslog.d` 経由の回転が root で走るため。
+  指定しないと新しいファイルが root 所有で作られ、監督者が書けなくなる
+
+**回転が効くのは次に子を入れ替えた時から。** 監督者は子が終わるまで追記の fd を握るので、
+rename で回転させても書き先は元のファイル (inode) のまま。新しいファイルに移すには
+`llm-gateway daemon restart --all` を打つ。放っておいても壊れはしないが、回転した側の
+ファイルが伸び続ける。
+
 ## 戻し方
 
 `service` を降ろして、旧 plist を載せ直す。`serve` を持つ binary が要るので、

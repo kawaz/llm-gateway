@@ -205,6 +205,47 @@ llm-gateway version
 ディスクを読んで版を推し量る経路は持たない。走っているプロセスがメモリに載せている版は、
 本人にしか言えない。`--version` (テキスト 1 行) はこの CLI 自身の版だけを言う口として残す。
 
+### 10. ログは監督者が unit 名で分けて書き、回転は OS に任せる
+
+子は stdout / stderr に書くだけで、置き場を知らない。監督者がそれを受けて
+`~/.local/state/llm-gateway/logs/<unit>.log` へ追記する (`daemon::protocol::log_path`)。
+同じ行は追従している人へも配るので、`daemon log --follow` は書かれた先を読み直さずに済む。
+子に置き場を教える案を採らないのは、置き場が変わるたびに全 unit の設定を書き直すことになり、
+「監督者が抱える」という決定 1 の形が崩れるため。
+
+**回転は gateway が持たない。** OS の仕組み (macOS は newsyslog、Linux は logrotate) に
+任せ、gateway 側は追記しかしない。自前で持つと、大きさの上限・世代数・圧縮の有無という
+運用ごとに違う判断を gateway が代わりに決めることになり、しかも OS の仕組みと二重になる。
+
+ただし監督者は追記の fd を子が終わるまで握り続ける。rename で回転させる方式 (newsyslog /
+logrotate の既定) では、回転した後も監督者は元の inode に書き続け、新しいファイルは
+`llm-gateway daemon restart` で子が入れ替わるまで空のままになる。回転の設定は
+`N` (シグナルを送らない) で置き、実際に切り替わるのは次の入れ替えの時、と読む。
+具体的な newsyslog の書き方は runbook `docs/runbooks/2026-09-09-migrate-launchd-to-service.md`
+に置く。
+
+### 11. 監督者が落ちても子は残る。次の監督者は拾わずに起こし直す
+
+`shutdown()` は SIGTERM / SIGINT を受けた時に走り、抱えている台を全部 `terminate` する
+(SIGTERM → `TERM_GRACE` 待ち → SIGKILL)。つまり **行儀よく降りる限り、子は道連れ**である。
+
+一方 SIGKILL や異常終了で監督者が消えた場合、子は残る。子は `kill_on_drop(false)` で
+起こしてあり、プロセスグループごと畳む経路も、pid を書き留めておく経路も無い
+(`Registry` は pid を持たない)。次に上がった監督者は `reload()` で登録簿どおりに
+子を起こし直すので、残った子と待ち受けポートが衝突し、新しい子は起動に失敗して
+backoff (`BACKOFF_FIRST` から倍々、`BACKOFF_MAX` まで) に入る。
+
+**引き取りは作らない。** 走っているプロセスが誰の子かは、pid を書き留めても再起動を
+跨いで確かめられない (pid は使い回される)。確かめられないものを頼りに「これは自分の子だ」と
+決めると、無関係のプロセスを畳む経路ができる。残った子は人が畳む — 残っていることは
+`daemon status` の各行と backoff の様子から分かる。
+
+### 12. systemd 側は未検証。Linux の実機が出来た時に確かめる
+
+`service register` の systemd (user unit) 経路は、書けてはいるが実機で確かめていない。
+手元は macOS だけで、launchd 経路のみが実証済みである。Linux の実機が用意できるまで
+「書いてあるが未検証」として扱い、実証済みであるかのように扱わない。
+
 ## 却下した案
 
 - **plist を 2 本のまま置き、CLI からは触らない**: 台数を増やすたびに人が plist を書く。
@@ -224,14 +265,6 @@ llm-gateway version
   ファイルからは分からない (入れ替えても走っている側は変わらない)。それが分からないなら、
   そもそも 2 つを並べる意味が無い
 
-## 未確定 (実装前に確かめる)
-
-- **子のログの置き場と回転**。今は plist が `~/.local/state/llm-gateway/logs/{stable,unstable}.log`
-  へ流している。監督者が受けて unit 名で分けるのか、子が自分で書くのか。回転は誰が持つのか
-- **監督者が落ちた時に子をどうするか**。道連れにするのか、生かしたまま次の監督者が拾うのか。
-  拾うなら pid の引き継ぎ方が要る
-- **systemd 側の検証環境**。手元は macOS のみで、user unit の登録は書けても実機で確かめ
-  られていない
 ## 影響
 
 - `serve` が消え、`status` が `upstream status` に動く。README / MANUAL / zsh completion の
