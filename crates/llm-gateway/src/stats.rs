@@ -186,14 +186,18 @@ impl Stats {
 
     /// 1 応答分を積む。
     ///
-    /// `at` はイベントを観測した時刻。日付はこの時刻の地方時で決める。日を
-    /// 跨いだら新しい日付の欄に積むだけで、落とす側が日ごとのファイルへ
-    /// 振り分ける。
-    pub fn record(&self, at: i64, credential: Option<&str>, model: &str, usage: &TokenUsage) {
+    /// `at_secs` はイベントを観測した時刻 (**unix 秒**)。日付はこの時刻の
+    /// 地方時で決める。日を跨いだら新しい日付の欄に積むだけで、落とす側が
+    /// 日ごとのファイルへ振り分ける。
+    ///
+    /// ミリ秒で持っている時刻 (知らせの `ts` 等、DR-0012) を渡すときは
+    /// [`crate::credential::time::to_unix_secs`] を通すこと。1000 倍のまま
+    /// 渡すと日付が 5 桁の年へ飛び、その 1 本が集計から迷子になる。
+    pub fn record(&self, at_secs: i64, credential: Option<&str>, model: &str, usage: &TokenUsage) {
         if usage.is_empty() {
             return;
         }
-        let date = local_date(at);
+        let date = local_date(at_secs);
         let credential = credential.unwrap_or(NO_CREDENTIAL).to_owned();
 
         // メモリに無い日なら、その日の自分のファイルを先に読む。読まずに積むと
@@ -252,6 +256,7 @@ impl Stats {
     /// (実時計に縛ると、固定時刻で積んだデータが日付の進みで範囲外になる)。
     pub fn restore(&self, now: i64) {
         sweep_temporaries(&self.dir, &self.writer);
+        self.absorb_millisecond_dates();
 
         let recent: Vec<String> = (0..RESTORED_DAYS as i64)
             .map(|back| local_date(now - back * 86_400))
@@ -269,6 +274,76 @@ impl Stats {
         let days = restored.len();
         *self.counts.lock().unwrap_or_else(|e| e.into_inner()) = restored;
         tracing::info!(days, "loaded daily totals from disk");
+    }
+
+    /// ミリ秒を秒として数えた日付のファイルを、本来の日へ寄せる。
+    ///
+    /// 時刻をミリ秒のまま積んでいた頃 ([`Self::record`] の `at_secs`) の
+    /// 置き土産で、`58667-10-30.…json` のような 5 桁の年のファイルが残る。
+    /// 日付として読めない名前なので閲覧は素通りするが、置き場に溜まり続ける
+    /// うえ、その 1 本分の記録が集計から落ちたままになる。
+    ///
+    /// Design rationale: 直す口を CLI に生やさず、読み戻しの一部として黙って
+    /// 済ませる。ここは既に「古い形のファイルを読んで新しい形で書き戻す」
+    /// ([`Counters`] の `Deserialize`) で移行を通してきた場所で、運用者が
+    /// 手順を覚える必要のない側に揃える。直す対象が無ければ何もしない。
+    ///
+    /// 日付は `日数 × 86400` がミリ秒だったので、1000 で割れば本来の時刻に
+    /// 戻る (地方時の時差の分だけずれるが、1 日の中に収まる)。寄せ先は
+    /// **自分のファイル**。書き手の名前はファイルを分けるためだけの目印で
+    /// 集計には出ないので、他の書き手のファイルへ書きに行って、向こうの
+    /// 保存と潰し合う方が高くつく。取り込む前に名前を変えて自分のものに
+    /// するのは、2 つの gateway が同時に立ち上がったときに同じ 1 本を
+    /// 両方が数えないようにするため。
+    fn absorb_millisecond_dates(&self) {
+        let mut absorbed = 0usize;
+        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(millis) = millisecond_date_of_file(name) else {
+                continue;
+            };
+            // 寄せ先を先に読む。読めない寄せ先へ書くと、そこにある 1 日分を
+            // 取り込んだつもりで踏み潰す。読めないうちは寄せずに残しておく。
+            let target = self.path_of(&local_date(millis.div_euclid(1000)));
+            let mut merged = match read_day(&target) {
+                Ok(day) => day,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ByCredential::new(),
+                Err(e) => {
+                    tracing::warn!(path = %target.display(), %e, "cannot read daily totals");
+                    continue;
+                }
+            };
+
+            // 名前を変えて取り込む者を 1 人に決める。負けた側は消えた名前を
+            // 読もうとして諦めるだけ。
+            let claimed = path.with_file_name(format!("{name}.absorbing.{}", std::process::id()));
+            if std::fs::rename(&path, &claimed).is_err() {
+                continue;
+            }
+            let day = match read_day(&claimed) {
+                Ok(day) => day,
+                Err(e) => {
+                    tracing::warn!(path = %claimed.display(), %e, "cannot read daily totals");
+                    continue;
+                }
+            };
+            merge_day(&mut merged, day);
+            if let Err(e) = write_atomically(&target, &merged) {
+                tracing::warn!(path = %target.display(), %e, "cannot write daily totals");
+                continue;
+            }
+            let _ = std::fs::remove_file(&claimed);
+            absorbed += 1;
+        }
+        if absorbed > 0 {
+            tracing::info!(
+                files = absorbed,
+                "moved daily totals that were filed under a millisecond date"
+            );
+        }
     }
 
     /// 変わった日だけをディスクへ落とす。変わっていなければ何もしない。
@@ -436,6 +511,23 @@ fn date_of_file(name: &str) -> Option<String> {
     ok.then(|| date.to_owned())
 }
 
+/// ミリ秒を秒として数えた日付のファイルなら、その元の時刻 (unix ミリ秒)。
+///
+/// `58667-10-30.8402.json` → `58667-10-30` の 00:00 を数にしたもの。見分ける
+/// のは**年が 4 桁に収まらないこと**。1 万年先の日付を本気で書いたファイルは
+/// 無いので、これだけで足りる。[`date_of_file`] が拾う形 (4 桁の年) はここでは
+/// 拾わない — 素性の正しい日次ファイルを動かしてはいけない。
+fn millisecond_date_of_file(name: &str) -> Option<i64> {
+    if !name.ends_with(".json") {
+        return None;
+    }
+    let date = name.split('.').next()?;
+    if date.split('-').next()?.len() <= 4 {
+        return None;
+    }
+    crate::credential::time::parse_date(date)
+}
+
 /// 1 日分を足し込む。ファイル同士・ファイルとメモリを合わせるときに使う。
 fn merge_day(into: &mut ByCredential, day: ByCredential) {
     for (credential, models) in day {
@@ -581,6 +673,58 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    /// ミリ秒を秒として数えた日付のファイルは、読み戻しで本来の日へ寄る。
+    ///
+    /// 5 桁の年のファイルは日付として読めないので、置いておくと閲覧から
+    /// 消えたまま溜まり続ける。寄せ先に既にある分へ足し込み、寄せ終えた
+    /// ファイルは消す。
+    #[test]
+    fn restoring_absorbs_a_day_filed_under_a_millisecond_date() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 時刻をミリ秒のまま積んでいた頃に出来たファイル。
+        let stale = stats(dir.path());
+        stale.record(NOW_MS, Some("a"), "m", &tokens(10, 5));
+        stale.flush().unwrap();
+        let broken = dir.path().join(format!("{}.8402.json", local_date(NOW_MS)));
+        assert!(broken.exists(), "the millisecond-dated file is there");
+
+        // 同じ日には、秒で積んだ分が既にある。
+        let sound = stats(dir.path());
+        sound.record(NOW, Some("a"), "m", &tokens(1, 2));
+        sound.record(NOW, Some("b"), "m", &tokens(7, 7));
+        sound.flush().unwrap();
+
+        let reopened = stats(dir.path());
+        reopened.restore(NOW);
+
+        assert!(!broken.exists(), "the millisecond-dated file is gone");
+        let counts = reopened.in_memory();
+        assert_eq!(
+            counts.keys().collect::<Vec<_>>(),
+            vec![&local_date(NOW)],
+            "everything landed on the day it was really sent"
+        );
+        let day = &counts[&local_date(NOW)];
+        let c = &day["a"]["m"];
+        assert_eq!(c.requests, 2, "both requests are counted");
+        assert_eq!(input_of(c), 11);
+        assert_eq!(output_of(c), 7);
+        assert_eq!(day["b"]["m"].requests, 1, "the rest of the day is intact");
+    }
+
+    /// 素性の正しい日次ファイルは寄せる対象ではない。
+    #[test]
+    fn only_a_five_digit_year_counts_as_a_millisecond_date() {
+        assert_eq!(millisecond_date_of_file("2026-07-29.8402.json"), None);
+        // 5 桁の年は数へ戻り、1000 で割ると元の日に帰る。
+        let name = format!("{}.8402.json", local_date(NOW_MS));
+        let millis = millisecond_date_of_file(&name).expect("{name} is a millisecond date");
+        assert_eq!(local_date(millis.div_euclid(1000)), local_date(NOW));
+        assert_eq!(millisecond_date_of_file(&format!("{name}.tmp.1.2")), None);
+        assert_eq!(millisecond_date_of_file("notes.json"), None);
     }
 
     /// 同じ (日, 認証情報, モデル) は足し合わされる。

@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use crate::cache::{self, keepalive, replay};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
-use crate::credential::time::{now_unix, now_unix_ms};
+use crate::credential::time::{now_unix, now_unix_ms, to_unix_secs};
 use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
 use crate::denial::Probing;
 use crate::egress::{self, EgressRequest, Headers, RequestShape, Response, SentResponse};
@@ -1112,7 +1112,7 @@ impl<P: Persistence> Gateway<P> {
         // 費用も、素性で割れば集計から自然に取れる。
         if let Some(usage) = &usage {
             self.stats.record(
-                sent_at_ms,
+                to_unix_secs(sent_at_ms),
                 route.credential.as_ref().map(CredentialId::as_str),
                 &kept.model,
                 usage,
@@ -5515,6 +5515,80 @@ main = "replay"
         assert_eq!(event.origin, "keepalive", "it is not a call anyone made");
         assert_eq!(event.session_id.as_deref(), Some("s1"));
         assert_eq!(event.cache_ttl_secs, Some(60 * 60));
+    }
+
+    /// 自送信の 1 本も、送った日の欄に積まれる (DR-0027 決定 6)。
+    ///
+    /// 送った時刻は知らせに合わせてミリ秒で持ち回っている (DR-0012)。集計は
+    /// 秒で数えるので、直さずに渡すと日付が 5 桁の年へ飛び、その 1 本が
+    /// 今日の集計から消えたうえ、置き場に読めない日付のファイルが残る。
+    #[tokio::test]
+    async fn the_replay_lands_on_the_day_it_was_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = FakeUpstream::start(|_, _| {
+            (
+                200,
+                r#"{"type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":5}}"#
+                    .to_owned(),
+            )
+        })
+        .await;
+        let gw = Arc::new(
+            gateway(&format!(
+                r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "replay"
+"#,
+                dir.path().display(),
+                up.url
+            ))
+            .await,
+        );
+
+        let mut body = request();
+        body["tools"] = json!([{"name": "read"}]);
+        body["system"] = json!([{"type": "text", "text": "you are here"}]);
+        gw.forward(
+            ns(&gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            body.clone(),
+            vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+        )
+        .await
+        .unwrap();
+
+        let series = replay::Series {
+            session_id: "s1".to_owned(),
+            prefix: events::prefix(&body).unwrap(),
+        };
+        let kept = replay::store::Store::new(dir.path()).load(&series).unwrap();
+        let outcome = gw.send_replay(&kept).await;
+        assert!(
+            matches!(outcome, replay::Outcome::Sent(_)),
+            "the replay went through"
+        );
+
+        let today = crate::credential::time::local_date(now_unix());
+        let days: Vec<String> = gw.stats().in_memory().into_keys().collect();
+        assert_eq!(days, vec![today], "the replay is counted on today");
     }
 
     /// 集計の USD は、その行を出した経路の単価で換算する。

@@ -59,6 +59,26 @@ fn parse_parts(s: &str) -> Option<(i64, i64)> {
     ))
 }
 
+/// `YYYY-MM-DD` を、その日の 00:00 を UTC で見たときの unix 秒にする。
+///
+/// 年の桁数は問わない。[`local_date`] が出した文字列を数へ戻す口で、4 桁に
+/// 収まらない年 (秒のつもりでミリ秒を渡すと出る) も読める必要がある。
+/// 読めなければ `None`。
+pub fn parse_date(date: &str) -> Option<i64> {
+    let mut parts = date.split('-');
+    let (y, mo, d) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || y.is_empty() || mo.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let num = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<i64>().ok())
+            .flatten()
+    };
+    Some(days_from_civil(num(y)?, num(mo)?, num(d)?) * 86_400)
+}
+
 /// unix 秒を RFC 3339 にする。
 pub fn format_rfc3339(unix: i64) -> String {
     let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
@@ -276,6 +296,33 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-08-02T08:59:59.5Z"), Some(utc));
         assert_eq!(parse_rfc3339("2026-08-02T17:59:59.571539+09:00"), Some(utc));
         assert_eq!(parse_rfc3339("2026-08-02T08:59:59.571539"), Some(utc));
+    }
+
+    /// 日付の文字列と数を行き来できる。年が 4 桁に収まらなくても読める。
+    #[test]
+    fn dates_convert_back_to_seconds() {
+        assert_eq!(parse_date("1970-01-01"), Some(0));
+        assert_eq!(
+            parse_date(&date_at_offset(NOW, 0)),
+            Some(NOW - NOW % 86_400)
+        );
+        // ミリ秒を秒として読むと出る日付。数へ戻せないと直しようがない。
+        let far = date_at_offset(NOW * 1000, 0);
+        assert_eq!(far, "58540-01-24", "5 桁の年になる");
+        assert_eq!(
+            parse_date(&far).map(|s| s / 86_400),
+            Some(NOW * 1000 / 86_400)
+        );
+        for bad in [
+            "",
+            "2026",
+            "2026-07",
+            "2026-7-29",
+            "2026-07-29-01",
+            "20xx-07-29",
+        ] {
+            assert_eq!(parse_date(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
