@@ -1,11 +1,11 @@
 ---
 title: replay の自送信が stats.record() にミリ秒を渡し日付が壊れる
-status: open
+status: wip
 category: bug
 created: 2026-09-12T20:02:14+09:00
 last_read:
 open_entered: 2026-09-12T20:02:14+09:00
-wip_entered:
+wip_entered: 2026-09-12T20:23:12+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -39,3 +39,8 @@ replay の自送信が `stats.record()` にミリ秒を渡し、日付が 58667 
 ## TODO
 
 - [ ] worker `replay-stats-fix` (opus5-medium) に修正実装を委譲済み。進捗確認・レビュー
+- [ ] stable 11302 の brew 反映後の再起動を確認し、両 unit 反映後に close する
+
+## 進捗 (2026-09-12)
+
+v0.46.1 で修正 (commit eb27cba3 + Release a34e72b2)。unstable 11301 は再起動済みで起動時修復により 219 件を吸収、5 桁年ファイル 0 件を実機確認。stable 11302 は brew 反映後の再起動待ち。両 unit 反映後に close する。
