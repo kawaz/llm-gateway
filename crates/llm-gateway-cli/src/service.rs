@@ -409,21 +409,26 @@ fn service_status(kind: Kind, out: &Output) -> Value {
 
 fn launchd_status(text: &str) -> Value {
     let mut status = json!({"loaded": true, "running": false});
+    let mut depth = 0usize;
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let (key, value) = (key.trim(), value.trim());
-        match key {
-            "state" => status["running"] = json!(value == "running"),
-            "pid" => {
-                if let Ok(pid) = value.parse::<u32>() {
-                    status["pid"] = json!(pid);
+        if depth == 1
+            && let Some((key, value)) = line.split_once('=')
+        {
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "state" => status["running"] = json!(value == "running"),
+                "pid" => {
+                    if let Ok(pid) = value.parse::<u32>() {
+                        status["pid"] = json!(pid);
+                    }
                 }
+                "last exit code" => status["last_exit"] = json!(value),
+                _ => {}
             }
-            "last exit code" => status["last_exit"] = json!(value),
-            _ => {}
         }
+        depth = depth
+            .saturating_add(line.bytes().filter(|byte| *byte == b'{').count())
+            .saturating_sub(line.bytes().filter(|byte| *byte == b'}').count());
     }
     status
 }
@@ -972,7 +977,8 @@ mod tests {
     fn what_launchctl_says_becomes_the_service_part() {
         let out = Output {
             code: 0,
-            stdout: "\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n".to_owned(),
+            stdout: "gui/501/jp.kawaz.llm-gateway.supervise = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n\n\tresource coalition = {\n\t\tstate = active\n\t}\n\n\tjetsam coalition = {\n\t\tstate = active\n\t}\n}\n"
+                .to_owned(),
             stderr: String::new(),
         };
         assert_eq!(
