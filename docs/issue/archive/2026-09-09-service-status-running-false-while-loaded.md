@@ -1,6 +1,6 @@
 ---
 title: service status の service.running が稼働中でも false になる
-status: open
+status: resolved
 category: bug
 created: 2026-09-09T16:12:51+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-12T20:46:16+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: v0.46.2 で修正 (commit 83454899)。真因は launchctl print のネスト節 (resource/jetsam coalition) の state = active が最上位の state = running を上書きしていたこと。ルート直下のキーだけを読むよう修正。brew 0.46.2 + 監督者再起動後に service status で service.running: true を実機確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
