@@ -1,6 +1,6 @@
 ---
 title: unit起動直後のversion問い合わせ失敗がstatusにnullのまま残る
-status: open
+status: resolved
 category: bug
 created: 2026-09-11T00:01:42+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-12T20:32:43+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: 原因は稼働監督者がv0.44.1のまま(status要求ごとに本人へ問い合わせる実装a2f6de27が未展開)。監督者をservice stop/startで0.46.1にした直後からdaemon status --all/versionが両unitのrunning versionを返すことを実機確認。regression testはsupervisor.rsの既存テストが覆う"]
 blocked_by:
 origin: 自リポ TODO
 ---
