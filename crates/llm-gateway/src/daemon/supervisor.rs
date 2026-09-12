@@ -1384,15 +1384,6 @@ mod tests {
         // 走っている台の代わりに、版だけ答える相手を立てる。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/llm-gateway/version",
-                axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"version": "0.1.2"}))
-                }),
-            );
-            let _ = axum::serve(listener, app).await;
-        });
         std::fs::write(
             world.root.join("stable.toml"),
             format!("[server]\nlisten = \"{listen}\"\n"),
@@ -1403,6 +1394,7 @@ mod tests {
         world.supervisor.reload().await;
         world.until("stable", |s| s.running).await;
 
+        // 起動直後に本人がまだ答えなくても、unit の状態自体は返す。
         let answer = world
             .supervisor
             .handle(Request::Status(Which::all()))
@@ -1412,6 +1404,23 @@ mod tests {
             answer["supervisor_version"],
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
+        assert_eq!(answer["units"][0]["version"], serde_json::Value::Null);
+
+        // 本人が答え始めた後の要求では改めて聞く。最初の失敗を保持しない。
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/llm-gateway/version",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"version": "0.1.2"}))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        let answer = world
+            .supervisor
+            .handle(Request::Status(Which::all()))
+            .await
+            .unwrap();
         assert_eq!(answer["units"][0]["version"], serde_json::json!("0.1.2"));
 
         // 止まっている台には聞きに行かない (答えようがない)。
