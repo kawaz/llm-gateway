@@ -11,4 +11,3 @@
 | 2026-09-08 | request | open | [keepalive-daily-counters](./2026-09-08-keepalive-daily-counters.md) | keepalive ping の実発火回数を日別に永続化する |
 | 2026-09-07 | request | open | [stats-per-session-and-subagent](./2026-09-07-stats-per-session-and-subagent.md) | stats / event で subagent 別・effort 別のコストを分離できるようにする (ccmsg からの要望) |
 | 2026-09-03 | tech-memo | open | [oauth-requires-claude-code-shape](./2026-09-03-oauth-requires-claude-code-shape.md) | サブスク OAuth 経路は Claude Code の形をしていない request を 429 "Error" で弾く (真因と対応候補) |
-| 2026-09-12 | bug | wip | [replay-stats-record-passes-millis-as-seconds](./2026-09-12-replay-stats-record-passes-millis-as-seconds.md) | replay の自送信が stats.record() にミリ秒を渡し日付が壊れる |

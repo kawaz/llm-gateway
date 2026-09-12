@@ -1,6 +1,6 @@
 ---
 title: replay の自送信が stats.record() にミリ秒を渡し日付が壊れる
-status: wip
+status: resolved
 category: bug
 created: 2026-09-12T20:02:14+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-12T20:23:12+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-12T20:32:31+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: v0.46.1 で修正・リリース (commit eb27cba3 + Release a34e72b2)","done: 両 unit・監督者を 0.46.1 に更新済み","done: 起動時修復で5桁年ファイル219件を本来の日へ吸収、残0件を実機確認"]
 blocked_by:
 origin: DR-0027 段階 A の hit 率確認中に発見
 ---
