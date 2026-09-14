@@ -1,6 +1,6 @@
 ---
 title: replay store の置き場が合図方式の見張り置き場と衝突している
-status: open
+status: resolved
 category: bug
 created: 2026-09-11T00:01:47+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-14T17:02:10+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:v0.48.0 (DR-0027 段階 B) で合図方式の見張り置き場を撤去、keepalive/ は自送信専用化", "done:起動スキャンは <session>.<prefix>.json のみ拾う", "runbook/2026-09-14-retire-signal-keepalive", "done:旧ファイル 127-0-0-1-*.json は runbook手順で2026-09-14削除済み、WARNなし実機確認"]
 blocked_by:
 origin: 自リポ TODO
 ---
