@@ -622,19 +622,51 @@ mod tests {
     /// 送られた本文を控える偽の upstream。
     struct FakeUpstream {
         seen: Mutex<Vec<Value>>,
+        /// 何本目がいつ送られたか (壁時計の Unix ミリ秒)。
+        ///
+        /// 「起点が再送の瞬間へ移った」を確かめるには、その瞬間そのものが
+        /// 要る。試験の側で時計を読み直すと、読んだ時刻と実装が読んだ時刻の
+        /// どちらが先かは実行速度次第になる。
+        at_ms: Mutex<Vec<i64>>,
         answer: Mutex<Outcome>,
+        /// ここまでに送った本数。待つ側はこれが増えるのを待つ。
+        count: tokio::sync::watch::Sender<usize>,
     }
 
     impl FakeUpstream {
         fn new(answer: Outcome) -> Arc<Self> {
             Arc::new(Self {
                 seen: Mutex::new(Vec::new()),
+                at_ms: Mutex::new(Vec::new()),
                 answer: Mutex::new(answer),
+                count: tokio::sync::watch::channel(0).0,
             })
         }
 
         fn sent(&self) -> Vec<Value> {
             self.seen.lock().unwrap().clone()
+        }
+
+        /// `nth` 本目が出るまで待って、それが出た時刻を返す。
+        ///
+        /// 待ち方は数えるのではなく知らせで ([`tokio::sync::watch`])。予定の
+        /// task が走る前に読みに行くと、「起点が動いていない」と「まだ送って
+        /// いない」が同じ姿になって見分けが付かない。
+        ///
+        /// 出ないまま止まったら待ち続けずに落とす。時計は止めてあるので、この
+        /// 上限は実時間を使わずに効く (何も走っていなければ tokio が自分で
+        /// 時計を進める)。
+        async fn until_sent(&self, nth: usize) -> i64 {
+            let mut watching = self.count.subscribe();
+            tokio::time::timeout(Duration::from_secs(60), async {
+                watching
+                    .wait_for(|count| *count >= nth)
+                    .await
+                    .expect("the upstream is still there");
+            })
+            .await
+            .unwrap_or_else(|_| panic!("replay #{nth} never went out"));
+            self.at_ms.lock().unwrap()[nth - 1]
         }
     }
 
@@ -642,9 +674,29 @@ mod tests {
         fn send<'a>(&'a self, kept: &'a Kept) -> BoxFuture<'a, Outcome> {
             Box::pin(async move {
                 self.seen.lock().unwrap().push(body_to_send(kept));
+                self.at_ms.lock().unwrap().push(now_unix_ms());
+                self.count.send_modify(|count| *count += 1);
                 *self.answer.lock().unwrap()
             })
         }
+    }
+
+    /// 取り消しの知らせが出るまで待って、それを返す。
+    ///
+    /// 時計は止めてあるので、上限は実時間を使わずに効く。
+    async fn until_withdrawn(
+        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
+    ) -> events::CacheExpired {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match watching.recv().await.expect("the event bus is still there") {
+                    events::Notice::CacheExpired(expired) => return expired,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("a withdrawal was published")
     }
 
     /// いつでも通る経路。
@@ -656,6 +708,13 @@ mod tests {
             Box::pin(async move { open })
         }
     }
+
+    /// 試験で使う「ひと昔前」。
+    ///
+    /// 止めた時計の下では実時計が進まないので、時刻が動いたかどうかは実行速度
+    /// 次第の数ミリ秒でしか出ない。起点をこれだけ過去へ置くと、動いた / 動か
+    /// ないの差が実時間と無関係に付く。
+    const LONG_AGO: Duration = Duration::from_secs(10 * 60);
 
     fn series() -> Series {
         Series {
@@ -717,7 +776,7 @@ mod tests {
         assert!(upstream.sent().is_empty(), "nothing goes out right away");
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        upstream.until_sent(1).await;
 
         let sent = upstream.sent();
         assert_eq!(sent.len(), 1, "one replay went out");
@@ -741,38 +800,60 @@ mod tests {
         assert!(upstream.sent().is_empty(), "the replay never came due");
     }
 
-    /// 繋いだ 1 本は、次の 55 分へまた繋がる。
+    /// 繋いだ 1 本は、次の 55 分へまた繋がる。起点は動かさない。
+    ///
+    /// 起点を**意図的に過去へ**置いて始める。繋がった 1 本は連鎖を数え直さない
+    /// ので、起点はその古い時刻のまま残るはず — 実時間が進んだかどうかに
+    /// 関係なく、ぴたり一致で確かめられる ([`a_rewrite_starts_the_chain_over`]
+    /// が確かめる「動く」側の対。両方を実時計の進みに頼らず書く)。
     #[tokio::test(start_paused = true)]
     async fn a_hit_leads_to_the_next_one() {
         let dir = tempfile::tempdir().unwrap();
         let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
-        keepalive.armed_by_request(sent(now_unix_ms()));
-        for _ in 0..3 {
+        let started = now_unix_ms() - LONG_AGO.as_millis() as i64;
+        keepalive.armed_by_request(sent(started));
+        for nth in 1..=3 {
             tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
+            upstream.until_sent(nth).await;
         }
         assert_eq!(upstream.sent().len(), 3, "it kept going");
         let kept = keepalive.store.load(&series()).unwrap();
         assert_eq!(kept.count, 3, "each replay is counted");
+        assert_eq!(
+            kept.since_ms, started,
+            "and the origin stays at the last real request"
+        );
     }
 
     /// 書き直しになったら、連鎖はそこから数え直す。
+    ///
+    /// 起点を**意図的に過去へ**置いて始める。時計は止めてあるので、実時計は
+    /// 55 分進めても動かない (測って 0 ミリ秒) — 「今」を起点にすると、起点が
+    /// 動いたかどうかが試験の実行速度に懸かる。古い起点から始めれば、動いた
+    /// 側は [`LONG_AGO`] ぶん離れる。
     #[tokio::test(start_paused = true)]
     async fn a_rewrite_starts_the_chain_over() {
         let dir = tempfile::tempdir().unwrap();
         let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Written));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
-        let started = now_unix_ms();
+        let started = now_unix_ms() - LONG_AGO.as_millis() as i64;
         keepalive.armed_by_request(sent(started));
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        let rewritten_at = upstream.until_sent(1).await;
 
         let kept = keepalive.store.load(&series()).unwrap();
         assert_eq!(kept.count, 0, "the chain is counted from the rewrite");
-        assert!(kept.since_ms > started, "the origin moved to the rewrite");
+        assert!(
+            kept.since_ms >= rewritten_at,
+            "the origin moved to the moment of the rewrite"
+        );
+        assert!(
+            kept.since_ms > started,
+            "so it no longer sits at the request that was replaced"
+        );
     }
 
     /// 乗るものが無かった系列は、そこで畳む (DR-0027 決定 8)。
@@ -795,7 +876,7 @@ mod tests {
 
         keepalive.armed_by_request(sent(now_unix_ms()));
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        upstream.until_sent(1).await;
 
         assert_eq!(upstream.sent().len(), 1, "one replay went out");
         assert_eq!(
@@ -827,9 +908,9 @@ mod tests {
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         keepalive.armed_by_request(sent(now_unix_ms()));
-        for _ in 0..2 {
+        for nth in 1..=2 {
             tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
+            upstream.until_sent(nth).await;
         }
         assert_eq!(upstream.sent().len(), 2, "it kept going");
         assert!(
@@ -876,7 +957,8 @@ mod tests {
         keepalive.store.save(&kept);
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        // 何も送らずに畳む場面なので、待つ相手は送信ではなく取り消しの知らせ。
+        let expired = until_withdrawn(&mut watching).await;
 
         assert!(
             upstream.sent().is_empty(),
@@ -887,14 +969,9 @@ mod tests {
             None,
             "the series was dropped"
         );
-        match watching.try_recv().expect("a withdrawal was published") {
-            events::Notice::CacheExpired(expired) => {
-                assert_eq!(expired.kind, events::CacheExpired::KIND);
-                assert_eq!(expired.of, "promise-1", "it names the promise it withdrew");
-                assert_eq!(expired.prefix, series().prefix);
-            }
-            other => panic!("expected a withdrawal, got {}", other.name()),
-        }
+        assert_eq!(expired.kind, events::CacheExpired::KIND);
+        assert_eq!(expired.of, "promise-1", "it names the promise it withdrew");
+        assert_eq!(expired.prefix, series().prefix);
     }
 
     /// 期間が尽きた系列は黙って畳む (最後の 1 本が置いた cache はまだ生きている)。
@@ -996,7 +1073,7 @@ mod tests {
         assert_eq!(after.armed(), 1, "the kept series came back");
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        upstream.until_sent(1).await;
         assert_eq!(upstream.sent().len(), 1, "it replayed on the old schedule");
     }
 
