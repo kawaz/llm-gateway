@@ -181,16 +181,15 @@ pub struct Completion {
     pub cache: Option<Arc<dyn CacheWitness>>,
 }
 
-/// この 1 本の cache がどうなったかを受け取る先 (DR-0024 §2 追補、DR-0027 決定 8)。
+/// この 1 本の cache がどうなったかを受け取る先 (DR-0027 決定 8)。
 ///
 /// 結果が分かるのは応答の usage を読み終えた時点だが、そこ
-/// ([`crate::exchange`]) は会話の系列も見張りも知らない。知っている側
-/// (gateway) が、この 1 本の系列を捕まえた実装を持たせる。
+/// ([`crate::exchange`]) は会話の系列を知らない。知っている側 (gateway) が、
+/// この 1 本の系列を捕まえた実装を持たせる。
 ///
 /// 渡すのは読めた語そのもので、どの語に反応するかは受け取る側が決める —
-/// 見張り (`keepalive`) は書き直し (`written`) だけを見て連鎖を数え直し、
-/// 送り直し (`replay`) は cache に乗ったかどうか ([`events::Cache::on_cache`])
-/// で控えるかを決める。
+/// keepalive は cache に乗ったかどうか ([`events::Cache::on_cache`]) で、
+/// この 1 本を控えるかを決める (DR-0027 決定 8)。
 pub trait CacheWitness: Send + Sync {
     /// この 1 本の cache の結果が出た。
     ///
@@ -1140,8 +1139,6 @@ mod tests {
             model: "claude-opus-5",
             credential: "personal",
             origin: "main",
-            keepalive: None,
-            cache_paused: false,
             chain: None,
             breakeven: None,
             cache_ttl_secs: None,

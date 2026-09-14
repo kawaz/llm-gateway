@@ -45,9 +45,6 @@ pub struct Event {
     /// この 1 本が残すプレフィックスの寿命 (秒)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_ttl_secs: Option<u64>,
-    /// cache の合図の戻りだったときの扱い (`applied` / `late`)。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub keepalive: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -202,7 +199,6 @@ mod tests {
             origin: "main".into(),
             cache_strategy: None,
             cache_ttl_secs: None,
-            keepalive: None,
             request_body: Some("abcdef".into()),
             response_body: Some("uvwxyz".into()),
         }

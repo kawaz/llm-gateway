@@ -735,7 +735,7 @@ impl Router {
     /// この namespace / モデルで、その経路を今も使えるか (DR-0024 §2)。
     ///
     /// 候補に居ること (namespace が許し、upstream が扱う) と、締め出しにも
-    /// pace にも掛かっていないことの両方を見る。合図を出す前の確認に使う —
+    /// pace にも掛かっていないことの両方を見る。送り直す前の確認に使う —
     /// 直前に通った経路が塞がっていれば、その会話は別の credential へ流れ、
     /// 延ばしたい cache には届かない。
     pub async fn usable(&self, ns_name: &str, model: &str, name: &str, now: i64) -> bool {
@@ -1099,8 +1099,6 @@ spend_down_within = "25%"
             ns: NS,
             model,
             credential: crate::stats::NO_CREDENTIAL,
-            keepalive: None,
-            cache_paused: false,
             chain: None,
             breakeven: None,
             origin: crate::provider::RequestOrigin::Unknown.as_str(),

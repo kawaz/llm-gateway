@@ -6,8 +6,6 @@
 //! ```toml
 //! [server]
 //! listen = "127.0.0.1:11300"
-//! # 対称に動く一式を、自分を含めて書く (keepalive の停止を渡す先)
-//! # peers = ["127.0.0.1:11301", "127.0.0.1:11302"]
 //!
 //! [store]
 //! type = "file"
@@ -439,13 +437,12 @@ pub enum CacheStrategy {
     FiveMinutes,
     #[serde(rename = "1h")]
     OneHour,
-    Keepalive,
     /// 1h + 自送信で継ぎ足す (DR-0027)。
     ///
     /// 本文の扱いは `1h` と同じ。違うのは、会話が止まったときに **gateway が
     /// 最後に転送した本文をそのまま送り直して** cache を繋ぐこと。会話を
     /// 起こさないので、届け先も戻りも要らず、subagent にも当てられる。
-    Replay,
+    Keepalive,
 }
 
 impl CacheStrategy {
@@ -456,7 +453,6 @@ impl CacheStrategy {
             Self::FiveMinutes => "5m",
             Self::OneHour => "1h",
             Self::Keepalive => "keepalive",
-            Self::Replay => "replay",
         }
     }
 }
@@ -480,11 +476,11 @@ pub struct CacheRule {
 /// 範囲。
 pub const DEFAULT_KEEPALIVE_HORIZON: Duration = Duration::from_secs(8 * 60 * 60);
 
-/// 合図を出し続ける上限の書き方 (DR-0024 §3)。
+/// 送り直し続ける上限の書き方 (DR-0024 §3)。
 ///
 /// 時間で直接書く (`"12h"`) か、**分岐時間に対する比率**で書く (`0.3`)。
 /// 分岐時間はモデルの単価で決まる — 1 時間 write が cache read の何倍かに
-/// 合図の間隔 (55 分) を掛けたところで、合図を出し続ける費用が再構築 1 回に
+/// 送り直しの間隔 (55 分) を掛けたところで、送り直し続ける費用が再構築 1 回に
 /// 追いつく。比率で書くと、単価の違うモデルに同じ判断基準を当てられる。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeepaliveHorizon {
@@ -494,7 +490,7 @@ pub enum KeepaliveHorizon {
     Ratio(f64),
 }
 
-/// 合図を出す間隔。分岐時間はこの間隔で ping を打ち続ける前提で決まる。
+/// 送り直す間隔。分岐時間はこの間隔で ping を打ち続ける前提で決まる。
 const KEEPALIVE_INTERVAL_SECS: f64 = 55.0 * 60.0;
 
 /// 1 時間 cache の write は input の何倍か (Anthropic の課金区分)。
@@ -503,9 +499,9 @@ const ONE_HOUR_WRITE_MULTIPLIER: f64 = 2.0;
 impl KeepaliveHorizon {
     /// このモデルでの上限。比率指定で単価が分からなければ `None`。
     ///
-    /// 比率の基準になる分岐時間は「合図を出し続ける費用が、cache を作り直す
+    /// 比率の基準になる分岐時間は「送り直し続ける費用が、cache を作り直す
     /// 費用に追いつく点」。プレフィックス全量を 1 時間 write で書き直す費用を、
-    /// 同じ量の read (= 合図 1 回) で割ると何回ぶんかが出る。
+    /// 同じ量の read (= 送り直し 1 回) で割ると何回ぶんかが出る。
     pub fn resolve(self, pricing: Option<&Pricing>) -> Option<Duration> {
         let ratio = match self {
             Self::Fixed(duration) => return Some(duration),
@@ -713,15 +709,6 @@ pub struct Server {
     #[serde(default)]
     pub disabled: bool,
 
-    /// LB の後ろで対称に動く gateway 一式の住所 (DR-0024 §2 追補)。
-    ///
-    /// **自分を含めて書く**。両プロセスの設定を `listen` 以外そっくり同じに
-    /// 保つためで、自分の分は [`Self::siblings`] が住所で外す。ここに書いた
-    /// 相手へ渡るのは keepalive の停止だけ — 転送も経路選定も、これまで
-    /// どおり互いの存在を知らないまま進む。
-    #[serde(default)]
-    pub peers: Vec<String>,
-
     /// この設定を走らせる実行ファイル (DR-0028 決定 2)。
     ///
     /// `daemon add` が登録簿へ焼き込む値の元。書かなければ、登録した時点の
@@ -731,33 +718,11 @@ pub struct Server {
     pub binary_path: Option<PathBuf>,
 }
 
-impl Server {
-    /// 自分を除いた兄弟の住所。
-    ///
-    /// 見るのは host:port だけ。`http://127.0.0.1:11301` と
-    /// `127.0.0.1:11301` を書き分ける理由は無いので、どちらでも同じ 1 つと
-    /// して扱う。
-    pub fn siblings(&self) -> Vec<&str> {
-        self.peers
-            .iter()
-            .filter(|peer| authority_of(peer) != authority_of(&self.listen))
-            .map(String::as_str)
-            .collect()
-    }
-}
-
-/// 住所から host:port だけを取り出す。
-fn authority_of(url: &str) -> &str {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    rest.split(['/', '?', '#']).next().unwrap_or(rest)
-}
-
 impl Default for Server {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             disabled: false,
-            peers: Vec::new(),
             binary_path: None,
         }
     }
@@ -1222,11 +1187,6 @@ impl Config {
                     "namespace `{ns_name}` cache[{i}] does not specify models"
                 )));
             }
-            if rule.sub == CacheStrategy::Keepalive {
-                return Err(Error::Config(format!(
-                    "namespace `{ns_name}` cache[{i}] cannot use keepalive for sub requests"
-                )));
-            }
         }
         for (i, rule) in ns.routing.iter().enumerate() {
             if rule.models.is_empty() {
@@ -1336,35 +1296,6 @@ impl Config {
             })
             .map(String::as_str)
             .collect()
-    }
-
-    /// 合図の届け先を持たないまま `keepalive` を書いた namespace (DR-0024 §2)。
-    ///
-    /// 合図は受け口 (DR-0012) 経由でしか会話へ届かない。設定として矛盾しては
-    /// いない (受け口を後から足せば動く) ので拒まないが、書いた人の意図どおり
-    /// には動かないので名前を挙げる。
-    pub fn keepalive_without_destination(&self) -> Vec<&str> {
-        if !self.destinations_are_empty() {
-            return Vec::new();
-        }
-        self.namespaces
-            .iter()
-            .filter(|(_, ns)| {
-                ns.cache
-                    .iter()
-                    .any(|rule| rule.main == CacheStrategy::Keepalive)
-            })
-            .map(|(name, _)| name.as_str())
-            .collect()
-    }
-
-    /// 知らせの届け先が 1 つも無いか。
-    ///
-    /// 受け口は 2 通りの書き方があるので ([`Webhook::base_url`] /
-    /// [`Webhook::base_urls`])、片方だけを見ると書いてあるのに「無い」と
-    /// 言うことになる。数えるのは解決した後の送り先。
-    fn destinations_are_empty(&self) -> bool {
-        self.webhook.destinations().0.is_empty()
     }
 
     /// 比率で書いた `keepalive_horizon` のうち、単価が分からず既定へ落ちるもの。
@@ -2645,87 +2576,23 @@ base_urls = []",
             ns(&original).routes_for("claude-fable-5", &original)
         );
     }
-    /// 合図の届け先は、`base_url` でも `base_urls` でも「書いてある」。
+    /// `keepalive` は sub にも書ける (DR-0027 決定 5)。
     ///
-    /// 片方だけを見ると、`base_urls` で書いた受け口が見えず「届け先が無い」と
-    /// 言ってしまう (= keepalive を黙って止める)。
+    /// 送るのは gateway 自身なので、応答を返す相手を当てにしない — 呼ばれた
+    /// きり黙る subagent でも成立する。
     #[test]
-    fn a_destination_counts_however_it_was_written() {
-        let with = |webhook: &str| {
-            let source = format!(
-                r#"
-{webhook}
-
-[[ns.default.cache]]
-models = ["*"]
-main = "keepalive"
-"#
-            );
-            parse(&source)
-                .unwrap()
-                .keepalive_without_destination()
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<String>>()
-        };
-
-        assert!(with("[webhook]\nbase_url = \"http://127.0.0.1:8642\"").is_empty());
-        assert!(
-            with("[webhook]\nbase_urls = [\"http://127.0.0.1:8642\"]").is_empty(),
-            "a destination written only as a list is a destination"
-        );
-        assert_eq!(with(""), vec!["default".to_owned()]);
-        assert_eq!(
-            with("[webhook]\nbase_urls = []"),
-            vec!["default".to_owned()]
-        );
-    }
-    /// 自送信 (`replay`) は sub にも書ける (DR-0027 決定 5)。
-    ///
-    /// 合図方式と違い、応答を返す相手を当てにしない — 送るのは gateway 自身
-    /// なので、合図を返さない subagent でも成立する。
-    #[test]
-    fn sub_may_ask_for_replay_but_not_for_the_signal() {
-        let replay = parse(
-            r#"
-[[ns.work.cache]]
-models = ["*"]
-sub = "replay"
-"#,
-        );
-        assert_eq!(
-            replay.unwrap().namespace("work").unwrap().cache[0].sub,
-            CacheStrategy::Replay
-        );
-
-        let signal = parse(
+    fn sub_may_ask_for_keepalive_too() {
+        let config = parse(
             r#"
 [[ns.work.cache]]
 models = ["*"]
 sub = "keepalive"
 "#,
-        );
-        assert!(
-            signal.is_err(),
-            "the signal needs a session to answer it; sub cannot"
-        );
-    }
-
-    /// 自送信は届け先を要らない。書いていなくても警告しない。
-    #[test]
-    fn replay_needs_no_webhook_destination() {
-        let config = parse(
-            r#"
-[[ns.work.cache]]
-models = ["*"]
-main = "replay"
-"#,
         )
         .unwrap();
-
-        assert!(
-            config.keepalive_without_destination().is_empty(),
-            "nothing has to receive a replay; the gateway sends it itself"
+        assert_eq!(
+            config.namespace("work").unwrap().cache[0].sub,
+            CacheStrategy::Keepalive
         );
     }
 }
@@ -2842,39 +2709,6 @@ main = "keepalive"
         assert_eq!(
             rules[3].keepalive_horizon, None,
             "unwritten stays unwritten; the default applies where it is read"
-        );
-    }
-
-    /// 兄弟の一覧は自分を含めて書き、自分の分は住所で外れる。
-    ///
-    /// 両プロセスの設定を `listen` 以外そっくり同じに保つための書き方なので、
-    /// 頭に scheme が付いていても、末尾に `/` が付いていても同じ 1 つと見る。
-    #[test]
-    fn a_gateway_leaves_itself_out_of_its_peers() {
-        let server = |listen: &str, peers: &[&str]| Server {
-            listen: listen.to_owned(),
-            disabled: false,
-            peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
-            ..Server::default()
-        };
-
-        assert_eq!(
-            server(
-                "127.0.0.1:11301",
-                &["127.0.0.1:11301", "http://127.0.0.1:11302"],
-            )
-            .siblings(),
-            ["http://127.0.0.1:11302"]
-        );
-        assert!(
-            server("127.0.0.1:11301", &["http://127.0.0.1:11301/"])
-                .siblings()
-                .is_empty(),
-            "the same address, written the other way"
-        );
-        assert!(
-            server("127.0.0.1:11301", &[]).siblings().is_empty(),
-            "a lone gateway has no one to tell"
         );
     }
 

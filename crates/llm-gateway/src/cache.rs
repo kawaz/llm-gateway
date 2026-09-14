@@ -9,7 +9,6 @@
 //! どの試行でも同じ本文になる。
 
 pub mod keepalive;
-pub mod replay;
 
 use serde_json::{Map, Value};
 
@@ -40,7 +39,7 @@ pub fn strategy_of(rule: &CacheRule, origin: RequestOrigin) -> CacheStrategy {
 /// 戦略どおりに `cache_control` を整える。
 ///
 /// `keepalive` の本文は `1h` と同じに整える。違うのは、会話が止まったときに
-/// 合図を出して cache を継ぎ足すかどうかだけ (DR-0024 §2)。
+/// gateway 自身が送り直して cache を継ぎ足すかどうかだけ (DR-0027)。
 pub fn apply(body: &mut Value, strategy: CacheStrategy) {
     match strategy {
         CacheStrategy::Passthrough => {}
@@ -52,9 +51,7 @@ pub fn apply(body: &mut Value, strategy: CacheStrategy) {
                 control.remove("ttl");
             }
         }),
-        CacheStrategy::OneHour | CacheStrategy::Keepalive | CacheStrategy::Replay => {
-            apply_one_hour(body)
-        }
+        CacheStrategy::OneHour | CacheStrategy::Keepalive => apply_one_hour(body),
     }
 }
 
@@ -84,9 +81,7 @@ pub fn ttl_secs(strategy: Option<CacheStrategy>, body: &Value) -> Option<u64> {
     match strategy {
         Some(CacheStrategy::None) => None,
         Some(CacheStrategy::FiveMinutes) => Some(FIVE_MINUTES),
-        Some(CacheStrategy::OneHour | CacheStrategy::Keepalive | CacheStrategy::Replay) => {
-            Some(ONE_HOUR)
-        }
+        Some(CacheStrategy::OneHour | CacheStrategy::Keepalive) => Some(ONE_HOUR),
         Some(CacheStrategy::Passthrough) | None => {
             let mut longest = None;
             visit(&mut body.clone(), &mut |holder| {
@@ -222,7 +217,7 @@ mod tests {
 
     /// `1h` は全ブレークポイントに 1 時間を書く。無い場所には付けない。
     ///
-    /// `keepalive` の本文も同じ — 違うのは合図を出すかどうかだけ (DR-0024 §2)。
+    /// `keepalive` の本文も同じ — 違うのは送り直すかどうかだけ (DR-0027)。
     #[test]
     fn one_hour_marks_every_existing_breakpoint() {
         for strategy in [CacheStrategy::OneHour, CacheStrategy::Keepalive] {

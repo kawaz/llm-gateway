@@ -1,166 +1,276 @@
-//! 見張りを再起動を跨いで残す置き場 (DR-0024 §2)。
+//! 系列ごとに「最後に転送した 1 本」を置く (DR-0027 決定 3)。
 //!
-//! keepalive の見張りはプロセス内のメモリにある。動いている会話なら次の
-//! リクエストで張り直されるが、**止まっている会話は誰も張り直さない** —
-//! そこを繋ぐのが keepalive の仕事なので、リリースのたびに全部落とすと
-//! 意味がない。
+//! **ここに載るのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグも
+//! 暗号化もマスキングも持たない — 同じホストにはセッションの transcript が
+//! 丸ごと置いてあり、tap (DR-0017) からも本文は読めるので、ここだけに保護の
+//! 儀式を足しても守られるものは増えない。置き場を配る・共有するときは、
+//! 会話の中身がそのまま入っている前提で扱う。
 //!
-//! 置き場と書き方は日次集計 ([`crate::stats`]) と同じ流儀にする — 同じ
-//! ディレクトリに**待ち受けごとのファイル**を持ち、一時ファイルへ書いてから
-//! 差し替える (DR-0011)。同じ置き場を共有する別プロセスの分を上書きしない。
+//! 置き場は待ち受けごとに分けない。11301 と 11302 は**同じファイルを共有**し、
+//! 脇の `.lock` を掴んだ 1 台だけが撫でる (DR-0010 と同型)。送るのは gateway が
+//! 自分で出す 1 本なので、ファイルの排他がそのまま重複防止になる。
+//!
+//! 書き方は他の置き場と同じ流儀 — 一時ファイルへ書いてから rename する
+//! ([`write_atomically`], DR-0011)。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::persist::{sanitize_writer, write_atomically};
+use crate::egress::RequestShape;
+use crate::persist::write_atomically;
 
-/// 残しておく 1 系列。時刻は Unix 秒 (単調時計は保存できない)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Saved {
+/// 1 系列に持たせてよい本文の大きさ (バイト)。
+///
+/// 30K トークンのプレフィックスで 200KB 前後、道具と system を厚く積んだ
+/// 会話でも 1MB を大きくは超えない。8MB はその 1 桁上に置いた蓋で、ここを
+/// 超える系列は**保持しない** = 延命しない。置き場全体に上限を掛けないのは、
+/// 系列の数は会話の数で頭打ちになり、1 本ずつの蓋があれば総量も抑えられる
+/// ため (DR-0027「未確定」への回答)。
+pub const BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// 系列 1 つ分の控え。時刻は全て Unix ミリ秒 (単調時計は保存できない)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Kept {
     pub session_id: String,
     pub prefix: String,
     pub ns: String,
+    /// 解決後の実モデル名 (クライアントが名乗った短い名前ではない)。
     pub model: String,
+    /// 直前の実リクエストが通った経路の名前。
     pub route: String,
-    /// 次に合図を出す予定の時刻。
-    pub fires_at: i64,
-    /// この系列の cache が消える時刻。過ぎていれば張り直す意味がない。
-    pub expires_at: i64,
-    /// 合図を出し続ける期間の終わり。
-    pub horizon_end: i64,
-    /// この連鎖の起点 (最後に来た実リクエストの時刻、Unix ミリ秒)。
-    ///
-    /// ここだけミリ秒なのは、知らせに出す `ts` と同じ値を欠けさせずに
-    /// 持ち回るため (他の時刻は見張りの都合だけに使うので秒で足りる)。
-    /// 起点を持たないファイルでは 0 になり、読み戻す側が予定から起こし直す。
-    #[serde(default)]
+    /// 送出直前の本文。認証の差し替えとモデル名の書き換えを済ませた形。
+    pub body: Value,
+    /// 送出直前のヘッダ。**認証は入っていない** — 認証は経路が送るときに
+    /// 付け直すので、控えに持つと古い token を持ち回ることになる。
+    pub headers: Vec<(String, String)>,
+    pub path: String,
+    pub query: Option<String>,
+    pub shape: RequestShape,
+    /// 次に送り直す予定の時刻。
+    pub fires_at_ms: i64,
+    /// この系列の cache が消える時刻。過ぎていれば送っても繋ぐものが無い。
+    pub expires_at_ms: i64,
+    /// 送り直し続ける期間の終わり。延ばせるのは実リクエストだけ。
+    pub horizon_end_ms: i64,
+    /// この連鎖の起点 = 最後に来た実リクエストを送った時刻。
     pub since_ms: i64,
-    /// ここまでに出した合図の本数。
+    /// ここまでに送り直した本数。
     #[serde(default)]
     pub count: u32,
-    /// 自分が出す番か ([`Kind::Primary`])、別のプロセスの後ろに控えているか。
-    pub kind: Kind,
     /// この系列について最後に約束した寿命の id (`cache_notice`、DR-0012)。
-    ///
-    /// 落ちている間に cache が消えていたら、読み戻した側が取り消し
-    /// (`cache_expired`) を出す。どの約束を取り消すのかはこの id で指す。
-    /// 約束を出していない系列 (控え) や、この欄を持たないファイルでは `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub promised: Option<String>,
+    pub cache_notice: Option<String>,
 }
 
-/// 合図を止めてある会話 1 つ。
-///
-/// 止めたのは人の意思なので、再起動で解けては困る。解くのは
-/// **その会話から実リクエストが来たとき**だけ (DR-0024 §2 追補)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Paused {
+/// 系列を指す鍵。ファイル名にもなる。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Series {
     pub session_id: String,
-    /// 止めた時刻。ここから離れすぎた停止は、起動時に捨てる。
-    pub paused_at: i64,
+    pub prefix: String,
 }
 
-/// 置き場に書く一式。
-///
-/// 見張りと停止は同じ待ち受けの持ち物なので、1 ファイルにまとめて 1 回で
-/// 差し替える。別ファイルにすると、片方だけ書けた状態が生まれる。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Kept {
-    #[serde(default)]
-    pub watched: Vec<Saved>,
-    #[serde(default)]
-    pub paused: Vec<Paused>,
-}
-
-/// 読み込むときだけ、見張りの配列だけが書かれた形も受ける。
-///
-/// 停止を持たなかった頃に書かれたファイルが手元に残っている。読めなければ
-/// 止まっている会話の見張りを 1 世代ぶん落とすことになるので、両方受ける。
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Read {
-    Kept(Kept),
-    Watched(Vec<Saved>),
-}
-
-impl From<Read> for Kept {
-    fn from(read: Read) -> Self {
-        match read {
-            Read::Kept(kept) => kept,
-            Read::Watched(watched) => Kept {
-                watched,
-                paused: Vec::new(),
-            },
-        }
+impl Series {
+    /// ファイル名 (拡張子なし)。
+    ///
+    /// 会話の id は client が名乗るものなので、区切りやパスに使える文字が
+    /// 混ざりうる。英数字以外を潰したうえで、潰した結果が衝突しないよう
+    /// **prefix を後ろに付ける** — prefix はこちらが本文から作る 16 進なので
+    /// そのまま名前に使える。
+    fn stem(&self) -> String {
+        let cleaned: String = self
+            .session_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let trimmed = cleaned.trim_matches('-');
+        let session = if trimmed.is_empty() {
+            "unknown"
+        } else {
+            trimmed
+        };
+        format!("{session}.{}", self.prefix)
     }
 }
 
-/// 見張りの立ち位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    Primary,
-    Standby,
+/// この名前は自分が置いたものか ([`Series::stem`] の形をしているか)。
+///
+/// 置き場は他の書き手も使う。拾うのは `<会話>.<prefix>` の形をした名前だけで、
+/// それ以外は読まずに飛ばす — 読めば「壊れている」と警告することになり、
+/// 自分のものでないファイルについて毎回 1 行吐く。
+fn is_ours(stem: &str) -> bool {
+    let Some((session, prefix)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    !session.is_empty()
+        && !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_hexdigit())
+        && session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-impl Kind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Primary => "primary",
-            Self::Standby => "standby",
-        }
-    }
-}
-
-/// 待ち受けごとの 1 ファイル。
+/// 系列の控えを置くディレクトリ 1 つ。
 pub struct Store {
-    path: PathBuf,
+    dir: PathBuf,
+}
+
+/// 掴んでいる間だけ、この系列を撫でてよい ([`Store::claim`])。
+///
+/// 落とすと flock が外れ、待っている兄弟が掴めるようになる。
+pub struct Claim {
+    _file: std::fs::File,
 }
 
 impl Store {
-    /// 日次集計と同じ置き場の下に、待ち受けごとのファイルを持つ。
-    pub fn new(dir: impl Into<PathBuf>, listen: &str) -> Self {
+    /// 日次集計と同じ置き場の下、`keepalive/` に系列ごとのファイルを持つ。
+    pub fn new(dir: impl AsRef<Path>) -> Self {
         Self {
-            path: dir
-                .into()
-                .join("keepalive")
-                .join(format!("{}.json", sanitize_writer(listen))),
+            dir: dir.as_ref().join("keepalive"),
         }
     }
 
-    /// 前回の見張り。読めなければ空から始める。
+    fn path_of(&self, series: &Series) -> PathBuf {
+        self.dir.join(format!("{}.json", series.stem()))
+    }
+
+    fn lock_path_of(&self, series: &Series) -> PathBuf {
+        self.dir.join(format!("{}.lock", series.stem()))
+    }
+
+    /// この系列を撫でる権利を掴む。**兄弟が掴んでいれば `None`**。
     ///
-    /// 読めないことは転送を止める理由にならない — 失うのは止まっている会話の
-    /// 延長の機会だけで、次の実リクエストで張り直される。
-    pub fn load(&self) -> Kept {
-        let raw = match std::fs::read(&self.path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Kept::default(),
+    /// 待たないのは、待って掴めた頃には相手が送り終えているため — その系列は
+    /// 既に延びていて、こちらが続けて送る理由が無い。
+    ///
+    /// `.lock` は消さない。消して作り直すと、掴んでいる側と後から来た側が別の
+    /// ファイルを見ることになり、締め出しが破れる (DR-0010 と同じ理由)。
+    pub fn claim(&self, series: &Series) -> Option<Claim> {
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            tracing::warn!(path = %self.dir.display(), %e, "cannot create the cache keepalive directory");
+            return None;
+        }
+        let path = self.lock_path_of(series);
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
             Err(e) => {
-                tracing::warn!(path = %self.path.display(), %e, "cannot read the saved cache keepalive watch");
-                return Kept::default();
+                tracing::warn!(path = %path.display(), %e, "cannot open the cache keepalive lock");
+                return None;
             }
         };
-        match serde_json::from_slice::<Read>(&raw) {
-            Ok(read) => read.into(),
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Some(Claim { _file: file }),
+            Err(rustix::io::Errno::WOULDBLOCK) => None,
             Err(e) => {
-                tracing::warn!(path = %self.path.display(), %e, "the saved cache keepalive watch is unreadable; starting empty");
-                Kept::default()
+                tracing::warn!(path = %path.display(), %e, "cannot take the cache keepalive lock");
+                None
             }
         }
     }
 
-    /// 今の見張りと停止を丸ごと書く。
-    pub fn save(&self, watched: &Kept) {
-        if let Some(dir) = self.path.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            tracing::warn!(path = %dir.display(), %e, "cannot create the cache keepalive directory");
-            return;
+    /// この系列の控え。無ければ `None`。
+    pub fn load(&self, series: &Series) -> Option<Kept> {
+        let path = self.path_of(series);
+        let raw = match std::fs::read(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), %e, "cannot read the kept request");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&raw) {
+            Ok(kept) => Some(kept),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), %e, "the kept request is unreadable; dropping it");
+                None
+            }
         }
-        if let Err(e) = write_atomically(&self.path, &watched) {
-            tracing::warn!(path = %self.path.display(), %e, "cannot save the cache keepalive watch");
+    }
+
+    /// 置いてある控えを全部読む。起動時に予定を張り直すために使う。
+    pub fn load_all(&self) -> Vec<Kept> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut all = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_none_or(|stem| !is_ours(stem))
+            {
+                continue;
+            }
+            match std::fs::read(&path).map(|raw| serde_json::from_slice::<Kept>(&raw)) {
+                Ok(Ok(kept)) => all.push(kept),
+                Ok(Err(e)) => {
+                    tracing::warn!(path = %path.display(), %e, "the kept request is unreadable; dropping it");
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), %e, "cannot read the kept request");
+                }
+            }
+        }
+        all
+    }
+
+    /// この系列の控えを書く。大きすぎる本文は**持たない** (= 延命しない)。
+    ///
+    /// 書けたかどうかを返す。書けなかったことは転送を止める理由にならない —
+    /// 失うのは止まった会話を繋ぐ機会だけ。
+    pub fn save(&self, kept: &Kept) -> bool {
+        let series = Series {
+            session_id: kept.session_id.clone(),
+            prefix: kept.prefix.clone(),
+        };
+        let size = match serde_json::to_vec(&kept.body) {
+            Ok(json) => json.len(),
+            Err(e) => {
+                tracing::warn!(%e, "cannot measure the request to keep");
+                return false;
+            }
+        };
+        if size > BODY_LIMIT {
+            tracing::info!(
+                session = %kept.session_id,
+                prefix = %kept.prefix,
+                bytes = size,
+                limit = BODY_LIMIT,
+                "this conversation is too large to keep; it will not be kept alive"
+            );
+            self.remove(&series);
+            return false;
+        }
+        if let Err(e) = std::fs::create_dir_all(&self.dir) {
+            tracing::warn!(path = %self.dir.display(), %e, "cannot create the cache keepalive directory");
+            return false;
+        }
+        let path = self.path_of(&series);
+        if let Err(e) = write_atomically(&path, kept) {
+            tracing::warn!(path = %path.display(), %e, "cannot keep the request for the next keepalive");
+            return false;
+        }
+        true
+    }
+
+    /// この系列の控えを捨てる。`.lock` は残す (掴んでいる相手が居る)。
+    pub fn remove(&self, series: &Series) {
+        let path = self.path_of(series);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %e, "cannot drop the kept request");
         }
     }
 }
@@ -169,27 +279,31 @@ impl Store {
 mod tests {
     use super::*;
 
-    fn saved(session: &str) -> Saved {
-        Saved {
+    fn series(session: &str) -> Series {
+        Series {
             session_id: session.to_owned(),
             prefix: "2cf24dba".to_owned(),
-            ns: "default".to_owned(),
-            model: "m".to_owned(),
-            route: "a".to_owned(),
-            fires_at: 1_800_003_300,
-            expires_at: 1_800_003_570,
-            horizon_end: 1_800_028_800,
-            since_ms: 1_800_000_000_000,
-            count: 2,
-            kind: Kind::Primary,
-            promised: None,
         }
     }
 
-    fn kept(watched: Vec<Saved>) -> Kept {
+    fn kept(session: &str, body: Value) -> Kept {
         Kept {
-            watched,
-            paused: Vec::new(),
+            session_id: session.to_owned(),
+            prefix: "2cf24dba".to_owned(),
+            ns: "default".to_owned(),
+            model: "claude-opus-5".to_owned(),
+            route: "a".to_owned(),
+            body,
+            headers: vec![("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned())],
+            path: "/v1/messages".to_owned(),
+            query: None,
+            shape: RequestShape::Messages,
+            fires_at_ms: 1_800_003_300_000,
+            expires_at_ms: 1_800_003_570_000,
+            horizon_end_ms: 1_800_028_800_000,
+            since_ms: 1_800_000_000_000,
+            count: 2,
+            cache_notice: Some("n-1".to_owned()),
         }
     }
 
@@ -197,58 +311,136 @@ mod tests {
     #[test]
     fn what_was_written_comes_back() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(dir.path(), "127.0.0.1:11301");
+        let store = Store::new(dir.path());
 
+        assert_eq!(store.load(&series("s-1")), None, "nothing is kept yet");
+
+        let written = kept("s-1", serde_json::json!({"messages": [{"role": "user"}]}));
+        assert!(store.save(&written));
+        assert_eq!(store.load(&series("s-1")), Some(written));
+    }
+
+    /// 系列ごとに別のファイル。同じ会話でも prefix が違えば別の控え。
+    #[test]
+    fn each_series_keeps_its_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
+        let mut other = kept("s-1", serde_json::json!({"a": 2}));
+        other.prefix = "ffffffff".to_owned();
+        store.save(&other);
+
+        assert_eq!(store.load(&series("s-1")).unwrap().body["a"], 1);
         assert_eq!(
-            store.load(),
-            Kept::default(),
-            "nothing has been written yet"
+            store
+                .load(&Series {
+                    session_id: "s-1".to_owned(),
+                    prefix: "ffffffff".to_owned(),
+                })
+                .unwrap()
+                .body["a"],
+            2
+        );
+    }
+
+    /// 上限を超えた本文は保持しない = その系列は延命しない。
+    #[test]
+    fn a_conversation_too_large_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+
+        let huge = serde_json::json!({ "text": "x".repeat(BODY_LIMIT + 1) });
+        assert!(!store.save(&kept("s-1", huge)));
+        assert_eq!(store.load(&series("s-1")), None);
+    }
+
+    /// 大きくなった系列は、それまでの控えごと落ちる。
+    ///
+    /// 残しておくと、伸びた会話のプレフィックスからとうに外れた古い本文を
+    /// 撫で続けることになる。
+    #[test]
+    fn growing_past_the_limit_drops_what_was_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+
+        assert!(store.save(&kept("s-1", serde_json::json!({"a": 1}))));
+        let huge = serde_json::json!({ "text": "x".repeat(BODY_LIMIT + 1) });
+        assert!(!store.save(&kept("s-1", huge)));
+
+        assert_eq!(store.load(&series("s-1")), None);
+    }
+
+    /// 撫でてよいのは 1 台だけ。掴んでいる間、後から来た側は掴めない。
+    #[test]
+    fn only_one_may_touch_a_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let one = Store::new(dir.path());
+        let other = Store::new(dir.path());
+
+        let claim = one.claim(&series("s-1")).expect("the first claim wins");
+        assert!(
+            other.claim(&series("s-1")).is_none(),
+            "the sibling must not touch the same series"
+        );
+        assert!(
+            other.claim(&series("s-2")).is_some(),
+            "another series is free"
         );
 
-        let written = Kept {
-            watched: vec![saved("s-1"), saved("s-2")],
-            paused: vec![Paused {
-                session_id: "s-3".to_owned(),
-                paused_at: 1_800_000_000,
-            }],
-        };
-        store.save(&written);
-        assert_eq!(store.load(), written);
+        drop(claim);
+        assert!(
+            other.claim(&series("s-1")).is_some(),
+            "the lock is released with the claim"
+        );
     }
 
-    /// 停止を持たなかった頃のファイル (見張りの配列だけ) も読める。
+    /// 置いてある控えを全部読み戻せる。壊れたファイルは飛ばす。
     #[test]
-    fn a_file_written_without_the_pauses_still_reads() {
+    fn everything_kept_reads_back() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(dir.path(), "127.0.0.1:11301");
-        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
-        std::fs::write(&store.path, serde_json::to_vec(&[saved("s-1")]).unwrap()).unwrap();
+        let store = Store::new(dir.path());
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
+        store.save(&kept("s-2", serde_json::json!({"a": 2})));
+        std::fs::write(store.dir.join("s-3.deadbeef.json"), b"{ not json").unwrap();
 
-        assert_eq!(store.load(), kept(vec![saved("s-1")]));
+        let mut sessions: Vec<String> = store
+            .load_all()
+            .into_iter()
+            .map(|kept| kept.session_id)
+            .collect();
+        sessions.sort();
+        assert_eq!(sessions, ["s-1", "s-2"]);
     }
 
-    /// 待ち受けごとに別のファイルを持つ。同じ置き場を共有しても上書きしない。
+    /// 自分の名前で置いていないファイルは、読まずに飛ばす。
+    ///
+    /// 置き場は他の書き手も使う。読みに行けば「壊れている」と毎回警告する
+    /// ことになるので、拾うのは `<会話>.<prefix>` の形だけにする。
     #[test]
-    fn each_listener_keeps_its_own_file() {
+    fn a_file_someone_else_left_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let one = Store::new(dir.path(), "127.0.0.1:11301");
-        let other = Store::new(dir.path(), "127.0.0.1:11302");
+        let store = Store::new(dir.path());
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
+        std::fs::write(store.dir.join("127-0-0-1-11301.json"), b"{\"watched\":[]}").unwrap();
 
-        one.save(&kept(vec![saved("s-1")]));
-        other.save(&kept(vec![saved("s-2")]));
-
-        assert_eq!(one.load().watched[0].session_id, "s-1");
-        assert_eq!(other.load().watched[0].session_id, "s-2");
+        let sessions: Vec<String> = store
+            .load_all()
+            .into_iter()
+            .map(|kept| kept.session_id)
+            .collect();
+        assert_eq!(sessions, ["s-1"], "only what this gateway keeps comes back");
     }
 
-    /// 壊れたファイルは、空から始める理由にしかならない。
+    /// 捨てた控えは読めなくなる。
     #[test]
-    fn an_unreadable_file_starts_empty() {
+    fn what_was_dropped_is_gone() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::new(dir.path(), "127.0.0.1:11301");
-        store.save(&kept(vec![saved("s-1")]));
-        std::fs::write(&store.path, b"{ this is not json").unwrap();
+        let store = Store::new(dir.path());
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
 
-        assert_eq!(store.load(), Kept::default());
+        store.remove(&series("s-1"));
+        assert_eq!(store.load(&series("s-1")), None);
+        store.remove(&series("s-1"));
     }
 }

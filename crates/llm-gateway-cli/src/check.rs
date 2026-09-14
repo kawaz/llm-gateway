@@ -84,19 +84,6 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
         println!("  write `[ns.<name>.aliases]` to add short names of your own");
     }
 
-    let orphaned = config.keepalive_without_destination();
-    if !orphaned.is_empty() {
-        println!(
-            "\nwarning: these namespaces ask for cache keepalive without a webhook destination:"
-        );
-        for name in &orphaned {
-            println!("  {name}");
-        }
-        println!(
-            "  set `webhook.base_url` (or `base_urls`) so the signal can reach the conversation"
-        );
-    }
-
     let unpointed = config.status_sources_without_routes();
     if !unpointed.is_empty() {
         println!("\nwarning: no route names these status sources, so they describe nothing:");

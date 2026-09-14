@@ -45,7 +45,7 @@ pub struct Skipped {
 pub struct Event {
     /// この知らせの時刻 = upstream へこの 1 本を送り始めた瞬間。
     ///
-    /// 合図の連鎖 (`cache_*`) から見れば、ここが「今」になる。
+    /// 連鎖 (`cache_*`) から見れば、ここが「今」になる。
     pub ts: i64,
     /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
     pub session_id: Option<String>,
@@ -77,38 +77,29 @@ pub struct Event {
     /// 経路選定で外した経路。無ければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<Skipped>,
-    /// この 1 本が cache の合図 (DR-0024 §2) だったときの扱い。間に合った分は
-    /// `applied`、遅れて 1 時間を付けなかった分は `late`。合図でなければ出さない。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keepalive: Option<String>,
-    /// この会話への合図が止めてあるか (DR-0024 §2 追補)。**常に出す** — 見る側は
-    /// 毎回の知らせで塗り替えるので、欄が消えると「止まっていない」と区別が
-    /// 付かない。
-    pub cache_paused: bool,
-    /// 合図の連鎖の起点 = この系列で最後に来た実リクエストを送った時刻。
-    /// 合図の往復の知らせでも、起点の実リクエストの時刻を出す。
+    /// 連鎖の起点 = この系列で最後に来た実リクエストを送った時刻。
     ///
-    /// ここから下の `cache_*` は、合図の見張りが付いている系列 (`keepalive`
-    /// 戦略が効く本流) にだけ出る。付いていなければ欄ごと出さない。
+    /// ここから下の `cache_*` は、控えの付いている系列 (`keepalive` 戦略が
+    /// 効く本流) にだけ出る。付いていなければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_since: Option<i64>,
-    /// 次の合図の予定時刻。次が無ければ欄ごと出さない。
+    /// 次の送り直しの予定時刻。次が無ければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_keepalive_at: Option<i64>,
-    /// この 1 本が連鎖の何番目か。実リクエストは 0、k 回目の合図は k。
+    /// この 1 本が連鎖の何番目か。実リクエストは 0、k 回目の送り直しは k。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_count: Option<u32>,
-    /// この系列の cache を、合図で継ぎ足せる終わり。
+    /// この系列の cache を、送り直しで継ぎ足せる終わり。
     ///
     /// [`Self::cache_expires_at`] が「この 1 本が置いた cache がいつ消えるか」
-    /// なのに対して、こちらは**最後に出る合図が置く cache がいつ消えるか**。
+    /// なのに対して、こちらは**最後に送る 1 本が置く cache がいつ消えるか**。
     /// 会話が止まったままなら、実際に切れるのはこの時刻になる。
     ///
-    /// 合図が出せなかった場合 (経路が塞がる・戻りが `late`) は、ここより
-    /// 早く切れる。見る側は最新の知らせで上書きする。
+    /// 送れなかった場合 (経路が塞がる) は、ここより早く切れる。見る側は
+    /// 最新の知らせで上書きする。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_until: Option<i64>,
-    /// 連鎖で出す合図の総数。[`Self::cache_until`] を作る合図の番号でもある。
+    /// 連鎖で送る総数。[`Self::cache_until`] を作る 1 本の番号でもある。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_until_count: Option<u32>,
     /// 損益分岐時間まで繋いだ場合の終わり (DR-0024 §3)。
@@ -116,7 +107,7 @@ pub struct Event {
     /// 単価が分からず分岐時間を出せないモデルでは欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_breakeven_until: Option<i64>,
-    /// 分岐時間に収まる合図の本数。
+    /// 分岐時間に収まる本数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_breakeven_count: Option<u32>,
 }
@@ -143,13 +134,9 @@ pub struct Origin<'a> {
     pub origin: &'a str,
     /// この 1 本が残すプレフィックスの寿命 (秒)。
     pub cache_ttl_secs: Option<u64>,
-    /// cache の合図としての扱い ([`Event::keepalive`])。
-    pub keepalive: Option<&'a str>,
-    /// この会話への合図が止めてあるか ([`Event::cache_paused`])。
-    pub cache_paused: bool,
     /// この 1 本が約束した寿命の id ([`Event::cache_notice`])。
     pub cache_notice: Option<&'a str>,
-    /// この系列に立っている合図の連鎖 ([`Event::cache_since`] 以下)。
+    /// この系列に立っている連鎖 ([`Event::cache_since`] 以下)。
     pub chain: Option<Chain>,
     /// 損益分岐時間から起こした連鎖 ([`Event::cache_breakeven_until`])。
     pub breakeven: Option<Breakeven>,
@@ -187,8 +174,6 @@ impl Event {
                 .and(origin.cache_notice)
                 .map(str::to_owned),
             skipped,
-            keepalive: origin.keepalive.map(str::to_owned),
-            cache_paused: origin.cache_paused,
             cache_since: origin.chain.map(|chain| chain.since_ms),
             next_keepalive_at: origin.chain.and_then(|chain| chain.next_at_ms),
             cache_count: origin.chain.map(|chain| chain.count),
@@ -359,87 +344,6 @@ impl Response {
     }
 }
 
-/// この会話への合図を止めた、という知らせ (DR-0024 §2 追補)。
-///
-/// 止めるのは人の意思で、実リクエストとは別の出来事。**止まった瞬間**を
-/// 見る側 (ccmsg の webui) へ伝える口がここしかない — 解除は次の実リクエストの
-/// [`Event::cache_paused`] で伝わるが、停止には次の 1 本が来ない。
-///
-/// 兄弟から回ってきた停止では流さない。人から直に受けた instance が既に
-/// 流していて、同じ受け口が 2 度受け取ることになる。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeepalivePaused {
-    /// 受け取る側が種類を見分ける印。値は常に `keepalive_paused`。
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// どの会話が止まったか。
-    pub session_id: String,
-    /// 止めた時刻 (Unix ミリ秒)。
-    pub paused_at: i64,
-}
-
-impl KeepalivePaused {
-    /// 種類の印。
-    pub const KIND: &'static str = "keepalive_paused";
-
-    pub fn new(session_id: &str, paused_at_ms: i64) -> Self {
-        Self {
-            kind: Self::KIND.to_owned(),
-            session_id: session_id.to_owned(),
-            paused_at: paused_at_ms,
-        }
-    }
-}
-
-/// 会話が止まった、という合図 (DR-0024 §2)。
-///
-/// 受け取った側 (ccmsg) が [`Self::marker`] をその会話へ流し込むと、戻って
-/// きたリクエストに 1 時間の cache が付く。[`Self::deadline`] を過ぎてから
-/// 届いたものには付けない — 間に合わなかった合図に 2 倍の書き込みをさせると、
-/// 何もしないより高くつく。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Keepalive {
-    /// 受け取る側が種類を見分ける印。値は常に `cache_keepalive`。
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// この合図を出した時刻 (Unix ミリ秒)。
-    pub ts: i64,
-    /// どの会話へ流し込むか。
-    pub session_id: String,
-    /// その会話のどの系列か ([`prefix`])。
-    pub prefix: String,
-    /// この 1 回きりの合言葉。戻ってきたリクエストの照合に使う。
-    pub nonce: String,
-    /// これを過ぎて届いたら 1 時間は付かない (Unix ミリ秒)。
-    pub deadline: i64,
-    /// この合図が約束した寿命の id (DR-0012)。値は [`Self::nonce`] と同じ。
-    ///
-    /// 同じ値を 2 つの欄に出すのは、役が別だから — `nonce` は**会話に返させる
-    /// 語**、`cache_notice` は**この約束の名前**。受け取る側は、どの種類の
-    /// 知らせでも同じ 1 欄を見て取り消し (`cache_expired`) と突き合わせられる。
-    pub cache_notice: String,
-    /// そのまま会話へ流し込む文面。
-    pub marker: String,
-}
-
-impl Keepalive {
-    /// 種類の印。受け取る側はこの値で [`Event`] と見分ける。
-    pub const KIND: &'static str = "cache_keepalive";
-
-    pub fn new(ts_ms: i64, session_id: &str, prefix: &str, nonce: &str, deadline_ms: i64) -> Self {
-        Self {
-            kind: Self::KIND.to_owned(),
-            ts: ts_ms,
-            session_id: session_id.to_owned(),
-            prefix: prefix.to_owned(),
-            nonce: nonce.to_owned(),
-            deadline: deadline_ms,
-            cache_notice: nonce.to_owned(),
-            marker: marker(nonce),
-        }
-    }
-}
-
 /// 約束した寿命が果たされずに終わった、という取り消し (DR-0012)。
 ///
 /// `cache_expires_at` は送る前に立てた見込みで、上流の都合や機械のサスペンドで
@@ -461,7 +365,7 @@ pub struct CacheExpired {
     pub session_id: String,
     /// その会話のどの系列か ([`prefix`])。
     pub prefix: String,
-    /// 取り消す約束の id ([`Event::cache_notice`] / [`Keepalive::cache_notice`])。
+    /// 取り消す約束の id ([`Event::cache_notice`])。
     pub of: String,
 }
 
@@ -480,37 +384,9 @@ impl CacheExpired {
     }
 }
 
-/// 合言葉の頭。この後ろに nonce が続いたものが 1 つの合言葉になる。
-///
-/// 会話へ送る文面にも、返させる語にも、戻ってきたリクエストから探すときにも
-/// 同じものを使う (= 合言葉は 1 つしか出てこない)。
-pub const KEEPALIVE_TOKEN_PREFIX: &str = "LLMGW-KEEPALIVE-";
-
-/// 会話へ流し込む文面。
-///
-/// 合言葉が 1 度だけ出てくる決め打ちの形にするのは、戻ってきたリクエストの
-/// 中から見つけるため。途中に挟まっていても拾えるようにしてあり (合図は通知に
-/// 包まれて届く)、返させるのは**その合言葉 1 語だけ**。
-///
-/// 出所と目的を文面自身に書く。合図は会話の文脈を持たない相手にも届くので、
-/// 素性の分からない指示に見えると、注入を疑われて断られる (実測)。
-///
-/// 「何も出力するな」とは頼まない。それは自分の振る舞いについての指示なので
-/// 完全には従わせられず、断り書きが 1 行返ってくる (実測)。返る形が決まって
-/// いれば、受け取った側がその 1 行を畳んで見せずに済む。空白を含まない形に
-/// するのは、受け取った側が 1 つの語として拾えるようにするため。
-pub fn marker(nonce: &str) -> String {
-    format!(
-        "[llm-gateway keepalive ping] nonce=`{KEEPALIVE_TOKEN_PREFIX}{nonce}` — \
-         automated prompt-cache refresh from your own llm-gateway proxy \
-         (see llm-gateway docs, DR-0024). Reply with a single line containing \
-         only the nonce above, nothing before or after."
-    )
-}
-
 /// 受け口へ流す 1 件。
 ///
-/// 転送の知らせ ([`Event`]) と cache の合図 ([`Keepalive`]) は別の出来事で、
+/// 転送の知らせ ([`Event`]) と約束の取り消し ([`CacheExpired`]) は別の出来事で、
 /// 欄も重ならない。1 つの型に混ぜて空欄で埋めるのではなく、種類として分ける。
 ///
 /// 読み戻すときは書いた順に当てはめる (`untagged`)。印を持つ種類を先に置くのは、
@@ -518,8 +394,6 @@ pub fn marker(nonce: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Notice {
-    CacheKeepalive(Keepalive),
-    KeepalivePaused(KeepalivePaused),
     /// 約束した寿命の取り消し。
     CacheExpired(CacheExpired),
     /// 応答が閉じた知らせ。
@@ -535,8 +409,6 @@ impl Notice {
         match self {
             Self::Request(_) => "request",
             Self::Response(_) => Response::KIND,
-            Self::CacheKeepalive(_) => Keepalive::KIND,
-            Self::KeepalivePaused(_) => KeepalivePaused::KIND,
             Self::CacheExpired(_) => CacheExpired::KIND,
         }
     }
@@ -545,10 +417,7 @@ impl Notice {
     pub fn request(&self) -> Option<&Event> {
         match self {
             Self::Request(event) => Some(event),
-            Self::Response(_)
-            | Self::CacheKeepalive(_)
-            | Self::KeepalivePaused(_)
-            | Self::CacheExpired(_) => None,
+            Self::Response(_) | Self::CacheExpired(_) => None,
         }
     }
 
@@ -556,10 +425,7 @@ impl Notice {
     pub fn response(&self) -> Option<&Response> {
         match self {
             Self::Response(response) => Some(response),
-            Self::Request(_)
-            | Self::CacheKeepalive(_)
-            | Self::KeepalivePaused(_)
-            | Self::CacheExpired(_) => None,
+            Self::Request(_) | Self::CacheExpired(_) => None,
         }
     }
 }
@@ -573,18 +439,6 @@ impl From<Event> for Notice {
 impl From<Response> for Notice {
     fn from(response: Response) -> Self {
         Self::Response(Box::new(response))
-    }
-}
-
-impl From<Keepalive> for Notice {
-    fn from(keepalive: Keepalive) -> Self {
-        Self::CacheKeepalive(keepalive)
-    }
-}
-
-impl From<KeepalivePaused> for Notice {
-    fn from(paused: KeepalivePaused) -> Self {
-        Self::KeepalivePaused(paused)
     }
 }
 
@@ -688,8 +542,6 @@ mod tests {
             ns: "personal",
             model: "m",
             credential,
-            keepalive: None,
-            cache_paused: false,
             chain: None,
             breakeven: None,
             origin: "main",
@@ -996,20 +848,7 @@ mod tests {
             assert!(unpriced.get(field).is_none(), "{field} is omitted");
         }
 
-        // 止まりは常に出る (欄が消えると「止まっていない」と区別が付かない)。
         let quiet = serde_json::to_value(Event::new(NOW, &from("a"), 200)).unwrap();
-        assert_eq!(quiet["cache_paused"], false);
-        let paused = serde_json::to_value(Event::new(
-            NOW,
-            &Origin {
-                cache_paused: true,
-                ..from("a")
-            },
-            200,
-        ))
-        .unwrap();
-        assert_eq!(paused["cache_paused"], true);
-
         for field in [
             "cache_since",
             "next_keepalive_at",
@@ -1019,7 +858,7 @@ mod tests {
         ] {
             assert!(
                 quiet.get(field).is_none(),
-                "{field} is omitted when no signal watches this series"
+                "{field} is omitted when nothing is kept for this series"
             );
         }
     }
@@ -1068,7 +907,6 @@ mod tests {
                 "cache_ttl_secs": 3600,
                 "cache_expires_at": NOW + HOUR,
                 "cache_notice": "n0tice",
-                "cache_paused": false,
                 "cache_since": NOW,
                 "next_keepalive_at": NOW + 55 * MINUTE,
                 "cache_count": 0,
@@ -1087,7 +925,6 @@ mod tests {
                 model: "claude-opus-5",
                 origin: "main",
                 cache_ttl_secs: Some(3600),
-                keepalive: Some("applied"),
                 chain: Some(Chain {
                     since_ms: NOW,
                     count: 1,
@@ -1112,45 +949,13 @@ mod tests {
                 "origin": "main",
                 "cache_ttl_secs": 3600,
                 "cache_expires_at": NOW + 55 * MINUTE + HOUR,
-                "keepalive": "applied",
-                "cache_paused": false,
                 "cache_since": NOW,
                 "next_keepalive_at": NOW + 2 * 55 * MINUTE,
                 "cache_count": 1,
                 "cache_until": NOW + 9 * 55 * MINUTE + HOUR,
                 "cache_until_count": 9,
             }),
-            "the round trip of a signal moves the chain along"
-        );
-
-        let signal = Keepalive::new(
-            NOW + 55 * MINUTE,
-            "s-1",
-            "2cf24dba",
-            "5Qv",
-            NOW + HOUR - 30 * 1_000,
-        );
-        assert_eq!(
-            serde_json::to_value(&signal).unwrap(),
-            json!({
-                "type": "cache_keepalive",
-                "ts": NOW + 55 * MINUTE,
-                "session_id": "s-1",
-                "prefix": "2cf24dba",
-                "nonce": "5Qv",
-                "deadline": NOW + HOUR - 30 * 1_000,
-                "cache_notice": "5Qv",
-                "marker": marker("5Qv"),
-            })
-        );
-
-        assert_eq!(
-            serde_json::to_value(Notice::from(KeepalivePaused::new("s-1", NOW))).unwrap(),
-            json!({
-                "type": "keepalive_paused",
-                "session_id": "s-1",
-                "paused_at": NOW,
-            })
+            "a replay of the same series moves the chain along"
         );
 
         let withdrawn = Notice::from(CacheExpired::new(NOW + HOUR, "s-1", "2cf24dba", "n0tice"));
@@ -1364,26 +1169,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Notice>(serde_json::to_value(&forwarded).unwrap()).unwrap(),
             forwarded
-        );
-    }
-
-    /// 止めた知らせの形。合図とも転送とも混ざらない。
-    #[test]
-    fn a_pause_is_told_apart_by_its_type() {
-        let notice = Notice::from(KeepalivePaused::new("s-1", NOW));
-        assert_eq!(notice.name(), "keepalive_paused");
-        assert!(notice.request().is_none());
-
-        let json = serde_json::to_value(&notice).unwrap();
-        assert_eq!(json["type"], "keepalive_paused");
-        assert_eq!(json["session_id"], "s-1");
-        assert_eq!(json["paused_at"], NOW, "a single number, in milliseconds");
-
-        // 受け取る側は 1 つの列で読む。型を跨いで取り違えない。
-        assert_eq!(
-            serde_json::from_value::<Notice>(json).unwrap(),
-            notice,
-            "it reads back as the same kind of notice"
         );
     }
 }
