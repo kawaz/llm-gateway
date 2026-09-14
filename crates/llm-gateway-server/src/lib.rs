@@ -793,9 +793,12 @@ async fn forward<P: Persistence + 'static>(
                     upstream.body,
                     forwarded.usage,
                     Arc::clone(gateway.stats()),
-                    now_unix(),
-                    forwarded.credential.as_ref().map(CredentialId::as_str),
-                    &forwarded.model,
+                    exchange::Attribution {
+                        at: now_unix(),
+                        credential: forwarded.credential.as_ref().map(CredentialId::as_str),
+                        model: &forwarded.model,
+                        origin: &forwarded.origin,
+                    },
                     span.clone(),
                 )
                 .with_tap(tap)

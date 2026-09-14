@@ -124,11 +124,90 @@ impl<'de> Deserialize<'de> for Counters {
     }
 }
 
-/// モデル名 → 集計。
-pub type ByModel = BTreeMap<String, Counters>;
-/// 認証情報 → モデル → 集計。1 日分のファイルの中身がこの形。
+/// 出した側が分からなかった 1 本の行き先 (DR-0029)。
+///
+/// 素性を知らない頃に書かれたファイルもここへ寄せる。「見分けが付かなかった」
+/// という意味は [`crate::provider::RequestOrigin::Unknown`] と同じなので、
+/// 過去の分のために別の語を増やさない。
+pub const UNKNOWN_ORIGIN: &str = "unknown";
+
+/// 素性 → 集計 (DR-0029)。
+///
+/// ファイルには**モデルの下**にこの形で落ちる。素性を知らない頃のファイルは
+/// モデルの下にいきなり集計が置いてあるので、読むときだけ
+/// [`UNKNOWN_ORIGIN`] の 1 本にくるんで受ける。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ByOrigin(BTreeMap<String, Counters>);
+
+impl std::ops::Deref for ByOrigin {
+    type Target = BTreeMap<String, Counters>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ByOrigin {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ByOrigin {
+    /// 素性のある形と、素性の無い頃の形のどちらでも読む。
+    ///
+    /// 見分けるのは**鍵の名前**。集計の器が持つ鍵 ([`Counters`] の
+    /// `requests` / `tokens` と旧形式の 4 区分) と素性の語 (`main` / `sub` /
+    /// `keepalive` …) は重ならないので、中身を見れば形が決まる。読めなく
+    /// すると、その日の記録が閲覧から消える (日ごとのファイルが正本で、
+    /// 作り直せない)。
+    ///
+    /// Design rationale: 鍵を見てから中身の読み方を決めるので、いったん
+    /// [`serde_json::Value`] へ受ける。形の判別を型に任せる書き方
+    /// (`#[serde(untagged)]`) を採らないのは、[`Counters`] が全欄 `default` で
+    /// 読めるため**素性の表がそのまま空の集計として通ってしまう**ため
+    /// (中身が黙って 0 になる)。この置き場のファイルは JSON だけなので、
+    /// self-describing な形に限られる不利は効かない。
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let raw = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        if raw.keys().any(|key| COUNTER_KEYS.contains(&key.as_str())) {
+            let counters =
+                Counters::deserialize(serde_json::Value::Object(raw)).map_err(D::Error::custom)?;
+            return Ok(Self(BTreeMap::from([(
+                UNKNOWN_ORIGIN.to_owned(),
+                counters,
+            )])));
+        }
+        let mut by_origin = BTreeMap::new();
+        for (origin, value) in raw {
+            by_origin.insert(
+                origin,
+                Counters::deserialize(value).map_err(D::Error::custom)?,
+            );
+        }
+        Ok(Self(by_origin))
+    }
+}
+
+/// 集計の器 ([`Counters`]) が持ちうる鍵。素性の語と重ならないので、
+/// 1 つでも見えたら「素性の無い頃の形」と決まる。
+const COUNTER_KEYS: [&str; 6] = [
+    "requests",
+    "tokens",
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+];
+
+/// モデル名 → 素性 → 集計。
+pub type ByModel = BTreeMap<String, ByOrigin>;
+/// 認証情報 → モデル → 素性 → 集計。1 日分のファイルの中身がこの形。
 pub type ByCredential = BTreeMap<String, ByModel>;
-/// 日付 → 認証情報 → モデル → 集計。閲覧に出す形。
+/// 日付 → 認証情報 → モデル → 素性 → 集計。閲覧に出す形。
 pub type ByDate = BTreeMap<String, ByCredential>;
 
 /// 起動時にメモリへ載せる日数 (当日から数えて)。
@@ -193,7 +272,18 @@ impl Stats {
     /// ミリ秒で持っている時刻 (知らせの `ts` 等、DR-0012) を渡すときは
     /// [`crate::credential::time::to_unix_secs`] を通すこと。1000 倍のまま
     /// 渡すと日付が 5 桁の年へ飛び、その 1 本が集計から迷子になる。
-    pub fn record(&self, at_secs: i64, credential: Option<&str>, model: &str, usage: &TokenUsage) {
+    ///
+    /// `origin` は出した側の 1 語 ([`crate::provider::RequestOrigin::as_str`]、
+    /// DR-0029)。gateway 自身の自送信 (`keepalive`) を後から分けて読むための
+    /// 軸で、単価には関わらない (単価はモデルまでで決まる)。
+    pub fn record(
+        &self,
+        at_secs: i64,
+        credential: Option<&str>,
+        model: &str,
+        origin: &str,
+        usage: &TokenUsage,
+    ) {
         if usage.is_empty() {
             return;
         }
@@ -223,6 +313,8 @@ impl Stats {
             .entry(credential)
             .or_default()
             .entry(model.to_owned())
+            .or_default()
+            .entry(origin.to_owned())
             .or_default()
             .add(usage);
         drop(counts);
@@ -532,8 +624,11 @@ fn millisecond_date_of_file(name: &str) -> Option<i64> {
 fn merge_day(into: &mut ByCredential, day: ByCredential) {
     for (credential, models) in day {
         let into = into.entry(credential).or_default();
-        for (model, counters) in models {
-            into.entry(model).or_default().merge(&counters);
+        for (model, origins) in models {
+            let into = into.entry(model).or_default();
+            for (origin, counters) in origins.0 {
+                into.entry(origin).or_default().merge(&counters);
+            }
         }
     }
 }
@@ -555,6 +650,15 @@ pub struct Entry {
     /// 言えることが無いという意味。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd: Option<f64>,
+    /// 出した側ごとの内訳 (DR-0029)。`main` / `sub` / `keepalive` …。
+    ///
+    /// この行が持つ数は内訳の和と一致する。畳んだ数を別に置くのは、よく見る
+    /// のが「このモデルにいくら使ったか」で、素性は当たりを付けた後に見る
+    /// ため (1 日の合計を内訳と別に置いてあるのと同じ形)。
+    ///
+    /// 素性の段は単価に関わらないので、内訳の `usd` は親と同じ単価で出る。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub origins: BTreeMap<String, Entry>,
 }
 
 /// 認証情報 → モデル → 行。
@@ -596,14 +700,38 @@ fn price(days: ByDate, pricing: &dyn PricingSource) -> (BTreeMap<String, Day>, O
         let mut day = Day::default();
         for (credential, models) in creds {
             let mut entries = EntriesByModel::new();
-            for (model, counters) in models {
-                let usd = pricing
-                    .pricing(&credential, &model)
-                    .map(|rates| rates.cost(&counters.tokens));
+            for (model, by_origin) in models {
+                // 単価はモデルまでで決まる (DR-0029)。素性ごとに聞き直さない。
+                let rates = pricing.pricing(&credential, &model);
+                let mut counters = Counters::default();
+                let mut usd: Option<f64> = None;
+                let mut origins = BTreeMap::new();
+                for (origin, slice) in by_origin.0 {
+                    let slice_usd = rates.as_ref().map(|rates| rates.cost(&slice.tokens));
+                    if let Some(slice_usd) = slice_usd {
+                        usd = Some(usd.unwrap_or(0.0) + slice_usd);
+                    }
+                    counters.merge(&slice);
+                    origins.insert(
+                        origin,
+                        Entry {
+                            counters: slice,
+                            usd: slice_usd,
+                            origins: BTreeMap::new(),
+                        },
+                    );
+                }
                 if let Some(usd) = usd {
                     day.total_usd = Some(day.total_usd.unwrap_or(0.0) + usd);
                 }
-                entries.insert(model, Entry { counters, usd });
+                entries.insert(
+                    model,
+                    Entry {
+                        counters,
+                        usd,
+                        origins,
+                    },
+                );
             }
             day.credentials.insert(credential, entries);
         }
@@ -646,6 +774,9 @@ mod tests {
         count(counters, TokenKind::output())
     }
 
+    /// 試験の既定の素性。ほとんどの試験は素性に関心が無いので、1 語に固定する。
+    const MAIN: &str = "main";
+
     fn stats(dir: &Path) -> Stats {
         Stats::new(dir, "8402")
     }
@@ -686,15 +817,15 @@ mod tests {
 
         // 時刻をミリ秒のまま積んでいた頃に出来たファイル。
         let stale = stats(dir.path());
-        stale.record(NOW_MS, Some("a"), "m", &tokens(10, 5));
+        stale.record(NOW_MS, Some("a"), "m", MAIN, &tokens(10, 5));
         stale.flush().unwrap();
         let broken = dir.path().join(format!("{}.8402.json", local_date(NOW_MS)));
         assert!(broken.exists(), "the millisecond-dated file is there");
 
         // 同じ日には、秒で積んだ分が既にある。
         let sound = stats(dir.path());
-        sound.record(NOW, Some("a"), "m", &tokens(1, 2));
-        sound.record(NOW, Some("b"), "m", &tokens(7, 7));
+        sound.record(NOW, Some("a"), "m", MAIN, &tokens(1, 2));
+        sound.record(NOW, Some("b"), "m", MAIN, &tokens(7, 7));
         sound.flush().unwrap();
 
         let reopened = stats(dir.path());
@@ -708,11 +839,14 @@ mod tests {
             "everything landed on the day it was really sent"
         );
         let day = &counts[&local_date(NOW)];
-        let c = &day["a"]["m"];
+        let c = &day["a"]["m"][MAIN];
         assert_eq!(c.requests, 2, "both requests are counted");
         assert_eq!(input_of(c), 11);
         assert_eq!(output_of(c), 7);
-        assert_eq!(day["b"]["m"].requests, 1, "the rest of the day is intact");
+        assert_eq!(
+            day["b"]["m"][MAIN].requests, 1,
+            "the rest of the day is intact"
+        );
     }
 
     /// 素性の正しい日次ファイルは寄せる対象ではない。
@@ -733,12 +867,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "m", &tokens(10, 5));
-        s.record(NOW, Some("a"), "m", &tokens(3, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(10, 5));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(3, 1));
 
         let counts = s.in_memory();
         let day = counts.values().next().expect("one day's worth");
-        let c = &day["a"]["m"];
+        let c = &day["a"]["m"][MAIN];
         assert_eq!(c.requests, 2, "the count is tallied too");
         assert_eq!(input_of(c), 13);
         assert_eq!(output_of(c), 6);
@@ -755,11 +889,11 @@ mod tests {
         let mut usage = tokens(10, 5);
         usage.set(TokenKind::output_reasoning(), 4);
         usage.set("provider.batch_prediction", 3);
-        s.record(NOW, Some("a"), "m", &usage);
-        s.record(NOW, Some("a"), "m", &usage);
+        s.record(NOW, Some("a"), "m", MAIN, &usage);
+        s.record(NOW, Some("a"), "m", MAIN, &usage);
 
         let counts = s.in_memory();
-        let c = &counts.values().next().unwrap()["a"]["m"];
+        let c = &counts.values().next().unwrap()["a"]["m"][MAIN];
         assert_eq!(count(c, TokenKind::output_reasoning()), 8);
         assert_eq!(count(c, TokenKind::new("provider.batch_prediction")), 6);
     }
@@ -773,8 +907,8 @@ mod tests {
         let s = stats(dir.path());
 
         // haiku-4-5 は input $1 / 100 万トークン。
-        s.record(NOW, Some("a"), "m-cheap", &tokens(1_000_000, 0));
-        s.record(NOW, Some("a"), "who-knows", &tokens(1_000_000, 0));
+        s.record(NOW, Some("a"), "m-cheap", MAIN, &tokens(1_000_000, 0));
+        s.record(NOW, Some("a"), "who-knows", MAIN, &tokens(1_000_000, 0));
 
         let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         let models = &day.credentials["a"];
@@ -809,9 +943,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         // 認証情報を持たない経路の分も、同じ形で聞きに行く。
-        s.record(NOW, None, "m", &tokens(1, 1));
+        s.record(NOW, None, "m", MAIN, &tokens(1, 1));
 
         let asked = Asked(StdMutex::new(Vec::new()));
         s.report(7, NOW_MS, &asked);
@@ -834,9 +968,9 @@ mod tests {
         let s = stats(dir.path());
 
         // 同じ日に、単価の分かるモデル 2 つと分からないモデル 1 つ。
-        s.record(NOW, Some("a"), "m-cheap", &tokens(1_000_000, 0)); // $1
-        s.record(NOW, Some("b"), "m-rich", &tokens(1_000_000, 0)); // $5
-        s.record(NOW, Some("b"), "who-knows", &tokens(9_000_000, 0)); // 不明
+        s.record(NOW, Some("a"), "m-cheap", MAIN, &tokens(1_000_000, 0)); // $1
+        s.record(NOW, Some("b"), "m-rich", MAIN, &tokens(1_000_000, 0)); // $5
+        s.record(NOW, Some("b"), "who-knows", MAIN, &tokens(9_000_000, 0)); // 不明
 
         let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days[&local_date(NOW)].total_usd, Some(6.0));
@@ -849,7 +983,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
+        s.record(NOW, Some("a"), "who-knows", MAIN, &tokens(10, 5));
 
         let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days[&local_date(NOW)].total_usd, None);
@@ -866,7 +1000,7 @@ mod tests {
         let mut usage = tokens(1_000_000, 1_000_000);
         usage.set(TokenKind::input_cache_creation(), 1_000_000);
         usage.set(TokenKind::input_cache_read(), 1_000_000);
-        s.record(NOW, Some("a"), "m-rich", &usage);
+        s.record(NOW, Some("a"), "m-rich", MAIN, &usage);
 
         let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         assert_eq!(day.credentials["a"]["m-rich"].usd, Some(36.75));
@@ -885,7 +1019,7 @@ mod tests {
         usage.set(TokenKind::input(), 1_000_000);
         // input の内訳 (単価表に無い)。
         usage.set("input.long_context", 900_000);
-        s.record(NOW, Some("a"), "m-rich", &usage);
+        s.record(NOW, Some("a"), "m-rich", MAIN, &usage);
 
         let entry = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m-rich"];
         assert_eq!(
@@ -908,8 +1042,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "m-rich", &tokens(10, 5));
-        s.record(NOW, Some("a"), "who-knows", &tokens(10, 5));
+        s.record(NOW, Some("a"), "m-rich", MAIN, &tokens(10, 5));
+        s.record(NOW, Some("a"), "who-knows", MAIN, &tokens(10, 5));
 
         let json = serde_json::to_value(s.report(7, NOW_MS, &Rates)).unwrap();
         let models = &json["days"][local_date(NOW)]["credentials"]["a"];
@@ -926,15 +1060,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "haiku", &tokens(1, 1));
-        s.record(NOW, Some("a"), "opus", &tokens(2, 2));
-        s.record(NOW, Some("b"), "haiku", &tokens(4, 4));
+        s.record(NOW, Some("a"), "haiku", MAIN, &tokens(1, 1));
+        s.record(NOW, Some("a"), "opus", MAIN, &tokens(2, 2));
+        s.record(NOW, Some("b"), "haiku", MAIN, &tokens(4, 4));
 
         let counts = s.in_memory();
         let day = counts.values().next().unwrap();
         assert_eq!(day["a"].len(), 2, "2 models under the same credential");
-        assert_eq!(input_of(&day["a"]["opus"]), 2);
-        assert_eq!(input_of(&day["b"]["haiku"]), 4);
+        assert_eq!(input_of(&day["a"]["opus"][MAIN]), 2);
+        assert_eq!(input_of(&day["b"]["haiku"][MAIN]), 4);
     }
 
     /// 認証情報を持たない経路も落とさず記録する。
@@ -943,11 +1077,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, None, "m", &tokens(7, 3));
+        s.record(NOW, None, "m", MAIN, &tokens(7, 3));
 
         let counts = s.in_memory();
         assert_eq!(
-            input_of(&counts.values().next().unwrap()[NO_CREDENTIAL]["m"]),
+            input_of(&counts.values().next().unwrap()[NO_CREDENTIAL]["m"][MAIN]),
             7
         );
     }
@@ -961,7 +1095,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "m", &TokenUsage::default());
+        s.record(NOW, Some("a"), "m", MAIN, &TokenUsage::default());
 
         assert!(s.in_memory().is_empty());
     }
@@ -972,14 +1106,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
 
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         // 地方時に依らず日付が変わる距離。
-        s.record(NOW + 2 * 86_400, Some("a"), "m", &tokens(2, 2));
+        s.record(NOW + 2 * 86_400, Some("a"), "m", MAIN, &tokens(2, 2));
 
         let counts = s.in_memory();
         assert_eq!(counts.len(), 2, "split into 2 days: {counts:?}");
         for day in counts.values() {
-            assert_eq!(day["a"]["m"].requests, 1, "not mixed across days");
+            assert_eq!(day["a"]["m"][MAIN].requests, 1, "not mixed across days");
         }
     }
 
@@ -991,8 +1125,8 @@ mod tests {
             let s = stats(dir.path());
             let mut usage = tokens(10, 5);
             usage.set("provider.batch_prediction", 2);
-            s.record(NOW, Some("a"), "m", &usage);
-            s.record(NOW, None, "m", &tokens(1, 2));
+            s.record(NOW, Some("a"), "m", MAIN, &usage);
+            s.record(NOW, None, "m", MAIN, &tokens(1, 2));
             s.flush().unwrap();
             s.in_memory()
         };
@@ -1018,7 +1152,7 @@ mod tests {
         let s = stats(dir.path());
         let mut usage = tokens(18, 16);
         usage.set(TokenKind::input_cache_read(), 3);
-        s.record(NOW, Some("a"), "m", &usage);
+        s.record(NOW, Some("a"), "m", MAIN, &usage);
         s.flush().unwrap();
 
         let raw = std::fs::read_to_string(s.path_of(&local_date(NOW))).unwrap();
@@ -1026,8 +1160,10 @@ mod tests {
         assert_eq!(
             saved["a"]["m"],
             serde_json::json!({
-                "requests": 1,
-                "tokens": {"input": 18, "output": 16, "input.cache_read": 3},
+                MAIN: {
+                    "requests": 1,
+                    "tokens": {"input": 18, "output": 16, "input.cache_read": 3},
+                },
             }),
             "{raw}"
         );
@@ -1042,21 +1178,140 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = stats(dir.path());
-            s.record(NOW, Some("a"), "m", &tokens(10, 5));
+            s.record(NOW, Some("a"), "m", MAIN, &tokens(10, 5));
             s.flush().unwrap();
         }
 
         let s = stats(dir.path());
         s.restore(NOW);
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let s = stats(dir.path());
         s.restore(NOW);
         let counts = s.in_memory();
-        let c = &counts.values().next().unwrap()["a"]["m"];
+        let c = &counts.values().next().unwrap()["a"]["m"][MAIN];
         assert_eq!(c.requests, 2, "adds to the previous one");
         assert_eq!(input_of(c), 11);
+    }
+
+    // ---------- 出した側 (origin) の軸 (DR-0029) ----------
+
+    /// 同じ認証情報・同じモデルでも、出した側が違えば別の行になる。
+    ///
+    /// gateway 自身の自送信 (`keepalive`) を、人が出した 1 本と混ぜない。
+    #[test]
+    fn the_same_model_is_split_by_who_sent_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(10, 5));
+        s.record(NOW, Some("a"), "m", "keepalive", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", "keepalive", &tokens(2, 2));
+
+        let counts = s.in_memory();
+        let by_origin = &counts[&local_date(NOW)]["a"]["m"];
+        assert_eq!(by_origin[MAIN].requests, 1);
+        assert_eq!(input_of(&by_origin[MAIN]), 10);
+        assert_eq!(by_origin["keepalive"].requests, 2, "both pings are counted");
+        assert_eq!(input_of(&by_origin["keepalive"]), 3);
+    }
+
+    /// 素性を知らない頃のファイル (正規形) は `unknown` に寄る。
+    ///
+    /// 集計の器の鍵と素性の語は重ならないので、どちらの形かは中身で決まる。
+    #[test]
+    fn a_day_file_without_origins_is_read_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(format!("{}.8402.json", local_date(NOW))),
+            r#"{"a":{"m":{"requests":2,"tokens":{"input":18,"output":16}}}}"#,
+        )
+        .unwrap();
+
+        let s = stats(dir.path());
+        s.restore(NOW);
+
+        let counts = s.in_memory();
+        let by_origin = &counts[&local_date(NOW)]["a"]["m"];
+        assert_eq!(
+            by_origin.keys().collect::<Vec<_>>(),
+            vec![UNKNOWN_ORIGIN],
+            "the whole row lands under one name"
+        );
+        let c = &by_origin[UNKNOWN_ORIGIN];
+        assert_eq!(c.requests, 2);
+        assert_eq!(input_of(c), 18);
+        assert_eq!(output_of(c), 16);
+    }
+
+    /// 閲覧では、モデルの行に素性ごとの内訳が付く。
+    ///
+    /// 行そのものは内訳の和で、単価はモデルまでで決まるので素性ごとの額も
+    /// 同じ単価で出る。
+    #[test]
+    fn the_report_carries_the_origins_under_each_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        // m-cheap は input $1 / 100 万トークン。
+        s.record(NOW, Some("a"), "m-cheap", MAIN, &tokens(3_000_000, 0));
+        s.record(
+            NOW,
+            Some("a"),
+            "m-cheap",
+            "keepalive",
+            &tokens(1_000_000, 0),
+        );
+
+        let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
+        let entry = &day.credentials["a"]["m-cheap"];
+        assert_eq!(entry.counters.requests, 2, "the row is the sum of both");
+        assert_eq!(entry.usd, Some(4.0));
+        assert_eq!(entry.origins[MAIN].usd, Some(3.0));
+        assert_eq!(entry.origins["keepalive"].usd, Some(1.0));
+        assert_eq!(input_of(&entry.origins["keepalive"].counters), 1_000_000);
+        assert_eq!(
+            day.total_usd,
+            Some(4.0),
+            "splitting by origin does not change the day's total"
+        );
+    }
+
+    /// 単価表に無いモデルは、素性ごとの内訳にも額が付かない。
+    #[test]
+    fn an_unpriced_model_leaves_every_origin_without_an_amount() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        s.record(NOW, Some("a"), "who-knows", "keepalive", &tokens(10, 5));
+
+        let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
+        let entry = &day.credentials["a"]["who-knows"];
+        assert_eq!(entry.usd, None);
+        assert_eq!(entry.origins["keepalive"].usd, None);
+        assert_eq!(
+            entry.origins["keepalive"].counters.requests, 1,
+            "the tokens are still there"
+        );
+    }
+
+    /// 別々の writer が同じ素性へ積んだ分は、閲覧で足し合わされる。
+    #[test]
+    fn origins_are_merged_across_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let other = Stats::new(dir.path(), "8401");
+            other.record(NOW, Some("a"), "m", "keepalive", &tokens(100, 50));
+            other.flush().unwrap();
+        }
+        let s = stats(dir.path());
+        s.record(NOW, Some("a"), "m", "keepalive", &tokens(1, 2));
+
+        let report = s.report(7, NOW_MS, &Rates);
+        let entry = &report.days[&local_date(NOW)].credentials["a"]["m"];
+        assert_eq!(entry.origins["keepalive"].counters.requests, 2);
+        assert_eq!(input_of(&entry.origins["keepalive"].counters), 101);
     }
 
     // ---------- 旧形式の読み込み (DR-0011 初版の 4 フィールド) ----------
@@ -1076,7 +1331,7 @@ mod tests {
         s.restore(NOW);
 
         let counts = s.in_memory();
-        let c = &counts[&local_date(NOW)]["a"]["m-rich"];
+        let c = &counts[&local_date(NOW)]["a"]["m-rich"][UNKNOWN_ORIGIN];
         assert_eq!(c.requests, 2);
         assert_eq!(input_of(c), 18);
         assert_eq!(output_of(c), 16);
@@ -1100,14 +1355,19 @@ mod tests {
 
         let s = stats(dir.path());
         s.restore(NOW);
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
             saved["a"]["m"],
-            serde_json::json!({"requests": 2, "tokens": {"input": 11, "output": 6}}),
+            serde_json::json!({
+                // 素性を知らない頃の分は unknown に寄り、新しい 1 本は素性の
+                // 下に並ぶ (DR-0029)。足して消えない。
+                UNKNOWN_ORIGIN: {"requests": 1, "tokens": {"input": 10, "output": 5}},
+                MAIN: {"requests": 1, "tokens": {"input": 1, "output": 1}},
+            }),
             "an unused category is not reordered while staying at 0"
         );
     }
@@ -1132,7 +1392,7 @@ mod tests {
         let mut usage = tokens(1_000_000, 1_000_000);
         usage.set(TokenKind::input_cache_creation(), 1_000_000);
         usage.set(TokenKind::input_cache_read(), 1_000_000);
-        s.record(NOW, Some("normalized"), "m-rich", &usage);
+        s.record(NOW, Some("normalized"), "m-rich", MAIN, &usage);
 
         let day = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)];
         let legacy = day.credentials["legacy"]["m-rich"].usd;
@@ -1150,8 +1410,8 @@ mod tests {
     fn each_day_gets_its_own_file() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
-        s.record(NOW + 2 * 86_400, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
+        s.record(NOW + 2 * 86_400, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let mut names: Vec<String> = std::fs::read_dir(dir.path())
@@ -1177,7 +1437,7 @@ mod tests {
     fn an_unchanged_aggregate_is_not_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let path = s.path_of(&local_date(NOW));
@@ -1196,12 +1456,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let other = Stats::new(dir.path(), "8401");
-            other.record(NOW, Some("a"), "m", &tokens(100, 50));
+            other.record(NOW, Some("a"), "m", MAIN, &tokens(100, 50));
             other.flush().unwrap();
         }
 
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 2));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 2));
 
         let report = s.report(7, NOW_MS, &Rates);
         let c = &report.days[&local_date(NOW)].credentials["a"]["m"].counters;
@@ -1217,7 +1477,7 @@ mod tests {
     fn flushed_counts_are_not_counted_twice() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(10, 5));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(10, 5));
         s.flush().unwrap();
 
         let c = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
@@ -1230,7 +1490,7 @@ mod tests {
     fn unflushed_counts_show_up_in_the_report() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(3, 4));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(3, 4));
 
         let c = &s.report(7, NOW_MS, &Rates).days[&local_date(NOW)].credentials["a"]["m"].counters;
         assert_eq!(output_of(c), 4, "visible without waiting for a save");
@@ -1241,8 +1501,8 @@ mod tests {
     fn the_report_can_be_narrowed_to_recent_days() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW - 10 * 86_400, Some("a"), "m", &tokens(1, 1));
-        s.record(NOW, Some("a"), "m", &tokens(2, 2));
+        s.record(NOW - 10 * 86_400, Some("a"), "m", MAIN, &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(2, 2));
 
         let recent = s.report(7, NOW_MS, &Rates);
         assert_eq!(
@@ -1262,8 +1522,8 @@ mod tests {
     fn one_day_means_today() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW - 86_400, Some("a"), "m", &tokens(1, 1));
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW - 86_400, Some("a"), "m", MAIN, &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
 
         let today = s.report(1, NOW_MS, &Rates);
         assert_eq!(today.days.len(), 1, "{:?}", today.days);
@@ -1289,7 +1549,7 @@ mod tests {
         std::fs::write(dir.path().join("broken.8401.json"), "{ not json").unwrap();
 
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
 
         let report = s.report(7, NOW_MS, &Rates);
         assert_eq!(report.days.len(), 1, "only its own: {:?}", report.days);
@@ -1317,7 +1577,7 @@ mod tests {
     fn a_listen_address_becomes_a_usable_name() {
         let dir = tempfile::tempdir().unwrap();
         let s = Stats::new(dir.path(), "127.0.0.1:8402");
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let names: Vec<String> = std::fs::read_dir(dir.path())
@@ -1348,8 +1608,8 @@ mod tests {
         let old = NOW - 10 * 86_400;
         {
             let s = stats(dir.path());
-            s.record(old, Some("a"), "m", &tokens(100, 50));
-            s.record(NOW, Some("a"), "m", &tokens(1, 2));
+            s.record(old, Some("a"), "m", MAIN, &tokens(100, 50));
+            s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 2));
             s.flush().unwrap();
         }
 
@@ -1377,14 +1637,14 @@ mod tests {
         let old = NOW - 10 * 86_400;
         {
             let s = stats(dir.path());
-            s.record(old, Some("a"), "m", &tokens(100, 50));
+            s.record(old, Some("a"), "m", MAIN, &tokens(100, 50));
             s.flush().unwrap();
         }
 
         let s = stats(dir.path());
         s.restore(NOW);
         // 時計が巻き戻った等で、載せていない日へ積む。
-        s.record(old, Some("a"), "m", &tokens(1, 1));
+        s.record(old, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let s = stats(dir.path());
@@ -1405,15 +1665,15 @@ mod tests {
         let s = stats(dir.path());
         let yesterday = NOW - 86_400;
 
-        s.record(yesterday, Some("a"), "m", &tokens(1, 1));
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(yesterday, Some("a"), "m", MAIN, &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         s.flush().unwrap();
 
         let old_path = s.path_of(&local_date(yesterday));
         let before = std::fs::metadata(&old_path).unwrap().modified().unwrap();
 
         // 当日だけ積んで、もう一度落とす。
-        s.record(NOW, Some("a"), "m", &tokens(2, 2));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(2, 2));
         s.flush().unwrap();
 
         let after = std::fs::metadata(&old_path).unwrap().modified().unwrap();
@@ -1421,7 +1681,7 @@ mod tests {
 
         // 当日側は更新されている。
         let today = read_day(&s.path_of(&local_date(NOW))).unwrap();
-        assert_eq!(today["a"]["m"].requests, 2);
+        assert_eq!(today["a"]["m"][MAIN].requests, 2);
     }
 
     /// 保存に失敗した日は、次の保存で書き直される。
@@ -1433,14 +1693,14 @@ mod tests {
         std::fs::write(&blocked, "not a directory").unwrap();
 
         let s = Stats::new(&blocked, "8402");
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
         assert!(s.flush().is_err(), "fails because it cannot write");
 
         // 目印が残っているので、書ける状態になれば落ちる。
         std::fs::remove_file(&blocked).unwrap();
         s.flush().unwrap();
         assert_eq!(
-            read_day(&s.path_of(&local_date(NOW))).unwrap()["a"]["m"].requests,
+            read_day(&s.path_of(&local_date(NOW))).unwrap()["a"]["m"][MAIN].requests,
             1
         );
     }
@@ -1455,7 +1715,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = std::sync::Arc::new(stats(dir.path()));
         for i in 0..50 {
-            s.record(NOW, Some("a"), "m", &tokens(i, i));
+            s.record(NOW, Some("a"), "m", MAIN, &tokens(i, i));
         }
 
         let handles: Vec<_> = (0..8)
@@ -1463,7 +1723,7 @@ mod tests {
                 let s = std::sync::Arc::clone(&s);
                 std::thread::spawn(move || {
                     for _ in 0..20 {
-                        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+                        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
                         s.flush().unwrap();
                     }
                 })
@@ -1475,7 +1735,7 @@ mod tests {
 
         // 読めること (= 途中の状態が rename されていない) を確かめる。
         let day = read_day(&s.path_of(&local_date(NOW))).unwrap();
-        assert!(day["a"]["m"].requests > 0);
+        assert!(day["a"]["m"][MAIN].requests > 0);
 
         // 一時ファイルを置き去りにしない。
         let leftovers: Vec<String> = std::fs::read_dir(dir.path())
@@ -1509,7 +1769,7 @@ mod tests {
     fn an_extreme_day_count_does_not_overflow() {
         let dir = tempfile::tempdir().unwrap();
         let s = stats(dir.path());
-        s.record(NOW, Some("a"), "m", &tokens(1, 1));
+        s.record(NOW, Some("a"), "m", MAIN, &tokens(1, 1));
 
         for days in [1, usize::MAX] {
             let report = s.report(days, NOW_MS, &Rates);

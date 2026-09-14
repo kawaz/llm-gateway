@@ -1122,6 +1122,7 @@ impl<P: Persistence> Gateway<P> {
                 to_unix_secs(sent_at_ms),
                 route.credential.as_ref().map(CredentialId::as_str),
                 &kept.model,
+                RequestOrigin::Keepalive.as_str(),
                 usage,
             );
         }
@@ -2413,9 +2414,12 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
             forwarded.response.body,
             forwarded.usage,
             Arc::clone(gw.stats()),
-            now_unix(),
-            forwarded.credential.as_ref().map(CredentialId::as_str),
-            &forwarded.model,
+            exchange::Attribution {
+                at: now_unix(),
+                credential: forwarded.credential.as_ref().map(CredentialId::as_str),
+                model: &forwarded.model,
+                origin: &forwarded.origin,
+            },
             tracing::Span::none(),
         )
         .with_completion(forwarded.completion);
@@ -5658,7 +5662,8 @@ main = "replay"
         assert_eq!(event.cache_ttl_secs, Some(60 * 60));
     }
 
-    /// 自送信の 1 本も、送った日の欄に積まれる (DR-0027 決定 6)。
+    /// 自送信の 1 本も、送った日の欄に素性 `keepalive` で積まれる
+    /// (DR-0027 決定 6、DR-0029)。
     ///
     /// 送った時刻は知らせに合わせてミリ秒で持ち回っている (DR-0012)。集計は
     /// 秒で数えるので、直さずに渡すと日付が 5 桁の年へ飛び、その 1 本が
@@ -5724,7 +5729,23 @@ main = "replay"
 
         let today = crate::credential::time::local_date(now_unix());
         let days: Vec<String> = gw.stats().in_memory().into_keys().collect();
-        assert_eq!(days, vec![today], "the replay is counted on today");
+        assert_eq!(days, vec![today.clone()], "the replay is counted on today");
+
+        // 人が出した 1 本と自送信は、同じモデルの中で素性ごとに分かれる
+        // (DR-0029)。混ざると ping の費用を後から引き算できない。
+        let by_origin = gw.stats().in_memory()[&today][crate::stats::NO_CREDENTIAL]["m"].clone();
+        assert_eq!(
+            by_origin[RequestOrigin::Keepalive.as_str()].requests,
+            1,
+            "the ping is filed on its own"
+        );
+        assert!(
+            by_origin
+                .keys()
+                .any(|origin| origin != RequestOrigin::Keepalive.as_str()),
+            "the forwarded request is not filed as a ping: {:?}",
+            by_origin.keys().collect::<Vec<_>>()
+        );
     }
 
     /// 集計の USD は、その行を出した経路の単価で換算する。
@@ -5753,10 +5774,12 @@ models = ["claude-opus-5"]
         let now = now_unix();
         let mut usage = TokenUsage::default();
         usage.set(TokenKind::input(), 1_000_000);
-        gw.stats().record(now, Some("a"), "claude-opus-5", &usage);
-        gw.stats().record(now, None, "claude-opus-5", &usage);
+        let main = RequestOrigin::Main.as_str();
+        gw.stats()
+            .record(now, Some("a"), "claude-opus-5", main, &usage);
+        gw.stats().record(now, None, "claude-opus-5", main, &usage);
         // 単価表に無いモデルは、どの経路に聞いても値が付かない。
-        gw.stats().record(now, Some("a"), "who-knows", &usage);
+        gw.stats().record(now, Some("a"), "who-knows", main, &usage);
 
         let report = gw.stats_report(7, now);
         let day = report

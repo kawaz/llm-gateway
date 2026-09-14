@@ -111,18 +111,21 @@ pub fn record_upstream_headers(span: &Span, model: &str, route: &str, status: u1
 /// `span` は [`request_span`] が返したもの。`observer` は応答を出した
 /// provider が作った役 ([`crate::provider::Metering`] 経由、DR-0014 §4) —
 /// 読めない応答では `None` で、その場合 usage は記録されないが、節目の
-/// ログは observer の有無に関わらず残す。`stats` は usage の積み先、
-/// `at` / `credential` / `model` は積むときの鍵になる (`at` は応答が
-/// 始まった時刻。生成が日を跨いで終わっても、始めた日に付ける)。
+/// ログは observer の有無に関わらず残す。`stats` は usage の積み先で、
+/// 誰の分として積むかは `attribution` ([`Attribution`])。
 pub fn observe(
     body: BodyStream,
     observer: Option<Box<dyn UsageObserver>>,
     stats: Arc<Stats>,
-    at: i64,
-    credential: Option<&str>,
-    model: &str,
+    attribution: Attribution<'_>,
     span: Span,
 ) -> BodyObservation {
+    let Attribution {
+        at,
+        credential,
+        model,
+        origin,
+    } = attribution;
     BodyObservation {
         inner: body,
         span,
@@ -137,10 +140,27 @@ pub fn observe(
         at,
         credential: credential.map(str::to_owned),
         model: model.to_owned(),
+        origin: origin.to_owned(),
         tap: None,
         response_body: Vec::new(),
         completion: None,
     }
+}
+
+/// 読めた usage を誰の分として積むか (DR-0011、DR-0029)。
+///
+/// 位置で渡すと、同じ型の欄 (モデル名と素性) を取り違えても気づけない。
+/// 名前で書けるようにしておく ([`events::Origin`] と同じ構え)。
+pub struct Attribution<'a> {
+    /// 応答が始まった時刻 (unix 秒)。生成が日を跨いで終わっても、始めた日に
+    /// 付ける。
+    pub at: i64,
+    /// 答えた経路。持たない経路 (relay 型) では `None`。
+    pub credential: Option<&'a str>,
+    /// 解決後の実モデル名。
+    pub model: &'a str,
+    /// 出した側の 1 語 ([`crate::provider::RequestOrigin::as_str`])。
+    pub origin: &'a str,
 }
 
 /// 1 exchange の tap 配信に必要な値。
@@ -208,6 +228,8 @@ pub struct BodyObservation {
     at: i64,
     credential: Option<String>,
     model: String,
+    /// 出した側の 1 語 (DR-0029)。集計を素性で割るための鍵。
+    origin: String,
     tap: Option<TapObservation>,
     response_body: Vec<u8>,
     /// 応答が閉じたことを流す先と、その下書き。流さない応答では `None`。
@@ -264,8 +286,13 @@ impl BodyObservation {
         };
         let outcome = observer.finish();
         if let Some(usage) = &outcome.usage {
-            self.stats
-                .record(self.at, self.credential.as_deref(), &self.model, usage);
+            self.stats.record(
+                self.at,
+                self.credential.as_deref(),
+                &self.model,
+                &self.origin,
+                usage,
+            );
         }
         outcome
     }
@@ -487,9 +514,12 @@ mod tests {
             body,
             None,
             Arc::new(Stats::new(dir.path(), "test")),
-            0,
-            None,
-            "m",
+            Attribution {
+                at: 0,
+                credential: None,
+                model: "m",
+                origin: "main",
+            },
             span,
         )
     }
@@ -849,7 +879,7 @@ mod tests {
 
     /// 積んだ input トークン数。1 日分・1 行分しか無い前提で読む。
     fn only_entry_input(counts: &ByDate) -> u64 {
-        counts.values().next().expect("one day's worth")["a"]["m"]
+        counts.values().next().expect("one day's worth")["a"]["m"]["main"]
             .tokens
             .get(&TokenKind::input())
             .unwrap_or(0)
@@ -866,9 +896,12 @@ mod tests {
             stream_of(chunks),
             observer,
             Arc::clone(stats),
-            USAGE_NOW,
-            Some("a"),
-            "m",
+            Attribution {
+                at: USAGE_NOW,
+                credential: Some("a"),
+                model: "m",
+                origin: "main",
+            },
             request_span(),
         );
         while let Some(chunk) = obs.next().await {
@@ -933,9 +966,12 @@ mod tests {
                 stream_of(vec![b"12345".to_vec(), b"67890".to_vec()]),
                 counter(),
                 Arc::clone(&stats),
-                USAGE_NOW,
-                Some("a"),
-                "m",
+                Attribution {
+                    at: USAGE_NOW,
+                    credential: Some("a"),
+                    model: "m",
+                    origin: "main",
+                },
                 request_span(),
             );
             // 1 チャンクだけ読んで捨てる。
@@ -957,7 +993,7 @@ mod tests {
 
         let counts = stats.in_memory();
         let day = counts.values().next().expect("one day's worth");
-        assert_eq!(day["a"]["m"].requests, 1);
+        assert_eq!(day["a"]["m"]["main"].requests, 1);
         assert_eq!(only_entry_input(&counts), 4, "not doubled");
     }
 
@@ -976,9 +1012,12 @@ mod tests {
                 broken,
                 counter(),
                 Arc::clone(&stats),
-                USAGE_NOW,
-                Some("a"),
-                "m",
+                Attribution {
+                    at: USAGE_NOW,
+                    credential: Some("a"),
+                    model: "m",
+                    origin: "main",
+                },
                 request_span(),
             );
             while let Some(item) = obs.next().await {
@@ -1001,9 +1040,12 @@ mod tests {
                 stream_of(vec![b"12".to_vec()]),
                 counter(),
                 Arc::clone(&stats),
-                USAGE_NOW,
-                None,
-                "claude-opus-5",
+                Attribution {
+                    at: USAGE_NOW,
+                    credential: None,
+                    model: "claude-opus-5",
+                    origin: "main",
+                },
                 request_span(),
             );
             while obs.next().await.is_some() {}
@@ -1012,12 +1054,44 @@ mod tests {
         let counts = stats.in_memory();
         let day = counts.values().next().expect("one day's worth");
         assert_eq!(
-            day[crate::stats::NO_CREDENTIAL]["claude-opus-5"]
+            day[crate::stats::NO_CREDENTIAL]["claude-opus-5"]["main"]
                 .tokens
                 .get(&TokenKind::input())
                 .unwrap_or(0),
             2,
             "a route without a credential is recorded under the reserved name"
+        );
+    }
+
+    /// 出した側 (DR-0029) も鍵の一部として、そのまま集計へ渡る。
+    ///
+    /// ここで落とすと、gateway 自身の自送信 (`keepalive`) が人の 1 本と
+    /// 混ざったまま日次ファイルに残り、後から分けられない。
+    #[tokio::test]
+    async fn the_origin_reaches_the_daily_totals() {
+        let stats = new_stats();
+        {
+            let mut obs = observe(
+                stream_of(vec![b"12".to_vec()]),
+                counter(),
+                Arc::clone(&stats),
+                Attribution {
+                    at: USAGE_NOW,
+                    credential: Some("a"),
+                    model: "m",
+                    origin: "keepalive",
+                },
+                request_span(),
+            );
+            while obs.next().await.is_some() {}
+        }
+
+        let counts = stats.in_memory();
+        let by_origin = &counts.values().next().expect("one day's worth")["a"]["m"];
+        assert_eq!(
+            by_origin.keys().collect::<Vec<_>>(),
+            vec!["keepalive"],
+            "the word the caller gave is the one that is filed"
         );
     }
 
@@ -1042,9 +1116,12 @@ mod tests {
             stream_of(chunks),
             observer,
             Arc::new(Stats::new(dir.path(), "test")),
-            USAGE_NOW,
-            Some("a"),
-            "m",
+            Attribution {
+                at: USAGE_NOW,
+                credential: Some("a"),
+                model: "m",
+                origin: "main",
+            },
             request_span(),
         )
         .with_completion(Some(Completion {
@@ -1170,9 +1247,12 @@ mod tests {
             ]),
             counter(),
             Arc::new(Stats::new(dir.path(), "test")),
-            USAGE_NOW,
-            Some("a"),
-            "m",
+            Attribution {
+                at: USAGE_NOW,
+                credential: Some("a"),
+                model: "m",
+                origin: "main",
+            },
             request_span(),
         )
         .with_completion(Some(Completion {
@@ -1235,9 +1315,12 @@ mod tests {
                 stream_of(vec![b"data".to_vec()]),
                 Some(Box::new(CacheCounter { read, written })),
                 Arc::new(Stats::new(dir.path(), "test")),
-                USAGE_NOW,
-                Some("a"),
-                "m",
+                Attribution {
+                    at: USAGE_NOW,
+                    credential: Some("a"),
+                    model: "m",
+                    origin: "main",
+                },
                 request_span(),
             )
             .with_completion(Some(Completion {
