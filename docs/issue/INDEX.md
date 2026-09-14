@@ -3,6 +3,7 @@
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
 | 2026-09-14 | bug | open | [keepalive-promise-not-withdrawn-on-refused-forward](./2026-09-14-keepalive-promise-not-withdrawn-on-refused-forward.md) | 全経路が断られた転送で cache_notice の約束が取り消されない |
+| 2026-09-14 | task | open | [keepalive-absence-tests-can-pass-vacuously](./2026-09-14-keepalive-absence-tests-can-pass-vacuously.md) | keepalive の「何も送られない」テストが判断回数を検証せず vacuous に pass しうる |
 | 2026-09-10 | request | open | [supervisor-log-reopen-on-rotation](./2026-09-10-supervisor-log-reopen-on-rotation.md) | 監督者のログ fd をログローテーション後に開き直す |
 | 2026-09-10 | bug | open | [supervisor-crash-leaves-orphan-children](./2026-09-10-supervisor-crash-leaves-orphan-children.md) | 監督者クラッシュ後に子プロセスが残り新監督者とポート衝突する |
 | 2026-09-09 | request | open | [daemon-restart-order-and-grace](./2026-09-09-daemon-restart-order-and-grace.md) | daemon restart --all の順序と停止猶予を設定可能にする |
