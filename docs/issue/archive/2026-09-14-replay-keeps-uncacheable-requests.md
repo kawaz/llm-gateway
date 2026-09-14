@@ -1,6 +1,6 @@
 ---
 title: replay がキャッシュに乗らない request を保持し、55 分ごとに全量入力で自送信し続ける
-status: open
+status: resolved
 category: bug
 created: 2026-09-14T14:29:57+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-14T15:07:21+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0027","implemented","commit/xukymxol","research/2026-09-14-claude-code-uncached-requests"]
 blocked_by:
 origin: 自リポ TODO
 ---
