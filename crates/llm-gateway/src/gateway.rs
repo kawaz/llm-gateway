@@ -855,6 +855,19 @@ impl<P: Persistence> Gateway<P> {
         crate::config::KeepaliveHorizon::Ratio(1.0).resolve(pricing.as_ref())
     }
 
+    /// この 1 本を控える (= 送り直しの対象にする) 条件を満たすか。
+    ///
+    /// 連鎖の見立てを知らせに出す側と、実際に控える側で同じ判定を使う。
+    /// 片方だけが真になると、繋ぐ気の無い系列に「この先どこまで繋ぐ」と
+    /// 言うか、言わずに繋ぐことになる。
+    ///
+    /// cache に乗ったかどうかはここでは分からない (応答を読み切るまで出ない)
+    /// ので、入っていない — 乗らなかった 1 本は約束を取り消して畳む
+    /// (DR-0027 決定 8)。
+    fn will_keep(&self, call: &Call<'_>) -> bool {
+        call.series.is_some() && keepalive::carries_tools(call.body)
+    }
+
     /// この 1 本の系列 (控えの鍵)。名乗りか prefix が無ければ `None`。
     fn series_of(&self, call: &Call<'_>) -> Option<keepalive::Series> {
         call.series.as_ref().map(|series| keepalive::Series {
@@ -882,10 +895,10 @@ impl<P: Persistence> Gateway<P> {
         sent_at_ms: i64,
         cache_notice: Option<String>,
     ) -> Option<Arc<dyn exchange::CacheWitness>> {
-        let series = self.series_of(call)?;
-        if !keepalive::carries_tools(call.body) {
+        if !self.will_keep(call) {
             return None;
         }
+        let series = self.series_of(call)?;
         let sent = keepalive::Sent {
             series,
             ns: call.ns.to_owned(),
@@ -1066,12 +1079,15 @@ impl<P: Persistence> Gateway<P> {
         let mut chain = None;
         if let Some(strategy) = strategy {
             cache::apply(&mut body, strategy);
-            if strategy == CacheStrategy::Keepalive {
-                // 控えを置くのは応答を見た後 (この 1 本が upstream に届いた
-                // ことを確かめてから)。見立てはこの時点の控えから出す。
-                chain = self
-                    .series_of(call)
-                    .and_then(|series| self.keepalive.chain(&series));
+            if strategy == CacheStrategy::Keepalive && self.will_keep(call) {
+                // 控えを置くのは応答を見た後だが、見立てはこの時点で全部
+                // 決まる — 実リクエストは連鎖を 0 から数え直すので、起点は
+                // この 1 本の時刻、終わりは期間から出る (DR-0012)。乗らな
+                // かったときは `cache_expired` が取り消す (決定 8)。
+                chain = Some(keepalive::Chain::promised(
+                    sent_at_ms,
+                    self.horizon_for(call, route),
+                ));
             }
         }
         // 分岐点は連鎖の起点から数える。単価を持たないモデルでは出せない。
@@ -1657,6 +1673,9 @@ impl exchange::CacheWitness for Keeping {
                 cache = cache.as_str(),
                 "this request did not land on the cache; not keeping it"
             );
+            // 送る前に連鎖を知らせてある。控えないまま黙ると、見る側はその
+            // 見立てを描き続ける (DR-0027 決定 8)。
+            self.keepalive.not_landed(&sent);
             return;
         }
         self.keepalive.armed_by_request(sent);
@@ -6151,9 +6170,10 @@ keepalive_horizon = "8h"
     /// 知らせは、送り直しの連鎖を載せる (DR-0012)。
     ///
     /// 見る側 (ccmsg) が描くリングは `cache_expires_at` の 1 時間で終わるが、
-    /// 控えの付いている系列は実際にはその先まで生きる。連鎖が出るのは控えを
-    /// 置いた後 = 2 本目からで、cache に乗ったことが分かるのは応答を読み切った
-    /// ところ (DR-0027 決定 8) だから。
+    /// 控えの付いている系列は実際にはその先まで生きる。**1 本目から**出す —
+    /// 控えを置くのは応答を読み切った後 (DR-0027 決定 8) だが、連鎖の見立ては
+    /// 送る時点の値 (この 1 本の時刻・期間・単価) だけで決まる。乗らなかった
+    /// ときは `cache_expired` が名指しで取り消す。
     #[tokio::test]
     async fn a_kept_conversation_reports_how_far_the_chain_reaches() {
         let dir = tempfile::tempdir().unwrap();
@@ -6186,13 +6206,6 @@ keepalive_horizon = "8h"
         };
 
         send(&gw).await;
-        let first = forwarding(&mut watching).await;
-        assert_eq!(
-            first.cache_since, None,
-            "nothing was kept for this series yet"
-        );
-
-        send(&gw).await;
         let forwarded = forwarding(&mut watching).await;
         // 送り直しは 55 分の格子に乗るので、時刻はすべて起点からの整数倍で
         // 決まる。欄ごとに時計を読み直すと、ここに端数が乗る (実測)。
@@ -6200,8 +6213,8 @@ keepalive_horizon = "8h"
         let lifetime = 60 * 60 * 1_000;
         let since = forwarded.cache_since.expect("the chain has a start");
         assert_eq!(
-            since, first.ts,
-            "the chain starts at the request that was kept, to the millisecond"
+            since, forwarded.ts,
+            "the chain starts at this very request, to the millisecond"
         );
         assert_eq!(forwarded.cache_count, Some(0), "nothing has been sent yet");
         assert_eq!(
@@ -6225,10 +6238,79 @@ keepalive_horizon = "8h"
         // 寿命を約束した 1 本には名前が付く (DR-0012)。取り消しはこれを指す。
         let promised = forwarded.cache_notice.expect("the promise has a name");
         assert!(!promised.is_empty());
+
+        // 次の 1 本は別の約束になる。名前を使い回すと、古い約束の取り消しが
+        // 新しい寿命まで消してしまう。
+        send(&gw).await;
+        let next = forwarding(&mut watching).await;
         assert_ne!(
-            first.cache_notice,
+            next.cache_notice,
             Some(promised),
             "each promise gets its own name"
+        );
+        assert_eq!(
+            next.cache_since,
+            Some(next.ts),
+            "and a real request always starts the chain over"
+        );
+    }
+
+    /// 乗るものが無かった 1 本は、出した約束をその場で取り消す
+    /// (DR-0027 決定 8、DR-0012)。
+    ///
+    /// 連鎖の見立ては送る前に出るので、`none` で終わった 1 本にも「この先
+    /// 8 時間繋ぐ」と言った知らせが既に流れている。控えないだけで黙ると、
+    /// 見る側はその見立てを描き続ける。
+    #[tokio::test]
+    async fn a_request_that_lands_on_nothing_withdraws_what_it_promised() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = FakeUpstream::start(|_, _| (200, body_with_cache(0, 0))).await;
+        let gw = gateway(&format!(
+            "[stats]\ndir = \"{}\"\n{}",
+            dir.path().display(),
+            keepalive_config(&up.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                headers,
+            )
+            .await
+            .unwrap();
+        drain(&gw, forwarded).await;
+
+        let promised = forwarding(&mut watching)
+            .await
+            .cache_notice
+            .expect("the request promised a lifetime");
+
+        let withdrawn = loop {
+            match watching.try_recv().expect("the promise was withdrawn") {
+                events::Notice::CacheExpired(expired) => break expired,
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            withdrawn.of, promised,
+            "it withdraws the promise this request made"
+        );
+        assert_eq!(withdrawn.session_id, "s-1");
+        assert!(
+            keepalive::store::Store::new(dir.path())
+                .load_all()
+                .is_empty(),
+            "and nothing is kept to send again"
         );
     }
 

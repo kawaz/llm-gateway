@@ -451,9 +451,12 @@ was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
 routes were skipped during route selection, `skipped` lists each credential and the
 reason.
 
-A series kept by the `keepalive` strategy also carries the shape of its resend chain
-(all omitted when nothing is kept for the series; since what's kept is written only
-after the response finishes, this starts from the series' second request):
+A request the `keepalive` strategy will keep also carries the shape of its resend
+chain (all omitted for a request that will not be kept). What is kept is written only
+after the response finishes, but **these fields are there from the very first
+request** — the projection follows from the values at send time alone. When a request
+turns out to have landed on no cache, the `cache_expired` that follows withdraws the
+promise it made:
 
 | Field | Meaning |
 |---|---|

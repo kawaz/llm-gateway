@@ -111,6 +111,40 @@ pub struct Breakeven {
     pub until_ms: i64,
 }
 
+impl Chain {
+    /// この 1 本が置く控えから見た連鎖。
+    ///
+    /// 実リクエストは控えを置き直して連鎖を 0 から数え直すので、送る時点で
+    /// 全部決まる ([`Keepalive::armed_by_request`] が書く値と同じ)。知らせに
+    /// 出すのは**この見立て**で、控えが実際に置かれるのは応答を読み切った後
+    /// (DR-0027 決定 8) — 乗らなかったときは `cache_expired` が取り消す。
+    pub fn promised(since_ms: i64, horizon: Duration) -> Self {
+        Self::laid_out(
+            since_ms,
+            0,
+            since_ms + refresh_ms(),
+            since_ms + horizon.as_millis() as i64,
+        )
+    }
+
+    /// 起点・本数・次の予定・期間の終わりから、55 分の格子に並べる。
+    fn laid_out(since_ms: i64, count: u32, fires_at_ms: i64, horizon_end_ms: i64) -> Self {
+        let at = |nth: u32| since_ms + i64::from(nth) * refresh_ms();
+        // 期間の終わりを跨いだ 1 本まで出る (発火時点で期間が残っていれば
+        // 次を仕込む)。次の 1 本の後に、あと何本続くか。
+        let more =
+            ((horizon_end_ms - fires_at_ms).max(0) as u64).div_ceil(refresh_ms() as u64) as u32;
+        let until_count = count + 1 + more;
+        Self {
+            since_ms,
+            count,
+            next_at_ms: Some(at(count + 1)),
+            until_ms: at(until_count) + LIFETIME.as_millis() as i64,
+            until_count,
+        }
+    }
+}
+
 impl Breakeven {
     /// この起点から数えた分岐点。本数の数え方は実際の連鎖と同じ
     /// ([`signals_within`])。
@@ -365,29 +399,12 @@ impl Keepalive {
     /// **見込み値**。経路が塞がって送れなければ、ここより早く切れる。
     pub fn chain(&self, series: &Series) -> Option<Chain> {
         let kept = self.store.load(series)?;
-        let at = |signal: u32| kept.since_ms + i64::from(signal) * refresh_ms();
-        // 期間の終わりを跨いだ 1 本まで出る (発火時点で期間が残っていれば
-        // 次を仕込む)。次の 1 本の後に、あと何本続くか。
-        let more = ((kept.horizon_end_ms - kept.fires_at_ms).max(0) as u64)
-            .div_ceil(refresh_ms() as u64) as u32;
-        let until_count = kept.count + 1 + more;
-        Some(Chain {
-            since_ms: kept.since_ms,
-            count: kept.count,
-            next_at_ms: Some(at(kept.count + 1)),
-            until_ms: at(until_count) + LIFETIME.as_millis() as i64,
-            until_count,
-        })
-    }
-
-    /// この系列の実リクエストが最後に通った先。
-    pub fn bound(&self, series: &Series) -> Option<Bound> {
-        let kept = self.store.load(series)?;
-        Some(Bound {
-            ns: kept.ns,
-            model: kept.model,
-            route: kept.route,
-        })
+        Some(Chain::laid_out(
+            kept.since_ms,
+            kept.count,
+            kept.fires_at_ms,
+            kept.horizon_end_ms,
+        ))
     }
 
     /// 予定を 1 つ置く。
@@ -532,6 +549,14 @@ impl Keepalive {
             return;
         }
         self.plan(series, REFRESH_AFTER, fires_at_ms);
+    }
+
+    /// 控えずに終わった 1 本の約束を取り消す (DR-0027 決定 8)。
+    ///
+    /// 送る前に「この先どこまで繋ぐ」と知らせてある ([`Chain::promised`]) ので、
+    /// 控えないだけで黙ると、見る側はその見立てを描き続ける。
+    pub fn not_landed(&self, sent: &Sent) {
+        self.expired(&sent.series, sent.cache_notice.as_deref());
     }
 
     /// 約束した寿命が果たされずに終わったことを知らせる (DR-0012)。
@@ -1010,6 +1035,29 @@ mod tests {
         assert_eq!(
             chain.until_ms,
             started + 2 * refresh_ms() + LIFETIME.as_millis() as i64
+        );
+    }
+
+    /// 送る前に出す見立てと、控えを置いた後に読める連鎖は同じもの。
+    ///
+    /// 知らせに出すのは前者 (1 本目から出せる)、見張りが使うのは後者。両者が
+    /// ずれると、見る側は「言われた終わり」と「実際に繋ぐ終わり」の違う 2 つを
+    /// 相手にすることになる。
+    #[tokio::test(start_paused = true)]
+    async fn what_was_promised_is_what_gets_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let keepalive = keepalive(dir.path(), &upstream, true);
+
+        let started = now_unix_ms();
+        let sent = sent(started);
+        let horizon = sent.horizon;
+        keepalive.armed_by_request(sent);
+
+        assert_eq!(
+            keepalive.chain(&series()),
+            Some(Chain::promised(started, horizon)),
+            "the notice promised exactly what the kept series reports"
         );
     }
 
