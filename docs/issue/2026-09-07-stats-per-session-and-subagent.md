@@ -27,6 +27,8 @@ ccmsg 統括からのフラグ (2026-09-07、r279m10、裁定不要の情報共�
 
 ## 背景
 
+2026-09-14: origin 軸 (main / sub / keepalive …) は DR-0029 / v0.47.0 で stats に入った。残るのは session × model の粒度と subagent 識別材料の棚卸し。DR-0029 の「やらないこと」に session 粒度は別設計が要る理由を記載。
+
 ## 候補 (採否は gateway 側で判断)
 
 - request / response event に subagent の識別を載せる (Claude Code が送る agent id 相当のヘッダ / 本文の印があるか要確認、origin=sub の下位区分)
