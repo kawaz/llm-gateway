@@ -54,7 +54,7 @@ sub = "none"
 | `models` | (required) | Patterns this rule applies to. An empty list is a config error |
 | `main` | `passthrough` | Strategy for requests from the main conversation |
 | `sub` | `passthrough` | Strategy for requests from a subagent |
-| `keepalive_horizon` | `8h` | How long `keepalive` keeps signalling a series |
+| `keepalive_horizon` | `8h` | How long `keepalive` keeps resending a series |
 
 The strategies:
 
@@ -64,8 +64,7 @@ The strategies:
 | `none` | Every `cache_control` is stripped (for one-shot calls) |
 | `5m` | Every breakpoint loses its `ttl` (= the default five minutes) |
 | `1h` | Every breakpoint gets `ttl: "1h"` |
-| `keepalive` | The body is written like `1h`, and when the conversation stops a signal goes out to draw one round trip that carries the cache into the next hour. **`main` only** — writing it under `sub` is a config error |
-| `replay` | The body is written like `1h`, and when the conversation stops **the gateway sends the last forwarded body again, unchanged**, carrying the cache into the next hour. Nothing has to receive it and no answer is expected, so it works under `sub` too (DR-0027) |
+| `keepalive` | The body is written like `1h`, and when the conversation stops **the gateway sends the last forwarded body again, unchanged**, carrying the cache into the next hour. Nothing has to receive it and no answer is expected, so it works under `sub` too (DR-0027) |
 
 `keepalive_horizon` can be written two ways:
 
@@ -75,7 +74,7 @@ The strategies:
 | Share | `0.3` | Three tenths of the **break-even time**. Any number above 0 (1 and up is allowed) |
 
 The break-even time is `(1h write rate / cache read rate) x 55 minutes` — the point
-where signalling for that long costs as much as rebuilding the cache once. It follows
+where resending for that long costs as much as rebuilding the cache once. It follows
 from the model's prices alone (80 pings, 73.3 hours, for Fable 5.1; 20 pings, 18.3
 hours, for Opus 5), so a share applies the same judgement to models that cost
 differently (`0.3` is 22 hours on Fable 5.1 and 5.5 hours on Opus 5). Measured against
@@ -95,18 +94,20 @@ header at all is the main conversation (`main`). A caller that cannot be read
 and `oneshot`** — neither is continued, so treating them as a conversation to come pays
 nothing back.
 
-`keepalive` can only reach a conversation through the `webhook` destination. With
-no `webhook.base_url` configured no signal is raised (so it behaves exactly like
-`1h`), and `llm-gateway check` lists that namespace as a warning.
+### Running keepalive
 
-### Running replay
-
-A `replay` series keeps its last forwarded request in
+A `keepalive` series keeps its last forwarded request in
 `<stats dir>/keepalive/<session>.<series>.json` and sends it again every 55 idle
 minutes with `max_tokens` set to 1. The answer is discarded (the cost is one output
 token plus a cache read of the whole prefix). What is kept is picked up again after a
-restart; a series is dropped once its cache has expired or its `keepalive_horizon`
-has passed.
+restart (`stats.dir` defaults to `~/.local/state/llm-gateway/stats`); a series is
+dropped once its cache has expired or its `keepalive_horizon` has passed.
+
+What gets kept is the real request — the one carrying tools — and only when it
+actually landed on the cache. A series whose usage reports a miss is not kept, and
+any existing entry is dropped: resending a body with no cache to extend would only
+spend the full input again. When the route it last used (namespace / model /
+credential) is down, nothing is sent, and it tries again 55 minutes later.
 
 **What is kept is the conversation body itself** (DR-0027 decision 4). There is no
 consent flag, no encryption, no masking — the same host already holds the session
@@ -116,25 +117,18 @@ conversation content. A series whose body exceeds 8MB is not kept, and is not
 extended.
 
 Several processes may share the directory. The `.lock` beside a series is taken right
-before sending, so only one of them ever touches it.
-`POST /llm-gateway/keepalive/pause` drops the kept request too, and one real request
-from that conversation resumes it.
+before sending, so only one of them ever touches it. On startup each process only
+reads its own naming (`<session>.<series>.json`) and ignores anything else in the
+directory. Prefer a priority policy (Caddy's `lb_policy first`) or sticky routing
+keyed on the `X-Claude-Code-Session-Id` header; round-robin also works correctly (the
+kept request is shared, so whichever process handles it sends the same one).
 
-A replayed request appears in the forwarding notices (DR-0012) with
+`POST /llm-gateway/keepalive/pause`, given that conversation's `session_id`, drops the
+kept request and stops resending. There is no separate resume endpoint — one real
+request from that conversation puts the kept request back.
+
+A resent request appears in the forwarding notices (DR-0012) with
 `origin: "keepalive"`, and is counted in usage / stats like any other request.
-
-### Running keepalive
-
-The watch over a stopped conversation is kept in
-`<stats dir>/keepalive/<listener>.json` and picked up again after a restart
-(`stats.dir` defaults to `~/.local/state/llm-gateway/stats`). Each listener writes its
-own file, so several processes may share one directory.
-
-With several processes behind a load balancer, the signal **converges on a single one
-from observation alone** (a process that sees another's signal steps back). Prefer a
-priority policy (Caddy's `lb_policy first`) or sticky routing keyed on the
-`X-Claude-Code-Session-Id` header; round-robin also converges, but with more duplicate
-signals along the way.
 
 ## Forwarding
 
@@ -442,40 +436,38 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_paused":false}
+data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which
 conversation series a request belongs to; when it cannot be derived, the field is
 omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in
-the Responses shape is `codex`). `cache_ttl_secs` is
+the Responses shape is `codex`, and the gateway's own resend is `keepalive`).
+`cache_ttl_secs` is
 **how long the prefix this request leaves behind lives**, in seconds: it follows the
 strategy that was applied, and for an untouched body it reads the `cache_control` that
 was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300).
 `cache_expires_at` is that moment. A request that leaves no breakpoint omits both. If
 routes were skipped during route selection, `skipped` lists each credential and the
-reason. A request that answered a cache signal carries `keepalive` (`applied` / `late`
-/ `foreign` / `spent`).
+reason.
 
-A series watched by the `keepalive` strategy also carries the shape of its signal chain
-(all omitted when no signal watches the series):
+A series kept by the `keepalive` strategy also carries the shape of its resend chain
+(all omitted when nothing is kept for the series; since what's kept is written only
+after the response finishes, this starts from the series' second request):
 
 | Field | Meaning |
 |---|---|
 | `cache_since` | Where the chain starts: the last real request on this series |
-| `next_keepalive_at` | When the next signal is due (omitted once no more go out) |
-| `cache_count` | Which link this request is (a real request is 0, the k-th signal is k) |
-| `cache_until` | **How far the signal can carry the cache**: when the hour the last signal buys runs out |
-| `cache_until_count` | How many signals the chain will send in total |
+| `next_keepalive_at` | When the next resend is due (omitted once no more go out) |
+| `cache_count` | Which link this request is (a real request is 0, the k-th resend is k) |
+| `cache_until` | **How far a resend can carry the cache**: when the hour the last one buys runs out |
+| `cache_until_count` | How many resends the chain will send in total |
 | `cache_breakeven_until` / `cache_breakeven_count` | The same, counted to the break-even time (omitted when the model has no known price) |
 
 Where `cache_expires_at` is when the hour this one request bought runs out, `cache_until`
-is when the hour the *last* signal buys runs out. Signals go out every 55 minutes, and
-the one that crosses `keepalive_horizon` is the last. If a signal cannot go out, the
+is when the hour the *last* resend buys runs out. Resends go out every 55 minutes, and
+the one that crosses `keepalive_horizon` is the last. If a resend cannot go out, the
 cache dies earlier than this, so a watcher overwrites it with the latest notice.
-
-Whether the signal is paused is reported in `cache_paused` (a bool) on **every** notice:
-were the field omitted, "not paused" could not be told from "not reported".
 
 When the response body closes, a second notice says how the turn ended.
 
@@ -506,43 +498,10 @@ A request that did reach the conversational endpoint is announced even when the 
 cut before a single byte arrived (`aborted: true`). A dialect with no single word for
 `stop_reason` (OpenAI) omits the field.
 
-In a namespace using the `keepalive` strategy, a second kind of notice is streamed
-when a conversation stops (DR-0024).
-
-```
-event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640000,"session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670000,"marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
-```
-
-The receiver injects `marker` verbatim into that conversation (`session_id`).
-`nonce` is 32 random bytes as base64url — 43 characters — and `LLMGW-KEEPALIVE-`
-followed by it is the token the answer consists of. The body of the
-answer is treated like any other request (under `keepalive` every request writes the
-hour); the notice only says whether it came back before `deadline` (`applied`) or after
-it (`late`). A token **this gateway never minted** is reported as `foreign`: another
-process watching the same conversation raised that signal, and this one steps back
-(that is how several processes converge on a single signal, DR-0024). A token stays in
-the conversation after the answer, so a later request of the same conversation may
-carry it along; one already taken is reported as `spent` and the watch does nothing. While the route a conversation was cached on is unavailable, no signal is
-raised at all. The same notice reaches the
-`webhook` destination in the same shape.
-
-Pausing the signal for a conversation (`POST /llm-gateway/keepalive/pause`) streams one
-notice too. No further request arrives for a paused conversation, so this is the only
-word that it stopped. A pause relayed from a sibling is not streamed (the same
-destination would receive it twice). There is no notice for resuming: the real request
-that lifts the pause carries `keepalive_paused: false`.
-
-```
-event: keepalive_paused
-data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
-```
-
-Every notice that promises a lifetime (a `request` carrying `cache_expires_at`, a
-`cache_keepalive` carrying `deadline`) names that promise in `cache_notice`: 22
-characters, freshly drawn per request, and equal to the signal's own `nonce` on a
-`cache_keepalive`. When a promised lifetime ends without being kept — the cache died
-first, across a suspend or a restart — a notice withdraws that name.
+Every notice that promises a lifetime (a `request` carrying `cache_expires_at`) names
+that promise in `cache_notice`: 22 characters, freshly drawn per request. When a
+promised lifetime ends without being kept — the cache died first, across a suspend or
+a restart — a notice withdraws that name.
 
 ```
 event: cache_expired
@@ -552,9 +511,9 @@ data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f
 A receiver keeps the latest `cache_notice` per (conversation, series) and zeroes its
 countdown only when `of` matches it; otherwise it does nothing, because that promise has
 already been replaced by a newer one. Several gateways can watch the same series without
-confusing each other, since each names only its own promises. The end of the watching
-window (`keepalive_horizon`) does not produce this notice: signalling merely stops, and
-the cache the last signal bought lives on until `cache_until`.
+confusing each other, since each names only its own promises. The end of the window it
+keeps resending for (`keepalive_horizon`) does not produce this notice: resending
+merely stops, and the cache the last resend placed lives on until `cache_until`.
 
 To receive the same stream without holding a connection open (ccmsg on another host,
 say), write the endpoint roots under `[webhook]` and the gateway POSTs to them. Both
@@ -596,8 +555,7 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 ```
 
 `origin` says who asked. `cache_strategy` appears when a prompt cache strategy was
-applied, `cache_ttl_secs` when the request leaves a prefix behind, and `keepalive`
-when the request answered a cache signal.
+applied, and `cache_ttl_secs` when the request leaves a prefix behind.
 `request_body` / `response_body` appear only for subscriptions that asked for them,
 and the truncation limit is independent per subscription. `thinking`, `tool_choice`,
 and `stream` are the values the client sent, before the gateway rewrote anything.

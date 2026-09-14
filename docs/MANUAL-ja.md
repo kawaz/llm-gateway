@@ -54,7 +54,7 @@ sub = "none"
 | `models` | (必須) | 当てるモデル名のパターン。空だと設定エラー |
 | `main` | `passthrough` | メインの会話からのリクエストに効く戦略 |
 | `sub` | `passthrough` | サブエージェントからのリクエストに効く戦略 |
-| `keepalive_horizon` | `8h` | `keepalive` で合図を出し続ける上限 |
+| `keepalive_horizon` | `8h` | `keepalive` で送り直し続ける上限 |
 
 戦略の語彙:
 
@@ -64,8 +64,7 @@ sub = "none"
 | `none` | `cache_control` を全て剥がす (使い捨ての 1 本向け) |
 | `5m` | 全ブレークポイントの `ttl` 指定を落とす (= 既定の 5 分) |
 | `1h` | 全ブレークポイントに `ttl: "1h"` を付ける |
-| `keepalive` | `1h` と同じ本文にした上で、会話が止まったら合図を出して 1 往復を誘発し、cache を次の 1 時間へ繋ぐ。**`main` のみ**、`sub` に書くと設定エラー |
-| `replay` | `1h` と同じ本文にした上で、会話が止まったら **gateway が最後に転送した本文をそのまま送り直して** cache を次の 1 時間へ繋ぐ。会話を起こさないので届け先も戻りも要らず、`sub` にも書ける (DR-0027) |
+| `keepalive` | `1h` と同じ本文にした上で、会話が止まったら **gateway が最後に転送した本文をそのまま送り直して** cache を次の 1 時間へ繋ぐ。会話を起こさないので届け先も戻りも要らず、`sub` にも書ける (DR-0027) |
 
 `keepalive_horizon` は 2 通りの書き方ができる:
 
@@ -74,7 +73,7 @@ sub = "none"
 | 時間 | `"12h"` | そのまま 12 時間。整数 + `h` のみ |
 | 比率 | `0.3` | **分岐時間の 3 割**。0 より大きい実数 (1 以上も可) |
 
-分岐時間 = (1 時間 write の単価 ÷ cache read の単価) × 55 分。合図を出し続ける
+分岐時間 = (1 時間 write の単価 ÷ cache read の単価) × 55 分。送り直し続ける
 費用が cache の作り直し 1 回に追いつく点で、モデルの単価だけで決まる
 (Fable 5.1 なら 80 回ぶん = 73.3 時間、Opus 5 なら 20 回ぶん = 18.3 時間)。
 比率で書くと、単価の違うモデルに同じ判断基準を当てられる (`0.3` は Fable 5.1
@@ -92,16 +91,19 @@ sub = "none"
 読めない相手 (`unknown`) はメイン扱い。**`sub` 側の戦略に乗るのは `sub` と
 `oneshot`** — どちらも続きが来ないので、続きを当て込んだ扱いをしても報われない。
 
-`keepalive` は合図を `webhook` 経由でしか届けられない。`webhook.base_url` を
-書いていない設定では合図を出さない (= `1h` と同じ動作)。`llm-gateway check` が
-その namespace を警告として挙げる。
+### keepalive の運用
 
-### replay の運用
+`keepalive` の系列は、最後に転送した 1 本を
+`<stats の置き場>/keepalive/<会話>.<系列>.json` に控え、idle 55 分ごとに
+`max_tokens` だけを 1 にして送り直す。応答は読み捨てる (費用は output 1 トークンと、
+プレフィックス全量の cache read)。控えは再起動で読み戻され、cache の期限か
+`keepalive_horizon` が過ぎた系列は捨てられる (`stats.dir` の既定は
+`~/.local/state/llm-gateway/stats`)。
 
-`replay` の系列は、最後に転送した 1 本を `<stats の置き場>/keepalive/<会話>.<系列>.json`
-に控え、idle 55 分ごとに `max_tokens` だけを 1 にして送り直す。応答は読み捨てる
-(費用は output 1 トークンと、プレフィックス全量の cache read)。控えは再起動で
-読み戻され、cache の期限か `keepalive_horizon` が過ぎた系列は捨てられる。
+控えるのは、道具を持つ本流の 1 本のうち **cache に乗ったもの**だけ。応答の usage が
+「乗らなかった」と答えた系列は控えない・畳む — 繋ぐ cache が無い本文を送り直しても、
+全量入力を払うだけになる。直前に通った先 (namespace / モデル / 経路) が塞がっている
+ときは送らず、55 分後に改めて試す。
 
 **控えるのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグ・暗号化・
 マスキングは持たない — 同じホストにはセッションの transcript が丸ごと置いてあり、
@@ -110,22 +112,17 @@ tap (`?include=request_body`) からも本文は読めるので、ここだけ�
 入っている前提で扱うこと。1 系列 8MB を超える会話は控えず、その系列は延命しない。
 
 複数プロセスで同じ置き場を共有してよい。送る直前に系列ごとの `.lock` を掴むので、
-撫でるのは常に 1 台だけになる。`POST /llm-gateway/keepalive/pause` はこの控えも
-落とし、解除はその会話から実リクエストが 1 本来れば自動で効く。
+撫でるのは常に 1 台だけになる。起動時に読むのは自分の命名 (`<会話>.<系列>.json`)
+だけで、置き場にある他のファイルは無視する。振り分けは優先度型 (Caddy の
+`lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を推奨。
+round-robin でも正しく動く (控えは共有なので、どちらが撫でても同じ 1 本になる)。
+
+`POST /llm-gateway/keepalive/pause` にその会話の `session_id` を渡すと、控えを
+落として送り直しを止められる。解除の口は持たない — その会話から実リクエストが
+1 本来れば、そこで控えが置き直される。
 
 送り直した 1 本は、転送の知らせ (DR-0012) に `origin: "keepalive"` で並び、
 usage / stats にも通常どおり計上される。
-
-### keepalive の運用
-
-止まっている会話の見張りは `<stats の置き場>/keepalive/<待ち受け>.json` に残り、
-再起動で読み戻される (`stats.dir` の既定は `~/.local/state/llm-gateway/stats`)。
-待ち受けごとに別ファイルなので、同じ置き場を複数プロセスで共有してよい。
-
-複数プロセスを LB の後ろで動かす場合、合図は**観測だけで 1 本に収束する**
-(他プロセスの合図を見たら控えに回る)。振り分けは優先度型 (Caddy の
-`lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を
-推奨。round-robin でも収束するが、収束するまでの重複した合図が増える。
 
 ## 転送系
 
@@ -431,39 +428,36 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_paused":false}
+data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
 見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
-(`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は
-`codex`)。`cache_ttl_secs` は**この 1 本が残す
+(`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、
+gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残す
 プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
 送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
 `cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと
 出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が
-並ぶ。合図の戻りだった 1 本には `keepalive`
-(`applied` / `late` / `foreign` / `spent`) が付く。
+並ぶ。
 
-`keepalive` 戦略で見張っている系列には、合図の連鎖の姿が付く (見張りが
-無ければ欄ごと出ない):
+`keepalive` 戦略で控えている系列には、送り直しの連鎖の姿が付く (控えが
+無ければ欄ごと出ない。控えが置かれるのは応答を読み切った後なので、その系列の
+2 本目から出る):
 
 | 欄 | 意味 |
 |---|---|
 | `cache_since` | 連鎖の起点 = この系列で最後に来た実リクエストの時刻 |
-| `next_keepalive_at` | 次の合図の予定時刻 (もう出さないなら欄ごと出ない) |
-| `cache_count` | この 1 本が連鎖の何番目か (実リクエスト = 0、k 回目の合図 = k) |
-| `cache_until` | **合図で継ぎ足せる終わり** = 最後の合図が置く cache が消える時刻 |
-| `cache_until_count` | 連鎖で出す合図の総数 |
+| `next_keepalive_at` | 次の送り直しの予定時刻 (もう送らないなら欄ごと出ない) |
+| `cache_count` | この 1 本が連鎖の何番目か (実リクエスト = 0、k 回目の送り直し = k) |
+| `cache_until` | **送り直しで継ぎ足せる終わり** = 最後の 1 本が置く cache が消える時刻 |
+| `cache_until_count` | 連鎖で送る総数 |
 | `cache_breakeven_until` / `cache_breakeven_count` | 損益分岐時間まで繋いだ場合の終わりと本数 (単価が分からないモデルでは出ない) |
 
 `cache_expires_at` が「この 1 本が置いた cache がいつ消えるか」なのに対して、
-`cache_until` は「最後に出る合図が置く cache がいつ消えるか」。合図は 55 分
-刻みで、`keepalive_horizon` を跨いだ 1 本が最後になる。合図が出せなかった
-場合はここより早く切れるので、見る側は最新の 1 通で上書きする。
-
-合図が止めてあるかは `cache_paused` (bool) に**常に**出る。欄が消えると
-「止まっていない」と区別が付かないため。
+`cache_until` は「最後に送る 1 本が置く cache がいつ消えるか」。送り直しは
+55 分刻みで、`keepalive_horizon` を跨いだ 1 本が最後になる。送れなかった場合は
+ここより早く切れるので、見る側は最新の 1 通で上書きする。
 
 応答本文が閉じたら、終わり方を載せた 2 通目が流れる。
 
@@ -492,41 +486,8 @@ cache が効いた) / `written` (繋ぐものが無く全量を書いた) / `par
 (`aborted: true`)。`stop_reason` にあたる 1 語を持たない方言 (OpenAI) では
 欄ごと出ない。
 
-`keepalive` 戦略の namespace では、会話が止まったときに別種の 1 通が流れる
-(DR-0024)。
-
-```
-event: cache_keepalive
-data: {"type":"cache_keepalive","ts":1785326640000,"session_id":"s-1","prefix":"3f9a1c02","nonce":"5Qv…","deadline":1785326670000,"marker":"[llm-gateway keepalive ping] nonce=`LLMGW-KEEPALIVE-5Qv…` — automated prompt-cache refresh from your own llm-gateway proxy (see llm-gateway docs, DR-0024). Reply with a single line containing only the nonce above, nothing before or after."}
-```
-
-受け取った側は `marker` をその会話 (`session_id`) へそのまま流し込む。
-`nonce` は 32 バイトの乱数を base64url にした 43 文字で、`LLMGW-KEEPALIVE-` を
-頭に付けたものが合言葉。返事はその 1 行だけになる。
-戻ってきた 1 本の本文は普通のリクエストと同じ扱い (`keepalive` は常に 1 時間を
-書く) で、`deadline` までに戻れば `applied`、過ぎていれば `late` として知らせに
-出る。**この gateway が出していない合言葉**が戻ってきた場合は `foreign` —
-同じ会話を見ている別プロセスの合図で、こちらは控えに回る (合図が 1 本に
-収束する仕組み、DR-0024)。合言葉は返事の後も会話に残るので、同じ会話の
-後続のリクエストが運んでくることがある。受け取り済みのものは `spent` で、
-見張りは何もしない。直前に通った経路が塞がっている間は合図そのものを出さない。同じ受け口
-(`webhook`) にも同じ形で届く。
-
-会話への合図を止めたとき (`POST /llm-gateway/keepalive/pause`) にも 1 通流れる。
-止めた会話には次のリクエストが来ないので、これが止まったことを伝える唯一の
-知らせになる。兄弟から回ってきた停止では流さない (同じ受け口が 2 度受け取る)。
-解除に対応する 1 通は無く、解いた実リクエストの知らせが
-`keepalive_paused: false` を運ぶ。
-
-```
-event: keepalive_paused
-data: {"type":"keepalive_paused","session_id":"s-1","paused_at":1785326700000}
-```
-
-寿命を約束した知らせ (`cache_expires_at` を出す `request`、`deadline` を出す
-`cache_keepalive`) には、その約束の名前 `cache_notice` が載る。リクエストごとに
-新しく振る 22 文字で、`cache_keepalive` では合言葉 (`nonce`) と同じ値になる。
-約束した寿命が果たされずに終わったとき (機械のサスペンドや停止を跨いで cache が
+寿命を約束した知らせ (`cache_expires_at` を出す `request`) には、その約束の
+名前 `cache_notice` が載る。リクエストごとに新しく振る 22 文字。約束した寿命が果たされずに終わったとき (機械のサスペンドや停止を跨いで cache が
 先に消えたとき) は、その名前を名指しで取り消す 1 通が流れる。
 
 ```
@@ -537,9 +498,9 @@ data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f
 受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚えておき、`of` が
 それと一致したときだけ残りを 0 にする。一致しなければ何もしない — その約束は
 既に新しいもので置き換わっている (同じ系列を複数の gateway が見ていても、
-各 gateway は自分の約束にしか名前を振らないので取り違えない)。見張る期間
+各 gateway は自分の約束にしか名前を振らないので取り違えない)。控え続ける期間
 (`keepalive_horizon`) が終わっただけでは流れない。継ぎ足すのをやめるだけで、
-最後の合図が置いた cache は `cache_until` まで生きているため。
+最後に送った 1 本が置いた cache は `cache_until` まで生きているため。
 
 同じ内容を待たずに受け取りたい相手 (別ホストの ccmsg 等) には、`[webhook]` に
 受け口の根を書くと gateway 側から POST で届く。`base_url` (1 つ) と `base_urls`
@@ -579,8 +540,8 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 ```
 
 `origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば
-`cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs`、合図の戻りだった
-1 本には `keepalive` が加わる。`include` を指定した購読にだけ `request_body` /
+`cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs` が加わる。
+`include` を指定した購読にだけ `request_body` /
 `response_body` が加わる。
 切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は
 gateway が書き換える前の、クライアントが送ってきた値。

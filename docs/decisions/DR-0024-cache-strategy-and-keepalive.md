@@ -3,8 +3,10 @@
 - Status: Partially superseded by DR-0027
 - Date: 2026-09-03
 
-§2 (合図の注入で cache を繋ぐ仕組みと、その追補) は DR-0027 の自送信 replay が置き換える。
-§1 の戦略語彙・§3 の損益・pause API・禁則は生きている。
+**§2 (合図の注入で cache を繋ぐ仕組みと、その追補) は DR-0027 の自送信が置き換えた。**
+以下の §2 は合図方式の記述で、実装は残っていない — 生きているのは §1 の戦略語彙
+(`keepalive` は自送信を指す)、§2 の debounce と横断条件と pause API、§3 の損益、
+末尾の禁則。
 
 ## 文脈
 
@@ -60,7 +62,7 @@ keepalive_horizon = "8h"
 | `none` | `cache_control` を全て剥がす (再利用しない one-shot 用。write 割増 1.25 → 1.0) |
 | `5m` | 全ブレークポイントの ttl を 5m に強制 |
 | `1h` | 全ブレークポイントの ttl を 1h に強制 (差分 write が 2 倍、60 分以内の再開が read になる) |
-| `keepalive` | `1h` と同じ本文にした上で、idle を検知してマーカー request を誘発し cache を繋ぐ (§2)。**main のみ受理**、sub に書いたら設定エラー |
+| `keepalive` | `1h` と同じ本文にした上で、idle を検知して cache を繋ぐ (繋ぎ方は DR-0027 の自送信。main / sub どちらにも書ける) |
 
 照合は alias 解決後のモデル名。呼び出し元の判定は anthropic 方言の preset が行い、
 core はその値だけを見る (DR-0014 の境界):
@@ -73,8 +75,8 @@ core はその値だけを見る (DR-0014 の境界):
 | `unknown` | `metadata.user_id` が無い / 読めない | `main` |
 
 `oneshot` を `sub` 側に寄せるのは、**1 回きりの呼び出しには続きが来ない**から。
-続きを当て込んだ扱い (1 時間持たせる・合図を出す) をしても報われず、割増だけが
-残る。`sub` に `keepalive` を書けないので、見張りの対象からも自動的に外れる。判定は
+続きを当て込んだ扱い (1 時間持たせる・繋ぎ続ける) をしても報われず、割増だけが
+残る。判定は
 Anthropic Messages 形式を話す preset 全て (公式 / Bedrock / relay) が持つ —
 読む対象は upstream ではなくクライアントの本文なので、経路を切り替えても
 同じ 1 本が別の戦略に落ちない。他方言 (openai) は unknown = main 扱い。

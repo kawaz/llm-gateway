@@ -161,8 +161,8 @@ prefix が完全一致することを実測済み (`docs/knowledge/2026-09-02-pr
 cache に乗っていることを前提にしている。
 
 結果が出るのは応答本文を読み終えた時点なので、控えを置くのは転送の直後ではなく
-交換の終端 (`exchange` の観測が締まるところ)。同じ場所で書き直しを見張りへ返して
-いる (DR-0024 §2 追補) ので、そこへ相乗りする。
+交換の終端 (`exchange` の観測が締まるところ)。そのため連鎖の欄 (`cache_since`
+以下) が知らせに出るのは、その系列の 2 本目からになる。
 
 ## 却下した案
 
@@ -177,20 +177,33 @@ cache に乗っていることを前提にしている。
 - **系列の共有に object storage 等の分散 backend を使う**: 同一ホストの 2 プロセスに
   対して過剰。要求が出てから足す
 
-## 未確定 (実装前に確かめる)
+## 未確定
 
-- **Bedrock / OpenAI 経路で同じ延命が成立するか**。今日の実験は Anthropic OAuth のみ。
+- **Bedrock / OpenAI 経路で同じ延命が成立するか**。実験は Anthropic OAuth のみ。
   OpenAI 方言は prompt cache の語彙が違う (DR-0024 §1 と同じ留保)
-- **系列ファイルのサイズ上限と掃除**。本文を持つので 1 系列が数 MB になりうる。
-  上限を超えた系列を諦めるのか、置き場全体に上限を掛けるのか
 - **`sub = "keepalive"` の既定値**。決定 5 のとおり、既定は変えずに実測を待つ
+
+決着した分:
+
+- **系列ファイルのサイズ上限と掃除**: 1 系列 8MB を蓋にして、超える系列は
+  保持しない (= 延命しない)。置き場全体には上限を掛けない — 系列の数は会話の
+  数で頭打ちになり、1 本ずつの蓋があれば総量も抑えられる
 
 ## 影響
 
-- DR-0024 の Status が `Partially superseded by DR-0027` になる (§1 / §3 / pause API は
+- DR-0024 の Status は `Partially superseded by DR-0027` (§1 / §3 / pause API は
   生きている)
 - 自送信の本文保持により、gateway の置き場に会話本文が載る (決定 4)
-- ccmsg 側に不要な受け口とルールが残る期間がある (決定 7)
+- **設定語 `keepalive` が自送信を指す**。移行のために置いた暫定語 `replay` は、
+  合図方式の撤去と同時に削除した (alias も残さない)
+- 合図方式の撤去で、次のものが無くなった: request event の `keepalive` (合図の
+  扱い) と `cache_paused`、`cache_keepalive` / `keepalive_paused` の知らせ、
+  `[server] peers` と兄弟への中継、`POST /llm-gateway/keepalive/resume` と
+  `GET /llm-gateway/keepalive/paused`。`cache_paused` が消えるのは、停止が
+  控えを落とすだけの操作になって状態として残らないため (DR-0012 を更新済み)
+- 連鎖の欄 (`cache_since` 以下) が出るのは系列の 2 本目から。控えを置くのが
+  応答を読み切った後 (決定 8) で、1 本目を送る時点ではまだ控えが無い
+- ccmsg 側の受け口と常時ロードのルールは、別 issue で落とす (決定 7)
 - issue `keepalive-daily-counters` は決定 6 で、issue `keepalive-via-messaging-socket` は
   却下した案で、それぞれ吸収される
 
