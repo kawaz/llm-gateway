@@ -382,6 +382,19 @@ impl Replay {
         let sent_at_ms = now_unix_ms();
         match outcome {
             Outcome::Unsent => self.postpone(series, kept, expected_ms),
+            // 乗らなかった (`none`) = 繋ぐ cache がそもそも無い。この本文を
+            // 55 分ごとに送り直しても延びるものは無いので、系列を畳む
+            // (DR-0027 決定 8)。約束した寿命は果たされないので取り消す。
+            Outcome::Sent(cache) if !cache.on_cache() && cache != events::Cache::Unknown => {
+                debug!(
+                    session = %series.session_id,
+                    prefix = %series.prefix,
+                    cache = cache.as_str(),
+                    "the replay did not land on any cache; dropping the kept conversation"
+                );
+                self.expired(&series, kept.cache_notice.as_deref());
+                self.forget(&series);
+            }
             Outcome::Sent(cache) => {
                 let mut next = kept;
                 // 書き直しになっていたら、繋いだのではなく作り直した
@@ -629,6 +642,66 @@ mod tests {
         let kept = replay.store.load(&series()).unwrap();
         assert_eq!(kept.count, 0, "the chain is counted from the rewrite");
         assert!(kept.since_ms > started, "the origin moved to the rewrite");
+    }
+
+    /// 乗るものが無かった系列は、そこで畳む (DR-0027 決定 8)。
+    ///
+    /// 送れてはいるので塞がり ([`Outcome::Unsent`]) とは別物。繋ぐ cache が
+    /// 無いまま 55 分ごとに全量入力を払い続けることになるので、控えを捨てて
+    /// 約束を取り消す。会話が戻ってくれば、実リクエスト 1 本がまた控えを置く。
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_that_lands_on_nothing_ends_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::None));
+        let events = Arc::new(Events::new());
+        let replay = Arc::new(Replay::new(
+            dir.path(),
+            Arc::clone(&events),
+            Arc::new(Open(true)),
+        ));
+        replay.served_by(Arc::downgrade(&upstream) as Weak<dyn Sender>);
+        let mut watching = events.subscribe();
+
+        replay.armed_by_request(sent(now_unix_ms()));
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(upstream.sent().len(), 1, "one replay went out");
+        assert_eq!(
+            replay.store.load(&series()),
+            None,
+            "the series was dropped instead of being replayed again"
+        );
+        assert_eq!(replay.armed(), 0, "nothing is watched any more");
+        match watching.try_recv().expect("a withdrawal was published") {
+            events::Notice::CacheExpired(expired) => {
+                assert_eq!(expired.of, "promise-1", "it names the promise it withdrew");
+            }
+            other => panic!("expected a withdrawal, got {}", other.name()),
+        }
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(upstream.sent().len(), 1, "and it never went out again");
+    }
+
+    /// usage が読めなかった 1 本では畳まない。
+    ///
+    /// 切れた応答・usage を載せない口がこれ。cache が無いと分かったわけでは
+    /// ないので、塞がりと同じく次の予定へ回す。
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_whose_usage_was_unreadable_keeps_the_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Unknown));
+        let replay = replay(dir.path(), &upstream, true);
+
+        replay.armed_by_request(sent(now_unix_ms()));
+        for _ in 0..2 {
+            tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(upstream.sent().len(), 2, "it kept going");
+        assert!(replay.store.load(&series()).is_some(), "the series is kept");
     }
 
     /// 経路が塞がっていたら送らず、次の予定へ回す。

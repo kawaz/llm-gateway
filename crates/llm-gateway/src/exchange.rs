@@ -161,16 +161,21 @@ pub struct Completion {
     pub cache: Option<Arc<dyn CacheWitness>>,
 }
 
-/// cache が書き直されたことを受け取る先 (DR-0024 §2 追補)。
+/// この 1 本の cache がどうなったかを受け取る先 (DR-0024 §2 追補、DR-0027 決定 8)。
 ///
-/// 書き直しが分かるのは応答の usage を読み終えた時点だが、そこ
+/// 結果が分かるのは応答の usage を読み終えた時点だが、そこ
 /// ([`crate::exchange`]) は会話の系列も見張りも知らない。知っている側
 /// (gateway) が、この 1 本の系列を捕まえた実装を持たせる。
+///
+/// 渡すのは読めた語そのもので、どの語に反応するかは受け取る側が決める —
+/// 見張り (`keepalive`) は書き直し (`written`) だけを見て連鎖を数え直し、
+/// 送り直し (`replay`) は cache に乗ったかどうか ([`events::Cache::on_cache`])
+/// で控えるかを決める。
 pub trait CacheWitness: Send + Sync {
-    /// この 1 本が cache を書き直した (= 延命に失敗して作り直した)。
+    /// この 1 本の cache の結果が出た。
     ///
-    /// `at_ms` は書き終えた時刻 = 新しい cache が始まった瞬間。
-    fn rewrote(&self, at_ms: i64);
+    /// `at_ms` は応答が閉じた時刻 = 書き直しなら新しい cache が始まった瞬間。
+    fn settled(&self, cache: events::Cache, at_ms: i64);
 }
 
 /// 終端を記録し、usage を抽出しながら流すストリーム。
@@ -276,12 +281,10 @@ impl BodyObservation {
             return;
         };
         completion.notice.settle(now_unix_ms(), outcome, !completed);
-        // 書き直しが起きていたら、繋いでいた cache はもう無い。次の知らせが
-        // 出す連鎖の起点を、この 1 本へ置き直す (DR-0024 §2 追補)。
-        if completion.notice.cache == events::Cache::Written
-            && let Some(witness) = &completion.cache
-        {
-            witness.rewrote(completion.notice.ts);
+        // cache の結果が出た。書き直しなら連鎖の起点を置き直し、乗らなかった
+        // 1 本なら控えない — どちらを選ぶかは受け取る側が決める。
+        if let Some(witness) = &completion.cache {
+            witness.settled(completion.notice.cache, completion.notice.ts);
         }
         completion.events.publish(completion.notice);
     }
@@ -1202,26 +1205,26 @@ mod tests {
         }
     }
 
-    /// 書き直しを聞かされた回数。
+    /// 聞かされた cache の語。
     #[derive(Default)]
-    struct Witness(std::sync::atomic::AtomicUsize);
+    struct Witness(std::sync::Mutex<Vec<events::Cache>>);
 
     impl CacheWitness for Witness {
-        fn rewrote(&self, _at_ms: i64) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        fn settled(&self, cache: events::Cache, _at_ms: i64) {
+            self.0.lock().unwrap().push(cache);
         }
     }
 
-    /// 全量を書いた 1 本だけが、書き直しとして見張りへ返る。
+    /// 読めた cache の結果が、そのまま見張りへ返る。
     ///
-    /// 合図の往復が `written` で終わったなら、繋いでいたはずの cache は
-    /// 上流の都合で消えていた = 延命ではなく作り直し (DR-0024 §2 追補)。
+    /// どの語に反応するかは受け取る側の判断 (書き直しなら連鎖を数え直す /
+    /// 乗らなかったなら控えない) なので、ここは語を渡し切ることだけを見る。
     #[tokio::test]
-    async fn a_rebuilt_cache_is_reported_back() {
-        for (read, written, told, verdict) in [
-            (0, 3_000, 1, events::Cache::Written),
-            (3_000, 0, 0, events::Cache::Hit),
-            (3_000, 40, 0, events::Cache::Partial),
+    async fn the_cache_verdict_is_reported_back() {
+        for (read, written, verdict) in [
+            (0, 3_000, events::Cache::Written),
+            (3_000, 0, events::Cache::Hit),
+            (3_000, 40, events::Cache::Partial),
         ] {
             let events = Arc::new(Events::new());
             let mut watching = events.subscribe();
@@ -1246,9 +1249,9 @@ mod tests {
 
             assert_eq!(completed(&mut watching).cache, verdict);
             assert_eq!(
-                witness.0.load(std::sync::atomic::Ordering::SeqCst),
-                told,
-                "a {verdict:?} response tells the watch {told} time(s)"
+                *witness.0.lock().unwrap(),
+                vec![verdict],
+                "the watch was told the verdict once"
             );
         }
     }

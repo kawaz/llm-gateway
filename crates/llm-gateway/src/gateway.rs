@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt as _;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::{self, keepalive, replay};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
@@ -981,7 +981,12 @@ impl<P: Persistence> Gateway<P> {
         })
     }
 
-    /// 届いた 1 本を、そのまま送り直せる形で控える (DR-0027 決定 1)。
+    /// 届いた 1 本を、そのまま送り直せる形で控える支度をする (DR-0027 決定 1・8)。
+    ///
+    /// 控えを置くのは応答の usage を読み終えた後なので、ここで作るのは
+    /// **その時に置く控え**と、それを受け取る役 ([`Keeping`]) だけ。cache に
+    /// 乗らなかった 1 本を控えないための判断材料 (`cache`) は、応答を読み切る
+    /// までどこにも無い。
     ///
     /// 道具を渡していないリクエスト (分類器・要約など) は控えない。本流とは
     /// 別のプレフィックスで走るので、そこを撫でても延ばしたい cache は延びない
@@ -994,14 +999,12 @@ impl<P: Persistence> Gateway<P> {
         headers: Vec<(String, String)>,
         sent_at_ms: i64,
         cache_notice: Option<String>,
-    ) {
-        let Some(series) = self.replay_series(call) else {
-            return;
-        };
+    ) -> Option<Arc<dyn exchange::CacheWitness>> {
+        let series = self.replay_series(call)?;
         if !keepalive::carries_tools(call.body) {
-            return;
+            return None;
         }
-        self.replay.armed_by_request(replay::Sent {
+        let sent = replay::Sent {
             series,
             ns: call.ns.to_owned(),
             model: call.model.to_owned(),
@@ -1019,7 +1022,11 @@ impl<P: Persistence> Gateway<P> {
             sent_at_ms,
             horizon: self.horizon_for(call, route),
             cache_notice,
-        });
+        };
+        Some(Arc::new(Keeping {
+            replay: Arc::clone(&self.replay),
+            sent: Mutex::new(Some(sent)),
+        }) as Arc<dyn exchange::CacheWitness>)
     }
 
     /// 控えた 1 本を送り直す (DR-0027)。
@@ -1250,12 +1257,13 @@ impl<P: Persistence> Gateway<P> {
         }
 
         // 届いた 1 本だけを控える。断られた応答の経路を控えると、送り直しは
-        // その塞がった先へ行くことになる。
-        if let Some((body, headers)) = keeping
-            && resp.response.status / 100 == 2
-        {
-            self.keep_for_replay(call, route, body, headers, sent_at_ms, cache_notice.clone());
-        }
+        // その塞がった先へ行くことになる。置くのは応答を読み切った後なので、
+        // ここでは控えを持った役を作るだけ (DR-0027 決定 8)。
+        let keeping = keeping
+            .filter(|_| resp.response.status / 100 == 2)
+            .and_then(|(body, headers)| {
+                self.keep_for_replay(call, route, body, headers, sent_at_ms, cache_notice.clone())
+            });
 
         // 見ている人へ知らせる (DR-0012)。prompt cache の起点に合わせて、
         // この試行を upstream へ送り始めた時刻を流す。断られた応答も流すので、
@@ -1286,16 +1294,18 @@ impl<P: Persistence> Gateway<P> {
                 },
                 resp.response.status,
             ),
-            // 見張りの付いている系列だけが、書き直しを連鎖へ反映できる。
-            cache: (strategy == Some(CacheStrategy::Keepalive))
-                .then(|| call.series.clone())
-                .flatten()
-                .map(|series| {
+            // cache の結果を待っている役。見張りの付いている系列では書き直しを
+            // 連鎖へ返し、送り直しの系列では控えを置くかを決める。
+            cache: match strategy {
+                Some(CacheStrategy::Keepalive) => call.series.clone().map(|series| {
                     Arc::new(Rebuilt {
                         keepalive: Arc::clone(&self.keepalive),
                         series,
                     }) as Arc<dyn exchange::CacheWitness>
                 }),
+                Some(CacheStrategy::Replay) => keeping,
+                _ => None,
+            },
         });
         Ok(Sent {
             response: resp,
@@ -1873,8 +1883,42 @@ struct Rebuilt {
 }
 
 impl exchange::CacheWitness for Rebuilt {
-    fn rewrote(&self, at_ms: i64) {
-        self.keepalive.rewritten(&self.series, at_ms);
+    fn settled(&self, cache: events::Cache, at_ms: i64) {
+        // 書き直しが起きていたら、繋いでいた cache はもう無い。次の知らせが
+        // 出す連鎖の起点を、この 1 本へ置き直す。
+        if cache == events::Cache::Written {
+            self.keepalive.rewritten(&self.series, at_ms);
+        }
+    }
+}
+
+/// 送り直しの控えを、cache に乗った 1 本にだけ置く役 (DR-0027 決定 8)。
+///
+/// 控えるかどうかは応答の usage でしか決まらないので、支度した控えをここで
+/// 抱えて結果を待つ。`cache_control` の無い本文は上流で cache に乗らず
+/// (`none`)、それを 55 分ごとに送り直しても延びるものは無い — 全量入力を
+/// 繰り返し払うだけになる。
+struct Keeping {
+    replay: Arc<replay::Replay>,
+    /// 置く控え。置くのは 1 度きりなので、取り出したら空になる。
+    sent: Mutex<Option<replay::Sent>>,
+}
+
+impl exchange::CacheWitness for Keeping {
+    fn settled(&self, cache: events::Cache, _at_ms: i64) {
+        let Some(sent) = self.sent.lock().unwrap().take() else {
+            return;
+        };
+        if !cache.on_cache() {
+            debug!(
+                session = %sent.series.session_id,
+                prefix = %sent.series.prefix,
+                cache = cache.as_str(),
+                "this request did not land on the cache; not keeping it for replay"
+            );
+            return;
+        }
+        self.replay.armed_by_request(sent);
     }
 }
 
@@ -2345,6 +2389,37 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
         } else {
             format!(r#"{{"type":"error","error":{{"message":"status {status}"}}}}"#)
         }
+    }
+
+    /// cache の結果が載った 200 の本文。
+    ///
+    /// 読めた分・書いた分をそのまま usage に出す。控えるかどうかはここでしか
+    /// 決まらない (DR-0027 決定 8) ので、cache に乗った 1 本と乗らなかった
+    /// 1 本を作り分けるのに使う。
+    fn body_with_cache(read: u64, written: u64) -> String {
+        format!(
+            r#"{{"type":"message","content":[{{"type":"text","text":"ok"}}],"usage":{{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":{read},"cache_creation_input_tokens":{written}}}}}"#
+        )
+    }
+
+    /// 応答を最後まで流して、usage を読み切らせる。
+    ///
+    /// server がクライアントへ中継しながらやっていること
+    /// ([`crate::exchange::observe`]) を、テストから 1 本だけ真似る。cache の
+    /// 結果は本文を読み終えるまで出ないので、控えの有無を見る試験はここを
+    /// 通さないと何も起きない。
+    async fn drain(gw: &Gateway<StaticStore>, forwarded: Forwarded) {
+        let mut body = exchange::observe(
+            forwarded.response.body,
+            forwarded.usage,
+            Arc::clone(gw.stats()),
+            now_unix(),
+            forwarded.credential.as_ref().map(CredentialId::as_str),
+            &forwarded.model,
+            tracing::Span::none(),
+        )
+        .with_completion(forwarded.completion);
+        while body.next().await.is_some() {}
     }
 
     /// 常に有効な認証情報を返す置き場。保存された内容は覚えておく。
@@ -5367,7 +5442,7 @@ url = "https://bedrock.invalid/anthropic"
     #[tokio::test]
     async fn a_replayed_series_keeps_what_went_out() {
         let dir = tempfile::tempdir().unwrap();
-        let up = FakeUpstream::always(200).await;
+        let up = FakeUpstream::start(|_, _| (200, body_with_cache(3_000, 0))).await;
         let gw = gateway(&format!(
             r#"
 [stats]
@@ -5415,6 +5490,7 @@ main = "replay"
             .await
             .unwrap();
         assert_eq!(resp.response.status, 200);
+        drain(&gw, resp).await;
 
         let series = replay::Series {
             session_id: "s1".to_owned(),
@@ -5435,6 +5511,69 @@ main = "replay"
         assert!(kept.cache_notice.is_some(), "the promise is kept with it");
     }
 
+    /// cache に乗らなかった 1 本は控えない (DR-0027 決定 8)。
+    ///
+    /// `cache_control` の無い本文は上流で cache に乗らず、usage には読みも
+    /// 書きも出ない (`none`)。それを控えて 55 分ごとに送り直しても延びるものは
+    /// 無く、全量入力を繰り返し払うだけになる (実測 2026-09-12〜14)。
+    #[tokio::test]
+    async fn a_request_that_never_touched_the_cache_is_not_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // 読みも書きも 0 = cache を使わなかった 1 本。
+        let up = FakeUpstream::start(|_, _| (200, body_with_cache(0, 0))).await;
+        let gw = gateway(&format!(
+            r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "replay"
+"#,
+            dir.path().display(),
+            up.url
+        ))
+        .await;
+
+        let mut body = request();
+        body["tools"] = json!([{"name": "read"}]);
+        body["system"] = json!([{"type": "text", "text": "you are here"}]);
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body.clone(),
+                vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+            )
+            .await
+            .unwrap();
+        drain(&gw, resp).await;
+
+        let series = replay::Series {
+            session_id: "s1".to_owned(),
+            prefix: events::prefix(&body).unwrap(),
+        };
+        assert_eq!(
+            replay::store::Store::new(dir.path()).load(&series),
+            None,
+            "there was no cache to keep alive"
+        );
+    }
+
     /// 控えた 1 本は、`max_tokens` だけを変えて出ていく (DR-0027 決定 1)。
     ///
     /// 素性は `keepalive` で、この 1 本を出したのが人でも subagent でもない
@@ -5442,7 +5581,7 @@ main = "replay"
     #[tokio::test]
     async fn the_replay_goes_out_with_only_max_tokens_changed() {
         let dir = tempfile::tempdir().unwrap();
-        let up = FakeUpstream::always(200).await;
+        let up = FakeUpstream::start(|_, _| (200, body_with_cache(3_000, 0))).await;
         let gw = Arc::new(
             gateway(&format!(
                 r#"
@@ -5471,19 +5610,21 @@ main = "replay"
         let mut body = request();
         body["tools"] = json!([{"name": "read"}]);
         body["system"] = json!([{"type": "text", "text": "you are here"}]);
-        gw.forward(
-            ns(&gw),
-            NS,
-            Ingress {
-                path: "/v1/messages",
-                query: None,
-                shape: RequestShape::Messages,
-            },
-            body.clone(),
-            vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
-        )
-        .await
-        .unwrap();
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body.clone(),
+                vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+            )
+            .await
+            .unwrap();
+        drain(&gw, resp).await;
 
         let series = replay::Series {
             session_id: "s1".to_owned(),
@@ -5525,14 +5666,7 @@ main = "replay"
     #[tokio::test]
     async fn the_replay_lands_on_the_day_it_was_sent() {
         let dir = tempfile::tempdir().unwrap();
-        let up = FakeUpstream::start(|_, _| {
-            (
-                200,
-                r#"{"type":"message","content":[],"usage":{"input_tokens":10,"output_tokens":5}}"#
-                    .to_owned(),
-            )
-        })
-        .await;
+        let up = FakeUpstream::start(|_, _| (200, body_with_cache(3_000, 0))).await;
         let gw = Arc::new(
             gateway(&format!(
                 r#"
@@ -5561,19 +5695,21 @@ main = "replay"
         let mut body = request();
         body["tools"] = json!([{"name": "read"}]);
         body["system"] = json!([{"type": "text", "text": "you are here"}]);
-        gw.forward(
-            ns(&gw),
-            NS,
-            Ingress {
-                path: "/v1/messages",
-                query: None,
-                shape: RequestShape::Messages,
-            },
-            body.clone(),
-            vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
-        )
-        .await
-        .unwrap();
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body.clone(),
+                vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+            )
+            .await
+            .unwrap();
+        drain(&gw, resp).await;
 
         let series = replay::Series {
             session_id: "s1".to_owned(),

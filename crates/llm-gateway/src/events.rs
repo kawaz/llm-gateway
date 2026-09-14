@@ -246,6 +246,15 @@ impl Cache {
         }
     }
 
+    /// この 1 本が prompt cache に乗ったか。
+    ///
+    /// 乗ったのは、読めた (`hit`)・書いた (`written`)・その両方 (`partial`) の
+    /// 3 つ。`none` は cache を使わなかった 1 本で、`unknown` は使ったかどうかが
+    /// 分からない 1 本なので、どちらも「乗った」とは言えない。
+    pub fn on_cache(self) -> bool {
+        matches!(self, Self::Hit | Self::Written | Self::Partial)
+    }
+
     /// 知らせに出す 1 語。
     pub fn as_str(self) -> &'static str {
         match self {
