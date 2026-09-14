@@ -1,6 +1,6 @@
 ---
 title: keepalive ping の実発火回数を日別に永続化する
-status: open
+status: resolved
 category: request
 created: 2026-09-08T16:40:18+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-14T15:44:29+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0029","implemented","finding/2026-09-08-keepalive-field-observation:追加計測案3点のうち1・2は満たす、3(horizonの事後評価=系列単位の再開率)はstatsの責務外で未対応"]
 blocked_by:
 origin: 自リポ TODO
 ---
