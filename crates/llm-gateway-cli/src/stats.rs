@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use llm_gateway::daemon::registry::Registry;
 use llm_gateway::metering::TokenKind;
-use llm_gateway::stats::{Counters, Report};
+use llm_gateway::stats::{Counters, Report, UNKNOWN_ORIGIN};
 
 use crate::destination;
 use crate::failure::Failure;
@@ -22,6 +22,7 @@ use crate::text::{thousands, width};
 pub struct Args {
     days: usize,
     unit: Option<String>,
+    by: By,
 }
 
 impl Default for Args {
@@ -29,8 +30,18 @@ impl Default for Args {
         Self {
             days: 7,
             unit: None,
+            by: By::Route,
         }
     }
+}
+
+/// 内訳をどの軸で割るか (DR-0029)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum By {
+    /// 認証情報 × モデル。既定。
+    Route,
+    /// 出した側 (`main` / `sub` / `keepalive` …) も割る。
+    Origin,
 }
 
 pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
@@ -41,7 +52,7 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
     let parsed = parse(args)?;
     let target = destination::resolve(&Registry::open(), parsed.unit.as_deref())?;
     let report: Report = destination::ask(&target, "stats", &format!("?days={}", parsed.days))?;
-    print!("{}", render(&report));
+    print!("{}", render(&report, parsed.by));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -54,6 +65,7 @@ fn parse(args: &[String]) -> Result<Args, Failure> {
                 parsed.days = take_days(&take_value("days", inline, &mut it)?)?;
             }
             Some(("unit", inline)) => parsed.unit = Some(take_value("unit", inline, &mut it)?),
+            Some(("by", inline)) => parsed.by = take_by(&take_value("by", inline, &mut it)?)?,
             _ => return Err(Failure::from(format!("could not understand `{arg}`"))),
         }
     }
@@ -70,6 +82,17 @@ fn take_days(raw: &str) -> Result<usize, Failure> {
         .map_err(|_| Failure::from(format!("--days takes a whole number, got `{raw}`")))
 }
 
+/// `--by` の値を読む。
+///
+/// 受ける語を並べて断るのは、黙って既定に落とすと「割ったつもり」の相手が
+/// 別の表を読むため (`--days` と同じ構え)。
+fn take_by(raw: &str) -> Result<By, Failure> {
+    match raw {
+        "origin" => Ok(By::Origin),
+        other => Err(Failure::from(format!("--by takes `origin`, got `{other}`"))),
+    }
+}
+
 /// 日次集計を人が読む形に整える。
 ///
 /// 1 つの桁組に全部を並べる。日ごとに合計を先に出し、その下に認証情報 ×
@@ -77,7 +100,7 @@ fn take_days(raw: &str) -> Result<usize, Failure> {
 /// 一番よく見る数字で、内訳は当たりを付けた後に見るため。
 ///
 /// 桁は全日で揃える。日ごとに幅が変わると、縦に並べて比べられない。
-fn render(report: &Report) -> String {
+fn render(report: &Report, by: By) -> String {
     if report.days.is_empty() {
         return "No usage recorded yet.\n\
                 Nothing has been forwarded through the gateway, \
@@ -99,15 +122,37 @@ fn render(report: &Report) -> String {
         all_days.merge(&total);
         lines.push((format!("{date} {TOTAL_LABEL}"), total, day.total_usd));
 
+        // 内訳の行。素性で割るときは素性を先頭に置き、ラベル順で並べ直す
+        // (`keepalive` の行が縦に固まって読める)。
+        let mut breakdown: Vec<Line> = Vec::new();
         for (cred, models) in &day.credentials {
             for (model, entry) in models {
-                lines.push((
-                    format!("  {cred} {model}"),
-                    entry.counters.clone(),
-                    entry.usd,
-                ));
+                match by {
+                    By::Route => breakdown.push((
+                        format!("  {cred} {model}"),
+                        entry.counters.clone(),
+                        entry.usd,
+                    )),
+                    // 素性を知らない gateway が返した報告では内訳が空。
+                    // 行を落とすと合計と内訳が食い違うので、言えることを
+                    // そのまま名乗らせる。
+                    By::Origin if entry.origins.is_empty() => breakdown.push((
+                        format!("  {UNKNOWN_ORIGIN} {cred} {model}"),
+                        entry.counters.clone(),
+                        entry.usd,
+                    )),
+                    By::Origin => breakdown.extend(entry.origins.iter().map(|(origin, slice)| {
+                        (
+                            format!("  {origin} {cred} {model}"),
+                            slice.counters.clone(),
+                            slice.usd,
+                        )
+                    })),
+                }
             }
         }
+        breakdown.sort_by(|(left, ..), (right, ..)| left.cmp(right));
+        lines.extend(breakdown);
     }
     // 全期間の合計を最後に置く。日ごとの合計と同じ桁組に並ぶので、
     // 「今月いくら使ったか」を表の下端で読める。
@@ -261,6 +306,11 @@ mod tests {
         }
     }
 
+    /// 既定の見え方 (認証情報 × モデル) で整形する。
+    fn render_routes(report: &Report) -> String {
+        render(report, By::Route)
+    }
+
     /// 試験で書く 1 行。`(認証情報, モデル, 集計)`。
     type Row<'a> = (&'a str, &'a str, Counters);
 
@@ -306,10 +356,140 @@ mod tests {
         .unwrap()
     }
 
+    /// 素性ごとの内訳を持つ 1 日分の報告 (DR-0029)。
+    ///
+    /// 走っている側と同じく、モデルの行は内訳の和で、額は同じ単価で出す。
+    fn report_with_origins(rows: &[(&str, &str, &str, Counters)]) -> Report {
+        let mut creds = serde_json::Map::new();
+        let mut day_total: Option<f64> = None;
+        for (cred, model, origin, c) in rows {
+            let usd = llm_gateway::preset::pricing::for_model(model).map(|p| p.cost(&c.tokens));
+            if let Some(usd) = usd {
+                day_total = Some(day_total.unwrap_or(0.0) + usd);
+            }
+            let entry = creds
+                .entry((*cred).to_owned())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap()
+                .entry((*model).to_owned())
+                .or_insert_with(|| serde_json::json!({"requests": 0, "tokens": {}, "origins": {}}))
+                .clone();
+            let mut total: Counters = serde_json::from_value(entry).unwrap();
+            total.merge(c);
+            let mut slice = serde_json::to_value(c).unwrap();
+            let mut row = serde_json::to_value(&total).unwrap();
+            if let Some(usd) = usd {
+                slice["usd"] = serde_json::json!(usd);
+                let before = llm_gateway::preset::pricing::for_model(model)
+                    .map(|p| p.cost(&total.tokens))
+                    .unwrap();
+                row["usd"] = serde_json::json!(before);
+            }
+            let models = creds
+                .get_mut(*cred)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .get_mut(*model)
+                .unwrap();
+            let origins = models
+                .get("origins")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            row["origins"] = origins;
+            row["origins"]
+                .as_object_mut()
+                .unwrap()
+                .insert((*origin).to_owned(), slice);
+            *models = row;
+        }
+        serde_json::from_value(serde_json::json!({
+            "generated_at": 1_785_326_400_000_i64,
+            "days": {"2026-07-29": {"credentials": creds, "total_usd": day_total}},
+            "total_usd": day_total,
+        }))
+        .unwrap()
+    }
+
+    /// `--by origin` は内訳を素性ごとに割り、素性を先頭に置く。
+    ///
+    /// keepalive (gateway 自身の自送信) の費用を、人が出した分と分けて読む
+    /// ための見え方 (DR-0029)。
+    #[test]
+    fn stats_splits_the_breakdown_by_origin() {
+        let report = report_with_origins(&[
+            (
+                "claude-one",
+                "claude-opus-5",
+                "main",
+                counters(2, 1_000, 100),
+            ),
+            (
+                "claude-one",
+                "claude-opus-5",
+                "keepalive",
+                counters(3, 30_000, 3),
+            ),
+        ]);
+
+        let routes = render(&report, By::Route);
+        assert!(
+            !routes.contains("keepalive"),
+            "the default view is unchanged: {routes}"
+        );
+
+        let out = render(&report, By::Origin);
+        // 先頭の 1 行は見出し。内訳の行は字下げされている。
+        let breakdown: Vec<&str> = out
+            .lines()
+            .skip(1)
+            .filter(|l| l.starts_with("  "))
+            .collect();
+        assert_eq!(breakdown.len(), 2, "one row per origin: {out}");
+        assert!(
+            breakdown[0].starts_with("  keepalive claude-one claude-opus-5"),
+            "the origin leads the label and the rows are grouped by it: {out}"
+        );
+        assert!(
+            breakdown[1].starts_with("  main claude-one claude-opus-5"),
+            "{out}"
+        );
+        // 割り方を変えただけなので、日の合計と全期間の合計は動かない。
+        for line in out.lines().filter(|l| l.contains("total")) {
+            assert!(line.contains("31,000"), "the totals still add up: {out}");
+        }
+    }
+
+    /// 素性を知らない gateway が返した報告でも、行を落とさない。
+    ///
+    /// 落とすと内訳の和が日の合計と合わなくなる。言えるのは「見分けが
+    /// 付かない」だけなので、その語をそのまま名乗らせる。
+    #[test]
+    fn a_report_without_origins_still_shows_its_rows() {
+        let out = render(
+            &stats_report(&[(
+                "2026-07-29",
+                &[("claude-one", "claude-opus-5", counters(1, 10, 5))],
+            )]),
+            By::Origin,
+        );
+        assert!(out.contains("  unknown claude-one claude-opus-5"), "{out}");
+    }
+
+    /// 割る軸は名指しで受ける。読めない語は断る。
+    #[test]
+    fn stats_rejects_an_unknown_axis() {
+        assert_eq!(parse_stats(&["--by", "origin"]).unwrap().by, By::Origin);
+        assert_eq!(parse_stats(&["--by=origin"]).unwrap().by, By::Origin);
+        assert!(parse_stats(&["--by", "session"]).is_err());
+        assert!(parse_stats(&["--by"]).is_err());
+    }
+
     /// 日ごとの合計と、認証情報 × モデルの内訳が出る。
     #[test]
     fn stats_shows_a_total_and_a_breakdown() {
-        let out = render(&stats_report(&[(
+        let out = render_routes(&stats_report(&[(
             "2026-07-29",
             &[
                 ("claude-one", "claude-haiku-4-5", counters(3, 1_200, 340)),
@@ -340,7 +520,7 @@ mod tests {
     /// 記録に現れた区分だけが列になる。使っていない区分で桁を広げない。
     #[test]
     fn stats_columns_follow_the_kinds_that_were_recorded() {
-        let out = render(&stats_report(&[(
+        let out = render_routes(&stats_report(&[(
             "2026-07-29",
             &[("a", "claude-opus-5", counters(1, 10, 5))],
         )]));
@@ -360,7 +540,7 @@ mod tests {
         c.tokens.set(TokenKind::output_reasoning(), 7);
         c.tokens.set("provider.batch_prediction", 3);
 
-        let out = render(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
+        let out = render_routes(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
 
         let head = out.lines().next().expect("a header line");
         assert!(
@@ -387,7 +567,7 @@ mod tests {
     /// 見えるので、言えることが無いことを記号で示す。
     #[test]
     fn an_unpriced_model_shows_a_dash() {
-        let out = render(&stats_report(&[(
+        let out = render_routes(&stats_report(&[(
             "2026-07-29",
             &[
                 ("a", "claude-opus-5", counters(1, 1_000_000, 0)),
@@ -407,7 +587,7 @@ mod tests {
     /// 新しい日が上に来る。見たいのは直近。
     #[test]
     fn stats_puts_the_newest_day_first() {
-        let out = render(&stats_report(&[
+        let out = render_routes(&stats_report(&[
             ("2026-07-28", &[("a", "m", counters(1, 1, 1))]),
             ("2026-07-30", &[("a", "m", counters(1, 2, 2))]),
         ]));
@@ -420,7 +600,7 @@ mod tests {
     /// 桁は全日で揃える。日ごとに幅が変わると縦に読めない。
     #[test]
     fn stats_aligns_columns_across_days() {
-        let out = render(&stats_report(&[
+        let out = render_routes(&stats_report(&[
             ("2026-07-29", &[("a", "m", counters(1, 1_000_000, 1))]),
             ("2026-07-30", &[("a", "m", counters(1, 5, 1))]),
         ]));
@@ -440,7 +620,7 @@ mod tests {
     /// 文言は英語 (DR-0008: CLI が出す文言は英語)。
     #[test]
     fn empty_stats_say_why() {
-        let out = render(&stats_report(&[]));
+        let out = render_routes(&stats_report(&[]));
         assert!(out.contains("No usage recorded yet"), "{out}");
         assert!(
             out.contains("gateway"),
@@ -455,7 +635,7 @@ mod tests {
     /// 認証情報を持たない経路は予約名で出る。
     #[test]
     fn stats_show_the_credentialless_route() {
-        let out = render(&stats_report(&[(
+        let out = render_routes(&stats_report(&[(
             "2026-07-29",
             &[(llm_gateway::stats::NO_CREDENTIAL, "m", counters(1, 5, 6))],
         )]));
@@ -492,7 +672,8 @@ mod tests {
             parse_stats(&["--unit=unstable", "--days=3"]).unwrap(),
             Args {
                 days: 3,
-                unit: Some("unstable".to_owned())
+                unit: Some("unstable".to_owned()),
+                by: By::Route,
             }
         );
         assert!(parse_stats(&["--config", "/tmp/c.toml"]).is_err());
@@ -536,7 +717,7 @@ mod tests {
         c.tokens.set(TokenKind::input_cache_creation_1h(), 200);
         c.tokens.set(TokenKind::input_cache_creation_5m(), 100);
 
-        let out = render(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
+        let out = render_routes(&stats_report(&[("2026-07-29", &[("a", "m", c)])]));
 
         let head = out.lines().next().expect("a header line");
         let heads: Vec<&str> = head.split_whitespace().collect();
@@ -560,7 +741,7 @@ mod tests {
         cached.tokens.set(TokenKind::input_cache_creation(), 2_000);
         cached.tokens.set(TokenKind::input_cache_read(), 50_000);
 
-        let out = render(&stats_report(&[
+        let out = render_routes(&stats_report(&[
             (
                 "2026-07-29",
                 &[

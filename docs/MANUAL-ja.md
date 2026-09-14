@@ -364,8 +364,10 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
 
 ### `GET /llm-gateway/stats`
 
-使用量の日次集計 (DR-0011)。日 × credential × モデルのトークン数と、単価表が
-ある分の USD 換算を返す。何を書いたかは残していない。
+使用量の日次集計 (DR-0011、DR-0029)。日 × credential × モデルのトークン数と、
+単価表がある分の USD 換算を返す。モデルの行には出した側 (`main` / `sub` /
+`oneshot` / `codex` / `keepalive` / `unknown`) ごとの内訳が付く — 行そのものは
+内訳の和。何を書いたかは残していない。
 
 | パラメータ | 既定 | 意味 |
 | --- | --- | --- |
@@ -387,10 +389,20 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
         "personal": {
           "claude-opus-5": {
             "requests": 12,
-            "input": 1200,
-            "output": 340,
-            "input.cache_read": 8800,
-            "usd": 0.42
+            "tokens": {"input": 1200, "output": 340, "input.cache_read": 8800},
+            "usd": 0.42,
+            "origins": {
+              "keepalive": {
+                "requests": 2,
+                "tokens": {"input": 200, "output": 40, "input.cache_read": 4800},
+                "usd": 0.12
+              },
+              "main": {
+                "requests": 10,
+                "tokens": {"input": 1000, "output": 300, "input.cache_read": 4000},
+                "usd": 0.30
+              }
+            }
           }
         }
       },
@@ -720,6 +732,7 @@ OS は知らない。
 | `--executable <path>` | `service register` | 焼き込む実行ファイル (既定: 同じ binary を指す PATH 上の安定な場所) |
 | `--refresh` | `usage` / `upstream status` | 読み直してから表示する (`usage` では少し消費する) |
 | `--days <N>` | `stats` | 直近 N 日 (既定: 7、`0` で全期間) |
+| `--by origin` | `stats` | 内訳を出した側 (`main` / `sub` / `keepalive` …) で割る |
 | `--type <type>` | `login` | `claude_oauth` または `codex_oauth` |
 | `--help`, `-h` | 全コマンド | ヘルプ |
 | `--version` | — | バージョン |

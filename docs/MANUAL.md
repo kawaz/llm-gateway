@@ -374,8 +374,10 @@ official page says operational but traffic is not getting through — or the rev
 
 ### `GET /llm-gateway/stats`
 
-Daily usage totals (DR-0011): token counts per day × credential × model, plus a USD
-figure wherever a price table covers the model. What was written is never kept.
+Daily usage totals (DR-0011, DR-0029): token counts per day × credential × model,
+plus a USD figure wherever a price table covers the model. Every model row carries a
+breakdown by who sent the request (`main` / `sub` / `oneshot` / `codex` /
+`keepalive` / `unknown`); the row itself is their sum. What was written is never kept.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -397,10 +399,20 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
         "personal": {
           "claude-opus-5": {
             "requests": 12,
-            "input": 1200,
-            "output": 340,
-            "input.cache_read": 8800,
-            "usd": 0.42
+            "tokens": {"input": 1200, "output": 340, "input.cache_read": 8800},
+            "usd": 0.42,
+            "origins": {
+              "keepalive": {
+                "requests": 2,
+                "tokens": {"input": 200, "output": 40, "input.cache_read": 4800},
+                "usd": 0.12
+              },
+              "main": {
+                "requests": 10,
+                "tokens": {"input": 1000, "output": 300, "input.cache_read": 4000},
+                "usd": 0.30
+              }
+            }
           }
         }
       },
@@ -741,6 +753,7 @@ Options:
 | `--executable <path>` | `service register` | The binary to bake in (default: the stable path on PATH pointing at this same binary) |
 | `--refresh` | `usage` / `upstream status` | Read again before showing (with `usage` this consumes a little) |
 | `--days <N>` | `stats` | The last N days (default: 7, `0` for everything) |
+| `--by origin` | `stats` | Split the breakdown by who sent the request (`main` / `sub` / `keepalive` …) |
 | `--type <type>` | `login` | `claude_oauth` or `codex_oauth` |
 | `--help`, `-h` | all commands | Show help |
 | `--version` | — | Show the version |

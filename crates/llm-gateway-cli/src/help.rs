@@ -41,6 +41,8 @@ usage options:
 stats options:
   --unit <name>     which running unit to ask
   --days <N>        show the last N days (default: 7, 0 for everything)
+  --by origin       split the breakdown by who sent the request
+                    (main / sub / oneshot / codex / keepalive / unknown)
 
 login options:
   --type <type>     claude_oauth or codex_oauth
