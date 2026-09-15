@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-15 | design | open | [store-layer-for-replaceable-persistence](./2026-09-15-store-layer-for-replaceable-persistence.md) | 永続化の器を Store 層として責務で切り、file backend を差し替え可能にする |
 | 2026-09-14 | bug | open | [keepalive-promise-not-withdrawn-on-refused-forward](./2026-09-14-keepalive-promise-not-withdrawn-on-refused-forward.md) | 全経路が断られた転送で cache_notice の約束が取り消されない |
 | 2026-09-14 | task | open | [keepalive-absence-tests-can-pass-vacuously](./2026-09-14-keepalive-absence-tests-can-pass-vacuously.md) | keepalive の「何も送られない」テストが判断回数を検証せず vacuous に pass しうる |
 | 2026-09-10 | request | open | [supervisor-log-reopen-on-rotation](./2026-09-10-supervisor-log-reopen-on-rotation.md) | 監督者のログ fd をログローテーション後に開き直す |
