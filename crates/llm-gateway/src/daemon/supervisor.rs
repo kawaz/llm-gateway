@@ -1309,42 +1309,60 @@ mod tests {
 
     /// `--all` の起こし直しは、登録の逆順に 1 台ずつ (DR-0028 決定 4)。
     ///
-    /// 手前は先の台を優先しているので、後ろから順に上げ直せば断が出ない。
+    /// 手前は先の台を優先しているので、後ろから順に上げ直し、先の台の
+    /// healthz が戻るまで次の台には触れない。
     #[tokio::test]
     async fn restarting_everything_goes_one_at_a_time_from_the_back() {
         let world = world();
         let binary = a_long_running_child(&world.root);
         world.register("stable", &binary, true);
         world.register("unstable", &binary, true);
-
-        // 立ち上がりの分から聞いておく。走り始めた後に聞き始めると、最初の子が
-        // 書いた行がまだ届いておらず、起こし直しの分と混ざる。
-        let mut written = world.supervisor.lines.subscribe();
         world.supervisor.reload().await;
         let first = world.until("stable", |s| s.running).await;
         let second = world.until("unstable", |s| s.running).await;
-        // 1 台につき stdout / stderr の 2 行。読み切ってから頼む。
-        heard(&mut written, 4).await;
 
-        world
-            .supervisor
-            .handle(Request::Restart(Which::all()))
+        // 最初に起こし直す unstable だけ、healthz の復帰をこちらで握る。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        std::fs::write(
+            world.root.join("unstable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+
+        let supervisor = Arc::clone(&world.supervisor);
+        let restarting = tokio::spawn(async move {
+            supervisor
+                .handle(Request::Restart(Which::all()))
+                .await
+                .unwrap();
+        });
+
+        // 名前順の後ろ (unstable) が先に別の子へ入り替わる。
+        assert!(
+            world
+                .supervisor
+                .wait_for("unstable", SPAWN_WAIT, |state| {
+                    state.pid.is_some() && state.pid != second.pid
+                })
+                .await
+        );
+        // healthz がまだ戻らない間は、次の stable を落としていない。
+        assert_eq!(first.pid, world.status("stable").await.pid);
+
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/llm-gateway/healthz",
+                axum::routing::get(|| async { axum::http::StatusCode::OK }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::timeout(HEALTH_WAIT, restarting)
             .await
+            .expect("restart did not finish after healthz recovered")
             .unwrap();
 
-        // 名前順の後ろ (unstable) が先に上がり直す。
-        let said = heard(&mut written, 4).await;
-        let order: Vec<&str> = said
-            .iter()
-            .filter(|l| l.line.starts_with("running"))
-            .map(|l| l.unit.as_str())
-            .collect();
-        assert_eq!(order, vec!["unstable", "stable"], "{said:?}");
-
-        // どちらも別の子に入れ替わっている。
         assert_ne!(first.pid, world.status("stable").await.pid);
-        assert_ne!(second.pid, world.status("unstable").await.pid);
-
         world.supervisor.shutdown().await;
     }
 
