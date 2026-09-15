@@ -38,8 +38,10 @@ use crate::egress::{BoxFuture, RequestShape};
 use crate::events::{self, Events};
 
 pub mod store;
+pub mod uncached;
 
 pub use store::{Kept, Series};
+pub use uncached::{Dropped, Evidence, Uncached};
 
 /// 1 本送ってから、次に送り直すまでの時間。
 ///
@@ -203,10 +205,10 @@ pub trait Sender: Send + Sync {
 }
 
 /// 送り直した結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// 送れた。usage から読んだ cache の実結果が入る。
-    Sent(events::Cache),
+    /// 送れた。応答から読んだ判定の材料が入る。
+    Sent(Evidence),
     /// 送れなかった (経路が塞がっていた・転送に失敗した)。次の予定へ回す。
     Unsent,
 }
@@ -214,6 +216,8 @@ pub enum Outcome {
 /// 送り直しの仕掛け。
 pub struct Keepalive {
     store: store::Store,
+    /// 乗らなかった 1 本を研究用に取っておく先。
+    quarantine: uncached::Quarantine,
     events: Arc<Events>,
     /// 直前に通った経路がまだ使えるかを聞く先。
     reach: Arc<dyn Reachable>,
@@ -258,14 +262,44 @@ pub struct Sent {
     pub cache_notice: Option<String>,
 }
 
+impl Sent {
+    /// この 1 本から、置く控えを作る。
+    ///
+    /// 予定の時刻はここで決まる。控えずに終わった 1 本 ([`Keepalive::not_landed`])
+    /// でも同じ形にするのは、乗っていれば置いたはずのものを、そのまま研究用の
+    /// 退避に移せるようにするため。
+    fn into_kept(self) -> Kept {
+        Kept {
+            session_id: self.series.session_id,
+            prefix: self.series.prefix,
+            ns: self.ns,
+            model: self.model,
+            route: self.route,
+            body: self.body,
+            headers: self.headers,
+            path: self.path,
+            query: self.query,
+            shape: self.shape,
+            fires_at_ms: self.sent_at_ms + refresh_ms(),
+            expires_at_ms: self.sent_at_ms + (LIFETIME - MARGIN).as_millis() as i64,
+            horizon_end_ms: self.sent_at_ms + self.horizon.as_millis() as i64,
+            since_ms: self.sent_at_ms,
+            count: 0,
+            cache_notice: self.cache_notice,
+        }
+    }
+}
+
 impl Keepalive {
     pub fn new(
         dir: impl AsRef<std::path::Path>,
         events: Arc<Events>,
         reach: Arc<dyn Reachable>,
+        uncached: uncached::Limits,
     ) -> Self {
         Self {
-            store: store::Store::new(dir),
+            store: store::Store::new(&dir),
+            quarantine: uncached::Quarantine::new(dir, uncached),
             events,
             reach,
             sender: Mutex::new(Weak::<NoSender>::new()),
@@ -284,31 +318,15 @@ impl Keepalive {
     /// 会話が動いている間は一度も発火しない。期間と通った先を延ばせるのは、
     /// この 1 本だけ (DR-0024 §2 の debounce をそのまま引き継ぐ)。
     pub fn armed_by_request(self: &Arc<Self>, sent: Sent) {
-        let kept = Kept {
-            session_id: sent.series.session_id.clone(),
-            prefix: sent.series.prefix.clone(),
-            ns: sent.ns,
-            model: sent.model,
-            route: sent.route,
-            body: sent.body,
-            headers: sent.headers,
-            path: sent.path,
-            query: sent.query,
-            shape: sent.shape,
-            fires_at_ms: sent.sent_at_ms + refresh_ms(),
-            expires_at_ms: sent.sent_at_ms + (LIFETIME - MARGIN).as_millis() as i64,
-            horizon_end_ms: sent.sent_at_ms + sent.horizon.as_millis() as i64,
-            since_ms: sent.sent_at_ms,
-            count: 0,
-            cache_notice: sent.cache_notice,
-        };
+        let series = sent.series.clone();
+        let kept = sent.into_kept();
         if !self.store.save(&kept) {
             // 置けなかった系列は繋げない。前の予定まで残すと、控えの無い
             // 系列を撫でに行くだけになる。
-            self.forget(&sent.series);
+            self.forget(&series);
             return;
         }
-        self.plan(sent.series, REFRESH_AFTER, kept.fires_at_ms);
+        self.plan(series, REFRESH_AFTER, kept.fires_at_ms);
     }
 
     /// この系列の控えと予定を捨てる。
@@ -355,6 +373,8 @@ impl Keepalive {
     /// 捨てる — 送っても繋ぐものが無い。
     pub fn restore(self: &Arc<Self>) {
         let now_ms = now_unix_ms();
+        // 落ちている間に古びた退避を、読み戻しのついでに切り詰める。
+        self.quarantine.prune(now_ms);
         let mut restored = 0;
         for kept in self.store.load_all() {
             let series = Series {
@@ -504,17 +524,28 @@ impl Keepalive {
             // 乗らなかった (`none`) = 繋ぐ cache がそもそも無い。この本文を
             // 55 分ごとに送り直しても延びるものは無いので、系列を畳む
             // (DR-0027 決定 8)。約束した寿命は果たされないので取り消す。
-            Outcome::Sent(cache) if !cache.on_cache() && cache != events::Cache::Unknown => {
+            Outcome::Sent(evidence)
+                if !evidence.cache.on_cache() && evidence.cache != events::Cache::Unknown =>
+            {
                 debug!(
                     session = %series.session_id,
                     prefix = %series.prefix,
-                    cache = cache.as_str(),
+                    cache = evidence.cache.as_str(),
                     "the replay did not land on any cache; dropping the kept conversation"
                 );
                 self.expired(&series, kept.cache_notice.as_deref());
                 self.forget(&series);
+                // 畳んだ控えは、本文のまま研究用へ移す (DR-0027 決定 9)。
+                // 捨ててしまうと、乗らなかった理由を後から見る材料が残らない。
+                self.quarantine.put(&Uncached {
+                    dropped: Dropped::Keepalive,
+                    sent_at_ms,
+                    evidence,
+                    kept,
+                });
             }
-            Outcome::Sent(cache) => {
+            Outcome::Sent(evidence) => {
+                let cache = evidence.cache;
                 let mut next = kept;
                 // 書き直しになっていたら、繋いだのではなく作り直した。
                 // 連鎖はここから数え直す。
@@ -555,8 +586,15 @@ impl Keepalive {
     ///
     /// 送る前に「この先どこまで繋ぐ」と知らせてある ([`Chain::promised`]) ので、
     /// 控えないだけで黙ると、見る側はその見立てを描き続ける。
-    pub fn not_landed(&self, sent: &Sent) {
+    pub fn not_landed(&self, sent: Sent, evidence: Evidence) {
         self.expired(&sent.series, sent.cache_notice.as_deref());
+        let sent_at_ms = sent.sent_at_ms;
+        self.quarantine.put(&Uncached {
+            dropped: Dropped::Entry,
+            sent_at_ms,
+            evidence,
+            kept: sent.into_kept(),
+        });
     }
 
     /// 約束した寿命が果たされずに終わったことを知らせる (DR-0012)。
@@ -676,7 +714,7 @@ mod tests {
                 self.seen.lock().unwrap().push(body_to_send(kept));
                 self.at_ms.lock().unwrap().push(now_unix_ms());
                 self.count.send_modify(|count| *count += 1);
-                *self.answer.lock().unwrap()
+                self.answer.lock().unwrap().clone()
             })
         }
     }
@@ -709,6 +747,15 @@ mod tests {
         }
     }
 
+    /// 送れた 1 本の答え。cache の語以外は、普通に返った応答の値。
+    fn answered(cache: events::Cache) -> Outcome {
+        Outcome::Sent(Evidence {
+            cache,
+            status: 200,
+            usage: None,
+        })
+    }
+
     /// 試験で使う「ひと昔前」。
     ///
     /// 止めた時計の下では実時計が進まないので、時刻が動いたかどうかは実行速度
@@ -721,6 +768,18 @@ mod tests {
             session_id: "s-1".to_owned(),
             prefix: "2cf24dba".to_owned(),
         }
+    }
+
+    /// 試験では退避を効かせておく (既定と同じ)。
+    fn limits() -> uncached::Limits {
+        uncached::Limits { keep: 50, days: 7 }
+    }
+
+    /// 研究用に取ってある 1 本を読み戻す。無ければ `None`。
+    fn set_aside(dir: &std::path::Path) -> Option<Uncached> {
+        let entries = std::fs::read_dir(dir.join("keepalive").join("uncached")).ok()?;
+        let path = entries.flatten().next()?.path();
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
     fn body() -> Value {
@@ -760,6 +819,7 @@ mod tests {
             dir,
             Arc::new(Events::new()),
             Arc::new(Open(open)),
+            limits(),
         ));
         keepalive.served_by(Arc::downgrade(upstream) as Weak<dyn Sender>);
         keepalive
@@ -769,7 +829,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn what_was_kept_goes_out_again_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         keepalive.armed_by_request(sent(now_unix_ms()));
@@ -789,7 +849,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_live_conversation_never_fires() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         for _ in 0..3 {
@@ -809,7 +869,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hit_leads_to_the_next_one() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         let started = now_unix_ms() - LONG_AGO.as_millis() as i64;
@@ -836,7 +896,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_rewrite_starts_the_chain_over() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Written));
+        let upstream = FakeUpstream::new(answered(events::Cache::Written));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         let started = now_unix_ms() - LONG_AGO.as_millis() as i64;
@@ -864,12 +924,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_replay_that_lands_on_nothing_ends_the_series() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::None));
+        let upstream = FakeUpstream::new(answered(events::Cache::None));
         let events = Arc::new(Events::new());
         let keepalive = Arc::new(Keepalive::new(
             dir.path(),
             Arc::clone(&events),
             Arc::new(Open(true)),
+            limits(),
         ));
         keepalive.served_by(Arc::downgrade(&upstream) as Weak<dyn Sender>);
         let mut watching = events.subscribe();
@@ -897,6 +958,95 @@ mod tests {
         assert_eq!(upstream.sent().len(), 1, "and it never went out again");
     }
 
+    /// 畳んだ系列の本文は、研究用に取ってある (DR-0027 決定 9)。
+    ///
+    /// 畳むのは「繋ぐ cache が無い」と分かったからだが、**なぜ無いのか**は
+    /// そこでは分からない。本文と判定の材料を残しておかないと、後から見る
+    /// ものが何も無くなる。
+    #[tokio::test(start_paused = true)]
+    async fn a_replay_that_lands_on_nothing_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(Outcome::Sent(Evidence {
+            cache: events::Cache::None,
+            status: 200,
+            usage: Some(crate::metering::TokenUsage::default()),
+        }));
+        let keepalive = keepalive(dir.path(), &upstream, true);
+
+        keepalive.armed_by_request(sent(now_unix_ms()));
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        upstream.until_sent(1).await;
+
+        let aside = set_aside(dir.path()).expect("the replay was set aside");
+        assert_eq!(aside.dropped, Dropped::Keepalive, "it was the self-send");
+        assert_eq!(aside.evidence.cache, events::Cache::None);
+        assert_eq!(aside.evidence.status, 200);
+        assert_eq!(
+            aside.evidence.usage,
+            Some(crate::metering::TokenUsage::default())
+        );
+        assert_eq!(aside.kept.body, body(), "the body itself is there");
+        assert_eq!(aside.kept.session_id, series().session_id);
+        assert_eq!(aside.kept.prefix, series().prefix);
+        assert_eq!(aside.kept.ns, "default");
+        assert_eq!(aside.kept.model, "claude-opus-5");
+        assert_eq!(aside.kept.route, "a");
+    }
+
+    /// 入口で控えなかった 1 本も、同じところに取ってある。
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_did_not_land_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
+        let keepalive = keepalive(dir.path(), &upstream, true);
+
+        let started = now_unix_ms();
+        keepalive.not_landed(
+            sent(started),
+            Evidence {
+                cache: events::Cache::None,
+                status: 200,
+                usage: None,
+            },
+        );
+
+        assert_eq!(
+            keepalive.store.load(&series()),
+            None,
+            "it is not kept for replay"
+        );
+        let aside = set_aside(dir.path()).expect("the request was set aside");
+        assert_eq!(aside.dropped, Dropped::Entry, "it was the real request");
+        assert_eq!(aside.sent_at_ms, started);
+        assert_eq!(aside.evidence.cache, events::Cache::None);
+        assert_eq!(aside.kept.body, body(), "the body itself is there");
+    }
+
+    /// 上限が 0 なら、乗らなかった 1 本も取っておかない。
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_set_aside_when_it_is_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
+        let keepalive = Arc::new(Keepalive::new(
+            dir.path(),
+            Arc::new(Events::new()),
+            Arc::new(Open(true)),
+            uncached::Limits { keep: 0, days: 7 },
+        ));
+        keepalive.served_by(Arc::downgrade(&upstream) as Weak<dyn Sender>);
+
+        keepalive.not_landed(
+            sent(now_unix_ms()),
+            Evidence {
+                cache: events::Cache::None,
+                status: 200,
+                usage: None,
+            },
+        );
+
+        assert!(set_aside(dir.path()).is_none(), "nothing was written");
+    }
+
     /// usage が読めなかった 1 本では畳まない。
     ///
     /// 切れた応答・usage を載せない口がこれ。cache が無いと分かったわけでは
@@ -904,7 +1054,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_replay_whose_usage_was_unreadable_keeps_the_series() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Unknown));
+        let upstream = FakeUpstream::new(answered(events::Cache::Unknown));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         keepalive.armed_by_request(sent(now_unix_ms()));
@@ -923,7 +1073,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_blocked_route_is_not_replayed() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, false);
 
         keepalive.armed_by_request(sent(now_unix_ms()));
@@ -938,12 +1088,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_expired_series_is_withdrawn_instead_of_replayed() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let events = Arc::new(Events::new());
         let keepalive = Arc::new(Keepalive::new(
             dir.path(),
             Arc::clone(&events),
             Arc::new(Open(true)),
+            limits(),
         ));
         keepalive.served_by(Arc::downgrade(&upstream) as Weak<dyn Sender>);
         let mut watching = events.subscribe();
@@ -978,7 +1129,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_finished_horizon_ends_quietly() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         keepalive.armed_by_request(sent(now_unix_ms()));
@@ -1002,7 +1153,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_series_a_sibling_holds_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
         keepalive.armed_by_request(sent(now_unix_ms()));
 
@@ -1021,7 +1172,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_conversation_too_large_is_not_replayed() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         let mut huge = sent(now_unix_ms());
@@ -1038,7 +1189,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn pausing_drops_the_kept_conversation() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
         keepalive.armed_by_request(sent(now_unix_ms()));
 
@@ -1062,7 +1213,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn what_was_kept_is_picked_up_again() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         {
             let before = keepalive(dir.path(), &upstream, true);
             before.armed_by_request(sent(now_unix_ms()));
@@ -1075,6 +1226,26 @@ mod tests {
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         upstream.until_sent(1).await;
         assert_eq!(upstream.sent().len(), 1, "it replayed on the old schedule");
+    }
+
+    /// 読み戻しのついでに、古びた退避も切り詰める。
+    ///
+    /// 落ちている間は誰も書かないので、上限を超えたまま残る分はここでしか
+    /// 減らない。
+    #[tokio::test(start_paused = true)]
+    async fn picking_up_also_trims_what_was_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
+        let stale = dir.path().join("keepalive").join("uncached");
+        std::fs::create_dir_all(&stale).unwrap();
+        // 期間の外に置いてある 1 本 = 前回動いていた頃の退避。
+        let long_ago = now_unix_ms() - 30 * 24 * 60 * 60 * 1000;
+        let path = stale.join(format!("s-1.2cf24dba.{long_ago}.json"));
+        std::fs::write(&path, b"{}").unwrap();
+
+        keepalive(dir.path(), &upstream, true).restore();
+
+        assert!(!path.exists(), "the stale one was dropped on the way up");
     }
 
     /// 連鎖の見立ては、起点から 55 分刻みで並ぶ。
@@ -1101,7 +1272,12 @@ mod tests {
             count: 0,
             cache_notice: None,
         });
-        let keepalive = Keepalive::new(dir.path(), Arc::new(Events::new()), Arc::new(Open(true)));
+        let keepalive = Keepalive::new(
+            dir.path(),
+            Arc::new(Events::new()),
+            Arc::new(Open(true)),
+            limits(),
+        );
 
         let chain = keepalive.chain(&series()).unwrap();
         assert_eq!(chain.since_ms, started);
@@ -1123,7 +1299,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn what_was_promised_is_what_gets_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = FakeUpstream::new(Outcome::Sent(events::Cache::Hit));
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
         let keepalive = keepalive(dir.path(), &upstream, true);
 
         let started = now_unix_ms();

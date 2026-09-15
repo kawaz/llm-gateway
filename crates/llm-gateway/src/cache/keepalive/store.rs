@@ -78,7 +78,7 @@ impl Series {
     /// 混ざりうる。英数字以外を潰したうえで、潰した結果が衝突しないよう
     /// **prefix を後ろに付ける** — prefix はこちらが本文から作る 16 進なので
     /// そのまま名前に使える。
-    fn stem(&self) -> String {
+    pub(super) fn stem(&self) -> String {
         let cleaned: String = self
             .session_id
             .chars()
@@ -99,7 +99,7 @@ impl Series {
 /// 置き場は他の書き手も使う。拾うのは `<会話>.<prefix>` の形をした名前だけで、
 /// それ以外は読まずに飛ばす — 読めば「壊れている」と警告することになり、
 /// 自分のものでないファイルについて毎回 1 行吐く。
-fn is_ours(stem: &str) -> bool {
+pub(super) fn is_ours(stem: &str) -> bool {
     let Some((session, prefix)) = stem.rsplit_once('.') else {
         return false;
     };
@@ -430,6 +430,27 @@ mod tests {
             .map(|kept| kept.session_id)
             .collect();
         assert_eq!(sessions, ["s-1"], "only what this gateway keeps comes back");
+    }
+
+    /// 置き場の下のディレクトリは、控えとして拾わない。
+    ///
+    /// 乗らなかった 1 本を取っておく `uncached/` がそこに居る。拾ってしまうと、
+    /// 読めない控えとして毎回警告するか、畳んだはずの系列を撫で直すことになる。
+    #[test]
+    fn a_directory_beside_the_kept_requests_is_not_one_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
+        let aside = store.dir.join("uncached");
+        std::fs::create_dir_all(&aside).unwrap();
+        std::fs::write(aside.join("s-2.deadbeef.1800000000000.json"), b"{}").unwrap();
+
+        let sessions: Vec<String> = store
+            .load_all()
+            .into_iter()
+            .map(|kept| kept.session_id)
+            .collect();
+        assert_eq!(sessions, ["s-1"], "only the kept requests come back");
     }
 
     /// 捨てた控えは読めなくなる。

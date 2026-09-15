@@ -116,6 +116,26 @@ guarding only this one place would protect nothing. Treat the directory as holdi
 conversation content. A series whose body exceeds 8MB is not kept, and is not
 extended.
 
+### Requests that did not land
+
+A request that did not land on the cache — not kept at the entrance, or dropped
+because a replay came back `none` — is set aside for study under
+`<stats dir>/keepalive/uncached/<session>.<series>.<sent at>.json`. It holds what
+the kept request holds (body, headers, model, route, namespace, session, series)
+plus the evidence: the usage read from the answer, the `cache` word, the response
+status, and where it was dropped (`entry` / `keepalive`).
+
+```toml
+[stats]
+uncached_keep = 50   # how many to keep, newest first (default 50)
+uncached_days = 7    # for how many days (default 7)
+```
+
+Anything past `uncached_keep` entries or older than `uncached_days` is dropped
+when a new one is written and again on startup. Setting either to `0` turns this
+off (what is already there is left alone). **These files hold the conversation
+body too**, with no more protection than the kept requests.
+
 Several processes may share the directory. The `.lock` beside a series is taken right
 before sending, so only one of them ever touches it. On startup each process only
 reads its own naming (`<session>.<series>.json`) and ignores anything else in the

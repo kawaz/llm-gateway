@@ -130,6 +130,7 @@ impl<P: Persistence> Gateway<P> {
             config.stats.resolve_dir(),
             Arc::clone(&events),
             Arc::new(RouterReach(Arc::clone(&router))),
+            config.stats.uncached_limits(),
         ));
 
         Ok(Self {
@@ -1022,6 +1023,11 @@ impl<P: Persistence> Gateway<P> {
             );
         }
         let cache = events::Cache::of(usage.as_ref());
+        let evidence = keepalive::Evidence {
+            cache,
+            status,
+            usage,
+        };
         self.events.publish(events::Event::new(
             sent_at_ms,
             &events::Origin {
@@ -1053,7 +1059,7 @@ impl<P: Persistence> Gateway<P> {
             cache = cache.as_str(),
             "replayed the last request to keep the cache alive"
         );
-        keepalive::Outcome::Sent(cache)
+        keepalive::Outcome::Sent(evidence)
     }
 
     async fn send(
@@ -1662,10 +1668,11 @@ struct Keeping {
 }
 
 impl exchange::CacheWitness for Keeping {
-    fn settled(&self, cache: events::Cache, _at_ms: i64) {
+    fn settled(&self, response: &events::Response, usage: Option<&TokenUsage>) {
         let Some(sent) = self.sent.lock().unwrap().take() else {
             return;
         };
+        let cache = response.cache;
         if !cache.on_cache() {
             debug!(
                 session = %sent.series.session_id,
@@ -1674,8 +1681,16 @@ impl exchange::CacheWitness for Keeping {
                 "this request did not land on the cache; not keeping it"
             );
             // 送る前に連鎖を知らせてある。控えないまま黙ると、見る側はその
-            // 見立てを描き続ける (DR-0027 決定 8)。
-            self.keepalive.not_landed(&sent);
+            // 見立てを描き続ける (DR-0027 決定 8)。本文は研究用に取っておく —
+            // `cache_control` を持つのに乗らない系列が実際にある。
+            self.keepalive.not_landed(
+                sent,
+                keepalive::Evidence {
+                    cache,
+                    status: response.status,
+                    usage: usage.cloned(),
+                },
+            );
             return;
         }
         self.keepalive.armed_by_request(sent);

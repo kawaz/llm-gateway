@@ -13,6 +13,9 @@
 //!
 //! [stats]
 //! # dir 省略時は $XDG_STATE_HOME/llm-gateway/stats
+//! # cache に乗らなかった request を研究用に取っておく量と期間 (0 で取らない)
+//! uncached_keep = 50
+//! uncached_days = 7
 //!
 //! # 認証情報の中身 (token 等) はここに書かない。store に置いた
 //! # <key>.json を type と結びつけるだけ。
@@ -851,18 +854,55 @@ impl Store {
 }
 
 /// 使用量の日次集計の置き場 (DR-0011)。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stats {
     /// 省略時は `$XDG_STATE_HOME/llm-gateway/stats`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<PathBuf>,
+    /// cache に乗らなかった request を、研究用に何本まで取っておくか
+    /// (`keepalive/uncached/`、DR-0027 決定 9)。
+    #[serde(default = "default_uncached_keep")]
+    pub uncached_keep: usize,
+    /// 同じく、何日まで取っておくか。
+    #[serde(default = "default_uncached_days")]
+    pub uncached_days: u32,
+}
+
+/// 取っておく本数の既定。
+///
+/// 会話 1 本ぶんの本文が数百 KB なので、50 本でも置き場は数十 MB に収まる。
+const fn default_uncached_keep() -> usize {
+    50
+}
+
+/// 取っておく日数の既定。1 週間あれば「先週おかしかった」に間に合う。
+const fn default_uncached_days() -> u32 {
+    7
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            uncached_keep: default_uncached_keep(),
+            uncached_days: default_uncached_days(),
+        }
+    }
 }
 
 impl Stats {
     /// 実際に使う置き場。
     pub fn resolve_dir(&self) -> PathBuf {
         self.dir.clone().unwrap_or_else(default_stats_dir)
+    }
+
+    /// 乗らなかった request をどこまで取っておくか。
+    pub fn uncached_limits(&self) -> crate::cache::keepalive::uncached::Limits {
+        crate::cache::keepalive::uncached::Limits {
+            keep: self.uncached_keep,
+            days: self.uncached_days,
+        }
     }
 }
 

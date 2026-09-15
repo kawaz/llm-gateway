@@ -58,7 +58,7 @@ use crate::Result;
 use crate::credential::time::now_unix_ms;
 use crate::egress::BodyStream;
 use crate::events::{self, Events};
-use crate::metering::{Outcome, UsageObserver};
+use crate::metering::{Outcome, TokenUsage, UsageObserver};
 use crate::stats::Stats;
 use crate::tap::{self, Tap};
 
@@ -193,8 +193,10 @@ pub struct Completion {
 pub trait CacheWitness: Send + Sync {
     /// この 1 本の cache の結果が出た。
     ///
-    /// `at_ms` は応答が閉じた時刻 = 書き直しなら新しい cache が始まった瞬間。
-    fn settled(&self, cache: events::Cache, at_ms: i64);
+    /// 渡すのは閉じ終えた知らせそのもの (時刻・状態・cache の語) と、そこには
+    /// 載らない usage。乗らなかった 1 本を後から読み解く材料はこの 2 つに全部
+    /// 入っているので、受け取る側が要るものだけを取る。
+    fn settled(&self, response: &events::Response, usage: Option<&TokenUsage>);
 }
 
 /// 終端を記録し、usage を抽出しながら流すストリーム。
@@ -306,11 +308,13 @@ impl BodyObservation {
         let Some(mut completion) = self.completion.take() else {
             return;
         };
-        completion.notice.settle(now_unix_ms(), outcome, !completed);
+        completion
+            .notice
+            .settle(now_unix_ms(), &outcome, !completed);
         // cache の結果が出た。書き直しなら連鎖の起点を置き直し、乗らなかった
         // 1 本なら控えない — どちらを選ぶかは受け取る側が決める。
         if let Some(witness) = &completion.cache {
-            witness.settled(completion.notice.cache, completion.notice.ts);
+            witness.settled(&completion.notice, outcome.usage.as_ref());
         }
         completion.events.publish(completion.notice);
     }
@@ -1287,7 +1291,8 @@ mod tests {
     struct Witness(std::sync::Mutex<Vec<events::Cache>>);
 
     impl CacheWitness for Witness {
-        fn settled(&self, cache: events::Cache, _at_ms: i64) {
+        fn settled(&self, response: &events::Response, _usage: Option<&TokenUsage>) {
+            let cache = response.cache;
             self.0.lock().unwrap().push(cache);
         }
     }

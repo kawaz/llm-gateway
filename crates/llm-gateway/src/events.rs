@@ -336,10 +336,10 @@ impl Response {
     ///
     /// 終わり方も cache の結果も同じ観測 ([`Outcome`]) から出るので、まとめて
     /// 受け取る。
-    pub fn settle(&mut self, ts_ms: i64, outcome: Outcome, aborted: bool) {
+    pub fn settle(&mut self, ts_ms: i64, outcome: &Outcome, aborted: bool) {
         self.ts = ts_ms;
         self.cache = Cache::of(outcome.usage.as_ref());
-        self.stop_reason = outcome.stop_reason;
+        self.stop_reason = outcome.stop_reason.clone();
         self.aborted = aborted;
     }
 }
@@ -1038,7 +1038,7 @@ mod tests {
         let mut notice = Response::pending(NOW, &from("personal"), 200);
         notice.settle(
             NOW + 1,
-            Outcome {
+            &Outcome {
                 usage: Some(read(123_456)),
                 stop_reason: Some("end_turn".to_owned()),
             },
@@ -1076,7 +1076,7 @@ mod tests {
         );
         notice.settle(
             NOW + 8 * 1_000,
-            Outcome {
+            &Outcome {
                 usage: Some(read(3_000)),
                 stop_reason: Some("end_turn".to_owned()),
             },
@@ -1104,7 +1104,7 @@ mod tests {
 
         // 切れた 1 本には終わり方が無い。切れたことは常に出す。
         let mut cut = Response::pending(NOW, &from("personal"), 200);
-        cut.settle(NOW + 3 * 1_000, Outcome::default(), true);
+        cut.settle(NOW + 3 * 1_000, &Outcome::default(), true);
         assert_eq!(
             serde_json::to_value(&cut).unwrap()["cache"],
             "unknown",
@@ -1141,7 +1141,7 @@ mod tests {
         let mut response = Response::pending(NOW, &from("a"), 200);
         response.settle(
             NOW + 1,
-            Outcome {
+            &Outcome {
                 usage: None,
                 stop_reason: Some("end_turn".to_owned()),
             },
