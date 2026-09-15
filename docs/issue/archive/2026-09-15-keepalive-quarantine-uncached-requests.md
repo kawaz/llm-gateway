@@ -1,6 +1,6 @@
 ---
 title: cache に乗らなかった request を研究用に一定期間・一定量だけ退避する
-status: open
+status: resolved
 category: task
 created: 2026-09-15T11:30:37+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-15T13:15:16+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done: v0.49.0 で実装 (DR-0027 決定 9、cache/keepalive/uncached.rs)、v0.49.1 として両 unit に展開済み (2026-09-15)。既定 50 件 / 7 日、[stats] uncached_keep / uncached_days。退避先 stats/keepalive/uncached/ は最初の該当 request が出た時に作られる"]
 blocked_by:
 origin: kawaz 承認 (2026-09-15)
 ---
