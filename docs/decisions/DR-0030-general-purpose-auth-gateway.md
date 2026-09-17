@@ -66,7 +66,9 @@ events (DR-0012) も二重に持つことになる。crate 分割だけで依存
 DR-0006 が「gateway の機能はすべて ns 配下」と決めた形をそのまま延長し、
 ns の直下に**どこへ出るか**の段を足す。`llm` は行き先の 1 つで、特別扱いしない。
 
-汎用パススルーは **`<apifqdn>` ごとに credential を設定で登録**し、gateway は
+汎用パススルーは **行き先ごとに「上流 URL + credential + 許可する endpoint」を
+設定で登録**し (`[upstreams.<name>]`、名前は既定で apifqdn、任意のラベルも可)、
+`/ns-<ns>/<name>/<rest>` の `<rest>` を上流 URL にそのまま連結する。gateway は
 クライアントの `Authorization` を落として登録された認証 (API key / bearer /
 OAuth token) を載せて、それ以外は本文もヘッダも応答も触らずに流す。DR-0025 §1 と
 同じ「認証だけ差し替える」形で、変換は持たない。
@@ -163,9 +165,11 @@ JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場
 4. ns 認証 `jwt`
 5. `issued` (別途設計)
 
-**xAI (`api.x.ai`、Responses 形式) は本 DR を待たない。** DR-0025 の受け口と
-無変換パススルーの経路にそのまま乗るので、route を 1 つ足せば済む
-(`x_search` が実機で動くことは 2026-09-17 に確認済み)。
+**xAI (`api.x.ai`、Responses 形式) は本 DR を待たない。** DR-0025 の受け口
+(`POST /ns-<ns>/v1/responses`、body の `model` で route を選ぶ) に乗るので、
+plain な API key を bearer で載せる credential 種別 (現行は OAuth 2 種と Bedrock の
+key しか無い) を 1 つ足し、`provider = "openai"` + `url = "https://api.x.ai/v1"` の
+route を 1 つ書けば通る (`x_search` が実機で動くことは 2026-09-17 に確認済み)。
 
 ## Alternatives Considered
 
@@ -192,8 +196,10 @@ JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場
 
 ## Consequences
 
-- **URL が変わる。** `/ns-<ns>/v1/...` は `/ns-<ns>/llm/<provider>/...` へ移る。
-  移行期の alias を残すかは未確定 (§未確定)
+- **URL が変わる。** `/ns-<ns>/v1/...` は `/ns-<ns>/llm/<provider>/...` へ移り、
+  **旧 URL の alias は残さない** (kawaz 裁定 2026-09-17)。使っているのは手元の
+  Claude 設定 3 つだけなので、unstable 側でパスを変えて設定を書き換え、通ったら
+  stable も入れ替える手順で足りる
 - **汎用層に LLM の語彙が現れないことをテストで縛る**必要がある (DR-0014 §3 の
   判定基準と同じ手当て)。文章の禁止だけでは、便利な近道として漏れる
 - **gateway が 429 を返す理由が 2 つになる** — 全経路が断られた結果 (DR-0009 /
@@ -224,9 +230,6 @@ JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場
 
 ## 未確定
 
-- **旧 URL (`/ns-<ns>/v1/...`) の alias を残すか。** 残さない方針を推すが
-  (段が 2 通りあると「LLM だけパスの形が違う」が恒久的に残る)、既存クライアントの
-  設定書き換えを伴うので kawaz の裁定待ち
 - **汎用層の crate 名。** `gateway-core` は提案
 - **`issued` の設計全体** (発行の口、refresh の再利用検知、access の寿命)。
   kawaz ペンディング。署名鍵の置き場は §5 で決まっているので、未確定なのは
