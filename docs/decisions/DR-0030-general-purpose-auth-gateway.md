@@ -45,8 +45,9 @@ workspace に汎用層の crate を切る (名前は提案として `gateway-cor
 **依存方向を固定する: llm-gateway → 汎用層。逆は禁止。** 汎用層は provider の名前も
 LLM の語彙 (model / token / cache) も知らない。これは DR-0014 §3 の判定基準
 「core は provider の名前を 1 つも知らない」を 1 段外側へ広げたもので、
-測り方も同じ — **汎用層のコードに `model` / `token` / `anthropic` / `openai` が
-現れないこと**。
+測り方も同じ — **汎用層のコードに `model` / `usage` / provider 名 (`anthropic` /
+`openai` 等) が現れないこと**。`token` は認証の語 (bearer token) として汎用層が
+使うので判定語にしない。
 
 **プロセスは分けない。** 別 daemon にすると、1 リクエストに 2 段の hop と 2 つの
 config が要り、credential store が 2 つに割れて DR-0010 の flock が守っている
@@ -106,12 +107,20 @@ LLM 専用だった間は、通る先が config の routing で閉じていた�
 この帰結として: **ns 認証が実質 dummy (固定 token を配っただけ) でよいのは、
 その ns の allowlist が読み取り系に閉じている場合に限る。**
 
-### 5. 静的 secret は当面そのままファイルに置く
+### 5. 秘密の置き場 — 預かりものはファイル、自前の秘密は JWKS 1 つだけ
 
 汎用パススルー用のキー・bearer も、今の credential と同じく**生のファイル**に
 置く (kawaz 裁定 2026-09-17)。ファイルの版と排他は DR-0010 の仕組みをそのまま使う。
 
-**gateway は秘密鍵を持たない**、ただし §6 の `issued` を採る場合の署名鍵だけは例外。
+**gateway が持つ自身の秘密は、`issued` (§6) 用の署名鍵 = JWKS ただ 1 つ。**
+これ以外は全部「他所から預かったキー」であって gateway が作ったものではない、
+という区別を保つ。その JWKS の置き場も段階を踏む:
+
+1. **初期はファイル管理** — 他の credential と同じ扱い (版 + flock)
+2. **cache-warden が稼働したら、そちらへ移す** — issue
+   `2026-09-15-store-layer-for-replaceable-persistence` の Store 層の backend として
+
+平文ファイルで置く期間の危険度は預かりキーより高い (§Consequences)。
 
 ### 6. ns 認証は方式の enum。出口は主体に揃える
 
@@ -139,11 +148,12 @@ stats / events) は主体だけを見る。方式が増えても下流は変わ�
   (JWKS に両方が載る期間を作る)
 
 `issued` は **設計ペンディング (kawaz)**。方向だけ決める: access / refresh とも
-JWT とし、gateway の署名鍵は JWK として管理する。詳細は §未確定。
+JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場は §5)。
+詳細は §未確定。
 
 **helper CLI** (鍵ペア生成 + JWKS 断片の出力 + 手元での署名) を用意するが、
-**生成物を標準出力に出すだけで gateway は保存しない**。gateway が鍵を作って
-持つ形にすると §5 の「秘密鍵を持たない」が崩れる。
+**生成物を標準出力に出すだけで gateway は保存しない**。アプリの秘密鍵を gateway が
+作って持つ形にすると、§5 の「自前の秘密は `issued` 用の JWKS 1 つだけ」が崩れる。
 
 ### 7. 進め方
 
@@ -194,6 +204,12 @@ JWT とし、gateway の署名鍵は JWK として管理する。詳細は §未
   そのまま当たるので、Store 層を切る時に一緒に収まる
 - **副作用のある API が通りうる**ので、ns 認証の設計不足が実害に変わる。§4 の
   allowlist はその歯止めであり、省略できない
+- **`issued` の署名鍵は、預かりキーより漏洩の影響が広い。** 上流キーが漏れれば
+  漏れた 1 本の枠を使われるが、署名鍵が漏れれば**任意の ns の access token を
+  偽造できる** — allowlist も ns の区分も丸ごと迂回される。平文ファイルで置く期間
+  (cache-warden 以前、§5) はこの差が剥き出しなので、**鍵ローテの runbook を
+  `issued` 稼働の前提条件とする** (漏洩に気づいてから手順を考えるのでは、
+  発行済み token が生きている間ずっと偽造が通る)
 - 既存の LLM 経路の振る舞い (routing / denial / spend_down / pace_cap / cache /
   stats) は変えない。汎用層へ移るのは所有であって挙動ではない
 
@@ -212,8 +228,16 @@ JWT とし、gateway の署名鍵は JWK として管理する。詳細は §未
   (段が 2 通りあると「LLM だけパスの形が違う」が恒久的に残る)、既存クライアントの
   設定書き換えを伴うので kawaz の裁定待ち
 - **汎用層の crate 名。** `gateway-core` は提案
-- **`issued` の設計全体** (発行の口、refresh の rotate と再利用検知、署名鍵の
-  置き場と rotate、access の寿命)。kawaz ペンディング
+- **`issued` の設計全体** (発行の口、refresh の再利用検知、access の寿命)。
+  kawaz ペンディング。署名鍵の置き場は §5 で決まっているので、未確定なのは
+  それ以外。以下 2 点は**方向だけ**決まっている:
+  - **鍵ローテの順序は「新 kid を先出し → 旧 kid での発行停止 → 旧 kid を失効」**。
+    失効してよい時刻は **旧 kid で最後に発行した access token の `exp`** から
+    機械的に決まる (それ以降は旧 kid で検証すべき token が 1 つも残らない)。
+    そのため **gateway は kid ごとの最終発行時刻を覚える**
+  - **refresh token も refresh のたびに新 kid で発行し直す (rotation)**。
+    refresh が旧 kid のまま残ると失効時刻が refresh の寿命に引きずられるが、
+    毎回新 kid へ載せ替えれば**失効判定は access の `exp` だけで足りる**
 - **静的 secret の供給を将来どうするか。** `op://` 参照を起動時に解決する案と、
   Store 層 (cache-warden) の backend に載せる案がある。当面は §5 のとおり生ファイル
 - **レート制限の 2 段目 (ns × apifqdn) を第一版に入れるか、credential 単位だけで
