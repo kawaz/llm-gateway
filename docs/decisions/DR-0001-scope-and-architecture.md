@@ -1,6 +1,6 @@
 # DR-0001: スコープとアーキテクチャ
 
-- Status: Active (一部を [DR-0002](./DR-0002-component-architecture.md) が改訂)
+- Status: Active
 - Date: 2026-07-27
 
 > **改訂あり**: 「ボディは触らない」「ヘッダを足さないので事故は起きない」の 2 点は

@@ -1,6 +1,6 @@
 # DR-0026: discovery が codex backend に名乗る版は定数で持つ
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-09-08
 
 ## 文脈

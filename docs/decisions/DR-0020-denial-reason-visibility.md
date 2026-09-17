@@ -1,6 +1,6 @@
 # DR-0020: 外した理由を出力に載せる (events の `skipped` / usage の `denials`)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-19
 
 ## 背景

@@ -1,5 +1,8 @@
 # DR-0003: upstream が拒否する beta フラグを credential 単位で学習する
 
+- Status: Active
+- Date: 2026-07-28
+
 ## Context
 
 Claude Code は `anthropic-beta` ヘッダに複数のフラグを載せて送る。実測

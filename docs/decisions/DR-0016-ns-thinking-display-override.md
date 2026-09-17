@@ -1,6 +1,6 @@
 # DR-0016: namespace 単位の thinking.display 強制上書き
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-14
 
 ## 背景

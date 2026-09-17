@@ -1,6 +1,6 @@
 # DR-0015: routing のネストグループと 7d リセット期限優先の動的順序
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-12
 
 ## 背景

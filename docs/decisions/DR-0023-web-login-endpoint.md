@@ -1,6 +1,6 @@
 # DR-0023: Web 経由の OAuth 再認証口 (`/llm-gateway/login`)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-28
 
 ## 文脈

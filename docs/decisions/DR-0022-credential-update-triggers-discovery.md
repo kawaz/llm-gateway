@@ -1,6 +1,6 @@
 # DR-0022: 認証情報の更新を版で見張り、一覧を即座に取り直す
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-26
 
 ## 背景

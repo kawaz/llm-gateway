@@ -1,5 +1,8 @@
 # DR-0004: credential の軸を「認証情報の形」と「話す API」に分ける
 
+- Status: Active
+- Date: 2026-07-28
+
 ## Context
 
 DR-0003 の実装で credential json を `type` + 運用設定 + `payload` に分けたが、

@@ -1,6 +1,6 @@
 # DR-0021: upstream の公式状態と実測状態を `/llm-gateway/status` で一括表示する
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-24
 - CLI 名は DR-0028 で `upstream status` (endpoint `/llm-gateway/status` は変わらない)
 

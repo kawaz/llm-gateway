@@ -1,6 +1,6 @@
 # DR-0017: デバッグ用 tap endpoint (購読時のみ動く観測口)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-14
 
 ## 背景

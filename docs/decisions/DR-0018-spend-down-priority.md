@@ -1,6 +1,6 @@
 # DR-0018: リセット間際の枠を優先して使い切る (spend_down)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-16
 
 ## 背景

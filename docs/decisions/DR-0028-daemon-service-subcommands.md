@@ -1,6 +1,6 @@
 # DR-0028: プロセスの起動と常駐を `daemon` / `service` の 2 系統に分ける
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-09-09
 - 実装: v0.44.0 (段階 A: 登録簿と命令の割り、B: 監督者と `daemon`、C: `service` と移行 runbook)
 

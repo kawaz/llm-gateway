@@ -1,6 +1,6 @@
 # DR-0019: 借りる枠は経過した時間ぶんまで (pace_cap)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-16
 
 ## 背景

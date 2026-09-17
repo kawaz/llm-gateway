@@ -1,6 +1,6 @@
 # DR-0029: 日次集計に「出した側」(origin) の軸を足す
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-09-14
 
 ## Context

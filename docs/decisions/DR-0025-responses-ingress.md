@@ -1,6 +1,6 @@
 # DR-0025: Responses 形式の受け口 (無変換パススルー + 認証差し替え)
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-09-07
 
 ## 文脈

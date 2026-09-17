@@ -1,6 +1,6 @@
 # DR-0014: 目標アーキテクチャ — ingress / egress / exchange と provider preset
 
-- Status: Accepted
+- Status: Active
 - Date: 2026-08-04
 
 ## Context
