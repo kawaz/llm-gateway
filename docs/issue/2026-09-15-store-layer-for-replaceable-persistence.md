@@ -63,6 +63,12 @@ log に載せない)。
 DR-0027 の「分散 backend は作らない」は、Raft backend を実際に入れる時点で
 supersede する。Store 層自体を切り出すことは DR-0027 と衝突しない。
 
+### 差し替え先の候補 (2026-09-17 追記, kawaz)
+
+第一候補は cache-warden (kawaz 製)。本来目的で使えるようになった時点で Store 層の
+backend にする。それまで固定 token 等の静的 secret も、今の credential と同じく
+生のファイルで置く。
+
 ## 受け入れ条件
 
 - [ ] kawaz から着手指示が出たら、Store 層の trait 設計 (単一 writer 更新 / リース /
