@@ -22,22 +22,17 @@ gateway の版 (0.43.0) は `minimal_client_version` (gpt-6-astra で 0.153.0) �
 一覧は出ていたので気づきにくかった。config のコメントにあった
 「空配列を返すアカウントがある」という記述は、この誤診である。
 
-実測 2026-09-07 (同一 credential): `client_version=0.43.0` → 0 件、`0.153.4` → 9 件
-(gpt-6-astra / gpt-reserve / gpt-5.6-sol / terra / luna / gpt-5.5 / gpt-5.4-mini /
-gpt-5.3-codex-spark / codex-auto-review)。
+実測 2026-09-22 (同一 credential): `client_version=0.153.4` / `0.154.0` → 7 件、`0.155.0` → 9 件。追加された gpt-6-sol / gpt-6-luna はともに `minimal_client_version=0.155.0`。
 
 ## 決定
 
-### 1. 定期 refresh で名乗る版は、codex CLI の版をコード定数で持つ
+### 1. 定期 refresh で名乗る版は、catalog が要求する codex CLI の版をコード定数で持つ
 
-`discovery::CODEX_CLIENT_VERSION` に codex CLI の版 (現在 `0.153.4`) を置き、
-`fetch()` はこれを渡す。gateway の版を名乗らない。
+`discovery::CODEX_CLIENT_VERSION` に、catalog の現行モデルが `minimal_client_version` で要求する公開済み codex CLI の版 (現在 `0.155.0`) を置き、`fetch()` はこれを渡す。gateway の版を名乗らない。
 
-これは **単価表 (`preset/pricing.rs`) と同じ運用**。upstream 側の事実を写した定数で、
-リリース時に手で更新する。
+これは **単価表 (`preset/pricing.rs`) と同じ運用**。upstream 側の事実を写した定数で、リリース時に手で更新する。ローカルに入っている codex CLI は配布更新が遅れる場合があるため、その版を正本にはしない。
 
-**リリース時の更新手順**: `codex --version` の出力に合わせて
-`crates/llm-gateway/src/discovery.rs` の `CODEX_CLIENT_VERSION` を更新する。
+**リリース時の更新手順**: upstream catalog が返す現行モデルの `minimal_client_version` と、その版の codex CLI が公開済みであることを確認して、`crates/llm-gateway/src/discovery.rs` の `CODEX_CLIENT_VERSION` を更新する。
 
 ### 2. catalog が取れた経路では catalog が勝つ。公開一覧の調整は `exclude` で行う
 

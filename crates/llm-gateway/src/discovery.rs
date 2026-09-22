@@ -21,9 +21,10 @@ use crate::{Error, Result};
 ///
 /// Design rationale: backend は各モデルの `minimal_client_version` と
 /// 突き合わせ、古すぎる相手には空の一覧を返す。gateway 自身の版
-/// (`CARGO_PKG_VERSION`) を名乗ると常に 0 件になるため、**codex CLI の版**を
-/// 名乗る。単価表と同じく、リリース時に手で更新する定数として持つ。
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.153.4";
+/// (`CARGO_PKG_VERSION`) を名乗ると常に 0 件になるため、catalog の現行モデルが
+/// 要求する公開済み codex CLI の版を名乗る。単価表と同じく、upstream の
+/// `minimal_client_version` に合わせて手で更新する定数として持つ。
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.155.0";
 
 /// upstream が公開している 1 モデル。
 #[derive(Debug, Clone, PartialEq, Eq)]
