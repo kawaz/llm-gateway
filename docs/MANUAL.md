@@ -75,9 +75,10 @@ The strategies:
 
 The break-even time is `(1h write rate / cache read rate) x 55 minutes` — the point
 where resending for that long costs as much as rebuilding the cache once. It follows
-from the model's prices alone (80 pings, 73.3 hours, for Fable 5.1; 20 pings, 18.3
-hours, for Opus 5), so a share applies the same judgement to models that cost
-differently (`0.3` is 22 hours on Fable 5.1 and 5.5 hours on Opus 5). Measured against
+from the model's prices alone (80 pings, 73.3 hours, for Fable 5.1; 40 pings, 36.7 hours,
+for Opus 5.5; 20 pings, 18.3 hours, for Opus 5), so a share applies the same judgement
+to models that cost differently (`0.3` is 22 hours on Fable 5.1, 11 hours on Opus 5.5,
+and 5.5 hours on Opus 5). Measured against
 the last seven days, **0.2 to 0.35** is the useful range
 (`scripts/keepalive-horizon-sim.py`).
 

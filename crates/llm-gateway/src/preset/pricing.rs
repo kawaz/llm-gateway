@@ -169,6 +169,19 @@ static TABLE: &[Row] = &[
         ],
         ANTHROPIC_REFINEMENTS,
     ),
+    // Opus 5.5 は cache read だけ 0.05 倍 ($0.20/MTok)。5 系の glob より前に置いて
+    // 先に当てる (2026-09-23 確認 / pricing doc)。
+    row(
+        &["claude-opus-5-5", "claude-opus-5-5-*"],
+        &[
+            (INPUT, 4.0),
+            (OUTPUT, 20.0),
+            (CACHE_WRITE, 5.0),
+            (CACHE_WRITE_1H, 8.0),
+            (CACHE_READ, 0.2),
+        ],
+        ANTHROPIC_REFINEMENTS,
+    ),
     row(
         &["claude-opus-5", "claude-opus-5-*"],
         &[
@@ -265,6 +278,27 @@ static TABLE: &[Row] = &[
             (OUTPUT, 50.0),
             (CACHE_WRITE, 12.5),
             (CACHE_READ, 1.0),
+        ],
+        OPENAI_REFINEMENTS,
+    ),
+    // gpt-6 の sol / luna は 2026-09-23 確認 (同じ Standard 表)。導入価格の断りは無い。
+    row(
+        &["gpt-6-sol", "gpt-6-sol-*"],
+        &[
+            (INPUT, 2.0),
+            (OUTPUT, 10.0),
+            (CACHE_WRITE, 2.5),
+            (CACHE_READ, 0.2),
+        ],
+        OPENAI_REFINEMENTS,
+    ),
+    row(
+        &["gpt-6-luna", "gpt-6-luna-*"],
+        &[
+            (INPUT, 0.1),
+            (OUTPUT, 0.5),
+            (CACHE_WRITE, 0.125),
+            (CACHE_READ, 0.01),
         ],
         OPENAI_REFINEMENTS,
     ),
@@ -455,6 +489,26 @@ mod tests {
         );
         assert_eq!(rate("claude-fable-5-1", &TokenKind::output()), Some(50.0));
         assert_eq!(rate("gpt-5.6-luna", &TokenKind::output()), Some(1.2));
+        assert_eq!(rate("gpt-6-sol", &TokenKind::output()), Some(10.0));
+        assert_eq!(rate("gpt-6-luna", &TokenKind::input()), Some(0.1));
+    }
+
+    /// Opus 5.5 は 5 系の glob に飲まれず、自分の安い単価を持つ。
+    #[test]
+    fn opus_5_5_is_cheaper_than_opus_5() {
+        assert_eq!(rate("claude-opus-5-5", &TokenKind::input()), Some(4.0));
+        assert_eq!(rate("claude-opus-5-5", &TokenKind::output()), Some(20.0));
+        // cache read は input の 0.05 倍。5 系の 0.1 倍とは違う。
+        assert_eq!(
+            rate("claude-opus-5-5", &TokenKind::input_cache_read()),
+            Some(0.2)
+        );
+        // 5 は従来どおり。
+        assert_eq!(rate("claude-opus-5", &TokenKind::input()), Some(5.0));
+        assert_eq!(
+            rate("claude-opus-5", &TokenKind::input_cache_read()),
+            Some(0.5)
+        );
     }
 
     /// 日付付きの形も同じ行に当たる。
@@ -536,7 +590,10 @@ mod tests {
                 "claude-haiku-4-5",
                 "claude-fable-5",
                 "claude-fable-5-1",
+                "claude-opus-5-5",
                 "gpt-5.6-luna",
+                "gpt-6-sol",
+                "gpt-6-luna",
             ]),
             vec![]
         );
