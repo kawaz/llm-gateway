@@ -1,11 +1,11 @@
 ---
 title: codex 経路が画像を含む tool_result を拒否し route 全滅で 503 になる
-status: open
+status: wip
 category: bug
 created: 2026-09-19T17:30:25+09:00
 last_read: 2026-09-23T18:11:18+09:00
 open_entered: 2026-09-19T17:30:25+09:00
-wip_entered:
+wip_entered: 2026-09-23T18:14:19+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -46,3 +46,5 @@ API Error: 503 all routes for model gpt-5.6-sol failed: codex-emrd: could not re
 ## TODO
 
 <!-- wip 時のみ -->
+
+原因分析済み: 拒否は gateway 変換層 (preset/openai/request.rs tool_result_text) で、Error::Config 型の使い回しと Switch::to_next による route 切替が 503 の原因。A (変換失敗を 400 で返す、route 切替も transport 障害計上もしない) を実装着手。画像の扱い (B プレースホルダ / C input_image 転送) は上流の実機裏取り後に決める。
