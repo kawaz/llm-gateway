@@ -83,7 +83,7 @@ llm-gateway daemon log [<unit>]|--all  [--follow]
 
 `~/.local/state/llm-gateway/daemon/units/<name>.toml` に 1 unit 1 ファイル。`name` は `daemon add --name <name> <config-path>` で与え、省略時は設定ファイルの basename から拡張子を落としたもの (`config-11301-unstable-new.toml` → `config-11301-unstable-new`)。
 
-unit が持つのは設定ファイルのパス、`enabled` (後述の desired state)、そして **実行する binary のパス**。binary は設定側の `[server] binary_path` を正とし、書かれていなければ登録した時点の自分自身の絶対パスを焼き込む。
+unit が持つのは設定ファイルのパス、`enabled` (後述の desired state)、そして **実行する binary のパス**。binary は設定側の `[server] binary_path` を正とし、書かれていなければ登録した時点の自分自身の絶対パスを焼き込む。`binary_path` は設定の他のパス欄と同じく、読み込み時に `~` と環境変数を開いた値を使う (台をまたぐ dotfiles に置くため)。
 
 binary を unit ごとに持つのは、いま走っている 2 台が **別のビルドだから**である (11302 = brew の stable、11301 = repo の release build)。1 つの監督者が両方を抱えるには、監督者の binary と子の binary が別でありうる必要がある。
 

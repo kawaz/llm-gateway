@@ -14,6 +14,21 @@ The endpoints fall into three groups.
 
 The examples below assume the gateway listens on `http://127.0.0.1:8402`.
 
+## Paths written in the configuration
+
+The path fields of the configuration (`extends`, `[server] binary_path`, `[store] dir`, `[stats] dir`, `[webhook] token_file`) expand `~` and environment variables once, when the file is read.
+
+| Spelling | Meaning |
+| --- | --- |
+| A leading `~` / `~/` | `$HOME`. A `~` in the middle is just a character |
+| `$VAR` | That environment variable |
+| `${VAR}` | The same, for when text follows it |
+| `${VAR:-fallback}` | The fallback when the variable is not set; it expands by the same rules (`${XDG_STATE_HOME:-~/.local/state}`) |
+
+An empty variable counts as unset. A `$VAR` with no fallback that is not set stops the load and names the variable — letting it through as empty would leave a value meant as `~/.local` pointing at the root. There is no `\$` escape.
+
+The defaults are built by the same rules (`~/.local/state` when `$XDG_STATE_HOME` is absent), so writing a default location into the configuration reads as `${XDG_STATE_HOME:-~/.local/state}/llm-gateway/stats`. The expanded paths are what `llm-gateway check --config <path>` prints, and what its existence checks look at.
+
 ## Namespaces
 
 Forwarding paths may carry a namespace prefixed with `ns-`.

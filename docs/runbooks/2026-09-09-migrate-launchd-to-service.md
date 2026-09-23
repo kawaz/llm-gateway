@@ -25,6 +25,8 @@ launchd に直接載っている 2 つの plist を降ろし、`llm-gateway serv
 
 登録簿は `[server] binary_path` を正として焼き込む。書かないと登録した時点の自分自身が入ってしまい、2 台が同じビルドで走る (= stable と unstable を分けている前提が消える)。
 
+パス欄は読み込み時に `~` と環境変数を開く (MANUAL の「設定に書くパス」)。台をまたぐ dotfiles に置くので、家からの道は `~` で書く。
+
 ```toml
 # ~/.config/llm-gateway/config-11302-stable.toml
 [server]
@@ -32,7 +34,7 @@ binary_path = "/opt/homebrew/bin/llm-gateway"
 
 # ~/.config/llm-gateway/config-11301-unstable-new.toml
 [server]
-binary_path = "/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/main/target/release/llm-gateway"
+binary_path = "~/.local/share/repos/github.com/kawaz/llm-gateway/main/target/release/llm-gateway"
 ```
 
 ```bash
