@@ -371,8 +371,7 @@ crates/llm-gateway-cli     バイナリ + サブコマンド (serve / auth / sta
 - **案 A: 独立した中間表現 (IR) を定義する**
   - 不採用理由: 入口が Anthropic Messages 1 種類なので N×M 問題が発生しない。IR を挟むと Claude 系で不要な往復変換が生じ、SSE のバイト列中継ができなくなる (レイテンシとメモリで損をする)。入口が増えた時に抜き出せばよい
 - **案 B: Phase 1 から OpenAI 変換も実装する**
-  - 不採用理由: 1,758 行の変換が完成するまで移行を始められない。`AnthropicRelay` は捨て駒ではなく、将来 work 面など別 gateway に
-+    Relay プロバイダは捨て駒ではなく、業務面など別 gateway に転送したい時に同じ実装が使える
+  - 不採用理由: 1,758 行の変換が完成するまで移行を始められない。Relay プロバイダは捨て駒ではなく、業務面など別 gateway に転送したい時に同じ実装が使える
 - **案 C: Bedrock 向けに `anthropic-beta` を丸ごと落とす**
   - 不採用理由: Bedrock が受理する 5 機能 (`context-1m` / `context-management` / `interleaved-thinking` / `structured-outputs` / `claude-code`) まで失う。cpa が束ごと置換して `context-management` を落とし実障害を出した事例がある (llm-notes DR-0001)。**拒否リストで落とす側を最小にする**
 - **案 D: `CredentialStore` を DR-0001 どおり get/set のままにする**
