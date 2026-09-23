@@ -21,21 +21,13 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 - `/ns-personal/v1/messages` → namespace `personal`
 - `/v1/messages` → 既定の namespace (`default`)
 
-`ns-` 接頭辞を付けるのは、namespace 名と API のパス (`/v1/...`) を見分けるため
-(DR-0006)。upstream へ渡すときに namespace の部分は取り除かれるので、upstream は
-namespace を知らない。設定に無い namespace を指すと 404 が返り、本文に設定済みの
-namespace 名が列挙される。
+`ns-` 接頭辞を付けるのは、namespace 名と API のパス (`/v1/...`) を見分けるため (DR-0006)。upstream へ渡すときに namespace の部分は取り除かれるので、upstream は namespace を知らない。設定に無い namespace を指すと 404 が返り、本文に設定済みの namespace 名が列挙される。
 
-認証は namespace ごと。`[ns.<name>]` に `auth_token` を書いた namespace だけが
-`Authorization` ヘッダを検査し、合わなければ 401 (`authentication_error`) を返す。
-`auth_token` を書かない namespace は検査せずに通す — 手前 (tailnet / Caddy) で
-境界を引く運用を前提にしているため。
+認証は namespace ごと。`[ns.<name>]` に `auth_token` を書いた namespace だけが `Authorization` ヘッダを検査し、合わなければ 401 (`authentication_error`) を返す。`auth_token` を書かない namespace は検査せずに通す — 手前 (tailnet / Caddy) で境界を引く運用を前提にしているため。
 
 ## prompt cache 戦略 (`[[ns.<name>.cache]]`)
 
-namespace ごとに、転送する本文の `cache_control` をどう扱うかを書ける
-(DR-0024)。並びは `routing` と同じ「モデル glob + 先勝ち」で、照合するのは
-短い名前を解決した後のモデル名。
+namespace ごとに、転送する本文の `cache_control` をどう扱うかを書ける (DR-0024)。並びは `routing` と同じ「モデル glob + 先勝ち」で、照合するのは短い名前を解決した後のモデル名。
 
 ```toml
 [[ns.personal.cache]]
@@ -73,52 +65,23 @@ sub = "none"
 | 時間 | `"12h"` | そのまま 12 時間。整数 + `h` のみ |
 | 比率 | `0.3` | **分岐時間の 3 割**。0 より大きい実数 (1 以上も可) |
 
-分岐時間 = (1 時間 write の単価 ÷ cache read の単価) × 55 分。送り直し続ける
-費用が cache の作り直し 1 回に追いつく点で、モデルの単価だけで決まる
-(Fable 5.1 なら 80 回ぶん = 73.3 時間、Opus 5.5 なら 40 回ぶん = 36.7 時間、
-Opus 5 なら 20 回ぶん = 18.3 時間)。比率で書くと、単価の違うモデルに同じ判断
-基準を当てられる (`0.3` は Fable 5.1 で 22 時間、Opus 5.5 で 11 時間、Opus 5
-で 5.5 時間)。過去 7 日の実測では **0.2〜0.35** が目安
-(`scripts/keepalive-horizon-sim.py`)。
+分岐時間 = (1 時間 write の単価 ÷ cache read の単価) × 55 分。送り直し続ける費用が cache の作り直し 1 回に追いつく点で、モデルの単価だけで決まる (Fable 5.1 なら 80 回ぶん = 73.3 時間、Opus 5.5 なら 40 回ぶん = 36.7 時間、Opus 5 なら 20 回ぶん = 18.3 時間)。比率で書くと、単価の違うモデルに同じ判断基準を当てられる (`0.3` は Fable 5.1 で 22 時間、Opus 5.5 で 11 時間、Opus 5 で 5.5 時間)。過去 7 日の実測では **0.2〜0.35** が目安 (`scripts/keepalive-horizon-sim.py`)。
 
-単価表に無いモデルでは比率を時間に直せないので、既定の 8 時間に落ちる。
-その組み合わせは起動時のログと `llm-gateway check` が名前を挙げる。
+単価表に無いモデルでは比率を時間に直せないので、既定の 8 時間に落ちる。その組み合わせは起動時のログと `llm-gateway check` が名前を挙げる。
 
-触るのは `cache_control` だけで、ブレークポイントの位置と数は変えない。
-呼び出し元は 4 通りに分かれる。`metadata.user_id` に `parent_session_id` が
-あればサブエージェント (`sub`)。無い場合は `system` 先頭ブロックの請求ヘッダを
-見て、`cc_entrypoint` が `cli` 以外 (`sdk-cli` = `claude -p` 等) なら 1 回きりの
-呼び出し (`oneshot`)、`cli` か請求ヘッダ無しならメイン (`main`)。`metadata` が
-読めない相手 (`unknown`) はメイン扱い。**`sub` 側の戦略に乗るのは `sub` と
-`oneshot`** — どちらも続きが来ないので、続きを当て込んだ扱いをしても報われない。
+触るのは `cache_control` だけで、ブレークポイントの位置と数は変えない。呼び出し元は 4 通りに分かれる。`metadata.user_id` に `parent_session_id` があればサブエージェント (`sub`)。無い場合は `system` 先頭ブロックの請求ヘッダを見て、`cc_entrypoint` が `cli` 以外 (`sdk-cli` = `claude -p` 等) なら 1 回きりの呼び出し (`oneshot`)、`cli` か請求ヘッダ無しならメイン (`main`)。`metadata` が読めない相手 (`unknown`) はメイン扱い。**`sub` 側の戦略に乗るのは `sub` と `oneshot`** — どちらも続きが来ないので、続きを当て込んだ扱いをしても報われない。
 
 ### keepalive の運用
 
-`keepalive` の系列は、最後に転送した 1 本を
-`<stats の置き場>/keepalive/<会話>.<系列>.json` に控え、idle 55 分ごとに
-`max_tokens` だけを 1 にして送り直す。応答は読み捨てる (費用は output 1 トークンと、
-プレフィックス全量の cache read)。控えは再起動で読み戻され、cache の期限か
-`keepalive_horizon` が過ぎた系列は捨てられる (`stats.dir` の既定は
-`~/.local/state/llm-gateway/stats`)。
+`keepalive` の系列は、最後に転送した 1 本を `<stats の置き場>/keepalive/<会話>.<系列>.json` に控え、idle 55 分ごとに `max_tokens` だけを 1 にして送り直す。応答は読み捨てる (費用は output 1 トークンと、プレフィックス全量の cache read)。控えは再起動で読み戻され、cache の期限か `keepalive_horizon` が過ぎた系列は捨てられる (`stats.dir` の既定は `~/.local/state/llm-gateway/stats`)。
 
-控えるのは、道具を持つ本流の 1 本のうち **cache に乗ったもの**だけ。応答の usage が
-「乗らなかった」と答えた系列は控えない・畳む — 繋ぐ cache が無い本文を送り直しても、
-全量入力を払うだけになる。直前に通った先 (namespace / モデル / 経路) が塞がっている
-ときは送らず、55 分後に改めて試す。
+控えるのは、道具を持つ本流の 1 本のうち **cache に乗ったもの**だけ。応答の usage が「乗らなかった」と答えた系列は控えない・畳む — 繋ぐ cache が無い本文を送り直しても、全量入力を払うだけになる。直前に通った先 (namespace / モデル / 経路) が塞がっているときは送らず、55 分後に改めて試す。
 
-**控えるのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグ・暗号化・
-マスキングは持たない — 同じホストにはセッションの transcript が丸ごと置いてあり、
-tap (`?include=request_body`) からも本文は読めるので、ここだけに保護を足しても
-守られるものは増えない。置き場を配る・共有するときは、会話の中身がそのまま
-入っている前提で扱うこと。1 系列 8MB を超える会話は控えず、その系列は延命しない。
+**控えるのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグ・暗号化・マスキングは持たない — 同じホストにはセッションの transcript が丸ごと置いてあり、tap (`?include=request_body`) からも本文は読めるので、ここだけに保護を足しても守られるものは増えない。置き場を配る・共有するときは、会話の中身がそのまま入っている前提で扱うこと。1 系列 8MB を超える会話は控えず、その系列は延命しない。
 
 ### 乗らなかった request の退避
 
-cache に乗らなかった 1 本 (入口で控えなかった / 自送信が `none` で畳んだ) は、
-研究用に `<stats の置き場>/keepalive/uncached/<会話>.<系列>.<送った時刻>.json` へ
-取っておく。中身は控えと同じ形 (本文・ヘッダ・model・route・ns・会話・系列) に、
-判定の材料 — 応答の usage、`cache` の語、応答の status、どこで捨てたか
-(`entry` / `keepalive`) — を添えたもの。
+cache に乗らなかった 1 本 (入口で控えなかった / 自送信が `none` で畳んだ) は、研究用に `<stats の置き場>/keepalive/uncached/<会話>.<系列>.<送った時刻>.json` へ取っておく。中身は控えと同じ形 (本文・ヘッダ・model・route・ns・会話・系列) に、判定の材料 — 応答の usage、`cache` の語、応答の status、どこで捨てたか (`entry` / `keepalive`) — を添えたもの。
 
 ```toml
 [stats]
@@ -126,39 +89,25 @@ uncached_keep = 50   # 新しい順にこの件数まで (既定 50)
 uncached_days = 7    # この日数まで (既定 7)
 ```
 
-新しい順に `uncached_keep` 件、かつ `uncached_days` 日を超えた分は、書くときと
-起動時に捨てる。どちらかを `0` にすると取っておかない (既にあるものも触らない)。
-**ここに載るのも会話の本文そのもの**で、控えと同じく保護策は持たない。
+新しい順に `uncached_keep` 件、かつ `uncached_days` 日を超えた分は、書くときと起動時に捨てる。どちらかを `0` にすると取っておかない (既にあるものも触らない)。**ここに載るのも会話の本文そのもの**で、控えと同じく保護策は持たない。
 
-複数プロセスで同じ置き場を共有してよい。送る直前に系列ごとの `.lock` を掴むので、
-撫でるのは常に 1 台だけになる。起動時に読むのは自分の命名 (`<会話>.<系列>.json`)
-だけで、置き場にある他のファイルは無視する。振り分けは優先度型 (Caddy の
-`lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を推奨。
-round-robin でも正しく動く (控えは共有なので、どちらが撫でても同じ 1 本になる)。
+複数プロセスで同じ置き場を共有してよい。送る直前に系列ごとの `.lock` を掴むので、撫でるのは常に 1 台だけになる。起動時に読むのは自分の命名 (`<会話>.<系列>.json`) だけで、置き場にある他のファイルは無視する。振り分けは優先度型 (Caddy の `lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を推奨。round-robin でも正しく動く (控えは共有なので、どちらが撫でても同じ 1 本になる)。
 
-`POST /llm-gateway/keepalive/pause` にその会話の `session_id` を渡すと、控えを
-落として送り直しを止められる。解除の口は持たない — その会話から実リクエストが
-1 本来れば、そこで控えが置き直される。
+`POST /llm-gateway/keepalive/pause` にその会話の `session_id` を渡すと、控えを落として送り直しを止められる。解除の口は持たない — その会話から実リクエストが 1 本来れば、そこで控えが置き直される。
 
-送り直した 1 本は、転送の知らせ (DR-0012) に `origin: "keepalive"` で並び、
-usage / stats にも通常どおり計上される。
+送り直した 1 本は、転送の知らせ (DR-0012) に `origin: "keepalive"` で並び、usage / stats にも通常どおり計上される。
 
 ## 転送系
 
 ### `POST /{ns}/v1/messages`
 
-Anthropic Messages API へそのまま中継する。応答は本文を溜めずに流すので、
-`"stream": true` の SSE もそのまま通る。
+Anthropic Messages API へそのまま中継する。応答は本文を溜めずに流すので、`"stream": true` の SSE もそのまま通る。
 
 - 認証: namespace の設定に従う
 - リクエスト本文の上限: 64 MiB
-- `model` は namespace の routing に従って経路が選ばれ、必要なら実モデル名へ
-  解決してから upstream に渡す
+- `model` は namespace の routing に従って経路が選ばれ、必要なら実モデル名へ解決してから upstream に渡す
 
-namespace に `thinking_display` が設定されている場合、クライアントが `thinking` を
-明示したリクエストに限り `thinking.display` を上書きする (DR-0016)。`thinking` の
-無いリクエスト、`thinking.type = "disabled"`、`tool_choice` が `any` / `tool`、
-末尾が assistant メッセージ (prefill) のリクエストは一切書き換えない。
+namespace に `thinking_display` が設定されている場合、クライアントが `thinking` を明示したリクエストに限り `thinking.display` を上書きする (DR-0016)。`thinking` の無いリクエスト、`thinking.type = "disabled"`、`tool_choice` が `any` / `tool`、末尾が assistant メッセージ (prefill) のリクエストは一切書き換えない。
 
 ```bash
 curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
@@ -167,8 +116,7 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
   -d '{"model":"opus","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-応答は upstream のものをそのまま返す (`{"type":"message","content":[...]}`)。
-gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を返す。
+応答は upstream のものをそのまま返す (`{"type":"message","content":[...]}`)。gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を返す。
 
 ```json
 {"type": "error", "error": {"type": "invalid_request_error", "message": "..."}}
@@ -186,27 +134,17 @@ gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を�
 
 ### `POST /{ns}/v1/responses`
 
-Responses API を話すクライアント (codex CLI) の受け口 (DR-0025)。本文は
-`model` 欄の alias 解決以外そのままで上流へ渡し、応答も無変換で流す。gateway が
-差し替えるのは認証だけ — クライアントの `Authorization` は落とし、経路の
-credential (`codex_oauth`) の token と `chatgpt-account-id` を載せる。
+Responses API を話すクライアント (codex CLI) の受け口 (DR-0025)。本文は `model` 欄の alias 解決以外そのままで上流へ渡し、応答も無変換で流す。gateway が差し替えるのは認証だけ — クライアントの `Authorization` は落とし、経路の credential (`codex_oauth`) の token と `chatgpt-account-id` を載せる。
 
 - 認証: namespace の設定に従う (クライアントが名乗る token は upstream へ渡らない)
-- 選ばれるのは **Responses API へ出る経路 (`provider = "openai"`) だけ**。その
-  モデルにそういう経路が無ければ 404 (`no route for model ... can carry a
-  responses request`)。同じモデルでも `/v1/messages` からなら通ることがあるので、
-  「モデルが無い」とは別の文言にしてある
-- prompt cache 戦略 (`[[ns.<name>.cache]]`) は当たらない。`cache_control` は
-  Messages 形式の語彙で、この本文には置き場所が無い
+- 選ばれるのは **Responses API へ出る経路 (`provider = "openai"`) だけ**。そのモデルにそういう経路が無ければ 404 (`no route for model ... can carry a responses request`)。同じモデルでも `/v1/messages` からなら通ることがあるので、「モデルが無い」とは別の文言にしてある
+- prompt cache 戦略 (`[[ns.<name>.cache]]`) は当たらない。`cache_control` は Messages 形式の語彙で、この本文には置き場所が無い
 - 知らせ (`/llm-gateway/events`) には `origin: "codex"` で出る
-- 消費は `/llm-gateway/stats` と `/llm-gateway/usage` に、Messages 経由の分と
-  同じように載る
+- 消費は `/llm-gateway/stats` と `/llm-gateway/usage` に、Messages 経由の分と同じように載る
 
 #### codex CLI の設定
 
-`~/.codex/config.toml` (または `CODEX_HOME/config.toml`) にカスタム provider を
-書いて向ける。`env_key` の中身は gateway が捨てるので、**namespace に
-`auth_token` を書いていなければ何でもよい** (書いてあるならその token を入れる)。
+`~/.codex/config.toml` (または `CODEX_HOME/config.toml`) にカスタム provider を書いて向ける。`env_key` の中身は gateway が捨てるので、**namespace に `auth_token` を書いていなければ何でもよい** (書いてあるならその token を入れる)。
 
 ```toml
 model = "gpt-5.6-sol"
@@ -219,15 +157,13 @@ env_key = "LLM_GATEWAY_API_KEY"
 wire_api = "responses"
 ```
 
-provider の名前に `openai` のような組み込み ID は使えない (codex CLI が予約して
-いる)。
+provider の名前に `openai` のような組み込み ID は使えない (codex CLI が予約している)。
 
 ```bash
 LLM_GATEWAY_API_KEY=dummy codex exec -m gpt-5.6-sol --skip-git-repo-check 'hi'
 ```
 
-codex CLI は `Session-Id` ヘッダを送るので、会話と経路の貼り付け (affinity) は
-Messages 経由と同じように効く。
+codex CLI は `Session-Id` ヘッダを送るので、会話と経路の貼り付け (affinity) は Messages 経由と同じように効く。
 
 ### `POST /{ns}/v1/messages/count_tokens`
 
@@ -241,8 +177,7 @@ curl -sS http://127.0.0.1:8402/v1/messages/count_tokens \
 
 ### `GET /{ns}/v1/models`
 
-その namespace から使えるモデルの一覧。クライアントのモデル選択に出る。
-見える内容は namespace の routing 設定によって変わる。
+その namespace から使えるモデルの一覧。クライアントのモデル選択に出る。見える内容は namespace の routing 設定によって変わる。
 
 - 認証: namespace の設定に従う
 
@@ -254,23 +189,17 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/models
 {"object": "list", "data": [{"id": "claude-opus-5", "object": "model", "type": "model"}]}
 ```
 
-`originator` か `User-Agent` で codex を名乗る相手 (codex CLI) には、同じ一覧を
-ChatGPT backend の形 (`{"models": […]}`) で返す。中身は backend の記述そのままで、
-並ぶのはこの namespace が見せるモデルだけ (DR-0025 §7)。
+`originator` か `User-Agent` で codex を名乗る相手 (codex CLI) には、同じ一覧を ChatGPT backend の形 (`{"models": […]}`) で返す。中身は backend の記述そのままで、並ぶのはこの namespace が見せるモデルだけ (DR-0025 §7)。
 
 ## 運用系
 
-`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため
-(DR-0006)。運用系はいずれも認証を持たない。境界は手前で引く。
+`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。運用系はいずれも認証を持たない。境界は手前で引く。
 
-**時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べない
-ので、人が読む形へは受け取った側で直す。名前に単位が入っている欄
-(`window_seconds` / `cache_ttl_secs`) だけが**長さ**で、こちらは秒。
+**時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べないので、人が読む形へは受け取った側で直す。名前に単位が入っている欄 (`window_seconds` / `cache_ttl_secs`) だけが**長さ**で、こちらは秒。
 
 ### `GET /llm-gateway/healthz`
 
-生きているかだけを返す。credential にも upstream にも触らない。前段の
-ロードバランサが数秒ごとに叩く前提。
+生きているかだけを返す。credential にも upstream にも触らない。前段のロードバランサが数秒ごとに叩く前提。
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
@@ -278,9 +207,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 
 ### `GET /llm-gateway/version`
 
-**このプロセスが載せている版**を返す (`{"version": "0.44.0"}`)。ディスクに置かれた
-binary の版ではない。2 つを並べれば「入れ替えたのに上げ直していない」が分かる —
-`llm-gateway version` がやっているのはそれである。
+**このプロセスが載せている版**を返す (`{"version": "0.44.0"}`)。ディスクに置かれた binary の版ではない。2 つを並べれば「入れ替えたのに上げ直していない」が分かる — `llm-gateway version` がやっているのはそれである。
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
@@ -288,16 +215,13 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 
 ### `GET /llm-gateway/usage`
 
-credential ごとの利用状況 (DR-0007)。出すのは使用率・リセット時刻・締め出しの
-状態だけで、token も organization id も出さない。
+credential ごとの利用状況 (DR-0007)。出すのは使用率・リセット時刻・締め出しの状態だけで、token も organization id も出さない。
 
 | パラメータ | 既定 | 意味 |
 | --- | --- | --- |
 | `refresh` | なし | `true` / `1` のときだけ能動プローブに入る |
 
-既定では転送に便乗して読んだ分しか出さない。**usage の確認自体が usage を消費する**
-構図を避けるため。`?refresh=true` を付けると休んでいる credential へ最小の
-リクエストを投げて読み直し、その消費量を `probe` に残す。
+既定では転送に便乗して読んだ分しか出さない。**usage の確認自体が usage を消費する** 構図を避けるため。`?refresh=true` を付けると休んでいる credential へ最小のリクエストを投げて読み直し、その消費量を `probe` に残す。
 
 ```bash
 curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
@@ -328,13 +252,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 }
 ```
 
-`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。
-`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として
-持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`claude_oauth` の
-`auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの
-相対パスが入る。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、
-ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの
-停止はその一例) が `auth.hint` に入る。
+`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`claude_oauth` の `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの相対パスが入る。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの停止はその一例) が `auth.hint` に入る。
 
 ### `GET /llm-gateway/status`
 
@@ -374,23 +292,17 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
 }
 ```
 
-`official` は公式ステータスページ由来、`observed` はこの gateway 自身が転送で
-観測した成否。両方を並べるのは、公式が operational でも実際には通っていない
-(あるいはその逆の) 場面を見分けるため。
+`official` は公式ステータスページ由来、`observed` はこの gateway 自身が転送で観測した成否。両方を並べるのは、公式が operational でも実際には通っていない (あるいはその逆の) 場面を見分けるため。
 
 ### `GET /llm-gateway/stats`
 
-使用量の日次集計 (DR-0011、DR-0029)。日 × credential × モデルのトークン数と、
-単価表がある分の USD 換算を返す。モデルの行には出した側 (`main` / `sub` /
-`oneshot` / `codex` / `keepalive` / `unknown`) ごとの内訳が付く — 行そのものは
-内訳の和。何を書いたかは残していない。
+使用量の日次集計 (DR-0011、DR-0029)。日 × credential × モデルのトークン数と、単価表がある分の USD 換算を返す。モデルの行には出した側 (`main` / `sub` / `oneshot` / `codex` / `keepalive` / `unknown`) ごとの内訳が付く — 行そのものは内訳の和。何を書いたかは残していない。
 
 | パラメータ | 既定 | 意味 |
 | --- | --- | --- |
 | `days` | `7` | 直近 N 日に絞る。`0` で全期間 |
 
-既定を 7 日にするのは、全期間を返すと日が経つほど応答が伸びるため。
-数字として読めない値を渡すと 400 を返す。
+既定を 7 日にするのは、全期間を返すと日が経つほど応答が伸びるため。数字として読めない値を渡すと 400 を返す。
 
 ```bash
 curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
@@ -429,17 +341,13 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 }
 ```
 
-`total_usd` は単価表にあるモデルの分だけを足す。1 行も出せなければ欄ごと省く
-(出ている数字が全体の額に見えないようにするため)。
+`total_usd` は単価表にあるモデルの分だけを足す。1 行も出せなければ欄ごと省く (出ている数字が全体の額に見えないようにするため)。
 
 ### `GET /llm-gateway/events`
 
-転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に
-起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は
-詰まらない (落として先へ進む)。20 秒ごとに keep-alive を送る。
+転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む)。20 秒ごとに keep-alive を送る。
 
-`Access-Control-Allow-Origin: *` を付けているので、ブラウザから直接開いて
-様子を見られる。本文もトークン数も流さない。
+`Access-Control-Allow-Origin: *` を付けているので、ブラウザから直接開いて様子を見られる。本文もトークン数も流さない。
 
 ```bash
 curl -sSN http://127.0.0.1:8402/llm-gateway/events
@@ -450,20 +358,9 @@ event: request
 data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
 
-`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを
-見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側
-(`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、
-gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残す
-プレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は
-送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。
-`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと
-出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が
-並ぶ。
+`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。
 
-`keepalive` 戦略で繋ぐ 1 本には、送り直しの連鎖の姿が付く (繋ぐ対象でなければ
-欄ごと出ない)。控えが置かれるのは応答を読み切った後だが、この欄は**その 1 本目
-から**出る — 見立ては送る時点の値だけで決まるため。cache に乗らずに終わった
-1 本では、直後の `cache_expired` がその約束を取り消す:
+`keepalive` 戦略で繋ぐ 1 本には、送り直しの連鎖の姿が付く (繋ぐ対象でなければ欄ごと出ない)。控えが置かれるのは応答を読み切った後だが、この欄は**その 1 本目から**出る — 見立ては送る時点の値だけで決まるため。cache に乗らずに終わった 1 本では、直後の `cache_expired` がその約束を取り消す:
 
 | 欄 | 意味 |
 |---|---|
@@ -474,10 +371,7 @@ gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 �
 | `cache_until_count` | 連鎖で送る総数 |
 | `cache_breakeven_until` / `cache_breakeven_count` | 損益分岐時間まで繋いだ場合の終わりと本数 (単価が分からないモデルでは出ない) |
 
-`cache_expires_at` が「この 1 本が置いた cache がいつ消えるか」なのに対して、
-`cache_until` は「最後に送る 1 本が置く cache がいつ消えるか」。送り直しは
-55 分刻みで、`keepalive_horizon` を跨いだ 1 本が最後になる。送れなかった場合は
-ここより早く切れるので、見る側は最新の 1 通で上書きする。
+`cache_expires_at` が「この 1 本が置いた cache がいつ消えるか」なのに対して、`cache_until` は「最後に送る 1 本が置く cache がいつ消えるか」。送り直しは 55 分刻みで、`keepalive_horizon` を跨いだ 1 本が最後になる。送れなかった場合はここより早く切れるので、見る側は最新の 1 通で上書きする。
 
 応答本文が閉じたら、終わり方を載せた 2 通目が流れる。
 
@@ -486,47 +380,22 @@ event: response
 data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
-`request_ts` は対応する `request` の `ts` で、同じ会話で何本も走っていても
-1 対 1 に結べる。素性 (`session_id` / `prefix` / `ns` / `model` / `credential` /
-`origin` / `status`) は `request` と同じ値が載る。`stop_reason` は upstream が
-言った終わり方をそのまま写したもの (`end_turn` / `tool_use` / `max_tokens` …)
-で、`end_turn` ならそのクライアントは入力待ちに戻っている。`aborted` は本文が
-最後まで流れなかったか (クライアントが Esc で切った場合がこれ) で、**常に**
-出る。切れた 1 本に終わり方は載らないので、`stop_reason` は欄ごと出ない。
+`request_ts` は対応する `request` の `ts` で、同じ会話で何本も走っていても 1 対 1 に結べる。素性 (`session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status`) は `request` と同じ値が載る。`stop_reason` は upstream が言った終わり方をそのまま写したもの (`end_turn` / `tool_use` / `max_tokens` …) で、`end_turn` ならそのクライアントは入力待ちに戻っている。`aborted` は本文が最後まで流れなかったか (クライアントが Esc で切った場合がこれ) で、**常に** 出る。切れた 1 本に終わり方は載らないので、`stop_reason` は欄ごと出ない。
 
-`cache` は、この 1 本で prompt cache が実際にどう働いたか。`hit` (置いてあった
-cache が効いた) / `written` (繋ぐものが無く全量を書いた) / `partial` (一部が
-効いて残りを書き足した) / `none` (cache を使わなかった) / `unknown` (usage を
-読めなかった) の 1 語で、**常に**出る。`request` の `cache_expires_at` は送る
-前の見込みなので、実際に効いたかはこの語で上書きする。トークン数は載らない。
+`cache` は、この 1 本で prompt cache が実際にどう働いたか。`hit` (置いてあった cache が効いた) / `written` (繋ぐものが無く全量を書いた) / `partial` (一部が効いて残りを書き足した) / `none` (cache を使わなかった) / `unknown` (usage を読めなかった) の 1 語で、**常に**出る。`request` の `cache_expires_at` は送る前の見込みなので、実際に効いたかはこの語で上書きする。トークン数は載らない。
 
-流れるのは**会話の口 (`/v1/messages`) への 1 本だけ**。トークンを数える口
-(`/v1/messages/count_tokens`) は転送ではあっても会話ではないので流れない。
-会話の口へ来た 1 本は、本文が 1 バイトも届かないうちに切られても流れる
-(`aborted: true`)。`stop_reason` にあたる 1 語を持たない方言 (OpenAI) では
-欄ごと出ない。
+流れるのは**会話の口 (`/v1/messages`) への 1 本だけ**。トークンを数える口 (`/v1/messages/count_tokens`) は転送ではあっても会話ではないので流れない。会話の口へ来た 1 本は、本文が 1 バイトも届かないうちに切られても流れる (`aborted: true`)。`stop_reason` にあたる 1 語を持たない方言 (OpenAI) では欄ごと出ない。
 
-寿命を約束した知らせ (`cache_expires_at` を出す `request`) には、その約束の
-名前 `cache_notice` が載る。リクエストごとに新しく振る 22 文字。約束した寿命が果たされずに終わったとき (機械のサスペンドや停止を跨いで cache が
-先に消えたとき) は、その名前を名指しで取り消す 1 通が流れる。
+寿命を約束した知らせ (`cache_expires_at` を出す `request`) には、その約束の名前 `cache_notice` が載る。リクエストごとに新しく振る 22 文字。約束した寿命が果たされずに終わったとき (機械のサスペンドや停止を跨いで cache が先に消えたとき) は、その名前を名指しで取り消す 1 通が流れる。
 
 ```
 event: cache_expired
 data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
 ```
 
-受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚えておき、`of` が
-それと一致したときだけ残りを 0 にする。一致しなければ何もしない — その約束は
-既に新しいもので置き換わっている (同じ系列を複数の gateway が見ていても、
-各 gateway は自分の約束にしか名前を振らないので取り違えない)。控え続ける期間
-(`keepalive_horizon`) が終わっただけでは流れない。継ぎ足すのをやめるだけで、
-最後に送った 1 本が置いた cache は `cache_until` まで生きているため。
+受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚えておき、`of` がそれと一致したときだけ残りを 0 にする。一致しなければ何もしない — その約束は既に新しいもので置き換わっている (同じ系列を複数の gateway が見ていても、各 gateway は自分の約束にしか名前を振らないので取り違えない)。控え続ける期間 (`keepalive_horizon`) が終わっただけでは流れない。継ぎ足すのをやめるだけで、最後に送った 1 本が置いた cache は `cache_until` まで生きているため。
 
-同じ内容を待たずに受け取りたい相手 (別ホストの ccmsg 等) には、`[webhook]` に
-受け口の根を書くと gateway 側から POST で届く。`base_url` (1 つ) と `base_urls`
-(複数) の両方が書け、**書いた全部へ同じ知らせを流す** — どの受け口宛かは
-gateway が選ばない。会話の id は世界で一意なので、受け取った側が自分の知らない
-会話を捨てればよい (DR-0012)。1 つが落ちていても他への配達は止まらない。
+同じ内容を待たずに受け取りたい相手 (別ホストの ccmsg 等) には、`[webhook]` に受け口の根を書くと gateway 側から POST で届く。`base_url` (1 つ) と `base_urls` (複数) の両方が書け、**書いた全部へ同じ知らせを流す** — どの受け口宛かは gateway が選ばない。会話の id は世界で一意なので、受け取った側が自分の知らない会話を捨てればよい (DR-0012)。1 つが落ちていても他への配達は止まらない。
 
 ```toml
 [webhook]
@@ -536,19 +405,16 @@ base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 
 ### `GET /llm-gateway/tap`
 
-転送 1 件ごとの詳細を JSONL (1 行 1 JSON) で流す (DR-0017)。SSE ではないので、
-そのままファイルに落として集計できる。
+転送 1 件ごとの詳細を JSONL (1 行 1 JSON) で流す (DR-0017)。SSE ではないので、そのままファイルに落として集計できる。
 
-**直接 loopback から繋いだ接続だけが使える。** loopback 以外からの接続、および
-`Forwarded` / `X-Forwarded-For` ヘッダが付いた接続は 403 を返す。
+**直接 loopback から繋いだ接続だけが使える。** loopback 以外からの接続、および `Forwarded` / `X-Forwarded-For` ヘッダが付いた接続は 403 を返す。
 
 | パラメータ | 既定 | 意味 |
 | --- | --- | --- |
 | `include` | なし | `request_body` / `response_body` をカンマ区切りで指定 |
 | `max_body` | `65536` | 本文を載せるときの切り詰めバイト数 |
 
-未知の `include` 値・未知のパラメータ名・数値でない `max_body` は 400。
-購読が追いつけなくなった場合、その購読は切断される (古い列へ復帰しない)。
+未知の `include` 値・未知のパラメータ名・数値でない `max_body` は 400。購読が追いつけなくなった場合、その購読は切断される (古い列へ復帰しない)。
 
 ```bash
 curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_body&max_body=4096' \
@@ -559,27 +425,17 @@ curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_b
 {"ts":1785326400000,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
 ```
 
-`origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば
-`cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs` が加わる。
-`include` を指定した購読にだけ `request_body` /
-`response_body` が加わる。
-切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は
-gateway が書き換える前の、クライアントが送ってきた値。
+`origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば `cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs` が加わる。`include` を指定した購読にだけ `request_body` / `response_body` が加わる。切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は gateway が書き換える前の、クライアントが送ってきた値。
 
 ## 再認証 (login)
 
-refresh token が失効したときに、ブラウザから OAuth をやり直す口 (DR-0023)。
-**`claude_oauth` の credential だけ**が対象。`codex_oauth` はページ上で CLI の
-実行を案内する。
+refresh token が失効したときに、ブラウザから OAuth をやり直す口 (DR-0023)。**`claude_oauth` の credential だけ**が対象。`codex_oauth` はページ上で CLI の実行を案内する。
 
-追加の認証は置かない。書けるのは正規の認可を通った token だけで、任意値を
-書き込める口ではない。横取りは state (CSRF) + PKCE + 単回使用 TTL (10 分) で防ぐ。
+追加の認証は置かない。書けるのは正規の認可を通った token だけで、任意値を書き込める口ではない。横取りは state (CSRF) + PKCE + 単回使用 TTL (10 分) で防ぐ。
 
 ### `GET /llm-gateway/login`
 
-設定に書かれた credential を列挙する HTML ページ。`claude_oauth` の行には
-credential 専用ページへの「Log in」リンクだけを表示する。`codex_oauth` の行には
-CLI の実行方法を表示する。
+設定に書かれた credential を列挙する HTML ページ。`claude_oauth` の行には credential 専用ページへの「Log in」リンクだけを表示する。`codex_oauth` の行には CLI の実行方法を表示する。
 
 ```bash
 open http://127.0.0.1:8402/llm-gateway/login
@@ -587,28 +443,22 @@ open http://127.0.0.1:8402/llm-gateway/login
 
 ### `GET /llm-gateway/login/{name}/start`
 
-state と PKCE verifier を作ってメモリに保持し、credential 専用の HTML ページを返す。
-ページには credential 名、別タブで開く Anthropic の認可リンク、短い手順、コード
-貼り付けフォームがある。認可後に Anthropic console が表示する `code#state` をコピーし、
-元のページへ戻って貼り付けて保存する。
+state と PKCE verifier を作ってメモリに保持し、credential 専用の HTML ページを返す。ページには credential 名、別タブで開く Anthropic の認可リンク、短い手順、コード貼り付けフォームがある。認可後に Anthropic console が表示する `code#state` をコピーし、元のページへ戻って貼り付けて保存する。
 
 設定に無い名前は 404、`claude_oauth` 以外の credential は 400 を返す。
 
 ### `POST /llm-gateway/login/{name}`
 
-貼り付け方式の受け口。`application/x-www-form-urlencoded` の `code` フィールドに
-`code#state` (または `#` の無いコード単体) を入れて送る。
+貼り付け方式の受け口。`application/x-www-form-urlencoded` の `code` フィールドに `code#state` (または `#` の無いコード単体) を入れて送る。
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/login/personal \
   --data-urlencode 'code=<code>#<state>'
 ```
 
-成功すると「Credential `<name>` was updated.」を含む HTML を返す。空文字列や
-`#` の片側が欠けた入力、期限切れ・使用済みの state は 400。
+成功すると「Credential `<name>` was updated.」を含む HTML を返す。空文字列や `#` の片側が欠けた入力、期限切れ・使用済みの state は 400。
 
-保存は CLI の login と同じ経路を通る (credential のロックを取り、既存を土台に
-書き戻す)。常駐の refresh 処理と消し合わない。
+保存は CLI の login と同じ経路を通る (credential のロックを取り、既存を土台に書き戻す)。常駐の refresh 処理と消し合わない。
 
 ## CLI コマンド対応表
 
@@ -628,15 +478,11 @@ llm-gateway <command> [options]
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |
 | `version` | 置いてある版と走っている版、食い違っているか | `/llm-gateway/version` |
 
-出力は JSON (追従は JSONL)、エラーは JSON を stderr に出して exit が非 0。help だけは
-テキストで、引数なしでも出る (DR-0028)。
+出力は JSON (追従は JSONL)、エラーは JSON を stderr に出して exit が非 0。help だけはテキストで、引数なしでも出る (DR-0028)。
 
 ### `daemon` — 台の操作
 
-**unit** は設定ファイル 1 つ。名前を付けて登録簿
-(`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`) に置き、以後はその名前で指す。
-unit は設定ファイルのパスと、走らせる binary のパス (`[server] binary_path`、省略時は
-登録した時点の自分自身) を持つ。
+**unit** は設定ファイル 1 つ。名前を付けて登録簿 (`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`) に置き、以後はその名前で指す。unit は設定ファイルのパスと、走らせる binary のパス (`[server] binary_path`、省略時は登録した時点の自分自身) を持つ。
 
 | コマンド | 内容 |
 | --- | --- |
@@ -649,17 +495,11 @@ unit は設定ファイルのパスと、走らせる binary のパス (`[server
 | `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `restarts` / `last_exit`) |
 | `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
 
-`start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ
-`supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が
-分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから
-次へ進む。
+`start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
 
 ### `version` — 置いてある版と走っている版
 
-`--version` はテキスト 1 行で、今叩いた CLI 自身の版を言う。`version` が JSON なのは、
-知りたい版がもう 2 つあって、しかも食い違いうるため: **置いてある版** (`on_disk`、
-binary に `--version` を聞いたもの = 次に上がる版) と **走っている版** (`running`、
-動いているプロセスに聞いたもの = 今処理している版)。
+`--version` はテキスト 1 行で、今叩いた CLI 自身の版を言う。`version` が JSON なのは、知りたい版がもう 2 つあって、しかも食い違いうるため: **置いてある版** (`on_disk`、binary に `--version` を聞いたもの = 次に上がる版) と **走っている版** (`running`、動いているプロセスに聞いたもの = 今処理している版)。
 
 ```bash
 llm-gateway version
@@ -670,17 +510,11 @@ llm-gateway version
            "binary_path":"/opt/homebrew/bin/llm-gateway","restart_needed":true}]}
 ```
 
-`binary_path` は `on_disk` を読んだファイルそのもの。版だけでは「では何を入れ替えれば
-よいのか」に届かない (同じ名前の binary が何箇所にも置かれる)。`restart_needed` が真に
-なるのは、両方が分かって食い違うときだけ。`null` は誰も答え
-られなかったということ (監督者が居ない / binary が消えている / `/llm-gateway/version`
-を持たない古い build が走っている) で、上げ直す理由にはならない。OS に何も登録して
-いなければ `supervisor` は `null`。
+`binary_path` は `on_disk` を読んだファイルそのもの。版だけでは「では何を入れ替えればよいのか」に届かない (同じ名前の binary が何箇所にも置かれる)。`restart_needed` が真になるのは、両方が分かって食い違うときだけ。`null` は誰も答えられなかったということ (監督者が居ない / binary が消えている / `/llm-gateway/version` を持たない古い build が走っている) で、上げ直す理由にはならない。OS に何も登録していなければ `supervisor` は `null`。
 
 ### `service` — OS への常駐登録
 
-OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を抱えるかは登録簿の話で、
-OS は知らない。
+OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を抱えるかは登録簿の話で、OS は知らない。
 
 | コマンド | 内容 |
 | --- | --- |
@@ -690,13 +524,9 @@ OS は知らない。
 | `service status` | 登録の有無・生死・抱えている台 |
 | `service log` | 監督者が書いたものを出す (`--follow` で追う) |
 
-`register --dry-run` は、書く unit ファイルの中身と叩くコマンド列を出すだけで何も
-触らない。Linux 側は書いてあるが未検証 (手元に systemd が無い)。
+`register --dry-run` は、書く unit ファイルの中身と叩くコマンド列を出すだけで何も触らない。Linux 側は書いてあるが未検証 (手元に systemd が無い)。
 
-`register` は何度実行しても同じ姿に落ち着く。同じ unit が既に載っていれば何もせず
-(`changed: false`)、違えば降ろして置き換えて載せ直す (`changed: true`)。焼き込む binary は
-今の自分と同じものを指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway` 等) を選び、
-そこが無ければ今の自分を焼いて `warning` を添える (`--executable <path>` で明示もできる)。
+`register` は何度実行しても同じ姿に落ち着く。同じ unit が既に載っていれば何もせず (`changed: false`)、違えば降ろして置き換えて載せ直す (`changed: true`)。焼き込む binary は今の自分と同じものを指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway` 等) を選び、そこが無ければ今の自分を焼いて `warning` を添える (`--executable <path>` で明示もできる)。
 
 移行手順は [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md) にある。
 

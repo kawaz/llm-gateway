@@ -14,9 +14,7 @@ llm-gateway ── OAuth プール    (Claude サブスク認証を解決)
 
 ## 何をするか
 
-クライアント (Claude Code 等) は `ANTHROPIC_BASE_URL` を設定するだけ。
-サブスク認証ヘッダも Bedrock のキーも gateway が解決してルーティングする。
-`gpt-*` を選んだ時も、裏で OpenAI 系のエンドポイントに繋ぐ。
+クライアント (Claude Code 等) は `ANTHROPIC_BASE_URL` を設定するだけ。サブスク認証ヘッダも Bedrock のキーも gateway が解決してルーティングする。`gpt-*` を選んだ時も、裏で OpenAI 系のエンドポイントに繋ぐ。
 
 構成要素は 4 つ:
 
@@ -27,24 +25,17 @@ llm-gateway ── OAuth プール    (Claude サブスク認証を解決)
 
 ## 何をしないか
 
-**介入は最小限に留める。** ボディはルーティングキーである `model` フィールドだけ
-書き換え、それ以外には触らない。ヘッダは認証情報の生成と、upstream が拒否する
-`anthropic-beta` フラグの除去のみ。
+**介入は最小限に留める。** ボディはルーティングキーである `model` フィールドだけ書き換え、それ以外には触らない。ヘッダは認証情報の生成と、upstream が拒否する `anthropic-beta` フラグの除去のみ。
 
-前身の CLIProxyAPI は Claude Code の偽装 (beta フラグ注入 / cloak /
-device profile) を行い、それが実障害の原因になった。Anthropic 経路では
-サブスク token が偽装なしで通ることを実測済み (DR-0001)。
+前身の CLIProxyAPI は Claude Code の偽装 (beta フラグ注入 / cloak / device profile) を行い、それが実障害の原因になった。Anthropic 経路ではサブスク token が偽装なしで通ることを実測済み (DR-0001)。
 
-429 検知 → cooldown → failover も持たない (実測で発生 0 件)。
-必要になってから足す。
+429 検知 → cooldown → failover も持たない (実測で発生 0 件)。必要になってから足す。
 
 ## ステータス
 
-**稼働中。** 転送 (claude / codex / Bedrock)・運用観測 (usage / stats / upstream status / tap)・
-Web 再認証まで実装済み (詳細は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md))。
+**稼働中。** 転送 (claude / codex / Bedrock)・運用観測 (usage / stats / upstream status / tap)・Web 再認証まで実装済み (詳細は [docs/MANUAL-ja.md](./docs/MANUAL-ja.md))。
 
-常駐は CLI が持つ。設定ファイル 1 つを unit として登録し (`llm-gateway daemon add`)、
-それらを抱える監督者 1 つを OS に載せる (`llm-gateway service register`、DR-0028)。
+常駐は CLI が持つ。設定ファイル 1 つを unit として登録し (`llm-gateway daemon add`)、それらを抱える監督者 1 つを OS に載せる (`llm-gateway service register`、DR-0028)。
 
 ## ドキュメント
 

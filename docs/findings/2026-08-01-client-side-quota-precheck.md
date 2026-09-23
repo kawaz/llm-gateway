@@ -2,16 +2,10 @@
 
 ## 判明した事実
 
-- **Claude Code は、モデル別の枠 (fable の weekly_scoped) が上限だと、リクエストを
-  送らずに打ち切る。** gateway には 1 本も届かない
-- **その判断材料は gateway を通らない。** Claude Code は枠を
-  `GET https://api.anthropic.com/api/oauth/usage` へ**直接**聞いている (2026-08-01、
-  透過プロキシで実測)。`ANTHROPIC_BASE_URL` の向き先には現れない
-- したがって **gateway 側からは介入できない**。枠を書き換えて見せることも、
-  「別の経路が空いている」と伝えることもできない
-- この事前チェックが働くのは **`ANTHROPIC_AUTH_TOKEN` が空** のとき。値が入っていると
-  Claude Code は API キーとして扱い、サブスクの枠を見なくなる (代わりに `/status` の
-  サブスク表示も出なくなる)
+- **Claude Code は、モデル別の枠 (fable の weekly_scoped) が上限だと、リクエストを送らずに打ち切る。** gateway には 1 本も届かない
+- **その判断材料は gateway を通らない。** Claude Code は枠を `GET https://api.anthropic.com/api/oauth/usage` へ**直接**聞いている (2026-08-01、透過プロキシで実測)。`ANTHROPIC_BASE_URL` の向き先には現れない
+- したがって **gateway 側からは介入できない**。枠を書き換えて見せることも、「別の経路が空いている」と伝えることもできない
+- この事前チェックが働くのは **`ANTHROPIC_AUTH_TOKEN` が空** のとき。値が入っていると Claude Code は API キーとして扱い、サブスクの枠を見なくなる (代わりに `/status` のサブスク表示も出なくなる)
 
 ## 実用的な示唆
 
@@ -22,16 +16,13 @@
 | 空 (現在の運用) | **する** (枠上限で送信前に諦める) | 出る |
 | 何か入っている | しない | 出ない |
 
-gateway は受け取った値を捨てて credential のトークンに差し替える (DR-0006) ので、
-入れる値は何でもよい。`/status` を使わない面では、ダミーを入れておくと
-「別 credential や Bedrock が空いているのに fable が使えない」状況を避けられる。
+gateway は受け取った値を捨てて credential のトークンに差し替える (DR-0006) ので、入れる値は何でもよい。`/status` を使わない面では、ダミーを入れておくと「別 credential や Bedrock が空いているのに fable が使えない」状況を避けられる。
 
 ## 検証の詳細
 
 ### 症状 (kawaz 報告)
 
-`ANTHROPIC_AUTH_TOKEN` なしで繋いでいるセッションで、Bedrock 経由の fable が開いて
-いるにもかかわらず、fable を試しすらせず枠判定で止まった。
+`ANTHROPIC_AUTH_TOKEN` なしで繋いでいるセッションで、Bedrock 経由の fable が開いているにもかかわらず、fable を試しすらせず枠判定で止まった。
 
 ### そのときの枠 (2026-08-01 13:30 頃)
 
@@ -49,14 +40,11 @@ gateway は受け取った値を捨てて credential のトークンに差し替
 | 「どの経路も断られています」 | `claude-opus-5` と `claude-sonnet-5` のみ、`routes=3` |
 | 症状が出たセッションからの fable リクエスト | **ログに無い** (届いていない) |
 
-`routes=3` は OAuth 3 枚だけを候補にした判定で、opus / sonnet の routing は Bedrock を
-含まない (fable 専用に絞ってあるため) から正しい。fable の routing は Bedrock を含み、
-実際に Bedrock で通っている。**gateway は fable を止めていない。**
+`routes=3` は OAuth 3 枚だけを候補にした判定で、opus / sonnet の routing は Bedrock を含まない (fable 専用に絞ってあるため) から正しい。fable の routing は Bedrock を含み、実際に Bedrock で通っている。**gateway は fable を止めていない。**
 
 ### 結論
 
-gateway に届いていないリクエストを gateway は止められない。症状は Claude Code 側の
-事前チェックによるもので、その判断は gateway を経由しない直通の問い合わせに基づく。
+gateway に届いていないリクエストを gateway は止められない。症状は Claude Code 側の事前チェックによるもので、その判断は gateway を経由しない直通の問い合わせに基づく。
 
 ## 関連
 

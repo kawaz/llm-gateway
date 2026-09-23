@@ -21,19 +21,13 @@ origin: 自リポ TODO
 
 ## 概要
 
-DR-0027 段階 A の replay の置き場 `<stats.dir>/keepalive/<session>.<prefix>.json` が、合図方式の見張り置き場
-`<stats.dir>/keepalive/127-0-0-1-<port>.json` と同じディレクトリになっている。このため起動時に replay store が
-旧ファイル (合図方式のファイル) を読もうとして `the kept request is unreadable; dropping it` を 4 件 WARN する
-(実測 2026-09-11 00:00 JST、v0.46.0)。削除はしていない (= drop は読み飛ばしであって破壊操作ではない)。
+DR-0027 段階 A の replay の置き場 `<stats.dir>/keepalive/<session>.<prefix>.json` が、合図方式の見張り置き場 `<stats.dir>/keepalive/127-0-0-1-<port>.json` と同じディレクトリになっている。このため起動時に replay store が旧ファイル (合図方式のファイル) を読もうとして `the kept request is unreadable; dropping it` を 4 件 WARN する (実測 2026-09-11 00:00 JST、v0.46.0)。削除はしていない (= drop は読み飛ばしであって破壊操作ではない)。
 
 ## 背景
 
-DR-0027 段階 A で replay store を `<stats.dir>/keepalive/` 配下に追加したが、既存の合図方式の見張りファイルも
-同じディレクトリに置かれていたため、起動スキャン時に両者が混在し、replay store が自分のものでないファイルを
-「壊れた replay ファイル」として誤検出・WARN する状態になっている。
+DR-0027 段階 A で replay store を `<stats.dir>/keepalive/` 配下に追加したが、既存の合図方式の見張りファイルも同じディレクトリに置かれていたため、起動スキャン時に両者が混在し、replay store が自分のものでないファイルを「壊れた replay ファイル」として誤検出・WARN する状態になっている。
 
-方針: replay の置き場を `<stats.dir>/keepalive/replay/` (または `replay/`) のようなサブディレクトリに分け、
-起動スキャンで拾う対象を自分の命名規則 (`<session>.<prefix>.json`) に限定する。
+方針: replay の置き場を `<stats.dir>/keepalive/replay/` (または `replay/`) のようなサブディレクトリに分け、起動スキャンで拾う対象を自分の命名規則 (`<session>.<prefix>.json`) に限定する。
 
 段階 B で合図方式を撤去するタイミングで、旧ファイル (合図方式の見張りファイル) の掃除手順を runbook に記載する。
 

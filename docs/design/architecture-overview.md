@@ -4,9 +4,7 @@
 
 ## 1. 全体像
 
-3 crate 構成。`llm-gateway` がドメインと転送の core、`llm-gateway-server` が
-Anthropic Messages API の HTTP ingress、`llm-gateway-cli` が起動・設定確認・閲覧・
-ログインを担う。
+3 crate 構成。`llm-gateway` がドメインと転送の core、`llm-gateway-server` が Anthropic Messages API の HTTP ingress、`llm-gateway-cli` が起動・設定確認・閲覧・ログインを担う。
 
 ```
 llm-gateway-cli ──────► llm-gateway-server ──────► llm-gateway (core)
@@ -69,8 +67,7 @@ core は provider-neutral な契約と横断機構、provider preset の実装�
 
 ### provider preset の構成
 
-`Preset` は必須の `Auth` / `Wire` / `Metering` と optional capability を束ねる。
-capability が無いことは空実装でなく `Option` で表す。
+`Preset` は必須の `Auth` / `Wire` / `Metering` と optional capability を束ねる。capability が無いことは空実装でなく `Option` で表す。
 
 | trait | 責務 |
 |---|---|
@@ -81,14 +78,9 @@ capability が無いことは空実装でなく `Option` で表す。
 | `Negotiation` | upstream が拒否する request header を除去し、失敗応答から学習する |
 | `ResponseAdmission` | 本文先頭の最初の semantic event まで読み、この経路の応答を採用してよいか判定する (DR-0014 §9) |
 
-`ResponseAdmission` は `Metering` に混ぜない。`Metering` は quota・消費 usage・
-料金の読み取りで、採用可否は転送の成立性という別の関心にあたる。判定結果の
-`Rejected` は `Denial` (混雑なら `Reason::Busy` + `Scope::Model`) と、
-クライアントへ返す `ClientError` (status + Anthropic error type + upstream の
-生 message) を伴える。拒否の分類語彙は provider 内に閉じ、core は知らない。
+`ResponseAdmission` は `Metering` に混ぜない。`Metering` は quota・消費 usage・料金の読み取りで、採用可否は転送の成立性という別の関心にあたる。判定結果の `Rejected` は `Denial` (混雑なら `Reason::Busy` + `Scope::Model`) と、クライアントへ返す `ClientError` (status + Anthropic error type + upstream の生 message) を伴える。拒否の分類語彙は provider 内に閉じ、core は知らない。
 
-`preset::from_spec` だけが設定の `type` と preset の対応を知る。router と gateway は
-provider の顔ぶれではなく、組み上がった `Preset` の capability を使う。
+`preset::from_spec` だけが設定の `type` と preset の対応を知る。router と gateway は provider の顔ぶれではなく、組み上がった `Preset` の capability を使う。
 
 ## 3. リクエスト 1 本のデータフロー
 
@@ -134,12 +126,8 @@ POST /ns-x/v1/messages
 - **本文は byte stream のまま流す**。方言固有の解釈は provider が作る `UsageObserver` に閉じる
 - **core の汎用 module は provider 名を知らない**。`lib.rs` のテストが production code を走査する
 - **route 固有状態は route が持つ**。router は `Availability` だけを受け取る
-- **ingress の書き換えは thinking.display だけ**。`thinking` object を持つ request に
-  限り、`display` を ns の設定値へ上書きする。thinking の無い request、assistant
-  prefill、forced `tool_choice` (`any` / `tool`)、`thinking.type = "disabled"` は
-  触らない (DR-0016)
-- **tap は購読者がいる間だけ動く**。購読数 0 ならシリアライズもしない。接続は
-  loopback 直結 (proxy ヘッダを持たない peer) に限り、本文は query で opt-in する (DR-0017)
+- **ingress の書き換えは thinking.display だけ**。`thinking` object を持つ request に限り、`display` を ns の設定値へ上書きする。thinking の無い request、assistant prefill、forced `tool_choice` (`any` / `tool`)、`thinking.type = "disabled"` は触らない (DR-0016)
+- **tap は購読者がいる間だけ動く**。購読数 0 ならシリアライズもしない。接続は loopback 直結 (proxy ヘッダを持たない peer) に限り、本文は query で opt-in する (DR-0017)
 
 ## 4. 拡張点と責務境界
 
@@ -158,13 +146,9 @@ POST /ns-x/v1/messages
 | `Tap` | ingress の request 受領時と response 終端時 | 購読中だけ動く揮発的な観測口 |
 | `PricingSource` | stats report の生成時 | 集計行を回答 route の単価へ接続する役 |
 
-内部正規形は Messages 形式の `serde_json::Value` で、中立 IR は置かない。
-`Wire` が upstream 方言への変換を担い、`egress` が正規形共通の model 読み書きと
-HTTP の出口手順を担う。
+内部正規形は Messages 形式の `serde_json::Value` で、中立 IR は置かない。`Wire` が upstream 方言への変換を担い、`egress` が正規形共通の model 読み書きと HTTP の出口手順を担う。
 
-集計正規形は `TokenKind(String)` と `BTreeMap<TokenKind, u64>` で拡張可能にする。
-provider が知らない区分も落とさず保持し、料金は `Pricing::rates` に明示された区分だけを
-合計する。親区分と内訳が同居しても、単価表に採らない内訳は二重課金されない。
+集計正規形は `TokenKind(String)` と `BTreeMap<TokenKind, u64>` で拡張可能にする。provider が知らない区分も落とさず保持し、料金は `Pricing::rates` に明示された区分だけを合計する。親区分と内訳が同居しても、単価表に採らない内訳は二重課金されない。
 
 ## 5. 残っている語彙の乱れ
 
@@ -192,8 +176,5 @@ provider が知らない区分も落とさず保持し、料金は `Pricing::rat
 - 残存する §5 の語彙と §6 の乖離を解消する
 - provider 追加時に contract test、preset test、server integration test のどこへ何を書くかを固定する
 - 日次 stats、quota snapshot、event stream、background probe の運用監視と障害時の切り分けを整備する
-- `ResponseAdmission` の採用後 (client へ書き始めた後) に届く error の扱いを決める。
-  現在は fallback できないためそのまま流し、denial も付けない (DR-0014 §9)
-- OpenAI 経路の枠は `Support::Unobserved` で、応答ヘッダからは読めず `QuotaApi`
-  (`wham/usage`) 経由でのみ埋まる。DR-0015 の同格グループ順序が OpenAI credential
-  でも期待どおり働くかを実機で確認する
+- `ResponseAdmission` の採用後 (client へ書き始めた後) に届く error の扱いを決める。現在は fallback できないためそのまま流し、denial も付けない (DR-0014 §9)
+- OpenAI 経路の枠は `Support::Unobserved` で、応答ヘッダからは読めず `QuotaApi` (`wham/usage`) 経由でのみ埋まる。DR-0015 の同格グループ順序が OpenAI credential でも期待どおり働くかを実機で確認する

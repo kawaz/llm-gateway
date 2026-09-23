@@ -21,8 +21,7 @@ origin: 自リポ TODO
 
 ## 概要
 
-origin (main/subagent/classifier 等) 判定に、請求ヘッダ
-`x-anthropic-billing-header` 内の `cc_is_subagent=true` を使う。
+origin (main/subagent/classifier 等) 判定に、請求ヘッダ `x-anthropic-billing-header` 内の `cc_is_subagent=true` を使う。
 
 ## 背景
 
@@ -32,12 +31,9 @@ origin (main/subagent/classifier 等) 判定に、請求ヘッダ
 - main は `…9c1; cc_entrypoint=sdk-cli;`
 - classifier は `…b6e; …`
 
-`-p` 経路では `metadata.user_id` に `parent_session_id` が無いため DR-0024 の sub 判定
-(parent_session_id ベース) が効かず、`oneshot` 規則で sub に落ちているだけだった。
-hex 接尾辞も種別で変わっており、起動ごとのノイズだけではない。
+`-p` 経路では `metadata.user_id` に `parent_session_id` が無いため DR-0024 の sub 判定 (parent_session_id ベース) が効かず、`oneshot` 規則で sub に落ちているだけだった。hex 接尾辞も種別で変わっており、起動ごとのノイズだけではない。
 
-方針案: origin 判定を `cc_is_subagent=true` → sub、を parent_session_id 判定と
-併置する (どちらかが真なら sub)。DR-0024 の判定表に追記が必要。
+方針案: origin 判定を `cc_is_subagent=true` → sub、を parent_session_id 判定と併置する (どちらかが真なら sub)。DR-0024 の判定表に追記が必要。
 
 cc_version の hex 接尾辞の意味は未解明 (未検証として findings に残す)。
 

@@ -1,8 +1,6 @@
 # 走っている 2 台を `service register` 1 本に移す
 
-launchd に直接載っている 2 つの plist を降ろし、`llm-gateway service register` が載せる
-監督者 1 つに移す (DR-0028)。`serve` は消えているので、**この移行を終えるまで plist は
-起動に失敗する**。
+launchd に直接載っている 2 つの plist を降ろし、`llm-gateway service register` が載せる監督者 1 つに移す (DR-0028)。`serve` は消えているので、**この移行を終えるまで plist は起動に失敗する**。
 
 ## 今の姿
 
@@ -11,31 +9,21 @@ launchd に直接載っている 2 つの plist を降ろし、`llm-gateway serv
 | `com.kawaz.llm-gateway-stable` | `/opt/homebrew/bin/llm-gateway` | `~/.config/llm-gateway/config-11302-stable.toml` | `logs/stable.log` / `stable.err.log` |
 | `com.kawaz.llm-gateway-unstable` | `<repo>/main/target/release/llm-gateway` | `~/.config/llm-gateway/config-11301-unstable-new.toml` | `logs/unstable.log` / `unstable.err.log` |
 
-どちらの plist も `<binary> serve --config <path>` を `RunAtLoad` + `KeepAlive` で走らせている。
-Caddy は 11301 を優先し、落ちていれば 11302 に回す。
+どちらの plist も `<binary> serve --config <path>` を `RunAtLoad` + `KeepAlive` で走らせている。Caddy は 11301 を優先し、落ちていれば 11302 に回す。
 
-移った後は、OS に載るのは `jp.kawaz.llm-gateway.supervise` (= `llm-gateway daemon supervise`)
-だけになり、2 台は登録簿 (`~/.local/state/llm-gateway/daemon/units/*.toml`) の中身になる。
+移った後は、OS に載るのは `jp.kawaz.llm-gateway.supervise` (= `llm-gateway daemon supervise`) だけになり、2 台は登録簿 (`~/.local/state/llm-gateway/daemon/units/*.toml`) の中身になる。
 
 ## 移る前に
 
-- **`just ci` が走っていないこと**。`cargo build --release` が
-  `target/release/llm-gateway` を差し替えている最中に 11301 を起こすと起動に失敗する
-  (2026-09-06 の実事故、10 分ダウン)
-- 監督者にする binary は `service register` が自分で選ぶ。今の自分と同じ binary を指す
-  PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそれを焼くので、brew の
-  binary から実行しても repo の build から実行しても、焼かれるのは brew のパスになる。
-  安定な場所が無い (= dev build しかない) ときは警告が出るが、登録は止まらない。
-  明示したいときは `--executable <path>`
-- `~/.config` は dotfiles (`~/.dotfiles`) の working copy。config を触ったら向こうで
-  コミットする
+- **`just ci` が走っていないこと**。`cargo build --release` が `target/release/llm-gateway` を差し替えている最中に 11301 を起こすと起動に失敗する (2026-09-06 の実事故、10 分ダウン)
+- 監督者にする binary は `service register` が自分で選ぶ。今の自分と同じ binary を指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそれを焼くので、brew の binary から実行しても repo の build から実行しても、焼かれるのは brew のパスになる。安定な場所が無い (= dev build しかない) ときは警告が出るが、登録は止まらない。明示したいときは `--executable <path>`
+- `~/.config` は dotfiles (`~/.dotfiles`) の working copy。config を触ったら向こうでコミットする
 
 ## 手順
 
 ### (a) 台ごとの binary を config に書く
 
-登録簿は `[server] binary_path` を正として焼き込む。書かないと登録した時点の自分自身が
-入ってしまい、2 台が同じビルドで走る (= stable と unstable を分けている前提が消える)。
+登録簿は `[server] binary_path` を正として焼き込む。書かないと登録した時点の自分自身が入ってしまい、2 台が同じビルドで走る (= stable と unstable を分けている前提が消える)。
 
 ```toml
 # ~/.config/llm-gateway/config-11302-stable.toml
@@ -54,8 +42,7 @@ llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable-new.toml
 
 ### (b) 2 台を登録簿に足す
 
-名前は config のファイル名から作られる (`config-11302-stable`) が、長いので明示する。
-以後 `stable` / `unstable` がそのまま unit 名になり、ログも `logs/<unit>.log` になる。
+名前は config のファイル名から作られる (`config-11302-stable`) が、長いので明示する。以後 `stable` / `unstable` がそのまま unit 名になり、ログも `logs/<unit>.log` になる。
 
 ```bash
 llm-gateway daemon add --name stable   ~/.config/llm-gateway/config-11302-stable.toml
@@ -63,12 +50,9 @@ llm-gateway daemon add --name unstable ~/.config/llm-gateway/config-11301-unstab
 llm-gateway daemon list
 ```
 
-`list` の各行の `binary_path` が (a) で書いたものになっているか見る。ここが違うまま進むと、
-brew の binary が 11301 を持つ (= 壊れた変更を 11301 に閉じ込める運用が崩れる)。
+`list` の各行の `binary_path` が (a) で書いたものになっているか見る。ここが違うまま進むと、brew の binary が 11301 を持つ (= 壊れた変更を 11301 に閉じ込める運用が崩れる)。
 
-なお新しい `logs/stable.log` は旧 plist の `StandardOutPath` と同じファイルである。
-両方が生きている (c)〜(d) の間は 1 つのファイルに 2 プロセスが書く。追記なので壊れないが、
-読むときは混ざる。
+なお新しい `logs/stable.log` は旧 plist の `StandardOutPath` と同じファイルである。両方が生きている (c)〜(d) の間は 1 つのファイルに 2 プロセスが書く。追記なので壊れないが、読むときは混ざる。
 
 ### (c) 何が起きるかを見る
 
@@ -78,21 +62,16 @@ brew の binary が 11301 を持つ (= 壊れた変更を 11301 に閉じ込め�
 
 見るところ:
 
-- `executable` が `/opt/homebrew/bin/llm-gateway` になっていること。`warning` が付いていたら、
-  焼かれるのは消えうるパス (dev build 等) なので、`--executable` で指すか brew の binary を入れる
+- `executable` が `/opt/homebrew/bin/llm-gateway` になっていること。`warning` が付いていたら、焼かれるのは消えうるパス (dev build 等) なので、`--executable` で指すか brew の binary を入れる
 - `contents` の `ProgramArguments` が `<executable> daemon supervise` の 3 語であること
-- `EnvironmentVariables` に `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が入っていること
-  (OS が起こす監督者は shell を通らないので、これが無いと別の状態ディレクトリを見る)
-- `commands` が `launchctl bootout …` → `launchctl bootstrap gui/<uid> <plist>` の 2 本
-  (載っていなければ bootout は空振りする)
+- `EnvironmentVariables` に `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が入っていること (OS が起こす監督者は shell を通らないので、これが無いと別の状態ディレクトリを見る)
+- `commands` が `launchctl bootout …` → `launchctl bootstrap gui/<uid> <plist>` の 2 本 (載っていなければ bootout は空振りする)
 
-`register` は何度実行しても同じ姿に落ち着く。同じ plist が既に載っていれば何もせず
-`{"changed": false}`、違えば降ろして置き換えて載せ直す (`{"changed": true}`)。
+`register` は何度実行しても同じ姿に落ち着く。同じ plist が既に載っていれば何もせず `{"changed": false}`、違えば降ろして置き換えて載せ直す (`{"changed": true}`)。
 
 ### (d) 1 台ずつ入れ替える
 
-Caddy が 11301 を優先しているので、**先に 11302 (stable) を明け渡す**。どの瞬間も
-どちらか一方は待ち受けている。
+Caddy が 11301 を優先しているので、**先に 11302 (stable) を明け渡す**。どの瞬間もどちらか一方は待ち受けている。
 
 ```bash
 # 1. 旧 stable を降ろす (この間 Caddy は 11301 に流れる)
@@ -132,16 +111,13 @@ rm ~/Library/LaunchAgents/com.kawaz.llm-gateway-unstable.plist
 rm ~/.config/llm-gateway/config.toml   # 待ち受けないダミー (DR-0028 決定 6 で不要になった)
 ```
 
-`config.toml` は `usage` / `stats` / `upstream status` が `--config` 無しで宛先を作るために
-置いてあったもの。今はこれらが登録簿から宛先を引くので要らない。消した後に
-`llm-gateway usage --unit unstable` が答えることを確かめる。
+`config.toml` は `usage` / `stats` / `upstream status` が `--config` 無しで宛先を作るために置いてあったもの。今はこれらが登録簿から宛先を引くので要らない。消した後に `llm-gateway usage --unit unstable` が答えることを確かめる。
 
 dotfiles 側で config の変更 (a) と `config.toml` の削除をコミットする。
 
 ## ログの回転を仕込む (macOS)
 
-監督者は `~/.local/state/llm-gateway/logs/<unit>.log` へ追記するだけで、回転は持たない
-(DR-0028 決定 10)。macOS では newsyslog に任せる。
+監督者は `~/.local/state/llm-gateway/logs/<unit>.log` へ追記するだけで、回転は持たない (DR-0028 決定 10)。macOS では newsyslog に任せる。
 
 ```bash
 # newsyslog は ~ を展開しないので、絶対パスを自分で埋める。
@@ -155,19 +131,13 @@ sudo newsyslog -nv     # 何をするつもりか確かめる (実行はしな�
 - `G` = ファイル名を glob として読む (unit が増えても書き足さなくて済む)
 - `N` = 回転の後にシグナルを送らない (監督者に受け口が無いため。送っても意味がない)
 - `Z` = 回転した世代を gzip する。`size` は KB なので上の例は 5 MB
-- owner を自分にするのは、`/etc/newsyslog.d` 経由の回転が root で走るため。
-  指定しないと新しいファイルが root 所有で作られ、監督者が書けなくなる
+- owner を自分にするのは、`/etc/newsyslog.d` 経由の回転が root で走るため。指定しないと新しいファイルが root 所有で作られ、監督者が書けなくなる
 
-**回転が効くのは次に子を入れ替えた時から。** 監督者は子が終わるまで追記の fd を握るので、
-rename で回転させても書き先は元のファイル (inode) のまま。新しいファイルに移すには
-`llm-gateway daemon restart --all` を打つ。放っておいても壊れはしないが、回転した側の
-ファイルが伸び続ける。
+**回転が効くのは次に子を入れ替えた時から。** 監督者は子が終わるまで追記の fd を握るので、rename で回転させても書き先は元のファイル (inode) のまま。新しいファイルに移すには `llm-gateway daemon restart --all` を打つ。放っておいても壊れはしないが、回転した側のファイルが伸び続ける。
 
 ## 戻し方
 
-`service` を降ろして、旧 plist を載せ直す。`serve` を持つ binary が要るので、
-**移行前の版に戻すか、旧 plist の `ProgramArguments` を
-`daemon run <unit>` に書き換える**かのどちらかになる。
+`service` を降ろして、旧 plist を載せ直す。`serve` を持つ binary が要るので、**移行前の版に戻すか、旧 plist の `ProgramArguments` を `daemon run <unit>` に書き換える**かのどちらかになる。
 
 ```bash
 llm-gateway service unregister          # 監督者を降ろす (子も畳まれる)
@@ -175,15 +145,11 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kawaz.llm-gateway-st
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kawaz.llm-gateway-unstable.plist
 ```
 
-(e) まで進んで plist を消してしまった後なら、`git`/`jj` の履歴ではなく
-`llm-gateway service register --dry-run` の形を参考に書き直すことになる。plist を消すのは
-2 台が新体制で落ち着いてからにする。
+(e) まで進んで plist を消してしまった後なら、`git`/`jj` の履歴ではなく `llm-gateway service register --dry-run` の形を参考に書き直すことになる。plist を消すのは 2 台が新体制で落ち着いてからにする。
 
 登録簿だけを畳みたい場合は `llm-gateway daemon remove <unit>`。
 
 ## 関連
 
 - DR-0028 (`daemon` / `service` の体系)
-- justfile の旧 `install` / `uninstall` / `restart` / `status` / `logs` recipe と
-  `dist/com.kawaz.llm-gateway.plist.in` は削除済み。稼働機の登録・切替は
-  `llm-gateway service register` / `daemon` サブコマンドで行う
+- justfile の旧 `install` / `uninstall` / `restart` / `status` / `logs` recipe と `dist/com.kawaz.llm-gateway.plist.in` は削除済み。稼働機の登録・切替は `llm-gateway service register` / `daemon` サブコマンドで行う

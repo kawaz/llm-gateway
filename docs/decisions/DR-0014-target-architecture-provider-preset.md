@@ -5,29 +5,17 @@
 
 ## Context
 
-codex (ChatGPT OAuth) を relay (cliproxyapi) 経由でなく**ネイティブ対応**する
-ことが決まった。OAuth は gateway が独立してログインし自前で保持する
-(`~/.codex/auth.json` とは並走しない)。
+codex (ChatGPT OAuth) を relay (cliproxyapi) 経由でなく**ネイティブ対応**することが決まった。OAuth は gateway が独立してログインし自前で保持する (`~/.codex/auth.json` とは並走しない)。
 
-これは **provider が初めて複数になる**契機になる。今までは upstream が
-実質 Anthropic 一系統だったため、Anthropic の方言が構造の各所へ水平に
-染み込んでいる。
+これは **provider が初めて複数になる**契機になる。今までは upstream が実質 Anthropic 一系統だったため、Anthropic の方言が構造の各所へ水平に染み込んでいる。
 
-- `backend/anthropic*` が `Provider` trait の実質的な唯一の実装で、Bedrock は
-  その 4 点差し替え (authorize / base_url / beta_policy / adapt) として乗っている
-- 枠ヘッダの読み方 (`usage`)、枠照会 API (`limits`)、本文 usage の形 (`stats`)、
-  beta フラグ学習 (`denied_beta`) は、いずれも **Anthropic 固有の知識**なのに
-  core 側のモジュールとして横に並んでいる
-- per-route の状態 (denial の印・affinity・beta 学習) は core が
-  **route 名の String をキーにした map** で持っている。provider が増えると
-  「どの provider の話か」を文字列から復元することになる
+- `backend/anthropic*` が `Provider` trait の実質的な唯一の実装で、Bedrock はその 4 点差し替え (authorize / base_url / beta_policy / adapt) として乗っている
+- 枠ヘッダの読み方 (`usage`)、枠照会 API (`limits`)、本文 usage の形 (`stats`)、beta フラグ学習 (`denied_beta`) は、いずれも **Anthropic 固有の知識**なのに core 側のモジュールとして横に並んでいる
+- per-route の状態 (denial の印・affinity・beta 学習) は core が **route 名の String をキーにした map** で持っている。provider が増えると「どの provider の話か」を文字列から復元することになる
 
-OpenAI (Responses API) は認証も枠の概念も応答形式も違う。この状態のまま
-2 つ目の provider を足すと、分岐が各モジュールへ散る。
+OpenAI (Responses API) は認証も枠の概念も応答形式も違う。この状態のまま 2 つ目の provider を足すと、分岐が各モジュールへ散る。
 
-語彙も既に乱れている (`docs/design/architecture-overview.md` §5.2)。特に
-**`provider` が二重定義** — backend trait の名前と、DR-0004 が導入する
-「話す API 名」が衝突している (overview §5.2-e)。この裁定は codex 対応の実装前に必須。
+語彙も既に乱れている (`docs/design/architecture-overview.md` §5.2)。特に **`provider` が二重定義** — backend trait の名前と、DR-0004 が導入する「話す API 名」が衝突している (overview §5.2-e)。この裁定は codex 対応の実装前に必須。
 
 境界と IF を先に整理する。骨格の正本は同文書 §7。
 
@@ -43,19 +31,15 @@ OpenAI (Responses API) は認証も枠の概念も応答形式も違う。この
 | **egress** | 出口。正規形を upstream 方言へ変換して送る層。現 `backend/` |
 | **exchange** | 1 転送の生涯を持つ型。観測フック (usage 抽出 / stats tap / 節目記録 / events publish) の掛け先 |
 
-相手方の呼称は既存語彙のまま **`client` / `upstream`** を維持する。
-レイヤの名前と相手方の名前を分ける (「入口」と「入ってくる相手」は別の話)。
+相手方の呼称は既存語彙のまま **`client` / `upstream`** を維持する。レイヤの名前と相手方の名前を分ける (「入口」と「入ってくる相手」は別の話)。
 
 ingress / egress は**場所**の名前であり、**そこに立つ実装が provider** である。
 
-現 module `relay` は「中継」の名前を持ちながら実体は観測専用という乱れが
-あった (overview §5.2-a)。これは **exchange に吸収する** — 1 転送の生涯を持つ型に
-観測フックが掛かる、という形が実体に一致する。
+現 module `relay` は「中継」の名前を持ちながら実体は観測専用という乱れがあった (overview §5.2-a)。これは **exchange に吸収する** — 1 転送の生涯を持つ型に観測フックが掛かる、という形が実体に一致する。
 
 ### 2. provider = 小 trait の束
 
-一枚岩の `Provider` trait を持たない。責務ごとに小 trait へ割り、
-provider はその**束 (preset)** として定義する。
+一枚岩の `Provider` trait を持たない。責務ごとに小 trait へ割り、provider はその**束 (preset)** として定義する。
 
 | trait | 責務 (provider 毎に違う「方言」) |
 |---|---|
@@ -64,31 +48,17 @@ provider はその**束 (preset)** として定義する。
 | `Metering` | 応答からの抽出 — 枠ヘッダ → quota スナップショット、本文 usage → トークン数、拒否シグナル (429 / retry-after) の読み方、単価表 |
 | `QuotaApi` (optional) | 枠照会 API の叩き方 |
 
-**パラメータ変換は `Wire` の変換表に置く。** 例: Anthropic の effort / thinking
-→ OpenAI `reasoning.effort`。対応の無いパラメータの取捨も同じ表に書く。
-変換規則が散らないよう、方言の対応関係は方言変換の担当者が 1 箇所で持つ。
+**パラメータ変換は `Wire` の変換表に置く。** 例: Anthropic の effort / thinking → OpenAI `reasoning.effort`。対応の無いパラメータの取捨も同じ表に書く。変換規則が散らないよう、方言の対応関係は方言変換の担当者が 1 箇所で持つ。
 
-**capability の非対称は optional 取得で表す** (`fn quota_api(&self) -> Option<&dyn QuotaApi>` 的な形)。
-枠照会 API は Anthropic OAuth にはあるが Bedrock には無い。beta フラグ学習の
-ような provider 固有機能も同じ扱いにする。「無い」を空実装やエラーで表さず、
-**型として無い**ことを示す。
+**capability の非対称は optional 取得で表す** (`fn quota_api(&self) -> Option<&dyn QuotaApi>` 的な形)。枠照会 API は Anthropic OAuth にはあるが Bedrock には無い。beta フラグ学習のような provider 固有機能も同じ扱いにする。「無い」を空実装やエラーで表さず、**型として無い**ことを示す。
 
-**小 trait 分割の根拠**は既存実装にある。Bedrock は「認証は SigV4 だが方言は
-Anthropic」— 認証の軸と方言の軸が**直交している実証**であり、DR-0004 の
-2 軸分離と同型である。
+**小 trait 分割の根拠**は既存実装にある。Bedrock は「認証は SigV4 だが方言は Anthropic」— 認証の軸と方言の軸が**直交している実証**であり、DR-0004 の 2 軸分離と同型である。
 
 ### 3. core = IF 規定、provider = impl の preset
 
-- **core が持つのは状態機構の IF 規定**。trait と入出力の契約、共通の状態機械型。
-  denial の印の付け外し、quota スナップショット、metering の抽出結果などの
-  「型と契約」は core が規定する
-- **provider はその IF の provider 毎 impl を preset として束ねて持つ**。
-  per-credential / per-route の状態 (denial の印、quota、beta 学習、枠照会
-  スケジュール) の**所有も provider 側**。router は各 route に
-  「今使えるか?」と聞くだけ (tell-don't-ask)。現在の「core が route 名 String を
-  キーに map を持つ」構造を置き換える
-- **横断機構のみ core が所有する**。ドメインが provider 間比較・全 provider 合流
-  であるものは、定義上 provider の外にある:
+- **core が持つのは状態機構の IF 規定**。trait と入出力の契約、共通の状態機械型。denial の印の付け外し、quota スナップショット、metering の抽出結果などの「型と契約」は core が規定する
+- **provider はその IF の provider 毎 impl を preset として束ねて持つ**。per-credential / per-route の状態 (denial の印、quota、beta 学習、枠照会スケジュール) の**所有も provider 側**。router は各 route に「今使えるか?」と聞くだけ (tell-don't-ask)。現在の「core が route 名 String をキーに map を持つ」構造を置き換える
+- **横断機構のみ core が所有する**。ドメインが provider 間比較・全 provider 合流であるものは、定義上 provider の外にある:
 
 | 横断機構 | core が持つ理由 |
 |---|---|
@@ -98,63 +68,39 @@ Anthropic」— 認証の軸と方言の軸が**直交している実証**であ
 
 #### 判定基準: 「core は provider の名前を 1 つも知らない」
 
-この設計が達成できたかを測る基準を 1 つに定める。**core のコードに
-`claude` / `openai` / `bedrock` といった provider 名が 1 つも現れないこと**。
+この設計が達成できたかを測る基準を 1 つに定める。**core のコードに `claude` / `openai` / `bedrock` といった provider 名が 1 つも現れないこと**。
 
-現れたなら、それは provider 固有の知識が core へ漏れている印であり、
-3 つ目の provider を足すときに同じ場所を再び触ることになる。
+現れたなら、それは provider 固有の知識が core へ漏れている印であり、3 つ目の provider を足すときに同じ場所を再び触ることになる。
 
 ### 4. 集計の正規形も core の IO 規約
 
-**トークン集計・料金集計のレコード形も core が規定する。** provider の
-`Metering` は、自方言の usage を**正規レコードへ写像する**責務を負う。
+**トークン集計・料金集計のレコード形も core が規定する。** provider の `Metering` は、自方言の usage を**正規レコードへ写像する**責務を負う。
 
-現 `stats` は Anthropic 形のトークン区分 (input / output / cache_creation /
-cache_read) を前提にしている。OpenAI は区分が異なる (reasoning tokens /
-cached input 等)。ここを規約化しないと、provider ごとに集計ファイルの形が
-変わり、日次ファイルを 1 本の writer で書く前提 (本 DR §3 の横断機構) が崩れる。
+現 `stats` は Anthropic 形のトークン区分 (input / output / cache_creation / cache_read) を前提にしている。OpenAI は区分が異なる (reasoning tokens / cached input 等)。ここを規約化しないと、provider ごとに集計ファイルの形が変わり、日次ファイルを 1 本の writer で書く前提 (本 DR §3 の横断機構) が崩れる。
 
 | 側 | 持つもの |
 |---|---|
 | core | 正規化済み集計レコード — トークン区分の分類学、集計キー (日 × credential × モデル)、単価適用の形 |
 | provider (`Metering`) | 自方言 usage → 正規レコードへの写像 |
 
-- **トークン区分は `TokenKind(String)` で表す。** core が既知の区分には
-  constructor を用意して綴りを揃えるが、provider 固有の区分も同じ型で保持する。
-  閉じた enum や `other` へ潰さない
-- **1 応答の usage は `BTreeMap<TokenKind, u64>` で持つ。** provider が抽出した
-  区分は対応の有無にかかわらず落とさず記録し、日次集計でも同じ区分ごとに加算する
-- **単価は `BTreeMap<TokenKind, f64>` で、明示した区分だけへ適用する。** usage に
-  親区分とその subset である内訳が同居しても、単価表に載せない内訳は合計へ
-  入らない。重複しない課金軸の選択は provider の `Metering` が単価表を組む時点で行う
-- **単価の違う内訳は、親区分を宣言した上で並べる。** 単価表は「内訳 → 親」の
-  対応 (`Pricing::refines`) を併せ持ち、親は**単価を持つ内訳を引いた残り**だけを
-  負担する。内訳の届かない記録 (内訳を返さない provider、内訳を持たない過去日)
-  では親が全量を負担するので、同じ表が両方を正しく値付けする
-- **親子の宣言は行ごと。** 同じ綴りの区分でも、内数かどうかは upstream で違う。
-  Anthropic の `input` はキャッシュ分を含まないが、OpenAI の `input_tokens` は
-  cached も cache write も含む総数で、両方が `input` の内訳になる。
-  `Metering` が写像の意味を決め、単価表の行がそれに対応する宣言を持つ
+- **トークン区分は `TokenKind(String)` で表す。** core が既知の区分には constructor を用意して綴りを揃えるが、provider 固有の区分も同じ型で保持する。閉じた enum や `other` へ潰さない
+- **1 応答の usage は `BTreeMap<TokenKind, u64>` で持つ。** provider が抽出した区分は対応の有無にかかわらず落とさず記録し、日次集計でも同じ区分ごとに加算する
+- **単価は `BTreeMap<TokenKind, f64>` で、明示した区分だけへ適用する。** usage に親区分とその subset である内訳が同居しても、単価表に載せない内訳は合計へ入らない。重複しない課金軸の選択は provider の `Metering` が単価表を組む時点で行う
+- **単価の違う内訳は、親区分を宣言した上で並べる。** 単価表は「内訳 → 親」の対応 (`Pricing::refines`) を併せ持ち、親は**単価を持つ内訳を引いた残り**だけを負担する。内訳の届かない記録 (内訳を返さない provider、内訳を持たない過去日) では親が全量を負担するので、同じ表が両方を正しく値付けする
+- **親子の宣言は行ごと。** 同じ綴りの区分でも、内数かどうかは upstream で違う。Anthropic の `input` はキャッシュ分を含まないが、OpenAI の `input_tokens` は cached も cache write も含む総数で、両方が `input` の内訳になる。`Metering` が写像の意味を決め、単価表の行がそれに対応する宣言を持つ
 - **USD は読み出し時に換算する。** DR-0011 の日次集計と単価適用の時点を維持する
 
 ### 5. 内部正規形 = Anthropic Messages 形式
 
-中立 IR は**新設しない**。内部正規形は Anthropic Messages 形式とし、
-egress の `Wire` が方言変換を担う。
+中立 IR は**新設しない**。内部正規形は Anthropic Messages 形式とし、egress の `Wire` が方言変換を担う。
 
-理由: クライアントが Claude Code (Anthropic 方言) である。中立 IR を挟むと
-tool use / SSE イベントの対応付け / beta 機能の表現で変換の完全性が沼になり、
-しかも**その苦労は現在の唯一のクライアントには 1 mm も報われない**
-(Anthropic → 中立 → Anthropic の往復が増えるだけ)。
+理由: クライアントが Claude Code (Anthropic 方言) である。中立 IR を挟むと tool use / SSE イベントの対応付け / beta 機能の表現で変換の完全性が沼になり、しかも**その苦労は現在の唯一のクライアントには 1 mm も報われない** (Anthropic → 中立 → Anthropic の往復が増えるだけ)。
 
-将来 OpenAI 方言のクライアントを受ける場合に備え、
-**「ingress アダプタ → 正規形」を足す拡張点だけを型で確保**する。実装はしない。
+将来 OpenAI 方言のクライアントを受ける場合に備え、**「ingress アダプタ → 正規形」を足す拡張点だけを型で確保**する。実装はしない。
 
 ### 6. composite provider (Bedrock)
 
-Bedrock は「独自 Auth + 通訳は他 provider へ委譲」の **composite preset** として
-表現する。DR-0004 が置いた composition provider は、小 trait の束になって初めて
-素直に書ける。
+Bedrock は「独自 Auth + 通訳は他 provider へ委譲」の **composite preset** として表現する。DR-0004 が置いた composition provider は、小 trait の束になって初めて素直に書ける。
 
 ```
 BedrockProvider (preset)
@@ -166,19 +112,15 @@ BedrockProvider (preset)
 └ QuotaApi = None (枠照会 API が無い)
 ```
 
-**trait の切り方の試金石**: 「Anthropic の `Wire` を**書き直さずに** Bedrock が
-再利用できるか」。Gemini 追加のような将来の話を待たず、**手元で今すぐ試せる**
-検証である。書き直しが要るなら trait の切り方が間違っている。
+**trait の切り方の試金石**: 「Anthropic の `Wire` を**書き直さずに** Bedrock が再利用できるか」。Gemini 追加のような将来の話を待たず、**手元で今すぐ試せる** 検証である。書き直しが要るなら trait の切り方が間違っている。
 
 ### 7. codex 対応の実装部品
 
 上記骨格への当てはめ。
 
 1. **ChatGPT OAuth (PKCE + refresh)** → `credential/` の Kind 追加 + OpenAI 用 `Auth` 実装
-2. **Responses API egress** → `Wire` の 2 個目の実装 (Messages → Responses 変換、
-   SSE 逆変換、effort 変換表を含む)
-3. **Metering の OpenAI 実装** → 自方言 usage → 正規集計レコードへの写像
-   (reasoning tokens / cached input 等の区分差)、単価表追加、429 意味論の読み方
+2. **Responses API egress** → `Wire` の 2 個目の実装 (Messages → Responses 変換、SSE 逆変換、effort 変換表を含む)
+3. **Metering の OpenAI 実装** → 自方言 usage → 正規集計レコードへの写像 (reasoning tokens / cached input 等の区分差)、単価表追加、429 意味論の読み方
 4. **QuotaApi** → OpenAI に相当 API があるか要調査。無ければ `None` で denial のみ運用
 
 ### 8. 語彙改名と全滅時 429 の置き場 (kawaz 裁定 2026-08-04, VG-Q1/Q2)
@@ -186,115 +128,57 @@ BedrockProvider (preset)
 - **`usage.rs` (枠ヘッダ観測) → `quota` に改名**。"usage" の語は token usage (stats) に譲る
 - **`limits` (枠照会) も quota 語彙圏へ寄せる** (`quota::poll` 等、細部は実装時に確定)
 - **config type の `relay` (素通し転送先) は現名のまま残す**
-- **全滅時の自前 429 生成は router の責務** (「候補が空」の判断として)。
-  あわせて events にも出すよう直す (overview §6-#8 の乖離を解消)
+- **全滅時の自前 429 生成は router の責務** (「候補が空」の判断として)。あわせて events にも出すよう直す (overview §6-#8 の乖離を解消)
 - overview §5.2 の d / f / g / h / i / j はこの裁定に機械的に追従する (裁定不要)
 
 ### 9. `ResponseAdmission` — 本文先頭を見てからの採用判定 (実装時に追加、2026-08-11)
 
-HTTP status だけでは判定できない失敗がある。OpenAI の Responses API は一時的な
-混雑を **HTTP 200 のまま本文内の SSE `error` event** で返す。status しか見ないと
-「成功」と誤認して次の経路へ回さず、fallback の機会を逃す。
+HTTP status だけでは判定できない失敗がある。OpenAI の Responses API は一時的な混雑を **HTTP 200 のまま本文内の SSE `error` event** で返す。status しか見ないと「成功」と誤認して次の経路へ回さず、fallback の機会を逃す。
 
-- **provider の新しい optional capability として `ResponseAdmission` を追加**。
-  `Metering` には**足さない**。Metering の責務は quota・消費 usage・料金の
-  「読み取り」で、`ResponseAdmission` は「この経路を採用してよいか」という
-  転送成立性の判定。混ぜると、accounting を持たない provider が本文の失敗を
-  判定できないという不自然な依存が生まれる
-- **判定は変換後の最初の semantic event 境界まで**。固定バイト数ではなく
-  event の区切りまで読む (JSON 途中では成否を判定できないため)。上限は
-  `Metering` の SSE 解析と同じ `MAX_EVENT` (256 KiB) を流用し、新しい定数は
-  増やさない
-- **経路切替はクライアントへ 1 バイトも書く前まで**という不変条件 (§3 参照) は
-  変わらない。判定は「まだ何も書いていない」区間だけを対象にする。採用後
-  (= クライアントへ送出を始めた後) に届く error は fallback できないので、
-  そのまま流す。この場合の denial 付与は本 DR ではやらない (「採用前判定」と
-  「採用後監視」を同じ capability に同居させると責務とライフサイクルが崩れる)
-- **拒否の分類は provider 内に閉じる**。混雑 (overloaded) は `Denial` を伴う
-  (`Reason::Busy`, `Scope::Model`, 既存の `DEFAULT_BACKOFF` — DR-0009 の契約を
-  再利用し新定数を増やさない)。分類語彙 (`overloaded_error` 等)
-  は provider の語彙であり、core はこれを知らない
-- **本文内エラーは適切な HTTP status へ写像して返す** (2026-08-12 追加)。
-  元 status が 2xx のまま本文内 error だった denial は、全経路が尽きた時に
-  生透過せず、provider が分類した `ClientError` (status + Anthropic error
-  type + upstream の生 message) を Anthropic 形式の error JSON にして返す
-  (overloaded → 529、rate limit → 429、入力起因 (context 超過等) → 400、
-  判別不能 → 502)。200 のまま透過するとクライアントには「壊れた成功応答」
-  に見え、原因が伝わらない (実測 2026-08-12: context 超過の 200 透過が
-  「empty or malformed response」と誤診された)。元から HTTP エラーの denial
-  は従来どおり status・headers (`retry-after` 含む)・本文を生透過する
-  (DR-0009)。依頼自体の誤り (invalid_request 等) もこの写像に乗せるため
-  Rejected 扱いとなり、結果として fallback を試してから 400 で返る —
-  別経路でも直らない無駄打ちだが、経路数は有界で、写像の一貫性を優先した
-- **時間の上限は設けない**。最初の event を待つ間 upstream が沈黙した場合は、
-  既存の HTTP クライアントの接続/読み取り timeout に委ねる。バイト上限
-  (`MAX_EVENT`) は「異常に大きい先頭 event」に対する保護であり、「応答が
-  遅い」を検知する仕組みではない
+- **provider の新しい optional capability として `ResponseAdmission` を追加**。`Metering` には**足さない**。Metering の責務は quota・消費 usage・料金の「読み取り」で、`ResponseAdmission` は「この経路を採用してよいか」という転送成立性の判定。混ぜると、accounting を持たない provider が本文の失敗を判定できないという不自然な依存が生まれる
+- **判定は変換後の最初の semantic event 境界まで**。固定バイト数ではなく event の区切りまで読む (JSON 途中では成否を判定できないため)。上限は `Metering` の SSE 解析と同じ `MAX_EVENT` (256 KiB) を流用し、新しい定数は増やさない
+- **経路切替はクライアントへ 1 バイトも書く前まで**という不変条件 (§3 参照) は変わらない。判定は「まだ何も書いていない」区間だけを対象にする。採用後 (= クライアントへ送出を始めた後) に届く error は fallback できないので、そのまま流す。この場合の denial 付与は本 DR ではやらない (「採用前判定」と「採用後監視」を同じ capability に同居させると責務とライフサイクルが崩れる)
+- **拒否の分類は provider 内に閉じる**。混雑 (overloaded) は `Denial` を伴う (`Reason::Busy`, `Scope::Model`, 既存の `DEFAULT_BACKOFF` — DR-0009 の契約を再利用し新定数を増やさない)。分類語彙 (`overloaded_error` 等) は provider の語彙であり、core はこれを知らない
+- **本文内エラーは適切な HTTP status へ写像して返す** (2026-08-12 追加)。元 status が 2xx のまま本文内 error だった denial は、全経路が尽きた時に生透過せず、provider が分類した `ClientError` (status + Anthropic error type + upstream の生 message) を Anthropic 形式の error JSON にして返す (overloaded → 529、rate limit → 429、入力起因 (context 超過等) → 400、判別不能 → 502)。200 のまま透過するとクライアントには「壊れた成功応答」に見え、原因が伝わらない (実測 2026-08-12: context 超過の 200 透過が「empty or malformed response」と誤診された)。元から HTTP エラーの denial は従来どおり status・headers (`retry-after` 含む)・本文を生透過する (DR-0009)。依頼自体の誤り (invalid_request 等) もこの写像に乗せるため Rejected 扱いとなり、結果として fallback を試してから 400 で返る — 別経路でも直らない無駄打ちだが、経路数は有界で、写像の一貫性を優先した
+- **時間の上限は設けない**。最初の event を待つ間 upstream が沈黙した場合は、既存の HTTP クライアントの接続/読み取り timeout に委ねる。バイト上限 (`MAX_EVENT`) は「異常に大きい先頭 event」に対する保護であり、「応答が遅い」を検知する仕組みではない
 
 ## Alternatives Considered
 
-**一枚岩の `Provider` trait を維持し、実装を増やす** — Bedrock が既に
-「認証だけ独自、方言は Anthropic」であり、一枚岩だと Anthropic の実装を
-丸ごと写すか継承もどきの委譲を書くことになる。軸が直交している事実を
-型で表せない。
+**一枚岩の `Provider` trait を維持し、実装を増やす** — Bedrock が既に「認証だけ独自、方言は Anthropic」であり、一枚岩だと Anthropic の実装を丸ごと写すか継承もどきの委譲を書くことになる。軸が直交している事実を型で表せない。
 
-**中立 IR を新設する** — 変換の完全性 (tool use / SSE / beta) で沼る。
-現在の唯一のクライアントが Anthropic 方言である以上、往復の変換が増えるだけで
-得るものがない。
+**中立 IR を新設する** — 変換の完全性 (tool use / SSE / beta) で沼る。現在の唯一のクライアントが Anthropic 方言である以上、往復の変換が増えるだけで得るものがない。
 
-**per-route の状態を core が持ち続ける (現状維持)** — provider が増えると
-「この route 名はどの provider か」を文字列から復元する処理が各所に要る。
-状態の所有者と、その状態の意味を知っている者が分かれている。
+**per-route の状態を core が持ち続ける (現状維持)** — provider が増えると「この route 名はどの provider か」を文字列から復元する処理が各所に要る。状態の所有者と、その状態の意味を知っている者が分かれている。
 
-**Bedrock を独立した provider として全部書く** — Anthropic の `Wire` と
-ほぼ同内容の複製ができる。Anthropic 側の変更が Bedrock へ追従しない乖離を生む。
+**Bedrock を独立した provider として全部書く** — Anthropic の `Wire` とほぼ同内容の複製ができる。Anthropic 側の変更が Bedrock へ追従しない乖離を生む。
 
 ## Consequences
 
-- `backend/` は egress へ、module `relay` (観測) は exchange へ移る。overview §5.2 の
-  語彙裁定 (a / e) が構造の変更と同時に消化される
-- `Provider` trait の分解に伴い、`Provider::needs_credential()` の dead code
-  (overview §6-#6) は分解の過程で消える
-- DR-0004 の credential 3 軸 (`type` / `provider` / 範囲) は、この trait 構成の
-  上で意味を持つ。`provider` の値が preset を指し、`type` が `Auth` に渡る
-  payload の形を決める
-- 死蔵メタデータ (StoredCredential の priority / disabled / excluded_models、
-  overview §6-#2) の去就は、状態の所有が provider 側へ移る本再設計の中で決める
-- `stats` の集計レコード形が Anthropic 形の区分から正規形へ変わる。DR-0011 の
-  日次ファイル運用 (writer 毎・日 × credential × モデル) と読み出し時 USD 換算は
-  維持されるが、レコード内のトークン区分の表現は変わる
-- core のテストに provider 名が現れなくなる方向へ寄せる (判定基準の副産物)。
-  provider 固有の振る舞いのテストは provider preset 側へ移る
+- `backend/` は egress へ、module `relay` (観測) は exchange へ移る。overview §5.2 の語彙裁定 (a / e) が構造の変更と同時に消化される
+- `Provider` trait の分解に伴い、`Provider::needs_credential()` の dead code (overview §6-#6) は分解の過程で消える
+- DR-0004 の credential 3 軸 (`type` / `provider` / 範囲) は、この trait 構成の上で意味を持つ。`provider` の値が preset を指し、`type` が `Auth` に渡る payload の形を決める
+- 死蔵メタデータ (StoredCredential の priority / disabled / excluded_models、overview §6-#2) の去就は、状態の所有が provider 側へ移る本再設計の中で決める
+- `stats` の集計レコード形が Anthropic 形の区分から正規形へ変わる。DR-0011 の日次ファイル運用 (writer 毎・日 × credential × モデル) と読み出し時 USD 換算は維持されるが、レコード内のトークン区分の表現は変わる
+- core のテストに provider 名が現れなくなる方向へ寄せる (判定基準の副産物)。provider 固有の振る舞いのテストは provider preset 側へ移る
 
 ### やらないこと
 
 - **中立 IR の新設** — 本 DR §5 のとおり。拡張点を型で確保するに留める
 - **OpenAI 方言 ingress の実装** — 受ける需要が現れてから
-- **effort 変換表の config 化** — `Wire` 内の定数から始める。調整需要が出てから
-  config へ出す
-- **overview §6 の乖離の一括解消** — 8 件のうち本再設計に統合するのは #1 (DR-0004 未着手) と
-  #2 (死蔵メタデータ) のみ。残りは独立に潰せるので、この再設計を待たせない
+- **effort 変換表の config 化** — `Wire` 内の定数から始める。調整需要が出てから config へ出す
+- **overview §6 の乖離の一括解消** — 8 件のうち本再設計に統合するのは #1 (DR-0004 未着手) と #2 (死蔵メタデータ) のみ。残りは独立に潰せるので、この再設計を待たせない
 
 ## 未確定
 
 以下は本 DR では確定させない。実装着手前または着手中に別途裁定する。
 
-- **OpenAI の枠照会 API の実機検証**。静的調査では `GET /backend-api/wham/usage` が
-  存在する (findings 2026-08-04-openai-codex-native-spec)。実アカウントでの応答形式の
-  確認が残る
-- **`provider` と `type` の組み合わせ制約を型で表すか実行時検証にするか**
-  (DR-0004 から持ち越し)
+- **OpenAI の枠照会 API の実機検証**。静的調査では `GET /backend-api/wham/usage` が存在する (findings 2026-08-04-openai-codex-native-spec)。実アカウントでの応答形式の確認が残る
+- **`provider` と `type` の組み合わせ制約を型で表すか実行時検証にするか** (DR-0004 から持ち越し)
 
 ## 関連
 
-- [DR-0004](./DR-0004-credential-axes.md) — credential の 2 軸分離。**本 DR は
-  DR-0004 の 2 軸分離を trait 構成として具体化する** (認証の軸 = `Auth`、
-  話す API の軸 = `Wire` + `Metering`)。DR-0004 の composition provider は
-  本 DR §6 の composite preset として実装形を得る
-- [DR-0002](./DR-0002-component-architecture.md) — OpenAI 変換を Phase 2 に
-  置いた判断。本 DR はその Phase 2 に入る前の境界整理
-- [DR-0003](./DR-0003-beta-flag-negotiation.md) — beta フラグ学習。provider 固有
-  機能の optional 取得の例
-- [DR-0011](./DR-0011-daily-usage-stats.md) — 日次集計。本 DR §4 の正規レコードは
-  この集計キーと単価適用の形を引き継ぐ
+- [DR-0004](./DR-0004-credential-axes.md) — credential の 2 軸分離。**本 DR は DR-0004 の 2 軸分離を trait 構成として具体化する** (認証の軸 = `Auth`、話す API の軸 = `Wire` + `Metering`)。DR-0004 の composition provider は本 DR §6 の composite preset として実装形を得る
+- [DR-0002](./DR-0002-component-architecture.md) — OpenAI 変換を Phase 2 に置いた判断。本 DR はその Phase 2 に入る前の境界整理
+- [DR-0003](./DR-0003-beta-flag-negotiation.md) — beta フラグ学習。provider 固有機能の optional 取得の例
+- [DR-0011](./DR-0011-daily-usage-stats.md) — 日次集計。本 DR §4 の正規レコードはこの集計キーと単価適用の形を引き継ぐ
 - `docs/design/architecture-overview.md` §7 — 本 DR の骨格の正本 (議論の全文)

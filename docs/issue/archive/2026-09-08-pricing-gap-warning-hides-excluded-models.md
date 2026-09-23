@@ -21,19 +21,13 @@ origin: 自リポ TODO
 
 ## 概要
 
-2026-09-08 v0.43.3 起動時に `the price table does not describe this model`
-gap=`gpt-reserve` / `gpt-5.5` / `gpt-5.4-mini` /
-`claude-opus-4-5-20251101` / `claude-sonnet-4-5-20250929` の warning が出る。
-これらは全て `[routes.*] exclude` / `[ns.*.filter] exclude` で隠しており、
-どの namespace からも選択できないモデル。実害はないが起動ログのノイズ。
+2026-09-08 v0.43.3 起動時に `the price table does not describe this model` gap=`gpt-reserve` / `gpt-5.5` / `gpt-5.4-mini` / `claude-opus-4-5-20251101` / `claude-sonnet-4-5-20250929` の warning が出る。これらは全て `[routes.*] exclude` / `[ns.*.filter] exclude` で隠しており、どの namespace からも選択できないモデル。実害はないが起動ログのノイズ。
 
 ## 背景
 
-gap 検査 (router.rs の catalog 更新時) が絞り込み前の catalog を対象にして
-いるため、exclude 済みで到達不能なモデルにも warning が出てしまう。
+gap 検査 (router.rs の catalog 更新時) が絞り込み前の catalog を対象にしているため、exclude 済みで到達不能なモデルにも warning が出てしまう。
 
-方針案: gap 検査の対象を「いずれかの namespace から visible なモデル」に
-限定する (`Namespace::allows` を通したあとの集合で判定)。
+方針案: gap 検査の対象を「いずれかの namespace から visible なモデル」に限定する (`Namespace::allows` を通したあとの集合で判定)。
 
 関連: DR-0026、DR-0014。
 

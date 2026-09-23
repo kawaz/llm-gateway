@@ -14,10 +14,7 @@ llm-gateway ── OAuth pool     (resolves Claude subscription auth)
 
 ## What it does
 
-A client (Claude Code and friends) only sets `ANTHROPIC_BASE_URL`. The gateway
-resolves the subscription auth header or the Bedrock key and routes accordingly.
-When you pick a `gpt-*` model, it connects to an OpenAI-family endpoint behind
-the scenes.
+A client (Claude Code and friends) only sets `ANTHROPIC_BASE_URL`. The gateway resolves the subscription auth header or the Bedrock key and routes accordingly. When you pick a `gpt-*` model, it connects to an OpenAI-family endpoint behind the scenes.
 
 There are four parts:
 
@@ -28,28 +25,17 @@ There are four parts:
 
 ## What it does not do
 
-**Intervention is kept to a minimum.** The body is rewritten only in the `model`
-field, which is the routing key; nothing else is touched. Headers get only the
-generated credentials, plus removal of the `anthropic-beta` flags the upstream
-rejects.
+**Intervention is kept to a minimum.** The body is rewritten only in the `model` field, which is the routing key; nothing else is touched. Headers get only the generated credentials, plus removal of the `anthropic-beta` flags the upstream rejects.
 
-Its predecessor, CLIProxyAPI, impersonated Claude Code (beta flag injection /
-cloak / device profile), and that turned into real breakage. On the Anthropic
-route, subscription tokens have been measured to pass without any impersonation
-(DR-0001).
+Its predecessor, CLIProxyAPI, impersonated Claude Code (beta flag injection / cloak / device profile), and that turned into real breakage. On the Anthropic route, subscription tokens have been measured to pass without any impersonation (DR-0001).
 
-There is no 429 detection → cooldown → failover either (measured: zero
-occurrences). It will be added once it is actually needed.
+There is no 429 detection → cooldown → failover either (measured: zero occurrences). It will be added once it is actually needed.
 
 ## Status
 
-**In service.** Forwarding (claude / codex / Bedrock), operational observation
-(usage / stats / upstream status / tap), and web re-authentication are
-implemented (details in [docs/MANUAL-ja.md](./docs/MANUAL-ja.md), Japanese).
+**In service.** Forwarding (claude / codex / Bedrock), operational observation (usage / stats / upstream status / tap), and web re-authentication are implemented (details in [docs/MANUAL-ja.md](./docs/MANUAL-ja.md), Japanese).
 
-The CLI owns the resident processes. One config file is registered as a unit
-(`llm-gateway daemon add`), and a single supervisor holding those units is put
-on the OS (`llm-gateway service register`, DR-0028).
+The CLI owns the resident processes. One config file is registered as a unit (`llm-gateway daemon add`), and a single supervisor holding those units is put on the OS (`llm-gateway service register`, DR-0028).
 
 ## Documentation
 
@@ -57,8 +43,7 @@ on the OS (`llm-gateway service register`, DR-0028).
 - [docs/decisions/INDEX.md](./docs/decisions/INDEX.md) — decision records (DR, Japanese)
 - [docs/QUESTIONS.md](./docs/QUESTIONS.md) — awaiting a ruling or a confirmation (Japanese)
 
-The measurements and research behind all of this live in **`kawaz/llm-notes`**
-(private), which is the source of truth:
+The measurements and research behind all of this live in **`kawaz/llm-notes`** (private), which is the source of truth:
 
 - `docs/findings/2026-07-27-thin-proxy-poc.md` — the conditions under which writing our own works
 - `docs/findings/2026-07-27-bedrock-api-key-integration.md` — the Bedrock route

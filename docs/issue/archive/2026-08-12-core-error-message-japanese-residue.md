@@ -21,8 +21,7 @@ origin: 自リポ TODO
 
 ## 概要
 
-`crates/llm-gateway/src/{egress,gateway,exchange,discovery,webhook}.rs` に
-`Error::Config` / `Err(format!(...))` 形の日本語 error message が複数残っている。
+`crates/llm-gateway/src/{egress,gateway,exchange,discovery,webhook}.rs` に `Error::Config` / `Err(format!(...))` 形の日本語 error message が複数残っている。
 
 例:
 - `webhook.rs:208` `"{status} が返りました"`
@@ -32,16 +31,11 @@ tracing ログの日本語は対象外 (error message のみ)。
 
 ## 背景
 
-2026-08-12 の CLI 英語化 (issue `2026-07-30-dr-0008-cli-language-mixing`) で
-`main.rs` / `error.rs` / `config.rs` は英語化済み。残りの core crate 側は
-DR-0008 の「触ったついでに直す」運用方針で対応する (一括置換ではなく、
-該当ファイルを触る変更のついでに英語化する)。
+2026-08-12 の CLI 英語化 (issue `2026-07-30-dr-0008-cli-language-mixing`) で `main.rs` / `error.rs` / `config.rs` は英語化済み。残りの core crate 側は DR-0008 の「触ったついでに直す」運用方針で対応する (一括置換ではなく、該当ファイルを触る変更のついでに英語化する)。
 
 ## 受け入れ条件
 
-- [ ] `egress.rs` / `gateway.rs` / `exchange.rs` / `discovery.rs` / `webhook.rs`
-      の `Error::Config` / `Err(format!(...))` 形のユーザ向け error message が
-      すべて英語化されている (tracing ログは対象外)
+- [ ] `egress.rs` / `gateway.rs` / `exchange.rs` / `discovery.rs` / `webhook.rs` の `Error::Config` / `Err(format!(...))` 形のユーザ向け error message がすべて英語化されている (tracing ログは対象外)
 
 ## TODO
 

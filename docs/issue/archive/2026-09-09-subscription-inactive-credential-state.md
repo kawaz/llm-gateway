@@ -21,14 +21,11 @@ origin: 自リポ TODO
 
 ## 概要
 
-サブスク停止中の credential を、現状の「経路固有失敗として毎回そのまま切り替える」扱いから、
-`subscription_inactive` という auth.status の新しい値として識別し、cooldown + 自動復帰 + 表示改善する。
+サブスク停止中の credential を、現状の「経路固有失敗として毎回そのまま切り替える」扱いから、`subscription_inactive` という auth.status の新しい値として識別し、cooldown + 自動復帰 + 表示改善する。
 
 ## 背景
 
-実測 2026-09-09: claude-zunsystem のサブスクを 9/9 に停止したところ、上流が全リクエストに
-`403 permission_error: "OAuth authentication is currently not allowed for this organization."`
-を返す (token の refresh は成功し続ける、quota API は 429)。
+実測 2026-09-09: claude-zunsystem のサブスクを 9/9 に停止したところ、上流が全リクエストに `403 permission_error: "OAuth authentication is currently not allowed for this organization."` を返す (token の refresh は成功し続ける、quota API は 429)。
 
 現状の gateway は 403 を経路固有失敗として毎回 zunsystem に当ててから切り替えるため、以下の問題がある:
 

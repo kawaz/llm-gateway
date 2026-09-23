@@ -62,11 +62,8 @@ kawaz からの依頼 (2026-09-10、claude-rules-personal セッション経由)
 
 ### 裁定完了 (1)
 
-- **L-3**: DR-0027 (keepalive を自送信に置き換える) は kawaz 裁定 (2026-09-10、
-  QUESTIONS KA-Q1 = a) で Accepted、実装着手済み。`keepalive-via-messaging-socket`
-  は discard、`keepalive-daily-counters` は書き換え済み
+- **L-3**: DR-0027 (keepalive を自送信に置き換える) は kawaz 裁定 (2026-09-10、QUESTIONS KA-Q1 = a) で Accepted、実装着手済み。`keepalive-via-messaging-socket` は discard、`keepalive-daily-counters` は書き換え済み
 
 ### レビューの誤り
 
-「DR-0027 の未確定は 9/9 の findings で回答済み」は不成立。残る未確定は
-Bedrock/OpenAI 経路・ファイル上限・sub 既定。
+「DR-0027 の未確定は 9/9 の findings で回答済み」は不成立。残る未確定は Bedrock/OpenAI 経路・ファイル上限・sub 既定。
