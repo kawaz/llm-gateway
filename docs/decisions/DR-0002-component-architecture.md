@@ -64,7 +64,7 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認): `opena
 
 ## Decision
 
-### コンポーネント分割 (kawaz 案 mid=6 を採用)
+### コンポーネント分割 (kawaz 案 2026-07-27 を採用)
 
 ```
                     ┌──────────────────────────────────────────┐
@@ -106,7 +106,7 @@ Bedrock 経由の OpenAI は使えない (実測、2026-07-27 再確認): `opena
 
 ### BackendAdapter は「話す API」で分け、その中をプロバイダで分ける
 
-kawaz 裁定 (mid=15, mid=16):
+kawaz 裁定 (2026-07-27):
 
 > anthropic バックエンドアダプタの亜種で別アダプタという建て付けが良いでしょう。
 > bedrock は一皮ラップしてるだけのバックエンドアダプタ? プロバイダ? でしょ。
@@ -138,7 +138,7 @@ trait AnthropicProvider {
 }
 ```
 
-**差分をパラメータ化しない** (kawaz 裁定 mid=18)。
+**差分をパラメータ化しない** (kawaz 裁定 2026-07-27)。
 
 > パラメータ調整可能にしたとして無限に要求が増える上に使うパラメータの
 > 組み合わせなんてプロバイダごとに 1 個ずつしかないんだから、全ての組み合わせ
@@ -240,7 +240,7 @@ trait Persistence {
 }
 ```
 
-**single-flight は必須** (kawaz mid=7「当たり前にやること」)。cpa も `singleflight.Group` を使っており、`refresh_token_reused` エラーの検出コードを持つ = ローテート方式であることの裏付け。二重リフレッシュは後発が失敗して**全アカウント再ログイン**を招く。
+**single-flight は必須** (kawaz 2026-07-27「当たり前にやること」)。cpa も `singleflight.Group` を使っており、`refresh_token_reused` エラーの検出コードを持つ = ローテート方式であることの裏付け。二重リフレッシュは後発が失敗して**全アカウント再ログイン**を招く。
 
 `Persistence` の v1 実装は `PlainFile` (kawaz 確認 2026-07-27):
 
@@ -306,13 +306,13 @@ Phase 1 の時点で、直近 6 万行のモデル別内訳 (opus-5 2,219 + sonn
 | `check-version-bumped` gate | **無し**。リリースしないので version を進める意味がない |
 | README / DESIGN の英訳ペア | **無し**。日本語のみ (公開・配布しないため) |
 | `.app` bundle | **無し** |
-| **codesign** | **する** (kawaz 裁定 mid=20) |
+| **codesign** | **する** (kawaz 裁定 2026-07-27) |
 | notarize | **無し**。ローカルビルドは quarantine されないので不要 |
 | launchd 登録 | **持つ**。常駐は要る (下記) |
 
 `push = 完了` として扱う (release workflow を持たないリポの標準)。
 
-**バイナリには Apple 署名をする** (kawaz 裁定 mid=20, mid=21)。配布のためではなく、**cache-warden の peer 認証に乗るため**:
+**バイナリには Apple 署名をする** (kawaz 裁定 2026-07-27)。配布のためではなく、**cache-warden の peer 認証に乗るため**:
 
 > cache-warden は get 要求時にソケット通信のプロセスの capability チェック機能を
 > モデル設計になっていて、署名のチーム ID 一致するバイナリからのみ取得可能の

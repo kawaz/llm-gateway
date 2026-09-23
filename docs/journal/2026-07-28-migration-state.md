@@ -41,8 +41,3 @@
 - **DR-0002 / README が discovery・namespace の実装前の記述のまま**
 - **OpenAI 変換 (Phase 2)**。今は gpt を 8320 の cpa へ転送している
 - **Bedrock の fable が `thinking.type: "enabled"` で 400**。クライアントが再試行して通るが 1 往復無駄。`adaptive` なら通ることは確認済み
-
-## 連絡先
-
-- kawaz との 1on1: ccmsg room `r79`
-- canddy (Caddy 担当) との相談: ccmsg room `r80`

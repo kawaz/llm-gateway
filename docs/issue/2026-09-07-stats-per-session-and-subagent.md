@@ -21,7 +21,7 @@ origin: ccmsg
 
 ## 概要
 
-ccmsg 統括からのフラグ (2026-09-07、r279m10、裁定不要の情報共有): subagent のモデル別コストを測ろうとして、gateway の stats が credential × model × 日 の粒度なので「同じ model の effort 違い」「親セッション vs subagent」を分離できない。
+ccmsg 統括からのフラグ (2026-09-07、裁定不要の情報共有): subagent のモデル別コストを測ろうとして、gateway の stats が credential × model × 日 の粒度なので「同じ model の effort 違い」「親セッション vs subagent」を分離できない。
 
 一次資料: claude-ccmsg リポ `docs/research/2026-09-07-eli5-bench/` (7 agent 並列の実験)。
 
