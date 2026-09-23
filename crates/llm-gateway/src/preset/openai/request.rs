@@ -158,7 +158,7 @@ fn user_content(value: &Value, output: &mut Vec<Value>) -> Result<()> {
                 output.push(json!({
                     "type": "function_call_output",
                     "call_id": required_str(&block, "tool_use_id", "tool_result")?,
-                    "output": tool_result_text(block.get("content"))?,
+                    "output": tool_result_output(block.get("content"))?,
                 }));
             }
             Some(other) => {
@@ -242,22 +242,47 @@ fn image_url(block: &Value) -> Result<String> {
     }
 }
 
-fn tool_result_text(value: Option<&Value>) -> Result<String> {
+/// tool_result の中身を `function_call_output.output` にする。
+///
+/// text だけなら文字列にまとめる。画像を含むときだけ、上流が受け付ける
+/// 配列 (`input_text` / `input_image`) にして元の順序のまま渡す。
+fn tool_result_output(value: Option<&Value>) -> Result<Value> {
     match value {
-        None => Ok(String::new()),
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .map(|block| {
-                if block.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(invalid("tool_result may only contain text blocks"));
-                }
-                required_str(block, "text", "tool_result text block").map(str::to_owned)
-            })
-            .collect::<Result<Vec<_>>>()
-            .map(|parts| parts.join("\n")),
+        None => Ok(Value::String(String::new())),
+        Some(Value::String(text)) => Ok(Value::String(text.clone())),
+        Some(Value::Array(blocks)) => {
+            let has_image = blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("image"));
+            let parts = blocks
+                .iter()
+                .map(|block| match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        required_str(block, "text", "tool_result text block").map(str::to_owned)
+                    }
+                    Some("image") => Ok(String::new()),
+                    _ => Err(invalid("tool_result may only contain text or image blocks")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !has_image {
+                return Ok(Value::String(parts.join("\n")));
+            }
+            blocks
+                .iter()
+                .zip(parts)
+                .map(|(block, text)| {
+                    Ok(match block.get("type").and_then(Value::as_str) {
+                        Some("image") => {
+                            json!({"type": "input_image", "image_url": image_url(block)?})
+                        }
+                        _ => json!({"type": "input_text", "text": text}),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Value::Array)
+        }
         Some(_) => Err(invalid(
-            "tool_result content must be a string or an array of text blocks",
+            "tool_result content must be a string or an array of text or image blocks",
         )),
     }
 }
@@ -420,7 +445,7 @@ mod tests {
     fn rejects_structurally_untranslatable_blocks() {
         for body in [
             json!({"model":"m","system":[{"type":"image"}],"messages":[]}),
-            json!({"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"image"}]}]}]}),
+            json!({"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"document"}]}]}]}),
             json!({"model":"m","messages":[],"tools":[{"name":"web_search"}]}),
         ] {
             assert!(matches!(
@@ -428,6 +453,53 @@ mod tests {
                 Err(Error::UntranslatableRequest(_))
             ));
         }
+    }
+
+    /// 画像を含む tool_result は、元の順序のまま配列の output になる。
+    #[test]
+    fn tool_result_with_an_image_becomes_an_array_output() {
+        let body = convert(json!({"model":"m","messages":[{"role":"user","content":[{
+        "type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"text","text":"before"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},
+            {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},
+            {"type":"text","text":"after"}
+        ]}]}]}))
+        .unwrap();
+        assert_eq!(
+            body["input"][0],
+            json!({"type":"function_call_output","call_id":"call-1","output":[
+                {"type":"input_text","text":"before"},
+                {"type":"input_image","image_url":"data:image/png;base64,AAAA"},
+                {"type":"input_image","image_url":"https://example.com/a.png"},
+                {"type":"input_text","text":"after"}
+            ]})
+        );
+    }
+
+    /// text だけの tool_result は文字列の output のまま。
+    #[test]
+    fn tool_result_with_only_text_stays_a_string_output() {
+        let body = convert(json!({"model":"m","messages":[{"role":"user","content":[{
+        "type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"text","text":"a"},{"type":"text","text":"b"}
+        ]}]}]}))
+        .unwrap();
+        assert_eq!(body["input"][0]["output"], json!("a\nb"));
+    }
+
+    /// text でも image でもないブロックは偽装せずに断る。
+    #[test]
+    fn tool_result_with_a_document_is_refused() {
+        let error = convert(json!({"model":"m","messages":[{"role":"user","content":[{
+        "type":"tool_result","tool_use_id":"call-1","content":[
+            {"type":"document","source":{"type":"text","data":"x"}}
+        ]}]}]}))
+        .unwrap_err();
+        assert!(
+            matches!(&error, Error::UntranslatableRequest(m) if m.contains("text or image")),
+            "{error:?}"
+        );
     }
 
     /// thinking budget の境界は low / medium / high の変換表どおり。

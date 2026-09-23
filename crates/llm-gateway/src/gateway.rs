@@ -6944,7 +6944,7 @@ routes = ["first", "second"]
                     "messages": [{"role": "user", "content": [{
                         "type": "tool_result",
                         "tool_use_id": "x",
-                        "content": [{"type": "image"}],
+                        "content": [{"type": "document"}],
                     }]}],
                 }),
                 vec![],

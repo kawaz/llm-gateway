@@ -143,7 +143,7 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
 | --- | --- | --- |
 | namespace のトークン不一致 | 401 | `authentication_error` |
 | 本文が読めない / JSON でない | 400 | `invalid_request_error` |
-| 本文を経路の形式へ変換できない (例: OpenAI 経路で `tool_result` に画像がある) | 400 | `invalid_request_error` |
+| 本文を経路の形式へ変換できない (例: OpenAI 経路で `tool_result` に `document` ブロックがある) | 400 | `invalid_request_error` |
 | 未知の namespace | 404 | `invalid_request_error` |
 | モデルがどの経路にも無い | 404 | `not_found_error` |
 | 全経路が失敗 / upstream に届かない | 503 | `api_error` |

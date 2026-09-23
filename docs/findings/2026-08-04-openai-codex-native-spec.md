@@ -32,6 +32,7 @@
 | assistant `text` | assistant message の `output_text` |
 | assistant `tool_use` | `function_call` (`id`, `call_id`, `name`, JSON文字列 `arguments`) |
 | user `tool_result` | `function_call_output` (`call_id`, string `output`) |
+| user `tool_result` (content に image を含む) | `function_call_output` の `output` を配列にする (text → `input_text`、image → `input_image`、順序は元のまま) |
 | `tools[].input_schema` | function tool の `parameters` |
 | `tool_choice: auto` | `auto` |
 | `tool_choice: any` | `required` |
