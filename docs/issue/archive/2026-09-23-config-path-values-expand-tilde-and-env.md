@@ -1,6 +1,6 @@
 ---
 title: config のパス値で `~` と環境変数を展開する
-status: open
+status: resolved
 category: task
 created: 2026-09-23T16:48:56+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-23T17:08:26+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented: v0.50.0 で展開を実装", "done: 稼働 config (dotfiles) の binary_path を ~ 表記へ直し、unstable を 0.50.0 で再起動・疎通確認済み", "done: runbook 側に絶対パスは残っていない"]
 blocked_by:
 origin: 自リポ TODO
 ---
