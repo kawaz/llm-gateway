@@ -342,7 +342,7 @@ fn required_str<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a 
 }
 
 fn invalid(message: impl Into<String>) -> Error {
-    Error::Config(message.into())
+    Error::UntranslatableRequest(message.into())
 }
 
 #[cfg(test)]
@@ -423,7 +423,10 @@ mod tests {
             json!({"model":"m","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":[{"type":"image"}]}]}]}),
             json!({"model":"m","messages":[],"tools":[{"name":"web_search"}]}),
         ] {
-            assert!(convert(body).is_err());
+            assert!(matches!(
+                convert(body),
+                Err(Error::UntranslatableRequest(_))
+            ));
         }
     }
 

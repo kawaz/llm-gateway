@@ -546,6 +546,7 @@ impl<P: Persistence> Gateway<P> {
         )> = None;
         for route in &routes {
             match self.try_route(route, &call, &headers, &skipped).await {
+                Err(Failure::Refuse(error)) => return Err(error),
                 Ok(Attempt {
                     response: resp,
                     completion,
@@ -594,11 +595,11 @@ impl<P: Persistence> Gateway<P> {
                         completion,
                     });
                 }
-                Err(Switch {
+                Err(Failure::Switch(Switch {
                     reason,
                     denial,
                     client_error,
-                }) => {
+                })) => {
                     warn!(model = %model, route = route.name(), %reason, "switching routes");
                     attempts.push(UpstreamAttempt {
                         provider: route.name().to_owned(),
@@ -702,22 +703,23 @@ impl<P: Persistence> Gateway<P> {
 
     /// 1 経路を試す。切り替える価値のある失敗なら理由を返す。
     ///
-    /// 戻り値の `Err` は「次を試してよい」という意味で、呼び出し側へ
-    /// そのまま返すべきエラーではない。切り替えても直らない失敗
-    /// (リクエストが不正) は `Ok` の応答として返し、クライアントに伝える。
+    /// [`Failure::Switch`] は「次を試してよい」という意味で、呼び出し側へ
+    /// そのまま返すべきエラーではない。切り替えても直らない失敗のうち、
+    /// upstream が断ったもの (リクエストが不正) は `Ok` の応答として返し、
+    /// 送る前に本文を変換できなかったものは [`Failure::Refuse`] で返す。
     async fn try_route(
         &self,
         route: &Arc<Route>,
         call: &Call<'_>,
         headers: &[(String, String)],
         skipped: &[events::Skipped],
-    ) -> std::result::Result<Attempt, Switch> {
+    ) -> std::result::Result<Attempt, Failure> {
         let credential = match &route.credential {
             Some(id) => match self.credentials.acquire(id).await {
                 Ok(c) => Some(c),
                 // 認証情報を用意できないなら、この経路は使えない。
                 // 他の経路は別の認証情報を使うので、試す価値がある。
-                Err(e) => return Err(Switch::to_next(e.to_string())),
+                Err(e) => return Err(Switch::to_next(e.to_string()).into()),
             },
             None => None,
         };
@@ -746,10 +748,10 @@ impl<P: Persistence> Gateway<P> {
 
         // 交渉するものを載せていないなら、失敗の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
-            return Attempt::of(resp, completion);
+            return Ok(Attempt::of(resp, completion)?);
         }
         let Some(negotiation) = negotiation else {
-            return Attempt::of(resp, completion);
+            return Ok(Attempt::of(resp, completion)?);
         };
 
         let (resp, raw) = egress::buffer(resp)
@@ -757,7 +759,7 @@ impl<P: Persistence> Gateway<P> {
             .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
         let Some(blamed) = negotiation.blame(&raw, &sent) else {
-            return Attempt::of(resp, completion);
+            return Ok(Attempt::of(resp, completion)?);
         };
 
         warn!(
@@ -785,7 +787,7 @@ impl<P: Persistence> Gateway<P> {
         let resp = self
             .admit(route, call.model, sent_response.response)
             .await?;
-        Attempt::of(resp, sent_response.completion)
+        Ok(Attempt::of(resp, sent_response.completion)?)
     }
 
     async fn admit(
@@ -1069,7 +1071,7 @@ impl<P: Persistence> Gateway<P> {
         credential: Option<&Credential>,
         headers: Headers,
         skipped: &[events::Skipped],
-    ) -> std::result::Result<Sent, Switch> {
+    ) -> std::result::Result<Sent, Failure> {
         // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
         // 送る。何という名前で受け付けるかは discovery が答えている。
         let mut body = call.body.clone();
@@ -1127,11 +1129,14 @@ impl<P: Persistence> Gateway<P> {
         .await
         {
             Ok(response) => response,
+            // 本文を変換できないなら、どの経路へ送っても同じ結果になる。
+            // 経路の不調ではないので、数えずにそのまま返す。
+            Err(error @ Error::UntranslatableRequest(_)) => return Err(Failure::Refuse(error)),
             Err(error) => {
                 self.status
                     .observe_failure(route.name(), "transport", None)
                     .await;
-                return Err(Switch::to_next(error.to_string()));
+                return Err(Switch::to_next(error.to_string()).into());
             }
         };
 
@@ -1895,6 +1900,19 @@ impl Switch {
             denial: None,
             client_error: None,
         }
+    }
+}
+
+/// 1 経路を試して失敗したとき、次の経路へ進むか、ここで打ち切るか。
+enum Failure {
+    Switch(Switch),
+    /// 本文そのものの問題。どの経路でも同じ結果なので、呼び出し元へ返す。
+    Refuse(Error),
+}
+
+impl From<Switch> for Failure {
+    fn from(switch: Switch) -> Self {
+        Self::Switch(switch)
     }
 }
 
@@ -6871,6 +6889,91 @@ routes = ["spare"]
             "nothing is sent to a route that cannot carry it"
         );
         assert!(error.to_string().contains("responses"), "{error}");
+    }
+
+    /// 本文を経路の形式へ変換できないなら、次の経路は試さず、経路の不調とも数えない。
+    ///
+    /// 同じ本文はどの経路へ送っても同じところで変換に失敗する。切り替えると
+    /// 全経路で同じ失敗を重ねて「全経路に届かなかった」に化け、本文の問題だと
+    /// 読めなくなる。
+    #[tokio::test]
+    async fn an_untranslatable_request_is_returned_without_switching_routes() {
+        let first = responses_upstream().await;
+        let second = responses_upstream().await;
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.first]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["m"]
+
+[routes.second]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["m"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["first", "second"]
+"#,
+                first.url, second.url
+            ),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let error = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                json!({
+                    "model": "m",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "x",
+                        "content": [{"type": "image"}],
+                    }]}],
+                }),
+                vec![],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, Error::UntranslatableRequest(_)),
+            "{error:?}"
+        );
+        for upstream in [&first, &second] {
+            assert!(
+                !upstream
+                    .requests()
+                    .iter()
+                    .any(|req| req.starts_with("POST ")),
+                "nothing is forwarded"
+            );
+        }
+        let report = gw.status_report(false).await;
+        for service in &report.services {
+            assert_ne!(
+                service.observed.state,
+                crate::status::ObservedState::Failing,
+                "{} is not blamed for the request body",
+                service.name
+            );
+        }
     }
 
     /// Responses 形式の 1 本は `origin: "codex"` として流れ、cache 戦略を持たない。

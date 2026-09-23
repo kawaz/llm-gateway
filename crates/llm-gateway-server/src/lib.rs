@@ -935,7 +935,9 @@ fn error_response(ns: &str, e: &Error) -> Response {
         Error::Credential { .. } | Error::Refresh { .. } => {
             (StatusCode::UNAUTHORIZED, "authentication_error")
         }
-        Error::Config(_) | Error::Json(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        Error::Config(_) | Error::Json(_) | Error::UntranslatableRequest(_) => {
+            (StatusCode::BAD_REQUEST, "invalid_request_error")
+        }
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
     };
 
@@ -3461,6 +3463,24 @@ type = "codex_oauth"
             body.contains("llm-gateway login --type codex_oauth local"),
             "{body}"
         );
+    }
+
+    /// 変換できない本文は、設定の問題ではなくリクエストの問題として 400 で返す。
+    #[tokio::test]
+    async fn an_untranslatable_request_is_refused_as_invalid() {
+        let response = error_response(
+            "default",
+            &Error::UntranslatableRequest("tool_result may only contain text blocks".to_owned()),
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_str(&response_body(response).await).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("tool_result may only contain text blocks"),
+            "{message}"
+        );
+        assert!(!message.contains("configuration"), "{message}");
     }
 
     async fn response_body(response: Response) -> String {

@@ -27,6 +27,12 @@ pub enum Error {
     #[error("no route for model `{model}` can carry a `{shape}` request")]
     UnsupportedRequestShape { model: String, shape: &'static str },
 
+    /// 経路の形式へ本文を変換できない (本文側の問題)。
+    ///
+    /// 同じ本文なら他の経路でも結果は変わらないので、経路は切り替えない。
+    #[error("could not translate the request for this route: {0}")]
+    UntranslatableRequest(String),
+
     /// 経路はあるが、全て試して届かなかった。
     #[error("all routes for model `{model}` failed ({} attempts)", attempts.len())]
     AllUpstreamsFailed {
