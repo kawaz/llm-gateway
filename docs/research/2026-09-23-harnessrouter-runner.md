@@ -162,3 +162,5 @@
 - `codex exec` と `codex app-server` で codex が upstream へ出る入口が違うかは未検証 (llm-gateway の origin `unknown` issue の観測軸候補)。
 - `docs/support-matrix.md` の各行が何日・どの版で測られたかは本文から読み取れず、`docs/support-matrix-notes.md` / `docs/support-matrix-results.json` は精読していない。
 - harnessrouter の codex app-server 経路で使う JSON-RPC の method 名は runner のコードから読んだもので、codex の公開仕様との突き合わせはしていない。
+- 特に §2.2 / §2.3 は ccmsg の codex queue が stdio を全部 ignore にして pipe を持たず、launcher が SIGTERM → 500ms → SIGKILL と reader の cancel を既に行っているため前提が当てはまらず、プロセスグループ kill は launcher が立てた当のセッションを殺すので逆効果。後始末の懸念が当てはまるのは translate helper (常駐、stdin pipe を閉じず SIGTERM のみ)。
+- ccmsg 側の実コード照合 (2026-09-24): ccmsg 統括が本ファイルの ccmsg 向け所見を実コードと突き合わせた評価を、ccmsg リポの docs/issue/2026-09-24-harnessrouter-research-review-for-ccmsg.md に記録している。前提がずれていた所見と、本研究が拾えていなかった取り込み候補 (transcript の stop_reason の max_tokens / refusal を ccmsg が表示していない件) はそちらが正本。

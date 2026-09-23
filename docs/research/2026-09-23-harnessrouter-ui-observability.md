@@ -107,3 +107,4 @@
 - harnessrouter の通知 (ヘッダの notifications) の中身と、失敗時にユーザへどう知らせるか。設計文書が見当たらず、コードも追っていない。
 - harnessrouter の Traces 画面が進行中セッションを live で更新するか (bus を購読しているか)。`ui/src/studio/traces/api.js` と `store.js` は読んでいない。
 - harnessrouter の UI は起動しておらず、見た目・操作感は未確認。
+- ccmsg 側の実コード照合 (2026-09-24): ccmsg 統括が本ファイルの ccmsg 向け所見を実コードと突き合わせた評価を、ccmsg リポの docs/issue/2026-09-24-harnessrouter-research-review-for-ccmsg.md に記録している。前提がずれていた所見と、本研究が拾えていなかった取り込み候補 (transcript の stop_reason の max_tokens / refusal を ccmsg が表示していない件) はそちらが正本。

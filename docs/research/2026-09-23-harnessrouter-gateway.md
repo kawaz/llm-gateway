@@ -140,3 +140,4 @@
 - llm-gateway の転送 timeout が総時間か無活動か、クライアント切断時に upstream 接続をどう畳むか (2.6)。
 - DR-0030 の「未確定」節で ns 認証方式 (JWT 等) がどこまで決まっているか (2.2 の比較材料として)。本調査では Decision §1–4 冒頭までしか読んでいない。
 - ccmsg の契約に capability 宣言が存在するか (3.1)。
+- ccmsg 側の実コード照合 (2026-09-24): ccmsg 統括が本ファイルの ccmsg 向け所見を実コードと突き合わせた評価を、ccmsg リポの docs/issue/2026-09-24-harnessrouter-research-review-for-ccmsg.md に記録している。前提がずれていた所見と、本研究が拾えていなかった取り込み候補 (transcript の stop_reason の max_tokens / refusal を ccmsg が表示していない件) はそちらが正本。

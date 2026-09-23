@@ -137,3 +137,4 @@
 - llm-gateway の GitHub Release 本文の作り方 (CHANGELOG 代替になっているか)
 - ccmsg の Claude Code plugin 配布は、依頼文にあった `.claude-plugin/` がリポ直下に無かった。README によれば `ccmsg plugin install claude` で CLI が plugin を配る方式で、npm (trusted publishing / OIDC、`.github/workflows/publish.yml`) で本体を配布している。plugin 同梱物の置き場 (src 配下か) は未確認
 - llm-gateway には docs 標準が定める `docs/DESIGN.md` が無く、`docs/design/architecture-overview.md` がその役を担っているように見える (標準との差分。意図的かは未確認)
+- ccmsg 側の実コード照合 (2026-09-24): ccmsg 統括が本ファイルの ccmsg 向け所見を実コードと突き合わせた評価を、ccmsg リポの docs/issue/2026-09-24-harnessrouter-research-review-for-ccmsg.md に記録している。前提がずれていた所見と、本研究が拾えていなかった取り込み候補 (transcript の stop_reason の max_tokens / refusal を ccmsg が表示していない件) はそちらが正本。

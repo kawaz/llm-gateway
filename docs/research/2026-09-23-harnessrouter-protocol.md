@@ -176,3 +176,4 @@
 - UHP の `GET /v1/harnesses/{harness_id}/events` (`streaming.md` §5 で言及) は endpoint 一覧 (`versions/2026-09-12/index.md`) に載っておらず、仕様内で定義箇所を確認できなかった。仕様側の記述漏れか、別章 (harnesses.md) にあるかは未確認
 - UHP の `plugins.md` / `files.md` / `security.md` / `harnesses.md` / `schema/` / `CHANGELOG.md` は本調査の観点 (ライフサイクル・stream・エラー・版) から外れるため精読していない
 - conformance suite は実行していない。「75 checks」「S-09 の測り方」は README の記述に基づく
+- ccmsg 側の実コード照合 (2026-09-24): ccmsg 統括が本ファイルの ccmsg 向け所見を実コードと突き合わせた評価を、ccmsg リポの docs/issue/2026-09-24-harnessrouter-research-review-for-ccmsg.md に記録している。前提がずれていた所見と、本研究が拾えていなかった取り込み候補 (transcript の stop_reason の max_tokens / refusal を ccmsg が表示していない件) はそちらが正本。
