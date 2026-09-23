@@ -1,6 +1,6 @@
 ---
 title: 全経路が断られた転送で cache_notice の約束が取り消されない
-status: wip
+status: resolved
 category: bug
 created: 2026-09-14T17:02:44+09:00
 last_read: 2026-09-23T18:39:41+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-09-23T18:40:38+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-23T18:45:00+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0012:implemented","案1採用: 2xxでない試行では寿命を約束しない"]
 blocked_by:
 origin: worker replay-stage-b の報告
 ---
@@ -42,10 +42,10 @@ v0.48.0 (DR-0027 決定 8 の「1 本目から見立てを出す」) で顕在�
 
 ## 受け入れ条件
 
-- [ ] 全経路が断られた転送で、果たされない `cache_notice` / `cache_expires_at` が webui のリングに残らないことを確認する
+- [x] 全経路が断られた転送で、果たされない `cache_notice` / `cache_expires_at` が webui のリングに残らないことを確認する
 - [x] 上記 2 案のどちらを採るか裁定し、DR-0012 の request event の記述を更新する
 
 ## TODO
 
-- [ ] DR-0012 の request event 記述を案 1 に合わせて更新する
-- [ ] 実装 (2xx でない試行で連鎖の欄と `cache_notice` を載せない)
+- [x] DR-0012 の request event 記述を案 1 に合わせて更新する
+- [x] 実装 (2xx でない試行で連鎖の欄と `cache_notice` を載せない)

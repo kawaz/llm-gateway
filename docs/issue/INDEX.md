@@ -11,4 +11,3 @@
 | 2026-09-09 | request | open | [daemon-restart-order-and-grace](./2026-09-09-daemon-restart-order-and-grace.md) | daemon restart --all の順序と停止猶予を設定可能にする |
 | 2026-09-07 | request | open | [stats-per-session-and-subagent](./2026-09-07-stats-per-session-and-subagent.md) | stats / event で subagent 別・effort 別のコストを分離できるようにする (ccmsg からの要望) |
 | 2026-09-03 | tech-memo | open | [oauth-requires-claude-code-shape](./2026-09-03-oauth-requires-claude-code-shape.md) | サブスク OAuth 経路は Claude Code の形をしていない request を 429 "Error" で弾く (真因と対応候補) |
-| 2026-09-14 | bug | wip | [keepalive-promise-not-withdrawn-on-refused-forward](./2026-09-14-keepalive-promise-not-withdrawn-on-refused-forward.md) | 全経路が断られた転送で cache_notice の約束が取り消されない |
