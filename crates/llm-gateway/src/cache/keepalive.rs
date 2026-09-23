@@ -436,11 +436,13 @@ impl Keepalive {
     /// 同士で、どちらも同じ書き方の時刻になる。
     fn plan(self: &Arc<Self>, series: Series, after: Duration, expected_ms: i64) {
         let fires_at = Instant::now() + after;
-        let waking = Arc::clone(self);
+        let waking = Arc::downgrade(self);
         let ringing = series.clone();
         let timer = Timer(tokio::spawn(async move {
             tokio::time::sleep_until(fires_at).await;
-            waking.fire(ringing, expected_ms).await;
+            if let Some(waking) = waking.upgrade() {
+                waking.fire(ringing, expected_ms).await;
+            }
         }));
         // 前の予定は差し替えで畳まれる (`Timer` の Drop が止める)。
         self.timers.lock().unwrap().insert(series, timer);
@@ -1212,10 +1214,15 @@ mod tests {
     async fn what_was_kept_is_picked_up_again() {
         let dir = tempfile::tempdir().unwrap();
         let upstream = FakeUpstream::new(answered(events::Cache::Hit));
-        {
+        let before_gone = {
             let before = keepalive(dir.path(), &upstream, true);
             before.armed_by_request(sent(now_unix_ms()));
-        }
+            Arc::downgrade(&before)
+        };
+        assert!(
+            before_gone.upgrade().is_none(),
+            "the old owner stopped watching"
+        );
 
         let after = keepalive(dir.path(), &upstream, true);
         after.restore();
