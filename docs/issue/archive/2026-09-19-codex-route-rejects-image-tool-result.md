@@ -1,6 +1,6 @@
 ---
 title: codex 経路が画像を含む tool_result を拒否し route 全滅で 503 になる
-status: wip
+status: resolved
 category: bug
 created: 2026-09-19T17:30:25+09:00
 last_read: 2026-09-23T18:11:18+09:00
@@ -9,10 +9,10 @@ wip_entered: 2026-09-23T18:14:19+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-23T18:25:18+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","finding/2026-09-23-codex-function-call-output-accepts-input-image","issue/error-config-reused-for-non-config-failures","todo:稼働機での Messages 形式 end-to-end は新 binary 展開後に要確認"]
 blocked_by:
 origin: ccmsg
 ---
