@@ -33,7 +33,7 @@ SSE ストリーム中継中に発生した失敗 (upstream 切断・タイム�
 
 ### 実害 (観測済み)
 
-2026-07-28 に 3 セッションで `API Error: Response stalled mid-stream` が発生した際、gateway が原因かを切り分けられなかった。ストリーム中断がログに一切残らないため。詳細はセッション状態ファイル `/Users/kawaz/.cache/claude-session-state/llm-gateway/20260728-2131.md` の §9 参照。
+2026-07-28 に 3 セッションで `API Error: Response stalled mid-stream` が発生した際、gateway が原因かを切り分けられなかった。ストリーム中断がログに一切残らないため。詳細はセッション状態ファイル `~/.cache/claude-session-state/llm-gateway/20260728-2131.md` の §9 参照。
 
 ## 対処の方向性 (案、未裁定)
 
