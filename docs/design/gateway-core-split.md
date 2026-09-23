@@ -149,6 +149,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 完了条件: `crates/gateway-core` が workspace member にあり、`pattern` / `persist` / `credential/time` を移し、`llm-gateway` が `pub use gateway_core::{pattern, ...}` で既存パスを保っている。§3 の語彙テストが入っていて緑
 - 検証: `just ci`。語彙テストに禁止語を 1 語入れたファイルを一時的に置いて赤になることを手元で 1 度確かめる (commit しない)
 - やらないこと: credential / events / stats には触らない。`llm-gateway-server` / `-cli` の `Cargo.toml` は変えない
+- 実施済み: `crates/gateway-core` を新設し `pattern` / `persist` / `credential::time` を移動、`llm-gateway` は `pub use` で既存パスを維持。語彙テストは DR-0014 側に倣い `#[cfg(test)]` より前だけを読む
 
 ### 段 0.5: DR-0031 (Store 層) の起草・裁定
 

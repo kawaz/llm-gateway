@@ -30,7 +30,7 @@ pub mod events;
 pub mod exchange;
 pub mod gateway;
 pub mod metering;
-pub mod pattern;
+pub use gateway_core::pattern;
 pub mod preset;
 pub mod provider;
 pub mod quota;
@@ -46,7 +46,7 @@ pub use config::Config;
 pub use gateway::Gateway;
 
 mod error;
-mod persist;
+pub(crate) use gateway_core::persist;
 
 pub use error::{Error, Result};
 

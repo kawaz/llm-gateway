@@ -364,6 +364,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-core"
+version = "0.54.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -758,6 +769,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-util",
+ "gateway-core",
  "humantime",
  "libc",
  "rand",

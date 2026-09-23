@@ -1,7 +1,7 @@
 //! 置き場へ落とすときの共通の作法。
 //!
-//! 日次集計 ([`crate::stats`]) と利用状況のスナップショット ([`crate::quota`])
-//! は、同じ置き場に**書き手ごとのファイル**を持つ。書き手の名前の付け方と
+//! 日次集計や状態のスナップショットのように、同じ置き場に**書き手ごとの
+//! ファイル**を持つものがある。書き手の名前の付け方と
 //! 「途中の状態を読ませない書き方」は両方で同じでなければならないので、
 //! ここに 1 つだけ置く。
 
@@ -13,7 +13,7 @@ use serde::Serialize;
 ///
 /// `127.0.0.1:8402` のような待ち受け先がそのまま来る。`.` はファイル名の
 /// 区切りに使っているので、混ざると名前の切り出しが狂う。
-pub(crate) fn sanitize_writer(writer: &str) -> String {
+pub fn sanitize_writer(writer: &str) -> String {
     let cleaned: String = writer
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -41,7 +41,7 @@ static NEXT_TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 ///
 /// 一時ファイル名は `<path>.tmp.<pid>.<連番>`。片付ける側 ([`sweep_temporaries`])
 /// はこの形を当てにする。
-pub(crate) fn write_atomically<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+pub fn write_atomically<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::Ordering;
 
@@ -68,7 +68,7 @@ pub(crate) fn write_atomically<T: Serialize>(path: &Path, value: &T) -> std::io:
 /// **自分の名前が付いたものだけ** — 他の writer の一時ファイルは今まさに書いて
 /// いる途中かもしれない。起動時に呼ぶ前提 (書いている最中に呼ぶと自分の書き
 /// かけを消す)。
-pub(crate) fn sweep_temporaries(dir: &Path, writer: &str) {
+pub fn sweep_temporaries(dir: &Path, writer: &str) {
     // `2026-07-30.8402.json.tmp.<pid>.<連番>` の後半で見分ける。
     let mark = format!("{writer}.json.tmp.");
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {

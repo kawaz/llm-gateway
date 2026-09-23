@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gateway-core",
     "crates/llm-gateway",
     "crates/llm-gateway-server",
     "crates/llm-gateway-cli",

@@ -1,0 +1,13 @@
+//! gateway の汎用層。
+//!
+//! 上流が何であっても変わらない部品だけを置く。上流の種類や、そこで流れる
+//! 中身の語彙は利用側の crate が持ち、ここへは持ち込まない (DR-0030 §1)。
+//! 語彙が漏れていないことは `tests/vocabulary.rs` が確かめる。
+//!
+//! - [`pattern`] `*` だけを扱う名前の照合
+//! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
+//! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
+
+pub mod credential;
+pub mod pattern;
+pub mod persist;
