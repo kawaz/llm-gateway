@@ -3,7 +3,7 @@ title: 全経路が断られた転送で cache_notice の約束が取り消さ�
 status: open
 category: bug
 created: 2026-09-14T17:02:44+09:00
-last_read:
+last_read: 2026-09-23T18:39:41+09:00
 open_entered: 2026-09-14T17:02:44+09:00
 wip_entered:
 blocked_entered:
