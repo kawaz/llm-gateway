@@ -29,6 +29,8 @@ gateway では client が送った model 名を discovery の catalog / aliases 
 
 ## 3. prompt cache が効く条件
 
+出典: Anthropic 列は公式 doc `build-with-claude/prompt-caching` の読解と gateway 経由の実測 ([2026-09-02-prompt-cache-and-thinking-facts.md](./2026-09-02-prompt-cache-and-thinking-facts.md) が正本)。OpenAI 列は公式 doc `guides/prompt-caching` の記載のみで、実測していない。
+
 | | Anthropic | OpenAI |
 |---|---|---|
 | 制御 | **明示**。content block に `cache_control: {type: "ephemeral"}` (breakpoint 最大 4) | **自動**。明示制御なし (`prompt_cache_key` でルーティングのヒント程度) |

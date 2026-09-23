@@ -1,5 +1,7 @@
 # cache_control は checkpoint ではない / rewind の実体
 
+出典: §1・§2 は公式 doc `build-with-claude/prompt-caching` (倍率と TTL の一次情報は [2026-09-02-prompt-cache-and-thinking-facts.md](./2026-09-02-prompt-cache-and-thinking-facts.md) が読解結果と実測の正本)。§3 は Claude Code バイナリの実装確認 (2026-08-11)。
+
 関連: [2026-08-11-model-effort-cache-mapping.md](./2026-08-11-model-effort-cache-mapping.md)
 
 ## 1. cache_control の正体 (課金・レイテンシ最適化の印、semantics ゼロ)
