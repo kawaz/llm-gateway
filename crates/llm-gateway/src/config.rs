@@ -67,6 +67,7 @@ use crate::metering::{Pricing, TokenKind};
 use crate::{Error, Result};
 
 mod extends;
+mod path_expand;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -717,7 +718,11 @@ pub struct Server {
     /// `daemon add` が登録簿へ焼き込む値の元。書かなければ、登録した時点の
     /// 自分自身の絶対パスを使う。面ごとに別のビルドを走らせる (stable は
     /// brew、unstable は repo の build) 運用があるので、台ごとに指せる。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "path_expand::serde_opt_path"
+    )]
     pub binary_path: Option<PathBuf>,
 }
 
@@ -765,7 +770,7 @@ pub struct Webhook {
     ///
     /// 設定に直接書かせないのは、設定ファイルが人の目に触れる場所 (共有した
     /// 土台・差分・貼り付けたログ) を通りやすいため。
-    #[serde(default = "default_token_file")]
+    #[serde(default = "default_token_file", with = "path_expand::serde_path")]
     pub token_file: PathBuf,
 }
 
@@ -832,7 +837,11 @@ pub enum Store {
     /// 1 認証情報 1 ファイル。平文。
     File {
         /// 省略時は `$XDG_STATE_HOME/llm-gateway/credentials`。
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "path_expand::serde_opt_path"
+        )]
         dir: Option<PathBuf>,
     },
 }
@@ -858,7 +867,11 @@ impl Store {
 #[serde(deny_unknown_fields)]
 pub struct Stats {
     /// 省略時は `$XDG_STATE_HOME/llm-gateway/stats`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "path_expand::serde_opt_path"
+    )]
     pub dir: Option<PathBuf>,
     /// cache に乗らなかった request を、研究用に何本まで取っておくか
     /// (`keepalive/uncached/`、DR-0027 決定 9)。
@@ -2464,6 +2477,56 @@ routes = ["a", "typo-here"]
     fn store_dir_can_be_overridden() {
         let c = parse("[store]\ntype = \"file\"\ndir = \"/tmp/creds\"").unwrap();
         assert_eq!(c.store.resolve_dir(), PathBuf::from("/tmp/creds"));
+    }
+
+    /// パスの欄は、書いた `~` と環境変数を読み込んだ時点で開く。
+    ///
+    /// 設定は dotfiles に置かれて台をまたぐので、`/Users/<誰か>/...` を
+    /// 焼き込ませない。開く規則そのものは `path_expand` が持つ。
+    #[test]
+    fn path_fields_open_tilde_and_variables_when_read() {
+        let home = std::env::var("HOME").expect("tests run with a home");
+        let c = parse(
+            "[server]\nbinary_path = \"~/bin/llm-gateway\"\n\n\
+             [store]\ntype = \"file\"\ndir = \"$HOME/creds\"\n\n\
+             [stats]\ndir = \"${XDG_STATE_HOME:-~/.local/state}/llm-gateway/stats\"\n\n\
+             [webhook]\ntoken_file = \"~/hook.token\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            c.server.binary_path,
+            Some(PathBuf::from(format!("{home}/bin/llm-gateway")))
+        );
+        assert_eq!(
+            c.store.resolve_dir(),
+            PathBuf::from(format!("{home}/creds"))
+        );
+        assert_eq!(
+            c.webhook.token_file,
+            PathBuf::from(format!("{home}/hook.token"))
+        );
+
+        let stats = c.stats.resolve_dir();
+        assert!(stats.is_absolute(), "{}", stats.display());
+        assert!(stats.ends_with("llm-gateway/stats"), "{}", stats.display());
+        assert!(
+            !stats.to_string_lossy().contains('~'),
+            "the tilde is opened, not carried: {}",
+            stats.display()
+        );
+    }
+
+    /// 定まらない環境変数は、代わりが書かれていなければ名指しで落とす。
+    ///
+    /// 空として通すと、`~/.local` のつもりの値が根を指したまま動く。
+    #[test]
+    fn an_unset_variable_in_a_path_is_refused_by_name() {
+        let e = parse("[server]\nbinary_path = \"$LLM_GATEWAY_NOWHERE/bin\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("LLM_GATEWAY_NOWHERE"), "{e}");
+        assert!(e.contains("not set"), "{e}");
     }
 
     /// 既定は state 配下。cache ではない (消えると再ログインが要る)。

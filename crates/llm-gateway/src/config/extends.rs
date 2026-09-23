@@ -65,6 +65,10 @@ fn layer(path: &Path, referrer: Option<&Path>, visiting: &mut BTreeSet<PathBuf>)
         )));
     };
 
+    // 土台の指し先も人が書いたパス。`~` と環境変数をここで開く。設定の項目と
+    // 同じ規則にしないと、「`~` が使えるのはどの欄か」を覚えることになる。
+    let base = super::path_expand::expand(base)?;
+
     // 相対パスは、それを書いたファイルの隣から。
     let base = here.parent().unwrap_or(Path::new(".")).join(base);
     let mut merged = layer(&base, Some(&here), visiting)?;
@@ -241,6 +245,45 @@ listen = "127.0.0.1:8402"
         assert_eq!(
             merged["credentials"]["bedrock"]["type"].as_str(),
             Some("bedrock_api_key")
+        );
+    }
+
+    /// 土台の指し先にも `~` と環境変数が書ける。
+    ///
+    /// ここが開かないと、台ごとに違う置き場の土台を指す設定が書けない
+    /// (= 設定の項目だけ開いても、土台の一段目で絶対パスに戻ってしまう)。
+    #[test]
+    fn the_base_path_opens_variables_too() {
+        let dir = spread(&[
+            ("base.toml", BASE),
+            (
+                "here.toml",
+                r#"
+extends = "${LLM_GATEWAY_TEST_BASE_DIR}/base.toml"
+
+[server]
+listen = "127.0.0.1:8402"
+"#,
+            ),
+        ]);
+
+        let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
+        assert!(e.contains("LLM_GATEWAY_TEST_BASE_DIR"), "{e}");
+        assert!(
+            e.contains("not set"),
+            "an unset variable in extends is named, not pasted literally: {e}"
+        );
+    }
+
+    /// 家を指す土台は、その場で開いてから読みに行く。
+    #[test]
+    fn the_base_path_opens_a_leading_tilde() {
+        let dir = spread(&[("here.toml", "extends = \"~/nowhere-llm-gateway.toml\"\n")]);
+        let e = resolve(&at(&dir, "here.toml")).unwrap_err().to_string();
+        let home = std::env::var("HOME").expect("tests run with a home");
+        assert!(
+            e.contains(&format!("{home}/nowhere-llm-gateway.toml")),
+            "the tilde is opened before reading: {e}"
         );
     }
 
