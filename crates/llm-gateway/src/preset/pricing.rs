@@ -348,12 +348,13 @@ pub fn for_model(model: &str) -> Option<Pricing> {
         .map(|(kind, usd)| (TokenKind::new(*kind), *usd))
         .collect();
     Some(Pricing {
-        // 親子の関係は、両方に単価を書いた行にだけ要る。
+        // 宣言は単価の有無で絞らずに全部渡す。課金は単価のある内訳だけを引き
+        // ([`Pricing::cost`])、閲覧は全部を引いて数え方を揃える
+        // ([`Pricing::exclusive`])。
         refines: row
             .refinements
             .iter()
             .map(|(child, parent)| (TokenKind::new(*child), TokenKind::new(*parent)))
-            .filter(|(child, parent)| rates.contains_key(child) && rates.contains_key(parent))
             .collect(),
         rates,
     })

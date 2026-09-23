@@ -659,6 +659,28 @@ pub struct Entry {
     /// 素性の段は単価に関わらないので、内訳の `usd` は親と同じ単価で出る。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub origins: BTreeMap<String, Entry>,
+    /// `input` の数がどちらの数え方か (DR-0029)。
+    #[serde(default)]
+    pub input_basis: InputBasis,
+}
+
+/// 閲覧に出す `input` の数え方 (DR-0029)。
+///
+/// ファイルには upstream の数え方のまま積む (cache 込みの総数を返す
+/// upstream も、cache を含まない数を返す upstream もある)。閲覧に出すときに、単価表が宣言する内訳
+/// ([`crate::metering::Pricing::exclusive`]) を引いて「cache でない入力」へ
+/// 揃える。単価表に無いモデルは内訳が分からないので揃えられず、そのまま出す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBasis {
+    /// cache を含まない入力に揃えてある。
+    Fresh,
+    /// upstream が言った数のまま。cache 分を含むかどうかは分からない。
+    ///
+    /// 既定をこちらにするのは、この欄を知らない gateway の報告が揃えて
+    /// いない数を運んでくるため。
+    #[default]
+    AsRecorded,
 }
 
 /// 認証情報 → モデル → 行。
@@ -706,10 +728,18 @@ fn price(days: ByDate, pricing: &dyn PricingSource) -> (BTreeMap<String, Day>, O
                 let mut counters = Counters::default();
                 let mut usd: Option<f64> = None;
                 let mut origins = BTreeMap::new();
-                for (origin, slice) in by_origin.0 {
+                let input_basis = match rates {
+                    Some(_) => InputBasis::Fresh,
+                    None => InputBasis::AsRecorded,
+                };
+                for (origin, mut slice) in by_origin.0 {
+                    // 金額は積んだままの数で出す。揃えるのはその後。
                     let slice_usd = rates.as_ref().map(|rates| rates.cost(&slice.tokens));
                     if let Some(slice_usd) = slice_usd {
                         usd = Some(usd.unwrap_or(0.0) + slice_usd);
+                    }
+                    if let Some(rates) = &rates {
+                        to_fresh_input(&mut slice, rates);
                     }
                     counters.merge(&slice);
                     origins.insert(
@@ -718,6 +748,7 @@ fn price(days: ByDate, pricing: &dyn PricingSource) -> (BTreeMap<String, Day>, O
                             counters: slice,
                             usd: slice_usd,
                             origins: BTreeMap::new(),
+                            input_basis,
                         },
                     );
                 }
@@ -730,6 +761,7 @@ fn price(days: ByDate, pricing: &dyn PricingSource) -> (BTreeMap<String, Day>, O
                         counters,
                         usd,
                         origins,
+                        input_basis,
                     },
                 );
             }
@@ -743,6 +775,20 @@ fn price(days: ByDate, pricing: &dyn PricingSource) -> (BTreeMap<String, Day>, O
     }
 
     (priced, grand.map(round_usd))
+}
+
+/// `input` を cache でない入力に揃える (DR-0029)。
+///
+/// 引く相手は単価表が内訳として宣言した区分で、金額の計算
+/// ([`crate::metering::Pricing::cost`]) と同じ宣言を使う。数え方の規則を
+/// 2 か所に持たないため。
+fn to_fresh_input(counters: &mut Counters, rates: &crate::metering::Pricing) {
+    let input = TokenKind::input();
+    if counters.tokens.get(&input).is_none() {
+        return;
+    }
+    let fresh = rates.exclusive(&counters.tokens, &input);
+    counters.tokens.set(input, fresh);
 }
 
 #[cfg(test)]
@@ -1778,5 +1824,90 @@ mod tests {
                 "today disappears with days={days}"
             );
         }
+    }
+
+    /// 実際の単価表で値付けする役。数え方の揃え方は表の宣言に従う。
+    struct Table;
+
+    impl PricingSource for Table {
+        fn pricing(&self, _credential: &str, model: &str) -> Option<crate::metering::Pricing> {
+            crate::preset::pricing::for_model(model)
+        }
+    }
+
+    /// 閲覧に出す `input` は cache でない入力に揃う (DR-0029)。
+    ///
+    /// 総数で積まれた行は内訳を引き、もともと cache を含まない行はそのまま。
+    /// 単価表に無いモデルは揃えられないので、積んだ数のまま印を付ける。
+    /// 金額は積んだ数から出すので、揃えても変わらない。
+    #[test]
+    fn the_input_is_reported_without_cached_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = stats(dir.path());
+
+        // 総数で積む upstream の行: input 1,000 のうち cached 600 / write 100。
+        let mut total = tokens(1_000, 50);
+        total.set(TokenKind::input_cache_read(), 600);
+        total.set(TokenKind::input_cache_creation(), 100);
+        s.record(NOW, Some("o"), "gpt-6-sol", MAIN, &total);
+        s.record(NOW, Some("o"), "gpt-6-sol", "sub", &total);
+        // サブスク経路の行は cache write に単価が無いが、数としては引く。
+        s.record(NOW, Some("o"), "gpt-5.4", MAIN, &total);
+        // cache を含まない数で積む upstream の行。
+        let mut fresh = tokens(1_000, 50);
+        fresh.set(TokenKind::input_cache_read(), 600);
+        fresh.set(TokenKind::input_cache_creation(), 100);
+        s.record(NOW, Some("c"), "claude-opus-5", MAIN, &fresh);
+        s.record(NOW, Some("x"), "who-knows", MAIN, &total);
+
+        let day = &s.report(7, NOW_MS, &Table).days[&local_date(NOW)];
+        let gpt = &day.credentials["o"]["gpt-6-sol"];
+        assert_eq!(input_of(&gpt.counters), 2 * 300);
+        assert_eq!(input_of(&gpt.origins[MAIN].counters), 300);
+        assert_eq!(input_of(&gpt.origins["sub"].counters), 300);
+        assert_eq!(gpt.input_basis, InputBasis::Fresh);
+        assert_eq!(
+            count(&gpt.counters, TokenKind::input_cache_read()),
+            2 * 600,
+            "the cache columns keep what was recorded"
+        );
+        let expected = crate::preset::pricing::for_model("gpt-6-sol")
+            .unwrap()
+            .cost(&total);
+        assert_eq!(
+            gpt.origins[MAIN].usd,
+            Some(expected),
+            "usd is priced on the recorded counts"
+        );
+
+        let sub = &day.credentials["o"]["gpt-5.4"];
+        assert_eq!(input_of(&sub.counters), 300);
+
+        let claude = &day.credentials["c"]["claude-opus-5"];
+        assert_eq!(input_of(&claude.counters), 1_000);
+        assert_eq!(claude.input_basis, InputBasis::Fresh);
+        assert_eq!(
+            claude.usd,
+            crate::preset::pricing::for_model("claude-opus-5").map(|p| p.cost(&fresh))
+        );
+
+        let unknown = &day.credentials["x"]["who-knows"];
+        assert_eq!(input_of(&unknown.counters), 1_000);
+        assert_eq!(unknown.input_basis, InputBasis::AsRecorded);
+        assert_eq!(unknown.origins[MAIN].input_basis, InputBasis::AsRecorded);
+
+        // ファイルは積んだ数のまま。
+        s.flush().unwrap();
+        let raw = std::fs::read_to_string(s.path_of(&local_date(NOW))).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(raw["o"]["gpt-6-sol"][MAIN]["tokens"]["input"], 1_000);
+    }
+
+    /// 欄を持たない報告 (揃える前の gateway が返したもの) は、揃っていない
+    /// 数として読む。
+    #[test]
+    fn an_entry_without_a_basis_reads_as_recorded() {
+        let entry: Entry = serde_json::from_str(r#"{"requests":1,"tokens":{"input":10}}"#).unwrap();
+        assert_eq!(entry.input_basis, InputBasis::AsRecorded);
     }
 }

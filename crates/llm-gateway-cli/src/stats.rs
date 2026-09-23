@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use llm_gateway::daemon::registry::Registry;
 use llm_gateway::metering::TokenKind;
-use llm_gateway::stats::{Counters, Report, UNKNOWN_ORIGIN};
+use llm_gateway::stats::{Counters, InputBasis, Report, UNKNOWN_ORIGIN};
 
 use crate::destination;
 use crate::failure::Failure;
@@ -112,15 +112,24 @@ fn render(report: &Report, by: By) -> String {
     let mut lines: Vec<Line> = Vec::new();
     // 新しい日を上に出す。見たいのは直近。
     let mut all_days = Counters::default();
+    let mut all_days_basis = InputBasis::Fresh;
     for (date, day) in report.days.iter().rev() {
         let mut total = Counters::default();
+        // 揃えていない行が 1 つでも混ざれば、合計も揃っていない。
+        let mut basis = InputBasis::Fresh;
         for models in day.credentials.values() {
             for entry in models.values() {
                 total.merge(&entry.counters);
+                if entry.input_basis == InputBasis::AsRecorded {
+                    basis = InputBasis::AsRecorded;
+                }
             }
         }
         all_days.merge(&total);
-        lines.push((format!("{date} {TOTAL_LABEL}"), total, day.total_usd));
+        if basis == InputBasis::AsRecorded {
+            all_days_basis = InputBasis::AsRecorded;
+        }
+        lines.push((format!("{date} {TOTAL_LABEL}"), total, day.total_usd, basis));
 
         // 内訳の行。素性で割るときは素性を先頭に置き、ラベル順で並べ直す
         // (`keepalive` の行が縦に固まって読める)。
@@ -132,6 +141,7 @@ fn render(report: &Report, by: By) -> String {
                         format!("  {cred} {model}"),
                         entry.counters.clone(),
                         entry.usd,
+                        entry.input_basis,
                     )),
                     // 素性を知らない gateway が返した報告では内訳が空。
                     // 行を落とすと合計と内訳が食い違うので、言えることを
@@ -140,12 +150,14 @@ fn render(report: &Report, by: By) -> String {
                         format!("  {UNKNOWN_ORIGIN} {cred} {model}"),
                         entry.counters.clone(),
                         entry.usd,
+                        entry.input_basis,
                     )),
                     By::Origin => breakdown.extend(entry.origins.iter().map(|(origin, slice)| {
                         (
                             format!("  {origin} {cred} {model}"),
                             slice.counters.clone(),
                             slice.usd,
+                            slice.input_basis,
                         )
                     })),
                 }
@@ -156,7 +168,12 @@ fn render(report: &Report, by: By) -> String {
     }
     // 全期間の合計を最後に置く。日ごとの合計と同じ桁組に並ぶので、
     // 「今月いくら使ったか」を表の下端で読める。
-    lines.push((TOTAL_LABEL.to_owned(), all_days, report.total_usd));
+    lines.push((
+        TOTAL_LABEL.to_owned(),
+        all_days,
+        report.total_usd,
+        all_days_basis,
+    ));
 
     // 列は記録に現れた区分だけ並べる。区分は provider ごとに違うので
     // (DR-0014 §4)、固定の列を並べると知らない区分が表から消える。
@@ -168,27 +185,40 @@ fn render(report: &Report, by: By) -> String {
     let label_width = lines.iter().map(|(l, ..)| width(l)).max().unwrap_or(0);
     let cell_width = lines
         .iter()
-        .flat_map(|(_, c, _)| columns(c, &kinds))
+        .flat_map(|(_, c, ..)| columns(c, &kinds))
         .map(|n| thousands(n).len())
         .max()
         .unwrap_or(0)
         .max(headers.iter().map(|h| h.len()).max().unwrap_or(0));
     let usd_width = lines
         .iter()
-        .map(|(.., usd)| usd_cell(*usd).len())
+        .map(|(_, _, usd, _)| usd_cell(*usd).len())
         .chain(std::iter::once(USD_HEADER.len()))
         .max()
         .unwrap_or(0);
 
+    // 揃えられなかった input に付ける印の桁。1 つも無ければ桁ごと取らない。
+    let marked = lines
+        .iter()
+        .any(|(.., basis)| *basis == InputBasis::AsRecorded)
+        && kinds.contains(&TokenKind::input());
+    let input_column = kinds
+        .iter()
+        .position(|kind| *kind == TokenKind::input())
+        .map(|i| i + 1);
+
     // 見出しは 1 度だけ。日ごとに挟むと、行数の少ない日ほど見出しで埋まる。
     let mut out = " ".repeat(label_width);
-    for head in &headers {
+    for (i, head) in headers.iter().enumerate() {
         out.push_str(&format!(" {head:>cell_width$}"));
+        if marked && Some(i) == input_column {
+            out.push(' ');
+        }
     }
     out.push_str(&format!(" {USD_HEADER:>usd_width$}\n"));
 
     let mut previous_day_ended = false;
-    for (label, counters, usd) in &lines {
+    for (label, counters, usd, basis) in &lines {
         // 日の切り替わりで 1 行空ける。合計行は字下げが無いので見分けられる。
         if !label.starts_with(' ') && previous_day_ended {
             out.push('\n');
@@ -197,14 +227,26 @@ fn render(report: &Report, by: By) -> String {
 
         out.push_str(label);
         out.push_str(&" ".repeat(label_width.saturating_sub(width(label))));
-        out.push_str(&row(counters, &kinds, cell_width));
+        let mark = match (marked, basis) {
+            (false, _) => None,
+            (true, InputBasis::AsRecorded) => Some('*'),
+            (true, InputBasis::Fresh) => Some(' '),
+        };
+        out.push_str(&row(counters, &kinds, cell_width, input_column.zip(mark)));
         out.push_str(&format!(" {:>usd_width$}\n", usd_cell(*usd)));
+    }
+    if marked {
+        out.push_str(AS_RECORDED_NOTE);
     }
     out
 }
 
-/// 表示用の 1 行。`(ラベル, 集計, USD)`。
-type Line = (String, Counters, Option<f64>);
+/// `*` の脚注。どの数が揃っていないのか、なぜかを 1 行で言う。
+const AS_RECORDED_NOTE: &str = "\n* input as reported by upstream: the model is not in the price table, \
+     so cached tokens could not be taken out and may be included.\n";
+
+/// 表示用の 1 行。`(ラベル, 集計, USD, input の数え方)`。
+type Line = (String, Counters, Option<f64>, InputBasis);
 
 /// USD の欄。単価表に無いモデルは `-`。
 ///
@@ -242,7 +284,7 @@ const KIND_ORDER: [&str; 7] = [
 fn kinds_of(lines: &[Line]) -> Vec<TokenKind> {
     let seen: BTreeSet<TokenKind> = lines
         .iter()
-        .flat_map(|(_, c, _)| c.tokens.tokens.keys().cloned())
+        .flat_map(|(_, c, ..)| c.tokens.tokens.keys().cloned())
         .collect();
 
     let mut ordered: Vec<TokenKind> = KIND_ORDER
@@ -281,11 +323,24 @@ fn columns(c: &Counters, kinds: &[TokenKind]) -> Vec<u64> {
 }
 
 /// 数を桁揃えで 1 行に並べる。見出しと同じ幅で、先頭に区切りの 1 桁を置く。
-fn row(c: &Counters, kinds: &[TokenKind], cell_width: usize) -> String {
-    columns(c, kinds)
-        .iter()
-        .map(|n| format!(" {:>cell_width$}", thousands(*n)))
-        .collect()
+///
+/// `mark` は `(何列目か, 印)`。その列の数の直後に印の 1 桁を足す。
+fn row(
+    c: &Counters,
+    kinds: &[TokenKind],
+    cell_width: usize,
+    mark: Option<(usize, char)>,
+) -> String {
+    let mut out = String::new();
+    for (i, n) in columns(c, kinds).iter().enumerate() {
+        out.push_str(&format!(" {:>cell_width$}", thousands(*n)));
+        if let Some((column, mark)) = mark
+            && column == i
+        {
+            out.push(mark);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -330,6 +385,7 @@ mod tests {
                 let mut entry = serde_json::to_value(c).unwrap();
                 if let Some(usd) = usd {
                     entry["usd"] = serde_json::json!(usd);
+                    entry["input_basis"] = serde_json::json!("fresh");
                 }
                 creds
                     .entry((*cred).to_owned())
@@ -381,6 +437,8 @@ mod tests {
             let mut row = serde_json::to_value(&total).unwrap();
             if let Some(usd) = usd {
                 slice["usd"] = serde_json::json!(usd);
+                slice["input_basis"] = serde_json::json!("fresh");
+                row["input_basis"] = serde_json::json!("fresh");
                 let before = llm_gateway::preset::pricing::for_model(model)
                     .map(|p| p.cost(&total.tokens))
                     .unwrap();
@@ -557,8 +615,9 @@ mod tests {
             .expect("a breakdown line");
         assert_eq!(
             row.split_whitespace().collect::<Vec<_>>(),
-            // 認証情報 / モデル / 本数 / input / output / reasoning / 固有区分 / USD
-            ["a", "m", "1", "10", "5", "7", "3", "-"],
+            // 認証情報 / モデル / 本数 / input / output / reasoning / 固有区分 / USD。
+            // `m` は単価表に無いので input は揃えられず、印が付く。
+            ["a", "m", "1", "10*", "5", "7", "3", "-"],
             "{out}"
         );
     }
@@ -774,5 +833,37 @@ mod tests {
             out, expected,
             "\n--- actual ---\n{out}--- expected ---\n{expected}"
         );
+    }
+
+    /// 揃えられなかった input には `*` が付き、合計行にも伝わり、脚注が出る
+    /// (DR-0029)。揃えた行だけの表には印の桁も脚注も出ない。
+    #[test]
+    fn an_input_left_as_recorded_is_marked() {
+        let out = render_routes(&stats_report(&[(
+            "2026-07-29",
+            &[
+                ("a", "claude-opus-5", counters(1, 100, 0)),
+                ("a", "who-knows", counters(1, 1_000, 0)),
+            ],
+        )]));
+        let cells = |prefix: &str| -> Vec<String> {
+            out.lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no `{prefix}` line: {out}"))
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(cells("  a claude-opus-5")[3], "100", "{out}");
+        assert_eq!(cells("  a who-knows")[3], "1,000*", "{out}");
+        assert_eq!(cells("2026-07-29 total")[3], "1,100*", "{out}");
+        assert_eq!(cells("total")[2], "1,100*", "{out}");
+        assert!(out.contains("\n* input as reported by upstream"), "{out}");
+
+        let clean = render_routes(&stats_report(&[(
+            "2026-07-29",
+            &[("a", "claude-opus-5", counters(1, 100, 0))],
+        )]));
+        assert!(!clean.contains('*'), "{clean}");
     }
 }

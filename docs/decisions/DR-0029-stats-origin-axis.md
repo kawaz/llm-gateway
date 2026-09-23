@@ -54,6 +54,22 @@ DR-0027 で keepalive は合図の注入をやめ、gateway が最後に転送�
 
 既定を内訳ありにしないのは、素性が 1 つしかない使い方 (gateway 越しに 1 つのクライアントだけを通す) では行数が倍になるだけで何も増えないため。
 
+### `input` は出口で cache を除いた入力に揃える。蓄積は upstream の usage のまま
+
+(2026-09-24 追補、kawaz 裁定)
+
+upstream によって `input` の意味が違う。Anthropic の `input_tokens` は cache 分を含まないが、OpenAI の `input_tokens` は cached / cache write を内数に含む総数で、`preset/openai/metering.rs` の `read_usage` は経路に依らずこの総数で積む。USD は単価表の内訳の宣言 (`OPENAI_REFINEMENTS`、`Pricing::refines`) が内数を引くので正しいが、トークン数の `input` をそのまま並べると、`--by origin` の行どうしや合計行で性質の違う数を比べ・足すことになる。
+
+決定:
+
+- **ファイル (蓄積) は upstream の usage のまま積む**。`read_usage` の総数化も単価表の宣言もそのまま
+- **gateway から外に出す時点で揃える**。`/llm-gateway/stats` の応答を組む `stats::price` で、行ごとに `Pricing::exclusive` (単価表が `input` の内訳と宣言した区分を引いた残り) を `input` に入れる。CLI はこの応答を整形するだけなので、HTTP と CLI の両方が揃う。view 側 (応答を読む外部のツール) では対処しない
+- 揃える先は **cache を除いた入力**。cache の読み書きは別の区分 (`input.cache_read` / `input.cache_creation`) として既に並んでいるので、`input` を総数にする理由が無い
+- 金額は揃える前の数から出す。引き算の規則は USD と同じ宣言 (`Pricing::refines`) を使い、2 か所に持たない。宣言は単価の有無で絞らずに全部持ち、課金は単価のある内訳だけを引く (`Pricing::billable`)、閲覧は全部を引く (`Pricing::exclusive`)
+- **単価表に無いモデルの行は揃えられない**。内訳の宣言が引けないので、積んだ数のまま出し、`Entry::input_basis` を `as_recorded` にする (揃えた行は `fresh`)。CLI はその欄と、それを足し込んだ合計の欄に `*` を付け、表の下に脚注を出す。無言で混ぜない — 素性の無い過去のファイルを `unknown` に寄せるのと同じく、分からないことを分からないと出す。欄を持たない応答 (揃える前の gateway) も `as_recorded` として読む
+
+理由: 蓄積のときに特定の解釈で加工すると、解釈の誤りや上流仕様の変更のたびに過去のファイルまで直すことになる。生の数を持っておけば、出口の解釈を直すだけで過去日にも遡って効く (DR-0011 の「コストは読み出しのたびに計算する」と同じ構え)。
+
 ## やらないこと
 
 - **会話 (session) × モデルの粒度** — 別の要望 (issue `2026-09-07-stats-per-session-and-subagent`) があるが、軸の性質が違う。素性は語彙が閉じていて (6 語) 行数が増えないのに対し、会話の id は使うほど増える。日次ファイルの大きさと、過去日を読む速さに効くので、保存の形から別に設計が要る。本 DR では扱わない

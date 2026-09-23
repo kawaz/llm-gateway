@@ -148,10 +148,30 @@ impl Pricing {
     /// 単価を書いていない内訳は引かない。引いてしまうと、その分がどの区分でも
     /// 課金されずに消える。
     fn billable(&self, usage: &TokenUsage, kind: &TokenKind) -> u64 {
+        self.remainder(usage, kind, |child| self.rates.contains_key(child))
+    }
+
+    /// この区分のうち、宣言された内訳のどれにも入らない分。
+    ///
+    /// 閲覧に出す数を upstream の数え方に依らず揃えるための値 (DR-0029)。
+    /// `input` を cache 込みの総数で返す upstream の数も、ここを通すと
+    /// 「cache でない入力」になる。[`Self::billable`] と違って単価の有無を
+    /// 問わず引く — 引いた分は内訳の欄に数として残るので、消えない。
+    pub fn exclusive(&self, usage: &TokenUsage, kind: &TokenKind) -> u64 {
+        self.remainder(usage, kind, |_| true)
+    }
+
+    /// 親区分から、`counts` が認めた内訳を引いた残り。
+    fn remainder(
+        &self,
+        usage: &TokenUsage,
+        kind: &TokenKind,
+        counts: impl Fn(&TokenKind) -> bool,
+    ) -> u64 {
         let detailed: u64 = self
             .refines
             .iter()
-            .filter(|(child, parent)| *parent == kind && self.rates.contains_key(*child))
+            .filter(|(child, parent)| *parent == kind && counts(child))
             .map(|(child, _)| usage.get(child).unwrap_or(0))
             .sum();
         // 内訳の合計が親を超えていても負にしない (観測値は upstream 任せ)。

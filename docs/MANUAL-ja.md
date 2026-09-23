@@ -343,16 +343,19 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
             "requests": 12,
             "tokens": {"input": 1200, "output": 340, "input.cache_read": 8800},
             "usd": 0.42,
+            "input_basis": "fresh",
             "origins": {
               "keepalive": {
                 "requests": 2,
                 "tokens": {"input": 200, "output": 40, "input.cache_read": 4800},
-                "usd": 0.12
+                "usd": 0.12,
+                "input_basis": "fresh"
               },
               "main": {
                 "requests": 10,
                 "tokens": {"input": 1000, "output": 300, "input.cache_read": 4000},
-                "usd": 0.30
+                "usd": 0.30,
+                "input_basis": "fresh"
               }
             }
           }
@@ -366,6 +369,8 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 ```
 
 `total_usd` は単価表にあるモデルの分だけを足す。1 行も出せなければ欄ごと省く (出ている数字が全体の額に見えないようにするため)。
+
+`input` は cache を読み書きしなかった入力だけを数える (`input_basis: "fresh"`)。cache の読み出し・書き込みはそれぞれの数 (`input.cache_read` / `input.cache_creation`) にある。upstream によっては `input` を cache 分込みの総数で返すため、ファイルには upstream の数のまま積み、gateway が答えるときに cache 分を引いて揃える。引く相手は USD の計算と同じ単価表の内訳の宣言。単価表に無いモデルは揃えられないので、`input` を積んだ数のまま出し `input_basis: "as_recorded"` を付ける (cache 分を含むことがある)。`llm-gateway stats` ではその欄と、それを足し込んだ合計の欄に `*` が付き、表の下に脚注が出る。
 
 ### `GET /llm-gateway/events`
 

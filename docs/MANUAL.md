@@ -341,16 +341,19 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
             "requests": 12,
             "tokens": {"input": 1200, "output": 340, "input.cache_read": 8800},
             "usd": 0.42,
+            "input_basis": "fresh",
             "origins": {
               "keepalive": {
                 "requests": 2,
                 "tokens": {"input": 200, "output": 40, "input.cache_read": 4800},
-                "usd": 0.12
+                "usd": 0.12,
+                "input_basis": "fresh"
               },
               "main": {
                 "requests": 10,
                 "tokens": {"input": 1000, "output": 300, "input.cache_read": 4000},
-                "usd": 0.30
+                "usd": 0.30,
+                "input_basis": "fresh"
               }
             }
           }
@@ -364,6 +367,8 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 ```
 
 `total_usd` sums only the models the price table covers. If not a single row can be priced, the field is omitted — so the number shown is never mistaken for the whole bill.
+
+`input` counts only the input that did not come from or go into the cache (`input_basis: "fresh"`); cache reads and writes have their own counts (`input.cache_read` / `input.cache_creation`). Upstreams disagree here — some report `input` as a total that already contains the cached tokens — so the stored files keep each upstream's own count and the gateway takes the cached part out when it answers, using the same price-table breakdown that the USD figure uses. A model the price table does not cover cannot be aligned: its `input` is left as recorded and marked `input_basis: "as_recorded"` (it may include cached tokens). In `llm-gateway stats` such cells, and any total they flow into, carry a `*` with a footnote under the table.
 
 ### `GET /llm-gateway/events`
 
