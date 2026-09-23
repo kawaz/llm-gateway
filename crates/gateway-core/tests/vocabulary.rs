@@ -1,7 +1,6 @@
 //! 汎用層に利用側の語彙が現れないことの判定 (DR-0030 §1、計画 gateway-core-split §3)。
 //!
-//! 読むのは各ファイルの `#[cfg(test)]` より前 (= 実際に動く側) だけ。
-//! 試験の中は実物を模した値を置く場所で、そこに名前が出るのは漏れではない。
+//! 試験もこの crate のコードなので、ファイル全文を読む。試験の値も中立な名前にする。
 
 use std::path::{Path, PathBuf};
 
@@ -52,13 +51,9 @@ fn core_never_uses_consumer_vocabulary() {
     for path in scanned() {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let production = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => &text[..],
-        };
         let name = path.strip_prefix(&src).unwrap_or(&path).display();
 
-        for (number, line) in production.lines().enumerate() {
+        for (number, line) in text.lines().enumerate() {
             let lowered = line.to_lowercase();
             for word in WORDS {
                 if lowered.contains(word) {

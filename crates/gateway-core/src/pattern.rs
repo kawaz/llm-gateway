@@ -45,49 +45,49 @@ mod tests {
 
     #[test]
     fn exact_name() {
-        assert!(matches("claude-opus-5", "claude-opus-5"));
-        assert!(!matches("claude-opus-5", "claude-opus-4-8"));
-        assert!(!matches("claude-opus-5", "claude-opus-50"));
+        assert!(matches("vendor-large-5", "vendor-large-5"));
+        assert!(!matches("vendor-large-5", "vendor-large-4-8"));
+        assert!(!matches("vendor-large-5", "vendor-large-50"));
     }
 
     /// 実際に使う形 (cpa の除外リストと同じ書き方)。
     #[test]
     fn trailing_wildcard() {
-        assert!(matches("claude-opus-*", "claude-opus-5"));
-        assert!(matches("claude-opus-*", "claude-opus-4-1-20250805"));
-        assert!(!matches("claude-opus-*", "claude-sonnet-5"));
+        assert!(matches("vendor-large-*", "vendor-large-5"));
+        assert!(matches("vendor-large-*", "vendor-large-4-1-20250805"));
+        assert!(!matches("vendor-large-*", "vendor-medium-5"));
     }
 
-    /// `claude-opus-4*` は 4 系だけを狙う (5 を巻き込まない)。
+    /// `vendor-large-4*` は 4 系だけを狙う (5 を巻き込まない)。
     #[test]
     fn version_prefix_does_not_over_match() {
-        assert!(matches("claude-opus-4*", "claude-opus-4-8"));
-        assert!(matches("claude-opus-4*", "claude-opus-4-1-20250805"));
-        assert!(!matches("claude-opus-4*", "claude-opus-5"));
+        assert!(matches("vendor-large-4*", "vendor-large-4-8"));
+        assert!(matches("vendor-large-4*", "vendor-large-4-1-20250805"));
+        assert!(!matches("vendor-large-4*", "vendor-large-5"));
     }
 
     #[test]
     fn leading_wildcard() {
-        assert!(matches("*-20250805", "claude-opus-4-1-20250805"));
-        assert!(!matches("*-20250805", "claude-opus-5"));
+        assert!(matches("*-20250805", "vendor-large-4-1-20250805"));
+        assert!(!matches("*-20250805", "vendor-large-5"));
     }
 
     #[test]
     fn surrounding_wildcards() {
-        assert!(matches("*opus*", "claude-opus-5"));
-        assert!(!matches("*opus*", "claude-sonnet-5"));
+        assert!(matches("*large*", "vendor-large-5"));
+        assert!(!matches("*large*", "vendor-medium-5"));
     }
 
     #[test]
     fn multiple_wildcards() {
-        assert!(matches("claude-*-4-*", "claude-opus-4-8"));
-        assert!(matches("claude-*-4-*", "claude-sonnet-4-5-20250929"));
-        assert!(!matches("claude-*-4-*", "claude-opus-5"));
+        assert!(matches("vendor-*-4-*", "vendor-large-4-8"));
+        assert!(matches("vendor-*-4-*", "vendor-medium-4-5-20250929"));
+        assert!(!matches("vendor-*-4-*", "vendor-large-5"));
     }
 
     #[test]
     fn bare_wildcard_matches_everything() {
-        assert!(matches("*", "claude-opus-5"));
+        assert!(matches("*", "vendor-large-5"));
         assert!(matches("*", ""));
     }
 
@@ -107,23 +107,23 @@ mod tests {
 
     #[test]
     fn case_is_significant() {
-        assert!(!matches("claude-opus-*", "Claude-Opus-5"));
+        assert!(!matches("vendor-large-*", "Vendor-Large-5"));
     }
 
     /// 実運用の除外リスト (cpa の設定から)。
     #[test]
     fn realistic_exclusion_list() {
-        let excluded = ["claude-3-*", "claude-opus-4*", "claude-sonnet-4-*"];
+        let excluded = ["vendor-3-*", "vendor-large-4*", "vendor-medium-4-*"];
 
         for hidden in [
-            "claude-3-5-sonnet-20241022",
-            "claude-opus-4-8",
-            "claude-opus-4-1-20250805",
-            "claude-sonnet-4-6",
+            "vendor-3-5-medium-20241022",
+            "vendor-large-4-8",
+            "vendor-large-4-1-20250805",
+            "vendor-medium-4-6",
         ] {
             assert!(matches_any(&excluded, hidden), "{hidden} should be hidden");
         }
-        for shown in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"] {
+        for shown in ["vendor-large-5", "vendor-medium-5", "vendor-small-5"] {
             assert!(!matches_any(&excluded, shown), "{shown} should be shown");
         }
     }
@@ -131,6 +131,6 @@ mod tests {
     #[test]
     fn empty_pattern_list_matches_nothing() {
         let empty: [&str; 0] = [];
-        assert!(!matches_any(&empty, "claude-opus-5"));
+        assert!(!matches_any(&empty, "vendor-large-5"));
     }
 }

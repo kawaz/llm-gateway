@@ -136,6 +136,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - `cache` を禁止語に入れる帰結として、core へ移る credential store の控えの型 `Cached` は段 1 で改名する (例: `Held`)。cache-warden に言及する doc コメント (`credential` の `Persistence` 周り) も言い換える
 - doc コメントも対象にする (DR-0014 側と同じ)。「LLM の場合は…」という説明が core に書かれた時点で、責務が漏れ始めている兆候なので弾いてよい
 - 置き場: `crates/gateway-core/tests/vocabulary.rs` (integration test、`env!("CARGO_MANIFEST_DIR")` から `src` を引く)。`just test` / `just ci` は `--workspace` なので追加の recipe は不要
+- ファイル全文を対象にする (DR-0014 側と違い `#[cfg(test)]` 以降も読む)。試験もこの crate のコードなので、試験の値 (照合する名前・ファイル名) も中立な名前にする
 - 部分一致で誤検知しうる語 (`remodel` 等) は現れた時に単語境界の判定へ変える。先回りで正規表現にはしない
 
 加えて**依存方向**も機械的に縛る: `crates/gateway-core/Cargo.toml` に `llm-gateway` を書けば循環で cargo が拒否するので追加の検査は要らない。ただし `llm-gateway-server` が両方を見る形 (§6.4) では、server 内のコードは判定の対象外になる点を文書に残す。
@@ -149,7 +150,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 完了条件: `crates/gateway-core` が workspace member にあり、`pattern` / `persist` / `credential/time` を移し、`llm-gateway` が `pub use gateway_core::{pattern, ...}` で既存パスを保っている。§3 の語彙テストが入っていて緑
 - 検証: `just ci`。語彙テストに禁止語を 1 語入れたファイルを一時的に置いて赤になることを手元で 1 度確かめる (commit しない)
 - やらないこと: credential / events / stats には触らない。`llm-gateway-server` / `-cli` の `Cargo.toml` は変えない
-- 実施済み: `crates/gateway-core` を新設し `pattern` / `persist` / `credential::time` を移動、`llm-gateway` は `pub use` で既存パスを維持。語彙テストは DR-0014 側に倣い `#[cfg(test)]` より前だけを読む
+- 実施済み: `crates/gateway-core` を新設し `pattern` / `persist` / `credential::time` を移動、`llm-gateway` は `pub use` で既存パスを維持。語彙テストはファイル全文 (試験を含む) を読む
 
 ### 段 0.5: DR-0031 (Store 層) の起草・裁定
 

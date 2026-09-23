@@ -141,7 +141,7 @@ check-outdated-translations: ensure-clean
 check-version-bumped:
     rc=0
     bump-semver vcs diff -q main@origin -- \
-      crates/llm-gateway/src/ crates/llm-gateway-server/src/ crates/llm-gateway-cli/src/ || rc=$?
+      crates/gateway-core/src/ crates/llm-gateway/src/ crates/llm-gateway-server/src/ crates/llm-gateway-cli/src/ || rc=$?
     case "$rc" in
       0) exit 0 ;;
       1) ;;

@@ -108,14 +108,14 @@ mod tests {
     #[test]
     fn a_write_leaves_only_the_finished_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("usage-latest.8402.json");
+        let path = dir.path().join("snapshot-latest.8402.json");
         write_atomically(&path, &serde_json::json!({"a": 1})).unwrap();
 
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["usage-latest.8402.json".to_owned()]);
+        assert_eq!(names, vec!["snapshot-latest.8402.json".to_owned()]);
         assert!(std::fs::read_to_string(&path).unwrap().contains("\"a\""));
     }
 
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn only_our_own_leftovers_are_swept() {
         let dir = tempfile::tempdir().unwrap();
-        let mine = dir.path().join("usage-latest.8402.json.tmp.1234.0");
+        let mine = dir.path().join("snapshot-latest.8402.json.tmp.1234.0");
         let also_mine = dir.path().join("2026-07-30.8402.json.tmp.1234.1");
         let theirs = dir.path().join("2026-07-30.8401.json.tmp.9999.0");
         let finished = dir.path().join("2026-07-30.8402.json");
