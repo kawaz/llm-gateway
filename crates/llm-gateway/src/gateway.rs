@@ -1030,6 +1030,8 @@ impl<P: Persistence> Gateway<P> {
             status,
             usage,
         };
+        // 断られた送り直しは cache を延ばしていないので、寿命を約束しない (DR-0012)。
+        let promised = status / 100 == 2;
         self.events.publish(events::Event::new(
             sent_at_ms,
             &events::Origin {
@@ -1039,8 +1041,9 @@ impl<P: Persistence> Gateway<P> {
                 model: &kept.model,
                 credential: route.name(),
                 origin: RequestOrigin::Keepalive.as_str(),
-                cache_ttl_secs: cache::ttl_secs(Some(CacheStrategy::Keepalive), &kept.body),
-                cache_notice: kept.cache_notice.as_deref(),
+                cache_ttl_secs: cache::ttl_secs(Some(CacheStrategy::Keepalive), &kept.body)
+                    .filter(|_| promised),
+                cache_notice: kept.cache_notice.as_deref().filter(|_| promised),
                 chain: None,
                 breakeven: None,
             },
@@ -1160,15 +1163,17 @@ impl<P: Persistence> Gateway<P> {
 
         // 見ている人へ知らせる (DR-0012)。prompt cache の起点に合わせて、
         // この試行を upstream へ送り始めた時刻を流す。断られた応答も流すので、
-        // status で絞らない。
+        // status で絞らない。ただし断られた 1 本には延ばす cache が無いので、
+        // 寿命は約束しない (控えを置かないのと対称、DR-0027 決定 8)。
+        let promised = resp.response.status / 100 == 2;
         self.events.publish(events::Event::with_skipped(
             sent_at_ms,
             &events::Origin {
                 origin: origin.as_str(),
-                cache_ttl_secs,
-                cache_notice: cache_notice.as_deref(),
-                chain,
-                breakeven,
+                cache_ttl_secs: cache_ttl_secs.filter(|_| promised),
+                cache_notice: cache_notice.as_deref().filter(|_| promised),
+                chain: chain.filter(|_| promised),
+                breakeven: breakeven.filter(|_| promised),
                 ..call.origin(route.name())
             },
             resp.response.status,
@@ -5449,6 +5454,69 @@ main = "keepalive"
         assert_eq!(event.cache_ttl_secs, Some(60 * 60));
     }
 
+    /// 断られた送り直しは、寿命を約束しない (DR-0012)。
+    ///
+    /// cache を延ばしていないのに `cache_expires_at` を出すと、見る側のリングが
+    /// 延びたように見える。
+    #[tokio::test]
+    async fn a_refused_replay_promises_no_cache_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let up = FakeUpstream::start({
+            let answered = Arc::clone(&answered);
+            move |_, _| {
+                if answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (200, body_with_cache(3_000, 0))
+                } else {
+                    (429, r#"{"type":"error"}"#.to_owned())
+                }
+            }
+        })
+        .await;
+        let gw = Arc::new(
+            gateway(&format!(
+                "[stats]\ndir = \"{}\"\n{}",
+                dir.path().display(),
+                keepalive_config(&up.url)
+            ))
+            .await,
+        );
+
+        let (body, headers) = conversation(json!({}));
+        let resp = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body.clone(),
+                headers,
+            )
+            .await
+            .unwrap();
+        drain(&gw, resp).await;
+
+        let kept = keepalive::store::Store::new(dir.path())
+            .load_all()
+            .into_iter()
+            .next()
+            .expect("the conversation is kept");
+        let mut watching = gw.events().subscribe();
+
+        let outcome = gw.send_keepalive(&kept).await;
+        assert!(matches!(outcome, keepalive::Outcome::Unsent));
+
+        let event = announced(watching.try_recv().expect("the replay was announced"));
+        assert_eq!(event.status, 429);
+        assert_eq!(event.origin, "keepalive");
+        assert_eq!(event.cache_ttl_secs, None);
+        assert_eq!(event.cache_expires_at, None);
+        assert_eq!(event.cache_notice, None);
+    }
+
     /// 自送信の 1 本も、送った日の欄に素性 `keepalive` で積まれる
     /// (DR-0027 決定 6、DR-0029)。
     ///
@@ -6198,6 +6266,93 @@ keepalive_horizon = "8h"
                 events::Notice::Response(_) | events::Notice::CacheExpired(_) => continue,
             }
         }
+    }
+
+    /// 断られた試行は寿命を約束しない (DR-0012)。
+    ///
+    /// 断られた 1 本には延ばす cache が無く、控えも置かれない (DR-0027 決定 8)。
+    /// 約束を載せると、取り消す `cache_expired` も出ないので見る側に残り続ける。
+    #[tokio::test]
+    async fn a_refused_attempt_promises_no_cache_lifetime() {
+        let first = FakeUpstream::always(429).await;
+        let last = FakeUpstream::always(529).await;
+        let gw = gateway(&format!(
+            "{}\n[[ns.default.cache]]\nmodels = [\"m\"]\nmain = \"keepalive\"\nkeepalive_horizon = \"8h\"\n",
+            two_credentials(&first.url, &last.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                headers,
+            )
+            .await
+            .unwrap();
+        drain(&gw, forwarded).await;
+
+        for status in [429, 529] {
+            let event = forwarding(&mut watching).await;
+            assert_eq!(event.status, status);
+            assert_eq!(event.origin, "main", "the attempt is still reported");
+            assert_eq!(event.cache_ttl_secs, None);
+            assert_eq!(event.cache_expires_at, None);
+            assert_eq!(event.cache_notice, None);
+            assert_eq!(event.cache_since, None);
+            assert_eq!(event.cache_until, None);
+            assert_eq!(event.next_keepalive_at, None);
+        }
+    }
+
+    /// 1 本目が断られて 2 本目が通ったなら、約束するのは通った 1 本だけ。
+    #[tokio::test]
+    async fn only_the_accepted_attempt_of_a_fallback_promises_a_lifetime() {
+        let first = FakeUpstream::always(429).await;
+        let last = FakeUpstream::start(|_, _| (200, body_with_cache(3_000, 0))).await;
+        let gw = gateway(&format!(
+            "{}\n[[ns.default.cache]]\nmodels = [\"m\"]\nmain = \"keepalive\"\nkeepalive_horizon = \"8h\"\n",
+            two_credentials(&first.url, &last.url)
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        let (body, headers) = conversation(json!({}));
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                headers,
+            )
+            .await
+            .unwrap();
+        drain(&gw, forwarded).await;
+
+        let refused = forwarding(&mut watching).await;
+        assert_eq!(refused.status, 429);
+        assert_eq!(refused.cache_expires_at, None);
+        assert_eq!(refused.cache_notice, None);
+        assert_eq!(refused.cache_until, None);
+
+        let accepted = forwarding(&mut watching).await;
+        assert_eq!(accepted.status, 200);
+        assert_eq!(accepted.cache_expires_at, Some(accepted.ts + 3600 * 1_000));
+        assert!(accepted.cache_notice.is_some());
+        assert!(accepted.cache_until.is_some());
     }
 
     /// 知らせは、送り直しの連鎖を載せる (DR-0012)。
