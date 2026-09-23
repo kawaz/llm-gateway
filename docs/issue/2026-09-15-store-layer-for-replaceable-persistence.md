@@ -60,6 +60,15 @@ DR-0027 の「分散 backend は作らない」は、Raft backend を実際に�
 
 第一候補は cache-warden (kawaz 製)。本来目的で使えるようになった時点で Store 層の backend にする。それまで固定 token 等の静的 secret も、今の credential と同じく生のファイルで置く。
 
+### harnessrouter からの補強 (2026-09-23 追記)
+
+`docs/research/2026-09-23-harnessrouter-gateway.md` §2.1 より。harnessrouter も永続化を一貫性の意味論で切り、さらに idempotency・lease・cancel ラッチの「制御状態」を原子的作成 / CAS / TTL を持つ別 store に分けている。Store 層の DR に足す価値があるもの:
+
+- 操作ごとに **fail-closed か best-effort か** を trait の契約に書く (例: credential の refresh は fail-closed、stats の合算は best-effort)
+- **リースに fencing token** (担当が替わるたびに上がる番号) を入れる。Raft 等に差し替えた時、期限切れの元担当が keepalive を送ってしまうのを防ぐ
+
+真似しない方がよいもの: データの形 (Graph / Blob / Secret) で切る軸。責務 (意味論) で切る本 issue の方針の方が file 実装の見通しにも効く。
+
 ## 受け入れ条件
 
 - [ ] kawaz から着手指示が出たら、Store 層の trait 設計 (単一 writer 更新 / リース / 合算可能カウンタ / LWW スナップショット) を DR として起票する
