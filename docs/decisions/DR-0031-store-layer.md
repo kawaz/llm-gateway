@@ -62,10 +62,10 @@ trait Locked {                // 権利を持つ間だけ書ける
 - **順序の契約**: 書き換えは「`lock` で権利を取る → その権利の下で最新を読み直す → 書く → 権利を手放す」の 1 単位で行う。読み直しは権利を取った**後**にする (取る前に読んだ内容を土台にすると、待っている間に相手が書いたものを消す。DR-0010 のロック区間)。上の案は書き込みを guard のメソッドにして、権利なしでは書けない形にしている
 - `lock` / `store`: **fail-closed**。refresh は失敗したら古い token を使い続けるのでなく失敗を返す (二重 refresh で refresh token を焼く事故を防ぐ)
 - `load`: **fail-closed**。静的 secret と JWKS も、読めなければ認証を通さない
-- `version`: 版を持たない置き場は `None` を返してよい (DR-0010、DR-0022)。版が無いと照合できないので、その控えは次の読み出しで必ず読み直す。版の取得そのものが失敗した時も同じく読み直しに倒す
+- `version`: 版を持たない置き場は `None` を返してよい (DR-0010、DR-0022)。`None` 同士は「変わっていない」とみなし、控えをそのまま使う (DR-0010 の意味論のまま)。版の取得に失敗した時も版なしと区別せず同じ扱いにする
 - 値の型は関連型 (または型パラメータ) にして、OAuth credential と静的 secret と JWKS が同じ backend に乗るようにする。静的 secret と JWKS は refresh しないので、読み手は `load` + `version` だけを使う。流用するのは DR-0010 の「版が変わったら控えを読み直す」機構だけ
 
-既存の `credential::Persistence` が既にこの形をしているので、新しい trait は並べず、段 1 で core へ移すときにこれを (1) として位置づける (`gateway-core-split.md` §5)。
+新しい trait は並べず、既存の `credential::Persistence` を guard 付きに拡張して、段 1 で core へ移すときにこれを (1) として位置づける (`gateway-core-split.md` §5)。
 
 #### (2) リース — `LeaseStore`
 
@@ -93,7 +93,7 @@ writer ごとに自分の分だけを書き、読む時に全 writer 分を merg
 ```rust
 trait CounterStore<C: Mergeable> {
     fn write_own(&self, writer, bucket, value: &C) -> Result<()>;
-    fn read_merged(&self, bucket) -> Result<C>;
+    fn read_merged(&self, bucket) -> Result<Merged<C>>;  // Merged { value, missing }
 }
 ```
 
@@ -117,7 +117,7 @@ trait SnapshotStore<T> {
 }
 ```
 
-これは**目標の意味論**で、今の usage スナップショットはまだ LWW ではない (Context の表)。file backend をこの契約に合わせる時に、他の writer の分も読んで `observed_at` で比べる形に直す。
+これは**目標の意味論**で、今の usage スナップショットはまだ LWW ではない (Context の表)。LWW は trait の契約として固定するが、file backend の実装は分割の段 1 では今のプロセス別スナップショット (自分の分だけ読み戻す) のままで、挙動は変えない。writer を横断して `observed_at` で比べる読み出しは分割の範囲外の後続 (2 つ目の backend を入れる時か、その前の独立した変更) で入れる (`gateway-core-split.md` §4)。
 
 - **writer の識別子を引数に持つ**。どの writer の観測かを backend が知らないと、同じ鍵への複数 writer の書き込みを区別できない
 - **時刻源は値に付いた `observed_at`** (gateway が上流の応答を観測した時刻) で、書き込んだ時刻ではない。遅れて届いた古い観測が新しい観測を上書きしないため
@@ -157,7 +157,7 @@ trait SnapshotStore<T> {
 
 - **使わない抽象を先に切るコスト (YAGNI)**: 今 backend は file しか無い。ただし切る位置を意味論に置くと、file 実装の側でも「どの器がどの保証に頼っているか」が型に現れ、見通しが良くなる。HA に進まなくても損にならないと判断する。その上で、実際に trait を切るのは (1) から順に、使う時点まで遅らせる (§5)
 - **Raft backend を入れる時は DR-0027 を supersede する**: DR-0027 の「分散 backend は作らない」とは、Store 層を切ること自体は衝突しない。Raft backend は (1)(2) だけを log に載せ、(3)(4) は複製で済む見立て (keepalive の本文のような 2 MB 級の控えは log に載せない)
-- **fencing token は file backend でも保存して比較する**: flock の排他は `Claim` guard の存命中だけなので、guard を落とした元担当が控えを書き戻す窓は単一ホストでも生じる。今の keepalive の `save` は `Claim` も token も要求していないので、段 1 で `put_fenced` の形に直す対象になる
+- **fencing token は file backend でも保存して比較する**: flock の排他は `Claim` guard の存命中だけなので、guard を落とした元担当が控えを書き戻す窓は単一ホストでも生じる。今の keepalive の `save` は `Claim` も token も要求していないので、`save` に Claim / token を要求する変更は、リースを trait として切る後続の段で行う (`gateway-core-split.md` §4 でリースは分割の範囲外)。それまでの間、控えの `save` は今のとおり Claim を要求せず、二重送出の抑止は claim と `fires_at_ms` の検出に依る
 - **送信の二重は token では防げない**: upstream への送信は今の claim と `fires_at_ms` の検出のまま。複数ホストの backend でもこの検出は要る
 - **fail-closed の操作が増える backend では可用性が下がる**: Raft 等で quorum を失うと (1)(2) が止まる。これは契約通り (refresh と発火は止まるのが正しい) だが、転送自体は (1) の読み出しが通る限り続くことを backend 側で保つ必要がある
 - 静的 secret と JWKS は (1) に載るので、cache-warden への移行は backend の variant 追加で済み、読む側は変えない (DR-0030 §5)
