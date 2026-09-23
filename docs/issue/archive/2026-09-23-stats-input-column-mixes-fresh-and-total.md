@@ -1,6 +1,6 @@
 ---
 title: stats の input 列が Anthropic 行 (cache 除外) と OpenAI 行 (cache 込み総数) で意味が違う
-status: wip
+status: resolved
 category: design
 created: 2026-09-23T21:25:58+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-09-24T00:06:27+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-24T00:18:19+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0029","implemented:実装 (ab22273e) — 蓄積は upstream の usage のまま、gateway の出口 (stats::report、CLI / HTTP 共通) で input から宣言済みの内数 (cached / cache_write) を引いて cache 除外入力に揃える。単価表に無いモデルは加工せず input_basis=as_recorded で印 (CLI は * と脚注)。USD は不変 (実データ 2 日分で検算一致)"]
 blocked_by:
 origin: 自リポ TODO
 ---
