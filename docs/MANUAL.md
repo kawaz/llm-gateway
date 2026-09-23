@@ -229,10 +229,10 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 
 ### `GET /llm-gateway/self`
 
-Reports the state of **this running process**: its version and how many events (`/llm-gateway/events` and webhook) it dropped because a watcher could not keep up, counted since it started. `events.dropped` is present even when it is 0. `daemon status` fills each row from this.
+Reports the state of **this running process**: its version, its start marker (`boot`, the start time in Unix ms; it changes on restart), and how many events (`/llm-gateway/events` and webhook) it dropped because a watcher could not keep up, counted since it started. `events.dropped` is present even when it is 0. `daemon status` fills each row from this.
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","events":{"dropped":0}}
+curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
 ```
 
 ### `GET /llm-gateway/usage`
@@ -382,8 +382,11 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
+id: 42
+data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
+
+`seq` is a **gateway-wide sequence number**: it starts at 1 when the process starts and goes up by one for every event of any type (`request` / `response` / `cache_expired`), so every watcher sees the same event under the same number. It is also sent as the SSE `id:`. A watcher that receives something other than the previous `seq` + 1 has missed events in between (the count of what was dropped is `events.dropped` in `/llm-gateway/self`; where the gap is shows in `seq`). The gateway keeps no history, so a reconnecting `Last-Event-ID` is ignored and nothing is replayed. `boot` identifies the process start (Unix ms, the same value as `boot` in `/llm-gateway/self`); when it changes, `seq` has restarted from 1 and the jump is not a loss. Webhook deliveries carry the same two fields on every item.
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which conversation series a request belongs to; when it cannot be derived, the field is omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in the Responses shape is `codex`, and the gateway's own resend is `keepalive`). `cache_ttl_secs` is **how long the prefix this request leaves behind lives**, in seconds: it follows the strategy that was applied, and for an untouched body it reads the `cache_control` that was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300). `cache_expires_at` is that moment. A request that leaves no breakpoint omits both, and so does an attempt the upstream refused (non-2xx): it placed no cache, so it promises no lifetime and carries none of the `cache_*` fields below either. If routes were skipped during route selection, `skipped` lists each credential and the reason.
 
@@ -404,7 +407,8 @@ When the response body closes, a second notice says how the turn ended.
 
 ```
 event: response
-data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
+id: 43
+data: {"type":"response","ts":1785326412000,"seq":43,"boot":1785320000000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
 `request_ts` is the `ts` of the matching `request` notice, so the two pair up one to one even when several requests run on the same conversation. The identity fields (`session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status`) carry the same values as that notice. `stop_reason` is whatever word the upstream used (`end_turn` / `tool_use` / `max_tokens` …), passed through untouched; `end_turn` means that client is back to waiting for input. `aborted` says whether the body failed to reach its end (a client pressing Esc lands here) and is **always** present. A body that was cut short says nothing about how it ended, so `stop_reason` is omitted there.
@@ -417,7 +421,8 @@ Every notice that promises a lifetime (a `request` carrying `cache_expires_at`) 
 
 ```
 event: cache_expired
-data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
+id: 57
+data: {"type":"cache_expired","ts":1785330001000,"seq":57,"boot":1785320000000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
 ```
 
 A receiver keeps the latest `cache_notice` per (conversation, series) and zeroes its countdown only when `of` matches it; otherwise it does nothing, because that promise has already been replaced by a newer one. Several gateways can watch the same series without confusing each other, since each names only its own promises. The end of the window it keeps resending for (`keepalive_horizon`) does not produce this notice: resending merely stops, and the cache the last resend placed lives on until `cache_until`.

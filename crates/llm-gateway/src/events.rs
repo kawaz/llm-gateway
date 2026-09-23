@@ -14,8 +14,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::broadcast;
 
@@ -50,6 +50,11 @@ pub struct Event {
     ///
     /// 連鎖 (`cache_*`) から見れば、ここが「今」になる。
     pub ts: i64,
+    /// gateway 全体の通し番号 ([`Events::publish`] が振る)。起動からの連番で、
+    /// 最初の 1 件が 1。前に受けた番号 + 1 でなければ、間が欠けている。
+    pub seq: u64,
+    /// どの起動の番号か ([`Events::boot`])。変わったら `seq` は振り直し。
+    pub boot: i64,
     /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
     pub session_id: Option<String>,
     /// どの namespace 宛か。
@@ -158,6 +163,9 @@ impl Event {
     ) -> Self {
         Self {
             ts: ts_ms,
+            // 番号は流すときに振る ([`Events::publish`])。
+            seq: 0,
+            boot: 0,
             session_id: origin.session_id.map(str::to_owned),
             ns: origin.ns.to_owned(),
             model: origin.model.to_owned(),
@@ -275,6 +283,11 @@ pub struct Response {
     pub kind: String,
     /// この知らせの時刻 = 本文が閉じた (または切れた) 瞬間。
     pub ts: i64,
+    /// gateway 全体の通し番号 ([`Events::publish`] が振る)。起動からの連番で、
+    /// 最初の 1 件が 1。前に受けた番号 + 1 でなければ、間が欠けている。
+    pub seq: u64,
+    /// どの起動の番号か ([`Events::boot`])。変わったら `seq` は振り直し。
+    pub boot: i64,
     /// 対応する [`Event`] の [`Event::ts`]。同じ会話で何本も走るので、
     /// 素性が同じでも 1 対 1 に結べるようにする。
     pub request_ts: i64,
@@ -321,6 +334,8 @@ impl Response {
             kind: Self::KIND.to_owned(),
             // 本文が終わった時刻は、まだ来ていない ([`Self::settle`] が埋める)。
             ts: 0,
+            seq: 0,
+            boot: 0,
             request_ts,
             session_id: origin.session_id.map(str::to_owned),
             prefix: origin.prefix.map(str::to_owned),
@@ -364,6 +379,11 @@ pub struct CacheExpired {
     pub kind: String,
     /// 消えたと分かった時刻 (Unix ミリ秒)。
     pub ts: i64,
+    /// gateway 全体の通し番号 ([`Events::publish`] が振る)。起動からの連番で、
+    /// 最初の 1 件が 1。前に受けた番号 + 1 でなければ、間が欠けている。
+    pub seq: u64,
+    /// どの起動の番号か ([`Events::boot`])。変わったら `seq` は振り直し。
+    pub boot: i64,
     /// どの会話か。
     pub session_id: String,
     /// その会話のどの系列か ([`prefix`])。
@@ -380,6 +400,8 @@ impl CacheExpired {
         Self {
             kind: Self::KIND.to_owned(),
             ts: ts_ms,
+            seq: 0,
+            boot: 0,
             session_id: session_id.to_owned(),
             prefix: prefix.to_owned(),
             of: of.to_owned(),
@@ -413,6 +435,26 @@ impl Notice {
             Self::Request(_) => "request",
             Self::Response(_) => Response::KIND,
             Self::CacheExpired(_) => CacheExpired::KIND,
+        }
+    }
+
+    /// 通し番号と起動の印を押す。押すのは流す 1 箇所 ([`Events::publish`]) だけ。
+    fn stamp(&mut self, seq: u64, boot: i64) {
+        let (to_seq, to_boot) = match self {
+            Self::Request(event) => (&mut event.seq, &mut event.boot),
+            Self::Response(response) => (&mut response.seq, &mut response.boot),
+            Self::CacheExpired(expired) => (&mut expired.seq, &mut expired.boot),
+        };
+        *to_seq = seq;
+        *to_boot = boot;
+    }
+
+    /// gateway 全体の通し番号 ([`Events::publish`] が振った値)。
+    pub fn seq(&self) -> u64 {
+        match self {
+            Self::Request(event) => event.seq,
+            Self::Response(response) => response.seq,
+            Self::CacheExpired(expired) => expired.seq,
         }
     }
 
@@ -488,6 +530,15 @@ fn short_hash(text: &str) -> String {
 /// 見ている人へ配る口。
 pub struct Events {
     tx: broadcast::Sender<Notice>,
+    /// 最後に振った通し番号。
+    ///
+    /// Design rationale: 原子的な加算ではなく錠で持つ。番号を振ってから流す
+    /// までの間に別の送り手が割り込むと、番号の順と届く順が入れ替わり、見る側が
+    /// 「欠けた」と誤読する。錠の中で振って流せば、届く順 = 番号の順になる。
+    /// 流すのは溜め置きへの書き込みだけで待たないので、錠を持つ時間は短い。
+    seq: Mutex<u64>,
+    /// この起動の印 (口を作った時刻、Unix ミリ秒)。
+    boot: i64,
     /// 見ている人が追いつけずに落とした数 (起動からの累積、全員の合計)。
     dropped: Arc<AtomicU64>,
 }
@@ -502,6 +553,8 @@ impl Events {
     pub fn new() -> Self {
         Self {
             tx: broadcast::Sender::new(BACKLOG),
+            seq: Mutex::new(0),
+            boot: crate::credential::time::now_unix_ms(),
             dropped: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -510,8 +563,21 @@ impl Events {
     ///
     /// 誰も見ていなければ何もしない。**転送の邪魔をしないこと**が第一で、
     /// 配れなかったことを転送側へ持ち帰らない (待たない・失敗にしない)。
+    ///
+    /// 番号はここで振る。誰も見ていなくても進める — 見る側が比べるのは
+    /// 自分が受け取った番号同士なので、繋ぐ前の分は比較に現れない。
     pub fn publish(&self, notice: impl Into<Notice>) {
-        let _ = self.tx.send(notice.into());
+        let mut notice = notice.into();
+        let mut seq = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
+        *seq += 1;
+        notice.stamp(*seq, self.boot);
+        let _ = self.tx.send(notice);
+    }
+
+    /// この起動の印。再起動で通し番号が 1 に戻ったことを、見る側がこれの
+    /// 変化で知る。
+    pub fn boot(&self) -> i64 {
+        self.boot
     }
 
     /// 見る側に回る。届くのは**これ以降**の分だけ。
@@ -602,6 +668,60 @@ mod tests {
     }
 
     /// 誰も見ていなくても、流す側は何も気にしない。
+    /// 流した順に 1 から番号が振られ、種類をまたいでも同じ列で数える。
+    #[tokio::test]
+    async fn every_notice_gets_the_next_number() {
+        let events = Events::new();
+        let mut watching = events.subscribe();
+        events.publish(Event::new(NOW, &from("a"), 200));
+        events.publish(CacheExpired::new(NOW, "s-1", "2cf24dba", "n-1"));
+        events.publish(Event::new(NOW, &from("b"), 200));
+
+        let mut seqs = Vec::new();
+        for _ in 0..3 {
+            let got = watching.recv().await.unwrap();
+            assert_eq!(serde_json::to_value(&got).unwrap()["boot"], events.boot());
+            seqs.push(got.seq());
+        }
+        assert_eq!(seqs, [1, 2, 3]);
+    }
+
+    /// 遅れて落とした見る側は、次に受け取る番号の飛びで欠けたと分かる。
+    #[tokio::test]
+    async fn a_gap_in_the_numbers_shows_what_was_dropped() {
+        let events = Events::new();
+        let mut watching = events.subscribe();
+        let total = BACKLOG as u64 + 10;
+        for _ in 0..total {
+            events.publish(Event::new(NOW, &from("a"), 200));
+        }
+
+        let first = loop {
+            match watching.recv().await {
+                Ok(notice) => break notice,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert_eq!(first.seq(), total - BACKLOG as u64 + 1);
+        assert_eq!(
+            first.seq() - 1,
+            events.dropped(),
+            "the gap is what was dropped"
+        );
+    }
+
+    /// 番号は JSON で時刻の隣に出る。
+    #[test]
+    fn the_number_sits_next_to_the_time() {
+        let events = Events::new();
+        let mut watching = events.subscribe();
+        events.publish(Event::new(NOW, &from("a"), 200));
+        let sent = serde_json::to_string(&watching.try_recv().unwrap()).unwrap();
+        let head = format!(r#"{{"ts":{NOW},"seq":1,"boot":{},"#, events.boot());
+        assert!(sent.starts_with(&head), "{sent}");
+    }
+
     #[test]
     fn publishing_to_nobody_is_fine() {
         let events = Events::new();
@@ -940,6 +1060,9 @@ mod tests {
             serde_json::to_value(&forwarded).unwrap(),
             json!({
                 "ts": NOW,
+                // まだ流していない 1 件は番号を持たない ([`Events::publish`] が振る)。
+                "seq": 0,
+                "boot": 0,
                 "session_id": "s-1",
                 "ns": "personal",
                 "model": "claude-opus-5",
@@ -983,6 +1106,8 @@ mod tests {
             serde_json::to_value(&answered).unwrap(),
             json!({
                 "ts": NOW + 55 * MINUTE,
+                "seq": 0,
+                "boot": 0,
                 "session_id": "s-1",
                 "ns": "personal",
                 "model": "claude-opus-5",
@@ -1007,6 +1132,8 @@ mod tests {
             json!({
                 "type": "cache_expired",
                 "ts": NOW + HOUR,
+                "seq": 0,
+                "boot": 0,
                 "session_id": "s-1",
                 "prefix": "2cf24dba",
                 "of": "n0tice",
@@ -1131,6 +1258,9 @@ mod tests {
             json!({
                 "type": "response",
                 "ts": NOW + 8 * 1_000,
+                // まだ流していない 1 件は番号を持たない ([`Events::publish`] が振る)。
+                "seq": 0,
+                "boot": 0,
                 "request_ts": NOW,
                 "session_id": "s-1",
                 "prefix": "2cf24dba",

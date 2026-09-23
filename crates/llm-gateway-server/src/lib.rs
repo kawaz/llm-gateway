@@ -282,6 +282,7 @@ async fn version() -> Response {
 async fn self_report<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
     json_utf8(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "boot": gateway.events().boot(),
         "events": { "dropped": gateway.events().dropped() },
     })))
 }
@@ -391,11 +392,15 @@ async fn events<P: Persistence + 'static>(
 
 /// 1 件を SSE の 1 通にする。
 ///
+/// `id:` には通し番号を載せる。再接続する EventSource は `Last-Event-ID` で
+/// これを返してくるが、履歴を持たないので読まない (送り直さない)。
+///
 /// 載せるのは自分で組み立てた構造体だけなので、JSON にできない事態は
 /// 起きない。それでも配信を止めないよう、万一のときは空の 1 通を送る。
 fn sse_line(notice: &llm_gateway::events::Notice) -> SseEvent {
     SseEvent::default()
         .event(notice.name())
+        .id(notice.seq().to_string())
         .json_data(notice)
         .unwrap_or_else(|e| {
             error!(%e, "cannot serialize the event to JSON");
@@ -1258,10 +1263,68 @@ content-length: {declared}\r\n\r\n{head}"
             .json()
             .await
             .unwrap();
+        let boot = answered["boot"].as_i64().expect("boot is a Unix ms number");
         assert_eq!(
             answered,
-            json!({"version": env!("CARGO_PKG_VERSION"), "events": {"dropped": 0}})
+            json!({"version": env!("CARGO_PKG_VERSION"), "boot": boot, "events": {"dropped": 0}})
         );
+    }
+
+    /// SSE の `id:` は通し番号で、中身の `seq` と揃う。`boot` は `/self` と同じ値。
+    #[tokio::test]
+    async fn the_sse_id_is_the_number_and_the_boot_matches_self() {
+        let config: llm_gateway::Config = toml::from_str("[ns.default]\n").unwrap();
+        let gateway = Arc::new(Gateway::new(&config, crate::tests::StaticStore).unwrap());
+        let events = Arc::clone(gateway.events());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(gateway).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let mut watching = reqwest::get(format!("{base}/llm-gateway/events"))
+            .await
+            .unwrap();
+        while events.watchers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        for n in 0..2 {
+            events.publish(llm_gateway::events::CacheExpired::new(
+                1_785_600_000_000,
+                "s-1",
+                "2cf24dba",
+                &format!("n-{n}"),
+            ));
+        }
+        let mut text = String::new();
+        while text.matches("data:").count() < 2 {
+            let chunk = watching.chunk().await.unwrap().expect("still streaming");
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let mut id = None;
+        let mut seen = Vec::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("id:") {
+                id = Some(value.trim().parse::<u64>().unwrap());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                let data: Value = serde_json::from_str(data.trim()).unwrap();
+                assert_eq!(Some(data["seq"].as_u64().unwrap()), id, "{text}");
+                assert_eq!(data["boot"], answered["boot"], "{text}");
+                seen.push(id.take().unwrap());
+            }
+        }
+        assert_eq!(seen, [1, 2]);
     }
 
     /// 追いつけない見る側の分を落としたら、落とした数が `/self` に積もる。
@@ -1539,10 +1602,18 @@ routes = ["a"]
             .expect("one delivery arrives");
         let text = String::from_utf8(chunk.to_vec()).unwrap();
 
-        let (kind, data) = text.trim_end().split_once('\n').expect("2 lines");
-        assert_eq!(kind, "event: request");
-        let event: Value =
-            serde_json::from_str(data.strip_prefix("data: ").expect("a data line")).unwrap();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no `{name}` line:\n{text}"))
+        };
+        assert_eq!(field("event: "), "request");
+        let event: Value = serde_json::from_str(field("data: ")).unwrap();
+        assert_eq!(
+            field("id: "),
+            event["seq"].to_string(),
+            "the SSE id is the seq"
+        );
 
         assert_eq!(event["session_id"], "s-1", "the conversation is known");
         assert_eq!(event["ns"], "default");
@@ -1701,10 +1772,11 @@ routes = ["a"]
         while let Some(chunk) = watching.chunk().await.unwrap() {
             seen.push_str(std::str::from_utf8(&chunk).unwrap());
             for notice in seen.split("\n\n") {
-                let Some((kind, data)) = notice.trim_end().split_once('\n') else {
+                let mut lines = notice.lines();
+                let Some(kind) = lines.next() else {
                     continue;
                 };
-                let Some(data) = data.strip_prefix("data: ") else {
+                let Some(data) = lines.find_map(|line| line.strip_prefix("data: ")) else {
                     continue;
                 };
                 if kind == wanted {

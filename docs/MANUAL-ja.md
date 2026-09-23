@@ -231,10 +231,10 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 
 ### `GET /llm-gateway/self`
 
-**走っているこのプロセスの状態**を返す。版と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。`daemon status` の各行はここから埋める。
+**走っているこのプロセスの状態**を返す。版と、起動の印 (`boot`、起動時刻の Unix ミリ秒。再起動で変わる) と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。`daemon status` の各行はここから埋める。
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","events":{"dropped":0}}
+curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
 ```
 
 ### `GET /llm-gateway/usage`
@@ -384,8 +384,11 @@ curl -sSN http://127.0.0.1:8402/llm-gateway/events
 
 ```
 event: request
-data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
+id: 42
+data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
+
+`seq` は **gateway 全体の通し番号**で、起動から 1 ずつ増える (最初の 1 件が 1)。`request` / `response` / `cache_expired` の種類をまたいで同じ列を数えるので、どの見物人も同じ知らせを同じ番号で受け取る。SSE の `id:` にも同じ値が載る。前に受けた `seq` + 1 でない番号が来たら間が欠けている (落とした数は `/llm-gateway/self` の `events.dropped`、どこが欠けたかは `seq` の飛び)。gateway は履歴を持たないので、再接続時の `Last-Event-ID` は読まず、送り直さない。`boot` は起動の印 (Unix ミリ秒、`/llm-gateway/self` の `boot` と同じ値) で、変わったら `seq` が 1 から振り直されたと読む (欠落ではない)。webhook の各件も同じ 2 欄を持つ。
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。
 
@@ -406,7 +409,8 @@ data: {"ts":1785326400000,"session_id":"s-1","ns":"default","model":"claude-opus
 
 ```
 event: response
-data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
+id: 43
+data: {"type":"response","ts":1785326412000,"seq":43,"boot":1785320000000,"request_ts":1785326400000,"session_id":"s-1","prefix":"3f9a1c02","ns":"default","model":"claude-opus-5","credential":"personal","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
 ```
 
 `request_ts` は対応する `request` の `ts` で、同じ会話で何本も走っていても 1 対 1 に結べる。素性 (`session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status`) は `request` と同じ値が載る。`stop_reason` は upstream が言った終わり方をそのまま写したもの (`end_turn` / `tool_use` / `max_tokens` …) で、`end_turn` ならそのクライアントは入力待ちに戻っている。`aborted` は本文が最後まで流れなかったか (クライアントが Esc で切った場合がこれ) で、**常に** 出る。切れた 1 本に終わり方は載らないので、`stop_reason` は欄ごと出ない。
@@ -419,7 +423,8 @@ data: {"type":"response","ts":1785326412000,"request_ts":1785326400000,"session_
 
 ```
 event: cache_expired
-data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
+id: 57
+data: {"type":"cache_expired","ts":1785330001000,"seq":57,"boot":1785320000000,"session_id":"s-1","prefix":"3f9a1c02","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
 ```
 
 受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚えておき、`of` がそれと一致したときだけ残りを 0 にする。一致しなければ何もしない — その約束は既に新しいもので置き換わっている (同じ系列を複数の gateway が見ていても、各 gateway は自分の約束にしか名前を振らないので取り違えない)。控え続ける期間 (`keepalive_horizon`) が終わっただけでは流れない。継ぎ足すのをやめるだけで、最後に送った 1 本が置いた cache は `cache_until` まで生きているため。

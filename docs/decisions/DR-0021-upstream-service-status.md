@@ -33,7 +33,7 @@ CLI は `llm-gateway status [--refresh] [--config <path>]` とし、usage と同
 | endpoint | 答える問い | upstream access |
 |---|---|---|
 | `/llm-gateway/healthz` | この daemon は要求を受けられるか | しない |
-| `/llm-gateway/self` | 走っている本人の状態 (版・落とした event 数) | しない |
+| `/llm-gateway/self` | 走っている本人の状態 (版・起動の印 `boot`・落とした event 数) | しない |
 | `/llm-gateway/status` | configured upstream は現在使えそうか | cache refresh 時のみ |
 | `/llm-gateway/usage` | credential の枠はどれだけ残っているか | `refresh=true` 時のみ |
 

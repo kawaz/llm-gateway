@@ -53,7 +53,8 @@ SSE の `data` と webhook の JSON 要素は同じ型を使う。webhook は常
 
 ```
 event: request
-data: {"ts":1785600000000,"session_id":"s-1","ns":"personal",
+id: 42
+data: {"ts":1785600000000,"seq":42,"boot":1785590000000,"session_id":"s-1","ns":"personal",
        "model":"claude-opus-5","credential":"claude-kawazzz","status":200,
        "prefix":"2cf24dba","origin":"main","cache_ttl_secs":3600,
        "cache_expires_at":1785603600000,
@@ -63,6 +64,8 @@ data: {"ts":1785600000000,"session_id":"s-1","ns":"personal",
 ```
 
 - `ts` — **この知らせの時刻** = upstream へリクエストを送り始めた瞬間。5 分はここから。他の意味を持つ時刻と違い、ログ共通の「その出来事の時刻」なので名前は `ts` のまま
+- `seq` — **gateway 全体の通し番号**。起動から 1 ずつ増え、最初の 1 件が 1。`request` / `response` / `cache_expired` の 3 種で同じ列を数え、見物人ごとではなく流す 1 箇所で振るので、複数の見物人が同じ知らせを同じ番号で突き合わせられる。SSE では同じ値を `id:` にも載せる (再接続する EventSource が `Last-Event-ID` で返してくるが、履歴を持たないので読まない・送り直さない)
+- `boot` — **どの起動の番号か** (その gateway が起動した時刻、Unix ミリ秒)。再起動で `seq` は 1 に戻るので、`boot` が変わったら番号の振り直しと読む。`/llm-gateway/self` の `boot` と同じ値
 - `session_id` — リクエストヘッダ `X-Claude-Code-Session-Id` の値 (大文字小文字は問わない)。名乗らないクライアント (curl 等) では `null`。欄自体は必ず出す — 欠けさせると、読む側が形を 2 通り扱うことになる
 - `ns` / `model` / `credential` — どの面の・どのモデルが・どの経路に当たったか。`model` は解決後の実名 (`opus` のような短い名前はここでは解決済み)
 - `status` — upstream が返した状態
@@ -95,7 +98,9 @@ data: {"ts":1785600000000,"session_id":"s-1","ns":"personal",
 
 ```
 event: response
-data: {"type":"response","ts":1785600012000,"request_ts":1785600000000,
+id: 43
+data: {"type":"response","ts":1785600012000,"seq":43,"boot":1785590000000,
+       "request_ts":1785600000000,
        "session_id":"s-1","prefix":"2cf24dba","ns":"personal",
        "model":"claude-opus-5","credential":"claude-kawazzz","origin":"main",
        "status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
@@ -103,6 +108,7 @@ data: {"type":"response","ts":1785600012000,"request_ts":1785600000000,
 
 - `type` — 種類の印。`request` の知らせだけが印を持たない (先にあったので、後から足すと読む側が壊れる)
 - `ts` — **この知らせの時刻** = 本文が閉じた、または切れた瞬間
+- `seq` / `boot` — `request` と同じ規則 (1 つの列で数える)
 - `request_ts` — 対応する `request` の `ts`。同じ会話で何本も走るので、素性が同じでも 1 対 1 に結べるようにする
 - `session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status` — 対応する `request` と同じ値。見る側に 2 通の突き合わせを強いない
 - `stop_reason` — upstream が言った終わり方を**そのまま写す**。こちらで語彙の一覧を持つと、増えた語を落とす。載っていなければ欄ごと出さない (途中で切れた場合がこれ)
@@ -150,7 +156,9 @@ data: {"ts":1785326400000,…,"cache_ttl_secs":3600,
 
 ```
 event: cache_expired
-data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1",
+id: 57
+data: {"type":"cache_expired","ts":1785330001000,"seq":57,"boot":1785320000000,
+       "session_id":"s-1",
        "prefix":"2cf24dba","of":"kUu1xR4-tQ9nSp2Zc0dBvA"}
 ```
 
@@ -188,6 +196,8 @@ data: {"type":"cache_expired","ts":1785330001000,"session_id":"s-1",
 - **転送の邪魔をしない**のが第一。誰も見ていなければ送らず、配れなかったことを転送側へ持ち帰らない (待たない・失敗にしない)
 - 溜めておけるのは 256 件。追いつけない見物人の分は**落とす**。5 分の残りを数える相手に、遅れて届いた開始時刻を渡しても使い道がない。落とした数は gateway 側のログに残す
 - 落とした数は `/llm-gateway/self` の `events.dropped` と `daemon status` の各行の `events.dropped` に累積 (その gateway の起動から、全見物人と webhook 送出の合計) で出る。0 でも欄は出す
+- **落とした数は `/self` の `events.dropped`、どこが欠けたかは `seq` の飛び**で分かる。見る側は、前に受けた `seq` + 1 でない番号が来たら間が欠けたと判定する (`boot` が変わった場合は振り直しで、欠落ではない)。誰も見ていない間も番号は進むので、繋いだ直後の 1 件が 1 とは限らない — 比べるのは自分が受け取った番号同士
+- webhook 送出も同じ知らせを送るので、1 通の配列に入った各件がそれぞれ自分の `seq` / `boot` を持つ
 - **過去には遡らない**。繋いだ時点で既に過ぎている分を配っても数え直せない
 
 ### 認証は掛けない。keepalive は 20 秒

@@ -498,6 +498,16 @@ mod tests {
 
         assert_eq!(sent.len(), 10, "10 items arrive in a single delivery");
         assert_eq!(
+            sent.iter().map(Notice::seq).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>(),
+            "each item carries its own number"
+        );
+        assert!(
+            sent.iter()
+                .all(|notice| request(notice).boot == events.boot()),
+            "each item carries the boot"
+        );
+        assert_eq!(
             receiver.deliveries().len(),
             1,
             "only a single connection too"
