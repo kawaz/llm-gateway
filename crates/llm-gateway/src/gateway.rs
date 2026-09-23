@@ -7262,4 +7262,287 @@ models = ["m"]
                 .is_empty()
         );
     }
+
+    // ---------------------------------------------------------------------
+    // 本文の逐次 flush
+    // ---------------------------------------------------------------------
+
+    /// 1 つ届けるたびに、受け取ったと言われるまで次を送らない SSE upstream。
+    ///
+    /// gateway が本文を溜め込んでから流すと、最初の chunk がクライアントへ届かず
+    /// 合図が来ないので、upstream は 2 つ目を送れないまま止まる。届いたかを時間の
+    /// 広がりで測らないのは、負荷の高い機械で到着が詰まっても誤って落ちない
+    /// ようにするため — 遅くなるだけで順序は崩れない。
+    struct PacedUpstream {
+        url: String,
+        /// クライアントが受け取った chunk の数を upstream へ伝える合図。
+        received: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl PacedUpstream {
+        async fn start(chunks: &'static [&'static str]) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let received = Arc::new(tokio::sync::Semaphore::new(0));
+            let gate = Arc::clone(&received);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let gate = Arc::clone(&gate);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                        let mut buf = vec![0u8; 65536];
+                        let read = sock.read(&mut buf).await.unwrap_or(0);
+                        if buf[..read].starts_with(b"GET ") {
+                            let resp = format!(
+                                "HTTP/1.1 200 X\r\ncontent-type: application/json\r\n\
+content-length: {}\r\nconnection: close\r\n\r\n{MODELS}",
+                                MODELS.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                            return;
+                        }
+                        // 長さを名乗らず、閉じるまでを本文にする。
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 X\r\ncontent-type: text/event-stream\r\n\
+connection: close\r\n\r\n",
+                            )
+                            .await;
+                        for (i, chunk) in chunks.iter().enumerate() {
+                            if i > 0 {
+                                gate.acquire().await.expect("never closes").forget();
+                            }
+                            let _ = sock.write_all(chunk.as_bytes()).await;
+                            let _ = sock.flush().await;
+                        }
+                    });
+                }
+            });
+            Self {
+                url: format!("http://{addr}"),
+                received,
+            }
+        }
+    }
+
+    /// 本文を読みながら、chunk が 1 つ揃うたびに upstream へ次を許す。
+    ///
+    /// 読み出しはサーバが中継するときと同じく [`exchange::observe`] を通す
+    /// (usage の読み取りも挟まった状態で測る)。返すのは読み切った本文。
+    ///
+    /// 待ちに上限を置くのは、溜め込みで詰まったときにテストを終わらせるため
+    /// だけ。届く順序の判定には使っていない。
+    async fn read_paced(
+        gw: &Gateway<StaticStore>,
+        forwarded: Forwarded,
+        up: &PacedUpstream,
+        markers: &[&str],
+    ) -> String {
+        let mut body = exchange::observe(
+            forwarded.response.body,
+            forwarded.usage,
+            Arc::clone(gw.stats()),
+            exchange::Attribution {
+                at: now_unix(),
+                credential: forwarded.credential.as_ref().map(CredentialId::as_str),
+                model: &forwarded.model,
+                origin: &forwarded.origin,
+            },
+            tracing::Span::none(),
+        )
+        .with_completion(forwarded.completion);
+
+        let mut seen = String::new();
+        for (i, marker) in markers.iter().enumerate() {
+            while !seen.contains(marker) {
+                let next = tokio::time::timeout(std::time::Duration::from_secs(30), body.next())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "chunk {i} ({marker}) did not reach the client while upstream \
+                             held back the next one; the body is being buffered. got: {seen:?}"
+                        )
+                    });
+                let bytes = next
+                    .unwrap_or_else(|| panic!("the body ended before chunk {i}: {seen:?}"))
+                    .expect("the body reads");
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            up.received.add_permits(1);
+        }
+        while let Some(bytes) = body.next().await {
+            seen.push_str(&String::from_utf8_lossy(&bytes.expect("the body reads")));
+        }
+        seen
+    }
+
+    const MESSAGES_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"one\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"two\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    ];
+    const MESSAGES_MARKERS: &[&str] = &[
+        "message_start",
+        "\"one\"",
+        "\"two\"",
+        "message_delta",
+        "message_stop",
+    ];
+
+    /// Messages 形式の SSE は、upstream が送った分から順にクライアントへ届く。
+    #[tokio::test]
+    async fn a_messages_stream_is_flushed_chunk_by_chunk() {
+        let up = PacedUpstream::start(MESSAGES_CHUNKS).await;
+        let gw = gateway(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#,
+            up.url
+        ))
+        .await;
+
+        let mut body = request();
+        body["stream"] = json!(true);
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 200);
+
+        let seen = read_paced(&gw, forwarded, &up, MESSAGES_MARKERS).await;
+        assert_eq!(seen, MESSAGES_CHUNKS.concat(), "not a byte is changed");
+    }
+
+    /// keepalive で控える本流 (道具を持ち、系列を名乗る 1 本) も溜め込まない。
+    ///
+    /// 控えるための usage 読み取りと cache の判定は本文に挟まるので、そこで
+    /// 待たされていないかを見る。
+    #[tokio::test]
+    async fn a_kept_main_stream_is_flushed_chunk_by_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = PacedUpstream::start(MESSAGES_CHUNKS).await;
+        let gw = gateway(&format!(
+            r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+
+[[ns.default.cache]]
+models = ["m"]
+main = "keepalive"
+"#,
+            dir.path().display(),
+            up.url
+        ))
+        .await;
+
+        let mut body = request();
+        body["stream"] = json!(true);
+        body["tools"] = json!([{"name": "read"}]);
+        body["system"] = json!([{"type": "text", "text": "you are here", "cache_control": {"type": "ephemeral"}}]);
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                body,
+                vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 200);
+        assert!(
+            forwarded.cache_strategy.is_some(),
+            "the keepalive rule applies to this call"
+        );
+
+        let seen = read_paced(&gw, forwarded, &up, MESSAGES_MARKERS).await;
+        assert_eq!(seen, MESSAGES_CHUNKS.concat());
+    }
+
+    /// Responses 形式 (DR-0025) も、採用前判定 (DR-0014 §9) で最初の event を
+    /// 読んだ後は溜め込まずに流す。
+    #[tokio::test]
+    async fn a_responses_stream_is_flushed_chunk_by_chunk() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"two\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"three\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":3}}}\n\n",
+        ];
+        let up = PacedUpstream::start(CHUNKS).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &responses_config(&up.url, &spare.url),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+
+        let forwarded = gw
+            .forward(
+                ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/responses",
+                    query: None,
+                    shape: RequestShape::Responses,
+                },
+                responses_request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.route, "codex");
+        assert_eq!(forwarded.response.status, 200);
+
+        let seen = read_paced(
+            &gw,
+            forwarded,
+            &up,
+            &[
+                "response.created",
+                "\"one\"",
+                "\"two\"",
+                "\"three\"",
+                "response.completed",
+            ],
+        )
+        .await;
+        assert_eq!(seen, CHUNKS.concat(), "not a byte is changed");
+    }
 }

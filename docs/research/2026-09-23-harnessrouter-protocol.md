@@ -116,6 +116,7 @@
 - **llm-gateway の現状 (事実)**: DR-0025 の受け入れ確認は実機 1 回 (codex CLI 0.153.4 で `codex exec` が通り tap が記録) を DR に記録。自動テストは crate 内の単体・結合テスト (`crates/llm-gateway-server/src/lib.rs` の tests)
 - **取り込むなら (評価)**: 特に「stream が逐次 flush されているか」は proxy である gateway の核心の性質で、UHP S-09 の測り方 (event 到着時刻の広がり) は mock upstream を相手に結合テストとして移植しやすい。DR-0014 §9 の「採用前判定で本文先頭を見る」区間が、意図せず flush を遅らせていないかの回帰検知にもなる。推しはこれが本調査で一番安く効く取り込み
 - **取り込まない方がよい理由**: 実トークンを使う suite は個人用 proxy の CI には重い。移植するなら mock upstream 相手の測定に限る
+- **取り込み済み**: `crates/llm-gateway/src/gateway.rs` の `a_messages_stream_is_flushed_chunk_by_chunk` / `a_responses_stream_is_flushed_chunk_by_chunk` / `a_kept_main_stream_is_flushed_chunk_by_chunk`。到着時刻の広がりでなく、upstream が「前の chunk をクライアントが受け取った」合図を待って次を送る lockstep で測る (負荷で到着が詰まっても誤判定しない)
 
 ### 2.8 SSE keep-alive 間隔
 
