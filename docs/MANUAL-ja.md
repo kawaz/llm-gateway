@@ -229,6 +229,14 @@ curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 ```
 
+### `GET /llm-gateway/self`
+
+**走っているこのプロセスの状態**を返す。版と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。`daemon status` の各行はここから埋める。
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","events":{"dropped":0}}
+```
+
 ### `GET /llm-gateway/usage`
 
 credential ごとの利用状況 (DR-0007)。出すのは使用率・リセット時刻・締め出しの状態だけで、token も organization id も出さない。
@@ -361,7 +369,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 
 ### `GET /llm-gateway/events`
 
-転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む)。20 秒ごとに keep-alive を送る。
+転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む。落とした数は `/llm-gateway/self` に出る)。20 秒ごとに keep-alive を送る。
 
 `Access-Control-Allow-Origin: *` を付けているので、ブラウザから直接開いて様子を見られる。本文もトークン数も流さない。
 
@@ -508,7 +516,7 @@ llm-gateway <command> [options]
 | `daemon remove <unit>` | 登録簿から外す |
 | `daemon list` | 登録されている台を並べる |
 | `daemon start\|stop\|restart <unit>\|--all` | 監督者に頼んで上げ下げする |
-| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
 | `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
 
 `start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。

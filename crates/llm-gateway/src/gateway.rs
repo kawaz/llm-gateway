@@ -6257,9 +6257,7 @@ keepalive_horizon = "8h"
     }
 
     /// 転送の知らせが出るまで待って、その 1 件を返す。
-    async fn forwarding(
-        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
-    ) -> events::Event {
+    async fn forwarding(watching: &mut events::Watching) -> events::Event {
         loop {
             match watching.recv().await.unwrap() {
                 events::Notice::Request(event) => return *event,

@@ -722,9 +722,7 @@ mod tests {
     /// 取り消しの知らせが出るまで待って、それを返す。
     ///
     /// 時計は止めてあるので、上限は実時間を使わずに効く。
-    async fn until_withdrawn(
-        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
-    ) -> events::CacheExpired {
+    async fn until_withdrawn(watching: &mut events::Watching) -> events::CacheExpired {
         tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 match watching.recv().await.expect("the event bus is still there") {

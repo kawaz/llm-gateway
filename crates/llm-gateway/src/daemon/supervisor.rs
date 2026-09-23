@@ -39,7 +39,7 @@ const SPAWN_WAIT: Duration = Duration::from_secs(10);
 /// 起こしてから healthz が返るのを待つ上限。
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
-/// 走っている台に版を聞くときの待ち上限。
+/// 走っている台に版と配り損ねを聞くときの待ち上限。
 ///
 /// 答えないなら「分からない」でよい。状態を出す道の途中なので、長く待つと
 /// `daemon status` 自体が返らなくなる。
@@ -652,6 +652,7 @@ impl Supervisor {
                         pid: state.and_then(|s| s.pid),
                         since_ms: state.and_then(|s| s.since_ms),
                         version: None,
+                        events: None,
                         restarts: state.map_or(0, |s| s.restarts),
                         last_exit: state.and_then(|s| s.last_exit.clone()),
                     }
@@ -659,13 +660,16 @@ impl Supervisor {
                 .collect()
         };
 
-        // 版は走っている本人にしか言えないので、聞きに行く。錠は放してから
-        // 聞く (返事を待つ間、上げ下げが止まってしまう)。
+        // 版と配り損ねは走っている本人にしか言えないので、聞きに行く。錠は
+        // 放してから聞く (返事を待つ間、上げ下げが止まってしまう)。
         for row in rows.iter_mut().filter(|row| row.running) {
             let Some(listen) = self.listen_of(&row.unit) else {
                 continue;
             };
-            row.version = running_version(&listen).await;
+            if let Some(answer) = ask_self(&listen).await {
+                row.version = answer.version;
+                row.events = answer.events;
+            }
         }
         Ok(rows)
     }
@@ -745,23 +749,58 @@ fn units_answer(units: Vec<UnitStatus>) -> serde_json::Value {
     })
 }
 
-/// 走っている台に、載せている版を聞く。
+/// 走っている台が自分について答えたこと。
+struct SelfAnswer {
+    version: Option<String>,
+    events: Option<super::protocol::UnitEvents>,
+}
+
+/// 走っている台に、自分の状態 (版と配り損ね) を聞く。
 ///
-/// 答えない版が走っていることもある (この口が無かった頃の binary)。その時は
-/// 「分からない」であって、異常ではない。
-async fn running_version(listen: &str) -> Option<String> {
-    let url = format!("http://{}/llm-gateway/version", reachable_authority(listen));
-    let resp = reqwest::Client::new()
-        .get(&url)
+/// `/llm-gateway/self` を持たない版には `/llm-gateway/version` で版だけ聞く。
+/// 入れ替えたのに上げ直していない古い台こそ版を見せたい相手なので、新しい口が
+/// 無いことを理由に版まで失わない。どちらにも答えない版は「分からない」で
+/// あって、異常ではない。
+async fn ask_self(listen: &str) -> Option<SelfAnswer> {
+    let authority = reachable_authority(listen);
+    let resp = get(&format!("http://{authority}/llm-gateway/self")).await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // 返事はしたので、古い口に聞き直す。黙っている台に 2 回待たされない
+        // よう、聞き直すのはこの場合だけ。
+        let resp = get(&format!("http://{authority}/llm-gateway/version")).await?;
+        let body = json_of(resp).await?;
+        return Some(SelfAnswer {
+            version: body.get("version")?.as_str().map(str::to_owned),
+            events: None,
+        });
+    }
+    let body = json_of(resp).await?;
+    Some(SelfAnswer {
+        version: body
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        events: body
+            .get("events")
+            .and_then(|e| serde_json::from_value(e.clone()).ok()),
+    })
+}
+
+async fn get(url: &str) -> Option<reqwest::Response> {
+    reqwest::Client::new()
+        .get(url)
         .timeout(VERSION_WAIT)
         .send()
         .await
-        .ok()?;
+        .ok()
+}
+
+/// 成功した応答の JSON。それ以外は `None`。
+async fn json_of(resp: reqwest::Response) -> Option<serde_json::Value> {
     if !resp.status().is_success() {
         return None;
     }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body.get("version")?.as_str().map(str::to_owned)
+    resp.json().await.ok()
 }
 
 /// 1 台に対してすること。
@@ -1399,7 +1438,8 @@ mod tests {
         let world = world();
         let binary = a_long_running_child(&world.root);
 
-        // 走っている台の代わりに、版だけ答える相手を立てる。
+        // 走っている台の代わりに、版だけ答える相手を立てる (`/self` を持たない
+        // 古い版に当たる)。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap().to_string();
         std::fs::write(
@@ -1449,6 +1489,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer["units"][0]["version"], serde_json::Value::Null);
+    }
+
+    /// 本人が `/self` で答えれば、版と配り損ねを同じ 1 回から取って行に載せる。
+    #[tokio::test]
+    async fn the_answer_carries_what_the_unit_dropped() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        std::fs::write(
+            world.root.join("stable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+        world.register("stable", &binary, true);
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/llm-gateway/self",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"version": "0.1.3", "events": {"dropped": 7}}))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        world.supervisor.reload().await;
+        world.until("stable", |s| s.running).await;
+
+        let answer = world
+            .supervisor
+            .handle(Request::Status(Which::all()))
+            .await
+            .unwrap();
+        assert_eq!(answer["units"][0]["version"], serde_json::json!("0.1.3"));
+        assert_eq!(
+            answer["units"][0]["events"],
+            serde_json::json!({"dropped": 7})
+        );
+
+        world.supervisor.shutdown().await;
     }
 
     /// 版を答えない台が走っていても、状態そのものは出る。

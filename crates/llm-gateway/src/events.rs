@@ -14,6 +14,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use tokio::sync::broadcast;
 
 use crate::cache::keepalive::{Breakeven, Chain};
@@ -485,6 +488,8 @@ fn short_hash(text: &str) -> String {
 /// 見ている人へ配る口。
 pub struct Events {
     tx: broadcast::Sender<Notice>,
+    /// 見ている人が追いつけずに落とした数 (起動からの累積、全員の合計)。
+    dropped: Arc<AtomicU64>,
 }
 
 impl Default for Events {
@@ -497,6 +502,7 @@ impl Events {
     pub fn new() -> Self {
         Self {
             tx: broadcast::Sender::new(BACKLOG),
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -512,13 +518,50 @@ impl Events {
     ///
     /// 過去に遡らないのは、この知らせが「今から 5 分」を数えるためのもの
     /// だから。接続した時点で既に過ぎている分を配っても数え直せない。
-    pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
-        self.tx.subscribe()
+    pub fn subscribe(&self) -> Watching {
+        Watching {
+            rx: self.tx.subscribe(),
+            dropped: Arc::clone(&self.dropped),
+        }
+    }
+
+    /// 見ている人が追いつけずに落とした数。起動からの累積で、全員の合計。
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// 今この口を見ている人の数。
     pub fn watchers(&self) -> usize {
         self.tx.receiver_count()
+    }
+}
+
+/// 1 人ぶんの見る口。
+///
+/// 落とした数は購読の入口で数える。見る側ごとに数えさせると、新しく足した
+/// 見る側が数え忘れても気づけない。
+pub struct Watching {
+    rx: broadcast::Receiver<Notice>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Watching {
+    /// 次の 1 件。追いつけなかったときは、落とした数を足してから知らせる。
+    pub async fn recv(&mut self) -> Result<Notice, broadcast::error::RecvError> {
+        let received = self.rx.recv().await;
+        if let Err(broadcast::error::RecvError::Lagged(missed)) = &received {
+            self.dropped.fetch_add(*missed, Ordering::Relaxed);
+        }
+        received
+    }
+
+    /// 待たずに次の 1 件。落とした数の数え方は [`Self::recv`] と同じ。
+    pub fn try_recv(&mut self) -> Result<Notice, broadcast::error::TryRecvError> {
+        let received = self.rx.try_recv();
+        if let Err(broadcast::error::TryRecvError::Lagged(missed)) = &received {
+            self.dropped.fetch_add(*missed, Ordering::Relaxed);
+        }
+        received
     }
 }
 

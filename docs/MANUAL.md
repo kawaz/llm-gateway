@@ -227,6 +227,14 @@ Reports the version **this process is running**, not what is installed on disk (
 curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 ```
 
+### `GET /llm-gateway/self`
+
+Reports the state of **this running process**: its version and how many events (`/llm-gateway/events` and webhook) it dropped because a watcher could not keep up, counted since it started. `events.dropped` is present even when it is 0. `daemon status` fills each row from this.
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","events":{"dropped":0}}
+```
+
 ### `GET /llm-gateway/usage`
 
 Per-credential usage (DR-0007). It reports utilization, reset times, and denial state — never tokens or organization ids.
@@ -359,7 +367,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 
 ### `GET /llm-gateway/events`
 
-Streams what happens on every forward, over SSE (DR-0012). You receive only what happens **after** you connect; there is no replay. A slow watcher that misses events does not stall the gateway (events are dropped and it moves on). A keep-alive is sent every 20 seconds.
+Streams what happens on every forward, over SSE (DR-0012). You receive only what happens **after** you connect; there is no replay. A slow watcher that misses events does not stall the gateway (events are dropped and it moves on; the count is in `/llm-gateway/self`). A keep-alive is sent every 20 seconds.
 
 `Access-Control-Allow-Origin: *` is set, so a browser can open it directly to watch. Neither bodies nor token counts are streamed.
 
@@ -506,7 +514,7 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 | `daemon remove <unit>` | Drop a unit from the registry |
 | `daemon list` | List the registered units |
 | `daemon start\|stop\|restart <unit>\|--all` | Ask the supervisor to move them |
-| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
 | `daemon log [<unit>]\|--all` | Show what they wrote (`--follow` to keep reading) |
 
 `start` / `stop` / `restart` / `status` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.

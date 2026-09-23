@@ -1151,9 +1151,7 @@ mod tests {
     }
 
     /// 届いた知らせのうち、応答が閉じた 1 通。
-    fn completed(
-        watching: &mut tokio::sync::broadcast::Receiver<events::Notice>,
-    ) -> events::Response {
+    fn completed(watching: &mut events::Watching) -> events::Response {
         match watching.try_recv() {
             Ok(notice) => notice.response().expect("a completion notice").clone(),
             Err(e) => panic!("no completion notice arrived: {e}"),

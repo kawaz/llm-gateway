@@ -97,16 +97,27 @@ pub struct UnitStatus {
     pub since_ms: Option<u64>,
     /// 今動いているプロセスが載せている版。
     ///
-    /// ディスクの binary ではなく、走っている本人 (`GET /llm-gateway/version`)
+    /// ディスクの binary ではなく、走っている本人 (`GET /llm-gateway/self`)
     /// が答えたもの。答えられない版が走っていることもあるので `null` を許す。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// 走っている本人が数えた、知らせ (DR-0012) の配り損ね。版と同じ問い合わせ
+    /// で聞く。答えられなければ欄ごと出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<UnitEvents>,
 
     /// 監督者が起こし直した回数。
     pub restarts: u32,
     /// 最後に終わったときの様子。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<String>,
+}
+
+/// 1 台が数えた知らせの配り損ね (DR-0012)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UnitEvents {
+    /// 見る側が追いつけずに落とした数。その台の起動からの累積。
+    pub dropped: u64,
 }
 
 /// 子が書いた 1 行。

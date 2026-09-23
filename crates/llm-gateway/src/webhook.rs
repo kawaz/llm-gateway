@@ -19,7 +19,7 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{info, warn};
 
 use crate::config::Webhook;
-use crate::events::Notice;
+use crate::events::{Notice, Watching};
 
 /// 受け口が受理する 1 通の上限。
 const MAX_PAYLOAD: usize = 1024 * 1024;
@@ -45,11 +45,7 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 /// 受け口へ送り続ける。待ち受けと一緒に走らせる。
 ///
 /// 送り先が設定に無ければ、何もせずに戻る (機能ごと無効)。
-pub async fn keep_sending(
-    config: Webhook,
-    http: reqwest::Client,
-    mut watching: tokio::sync::broadcast::Receiver<Notice>,
-) {
+pub async fn keep_sending(config: Webhook, http: reqwest::Client, mut watching: Watching) {
     let (urls, refused) = config.destinations();
     for reason in refused {
         warn!(%reason, "this webhook destination is unusable; not sending to it");
@@ -114,7 +110,7 @@ pub async fn keep_sending(
 ///
 /// 1 件目は**いつまでも待つ** (何も起きなければ何もしない)。2 件目からは
 /// [`WINDOW`] の間だけ待って、来なければそこで区切る。
-async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Notice>) -> Option<Vec<Notice>> {
+async fn collect(watching: &mut Watching) -> Option<Vec<Notice>> {
     let mut batch = vec![first(watching).await?];
     let until = Instant::now() + WINDOW;
 
@@ -134,7 +130,7 @@ async fn collect(watching: &mut tokio::sync::broadcast::Receiver<Notice>) -> Opt
 }
 
 /// 次の 1 件を待つ。流す側が畳まれたら `None`。
-async fn first(watching: &mut tokio::sync::broadcast::Receiver<Notice>) -> Option<Notice> {
+async fn first(watching: &mut Watching) -> Option<Notice> {
     loop {
         match watching.recv().await {
             Ok(event) => return Some(event),

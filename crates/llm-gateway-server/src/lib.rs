@@ -51,6 +51,7 @@ pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
         // gateway 自身の機能はここの下にまとめる (DR-0006)。
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/version", get(version))
+        .route("/llm-gateway/self", get(self_report))
         .route("/llm-gateway/usage", get(usage))
         .route("/llm-gateway/status", get(status))
         .route("/llm-gateway/stats", get(stats))
@@ -268,6 +269,21 @@ async fn version() -> Response {
     json_utf8(Json(
         serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
     ))
+}
+
+/// 走っている本人の状態を返す (版と、見る側が追いつけずに落とした知らせの数)。
+///
+/// 版も本人にしか言えない自己申告なので、ここに同居させる。監督者は
+/// `daemon status` の各行をこの 1 回の問い合わせから埋める (DR-0028 決定 9)。
+/// 落とした数は起動からの累積で、0 でも欄を出す — 数えていることが分かる
+/// ように (DR-0012)。
+///
+/// 認証を掛けないのは healthz と同じ扱い。
+async fn self_report<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
+    json_utf8(Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "events": { "dropped": gateway.events().dropped() },
+    })))
 }
 
 /// credential ごとの利用状況を返す。
@@ -1228,6 +1244,69 @@ content-length: {declared}\r\n\r\n{head}"
             .await;
         });
         format!("http://{addr}")
+    }
+
+    /// 走っている本人の状態を返す。まだ何も落としていなくても欄は出る —
+    /// 数えていることが分かるように (DR-0012)。
+    #[tokio::test]
+    async fn self_answers_the_version_and_zero_dropped_events() {
+        let base = serve("[ns.default]\n").await;
+
+        let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            answered,
+            json!({"version": env!("CARGO_PKG_VERSION"), "events": {"dropped": 0}})
+        );
+    }
+
+    /// 追いつけない見る側の分を落としたら、落とした数が `/self` に積もる。
+    #[tokio::test]
+    async fn events_a_slow_watcher_missed_are_counted() {
+        let config: llm_gateway::Config = toml::from_str("[ns.default]\n").unwrap();
+        let gateway = Arc::new(Gateway::new(&config, crate::tests::StaticStore).unwrap());
+        let events = Arc::clone(gateway.events());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(gateway).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let mut watching = reqwest::get(format!("{base}/llm-gateway/events"))
+            .await
+            .unwrap();
+        // 見る側が 1 件も読まないうちに、溜められる数を超えて流す。
+        for n in 0..1000 {
+            events.publish(llm_gateway::events::CacheExpired::new(
+                1_785_600_000_000,
+                "s-1",
+                "2cf24dba",
+                &format!("n-{n}"),
+            ));
+        }
+        // 読みに行った時点で、溢れた分が落ちたと分かる。
+        watching
+            .chunk()
+            .await
+            .unwrap()
+            .expect("the rest still arrives");
+
+        let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let dropped = answered["events"]["dropped"].as_u64().unwrap();
+        assert!(dropped > 0, "nothing was counted as dropped: {answered}");
     }
 
     /// 止める頼みは受け取って、その会話の控えを落とす (DR-0024 §2 の pause API)。

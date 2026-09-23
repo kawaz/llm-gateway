@@ -101,6 +101,8 @@ binary を unit ごとに持つのは、いま走っている 2 台が **別の�
 
 DR-0021 の upstream 障害状況は `llm-gateway upstream status` になる。別名は残さない。`daemon status` はプロセスの状態 (`{id,unit,running,pid,version,...}`)、`service status` は登録の状態、と 3 者の意味が語で分かれる。
 
+HTTP の口でも語を分ける: `/llm-gateway/status` は upstream の状態だけを答え、走っている gateway 自身の状態 (版・落とした event 数) は `/llm-gateway/self` が答える。`daemon status` の各行は監督者が `/self` の 1 回の問い合わせから埋める (持たない古い版には `/llm-gateway/version` で版だけ聞く)。
+
 ### 6. 稼働中に問い合わせる系は、登録簿から宛先を引く
 
 `usage` / `stats` / `upstream status`、および HTTP でしか叩けない keepalive の pause (DR-0027 が維持する `POST /llm-gateway/keepalive/pause`) を CLI から呼ぶ場合も同じ:
