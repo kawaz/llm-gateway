@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-09-25 | design | open | [low-priority-slow-requests-should-wait-not-switch](./2026-09-25-low-priority-slow-requests-should-wait-not-switch.md) | Claude Code の /low-priority (anthropic-usage-limit: slow) の 429/529 を DR-0009 の断りとして扱わず透過する |
 | 2026-09-24 | bug | open | [keepalive-restore-test-double-send-in-ci](./2026-09-24-keepalive-restore-test-double-send-in-ci.md) | keepalive の復元テストが CI で 1 回だけ 2 回送出 (`2 != 1`) した真因が未特定 |
 | 2026-09-17 | design | open | [plan-command-routing-and-quota-forecast](./2026-09-17-plan-command-routing-and-quota-forecast.md) | plan command で routing 解決 + quota forecast を pull 型で出す |
 | 2026-09-15 | design | open | [store-layer-for-replaceable-persistence](./2026-09-15-store-layer-for-replaceable-persistence.md) | 永続化の器を Store 層として責務で切り、file backend を差し替え可能にする |
