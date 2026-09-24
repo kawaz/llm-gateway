@@ -144,6 +144,7 @@ LLM 経路 (案 B): routing が候補 credential を並べた後、各候補を�
 - ゴール: `[ns.<name>.allow]` 外のパススルーを 404 / 405 で断る
 - 完了条件: 設定のパースとエラー文言、受け口で `Principal` を `Relay` へ渡す、判定順 (§4 の 3 → 4) の test、`events::Passthrough.refused` の追加
 - やらないこと: LLM 経路の allowlist、レート制限
+- 3a 実施済み: `[ns.<name>.allow]` (`Allow` を共有、method の `*` は読み込みで断る、書かない ns は閉じる)、受け口で `Principal` を `Relay` へ渡す、判定は ns の allowlist → 行き先の `allow` → 秘密 → (レート制限の位置) → 送信、`events::Passthrough.refused`。あわせて `[secrets] type` を `[secret_store]` に改名 (旧形は理由付きで断る)。断る理由に計画 §5 の語へ `unknown_upstream` / `unsafe_path` を足した。未登録の行き先と ns の allowlist 外は同じ 404 の文言にした (行き先の有無を探らせない)
 
 **段 3b: 固定窓の境界計算と分 / 時のメモリバケット**
 - ゴール: credential 宣言の `limits` を読み、分 / 時の超過を 429 + `Retry-After` + `X-RateLimit-*` で返す

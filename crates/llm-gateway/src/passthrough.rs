@@ -42,12 +42,13 @@ const HOP_BY_HOP: [&str; 9] = [
 pub enum Refusal {
     /// `[upstreams.<name>]` に無い (404)。
     UnknownUpstream,
-    /// 許可に当たるパスが無い (404)。
-    NotAllowed,
     /// パスが上流で別の場所へ読み替わりうる形 (`..`、`//`、`%2F` 等) をしている (404)。
     UnsafePath,
-    /// パスは許可にあるが method が違う (405)。
-    MethodNotAllowed,
+    /// namespace の allowlist に無い。`method_only` はパスは当たるが method が違う場合 (405)、
+    /// それ以外は 404。
+    NsAllow { method_only: bool },
+    /// 行き先の側の `allow` に無い。`method_only` の意味は同じ。
+    UpstreamAllow { method_only: bool },
     /// 固定の秘密が読めない (502)。
     Secret(String),
     /// 上流に届かなかった (502)。
@@ -57,16 +58,44 @@ pub enum Refusal {
 impl Refusal {
     pub fn status(&self) -> u16 {
         match self {
-            Self::UnknownUpstream | Self::NotAllowed | Self::UnsafePath => 404,
-            Self::MethodNotAllowed => 405,
+            Self::NsAllow { method_only: true } | Self::UpstreamAllow { method_only: true } => 405,
+            Self::UnknownUpstream
+            | Self::UnsafePath
+            | Self::NsAllow { .. }
+            | Self::UpstreamAllow { .. } => 404,
             Self::Secret(_) | Self::Unreachable(_) => 502,
         }
+    }
+
+    /// 知らせ (`refused`) に載せる理由の語。
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::UnknownUpstream => "unknown_upstream",
+            Self::UnsafePath => "unsafe_path",
+            Self::NsAllow { .. } => "ns_allow",
+            Self::UpstreamAllow { .. } => "upstream_allow",
+            Self::Secret(_) => "secret",
+            Self::Unreachable(_) => "unreachable",
+        }
+    }
+}
+
+/// 判定の結果を理由に写す。通すなら `None`。
+fn refusal_of(decision: Decision, as_refusal: fn(bool) -> Refusal) -> Option<Refusal> {
+    match decision {
+        Decision::Allowed => None,
+        Decision::UnsafePath => Some(Refusal::UnsafePath),
+        Decision::NotFound => Some(as_refusal(false)),
+        Decision::MethodNotAllowed => Some(as_refusal(true)),
     }
 }
 
 /// 1 本の中継を頼む中身。
 pub struct Relay<'a, S> {
-    pub ns: &'a str,
+    /// ns 認証を通った相手 (検査しない ns では `subject` / `kid` の無い主体)。
+    pub principal: gateway_core::ns::Principal,
+    /// この namespace の allowlist (`[ns.<name>.allow]`)。
+    pub ns_allow: &'a BTreeMap<String, Vec<gateway_core::upstream::Allow>>,
     pub upstream: &'a str,
     pub method: reqwest::Method,
     /// `/` で始まる `<rest>` のパス (クエリを除く)。
@@ -91,7 +120,7 @@ impl Passthrough {
         let secrets = if config.upstreams.is_empty() {
             None
         } else {
-            let files = FileStore::open(config.secrets.resolve_dir())?;
+            let files = FileStore::open(config.secret_store.resolve_dir())?;
             Some(StaticSecretStore::new(files))
         };
         // Design rationale: LLM 経路と口を共有しない。共有の口は redirect を
@@ -126,7 +155,7 @@ impl Passthrough {
         let started = Instant::now();
         let ts = crate::credential::time::now_unix_ms();
         let (ns, upstream, method, path) = (
-            request.ns.to_owned(),
+            request.principal.ns.clone(),
             request.upstream.to_owned(),
             request.method.as_str().to_owned(),
             request.path.to_owned(),
@@ -136,9 +165,9 @@ impl Passthrough {
             None => Err(Refusal::UnknownUpstream),
             Some(spec) => self.send(spec, request).await,
         };
-        let status = match &outcome {
-            Ok(resp) => resp.status().as_u16(),
-            Err(refusal) => refusal.status(),
+        let (status, refused) = match &outcome {
+            Ok(resp) => (resp.status().as_u16(), None),
+            Err(refusal) => (refusal.status(), Some(refusal.reason().to_owned())),
         };
         events.publish(events::Passthrough {
             kind: events::Passthrough::KIND.to_owned(),
@@ -152,6 +181,7 @@ impl Passthrough {
             status,
             duration_ms: started.elapsed().as_millis() as u64,
             secret: spec.map(|s| s.secret.clone()).unwrap_or_default(),
+            refused,
         });
         outcome
     }
@@ -165,11 +195,25 @@ impl Passthrough {
         S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        match spec.decide(request.method.as_str(), request.path) {
-            Decision::Allowed => {}
-            Decision::NotFound => return Err(Refusal::NotAllowed),
-            Decision::MethodNotAllowed => return Err(Refusal::MethodNotAllowed),
-            Decision::UnsafePath => return Err(Refusal::UnsafePath),
+        // 判定の順 (計画 rate-limit-and-allowlist §4): namespace の allowlist を
+        // 行き先の側より先に見る。ns に見せてよくない行き先の中身 (どのパスが
+        // あるか) を、行き先の側の 405 で漏らさないため。
+        let method = request.method.as_str();
+        let ns_allows = request
+            .ns_allow
+            .get(request.upstream)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let ns_decision = gateway_core::upstream::decide(ns_allows, method, request.path);
+        if let Some(refusal) =
+            refusal_of(ns_decision, |method_only| Refusal::NsAllow { method_only })
+        {
+            return Err(refusal);
+        }
+        if let Some(refusal) = refusal_of(spec.decide(method, request.path), |method_only| {
+            Refusal::UpstreamAllow { method_only }
+        }) {
+            return Err(refusal);
         }
         let secret = self
             .secrets
@@ -177,6 +221,8 @@ impl Passthrough {
             .ok_or_else(|| Refusal::Secret("no secret store is open".into()))?
             .get(&CredentialId::new(spec.secret.as_str()))
             .map_err(|e| Refusal::Secret(Error::from(e).to_string()))?;
+        // レート制限はここに入る (秘密を読めた後、送る前。読めずに 502 になる
+        // 要求や、allowlist の外の要求を数えないため)。
 
         let mut headers = forwarded_headers(request.headers, &spec.auth);
         let (name, value) = match &spec.auth {

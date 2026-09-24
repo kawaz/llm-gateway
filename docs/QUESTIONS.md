@@ -39,7 +39,7 @@ secret = "xai"              # 静的 secret の id (secrets/xai.json)
 auth = "bearer"             # 載せ方: "bearer" / { header = "x-api-key" }。上流 API の形なので上流側に書く
 allow = ["GET /v1/models", "POST /v1/chat/completions"]   # "METHOD path-pattern"、* は任意の並び。外れは 404 / 405 で上流に出さない
 
-[secrets]
+[secret_store]
 type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/secrets/<id>.json。credential とはディレクトリを分ける
 ```
 

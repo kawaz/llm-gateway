@@ -230,6 +230,10 @@ haiku = "claude-haiku-*"
 # auth = "bearer"           # または { header = "x-api-key" }
 # allow = ["GET /v1/models", "POST /v1/chat/completions"]
 #
-# [secrets]
+# [secret_store]
 # type = "file"
 # dir = "~/.local/state/llm-gateway/secrets"
+#
+# 中継を使う namespace には、使ってよい行き先を書く (書かなければ何も通さない)。
+# [ns.default.allow]
+# "api.x.ai" = ["GET /v1/models", "POST /v1/chat/completions"]

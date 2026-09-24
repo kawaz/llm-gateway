@@ -116,7 +116,15 @@ pub struct Config {
 
     /// 中継に載せる固定の秘密の置き場 (DR-0030 §5)。
     #[serde(default)]
-    pub secrets: Secrets,
+    pub secret_store: SecretStore,
+
+    /// 秘密ごとの設定 (`[secrets.<id>]`) の予約地。今は何も書けない。
+    ///
+    /// 置き場の設定を書いていた `[secrets] type` を、読み込みで理由付きで
+    /// 断るために受ける (`deny_unknown_fields` の一般的な文言では、どこへ
+    /// 移ったのか分からない)。
+    #[serde(default, rename = "secrets", skip_serializing)]
+    secrets_table: Option<toml::Table>,
 
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
@@ -170,6 +178,14 @@ pub struct Namespace {
         skip_serializing_if = "NsAuth::is_open"
     )]
     pub auth: NsAuth,
+
+    /// この namespace が中継で使ってよい行き先と `METHOD パス` (DR-0030 §4)。
+    ///
+    /// キーは `[upstreams.<name>]` の名前。**書かなければ中継を何も通さない**。
+    /// 行き先の側の `allow` (その API で使ってよい endpoint) とは別の問いで、
+    /// 両方を通ったものだけが上流へ出る。LLM 経路 (`/v1/...`) には効かない。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allow: BTreeMap<String, Vec<gateway_core::upstream::Allow>>,
 
     /// この namespace で使う経路。空なら全部。
     ///
@@ -884,7 +900,7 @@ pub const RESERVED_UPSTREAM_NAMES: [&str; 3] = ["v1", "llm-gateway", "llm"];
 /// 固定の秘密の置き場 (DR-0030 §5)。認証情報とはディレクトリを分ける。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Secrets {
+pub enum SecretStore {
     /// 1 秘密 1 ファイル (`<id>.json`)。平文。
     File {
         /// 省略時は `$XDG_STATE_HOME/llm-gateway/secrets`。
@@ -897,13 +913,13 @@ pub enum Secrets {
     },
 }
 
-impl Default for Secrets {
+impl Default for SecretStore {
     fn default() -> Self {
         Self::File { dir: None }
     }
 }
 
-impl Secrets {
+impl SecretStore {
     /// 実際に使う置き場。
     pub fn resolve_dir(&self) -> PathBuf {
         match self {
@@ -1266,6 +1282,18 @@ impl Config {
             }
             validate_route(name, route, self)?;
         }
+        if let Some(table) = &self.secrets_table {
+            if table.contains_key("type") || table.contains_key("dir") {
+                return Err(Error::Config(
+                    "`[secrets] type` / `dir` moved to `[secret_store]` (write `[secret_store]` with `type = \"file\"`)".to_owned(),
+                ));
+            }
+            if !table.is_empty() {
+                return Err(Error::Config(
+                    "per-secret settings (`[secrets.<id>]`) are not supported yet".to_owned(),
+                ));
+            }
+        }
         for (name, upstream) in &self.upstreams {
             gateway_core::upstream::check_name(name, &RESERVED_UPSTREAM_NAMES)
                 .map_err(Error::Config)?;
@@ -1281,6 +1309,15 @@ impl Config {
     }
 
     fn validate_namespace(&self, ns_name: &str, ns: &Namespace) -> Result<()> {
+        for upstream in ns.allow.keys() {
+            if !self.upstreams.contains_key(upstream) {
+                tracing::warn!(
+                    namespace = ns_name,
+                    upstream = upstream.as_str(),
+                    "the namespace allow list names an upstream that is not configured; it lets nothing through"
+                );
+            }
+        }
         let known = |name: &String| self.routes.contains_key(name);
 
         for name in &ns.routes {

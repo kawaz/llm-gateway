@@ -847,15 +847,30 @@ async fn passthrough<P: CredentialPersistence + 'static>(
     let Some(ns) = gateway.namespace(ns_name) else {
         return unknown_namespace(ns_name, &gateway.namespace_names());
     };
-    if let Some(denied) = rejection(ns, ns_name, &parts.headers) {
-        return denied;
-    }
+    let presented = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let principal = match ns.auth.verify(ns_name, presented) {
+        Authorization::Accepted(principal) => principal,
+        // 検査しない ns でも、下流 (allowlist・知らせ) が見るのは主体だけ。
+        Authorization::Open => llm_gateway::config::Principal {
+            ns: ns_name.to_owned(),
+            subject: None,
+            kid: None,
+        },
+        Authorization::WrongToken => {
+            return rejection(ns, ns_name, &parts.headers)
+                .unwrap_or_else(|| StatusCode::UNAUTHORIZED.into_response());
+        }
+    };
 
     let rest_path = format!("/{rest}");
     let query = parts.uri.query();
     let relayed = gateway
         .relay(llm_gateway::passthrough::Relay {
-            ns: ns_name,
+            principal,
+            ns_allow: &ns.allow,
             upstream,
             method: parts.method.clone(),
             path: &rest_path,
@@ -879,15 +894,24 @@ async fn passthrough<P: CredentialPersistence + 'static>(
             let status =
                 StatusCode::from_u16(refusal.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let message = match &refusal {
-                Refusal::UnknownUpstream => format!("upstream `{upstream}` is not configured"),
+                // 未登録と namespace の allowlist 外は同じ文言にする。分けると、
+                // その namespace に見せていない行き先があるかを外から探れる。
+                Refusal::UnknownUpstream | Refusal::NsAllow { method_only: false } => format!(
+                    "`{} {rest_path}` on `{upstream}` is not available in namespace `{ns_name}`",
+                    parts.method
+                ),
+                Refusal::NsAllow { method_only: true } => format!(
+                    "`{}` is not allowed for `{rest_path}` on `{upstream}` in namespace `{ns_name}`",
+                    parts.method
+                ),
                 Refusal::UnsafePath => format!(
                     "`{rest_path}` could be read as another path upstream (`..`, `.`, `//`, `\\` or an encoded `/` `.` `\\`); send the plain path"
                 ),
-                Refusal::NotAllowed => format!(
+                Refusal::UpstreamAllow { method_only: false } => format!(
                     "`{} {rest_path}` is not in the allow list of upstream `{upstream}`",
                     parts.method
                 ),
-                Refusal::MethodNotAllowed => format!(
+                Refusal::UpstreamAllow { method_only: true } => format!(
                     "`{}` is not allowed for `{rest_path}` on upstream `{upstream}`",
                     parts.method
                 ),
@@ -903,10 +927,12 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                 }
             };
             let kind = match refusal {
-                Refusal::UnknownUpstream | Refusal::NotAllowed | Refusal::UnsafePath => {
-                    "not_found_error"
-                }
-                Refusal::MethodNotAllowed => "invalid_request_error",
+                Refusal::UnknownUpstream
+                | Refusal::UnsafePath
+                | Refusal::NsAllow { method_only: false }
+                | Refusal::UpstreamAllow { method_only: false } => "not_found_error",
+                Refusal::NsAllow { method_only: true }
+                | Refusal::UpstreamAllow { method_only: true } => "invalid_request_error",
                 Refusal::Secret(_) | Refusal::Unreachable(_) => "api_error",
             };
             refused(ns_name, status, kind, &message)
@@ -4065,7 +4091,7 @@ models = ["m"]
 
 #[cfg(test)]
 mod passthrough_tests {
-    use super::tests::{TOKEN, authed, serve_with_default_ns};
+    use super::tests::{TOKEN, authed, serve};
     use std::sync::{Arc, Mutex};
 
     /// 偽の上流が受けた 1 本。
@@ -4146,7 +4172,19 @@ mod passthrough_tests {
     }
 
     /// `upstream` を起点に立てる。`seen` は空 (呼び出し側が差し替える)。
+    /// 既定の namespace の allowlist。行き先の側の判定を見る試験のために広く取る。
+    const OPEN_NS_ALLOW: &str = r#"
+"api.example.test" = ["GET /v1/*", "POST /v1/*", "DELETE /v1/*"]
+keyed = ["GET /v1/*"]
+nosecret = ["GET /v1/*"]
+"#;
+
     async fn setup_at(upstream: &str, allow: &str) -> Setup {
+        setup_full(upstream, allow, Some(OPEN_NS_ALLOW)).await
+    }
+
+    /// `ns_allow` は `[ns.default.allow]` の中身。`None` なら書かない (閉じた ns)。
+    async fn setup_full(upstream: &str, allow: &str, ns_allow: Option<&str>) -> Setup {
         let seen = Arc::default();
         let secrets = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4156,7 +4194,7 @@ mod passthrough_tests {
         .unwrap();
         let config = format!(
             r#"
-[secrets]
+[secret_store]
 type = "file"
 dir = "{dir}"
 
@@ -4180,8 +4218,14 @@ allow = ["GET /v1/items"]
 "#,
             dir = secrets.path().display(),
         );
+        let ns = match ns_allow {
+            Some(list) => {
+                format!("[ns.default]\nauth_token = \"{TOKEN}\"\n[ns.default.allow]\n{list}")
+            }
+            None => format!("[ns.default]\nauth_token = \"{TOKEN}\"\n"),
+        };
         Setup {
-            base: serve_with_default_ns(&config).await,
+            base: serve(&format!("{config}\n{ns}")).await,
             seen,
             _secrets: secrets,
         }
@@ -4465,6 +4509,136 @@ allow = ["GET /v1/items"]
         }
     }
 
+    /// namespace の allowlist に無い行き先 / パス / method は、上流に問い合わせずに断る。
+    /// 断った理由は知らせに `ns_allow` として載る。
+    #[tokio::test]
+    async fn the_namespace_allow_list_is_checked_before_the_upstream() {
+        let (upstream, seen) = fake_upstream().await;
+        let mut s = setup_full(
+            &upstream,
+            r#"["GET /v1/items", "POST /v1/items/*", "DELETE /v1/items"]"#,
+            Some(r#""api.example.test" = ["GET /v1/items"]"#),
+        )
+        .await;
+        s.seen = seen;
+        let client = reqwest::Client::new();
+        for (method, path, status) in [
+            ("GET", "/ns-default/keyed/v1/items", 404),
+            ("GET", "/ns-default/api.example.test/v1/other", 404),
+            ("DELETE", "/ns-default/api.example.test/v1/items", 405),
+            ("POST", "/ns-default/api.example.test/v1/items/1", 404),
+        ] {
+            let resp = authed(client.request(method.parse().unwrap(), format!("{}{path}", s.base)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{method} {path}");
+        }
+        assert!(s.seen.lock().unwrap().is_empty(), "nothing went out");
+
+        // 両方の allow を通るものだけが届く。
+        let ok = authed(client.get(format!("{}/ns-default/api.example.test/v1/items", s.base)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 201);
+        assert_eq!(s.seen.lock().unwrap().len(), 1);
+    }
+
+    /// allow を書かない namespace は、中継を何も通さない。
+    #[tokio::test]
+    async fn a_namespace_without_an_allow_list_relays_nothing() {
+        let (upstream, seen) = fake_upstream().await;
+        let mut s = setup_full(&upstream, r#"["GET /v1/items"]"#, None).await;
+        s.seen = seen;
+        let resp = authed(
+            reqwest::Client::new().get(format!("{}/ns-default/api.example.test/v1/items", s.base)),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 404);
+        assert!(s.seen.lock().unwrap().is_empty());
+    }
+
+    /// 断った理由は、namespace の側か行き先の側かが知らせで分かる。
+    #[tokio::test]
+    async fn the_refusal_reason_is_announced() {
+        let (upstream, _seen) = fake_upstream().await;
+        let config: llm_gateway::Config = toml::from_str(&format!(
+            "[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\n"
+        ))
+        .unwrap();
+        let secrets = tempfile::tempdir().unwrap();
+        let mut config = config;
+        config.secret_store = llm_gateway::config::SecretStore::File {
+            dir: Some(secrets.path().to_path_buf()),
+        };
+        let gateway = llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap();
+        let mut watching = gateway.events().subscribe();
+        let headers = axum::http::HeaderMap::new();
+        let principal = || llm_gateway::config::Principal {
+            ns: "default".into(),
+            subject: None,
+            kid: None,
+        };
+        for (ns_allow, path, reason) in [
+            (vec![], "/a", "ns_allow"),
+            (
+                vec![("u".to_owned(), vec!["GET /*".parse().unwrap()])],
+                "/b",
+                "upstream_allow",
+            ),
+        ] {
+            let ns_allow: std::collections::BTreeMap<_, _> = ns_allow.into_iter().collect();
+            let refusal = gateway
+                .relay(llm_gateway::passthrough::Relay {
+                    principal: principal(),
+                    ns_allow: &ns_allow,
+                    upstream: "u",
+                    method: axum::http::Method::GET,
+                    path,
+                    query: None,
+                    headers: &headers,
+                    body: futures_util::stream::empty::<Result<axum::body::Bytes, std::io::Error>>(
+                    ),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.reason(), reason);
+            let json = serde_json::to_value(watching.try_recv().unwrap()).unwrap();
+            assert_eq!(json["refused"], reason, "{json}");
+            assert_eq!(json["status"], 404);
+        }
+    }
+
+    /// namespace の allowlist でも、method を `*` で束ねる書き方は読み込みで断る。
+    #[test]
+    fn a_wildcard_method_is_refused_on_load() {
+        let err = toml::from_str::<llm_gateway::Config>(
+            "[ns.default.allow]\n\"api.example.test\" = [\"* /v1/*\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("each method"), "{err}");
+    }
+
+    /// 置き場の設定は `[secret_store]`。`[secrets] type` は移った先を言って断る。
+    #[test]
+    fn the_secret_store_moved_from_secrets() {
+        let config: llm_gateway::Config =
+            toml::from_str("[secret_store]\ntype = \"file\"\ndir = \"/tmp/s\"\n").unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.secret_store.resolve_dir(),
+            std::path::PathBuf::from("/tmp/s")
+        );
+
+        let old: llm_gateway::Config = toml::from_str("[secrets]\ntype = \"file\"\n").unwrap();
+        let err = old.validate().unwrap_err().to_string();
+        assert!(err.contains("[secret_store]"), "{err}");
+    }
+
     /// 予約名は行き先の名前にできない (読み込みで断る)。
     #[test]
     fn a_reserved_name_is_refused_on_load() {
@@ -4488,7 +4662,7 @@ allow = ["GET /v1/items"]
         )
         .unwrap();
         let config: llm_gateway::Config = toml::from_str(&format!(
-            "[secrets]\ntype = \"file\"\ndir = \"{}\"\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\n",
+            "[secret_store]\ntype = \"file\"\ndir = \"{}\"\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\n",
             secrets.path().display()
         ))
         .unwrap();
@@ -4498,7 +4672,12 @@ allow = ["GET /v1/items"]
         let body = futures_util::stream::empty::<Result<axum::body::Bytes, std::io::Error>>();
         let resp = gateway
             .relay(llm_gateway::passthrough::Relay {
-                ns: "default",
+                principal: llm_gateway::config::Principal {
+                    ns: "default".into(),
+                    subject: None,
+                    kid: None,
+                },
+                ns_allow: &[("u".to_owned(), vec!["GET /a".parse().unwrap()])].into(),
                 upstream: "u",
                 method: axum::http::Method::GET,
                 path: "/a",

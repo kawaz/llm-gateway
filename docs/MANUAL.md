@@ -216,19 +216,32 @@ secret = "xai"              # the id of a static secret (secrets/xai.json)
 auth = "bearer"             # how to send it: "bearer" (Authorization: Bearer) or { header = "x-api-key" }
 allow = ["GET /v1/models", "POST /v1/chat/completions", "GET /v1/files/*"]
 
-[secrets]
+[secret_store]
 type = "file"               # default directory: $XDG_STATE_HOME/llm-gateway/secrets/<id>.json
 ```
 
 A secret file is kept apart from credentials. Its smallest form is `{"type":"static","payload":{"value":"..."}}`; `priority` / `disabled` may be omitted and are written back omitted. A change to the file is picked up on the next request (the file version, DR-0010).
 
 - URL: `/ns-<ns>/<name>/<rest>`, always under a namespace. The namespace token is checked as on the LLM paths
+- **A namespace relays only what its own allow list names** (`[ns.<name>.allow]`, below). A namespace without one relays nothing
 - Names may contain only letters, digits, `.`, `_` and `-`. `v1`, `llm-gateway` and `llm` are reserved and refused when the configuration is read
 - `allow` entries are `"METHOD path-pattern"` (`*` matches any run). Only the path of `<rest>` is matched; the query string is passed on as-is
 - A `<rest>` that could be read as another path upstream is refused with **404** before the allow list is consulted: an empty segment (`//`), a `.` or `..` segment, a `\`, or an encoded `/` `\` `.` inside a segment (`%2F` / `%5C` / `%2E`, either case). Send the plain path; the gateway does not normalize it for you. A trailing `/` is fine
 - A redirect (3xx) from the upstream is **not followed**; it is returned to the client as it is, `Location` included, so the gateway never leaves the registered upstream
 - Not configured, or no allowed path matches: **404**. The path matches but the method does not: **405**. The secret cannot be read, or the upstream cannot be reached: **502**. In the first three cases nothing is sent to the upstream
-- Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). Nothing is added to the daily totals
+- Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). When the gateway itself refused, `refused` says why: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (absent when the upstream answered, whatever its status). Nothing is added to the daily totals
+
+### Namespace allow list (`[ns.<name>.allow]`)
+
+```toml
+[ns.app1.allow]
+"api.x.ai" = ["GET /v1/models", "POST /v1/chat/completions"]
+"api.example.com" = ["GET /v1/*"]
+```
+
+The keys are `[upstreams.<name>]` names; the values use the same `"METHOD path-pattern"` form. The method must be written out (`*` as a method is refused when the configuration is read), so every method with a side effect is named on purpose.
+
+The two lists answer different questions: `[upstreams.<name>].allow` is what the key may be used for through the gateway, and `[ns.<name>.allow]` is what the holder of that namespace's token may use. A request goes out only when **both** allow it; a namespace cannot widen what the upstream allows. The namespace list is checked first, and a request it refuses gets the same 404 as an unknown upstream, so a namespace cannot tell which upstreams exist beyond its own list. It does not apply to the LLM paths (`/ns-<ns>/v1/...`).
 
 ```bash
 curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization: Bearer <namespace token>'

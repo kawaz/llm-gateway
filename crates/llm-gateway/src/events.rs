@@ -379,6 +379,13 @@ pub struct Passthrough {
     pub duration_ms: u64,
     /// 載せた固定の秘密の識別子。未登録の行き先では空。
     pub secret: String,
+    /// gateway が断った理由。上流まで届いたものは無い (上流が返した 4xx / 5xx も無い)。
+    ///
+    /// `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` /
+    /// `secret` / `unreachable`。状態コードだけでは、404 が namespace の側か
+    /// 行き先の側か読めない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 impl Passthrough {
@@ -668,6 +675,7 @@ mod tests {
             status: 200,
             duration_ms: 12,
             secret: "ex".into(),
+            refused: Some("ns_allow".into()),
         });
         let text = serde_json::to_string(&notice).unwrap();
         let back: Notice = serde_json::from_str(&text).unwrap();

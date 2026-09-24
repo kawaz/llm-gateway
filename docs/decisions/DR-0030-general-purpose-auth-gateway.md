@@ -55,11 +55,11 @@ DR-0006 が「gateway の機能はすべて ns 配下」と決めた形をその
 ```toml
 [upstreams."api.x.ai"]      # 名前 = 既定は apifqdn、任意ラベル可。英数字と . _ - のみ。予約名: v1 / llm-gateway / llm
 url = "https://api.x.ai"    # <rest> をそのまま連結
-secret = "xai"              # 固定の秘密の id ([secrets] の置き場の xai.json。最小形 {"type":"static","payload":{"value":"..."}})
+secret = "xai"              # 固定の秘密の id ([secret_store] の置き場の xai.json。最小形 {"type":"static","payload":{"value":"..."}})
 auth = "bearer"             # 載せ方: "bearer" / { header = "x-api-key" }。上流 API の形なので上流側に書く
 allow = ["GET /v1/models", "POST /v1/chat/completions"]   # "METHOD path-pattern"。外れは 404 / 405 で上流に出さない
 
-[secrets]
+[secret_store]
 type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/secrets。credential とはディレクトリを分ける
 ```
 

@@ -218,19 +218,32 @@ secret = "xai"              # 固定の秘密の id (secrets/xai.json)
 auth = "bearer"             # 載せ方: "bearer" (Authorization: Bearer) か { header = "x-api-key" }
 allow = ["GET /v1/models", "POST /v1/chat/completions", "GET /v1/files/*"]
 
-[secrets]
+[secret_store]
 type = "file"               # 既定の置き場: $XDG_STATE_HOME/llm-gateway/secrets/<id>.json
 ```
 
 秘密のファイルは認証情報とは別の置き場に置く。最小の形は `{"type":"static","payload":{"value":"..."}}` で、`priority` / `disabled` は省略でき、省略したまま書き戻される。ファイルを書き換えると次のリクエストで読み直す (ファイルの版、DR-0010)。
 
 - URL は `/ns-<ns>/<名前>/<rest>` で、必ず namespace の下。namespace のトークンは LLM 経路と同じく検査する
+- **namespace は自分の allowlist (`[ns.<name>.allow]`、下記) に書いたものだけを中継する**。書かない namespace は何も通さない
 - 名前に使えるのは英数字と `.` `_` `-` だけ。`v1` / `llm-gateway` / `llm` は予約名で、設定の読み込みで断る
 - `allow` は `"METHOD パスのパターン"` (`*` は任意の並び)。照合するのは `<rest>` のパスだけで、クエリ文字列はそのまま上流へ渡す
 - 上流で別のパスに読み替わりうる `<rest>` は、許可の照合より前に **404** で断る。空の段 (`//`)、`.` や `..` の段、`\`、段の中の符号化された `/` `\` `.` (`%2F` / `%5C` / `%2E`、大小どちらも) が対象。正規化はしないので、素のパスで送る。末尾の `/` は通す
 - 上流の redirect (3xx) は**追わない**。`Location` も含めてそのままクライアントへ返すので、gateway が登録した行き先の外へ出ることはない
 - 設定に無い行き先・当たるパスが無い: **404**。パスは当たるが method が違う: **405**。秘密が読めない・上流に届かない: **502**。前の 3 つでは上流へ何も送らない
-- 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。日次集計には積まない
+- 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。gateway 自身が断った時は `refused` に理由が載る: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (上流が答えた時は状態コードに関わらず無い)。日次集計には積まない
+
+### namespace の allowlist (`[ns.<name>.allow]`)
+
+```toml
+[ns.app1.allow]
+"api.x.ai" = ["GET /v1/models", "POST /v1/chat/completions"]
+"api.example.com" = ["GET /v1/*"]
+```
+
+キーは `[upstreams.<name>]` の名前で、値は同じ `"METHOD パスのパターン"` の形。method は 1 つずつ書く (method に `*` は設定の読み込みで断る)。副作用のある method を意図して書かせるため。
+
+2 つの allow は問いが違う: `[upstreams.<name>].allow` は「そのキーで gateway 経由に使ってよい endpoint」、`[ns.<name>.allow]` は「その namespace のトークンを持つ相手が使ってよいもの」。**両方が通したものだけ**が上流へ出る (namespace の側で行き先の側を広げることはできない)。先に見るのは namespace の側で、そこで断った要求は未登録の行き先と同じ 404 になるので、namespace から自分の allowlist の外にどんな行き先があるかは探れない。LLM 経路 (`/ns-<ns>/v1/...`) には効かない。
 
 ```bash
 curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization: Bearer <namespace のトークン>'

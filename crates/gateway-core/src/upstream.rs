@@ -102,6 +102,12 @@ impl std::str::FromStr for Allow {
             || format!("allow entry `{raw}` must be `METHOD /path` (for example `GET /v1/items`)");
         let (method, path) = raw.trim().split_once(' ').ok_or_else(hint)?;
         let path = path.trim();
+        // 副作用のある method を明示させるため、method を束ねる書き方は持たない。
+        if method.contains('*') {
+            return Err(format!(
+                "allow entry `{raw}` uses `*` as the method; write each method (GET, POST, ...) explicitly"
+            ));
+        }
         if method.is_empty()
             || !method.bytes().all(|b| b.is_ascii_alphabetic())
             || !path.starts_with('/')
@@ -125,6 +131,28 @@ pub enum Decision {
     MethodNotAllowed,
     /// パスが上流で別の場所へ読み替わりうる形をしている (404)。
     UnsafePath,
+}
+
+/// `METHOD パス` の並びで判定する。行き先の側 ([`UpstreamSpec::allow`]) と
+/// 利用者の側 (namespace の allowlist) が同じ規則を使う。
+pub fn decide(allows: &[Allow], method: &str, path: &str) -> Decision {
+    if !safe_path(path) {
+        return Decision::UnsafePath;
+    }
+    let mut path_matched = false;
+    for allow in allows {
+        if crate::pattern::matches(&allow.path, path) {
+            if allow.method.eq_ignore_ascii_case(method) {
+                return Decision::Allowed;
+            }
+            path_matched = true;
+        }
+    }
+    if path_matched {
+        Decision::MethodNotAllowed
+    } else {
+        Decision::NotFound
+    }
 }
 
 /// `<rest>` のパスが、上流で別の場所へ読み替わらない形か。
@@ -159,23 +187,7 @@ pub fn safe_path(path: &str) -> bool {
 impl UpstreamSpec {
     /// `<rest>` のパス部分 (クエリを除く) と method で判定する。
     pub fn decide(&self, method: &str, path: &str) -> Decision {
-        if !safe_path(path) {
-            return Decision::UnsafePath;
-        }
-        let mut path_matched = false;
-        for allow in &self.allow {
-            if crate::pattern::matches(&allow.path, path) {
-                if allow.method.eq_ignore_ascii_case(method) {
-                    return Decision::Allowed;
-                }
-                path_matched = true;
-            }
-        }
-        if path_matched {
-            Decision::MethodNotAllowed
-        } else {
-            Decision::NotFound
-        }
+        decide(&self.allow, method, path)
     }
 
     /// 上流へ出す URL。`path` は [`safe_path`] を通った `<rest>` のパス、
@@ -294,6 +306,7 @@ allow = ["GET /v1/items", "post /v1/items/*"]
             r#"auth = { header = "" }"#,
             r#"allow = ["GET v1"]"#,
             r#"allow = ["/v1"]"#,
+            r#"allow = ["* /v1/items"]"#,
         ] {
             let text = SAMPLE
                 .lines()
