@@ -40,6 +40,28 @@ The `ns-` prefix exists so a namespace name can be told apart from the API path 
 
 Authentication is per namespace. Only a namespace with `auth_token` under `[ns.<name>]` inspects the `Authorization` header; a mismatch returns 401 (`authentication_error`). A namespace without `auth_token` passes traffic through unchecked — the boundary is expected to be drawn in front (tailnet / Caddy).
 
+### `jwt` namespaces
+
+A namespace can instead accept Ed25519-signed JWTs (DR-0030 §6). The token is sent as `Authorization: Bearer <jwt>`, the same way as a fixed token, so a client such as Claude Code puts it in `ANTHROPIC_AUTH_TOKEN`.
+
+```toml
+[ns.claude]
+auth = "jwt"
+max_ttl = "400d"          # required; a token living longer than this (exp - now, and exp - iat when iat is present) is refused
+iss = "llm-gateway-cli"   # optional; when written, the token's iss must match
+aud = "ns-claude"         # optional; when written, the token's aud (a string or an array) must contain it
+
+[ns.claude.keys.claude-mbp-2026-09]   # the table key is the kid
+alg = "EdDSA"                          # the only one accepted
+public = "<Ed25519 public key, 32 bytes, base64url without padding>"
+```
+
+- `auth` names the method: omit it and `auth_token` decides (`token` when present, unchecked when absent), or write `auth = "token"` / `auth = "jwt"`. Fields of the other method (`auth_token` with `jwt`, `keys` / `max_ttl` / `iss` / `aud` without it) are refused when the configuration is read
+- A token passes when its header names a configured `kid`, its `alg` is `EdDSA` (the header's `alg` is only compared, never used to pick the algorithm), it carries no `crit`, the signature verifies, `exp` and `sub` are present, and the times hold within 60 seconds of skew (`exp` not passed, `iat` / `nbf` not in the future, the lifetime within `max_ttl`)
+- Every failure returns the same 401 with `WWW-Authenticate: Bearer error="invalid_token"`; which check failed is only written to the log
+- `keys` is a table keyed by kid, so a file that `extends` another adds keys to the base instead of replacing them. To revoke a key, delete its kid from the file that defines it
+- **The configuration is read when the gateway starts; a key added or removed takes effect only after a restart** (`daemon restart`). During a rolling restart the old key keeps working on a unit that has not restarted yet
+
 ## Prompt cache strategy (`[[ns.<name>.cache]]`)
 
 Each namespace can say how the `cache_control` of a forwarded body is treated (DR-0024). Rules are ordered like `routing` — model globs, first match wins — and are matched against the model name after aliases are resolved.

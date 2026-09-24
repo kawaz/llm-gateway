@@ -4990,3 +4990,150 @@ allow = ["GET /v1/items"]
         assert!(!json.to_string().contains("secret=1"), "{json}");
     }
 }
+
+#[cfg(test)]
+mod jwt_tests {
+    use super::tests::serve;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use serde_json::{Value, json};
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7; 32])
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn sign(key: &SigningKey, header: &Value, claims: &Value) -> String {
+        let head = B64.encode(serde_json::to_vec(header).unwrap());
+        let body = B64.encode(serde_json::to_vec(claims).unwrap());
+        let input = format!("{head}.{body}");
+        format!(
+            "{input}.{}",
+            B64.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    fn good() -> String {
+        sign(
+            &key(),
+            &json!({"alg": "EdDSA", "kid": "mbp-2026-09"}),
+            &json!({"sub": "kawaz-mbp", "exp": now() + 3600, "iat": now()}),
+        )
+    }
+
+    fn config() -> String {
+        format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5"]
+
+[ns.claude]
+auth = "jwt"
+max_ttl = "1d"
+
+[ns.claude.keys.mbp-2026-09]
+alg = "EdDSA"
+public = "{}"
+
+[ns.claude.allow]
+nothing = ["GET /x"]
+"#,
+            B64.encode(key().verifying_key().to_bytes())
+        )
+    }
+
+    /// 設定から読んだ `jwt` の ns は、署名した token の主体 (sub / kid) を返す。
+    #[test]
+    fn the_configured_namespace_yields_the_principal() {
+        let config: llm_gateway::Config = toml::from_str(&config()).unwrap();
+        config.validate().unwrap();
+        let ns = config.namespace("claude").unwrap();
+        assert_eq!(
+            ns.auth
+                .verify("claude", Some(&format!("Bearer {}", good()))),
+            llm_gateway::config::Authorization::Accepted(llm_gateway::config::Principal {
+                ns: "claude".into(),
+                subject: Some("kawaz-mbp".into()),
+                kid: Some("mbp-2026-09".into()),
+            })
+        );
+    }
+
+    /// LLM 経路でも中継でも、署名した token は通り、そうでないものは理由を区別
+    /// せずに 401 (`WWW-Authenticate: Bearer error="invalid_token"`)。
+    #[tokio::test]
+    async fn a_signed_token_passes_and_the_rest_get_the_same_401() {
+        let base = serve(&config()).await;
+        let client = reqwest::Client::new();
+        let models = |token: &str| {
+            client
+                .get(format!("{base}/ns-claude/v1/models"))
+                .bearer_auth(token)
+                .send()
+        };
+        assert_eq!(models(&good()).await.unwrap().status(), 200);
+
+        let other_key = SigningKey::from_bytes(&[8; 32]);
+        let mut tampered: Vec<String> = good().split('.').map(str::to_owned).collect();
+        tampered[1] =
+            B64.encode(serde_json::to_vec(&json!({"sub": "root", "exp": now() + 3600})).unwrap());
+        let bad = [
+            sign(
+                &key(),
+                &json!({"alg": "EdDSA", "kid": "mbp-2026-09"}),
+                &json!({"sub": "kawaz-mbp", "exp": now() - 3600}),
+            ),
+            sign(
+                &key(),
+                &json!({"alg": "EdDSA", "kid": "unknown"}),
+                &json!({"sub": "kawaz-mbp", "exp": now() + 3600}),
+            ),
+            sign(
+                &key(),
+                &json!({"alg": "RS256", "kid": "mbp-2026-09"}),
+                &json!({"sub": "kawaz-mbp", "exp": now() + 3600}),
+            ),
+            sign(
+                &key(),
+                &json!({"alg": "EdDSA", "kid": "mbp-2026-09"}),
+                &json!({"sub": "kawaz-mbp", "exp": now() + 3 * 86_400}),
+            ),
+            sign(
+                &other_key,
+                &json!({"alg": "EdDSA", "kid": "mbp-2026-09"}),
+                &json!({"sub": "kawaz-mbp", "exp": now() + 3600}),
+            ),
+            tampered.join("."),
+        ];
+        let mut bodies = std::collections::BTreeSet::new();
+        for token in &bad {
+            let resp = models(token).await.unwrap();
+            assert_eq!(resp.status(), 401, "{token}");
+            assert_eq!(
+                resp.headers()["www-authenticate"],
+                "Bearer error=\"invalid_token\""
+            );
+            bodies.insert(resp.text().await.unwrap());
+        }
+        assert_eq!(bodies.len(), 1, "every refusal reads the same: {bodies:?}");
+
+        // 中継の経路でも同じ検査が効く (通れば allowlist の判定まで進んで 404)。
+        let relay = |token: &str| {
+            client
+                .get(format!("{base}/ns-claude/nothing/x"))
+                .bearer_auth(token)
+                .send()
+        };
+        assert_eq!(relay(&good()).await.unwrap().status(), 404);
+        assert_eq!(relay(&bad[0]).await.unwrap().status(), 401);
+    }
+}

@@ -40,6 +40,28 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 
 認証は namespace ごと。`[ns.<name>]` に `auth_token` を書いた namespace だけが `Authorization` ヘッダを検査し、合わなければ 401 (`authentication_error`) を返す。`auth_token` を書かない namespace は検査せずに通す — 手前 (tailnet / Caddy) で境界を引く運用を前提にしているため。
 
+### `jwt` の namespace
+
+固定 token の代わりに、Ed25519 で署名した JWT を受ける namespace も作れる (DR-0030 §6)。送り方は固定 token と同じ `Authorization: Bearer <jwt>` なので、Claude Code なら `ANTHROPIC_AUTH_TOKEN` に入れる。
+
+```toml
+[ns.claude]
+auth = "jwt"
+max_ttl = "400d"          # 必須。これより長い寿命 (exp - now、iat があれば exp - iat も) の token は断る
+iss = "llm-gateway-cli"   # 任意。書いたら token の iss の一致を要求する
+aud = "ns-claude"         # 任意。書いたら token の aud (文字列か配列) に含まれることを要求する
+
+[ns.claude.keys.claude-mbp-2026-09]   # 表のキーが kid
+alg = "EdDSA"                          # 今はこれだけ
+public = "<Ed25519 公開鍵 32 バイトの base64url (パディング無し)>"
+```
+
+- `auth` は方式名。省けば `auth_token` の有無で決まり (有れば `token`、無ければ無検査)、`auth = "token"` / `auth = "jwt"` と明示もできる。別の方式の欄 (`jwt` での `auth_token`、`jwt` 以外での `keys` / `max_ttl` / `iss` / `aud`) は設定の読み込みで断る
+- 通るのは、ヘッダの `kid` が設定にあり、`alg` が `EdDSA` (ヘッダの `alg` は照合するだけで、検証の方法の選択には使わない)、`crit` が無く、署名が合い、`exp` と `sub` があり、時刻が 60 秒の揺れの内で合う (`exp` を過ぎていない、`iat` / `nbf` が先の時刻でない、寿命が `max_ttl` 以内) token
+- 通らなかった時は理由に関わらず同じ 401 と `WWW-Authenticate: Bearer error="invalid_token"` を返す。どの検査で落ちたかはログにだけ残す
+- `keys` は kid をキーにした表なので、`extends` した派生のファイルに書いた鍵は土台の鍵に加わる (置き換えない)。鍵を失効させるには、その kid を定義しているファイルから消す
+- **設定は起動時に読む。鍵の追加・削除 (失効) は再起動 (`daemon restart`) で反映される**。rolling restart の間、まだ再起動していない unit では古い鍵が通る
+
 ## prompt cache 戦略 (`[[ns.<name>.cache]]`)
 
 namespace ごとに、転送する本文の `cache_control` をどう扱うかを書ける (DR-0024)。並びは `routing` と同じ「モデル glob + 先勝ち」で、照合するのは短い名前を解決した後のモデル名。

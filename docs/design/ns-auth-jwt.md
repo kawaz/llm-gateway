@@ -153,6 +153,7 @@ Phase 0 の 3 行 (完了条件):
 1. **`NsAuth` を enum 化** (振る舞い不変)。`Open` / `Token` の 2 枝、生の欄からの畳み込み、方式と欄の食い違いの設定エラー。既存テスト全部そのまま緑 + 食い違いのテスト
 2. **jwt 検証** (`gateway-core`)。`ed25519-dalek` 導入、JWS 解析、claim 検査、`Rejected(Reason)`。単体テストで上の拒否 5 種 + `none` + `crit` + 未来 `iat` + skew 境界。テスト用の鍵はテスト内で生成
 3. **設定と経路の接続**。`auth = "jwt"` / `keys` / `max_ttl` / `iss` / `aud` の読み込み、LLM 経路と passthrough の両方で jwt を通す、401 + `WWW-Authenticate`、`extends` で `keys` が kid ごとにマージされるテスト。稼働中の設定再読込の有無を確認し、無ければ「失効は restart で反映」を MANUAL に明記する。e2e で Claude 形式のリクエストが通る
+   - 段 1〜3 実施済み: `NsAuth` は `Open` / `Token` / `Jwt` の enum、検証は `gateway_core::ns::jwt::JwtAuth`、失敗は `Authorization::Rejected(Reason)` でログだけに理由を出す。設定は起動時にしか読まないので、失効は restart で反映 (MANUAL に明記)
 4. **Principal を events へ**。`request` / 完了 / `passthrough` に `subject` / `kid`。無い時は欄が出ないことをテストで縛る
 5. **helper CLI** `auth keygen` / `jwks` / `sign`、help、completion。`sign` の出力を段 2 の検証に通す往復テスト (CLI と検証器が同じ規約で合っていることの証明)
 6. **docs**: README / 設定例、runbook (`docs/runbook/` 等、既存の置き場に合わせる)、DR-0030 の Status に手順 4 実装済みを記す

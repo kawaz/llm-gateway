@@ -28,6 +28,9 @@ futures-util = { workspace = true }
 # 置き場の試験用実装が汎用層の Result を返すため。
 gateway-core = { path = "../gateway-core" }
 toml = { workspace = true }
+# ns 認証 `jwt` の試験で token を署名する。
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 # 日次集計の置き場を試験ごとに分ける (実運用の state を触らせない)。
 tempfile = { workspace = true }
 # 記録が残ることを試験で確かめるための受け取り先。

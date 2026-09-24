@@ -104,6 +104,20 @@ ns 設定の `auth` を方式の enum にする。**検証の出口は方式に�
 | `jwt` | ns 設定が持つ JWKS (kid → 公開鍵) で検証する |
 | `issued` | gateway 自身が IdP として access / refresh を発行する |
 
+確定した設定の形 (ns 認証 `jwt` の段 3、`docs/design/ns-auth-jwt.md`):
+
+```toml
+[ns.claude]
+auth = "jwt"              # 方式名。省けば auth_token の有無で token / 無検査
+max_ttl = "400d"          # 必須
+iss = "llm-gateway-cli"   # 任意
+aud = "ns-claude"         # 任意
+
+[ns.claude.keys.claude-mbp-2026-09]   # kid ごとの表 (extends で鍵ごとにマージ)
+alg = "EdDSA"
+public = "<Ed25519 公開鍵 32 バイトの base64url>"
+```
+
 `jwt` の規定:
 
 - **alg は kid ごとに設定で固定し、JWT ヘッダの `alg` を信用しない**。ヘッダの申告で検証アルゴリズムを選ぶと、鍵の取り違えと `none` 系の事故の口になる
