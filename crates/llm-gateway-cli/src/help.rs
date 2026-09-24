@@ -19,6 +19,7 @@ commands:
   usage       list usage per credential (asks a running unit)
   stats       list token usage and USD cost per credential x model x day
   login       authorize in a browser and save the credential to <name>.json
+  auth        make keys and tokens for namespaces that use auth = \"jwt\"
   version     show what is installed and what is running (and whether they differ)
 
 global options:
@@ -140,6 +141,45 @@ status options:
   --unit <name>     which running unit to ask
                     (default: the only registered one; `daemon list` shows them)
   --refresh         refresh official sources before showing the report
+";
+
+/// `auth` の下。
+pub const AUTH: &str = "\
+llm-gateway auth — make keys and tokens for namespaces that use auth = \"jwt\"
+
+usage:
+  llm-gateway auth <command> [options]
+
+everything is written to stdout and nothing is saved. keep the private key
+yourself (a password manager, or a file readable only by you), and read it
+back from stdin with --key - (the default).
+
+commands:
+  keygen            make an Ed25519 key pair and print the private key as a JWK
+  jwks              print the public key to paste into the configuration
+  sign              print a JWT signed with the private key
+
+keygen options:
+  --kid <kid>       key id (default: today's date and 4 random hex digits)
+
+jwks options:
+  --key <file>      private key JWK to read, - for stdin (default: -)
+  --kid <kid>       key id to print (default: the kid in the JWK)
+  --ns <name>       namespace name to put in the TOML (default: <name>)
+  --format <form>   toml (a [ns.<name>.keys.<kid>] table, the default)
+                    or jwks (a JSON Web Key Set)
+
+sign options:
+  --key <file>      private key JWK to read, - for stdin (default: -)
+  --kid <kid>       key id to put in the header (default: the kid in the JWK)
+  --sub <subject>   who the token is for (required; shows up as subject in events)
+  --ttl <duration>  how long it lives, like 180d / 12h / 30m (required;
+                    the namespace's max_ttl caps what it accepts)
+  --iss <issuer>    iss claim
+  --aud <audience>  aud claim (repeat for more than one)
+
+global options:
+  --help, -h        show this help
 ";
 
 /// help を求められているか。

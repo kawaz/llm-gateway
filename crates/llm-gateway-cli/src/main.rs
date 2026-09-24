@@ -7,8 +7,10 @@
 //! - [`check`] / [`models`] 設定ファイルそのものを対象にする確認
 //! - [`usage`] / [`stats`] 走っている台に聞いて整形する
 //! - [`login`] ブラウザで認可を通して認証情報を置く
+//! - [`auth`] ns 認証 `jwt` の鍵と token を手元で作る
 //! - [`version`] 置いてある版と走っている版を並べる
 
+mod auth;
 mod check;
 mod daemon;
 mod destination;
@@ -64,6 +66,7 @@ fn run(args: &[String]) -> Result<ExitCode, Failure> {
         "daemon" => return daemon::dispatch(rest),
         "service" => return service::dispatch(rest),
         "upstream" => return upstream::run(rest),
+        "auth" => return auth::dispatch(rest),
         _ => {}
     }
 

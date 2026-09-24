@@ -13,7 +13,9 @@ use std::fmt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use ed25519_dalek::{Signature, VerifyingKey};
+pub use ed25519_dalek::{SigningKey, VerifyingKey};
+
+use ed25519_dalek::Signature;
 use serde_json::Value;
 
 /// 時計の揺れの許し (秒)。
@@ -214,6 +216,82 @@ fn decode_json(part: &str) -> Result<Value, Reason> {
     }
 }
 
+/// JWS compact で署名する (`alg = EdDSA`, `kid`)。`claims` は JSON のオブジェクト。
+///
+/// 検証 ([`JwtAuth::verify`]) と同じ規約で作るので、鋳造した token はそのまま
+/// 検証を通る。
+pub fn sign(key: &ed25519_dalek::SigningKey, kid: &str, claims: &Value) -> String {
+    use ed25519_dalek::Signer as _;
+    let header = serde_json::json!({"alg": "EdDSA", "typ": "JWT", "kid": kid});
+    let head = B64.encode(serde_json::to_vec(&header).unwrap_or_default());
+    let body = B64.encode(serde_json::to_vec(claims).unwrap_or_default());
+    let input = format!("{head}.{body}");
+    let sig = key.sign(input.as_bytes());
+    format!("{input}.{}", B64.encode(sig.to_bytes()))
+}
+
+/// 32 バイトの乱数から秘密鍵を作る。乱数は呼び出し側が OS の生成器から取る。
+pub fn signing_key(seed: &[u8; 32]) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(seed)
+}
+
+/// 公開鍵を設定に書く形 (32 バイトの base64url、パディング無し) にする。
+pub fn public_key_text(key: &VerifyingKey) -> String {
+    B64.encode(key.to_bytes())
+}
+
+/// 秘密鍵の JWK (`{"kty":"OKP","crv":"Ed25519","kid":..,"d":..,"x":..}`)。
+pub fn private_jwk(kid: &str, key: &ed25519_dalek::SigningKey) -> Value {
+    serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": kid,
+        "d": B64.encode(key.to_bytes()),
+        "x": public_key_text(&key.verifying_key()),
+    })
+}
+
+/// 公開鍵の JWK (`{"kty":"OKP","crv":"Ed25519","kid":..,"alg":"EdDSA","x":..}`)。
+pub fn public_jwk(kid: &str, key: &VerifyingKey) -> Value {
+    serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "kid": kid,
+        "alg": "EdDSA",
+        "use": "sig",
+        "x": public_key_text(key),
+    })
+}
+
+/// 秘密鍵の JWK を読む。`kid` と鍵を返す。`x` があれば `d` から求めた公開鍵と
+/// 合っているかも確かめる (取り違えた 2 本を貼り合わせた JWK を弾く)。
+pub fn read_private_jwk(text: &str) -> Result<(Option<String>, ed25519_dalek::SigningKey), String> {
+    let jwk: Value = serde_json::from_str(text.trim())
+        .map_err(|e| format!("the key is not a JWK (JSON): {e}"))?;
+    if jwk.get("kty").and_then(Value::as_str) != Some("OKP")
+        || jwk.get("crv").and_then(Value::as_str) != Some("Ed25519")
+    {
+        return Err("the key must be an Ed25519 JWK (kty = OKP, crv = Ed25519)".to_owned());
+    }
+    let d = jwk
+        .get("d")
+        .and_then(Value::as_str)
+        .ok_or("the JWK has no private part (`d`); give the file `auth keygen` wrote")?;
+    let d: [u8; 32] = B64
+        .decode(d)
+        .map_err(|e| format!("`d` is not base64url: {e}"))?
+        .try_into()
+        .map_err(|_| "`d` must be 32 bytes".to_owned())?;
+    let key = ed25519_dalek::SigningKey::from_bytes(&d);
+    if let Some(x) = jwk.get("x").and_then(Value::as_str)
+        && x != public_key_text(&key.verifying_key())
+    {
+        return Err("`x` does not belong to `d`".to_owned());
+    }
+    let kid = jwk.get("kid").and_then(Value::as_str).map(str::to_owned);
+    Ok((kid, key))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -398,6 +476,20 @@ pub(crate) mod tests {
         for bad in ["", "a.b", "a.b.c.d", "!!.!!.!!", "e30.e30.e30"] {
             assert!(auth().verify(bad, NOW).is_err(), "{bad:?}");
         }
+    }
+
+    /// ここで鋳造した token は、同じ規約の検証を通る。
+    #[test]
+    fn a_minted_token_passes_verification() {
+        let key = signing_key(1);
+        let jwk = private_jwk("k1", &key).to_string();
+        let (kid, read) = read_private_jwk(&jwk).unwrap();
+        assert_eq!(kid.as_deref(), Some("k1"));
+        let token = super::sign(&read, "k1", &json!({"sub": "mbp", "exp": NOW + 60}));
+        assert!(auth().verify(&token, NOW).is_ok());
+        let mut mixed: Value = serde_json::from_str(&jwk).unwrap();
+        mixed["x"] = json!(public_key_text(&signing_key(2).verifying_key()));
+        assert!(read_private_jwk(&mixed.to_string()).is_err());
     }
 
     #[test]

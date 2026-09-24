@@ -156,6 +156,7 @@ Phase 0 の 3 行 (完了条件):
    - 段 1〜3 実施済み: `NsAuth` は `Open` / `Token` / `Jwt` の enum、検証は `gateway_core::ns::jwt::JwtAuth`、失敗は `Authorization::Rejected(Reason)` でログだけに理由を出す。設定は起動時にしか読まないので、失効は restart で反映 (MANUAL に明記)
 4. **Principal を events へ**。`request` / 完了 / `passthrough` に `subject` / `kid`。無い時は欄が出ないことをテストで縛る
 5. **helper CLI** `auth keygen` / `jwks` / `sign`、help、completion。`sign` の出力を段 2 の検証に通す往復テスト (CLI と検証器が同じ規約で合っていることの証明)
+   - 段 4 / 5 実施済み: 知らせの `request` / `response` / `passthrough` に `subject` / `kid` (jwt の ns だけ)。CLI `auth keygen` / `jwks` / `sign` (鍵の生成・JWK・署名は `gateway_core::ns::jwt` に置き、CLI は呼ぶだけ)。この CLI には completion の定義が無いので、足すものは無い
 6. **docs**: README / 設定例、runbook (`docs/runbook/` 等、既存の置き場に合わせる)、DR-0030 の Status に手順 4 実装済みを記す
 
 `issued` との境界: 手順 4 の検証器は「kid → 公開鍵」の表を受けるだけにし、表の出どころ (設定 or gateway 自身の JWKS) を知らない。手順 5 は同じ検証器に gateway の JWKS から作った表を渡し、発行側 (署名、kid ごとの最終発行時刻、token endpoint) を足す。JWKS を DR-0031 (1) の Persistence に載せるのは `issued` の署名鍵 (gateway 自身の秘密) で、`jwt` の公開鍵は秘密ではないので設定内でよい、という線を引く。

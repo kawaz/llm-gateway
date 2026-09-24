@@ -619,6 +619,22 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 
 `start` / `stop` / `restart` / `status` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.
 
+### `auth` — keys and tokens for `jwt` namespaces
+
+Everything is printed to stdout; nothing is saved. Keep the private key yourself (a password manager, or a file only you can read) and feed it back on stdin (`--key -`, the default) or from a file (`--key <file>`).
+
+```bash
+llm-gateway auth keygen --kid claude-mbp-2026-09 > claude-mbp-2026-09.jwk   # private key as a JWK
+chmod 600 claude-mbp-2026-09.jwk
+llm-gateway auth jwks --ns claude < claude-mbp-2026-09.jwk                   # [ns.claude.keys.<kid>] to paste
+llm-gateway auth jwks --format jwks < claude-mbp-2026-09.jwk                 # the same key as a JWKS
+llm-gateway auth sign --sub kawaz-mbp --ttl 180d < claude-mbp-2026-09.jwk     # one JWT on one line
+```
+
+- `keygen [--kid <kid>]`: the kid defaults to today's date and four random hex digits
+- `jwks [--key <file|->] [--kid <kid>] [--ns <name>] [--format toml|jwks]`: `toml` (the default) is the table to add under the namespace; `jwks` is `{"keys":[…]}` without the private part
+- `sign [--key <file|->] [--kid <kid>] --sub <subject> --ttl <duration> [--iss <iss>] [--aud <aud>]...`: `iat` is now and `exp` is now + ttl. The namespace's `max_ttl` is checked by the gateway, not here
+
 ### `version` — installed against running
 
 `--version` prints one line: the version of the CLI you just ran. `version` prints JSON, because there are two more versions worth knowing and they can disagree: what is **on disk** (asked of the binary with `--version`, so what comes up next) and what is **running** (asked of the live process, so what is being served right now).

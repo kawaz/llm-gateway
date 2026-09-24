@@ -621,6 +621,22 @@ llm-gateway <command> [options]
 
 `start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
 
+### `auth` — `jwt` の namespace の鍵と token
+
+どれも標準出力に出すだけで、何も保存しない。秘密鍵は自分で持ち (パスワードマネージャか、自分だけが読めるファイル)、標準入力 (`--key -`、既定) かファイル (`--key <file>`) で渡す。
+
+```bash
+llm-gateway auth keygen --kid claude-mbp-2026-09 > claude-mbp-2026-09.jwk   # 秘密鍵 (JWK)
+chmod 600 claude-mbp-2026-09.jwk
+llm-gateway auth jwks --ns claude < claude-mbp-2026-09.jwk                   # 貼る [ns.claude.keys.<kid>]
+llm-gateway auth jwks --format jwks < claude-mbp-2026-09.jwk                 # 同じ鍵の JWKS
+llm-gateway auth sign --sub kawaz-mbp --ttl 180d < claude-mbp-2026-09.jwk     # JWT を 1 行
+```
+
+- `keygen [--kid <kid>]`: kid の既定は今日の日付と 16 進 4 桁の乱数
+- `jwks [--key <file|->] [--kid <kid>] [--ns <name>] [--format toml|jwks]`: `toml` (既定) は namespace の下に足す表、`jwks` は秘密の部分を含まない `{"keys":[…]}`
+- `sign [--key <file|->] [--kid <kid>] --sub <subject> --ttl <長さ> [--iss <iss>] [--aud <aud>]...`: `iat` は今、`exp` は今 + ttl。namespace の `max_ttl` との照合は gateway 側で行い、ここでは見ない
+
 ### `version` — 置いてある版と走っている版
 
 `--version` はテキスト 1 行で、今叩いた CLI 自身の版を言う。`version` が JSON なのは、知りたい版がもう 2 つあって、しかも食い違いうるため: **置いてある版** (`on_disk`、binary に `--version` を聞いたもの = 次に上がる版) と **走っている版** (`running`、動いているプロセスに聞いたもの = 今処理している版)。

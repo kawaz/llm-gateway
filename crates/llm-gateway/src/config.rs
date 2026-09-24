@@ -216,7 +216,7 @@ pub struct KeySpec {
 }
 
 /// `90d` / `12h` / `30m` / `45s` の長さを秒に直す。
-fn parse_duration_secs(raw: &str) -> std::result::Result<i64, String> {
+pub fn parse_duration_secs(raw: &str) -> std::result::Result<i64, String> {
     let hint = || {
         format!(
             "`{raw}` is not a duration; write a whole number with d / h / m / s (for example `180d`)"
@@ -1872,7 +1872,7 @@ impl Namespace {
     }
 }
 
-pub use gateway_core::ns::{Authorization, NsAuth, Principal};
+pub use gateway_core::ns::{Authorization, NsAuth, Principal, jwt};
 
 /// 既定の認証情報の置き場。
 ///
