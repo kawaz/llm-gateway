@@ -66,8 +66,7 @@ use serde::{Deserialize, Serialize};
 use crate::metering::{Pricing, TokenKind};
 use crate::{Error, Result};
 
-mod extends;
-mod path_expand;
+use gateway_core::config::{extends, path_expand, xdg_dir};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1526,7 +1525,7 @@ pub fn default_credentials_dir() -> PathBuf {
 
 /// 消えると作り直せないものの置き場。
 pub fn default_state_dir() -> PathBuf {
-    xdg_dir("XDG_STATE_HOME", ".local/state").join("llm-gateway")
+    gateway_core::config::default_state_dir("llm-gateway")
 }
 
 /// 既定の日次集計の置き場。
@@ -1535,19 +1534,6 @@ pub fn default_state_dir() -> PathBuf {
 /// (upstream に聞き直す口が無い) ので、cache の扱いに合わない (DR-0011)。
 pub fn default_stats_dir() -> PathBuf {
     default_state_dir().join("stats")
-}
-
-fn xdg_dir(env: &str, fallback: &str) -> PathBuf {
-    std::env::var_os(env)
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(fallback))
-}
-
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 #[cfg(test)]

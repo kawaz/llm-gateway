@@ -120,18 +120,18 @@ mod tests {
 [server]
 listen = "127.0.0.1:8401"
 
-[credentials.bedrock]
-type = "bedrock_api_key"
+[credentials.store]
+type = "fixed_key"
 
-[routes.bedrock]
-provider = "anthropic"
-credential = "bedrock"
-url = "https://bedrock.invalid/anthropic"
-exclude = ["claude-opus-*"]
+[routes.store]
+provider = "vendor"
+credential = "store"
+url = "https://vendor.invalid/v1"
+exclude = ["big-*"]
 
 [[ns.default.routing]]
-models = ["m"]
-routes = ["bedrock"]
+names = ["m"]
+routes = ["store"]
 "#;
 
     /// 派生側に書いた分だけが変わり、書いていない分は土台のまま。
@@ -153,8 +153,8 @@ listen = "127.0.0.1:8402"
         let merged = resolve(&at(&dir, "here.toml")).unwrap();
         assert_eq!(merged["server"]["listen"].as_str(), Some("127.0.0.1:8402"));
         assert_eq!(
-            merged["routes"]["bedrock"]["url"].as_str(),
-            Some("https://bedrock.invalid/anthropic"),
+            merged["routes"]["store"]["url"].as_str(),
+            Some("https://vendor.invalid/v1"),
             "untouched base entries remain"
         );
         assert!(
@@ -173,22 +173,19 @@ listen = "127.0.0.1:8402"
                 r#"
 extends = "base.toml"
 
-[routes.bedrock]
+[routes.store]
 exclude = ["*"]
 "#,
             ),
         ]);
 
-        let route = &resolve(&at(&dir, "here.toml")).unwrap()["routes"]["bedrock"];
+        let route = &resolve(&at(&dir, "here.toml")).unwrap()["routes"]["store"];
         assert_eq!(
             route["provider"].as_str(),
-            Some("anthropic"),
+            Some("vendor"),
             "an unwritten field comes from the base"
         );
-        assert_eq!(
-            route["url"].as_str(),
-            Some("https://bedrock.invalid/anthropic")
-        );
+        assert_eq!(route["url"].as_str(), Some("https://vendor.invalid/v1"));
         assert_eq!(
             route["exclude"].as_array().unwrap(),
             &[Value::from("*")],
@@ -207,7 +204,7 @@ exclude = ["*"]
 extends = "base.toml"
 
 [[ns.default.routing]]
-models = ["*"]
+names = ["*"]
 routes = ["oauth"]
 "#,
             ),
@@ -243,8 +240,8 @@ listen = "127.0.0.1:8402"
         let merged = resolve(&at(&dir, "faces/here.toml")).unwrap();
         assert_eq!(merged["server"]["listen"].as_str(), Some("127.0.0.1:8402"));
         assert_eq!(
-            merged["credentials"]["bedrock"]["type"].as_str(),
-            Some("bedrock_api_key")
+            merged["credentials"]["store"]["type"].as_str(),
+            Some("fixed_key")
         );
     }
 
@@ -300,7 +297,7 @@ extends = "a.toml"
 [server]
 listen = "127.0.0.1:8402"
 
-[routes.bedrock]
+[routes.store]
 exclude = ["b が書いた"]
 "#,
             ),
@@ -309,7 +306,7 @@ exclude = ["b が書いた"]
                 r#"
 extends = "b.toml"
 
-[routes.bedrock]
+[routes.store]
 exclude = ["c が書いた"]
 "#,
             ),
@@ -317,7 +314,7 @@ exclude = ["c が書いた"]
 
         let merged = resolve(&at(&dir, "c.toml")).unwrap();
         assert_eq!(
-            merged["routes"]["bedrock"]["exclude"].as_array().unwrap(),
+            merged["routes"]["store"]["exclude"].as_array().unwrap(),
             &[Value::from("c が書いた")],
             "the closest one wins"
         );
@@ -327,8 +324,8 @@ exclude = ["c が書いた"]
             "what an intermediate layer wrote still applies"
         );
         assert_eq!(
-            merged["credentials"]["bedrock"]["type"].as_str(),
-            Some("bedrock_api_key"),
+            merged["credentials"]["store"]["type"].as_str(),
+            Some("fixed_key"),
             "the outermost layer also survives"
         );
     }

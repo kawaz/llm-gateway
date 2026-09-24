@@ -7,6 +7,7 @@
 //! - [`pattern`] `*` だけを扱う名前の照合
 //! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
 //! - [`stats`] 日次の集計を書き手ごとのファイルに置き、読むときに合わせる器
+//! - [`config`] 設定を土台に重ねる規則、パスの開き方、既定の置き場
 //! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
 //! - [`credential::refreshing`] 更新を束ねて使える状態で渡す窓口 ([`credential::refreshing::CredentialStore`])
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
@@ -14,6 +15,7 @@
 //! - [`events`] 起きたことを通し番号付きで見ている人へ流す口
 //! - [`ns`] namespace の入口での認証 ([`ns::NsAuth::verify`] → [`ns::Principal`])
 
+pub mod config;
 pub mod credential;
 pub mod error;
 pub mod events;
