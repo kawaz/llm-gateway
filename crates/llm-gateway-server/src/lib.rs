@@ -711,9 +711,18 @@ async fn forward<P: CredentialPersistence + 'static>(
     let Some(ns) = gateway.namespace(&ns_name) else {
         return span.in_scope(|| unknown_namespace(&ns_name, &gateway.namespace_names()));
     };
-    if let Some(denied) = span.in_scope(|| rejection(ns, &ns_name, &parts.headers)) {
+    let presented = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let verdict = ns.auth.verify(&ns_name, presented);
+    if let Some(denied) = span.in_scope(|| denied(&ns_name, &verdict)) {
         return denied;
     }
+    let principal = match verdict {
+        Authorization::Accepted(principal) => Some(principal),
+        _ => None,
+    };
     // tap に載せる値は gateway が書き換える前の client request から取る。
     let tap_plan = gateway.tap().capture_plan();
     let tap_thinking = json.get("thinking").cloned();
@@ -731,7 +740,8 @@ async fn forward<P: CredentialPersistence + 'static>(
     let query = uri.query().map(str::to_owned);
 
     match gateway
-        .forward(
+        .forward_as(
+            principal.as_ref(),
             ns,
             &ns_name,
             Ingress {
@@ -5066,6 +5076,49 @@ nothing = ["GET /x"]
                 kid: Some("mbp-2026-09".into()),
             })
         );
+    }
+
+    /// jwt で通った相手は、転送の知らせに `subject` / `kid` として載る。
+    #[tokio::test]
+    async fn the_request_notice_names_the_subject() {
+        let (upstream, _seen) = super::tests::recording_upstream().await;
+        let config: llm_gateway::Config =
+            toml::from_str(&config().replace("http://127.0.0.1:9", &upstream)).unwrap();
+        let gateway = std::sync::Arc::new(
+            llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap(),
+        );
+        gateway.refresh_models().await;
+        let mut watching = gateway.events().subscribe();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = super::router(std::sync::Arc::clone(&gateway));
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        let _ = reqwest::Client::new()
+            .post(format!("http://{addr}/ns-claude/v1/messages"))
+            .bearer_auth(good())
+            .json(&json!({"model": "claude-opus-5", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let notice = watching.recv().await.unwrap();
+                if notice.request().is_some() {
+                    return notice;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&notice).unwrap();
+        assert_eq!(json["subject"], "kawaz-mbp");
+        assert_eq!(json["kid"], "mbp-2026-09");
     }
 
     /// LLM 経路でも中継でも、署名した token は通り、そうでないものは理由を区別

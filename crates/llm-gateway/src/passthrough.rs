@@ -199,6 +199,10 @@ impl Passthrough {
     {
         let started = Instant::now();
         let ts = crate::credential::time::now_unix_ms();
+        let (subject, kid) = (
+            request.principal.subject.clone(),
+            request.principal.kid.clone(),
+        );
         let (ns, upstream, method, path) = (
             request.principal.ns.clone(),
             request.upstream.to_owned(),
@@ -226,6 +230,8 @@ impl Passthrough {
             ts,
             seq: 0,
             boot: 0,
+            subject,
+            kid,
             ns,
             upstream,
             method,

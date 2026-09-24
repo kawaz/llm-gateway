@@ -443,6 +443,21 @@ impl<P: CredentialPersistence> Gateway<P> {
         ns: &Namespace,
         ns_name: &str,
         received: Ingress<'_>,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Result<Forwarded> {
+        self.forward_as(None, ns, ns_name, received, body, headers)
+            .await
+    }
+
+    /// [`Self::forward`] に、ns 認証で通った相手を添える。知らせに `subject` / `kid`
+    /// として載る (`jwt` 方式の ns だけ。それ以外は `None`)。
+    pub async fn forward_as(
+        &self,
+        principal: Option<&gateway_core::ns::Principal>,
+        ns: &Namespace,
+        ns_name: &str,
+        received: Ingress<'_>,
         mut body: Value,
         headers: Vec<(String, String)>,
     ) -> Result<Forwarded> {
@@ -470,6 +485,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
         let call = Call {
+            principal: principal.and_then(|p| p.subject.as_deref().zip(p.kid.as_deref())),
             ns: ns_name,
             model: &model,
             session_id: declared,
@@ -1055,6 +1071,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         self.events.publish(events::Event::new(
             sent_at_ms,
             &events::Origin {
+                principal: None,
                 session_id: Some(&kept.session_id),
                 prefix: Some(&kept.prefix),
                 ns: &kept.ns,
@@ -1595,6 +1612,8 @@ impl<P: CredentialPersistence> Gateway<P> {
 /// 個別の引数で渡していくと、経路を試す関数の引数が増え続ける (どの経路でも
 /// 同じ中身を渡すので、増えるのは呼び出し側の写経だけになる)。
 struct Call<'a> {
+    /// ns 認証 `jwt` で通った相手と鍵 (`sub`, `kid`)。
+    principal: Option<(&'a str, &'a str)>,
     ns: &'a str,
     /// 解決後の実モデル名。
     model: &'a str,
@@ -1619,6 +1638,7 @@ impl<'a> Call<'a> {
     /// 知らせに載せる素性。答えた経路の名前だけが呼び出しごとに変わる。
     fn origin(&'a self, credential: &'a str) -> events::Origin<'a> {
         events::Origin {
+            principal: self.principal,
             session_id: self.session_id.as_deref(),
             prefix: self.prefix.as_deref(),
             ns: self.ns,

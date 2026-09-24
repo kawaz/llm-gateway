@@ -45,6 +45,12 @@ pub struct Event {
     pub seq: u64,
     /// どの起動の番号か ([`Events::boot`])。変わったら `seq` は振り直し。
     pub boot: i64,
+    /// ns 認証 `jwt` で通った相手 (token の `sub`)。token 方式・無検査の ns では欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// その token を確かめた鍵 (`kid`)。`subject` と同じく、無ければ欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
     /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
     pub session_id: Option<String>,
     /// どの namespace 宛か。
@@ -119,6 +125,8 @@ pub struct Event {
 /// 組むので、素性は組み立て直さずに欄だけ差し替える。
 #[derive(Clone, Copy)]
 pub struct Origin<'a> {
+    /// ns 認証 `jwt` で通った相手と鍵 (`sub`, `kid`)。
+    pub principal: Option<(&'a str, &'a str)>,
     /// クライアントが名乗った会話の id。
     pub session_id: Option<&'a str>,
     /// 会話系列の識別子。
@@ -156,6 +164,8 @@ impl Event {
             // 番号は流すときに振る ([`Events::publish`])。
             seq: 0,
             boot: 0,
+            subject: origin.principal.map(|(s, _)| s.to_owned()),
+            kid: origin.principal.map(|(_, k)| k.to_owned()),
             session_id: origin.session_id.map(str::to_owned),
             ns: origin.ns.to_owned(),
             model: origin.model.to_owned(),
@@ -278,6 +288,12 @@ pub struct Response {
     pub seq: u64,
     /// どの起動の番号か ([`Events::boot`])。変わったら `seq` は振り直し。
     pub boot: i64,
+    /// ns 認証 `jwt` で通った相手 (token の `sub`)。token 方式・無検査の ns では欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// その token を確かめた鍵 (`kid`)。`subject` と同じく、無ければ欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
     /// 対応する [`Event`] の [`Event::ts`]。同じ会話で何本も走るので、
     /// 素性が同じでも 1 対 1 に結べるようにする。
     pub request_ts: i64,
@@ -326,6 +342,8 @@ impl Response {
             ts: 0,
             seq: 0,
             boot: 0,
+            subject: origin.principal.map(|(s, _)| s.to_owned()),
+            kid: origin.principal.map(|(_, k)| k.to_owned()),
             request_ts,
             session_id: origin.session_id.map(str::to_owned),
             prefix: origin.prefix.map(str::to_owned),
@@ -367,6 +385,12 @@ pub struct Passthrough {
     pub seq: u64,
     /// どの起動の番号か ([`Events::boot`])。
     pub boot: i64,
+    /// ns 認証 `jwt` で通った相手 (token の `sub`)。token 方式・無検査の ns では欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// その token を確かめた鍵 (`kid`)。`subject` と同じく、無ければ欄ごと出ない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
     pub ns: String,
     /// 行き先の名前 (`[upstreams.<name>]`)。
     pub upstream: String,
@@ -598,6 +622,7 @@ mod tests {
     /// 素性を 1 つ組む。試験で変えたい欄だけを書けるようにする。
     fn from(credential: &str) -> Origin<'_> {
         Origin {
+            principal: None,
             session_id: None,
             prefix: None,
             ns: "personal",
@@ -674,6 +699,8 @@ mod tests {
             ts: NOW,
             seq: 3,
             boot: 1,
+            subject: Some("mbp".into()),
+            kid: Some("k1".into()),
             ns: "default".into(),
             upstream: "api.example.test".into(),
             method: "GET".into(),
@@ -691,6 +718,33 @@ mod tests {
         assert_eq!(back.name(), "passthrough");
         assert_eq!(back.seq(), 3);
         assert!(back.request().is_none() && back.response().is_none());
+    }
+
+    /// ns 認証 `jwt` で通った相手は `boot` の後に `subject` / `kid` として出る。
+    /// token 方式・無検査の ns (主体の名前が無い) では欄ごと出ない。
+    #[test]
+    fn the_subject_follows_boot_only_when_known() {
+        let plain = serde_json::to_string(&Event::new(NOW, &from("a"), 200)).unwrap();
+        assert!(
+            !plain.contains("subject") && !plain.contains("\"kid\""),
+            "{plain}"
+        );
+        let named = Origin {
+            principal: Some(("mbp", "k1")),
+            ..from("a")
+        };
+        let text = serde_json::to_string(&Event::new(NOW, &named, 200)).unwrap();
+        assert!(
+            text.starts_with(&format!(
+                r#"{{"ts":{NOW},"seq":0,"boot":0,"subject":"mbp","kid":"k1","#
+            )),
+            "{text}"
+        );
+        let response = serde_json::to_string(&Response::pending(NOW, &named, 200)).unwrap();
+        assert!(
+            response.contains(r#""subject":"mbp","kid":"k1""#),
+            "{response}"
+        );
     }
 
     /// 番号は JSON で時刻の隣に出る。

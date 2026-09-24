@@ -1137,6 +1137,7 @@ mod tests {
     /// 知らせに載せる素性。
     fn notice_origin() -> events::Origin<'static> {
         events::Origin {
+            principal: None,
             session_id: Some("s-1"),
             prefix: Some("2cf24dba"),
             ns: "personal",

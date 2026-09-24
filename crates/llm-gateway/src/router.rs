@@ -1094,6 +1094,7 @@ spend_down_within = "25%"
 
     fn origin(model: &str) -> events::Origin<'_> {
         events::Origin {
+            principal: None,
             session_id: None,
             prefix: None,
             ns: NS,

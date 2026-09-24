@@ -243,6 +243,7 @@ mod tests {
         Notice::from(Event::new(
             NOW,
             &Origin {
+                principal: None,
                 session_id: Some("s-1"),
                 prefix: Some("2cf24dba"),
                 ns: "personal",
@@ -263,6 +264,7 @@ mod tests {
         let mut event = Event::new(
             NOW,
             &Origin {
+                principal: None,
                 session_id: Some("s-1"),
                 prefix: None,
                 ns: "personal",

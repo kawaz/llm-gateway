@@ -478,6 +478,8 @@ data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":
 
 `seq` は **gateway 全体の通し番号**で、起動から 1 ずつ増える (最初の 1 件が 1)。`request` / `response` / `cache_expired` / `passthrough` の種類をまたいで同じ列を数えるので、どの見物人も同じ知らせを同じ番号で受け取る。SSE の `id:` にも同じ値が載る。前に受けた `seq` + 1 でない番号が来たら間が欠けている (落とした数は `/llm-gateway/self` の `events.dropped`、どこが欠けたかは `seq` の飛び)。gateway は履歴を持たないので、再接続時の `Last-Event-ID` は読まず、送り直さない。`boot` は起動の印 (Unix ミリ秒、`/llm-gateway/self` の `boot` と同じ値) で、変わったら `seq` が 1 から振り直されたと読む (欠落ではない)。webhook の各件も同じ 2 欄を持つ。
 
+`jwt` で認証する namespace では、`request` / `response` / `passthrough` の知らせの `boot` の直後に `subject` (token の `sub`) と `kid` も載る (例: `{"ts":…,"seq":42,"boot":…,"subject":"kawaz-mbp","kid":"claude-mbp-2026-09","session_id":"s-1",…}`)。それ以外の namespace では 2 欄とも出ない。namespace の認証で断った要求は知らせに出さない。
+
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。
 
 `keepalive` 戦略で繋ぐ 1 本には、送り直しの連鎖の姿が付く (繋ぐ対象でなければ欄ごと出ない)。控えが置かれるのは応答を読み切った後だが、この欄は**その 1 本目から**出る — 見立ては送る時点の値だけで決まるため。cache に乗らずに終わった 1 本では、直後の `cache_expired` がその約束を取り消す:
