@@ -181,6 +181,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 完了条件: `Events<E>` / `Stats<C: Mergeable>` / `daemon::*` と `config::{extends, path_expand, default_state_dir}` が core にあり、llm-gateway は型別名と re-export で既存 API を保つ。日次集計ファイルと events の SSE 出力が段の前後で同じ
 - 検証: `just ci`。events の通し番号・落とした数の既存試験と、stats の旧形式読み替え試験が緑。CLI の `daemon_shutdown` integration test が緑
 - やらないこと: 自主レート制限のバケットは作らない (DR-0030 §7 手順 3)。`webhook` は動かさない。events の envelope (パススルー用 variant) は段 3 で足す
+- 2a 実施済み: `gateway_core::events::{Events<E>, Watching<E>, Stamped}` (通し番号・起動の印・落とした数・broadcast)。番号を押すのは trait `Stamped` で、`Notice` が実装する。llm-gateway は `pub type Events = Events<Notice>` / `Watching` で既存の名前を保つ
 
 ### 段 3: 汎用パススルー route
 

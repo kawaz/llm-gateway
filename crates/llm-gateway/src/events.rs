@@ -14,10 +14,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-
-use tokio::sync::broadcast;
 
 use crate::cache::keepalive::{Breakeven, Chain};
 use crate::denial::Reason;
@@ -27,12 +23,6 @@ use crate::metering::{Outcome, TokenKind, TokenUsage};
 ///
 /// 見分けが付けば足りる。人がログで突き合わせるので、短いほうが読める。
 const PREFIX_DIGITS: usize = 8;
-
-/// 溜めておける数。
-///
-/// 見ている人が遅れた分はここを溢れて落ちる。大きくしても「古い開始時刻が
-/// まとめて届く」だけで、数え直す相手の役には立たない。
-const BACKLOG: usize = 256;
 
 /// 経路選定で外した経路と、その理由。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,17 +428,6 @@ impl Notice {
         }
     }
 
-    /// 通し番号と起動の印を押す。押すのは流す 1 箇所 ([`Events::publish`]) だけ。
-    fn stamp(&mut self, seq: u64, boot: i64) {
-        let (to_seq, to_boot) = match self {
-            Self::Request(event) => (&mut event.seq, &mut event.boot),
-            Self::Response(response) => (&mut response.seq, &mut response.boot),
-            Self::CacheExpired(expired) => (&mut expired.seq, &mut expired.boot),
-        };
-        *to_seq = seq;
-        *to_boot = boot;
-    }
-
     /// gateway 全体の通し番号 ([`Events::publish`] が振った値)。
     pub fn seq(&self) -> u64 {
         match self {
@@ -472,6 +451,19 @@ impl Notice {
             Self::Response(response) => Some(response),
             Self::Request(_) | Self::CacheExpired(_) => None,
         }
+    }
+}
+
+impl gateway_core::events::Stamped for Notice {
+    /// 通し番号と起動の印を押す。押すのは流す 1 箇所 ([`Events::publish`]) だけ。
+    fn stamp(&mut self, seq: u64, boot: i64) {
+        let (to_seq, to_boot) = match self {
+            Self::Request(event) => (&mut event.seq, &mut event.boot),
+            Self::Response(response) => (&mut response.seq, &mut response.boot),
+            Self::CacheExpired(expired) => (&mut expired.seq, &mut expired.boot),
+        };
+        *to_seq = seq;
+        *to_boot = boot;
     }
 }
 
@@ -527,109 +519,11 @@ fn short_hash(text: &str) -> String {
         .collect::<String>()
 }
 
-/// 見ている人へ配る口。
-pub struct Events {
-    tx: broadcast::Sender<Notice>,
-    /// 最後に振った通し番号。
-    ///
-    /// Design rationale: 原子的な加算ではなく錠で持つ。番号を振ってから流す
-    /// までの間に別の送り手が割り込むと、番号の順と届く順が入れ替わり、見る側が
-    /// 「欠けた」と誤読する。錠の中で振って流せば、届く順 = 番号の順になる。
-    /// 流すのは溜め置きへの書き込みだけで待たないので、錠を持つ時間は短い。
-    seq: Mutex<u64>,
-    /// この起動の印 (口を作った時刻、Unix ミリ秒)。
-    boot: i64,
-    /// 見ている人が追いつけずに落とした数 (起動からの累積、全員の合計)。
-    dropped: Arc<AtomicU64>,
-}
-
-impl Default for Events {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Events {
-    pub fn new() -> Self {
-        Self {
-            tx: broadcast::Sender::new(BACKLOG),
-            seq: Mutex::new(0),
-            boot: crate::credential::time::now_unix_ms(),
-            dropped: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// 1 件流す。
-    ///
-    /// 誰も見ていなければ何もしない。**転送の邪魔をしないこと**が第一で、
-    /// 配れなかったことを転送側へ持ち帰らない (待たない・失敗にしない)。
-    ///
-    /// 番号はここで振る。誰も見ていなくても進める — 見る側が比べるのは
-    /// 自分が受け取った番号同士なので、繋ぐ前の分は比較に現れない。
-    pub fn publish(&self, notice: impl Into<Notice>) {
-        let mut notice = notice.into();
-        let mut seq = self.seq.lock().unwrap_or_else(PoisonError::into_inner);
-        *seq += 1;
-        notice.stamp(*seq, self.boot);
-        let _ = self.tx.send(notice);
-    }
-
-    /// この起動の印。再起動で通し番号が 1 に戻ったことを、見る側がこれの
-    /// 変化で知る。
-    pub fn boot(&self) -> i64 {
-        self.boot
-    }
-
-    /// 見る側に回る。届くのは**これ以降**の分だけ。
-    ///
-    /// 過去に遡らないのは、この知らせが「今から 5 分」を数えるためのもの
-    /// だから。接続した時点で既に過ぎている分を配っても数え直せない。
-    pub fn subscribe(&self) -> Watching {
-        Watching {
-            rx: self.tx.subscribe(),
-            dropped: Arc::clone(&self.dropped),
-        }
-    }
-
-    /// 見ている人が追いつけずに落とした数。起動からの累積で、全員の合計。
-    pub fn dropped(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
-    }
-
-    /// 今この口を見ている人の数。
-    pub fn watchers(&self) -> usize {
-        self.tx.receiver_count()
-    }
-}
+/// 見ている人へ配る口。仕組みは汎用層が持つ。
+pub type Events = gateway_core::events::Events<Notice>;
 
 /// 1 人ぶんの見る口。
-///
-/// 落とした数は購読の入口で数える。見る側ごとに数えさせると、新しく足した
-/// 見る側が数え忘れても気づけない。
-pub struct Watching {
-    rx: broadcast::Receiver<Notice>,
-    dropped: Arc<AtomicU64>,
-}
-
-impl Watching {
-    /// 次の 1 件。追いつけなかったときは、落とした数を足してから知らせる。
-    pub async fn recv(&mut self) -> Result<Notice, broadcast::error::RecvError> {
-        let received = self.rx.recv().await;
-        if let Err(broadcast::error::RecvError::Lagged(missed)) = &received {
-            self.dropped.fetch_add(*missed, Ordering::Relaxed);
-        }
-        received
-    }
-
-    /// 待たずに次の 1 件。落とした数の数え方は [`Self::recv`] と同じ。
-    pub fn try_recv(&mut self) -> Result<Notice, broadcast::error::TryRecvError> {
-        let received = self.rx.try_recv();
-        if let Err(broadcast::error::TryRecvError::Lagged(missed)) = &received {
-            self.dropped.fetch_add(*missed, Ordering::Relaxed);
-        }
-        received
-    }
-}
+pub type Watching = gateway_core::events::Watching<Notice>;
 
 #[cfg(test)]
 mod tests {
@@ -691,7 +585,7 @@ mod tests {
     async fn a_gap_in_the_numbers_shows_what_was_dropped() {
         let events = Events::new();
         let mut watching = events.subscribe();
-        let total = BACKLOG as u64 + 10;
+        let total = gateway_core::events::BACKLOG as u64 + 10;
         for _ in 0..total {
             events.publish(Event::new(NOW, &from("a"), 200));
         }
@@ -699,11 +593,14 @@ mod tests {
         let first = loop {
             match watching.recv().await {
                 Ok(notice) => break notice,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => panic!("{e}"),
             }
         };
-        assert_eq!(first.seq(), total - BACKLOG as u64 + 1);
+        assert_eq!(
+            first.seq(),
+            total - gateway_core::events::BACKLOG as u64 + 1
+        );
         assert_eq!(
             first.seq() - 1,
             events.dropped(),
