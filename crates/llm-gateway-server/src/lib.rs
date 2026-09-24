@@ -852,18 +852,14 @@ async fn passthrough<P: CredentialPersistence + 'static>(
     }
 
     let rest_path = format!("/{rest}");
-    let query = parts
-        .uri
-        .query()
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
+    let query = parts.uri.query();
     let relayed = gateway
         .relay(llm_gateway::passthrough::Relay {
             ns: ns_name,
             upstream,
             method: parts.method.clone(),
             path: &rest_path,
-            query: &query,
+            query,
             headers: &parts.headers,
             body: body.into_data_stream(),
         })
@@ -884,6 +880,9 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                 StatusCode::from_u16(refusal.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let message = match &refusal {
                 Refusal::UnknownUpstream => format!("upstream `{upstream}` is not configured"),
+                Refusal::UnsafePath => format!(
+                    "`{rest_path}` could be read as another path upstream (`..`, `.`, `//`, `\\` or an encoded `/` `.` `\\`); send the plain path"
+                ),
                 Refusal::NotAllowed => format!(
                     "`{} {rest_path}` is not in the allow list of upstream `{upstream}`",
                     parts.method
@@ -900,7 +899,9 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                 }
             };
             let kind = match refusal {
-                Refusal::UnknownUpstream | Refusal::NotAllowed => "not_found_error",
+                Refusal::UnknownUpstream | Refusal::NotAllowed | Refusal::UnsafePath => {
+                    "not_found_error"
+                }
                 Refusal::MethodNotAllowed => "invalid_request_error",
                 Refusal::Secret(_) | Refusal::Unreachable(_) => "api_error",
             };
@@ -4130,7 +4131,19 @@ mod passthrough_tests {
 
     /// `api.example.test` (bearer) と `keyed` (ヘッダ指定) の 2 つの行き先を持つ gateway。
     async fn setup() -> Setup {
+        setup_with_allow(r#"["GET /v1/items", "POST /v1/items/*"]"#).await
+    }
+
+    async fn setup_with_allow(allow: &str) -> Setup {
         let (upstream, seen) = fake_upstream().await;
+        let mut s = setup_at(&upstream, allow).await;
+        s.seen = seen;
+        s
+    }
+
+    /// `upstream` を起点に立てる。`seen` は空 (呼び出し側が差し替える)。
+    async fn setup_at(upstream: &str, allow: &str) -> Setup {
+        let seen = Arc::default();
         let secrets = tempfile::tempdir().unwrap();
         std::fs::write(
             secrets.path().join("ex.json"),
@@ -4147,7 +4160,7 @@ dir = "{dir}"
 url = "{upstream}/base"
 secret = "ex"
 auth = "bearer"
-allow = ["GET /v1/items", "POST /v1/items/*"]
+allow = {allow}
 
 [upstreams.keyed]
 url = "{upstream}"
@@ -4297,6 +4310,145 @@ allow = ["GET /v1/items"]
         assert!(s.seen.lock().unwrap().is_empty());
     }
 
+    /// 生の要求を 1 本送り、状態コードを返す (クライアント側でパスを正規化させない)。
+    async fn raw_status(base: &str, method: &str, path: &str) -> u16 {
+        raw_status_with(base, method, path, "connection: close\r\n").await
+    }
+
+    /// [`raw_status`] に、そのまま書くヘッダ行 (`name: value\r\n` の並び) を足す。
+    async fn raw_status_with(base: &str, method: &str, path: &str, extra: &str) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let authority = base.trim_start_matches("http://");
+        let mut sock = tokio::net::TcpStream::connect(authority).await.unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {authority}\r\nauthorization: Bearer {TOKEN}\r\n{extra}\r\n"
+        );
+        sock.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        sock.read_to_string(&mut response).await.unwrap();
+        response
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line: {response:?}"))
+    }
+
+    /// 上流で別の場所へ読み替わりうるパスは、許可に当たっていても上流へ出さない。
+    #[tokio::test]
+    async fn paths_that_could_move_upstream_are_refused() {
+        let s = setup_with_allow(r#"["GET /v1/*"]"#).await;
+        for path in ["/v1/../admin", "/v1/%2e%2e/admin", "/v1//x", "/v1/a%2Fb"] {
+            let status = raw_status(
+                &s.base,
+                "GET",
+                &format!("/ns-default/api.example.test{path}"),
+            )
+            .await;
+            assert_eq!(status, 404, "{path}");
+        }
+        assert!(s.seen.lock().unwrap().is_empty(), "nothing went out");
+    }
+
+    /// `Connection:` で名指ししたヘッダは、その接続限りのものなので上流へ持っていかない。
+    #[tokio::test]
+    async fn headers_named_by_connection_stay_on_this_hop() {
+        let s = setup().await;
+        let status = raw_status_with(
+            &s.base,
+            "GET",
+            "/ns-default/api.example.test/v1/items",
+            "connection: close, x-private\r\nx-private: hop\r\nx-kept: end-to-end\r\n",
+        )
+        .await;
+        assert_eq!(status, 201);
+        let seen = s.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.header("x-private"), None);
+        assert_eq!(seen.header("x-kept"), Some("end-to-end"));
+    }
+
+    /// 上流の redirect は追わず、3xx をそのまま返す (登録した行き先の外へ出ない)。
+    #[tokio::test]
+    async fn a_redirect_is_returned_not_followed() {
+        let (elsewhere, elsewhere_seen) = fake_upstream().await;
+        let redirecting = axum::Router::new().fallback(move || {
+            let to = format!("{elsewhere}/stolen");
+            async move {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(axum::http::header::LOCATION, to)],
+                    "",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, redirecting).await;
+        });
+        let s = setup_at(&upstream, r#"["GET /v1/items"]"#).await;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let resp = authed(client.get(format!("{}/ns-default/api.example.test/v1/items", s.base)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302);
+        assert!(
+            resp.headers()["location"]
+                .to_str()
+                .unwrap()
+                .ends_with("/stolen"),
+            "Location is passed on untouched"
+        );
+        assert!(
+            elsewhere_seen.lock().unwrap().is_empty(),
+            "the gateway did not go there"
+        );
+    }
+
+    /// 一度読めた秘密でも、ファイルが消えたら次の要求は 502 (控えで通さない)。
+    #[tokio::test]
+    async fn a_removed_secret_stops_the_next_request() {
+        let s = setup().await;
+        let url = format!("{}/ns-default/keyed/v1/items", s.base);
+        let first = authed(reqwest::Client::new().get(&url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), 201);
+        std::fs::remove_file(s._secrets.path().join("ex.json")).unwrap();
+        let second = authed(reqwest::Client::new().get(&url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 502);
+        assert_eq!(
+            s.seen.lock().unwrap().len(),
+            1,
+            "the second one did not go out"
+        );
+    }
+
+    /// 上流の起点は scheme / host を検査し、userinfo・クエリ・fragment を断る。
+    #[test]
+    fn an_upstream_origin_is_checked_on_load() {
+        for url in [
+            "https://api.example/x?y=",
+            "https://user:pw@host/",
+            "ftp://host/",
+        ] {
+            let config: llm_gateway::Config = toml::from_str(&format!(
+                "[upstreams.u]\nurl = \"{url}\"\nsecret = \"s\"\nauth = \"bearer\"\nallow = []\n"
+            ))
+            .unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("upstream url"), "{url}: {err}");
+        }
+    }
+
     /// 予約名は行き先の名前にできない (読み込みで断る)。
     #[test]
     fn a_reserved_name_is_refused_on_load() {
@@ -4334,7 +4486,7 @@ allow = ["GET /v1/items"]
                 upstream: "u",
                 method: axum::http::Method::GET,
                 path: "/a",
-                query: "?secret=1",
+                query: Some("secret=1"),
                 headers: &headers,
                 body,
             })

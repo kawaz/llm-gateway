@@ -225,6 +225,8 @@ A secret file is kept apart from credentials. Its smallest form is `{"type":"sta
 - URL: `/ns-<ns>/<name>/<rest>`, always under a namespace. The namespace token is checked as on the LLM paths
 - Names may contain only letters, digits, `.`, `_` and `-`. `v1`, `llm-gateway` and `llm` are reserved and refused when the configuration is read
 - `allow` entries are `"METHOD path-pattern"` (`*` matches any run). Only the path of `<rest>` is matched; the query string is passed on as-is
+- A `<rest>` that could be read as another path upstream is refused with **404** before the allow list is consulted: an empty segment (`//`), a `.` or `..` segment, a `\`, or an encoded `/` `\` `.` inside a segment (`%2F` / `%5C` / `%2E`, either case). Send the plain path; the gateway does not normalize it for you. A trailing `/` is fine
+- A redirect (3xx) from the upstream is **not followed**; it is returned to the client as it is, `Location` included, so the gateway never leaves the registered upstream
 - Not configured, or no allowed path matches: **404**. The path matches but the method does not: **405**. The secret cannot be read, or the upstream cannot be reached: **502**. In the first three cases nothing is sent to the upstream
 - Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). Nothing is added to the daily totals
 

@@ -123,11 +123,45 @@ pub enum Decision {
     NotFound,
     /// パスは当たるが method が違う (405)。
     MethodNotAllowed,
+    /// パスが上流で別の場所へ読み替わりうる形をしている (404)。
+    UnsafePath,
+}
+
+/// `<rest>` のパスが、上流で別の場所へ読み替わらない形か。
+///
+/// 許可の判定は受けたパスの文字列で行うので、上流 (や途中の URL 処理) が
+/// 正規化すると判定と実際の行き先がずれる (`/v1/../admin` は `/admin` に届く)。
+/// 正規化して通すのでなく、読み替わりうる形は全部断る方が単純で安全。
+///
+/// 断るもの: 途中の空の段 (`//`)、`.` / `..` の段、`\`、段の中の
+/// percent-encoded な `/` `\\` `.` (`%2F` / `%5C` / `%2E`、大小どちらも)。
+/// 末尾の `/` は API の形としてありうるので通す。
+pub fn safe_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    if path.contains('\\') {
+        return false;
+    }
+    let segments: Vec<&str> = rest.split('/').collect();
+    let last = segments.len() - 1;
+    segments.iter().enumerate().all(|(i, seg)| {
+        let lowered = seg.to_ascii_lowercase();
+        !(seg.is_empty() && i != last)
+            && *seg != "."
+            && *seg != ".."
+            && !lowered.contains("%2f")
+            && !lowered.contains("%5c")
+            && !lowered.contains("%2e")
+    })
 }
 
 impl UpstreamSpec {
     /// `<rest>` のパス部分 (クエリを除く) と method で判定する。
     pub fn decide(&self, method: &str, path: &str) -> Decision {
+        if !safe_path(path) {
+            return Decision::UnsafePath;
+        }
         let mut path_matched = false;
         for allow in &self.allow {
             if crate::pattern::matches(&allow.path, path) {
@@ -144,9 +178,46 @@ impl UpstreamSpec {
         }
     }
 
-    /// 上流へ出す URL。`rest` は `/` で始まるパスとクエリ。
-    pub fn target(&self, rest: &str) -> String {
-        format!("{}{rest}", self.url.trim_end_matches('/'))
+    /// 上流へ出す URL。`path` は [`safe_path`] を通った `<rest>` のパス、
+    /// `query` は `?` を除いたクエリ (無ければ `None`)。
+    ///
+    /// パスとクエリを別々に置くので、`?` や `#` がパスに混ざって別の URL に
+    /// ならない (パスの側では符号化される)。段の中の percent-encoding は
+    /// そのまま運ぶ。
+    pub fn target(&self, path: &str, query: Option<&str>) -> Result<url::Url, String> {
+        let mut url = self.parsed_url()?;
+        let joined = format!("{}{path}", url.path().trim_end_matches('/'));
+        url.set_path(&joined);
+        url.set_query(query);
+        Ok(url)
+    }
+
+    /// 上流の起点を検査する。scheme は `http` / `https`、host が要る。
+    /// userinfo・クエリ・fragment は書けない (path prefix は書ける)。
+    pub fn check_url(&self) -> Result<(), String> {
+        self.parsed_url().map(|_| ())
+    }
+
+    fn parsed_url(&self) -> Result<url::Url, String> {
+        let url = url::Url::parse(&self.url)
+            .map_err(|e| format!("upstream url `{}` is not a URL: {e}", self.url))?;
+        let refuse = |why: &str| Err(format!("upstream url `{}` {why}", self.url));
+        if !matches!(url.scheme(), "http" | "https") {
+            return refuse("must use http or https");
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            return refuse("must have a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return refuse("must not carry a user name or password (put the secret in `secret`)");
+        }
+        if url.query().is_some() {
+            return refuse("must not have a query string");
+        }
+        if url.fragment().is_some() {
+            return refuse("must not have a fragment");
+        }
+        Ok(url)
     }
 }
 
@@ -194,7 +265,7 @@ allow = ["GET /v1/items", "post /v1/items/*"]
         assert_eq!(s.auth, AuthPlacement::Bearer);
         assert_eq!(s.allow[1].method, "POST");
         assert_eq!(
-            s.target("/v1/items?x=1"),
+            s.target("/v1/items", Some("x=1")).unwrap().as_str(),
             "https://api.example.com/v1/items?x=1"
         );
 
@@ -251,5 +322,62 @@ allow = ["GET /v1/items", "post /v1/items/*"]
         let s = spec(SAMPLE).unwrap();
         let again: UpstreamSpec = toml::from_str(&toml::to_string(&s).unwrap()).unwrap();
         assert_eq!(again, s);
+    }
+
+    /// 上流で別の場所へ読み替わりうるパスは、許可の判定より前に断る。
+    #[test]
+    fn unsafe_paths_are_refused_before_the_allow_list() {
+        let s = spec(&SAMPLE.replace("post /v1/items/*", "GET /v1/*")).unwrap();
+        for bad in [
+            "/v1/../admin",
+            "/v1/%2e%2e/admin",
+            "/v1/%2E/x",
+            "/v1//x",
+            "/v1/a%2Fb",
+            "/v1/a%5cb",
+            "/v1/./x",
+            "/v1/a\\b",
+        ] {
+            assert_eq!(s.decide("GET", bad), Decision::UnsafePath, "{bad}");
+        }
+        assert_eq!(
+            s.decide("GET", "/v1/x/"),
+            Decision::Allowed,
+            "a trailing slash is fine"
+        );
+        assert_eq!(s.decide("GET", "/v1/a%20b"), Decision::Allowed);
+    }
+
+    /// 組み立てた URL のパスに `?` や `#` が混ざらない。path prefix は残る。
+    #[test]
+    fn the_target_is_built_by_segments() {
+        let mut s = spec(SAMPLE).unwrap();
+        s.url = "https://api.example.com/base/".into();
+        let url = s.target("/v1/a%20b", Some("q=1&r=2")).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.example.com/base/v1/a%20b?q=1&r=2"
+        );
+        assert_eq!(
+            s.target("/v1/x?y#z", None).unwrap().as_str(),
+            "https://api.example.com/base/v1/x%3Fy%23z"
+        );
+    }
+
+    #[test]
+    fn the_origin_is_checked() {
+        let mut s = spec(SAMPLE).unwrap();
+        for bad in [
+            "https://api.example/x?y=",
+            "https://user:pw@host/",
+            "https://api.example/#f",
+            "ftp://api.example/",
+            "not a url",
+        ] {
+            s.url = bad.into();
+            assert!(s.check_url().is_err(), "{bad}");
+        }
+        s.url = "http://127.0.0.1:9/prefix".into();
+        assert!(s.check_url().is_ok());
     }
 }

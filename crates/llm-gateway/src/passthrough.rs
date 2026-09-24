@@ -44,6 +44,8 @@ pub enum Refusal {
     UnknownUpstream,
     /// 許可に当たるパスが無い (404)。
     NotAllowed,
+    /// パスが上流で別の場所へ読み替わりうる形 (`..`、`//`、`%2F` 等) をしている (404)。
+    UnsafePath,
     /// パスは許可にあるが method が違う (405)。
     MethodNotAllowed,
     /// 固定の秘密が読めない (502)。
@@ -55,7 +57,7 @@ pub enum Refusal {
 impl Refusal {
     pub fn status(&self) -> u16 {
         match self {
-            Self::UnknownUpstream | Self::NotAllowed => 404,
+            Self::UnknownUpstream | Self::NotAllowed | Self::UnsafePath => 404,
             Self::MethodNotAllowed => 405,
             Self::Secret(_) | Self::Unreachable(_) => 502,
         }
@@ -69,8 +71,8 @@ pub struct Relay<'a, S> {
     pub method: reqwest::Method,
     /// `/` で始まる `<rest>` のパス (クエリを除く)。
     pub path: &'a str,
-    /// `?` から後ろ。無ければ空。
-    pub query: &'a str,
+    /// `?` を除いたクエリ。無ければ `None`。
+    pub query: Option<&'a str>,
     pub headers: &'a HeaderMap,
     pub body: S,
 }
@@ -78,6 +80,8 @@ pub struct Relay<'a, S> {
 /// 行き先の一覧と、秘密の読み手。
 pub struct Passthrough {
     upstreams: BTreeMap<String, UpstreamSpec>,
+    /// 中継専用の HTTP の口。redirect を追わない (下の Design rationale)。
+    http: reqwest::Client,
     /// 行き先を 1 つも書いていなければ置き場を開かない (ディレクトリも作らない)。
     secrets: Option<StaticSecretStore<FileStore<StoredSecret>>>,
 }
@@ -90,8 +94,19 @@ impl Passthrough {
             let files = FileStore::open(config.secrets.resolve_dir())?;
             Some(StaticSecretStore::new(files))
         };
+        // Design rationale: LLM 経路と口を共有しない。共有の口は redirect を
+        // 既定どおり追うので、許可した GET に上流が `302 Location: <別 host>` を
+        // 返すと、登録した行き先の外へ gateway が出ていく (open proxy)。
+        // 3xx は無変換の原則どおりそのままクライアントへ返し、追うかどうかは
+        // クライアントが決める。
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
         Ok(Self {
             upstreams: config.upstreams.clone(),
+            http,
             secrets,
         })
     }
@@ -101,7 +116,6 @@ impl Passthrough {
     /// 断った場合も含め、結果は 1 件の知らせとして流す。
     pub async fn relay<S, E>(
         &self,
-        http: &reqwest::Client,
         events: &Events,
         request: Relay<'_, S>,
     ) -> std::result::Result<reqwest::Response, Refusal>
@@ -120,7 +134,7 @@ impl Passthrough {
         let spec = self.upstreams.get(request.upstream);
         let outcome = match spec {
             None => Err(Refusal::UnknownUpstream),
-            Some(spec) => self.send(http, spec, request).await,
+            Some(spec) => self.send(spec, request).await,
         };
         let status = match &outcome {
             Ok(resp) => resp.status().as_u16(),
@@ -144,7 +158,6 @@ impl Passthrough {
 
     async fn send<S, E>(
         &self,
-        http: &reqwest::Client,
         spec: &UpstreamSpec,
         request: Relay<'_, S>,
     ) -> std::result::Result<reqwest::Response, Refusal>
@@ -156,6 +169,7 @@ impl Passthrough {
             Decision::Allowed => {}
             Decision::NotFound => return Err(Refusal::NotAllowed),
             Decision::MethodNotAllowed => return Err(Refusal::MethodNotAllowed),
+            Decision::UnsafePath => return Err(Refusal::UnsafePath),
         }
         let secret = self
             .secrets
@@ -182,9 +196,12 @@ impl Passthrough {
         value.set_sensitive(true);
         headers.insert(name, value);
 
-        let url = format!("{}{}", spec.target(request.path), request.query);
+        let url = spec
+            .target(request.path, request.query)
+            .map_err(Refusal::Unreachable)?;
         // 本文は 1 度しか読めないので、流したら取り返せない。断るのはここより前。
-        http.request(request.method, url)
+        self.http
+            .request(request.method, url)
             .headers(headers)
             .body(reqwest::Body::wrap_stream(request.body))
             .send()
@@ -198,23 +215,64 @@ impl Passthrough {
 /// 落とすのは認証 (`Authorization` と、載せ方に指定されたヘッダ)、`Host`
 /// (上流のものを付け直す)、接続ごとの約束だけ。
 fn forwarded_headers(from: &HeaderMap, auth: &AuthPlacement) -> HeaderMap {
-    let mut headers = from.clone();
+    let mut headers = without_hop_by_hop(from);
     headers.remove(header::AUTHORIZATION);
     headers.remove(header::HOST);
     if let AuthPlacement::Header { header } = auth {
         headers.remove(header.as_str());
-    }
-    for name in HOP_BY_HOP {
-        headers.remove(name);
     }
     headers
 }
 
 /// 応答のヘッダのうち、クライアントへ持っていくもの (接続ごとの約束を除く)。
 pub fn relayed_response_headers(from: &HeaderMap) -> HeaderMap {
+    without_hop_by_hop(from)
+}
+
+/// 接続ごとの約束を落とす。固定の一覧に加え、`Connection:` で名指しされた
+/// ヘッダもその接続限りのもの (RFC 9110 §7.6.1)。
+fn without_hop_by_hop(from: &HeaderMap) -> HeaderMap {
+    let named: Vec<String> = from
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
     let mut headers = from.clone();
-    for name in HOP_BY_HOP {
+    for name in HOP_BY_HOP
+        .iter()
+        .copied()
+        .chain(named.iter().map(String::as_str))
+    {
         headers.remove(name);
     }
     headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Connection:` で名指しされたヘッダは往復とも落とす。
+    #[test]
+    fn headers_named_by_connection_are_dropped_both_ways() {
+        let mut from = HeaderMap::new();
+        from.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("x-private, Keep-Alive"),
+        );
+        from.insert("x-private", HeaderValue::from_static("hop"));
+        from.insert("x-kept", HeaderValue::from_static("end-to-end"));
+
+        for headers in [
+            forwarded_headers(&from, &AuthPlacement::Bearer),
+            relayed_response_headers(&from),
+        ] {
+            assert!(headers.get("x-private").is_none());
+            assert!(headers.get(header::CONNECTION).is_none());
+            assert_eq!(headers["x-kept"], "end-to-end");
+        }
+    }
 }

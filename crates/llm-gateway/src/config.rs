@@ -1266,9 +1266,10 @@ impl Config {
             }
             validate_route(name, route, self)?;
         }
-        for name in self.upstreams.keys() {
+        for (name, upstream) in &self.upstreams {
             gateway_core::upstream::check_name(name, &RESERVED_UPSTREAM_NAMES)
                 .map_err(Error::Config)?;
+            upstream.check_url().map_err(Error::Config)?;
         }
         for (name, ns) in &self.namespaces {
             if name.is_empty() {

@@ -275,9 +275,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        self.passthrough
-            .relay(&self.http, &self.events, request)
-            .await
+        self.passthrough.relay(&self.events, request).await
     }
 
     /// 転送のたびに起きたことを流す口 (DR-0012)。

@@ -63,6 +63,7 @@ trait Persistence: Send + Sync + 'static {
 - `lock` / `store`: **fail-closed**。refresh は失敗したら古い token を使い続けるのでなく失敗を返す (二重 refresh で refresh token を焼く事故を防ぐ)
 - `load`: **fail-closed**。静的 secret と JWKS も、読めなければ認証を通さない
 - `version`: 版を持たない置き場は `None` を返してよい (DR-0010、DR-0022)。`None` 同士は「変わっていない」とみなし、控えをそのまま使う (DR-0010 の意味論のまま)。版の取得に失敗した時も版なしと区別せず同じ扱いにする
+- 静的 secret / JWKS の読み手は、版なし (`None`) のとき控えを使わず毎回読み直す (fail-closed の読み手側の方針。`Persistence` の契約は変えない)
 - 値の型は関連型 (または型パラメータ) にして、OAuth credential と静的 secret と JWKS が同じ backend に乗るようにする。静的 secret と JWKS は refresh しないので、読み手は `load` + `version` だけを使う。流用するのは DR-0010 の「版が変わったら控えを読み直す」機構だけ
 
 新しい trait は並べず、既存の `credential::Persistence` を guard 付きに拡張して、段 1 で core へ移すときにこれを (1) として位置づける (`gateway-core-split.md` §5)。

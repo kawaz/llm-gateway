@@ -89,9 +89,14 @@ impl<P: Persistence<Value = StoredSecret>> StaticSecretStore<P> {
     ///
     /// 版を先に見る。読んだ後に見ると、読み終えてから書かれた中身を
     /// 「今の版」として覚え、その更新に気づけなくなる。
+    ///
+    /// 版が取れない (`None`) ときは控えを使わず毎回読む。`Persistence` の契約
+    /// では `None` 同士は「変わっていない」だが、それは refresh する認証情報の
+    /// 側の割り切りで、秘密は fail-closed なので「消えた・読めない」を控えで
+    /// 覆い隠さない (DR-0031 §2 (1))。
     pub fn get(&self, id: &CredentialId) -> Result<Arc<StoredSecret>> {
         let version = self.persistence.version(id);
-        {
+        if version.is_some() {
             let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(hit) = held.get(id)
                 && hit.version == version
@@ -172,6 +177,18 @@ mod tests {
         file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
             .unwrap();
         assert_eq!(secrets.get(&id).unwrap().payload.value(), "k-2");
+    }
+
+    /// 一度読んだ後にファイルが消えたら、控えで通さず失敗する。
+    #[test]
+    fn a_removed_secret_is_not_served_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        put(dir.path(), "s", MINIMAL);
+        let secrets = StaticSecretStore::new(FileStore::<StoredSecret>::open(dir.path()).unwrap());
+        let id = CredentialId::new("s");
+        assert!(secrets.get(&id).is_ok());
+        std::fs::remove_file(dir.path().join("s.json")).unwrap();
+        assert!(secrets.get(&id).is_err());
     }
 
     #[test]
