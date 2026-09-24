@@ -182,6 +182,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 検証: `just ci`。events の通し番号・落とした数の既存試験と、stats の旧形式読み替え試験が緑。CLI の `daemon_shutdown` integration test が緑
 - やらないこと: 自主レート制限のバケットは作らない (DR-0030 §7 手順 3)。`webhook` は動かさない。events の envelope (パススルー用 variant) は段 3 で足す
 - 2a 実施済み: `gateway_core::events::{Events<E>, Watching<E>, Stamped}` (通し番号・起動の印・落とした数・broadcast)。番号を押すのは trait `Stamped` で、`Notice` が実装する。llm-gateway は `pub type Events = Events<Notice>` / `Watching` で既存の名前を保つ
+- 2b 実施済み: `gateway_core::stats::{Stats<C: Mergeable>, Mergeable, Merged}` (日の振り分け、書き手別ファイル、読み戻し、ミリ秒日付の寄せ直し、閲覧時の合算)。`Mergeable` は core が `BTreeMap<K, V: Mergeable>` に鍵ごとの合算として実装し、llm-gateway は `Counters` / `ByOrigin` に実装する (`ByCredential` は `BTreeMap` の別名なので、孤児規則で llm-gateway 側からは実装できない)。合算 `merged` は DR-0031 §2 (3) の `Merged { value, missing }` を返し、読めなかったファイルの書き手を `missing` に挙げる。閲覧 (`Stats::report`) は best-effort なので `missing` を見ない。llm-gateway の `Stats` は鍵 (credential × model × origin) と値付けを持つ薄い包み
 
 ### 段 3: 汎用パススルー route
 

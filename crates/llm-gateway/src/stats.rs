@@ -30,15 +30,12 @@
 //! 落とすのは**変わった日だけ**で、書き手はプロセス内で 1 人に絞る。読み戻すのは
 //! 当日と前日だけ (それ以前は閲覧時にファイルから読む)。
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::credential::time::local_date;
 use crate::metering::{PricingSource, TokenKind, TokenUsage, round_usd};
-use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
 
 /// 認証情報を持たない経路 (relay 型) の記録先。
 ///
@@ -210,43 +207,37 @@ pub type ByCredential = BTreeMap<String, ByModel>;
 /// 日付 → 認証情報 → モデル → 素性 → 集計。閲覧に出す形。
 pub type ByDate = BTreeMap<String, ByCredential>;
 
-/// 起動時にメモリへ載せる日数 (当日から数えて)。
-///
-/// 常駐したまま日を跨ぐと当日分と前日分の両方に積むことがある (応答の日付は
-/// 始まった時刻で決まるので、深夜に始まった応答が明けてから終わる)。載せるのは
-/// **書き足す予定のある日**だけでよく、それ以前は閲覧時にファイルから読める。
-/// 全部載せると、運用が続くほど起動時の読み込みと保存の対象が増える。
-const RESTORED_DAYS: usize = 2;
+pub use gateway_core::stats::MAX_DAYS;
 
-/// 閲覧で遡れる日数の上限 (約 100 年)。
-///
-/// 上限を置くのは、`days` を秒に直す掛け算が桁あふれするため。`usize` の上限を
-/// そのまま渡されると `i64` へ落とす時点で負に回り、絞り込みの起点が未来に
-/// なって**全部消える**。これより長い期間を指したいなら `days = 0` (全期間)。
-pub const MAX_DAYS: usize = 36_500;
+impl gateway_core::stats::Mergeable for Counters {
+    fn merge(&mut self, other: &Self) {
+        Counters::merge(self, other);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests == 0 && self.tokens.is_empty()
+    }
+}
+
+impl gateway_core::stats::Mergeable for ByOrigin {
+    fn merge(&mut self, other: &Self) {
+        gateway_core::stats::Mergeable::merge(&mut self.0, &other.0);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// 日ごと・認証情報ごと・モデルごとに積む器。
 ///
+/// 日の振り分けと、書き手ごとのファイルへの置き方・合わせ方は汎用層
+/// ([`gateway_core::stats::Stats`]) が持つ。ここが持つのは集計の鍵と値付け。
+///
 /// 書き込みは本文観測の終わり ([`crate::exchange::observe`] の後始末) から
-/// 呼ばれる。await できない場所なので
-/// 同期の [`Mutex`] を使う。押さえている間にやるのは足し算だけ。
+/// 呼ばれる。await できない場所なので、積むのは同期で済ませる。
 pub struct Stats {
-    counts: Mutex<ByDate>,
-    /// 前回落としてから変わった日。**日ごと**に持つ。
-    ///
-    /// 全体で 1 つの目印にすると、1 件積むだけで「メモリに載っている全部の日」を
-    /// 書き直すことになる。過去日のファイルは読むだけにしたいので、変わった日を
-    /// 名指しで覚える。
-    dirty: Mutex<BTreeSet<String>>,
-    /// 書き込み中であることの札。
-    ///
-    /// 定期の保存と終了時の保存が重なると、同じ一時ファイルを 2 者が切り詰め
-    /// 合って「混ざった中身が rename される」「片方が消したファイルをもう
-    /// 片方が rename しようとして失敗する」経路が開く。書く側を 1 人に絞る。
-    writing: Mutex<()>,
-    dir: PathBuf,
-    /// このプロセスの書き込み先を他と分ける名前 (待ち受けポート)。
-    writer: String,
+    inner: gateway_core::stats::Stats<ByCredential>,
 }
 
 impl Stats {
@@ -255,19 +246,14 @@ impl Stats {
     /// 起動時に自分のファイルを読み戻すのは呼び出し側 ([`Self::restore`])。
     pub fn new(dir: impl Into<PathBuf>, writer: &str) -> Self {
         Self {
-            counts: Mutex::new(ByDate::new()),
-            dirty: Mutex::new(BTreeSet::new()),
-            writing: Mutex::new(()),
-            dir: dir.into(),
-            writer: sanitize_writer(writer),
+            inner: gateway_core::stats::Stats::new(dir, writer),
         }
     }
 
     /// 1 応答分を積む。
     ///
     /// `at_secs` はイベントを観測した時刻 (**unix 秒**)。日付はこの時刻の
-    /// 地方時で決める。日を跨いだら新しい日付の欄に積むだけで、落とす側が
-    /// 日ごとのファイルへ振り分ける。
+    /// 地方時で決める。
     ///
     /// ミリ秒で持っている時刻 (知らせの `ts` 等、DR-0012) を渡すときは
     /// [`crate::credential::time::to_unix_secs`] を通すこと。1000 倍のまま
@@ -287,232 +273,44 @@ impl Stats {
         if usage.is_empty() {
             return;
         }
-        let date = local_date(at_secs);
         let credential = credential.unwrap_or(NO_CREDENTIAL).to_owned();
-
-        // メモリに無い日なら、その日の自分のファイルを先に読む。読まずに積むと
-        // 次の保存が**その日のファイルを上書きして消す**。読み戻しの範囲
-        // ([`RESTORED_DAYS`]) の外に落ちた日へ積む場合 (時計が巻き戻った等) も、
-        // ここで拾えば失われない。ファイルを読むのは鍵を持つ前 (I/O を
-        // 押さえた中でやらない)。
-        let seed = if self
-            .counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&date)
-        {
-            None
-        } else {
-            self.read_own_day(&date)
-        };
-
-        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        counts
-            .entry(date.clone())
-            .or_insert_with(|| seed.unwrap_or_default())
-            .entry(credential)
-            .or_default()
-            .entry(model.to_owned())
-            .or_default()
-            .entry(origin.to_owned())
-            .or_default()
-            .add(usage);
-        drop(counts);
-
-        self.dirty
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(date);
+        self.inner.add(at_secs, |day| {
+            day.entry(credential)
+                .or_default()
+                .entry(model.to_owned())
+                .or_default()
+                .entry(origin.to_owned())
+                .or_default()
+                .add(usage);
+        });
     }
 
     /// メモリに積んである分。
     pub fn in_memory(&self) -> ByDate {
-        self.counts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.inner.in_memory()
     }
 
-    /// 起動時に、自分が前回書いたファイルを読み戻す。
-    ///
-    /// これをやらないと、再起動のたびに当日分が 0 から数え直しになり、次の
-    /// flush で**前回までの分を上書きして消す**。読むのは自分のファイルだけ
-    /// (他の writer の分は向こうが持っている)。
-    ///
-    /// 載せるのは直近 [`RESTORED_DAYS`] 日分。それ以前の自分のファイルは
-    /// 触らないまま、閲覧では読み込まれる ([`Self::report`])。
-    ///
-    /// serve の開始前に 1 回だけ呼ぶ前提。積み始めた後に呼ぶと、読み戻した
-    /// 日についてはメモリの積み分が読み戻しで置き換わる。
-    /// `now` を引数で受けるのは、読み戻す「当日」を試験から固定するため
-    /// (実時計に縛ると、固定時刻で積んだデータが日付の進みで範囲外になる)。
+    /// 起動時に、自分が前回書いたファイルを読み戻す
+    /// ([`gateway_core::stats::Stats::restore`])。
     pub fn restore(&self, now: i64) {
-        sweep_temporaries(&self.dir, &self.writer);
-        self.absorb_millisecond_dates();
-
-        let recent: Vec<String> = (0..RESTORED_DAYS as i64)
-            .map(|back| local_date(now - back * 86_400))
-            .collect();
-
-        let mut restored = ByDate::new();
-        for date in recent {
-            if let Some(day) = self.read_own_day(&date) {
-                restored.insert(date, day);
-            }
-        }
-        if restored.is_empty() {
-            return;
-        }
-        let days = restored.len();
-        *self.counts.lock().unwrap_or_else(|e| e.into_inner()) = restored;
-        tracing::info!(days, "loaded daily totals from disk");
-    }
-
-    /// ミリ秒を秒として数えた日付のファイルを、本来の日へ寄せる。
-    ///
-    /// 時刻をミリ秒のまま積んでいた頃 ([`Self::record`] の `at_secs`) の
-    /// 置き土産で、`58667-10-30.…json` のような 5 桁の年のファイルが残る。
-    /// 日付として読めない名前なので閲覧は素通りするが、置き場に溜まり続ける
-    /// うえ、その 1 本分の記録が集計から落ちたままになる。
-    ///
-    /// Design rationale: 直す口を CLI に生やさず、読み戻しの一部として黙って
-    /// 済ませる。ここは既に「古い形のファイルを読んで新しい形で書き戻す」
-    /// ([`Counters`] の `Deserialize`) で移行を通してきた場所で、運用者が
-    /// 手順を覚える必要のない側に揃える。直す対象が無ければ何もしない。
-    ///
-    /// 日付は `日数 × 86400` がミリ秒だったので、1000 で割れば本来の時刻に
-    /// 戻る (地方時の時差の分だけずれるが、1 日の中に収まる)。寄せ先は
-    /// **自分のファイル**。書き手の名前はファイルを分けるためだけの目印で
-    /// 集計には出ないので、他の書き手のファイルへ書きに行って、向こうの
-    /// 保存と潰し合う方が高くつく。取り込む前に名前を変えて自分のものに
-    /// するのは、2 つの gateway が同時に立ち上がったときに同じ 1 本を
-    /// 両方が数えないようにするため。
-    fn absorb_millisecond_dates(&self) {
-        let mut absorbed = 0usize;
-        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(millis) = millisecond_date_of_file(name) else {
-                continue;
-            };
-            // 寄せ先を先に読む。読めない寄せ先へ書くと、そこにある 1 日分を
-            // 取り込んだつもりで踏み潰す。読めないうちは寄せずに残しておく。
-            let target = self.path_of(&local_date(millis.div_euclid(1000)));
-            let mut merged = match read_day(&target) {
-                Ok(day) => day,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ByCredential::new(),
-                Err(e) => {
-                    tracing::warn!(path = %target.display(), %e, "cannot read daily totals");
-                    continue;
-                }
-            };
-
-            // 名前を変えて取り込む者を 1 人に決める。負けた側は消えた名前を
-            // 読もうとして諦めるだけ。
-            let claimed = path.with_file_name(format!("{name}.absorbing.{}", std::process::id()));
-            if std::fs::rename(&path, &claimed).is_err() {
-                continue;
-            }
-            let day = match read_day(&claimed) {
-                Ok(day) => day,
-                Err(e) => {
-                    tracing::warn!(path = %claimed.display(), %e, "cannot read daily totals");
-                    continue;
-                }
-            };
-            merge_day(&mut merged, day);
-            if let Err(e) = write_atomically(&target, &merged) {
-                tracing::warn!(path = %target.display(), %e, "cannot write daily totals");
-                continue;
-            }
-            let _ = std::fs::remove_file(&claimed);
-            absorbed += 1;
-        }
-        if absorbed > 0 {
-            tracing::info!(
-                files = absorbed,
-                "moved daily totals that were filed under a millisecond date"
-            );
-        }
+        self.inner.restore(now);
     }
 
     /// 変わった日だけをディスクへ落とす。変わっていなければ何もしない。
-    ///
-    /// 書くのは自分のファイルだけ。日付ごとに分けて書くので、日を跨いだ直後に
-    /// 残っている前日分もそのまま正しい先へ行く。
     pub fn flush(&self) -> std::io::Result<()> {
-        // 先に目印を外す。書いている間に積まれた分は、次の周回で拾い直せる
-        // よう積み直される (取りこぼしより書き直しの方が安い)。
-        let pending: Vec<String> =
-            std::mem::take(&mut *self.dirty.lock().unwrap_or_else(|e| e.into_inner()))
-                .into_iter()
-                .collect();
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        // 書く者を 1 人に絞る。ここから下は直列。
-        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Err(e) = std::fs::create_dir_all(&self.dir) {
-            self.mark_dirty(pending);
-            return Err(e);
-        }
-        for (i, date) in pending.iter().enumerate() {
-            let Some(day) = self
-                .counts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(date)
-                .cloned()
-            else {
-                continue;
-            };
-            if let Err(e) = write_atomically(&self.path_of(date), &day) {
-                // 書けなかった日と、まだ書いていない日を積み直す。
-                self.mark_dirty(pending[i..].to_vec());
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// この日を「変わった」に戻す。保存し損なった分を次の周回へ回す。
-    fn mark_dirty(&self, dates: Vec<String>) {
-        let mut dirty = self.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        dirty.extend(dates);
+        self.inner.flush()
     }
 
     /// 全 writer のファイルとメモリの分を合わせた全体像。
     ///
-    /// 落とす前の分もここに出る。閲覧が「さっき使った分が出ない」にならない
-    /// ようにするため。ただし**他の writer がまだ落としていない分は見えない**
-    /// (向こうの保存間隔だけ遅れて現れる)。
+    /// 読めなかった writer の分は欠けたまま出す (閲覧は best-effort、
+    /// DR-0031 §2 (3))。
     ///
     /// `pricing` は 1 行ずつ単価を答える役。ここが単価表を持たないのは、
     /// いくら掛かるかを知っているのが答えた provider の側だから (DR-0014 §4)。
     pub fn report(&self, days: usize, now_ms: i64, pricing: &dyn PricingSource) -> Report {
-        let mine = self.in_memory();
-        // メモリに載っている日は、自分のファイルより新しい。その日だけ
-        // 自分のファイルを読み飛ばす (両方足すと二重に数える)。読み戻しの
-        // 範囲外の過去日は、メモリに無いのでファイルから読む。
-        let superseded: BTreeSet<&str> = mine.keys().map(String::as_str).collect();
-
-        let mut merged = self.on_disk(&superseded);
-        for (date, day) in mine {
-            merge_day(merged.entry(date).or_default(), day);
-        }
-
-        // 直近 N 日に絞る。日付は文字列だが `YYYY-MM-DD` は辞書順が日付順。
-        // 上限で抑えてから秒に直す (抑えないと桁あふれで起点が未来に回る)。
-        if days > 0 {
-            let back = (days.min(MAX_DAYS) as i64 - 1).saturating_mul(86_400);
-            let now_secs = crate::credential::time::to_unix_secs(now_ms);
-            let from = local_date(now_secs.saturating_sub(back));
-            merged.retain(|date, _| date.as_str() >= from.as_str());
-        }
+        let now_secs = crate::credential::time::to_unix_secs(now_ms);
+        let merged = self.inner.merged(days, now_secs).value;
         let (days, total_usd) = price(merged, pricing);
         Report {
             generated_at: now_ms,
@@ -521,121 +319,10 @@ impl Stats {
         }
     }
 
-    /// ディスクにある分を日付ごとに合わせる。
-    ///
-    /// `superseded` に挙げた日については、自分のファイルを読み飛ばす
-    /// (メモリの方が新しい)。他の writer のファイルは常に読む。
-    fn on_disk(&self, superseded: &BTreeSet<&str>) -> ByDate {
-        let mut merged = ByDate::new();
-        let own = self.own_suffix();
-        for (date, path) in self.day_files() {
-            let is_own = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&own));
-            if is_own && superseded.contains(date.as_str()) {
-                continue;
-            }
-            let Ok(day) = read_day(&path) else {
-                tracing::warn!(path = %path.display(), "cannot read daily totals");
-                continue;
-            };
-            merge_day(merged.entry(date).or_default(), day);
-        }
-        merged
-    }
-
-    /// 自分が書いたその日のファイル。無い / 読めない / 空なら `None`。
-    fn read_own_day(&self, date: &str) -> Option<ByCredential> {
-        let path = self.path_of(date);
-        if !path.exists() {
-            return None;
-        }
-        match read_day(&path) {
-            Ok(day) if !day.is_empty() => Some(day),
-            Ok(_) => None,
-            Err(e) => {
-                // 読めない 1 日分で起動や集計を止めない。
-                tracing::warn!(path = %path.display(), %e, "cannot read daily totals");
-                None
-            }
-        }
-    }
-
-    /// 置き場にある日次ファイルの `(日付, パス)`。日付として読めない名前は無視する。
-    fn day_files(&self) -> Vec<(String, PathBuf)> {
-        let mut found = Vec::new();
-        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if let Some(date) = date_of_file(name) {
-                found.push((date, path));
-            }
-        }
-        found
-    }
-
-    fn own_suffix(&self) -> String {
-        format!(".{}.json", self.writer)
-    }
-
+    #[cfg(test)]
     fn path_of(&self, date: &str) -> PathBuf {
-        self.dir.join(format!("{date}.{}.json", self.writer))
+        self.inner.path_of(date)
     }
-}
-
-/// ファイル名から日付を取り出す。`2026-07-30.8402.json` → `2026-07-30`。
-///
-/// 形が合わないものは無視する。置き場に紛れ込んだ別のファイルを日付として
-/// 読むと、ありえない日付が一覧に出る。
-fn date_of_file(name: &str) -> Option<String> {
-    if !name.ends_with(".json") {
-        return None;
-    }
-    let date = name.split('.').next()?;
-    let ok = date.len() == 10
-        && date.as_bytes().iter().enumerate().all(|(i, b)| match i {
-            4 | 7 => *b == b'-',
-            _ => b.is_ascii_digit(),
-        });
-    ok.then(|| date.to_owned())
-}
-
-/// ミリ秒を秒として数えた日付のファイルなら、その元の時刻 (unix ミリ秒)。
-///
-/// `58667-10-30.8402.json` → `58667-10-30` の 00:00 を数にしたもの。見分ける
-/// のは**年が 4 桁に収まらないこと**。1 万年先の日付を本気で書いたファイルは
-/// 無いので、これだけで足りる。[`date_of_file`] が拾う形 (4 桁の年) はここでは
-/// 拾わない — 素性の正しい日次ファイルを動かしてはいけない。
-fn millisecond_date_of_file(name: &str) -> Option<i64> {
-    if !name.ends_with(".json") {
-        return None;
-    }
-    let date = name.split('.').next()?;
-    if date.split('-').next()?.len() <= 4 {
-        return None;
-    }
-    crate::credential::time::parse_date(date)
-}
-
-/// 1 日分を足し込む。ファイル同士・ファイルとメモリを合わせるときに使う。
-fn merge_day(into: &mut ByCredential, day: ByCredential) {
-    for (credential, models) in day {
-        let into = into.entry(credential).or_default();
-        for (model, origins) in models {
-            let into = into.entry(model).or_default();
-            for (origin, counters) in origins.0 {
-                into.entry(origin).or_default().merge(&counters);
-            }
-        }
-    }
-}
-
-fn read_day(path: &Path) -> std::io::Result<ByCredential> {
-    let raw = std::fs::read_to_string(path)?;
-    serde_json::from_str(&raw).map_err(std::io::Error::other)
 }
 
 /// 閲覧に出す 1 行。トークン数に、その分の USD を添える。
@@ -794,6 +481,13 @@ fn to_fresh_input(counters: &mut Counters, rates: &crate::metering::Pricing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::time::local_date;
+    use gateway_core::stats::{date_of_file, millisecond_date_of_file};
+    use std::path::Path;
+
+    fn read_day(path: &Path) -> std::io::Result<ByCredential> {
+        gateway_core::stats::read_day(path)
+    }
 
     /// 2026-07-29T12:00:00Z
     const NOW: i64 = 1_785_326_400;

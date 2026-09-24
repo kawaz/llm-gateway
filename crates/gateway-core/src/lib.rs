@@ -6,6 +6,7 @@
 //!
 //! - [`pattern`] `*` だけを扱う名前の照合
 //! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
+//! - [`stats`] 日次の集計を書き手ごとのファイルに置き、読むときに合わせる器
 //! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
 //! - [`credential::refreshing`] 更新を束ねて使える状態で渡す窓口 ([`credential::refreshing::CredentialStore`])
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
@@ -19,5 +20,6 @@ pub mod events;
 pub mod ns;
 pub mod pattern;
 pub mod persist;
+pub mod stats;
 
 pub use error::{Error, Result};
