@@ -1,6 +1,6 @@
 # DR-0030: 汎用の認証 gateway を下に敷き、LLM をその上の 1 利用者にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24、未実装。alias と `issued` の発行の口は QUESTIONS.md で裁定中)
+- Status: Accepted (kawaz 裁定 2026-09-24、未実装)
 - Date: 2026-09-17
 
 ## Context
@@ -99,9 +99,11 @@ ns 設定の `auth` を方式の enum にする。**検証の出口は方式に�
 - **寿命の上限は ns 設定で決める**。既存アプリ向けに長寿命の JWT を許す ns を作れる
 - **失効は kid の削除、ローテーションは新しい kid を先に配ってから旧 kid を消す** (JWKS に両方が載る期間を作る)
 
-`issued` は **設計ペンディング (kawaz)**。方向だけ決める: access / refresh とも JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場は §5)。詳細は §未確定。
+`issued` の方向: access / refresh とも JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場は §5)。**発行の口は 2 つ** (kawaz 裁定 2026-09-24): 最初の 1 本 (bootstrap) は host 上の **CLI** が署名鍵ファイルを直接読んで refresh token を標準出力に出す (gateway は保存しない。kid ごとの最終発行時刻だけ DR-0010 の flock 下で記録)。refresh はアプリが自分で行うので **HTTP の token endpoint** (`POST /ns-<ns>/auth/token`、OAuth 2 の `grant_type=refresh_token` の形に合わせ、標準クライアントがそのまま使える) を持つ。access の寿命と refresh の rotation は §未確定の方向どおり。
 
-**helper CLI** (鍵ペア生成 + JWKS 断片の出力 + 手元での署名) を用意するが、**生成物を標準出力に出すだけで gateway は保存しない**。アプリの秘密鍵を gateway が作って持つ形にすると、§5 の「自前の秘密は `issued` 用の JWKS 1 つだけ」が崩れる。
+**Claude Code 向けの最初の運用は `jwt` 方式の長寿命 token** (kawaz 裁定 2026-09-24)。Claude Code 側に token を更新する仕組みが無いので `issued` の refresh は使えず、ns 設定で長寿命を許した JWT を CLI で鋳造して配り、ローテは手動 (新 kid を先に配って旧 kid を消す) で定期的に行う。ローテの周期と手順は runbook に書く。`issued` の HTTP endpoint は refresh を自前で回せるアプリが出た段階でよい。
+
+**helper CLI** (鍵ペア生成 + JWKS 断片の出力 + 手元での署名 + 上記の bootstrap 発行) を用意するが、**生成物を標準出力に出すだけで gateway は保存しない**。アプリの秘密鍵を gateway が作って持つ形にすると、§5 の「自前の秘密は `issued` 用の JWKS 1 つだけ」が崩れる。
 
 ### 7. 進め方
 
@@ -128,7 +130,7 @@ ns 設定の `auth` を方式の enum にする。**検証の出口は方式に�
 
 ## Consequences
 
-- **URL が変わる。** `/ns-<ns>/v1/...` は `/ns-<ns>/llm/<provider>/...` へ移る。切替中の旧 URL の扱い (一時 alias を持つか) は QUESTIONS.md で裁定中。手元の Caddy は `lb_policy first` で 11301 が落ちた時だけ 11302 に回し、404 では回らないので、unstable だけ先にパスを変えると旧 URL のクライアントはその瞬間から 404 になる
+- **URL が変わる。** `/ns-<ns>/v1/...` は `/ns-<ns>/llm/<provider>/...` へ移る。**切替中は旧 URL を一時 alias として binary に持つ** (kawaz 裁定 2026-09-24): 旧 `/ns-<ns>/v1/<endpoint>` は今と同じ「本文の model で route を選ぶ」扱いのまま残し、**alias の hit 数を `/llm-gateway/self` に出して、0 が続いたら消す**。手元の Caddy は `lb_policy first` で 11301 が落ちた時だけ 11302 に回し 404 では回らないので、alias 無しで unstable だけ先にパスを変えると旧 URL のクライアント (Claude 設定 ×3、codex) はその瞬間から 404 になり、走行中の Claude セッションは起動時の base URL を持ち続けるため一斉切替でも止まる
 - **汎用層に LLM の語彙が現れないことをテストで縛る**必要がある (DR-0014 §3 の判定基準と同じ手当て)。文章の禁止だけでは、便利な近道として漏れる
 - **gateway が 429 を返す理由が 2 つになる** — 全経路が断られた結果 (DR-0009 / DR-0014 §8) と、自主バケットの超過。events と応答で区別が付く形にしないと、上流が混んでいるのか自分で止めたのか読めない
 - **日次カウンタが stats と同型の永続を 1 つ増やす。** issue `2026-09-15-store-layer-for-replaceable-persistence` の「合算可能なカウンタ」にそのまま当たるので、Store 層を切る時に一緒に収まる
@@ -145,8 +147,7 @@ ns 設定の `auth` を方式の enum にする。**検証の出口は方式に�
 
 ## 未確定
 
-- **切替中の旧 URL の alias** (QUESTIONS.md)
-- **`issued` の設計全体** (発行の口、refresh の再利用検知、access の寿命)。発行の口は QUESTIONS.md で裁定中。署名鍵の置き場は §5 で決まっているので、未確定なのはそれ以外。以下 2 点は**方向だけ**決まっている:
+- **`issued` の残り** (refresh の再利用検知、access の寿命)。発行の口 (§6) と署名鍵の置き場 (§5) は決まっているので、未確定なのはそれ以外。以下 2 点は**方向だけ**決まっている:
   - **鍵ローテの順序は「新 kid を先出し → 旧 kid での発行停止 → 旧 kid を失効」**。失効してよい時刻は **旧 kid で最後に発行した access token の `exp`** から機械的に決まる (それ以降は旧 kid で検証すべき token が 1 つも残らない)。そのため **gateway は kid ごとの最終発行時刻を覚える**
   - **refresh token も refresh のたびに新 kid で発行し直す (rotation)**。refresh が旧 kid のまま残ると失効時刻が refresh の寿命に引きずられるが、毎回新 kid へ載せ替えれば**失効判定は access の `exp` だけで足りる**
 

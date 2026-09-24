@@ -1,6 +1,6 @@
 # DR-0031: 永続化の器を一貫性の意味論で 4 つの trait に切り、file backend をその 1 実装にする
 
-- Status: Proposed (裁定は kawaz)
+- Status: Accepted (kawaz 裁定 2026-09-24、未実装。gateway-core 分割の段 1 で (1) から切る)
 - Date: 2026-09-24
 
 ## Context
