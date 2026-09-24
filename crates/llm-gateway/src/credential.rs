@@ -9,11 +9,10 @@ use crate::Result;
 
 pub mod file;
 pub mod oauth;
-pub mod refreshing;
 pub mod store;
 pub mod stored;
-pub use gateway_core::credential::time;
 pub use gateway_core::credential::{CredentialId, Persistence};
+pub use gateway_core::credential::{refreshing, time};
 
 pub use store::{Credential, CredentialStore};
 pub use stored::{ApiKey, CodexTokens, Kind, OauthTokens, Payload, StoredCredential};

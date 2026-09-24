@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{RwLock, broadcast};
 
-use gateway_core::credential::time::to_unix_ms;
-use gateway_core::credential::{AuthState, AuthStatus, CredentialId, Persistence};
-use gateway_core::error::{Error, RefreshFailureClass, Result};
+use super::time::to_unix_ms;
+use super::{AuthState, AuthStatus, CredentialId, Persistence};
+use crate::error::{Error, RefreshFailureClass, Result};
 
 /// 値の更新のしかた。置き場の値の型ごとに利用側が実装する。
 pub trait Refresher: Send + Sync + 'static {

@@ -170,6 +170,8 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 
 - 1b-2a 実施済み: llm-gateway の中で `credential::refreshing` に `Refresher` trait と `CredentialStore<P, R>` (束ね方・締め出し・版の追従・認証の観測、core の語彙と `gateway_core::Error` だけで書く) を切り出し、`credential::store` は `OauthRefresher` と、`Credential` へ写す薄い `CredentialStore<P>` になった。refresh 競合試験群は llm-gateway 側に同じ名前で残し、`OauthRefresher` と偽の token サーバを通して総称の store を試す (§6.2 の「core 内に試験用 `Refresher` を書き直す」は採らない)
 
+- 1b-2b 実施済み: `credential::refreshing` (`Refresher` / `CredentialStore<P, R>` / `Clock`) を中身を変えずに `gateway_core::credential::refreshing` へ移し、llm-gateway は `pub use` で同じパスを保つ
+
 段 1 は diff が最も大きい。さらに割るなら **1a = `Persistence` / `FileStore` / `CredentialId` / `time` / core `Error`**、**1b = `CredentialStore` + `Refresher` + `AuthState` + `StoredCredential` の総称化**、**1c = ns 認証** の 3 つに切れる (各々単独で `just ci` が通る)。worker が 1 PR で扱いきれないと判断したらこちらで進める。
 
 ### 段 2: events broker / stats 合算 / daemon
