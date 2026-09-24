@@ -1,6 +1,6 @@
 # DR-0030: 汎用の認証 gateway を下に敷き、LLM をその上の 1 利用者にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24、未実装)
+- Status: Accepted (kawaz 裁定 2026-09-24)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist は実装済み (v0.55.0〜v0.58.0)、§6 の `jwt` / `issued` は未実装
 - Date: 2026-09-17
 
 ## Context
