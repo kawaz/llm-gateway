@@ -7,6 +7,7 @@ use crate::Result;
 pub mod auth;
 pub mod file;
 pub mod refreshing;
+pub mod secret;
 pub mod stored;
 pub mod time;
 

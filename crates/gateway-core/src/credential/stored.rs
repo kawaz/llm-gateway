@@ -22,6 +22,13 @@ pub trait TaggedPayload {
 
     /// `payload` 欄の中身を書く。
     fn serialize_body<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
+
+    /// `priority` / `disabled` が既定値 (`0` / `false`) なら書き出しで省くか。
+    ///
+    /// 使い分けの無い種別 (固定の秘密など) では、この 2 つは意味を持たない。
+    /// 読むときは省略を既定値で受けるので、省いて書けば人が置いた最小の形の
+    /// ままバイト単位で書き戻せる。
+    const OMITS_DEFAULT_TOP: bool = false;
 }
 
 /// ディスク上の認証情報。`X` はトップの拡張欄、`P` は payload。
@@ -66,8 +73,10 @@ impl<X: Serialize, P: TaggedPayload> Serialize for StoredCredential<X, P> {
         struct Out<'a, X, B> {
             #[serde(rename = "type")]
             type_name: &'static str,
-            priority: i32,
-            disabled: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            priority: Option<i32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            disabled: Option<bool>,
             #[serde(flatten)]
             ext: &'a X,
             payload: B,
@@ -83,8 +92,8 @@ impl<X: Serialize, P: TaggedPayload> Serialize for StoredCredential<X, P> {
 
         Out {
             type_name: self.payload.type_name(),
-            priority: self.priority,
-            disabled: self.disabled,
+            priority: (!P::OMITS_DEFAULT_TOP || self.priority != 0).then_some(self.priority),
+            disabled: (!P::OMITS_DEFAULT_TOP || self.disabled).then_some(self.disabled),
             ext: &self.ext,
             payload: Body(&self.payload),
         }
