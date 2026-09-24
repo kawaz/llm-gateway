@@ -146,30 +146,29 @@ pub struct Config {
 }
 
 /// 1 つの名前空間。使う人ごとに変えたいものだけを持つ。
+///
+/// 設定ファイルでは認証を方式名 (`auth`) と方式ごとの欄の平置きで書く。読み込みで
+/// [`NamespaceRepr`] を経て、方式と欄の食い違いを断りつつ [`NsAuth`] に畳む。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "NamespaceRepr", into = "NamespaceRepr")]
 pub struct Namespace {
     /// 公開するモデルの絞り込み。
     ///
     /// upstream から取れる一覧をそのまま出すと古い世代まで並ぶので、
     /// ここで隠す。`claude-opus-4*` のように書ける。
-    #[serde(default)]
     pub filter: Filter,
 
     /// モデルごとの経路。パターンで書ける。
     ///
     /// 上から順に照合し、最初に当たったものを使う。書かれていないモデルは
     /// `credentials` の宣言順に試す。
-    #[serde(default)]
     pub routing: Vec<RoutingRule>,
 
     /// モデルと呼び出し元ごとの prompt cache 戦略。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache: Vec<CacheRule>,
 
     /// 短い名前。値はパターンで、当たるもののうち一番新しいものに向く。
     /// 別の短い名前を指してもよい。
-    #[serde(default)]
     pub aliases: BTreeMap<String, String>,
 
     /// この namespace を使うのに要るトークン。
@@ -179,11 +178,6 @@ pub struct Namespace {
     /// 引く運用では、ここで二重に認証を求める意味がないうえ、クライアントに
     /// トークンを持たせること自体が邪魔になる (Claude Code は
     /// `ANTHROPIC_AUTH_TOKEN` があるとサブスクとしての振る舞いをやめる)。
-    #[serde(
-        rename = "auth_token",
-        default,
-        skip_serializing_if = "NsAuth::is_open"
-    )]
     pub auth: NsAuth,
 
     /// この namespace が中継で使ってよい行き先と `METHOD パス` (DR-0030 §4)。
@@ -191,18 +185,92 @@ pub struct Namespace {
     /// キーは `[upstreams.<name>]` の名前。**書かなければ中継を何も通さない**。
     /// 行き先の側の `allow` (その API で使ってよい endpoint) とは別の問いで、
     /// 両方を通ったものだけが上流へ出る。LLM 経路 (`/v1/...`) には効かない。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub allow: BTreeMap<String, Vec<gateway_core::upstream::Allow>>,
 
     /// この namespace で使う経路。空なら全部。
     ///
     /// 面ごとに upstream を分けたいときに絞る。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<String>,
 
     /// Messages API の思考表示方法を強制する。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<ThinkingDisplay>,
+}
+
+/// 認証の方式名 (`auth = "..."`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    Token,
+}
+
+/// [`Namespace`] の設定ファイル上の形。認証は平置きの欄で持つ。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceRepr {
+    #[serde(default)]
+    filter: Filter,
+    #[serde(default)]
+    routing: Vec<RoutingRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache: Vec<CacheRule>,
+    #[serde(default)]
+    aliases: BTreeMap<String, String>,
+    /// 認証の方式。省けば `auth_token` の有無で決まる (有れば `token`、無ければ無検査)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<AuthKind>,
+    /// `token` 方式の合言葉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    allow: BTreeMap<String, Vec<gateway_core::upstream::Allow>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    routes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_display: Option<ThinkingDisplay>,
+}
+
+impl TryFrom<NamespaceRepr> for Namespace {
+    type Error = String;
+
+    fn try_from(r: NamespaceRepr) -> std::result::Result<Self, String> {
+        let auth = match (r.auth, r.auth_token) {
+            (None, None) => NsAuth::Open,
+            (None | Some(AuthKind::Token), Some(token)) => NsAuth::Token(token),
+            (Some(AuthKind::Token), None) => {
+                return Err("auth = \"token\" needs `auth_token`".to_owned());
+            }
+        };
+        Ok(Self {
+            filter: r.filter,
+            routing: r.routing,
+            cache: r.cache,
+            aliases: r.aliases,
+            auth,
+            allow: r.allow,
+            routes: r.routes,
+            thinking_display: r.thinking_display,
+        })
+    }
+}
+
+impl From<Namespace> for NamespaceRepr {
+    fn from(n: Namespace) -> Self {
+        let (auth, auth_token) = match n.auth {
+            NsAuth::Open => (None, None),
+            NsAuth::Token(token) => (None, Some(token)),
+        };
+        Self {
+            filter: n.filter,
+            routing: n.routing,
+            cache: n.cache,
+            aliases: n.aliases,
+            auth,
+            auth_token,
+            allow: n.allow,
+            routes: n.routes,
+            thinking_display: n.thinking_display,
+        }
+    }
 }
 
 /// Messages API の思考表示方法。
@@ -1865,6 +1933,35 @@ o = "claude-opus-*"
                 "{presented:?} passes too"
             );
         }
+    }
+
+    /// `auth` を省けば `auth_token` の有無で方式が決まる。`auth = "token"` と明示してもよく、
+    /// その時は `auth_token` が要る。方式と欄の食い違いや知らない方式は読み込みで断る。
+    #[test]
+    fn the_auth_kind_and_its_fields_must_agree() {
+        let ns = |body: &str| toml::from_str::<Config>(&format!("[ns.a]\n{body}"));
+        assert_eq!(ns("").unwrap().namespaces["a"].auth, NsAuth::Open);
+        assert_eq!(
+            ns("auth_token = \"t\"").unwrap().namespaces["a"].auth,
+            NsAuth::token("t")
+        );
+        assert_eq!(
+            ns("auth = \"token\"\nauth_token = \"t\"")
+                .unwrap()
+                .namespaces["a"]
+                .auth,
+            NsAuth::token("t")
+        );
+        let err = ns("auth = \"token\"").unwrap_err().to_string();
+        assert!(err.contains("auth_token"), "{err}");
+        assert!(ns("auth = \"basic\"\nauth_token = \"t\"").is_err());
+
+        // 書き戻しは今までどおり `auth_token` だけ。
+        let text = toml::to_string(&ns("auth_token = \"t\"").unwrap()).unwrap();
+        assert!(
+            text.contains("auth_token = \"t\"") && !text.contains("auth = "),
+            "{text}"
+        );
     }
 
     /// 書いてあれば、合っているものだけ通す。

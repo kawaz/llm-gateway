@@ -3,8 +3,6 @@
 //! 検証の出口は方式によらず「Bearer → 主体 ([`Principal`])」に揃える
 //! (DR-0030 §6)。下流は主体だけを見ればよく、方式が増えても変わらない。
 
-use serde::{Deserialize, Serialize};
-
 /// 検証を通った相手。
 ///
 /// 固定トークンの方式では、誰が名乗ったかも、どの鍵で確かめたかも分からない
@@ -32,49 +30,52 @@ pub enum Authorization {
     Open,
 }
 
-/// namespace ごとの認証の設定。設定ファイルでは文字列 1 つ (無ければ無検査)。
+/// namespace ごとの認証の方式。
 ///
-/// **書かなければ誰でも通す** (DR-0006)。手前 (tailnet / リバースプロキシ) で
-/// 境界を引く運用では、ここで二重に認証を求める意味がないうえ、クライアントに
-/// トークンを持たせること自体が邪魔になることがある。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NsAuth {
-    token: Option<String>,
+/// 方式が増えても出口は [`Authorization`] の主体 ([`Principal`]) に揃える
+/// (DR-0030 §6)。設定ファイルの書き方 (どの欄から組み立てるか) は利用側が持つ。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NsAuth {
+    /// 検査しない。**書かなければ誰でも通す** (DR-0006)。手前 (tailnet / リバース
+    /// プロキシ) で境界を引く運用では、ここで二重に認証を求める意味がない。
+    #[default]
+    Open,
+    /// この固定トークンを名乗った相手だけを通す。
+    Token(String),
 }
 
 impl NsAuth {
     /// この固定トークンを名乗った相手だけを通す。
     pub fn token(token: impl Into<String>) -> Self {
-        Self {
-            token: Some(token.into()),
-        }
+        Self::Token(token.into())
     }
 
     /// 検査しない (誰でも通す) 設定か。
     pub fn is_open(&self) -> bool {
-        self.token.is_none()
+        matches!(self, Self::Open)
     }
 
     /// クライアントが名乗った `Authorization` の値を検査する。
     ///
     /// `Bearer xxx` でも `xxx` でも受ける。クライアントによって送り方が違う。
     pub fn verify(&self, ns: &str, presented: Option<&str>) -> Authorization {
-        let Some(expected) = &self.token else {
-            return Authorization::Open;
-        };
-        let matched = presented.is_some_and(|p| {
-            let p = p.strip_prefix("Bearer ").unwrap_or(p).trim();
-            p == expected
-        });
-        if matched {
-            Authorization::Accepted(Principal {
-                ns: ns.to_owned(),
-                subject: None,
-                kid: None,
-            })
-        } else {
-            Authorization::WrongToken
+        match self {
+            Self::Open => Authorization::Open,
+            Self::Token(expected) => {
+                let matched = presented.is_some_and(|p| {
+                    let p = p.strip_prefix("Bearer ").unwrap_or(p).trim();
+                    p == expected
+                });
+                if matched {
+                    Authorization::Accepted(Principal {
+                        ns: ns.to_owned(),
+                        subject: None,
+                        kid: None,
+                    })
+                } else {
+                    Authorization::WrongToken
+                }
+            }
         }
     }
 }
@@ -106,12 +107,5 @@ mod tests {
         for bad in [None, Some("Bearer t"), Some("")] {
             assert_eq!(auth.verify("n", bad), Authorization::WrongToken);
         }
-    }
-
-    #[test]
-    fn reads_and_writes_a_bare_string() {
-        let auth: NsAuth = serde_json::from_str(r#""s""#).unwrap();
-        assert_eq!(auth, NsAuth::token("s"));
-        assert_eq!(serde_json::to_string(&auth).unwrap(), r#""s""#);
     }
 }
