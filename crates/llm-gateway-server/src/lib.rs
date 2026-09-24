@@ -891,11 +891,15 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                     "`{}` is not allowed for `{rest_path}` on upstream `{upstream}`",
                     parts.method
                 ),
+                // 詳細 (秘密のファイルの置き場や io のエラー) はログにだけ残す。
+                // 本文に載せると、手元のパスがクライアントへ漏れる。
                 Refusal::Secret(reason) => {
-                    format!("cannot use the secret for upstream `{upstream}`: {reason}")
+                    warn!(ns = %ns_name, %upstream, %reason, "cannot use the upstream secret");
+                    "upstream secret unavailable".to_owned()
                 }
                 Refusal::Unreachable(reason) => {
-                    format!("could not reach upstream `{upstream}`: {reason}")
+                    warn!(ns = %ns_name, %upstream, %reason, "cannot reach the upstream");
+                    "upstream unreachable".to_owned()
                 }
             };
             let kind = match refusal {
@@ -4268,6 +4272,18 @@ allow = ["GET /v1/items"]
                 .await
                 .unwrap();
         assert_eq!(resp.status(), 502);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        let text = body.to_string();
+        assert!(
+            text.contains("upstream secret unavailable"),
+            "says what kind of failure: {text}"
+        );
+        let dir = s._secrets.path().display().to_string();
+        assert!(
+            !text.contains("secrets/") && !text.contains(&dir) && !text.contains(".json"),
+            "no local path leaks: {text}"
+        );
         assert!(s.seen.lock().unwrap().is_empty());
     }
 
