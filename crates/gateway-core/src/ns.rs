@@ -70,7 +70,7 @@ impl NsAuth {
             Self::Token(expected) => {
                 let matched = presented.is_some_and(|p| {
                     let p = p.strip_prefix("Bearer ").unwrap_or(p).trim();
-                    p == expected
+                    same_secret(p, expected)
                 });
                 if matched {
                     Authorization::Accepted(Principal {
@@ -101,6 +101,18 @@ impl NsAuth {
             }
         }
     }
+}
+
+/// 秘密を定数時間で比べる。
+///
+/// 両方を SHA-256 に通してから比べるので、長さが違っても比べる時間は変わらない
+/// (長さの違いで早く返すと、合言葉の長さを外から測れる)。
+fn same_secret(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest as _, Sha256};
+    use subtle::ConstantTimeEq as _;
+    let a = Sha256::digest(presented.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    a.ct_eq(&b).into()
 }
 
 #[cfg(test)]
@@ -160,5 +172,13 @@ mod tests {
             ns.verify("n", Some("Bearer nope")),
             Authorization::Rejected(jwt::Reason::Malformed)
         ));
+    }
+
+    #[test]
+    fn secrets_are_compared_whole() {
+        assert!(same_secret("s3cret", "s3cret"));
+        for other in ["", "s", "s3cre", "s3cretx", "S3cret"] {
+            assert!(!same_secret(other, "s3cret"), "{other:?}");
+        }
     }
 }
