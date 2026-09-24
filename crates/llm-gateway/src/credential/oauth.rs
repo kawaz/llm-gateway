@@ -782,7 +782,7 @@ impl Tokens {
             }
             None => StoredCredential::new(payload),
         };
-        next.last_refresh = format_rfc3339(now_unix);
+        next.ext.last_refresh = format_rfc3339(now_unix);
         next
     }
 }
@@ -1452,8 +1452,11 @@ mod tests {
             "2026-07-28T03:00:00Z",
             "now + expires_in"
         );
-        assert_eq!(c.last_refresh, "2026-07-27T19:00:00Z");
-        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "the default is set");
+        assert_eq!(c.ext.last_refresh, "2026-07-27T19:00:00Z");
+        assert_eq!(
+            c.ext.denied_beta_expires_ms, 86_400_000,
+            "the default is set"
+        );
     }
 
     /// ChatGPT の識別子は codex 側にだけ入る。
@@ -1481,9 +1484,10 @@ mod tests {
         let mut base = tokens().to_stored_at(Kind::Claude, None, NOW);
         base.priority = 20;
         base.disabled = true;
-        base.excluded_models = vec!["claude-opus-*".to_owned()];
-        base.denied_beta_expires_ms = 3_600_000;
-        base.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
+        base.ext.excluded_models = vec!["claude-opus-*".to_owned()];
+        base.ext.denied_beta_expires_ms = 3_600_000;
+        base.ext
+            .record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
 
         let next = Tokens {
             access_token: "at-2".into(),
@@ -1498,10 +1502,10 @@ mod tests {
         assert_eq!(next.payload.secret(), "at-2", "the token is swapped");
         assert_eq!(next.priority, 20);
         assert!(next.disabled);
-        assert_eq!(next.excluded_models, vec!["claude-opus-*"]);
-        assert_eq!(next.denied_beta_expires_ms, 3_600_000);
+        assert_eq!(next.ext.excluded_models, vec!["claude-opus-*"]);
+        assert_eq!(next.ext.denied_beta_expires_ms, 3_600_000);
         assert!(
-            next.denied_beta.contains_key("advisor-tool-2026-03-01"),
+            next.ext.denied_beta.contains_key("advisor-tool-2026-03-01"),
             "upstream observations are unrelated to auth, so they are kept"
         );
         assert_eq!(

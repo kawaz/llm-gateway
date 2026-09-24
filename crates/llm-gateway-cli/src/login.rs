@@ -342,7 +342,7 @@ mod tests {
             },
         ));
         existing.priority = 10;
-        existing.excluded_models = vec!["claude-opus-*".to_owned()];
+        existing.ext.excluded_models = vec!["claude-opus-*".to_owned()];
 
         let disk = Recorder::holding(existing);
         let saved = save(
@@ -355,7 +355,7 @@ mod tests {
 
         assert_eq!(saved.payload.secret(), "at-new");
         assert_eq!(saved.priority, 10);
-        assert_eq!(saved.excluded_models, vec!["claude-opus-*"]);
+        assert_eq!(saved.ext.excluded_models, vec!["claude-opus-*"]);
     }
 
     fn parse_login(list: &[&str]) -> Result<Args, Failure> {

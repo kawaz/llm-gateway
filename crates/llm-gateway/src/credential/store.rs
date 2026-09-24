@@ -247,7 +247,7 @@ impl<P: CredentialPersistence> Inner<P> {
         // 更新した token を古い値で上書きして消す。
         let current = self.reload_locked(&guard, id).await?;
         let mut next = (*current).clone();
-        next.record_denied_beta(flags, self.clock.now_unix());
+        next.ext.record_denied_beta(flags, self.clock.now_unix());
 
         self.persistence.store(&guard, &next)?;
         self.remember(id, next).await;
@@ -520,7 +520,7 @@ Issue a new key and save the credential again"
             id: id.clone(),
             token: Arc::from(c.payload.secret()),
             account_id: c.payload.account_id().map(str::to_owned),
-            denied_beta: c.denied_beta_at(self.clock.now_unix()),
+            denied_beta: c.ext.denied_beta_at(self.clock.now_unix()),
         }
     }
 }
@@ -546,7 +546,7 @@ fn apply_refresh(credential: &mut StoredCredential, response: oauth::RefreshResp
         tokens.account_id = oauth::account_id_from_token(&id_token).or(tokens.account_id.take());
         tokens.id_token = Some(id_token);
     }
-    credential.last_refresh = format_rfc3339(now);
+    credential.ext.last_refresh = format_rfc3339(now);
 }
 
 /// 切り離した更新の後始末。落ちるときに印を外して結果を配る。
@@ -1148,7 +1148,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             "the refresh result is saved"
         );
         assert!(
-            saved.denied_beta.contains_key("advisor-tool-2026-03-01"),
+            saved
+                .ext
+                .denied_beta
+                .contains_key("advisor-tool-2026-03-01"),
             "the waiting side's learned data is kept too"
         );
         assert_eq!(
@@ -1320,7 +1323,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         let saved = store.inner.persistence.current.lock().unwrap().clone();
         assert_eq!(
-            saved.denied_beta.get("advisor-tool-2026-03-01").unwrap(),
+            saved
+                .ext
+                .denied_beta
+                .get("advisor-tool-2026-03-01")
+                .unwrap(),
             &format_rfc3339(NOW),
             "the checked time is recorded alongside it"
         );
@@ -1342,8 +1349,9 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[tokio::test]
     async fn acquire_carries_live_denials_only() {
         let mut c = cred(&at(3600));
-        c.record_denied_beta(&["fresh".to_owned()], NOW - 3600);
-        c.record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
+        c.ext.record_denied_beta(&["fresh".to_owned()], NOW - 3600);
+        c.ext
+            .record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
 
         let store = store_with(c);
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
@@ -1414,7 +1422,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             format_rfc3339(NOW + 28_800),
             "the deadline is recomputed from expires_in"
         );
-        assert_eq!(saved.last_refresh, format_rfc3339(NOW));
+        assert_eq!(saved.ext.last_refresh, format_rfc3339(NOW));
     }
 
     /// 同時に来た 8 本が 1 回の更新に束ねられ、全員が同じ token を得る。
@@ -1647,6 +1655,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             "at-elsewhere",
             "does not clobber another process's refresh"
         );
-        assert!(saved.denied_beta.contains_key("advisor-tool-2026-03-01"));
+        assert!(
+            saved
+                .ext
+                .denied_beta
+                .contains_key("advisor-tool-2026-03-01")
+        );
     }
 }

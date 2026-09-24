@@ -14,7 +14,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::ser::SerializeMap as _;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use zeroize::Zeroize;
@@ -210,29 +209,31 @@ impl Payload {
     }
 }
 
-/// ディスク上の認証情報。
-///
-/// serde の派生では `type` と `payload` が隣り合ってしまう (adjacently tagged
-/// enum を flatten するため) ので、書き出しだけ手で並べる。読み手が先に見たい
-/// のは触ってよい層で、payload は最後でよい。
-///
-/// Design rationale: 書き出しを手で並べる代わり、読み込みは派生のままにして
-/// ある。両方手で書くと二重管理になるので、往復とキーの並びを試験で押さえる。
-#[derive(Debug, Clone, Deserialize)]
-pub struct StoredCredential {
-    /// 小さいほど先に選ばれる。
-    #[serde(default)]
-    pub priority: i32,
+/// ディスク上の認証情報。トップの汎用欄と並べ方は汎用層が持つ。
+pub type StoredCredential = gateway_core::credential::StoredCredential<LlmExt, Payload>;
 
-    /// true の間は選択対象から外す。
-    #[serde(default)]
-    pub disabled: bool,
+impl gateway_core::credential::TaggedPayload for Payload {
+    fn type_name(&self) -> &'static str {
+        Payload::type_name(self)
+    }
 
+    fn serialize_body<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Payload::ClaudeOauth(p) => p.serialize(serializer),
+            Payload::CodexOauth(p) => p.serialize(serializer),
+            Payload::BedrockApiKey(p) => p.serialize(serializer),
+        }
+    }
+}
+
+/// トップのうち、この gateway が持つ欄。書き出しはこの並び。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmExt {
     /// この認証情報で扱わないモデル。`claude-opus-*` のような後方ワイルドカードが書ける。
     #[serde(default)]
     pub excluded_models: Vec<String>,
 
-    /// 最後に更新した時刻。RFC 3339。
+    /// 最後に更新した時刻。RFC 3339。書くのは refresh を適用する側だけ。
     #[serde(default)]
     pub last_refresh: String,
 
@@ -246,10 +247,6 @@ pub struct StoredCredential {
     /// 無く、消しに行くと成功のたびに書き込みが要る (DR-0003)。
     #[serde(default)]
     pub denied_beta: BTreeMap<String, String>,
-
-    /// プロバイダから受け取った認証情報。
-    #[serde(flatten)]
-    pub payload: Payload,
 }
 
 /// 24 時間。upstream が対応したときに、その日のうちには拾い直せる長さ。
@@ -257,39 +254,18 @@ fn default_denied_beta_expires_ms() -> u64 {
     86_400_000
 }
 
-impl Serialize for StoredCredential {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(None)?;
-        map.serialize_entry("type", self.payload.type_name())?;
-        map.serialize_entry("priority", &self.priority)?;
-        map.serialize_entry("disabled", &self.disabled)?;
-        map.serialize_entry("excluded_models", &self.excluded_models)?;
-        map.serialize_entry("last_refresh", &self.last_refresh)?;
-        map.serialize_entry("denied_beta_expires_ms", &self.denied_beta_expires_ms)?;
-        map.serialize_entry("denied_beta", &self.denied_beta)?;
-        match &self.payload {
-            Payload::ClaudeOauth(p) => map.serialize_entry("payload", p)?,
-            Payload::CodexOauth(p) => map.serialize_entry("payload", p)?,
-            Payload::BedrockApiKey(p) => map.serialize_entry("payload", p)?,
-        }
-        map.end()
-    }
-}
-
-impl StoredCredential {
-    /// 運用の設定を既定にして作る。初めての login で使う。
-    pub fn new(payload: Payload) -> Self {
+impl Default for LlmExt {
+    fn default() -> Self {
         Self {
-            priority: 0,
-            disabled: false,
             excluded_models: Vec::new(),
             last_refresh: String::new(),
             denied_beta_expires_ms: default_denied_beta_expires_ms(),
             denied_beta: BTreeMap::new(),
-            payload,
         }
     }
+}
 
+impl LlmExt {
     /// このモデルをこの認証情報で扱ってよいか。
     pub fn accepts_model(&self, model: &str) -> bool {
         !self
@@ -379,43 +355,43 @@ mod tests {
     fn sample(excluded: &[&str]) -> StoredCredential {
         let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
         c.priority = 10;
-        c.excluded_models = excluded.iter().map(|s| (*s).to_owned()).collect();
+        c.ext.excluded_models = excluded.iter().map(|s| (*s).to_owned()).collect();
         c
     }
 
     #[test]
     fn no_exclusions_accepts_everything() {
-        assert!(sample(&[]).accepts_model("claude-opus-5"));
+        assert!(sample(&[]).ext.accepts_model("claude-opus-5"));
     }
 
     #[test]
     fn exact_name_is_excluded() {
         let c = sample(&["claude-opus-5"]);
-        assert!(!c.accepts_model("claude-opus-5"));
-        assert!(c.accepts_model("claude-sonnet-5"));
+        assert!(!c.ext.accepts_model("claude-opus-5"));
+        assert!(c.ext.accepts_model("claude-sonnet-5"));
     }
 
     /// 実運用の設定で使われている形 (`claude-opus-*` など)。
     #[test]
     fn trailing_wildcard() {
         let c = sample(&["claude-opus-*"]);
-        assert!(!c.accepts_model("claude-opus-5"));
-        assert!(!c.accepts_model("claude-opus-4-8"));
-        assert!(c.accepts_model("claude-sonnet-5"));
+        assert!(!c.ext.accepts_model("claude-opus-5"));
+        assert!(!c.ext.accepts_model("claude-opus-4-8"));
+        assert!(c.ext.accepts_model("claude-sonnet-5"));
     }
 
     #[test]
     fn leading_wildcard() {
         let c = sample(&["*-preview"]);
-        assert!(!c.accepts_model("claude-opus-5-preview"));
-        assert!(c.accepts_model("claude-opus-5"));
+        assert!(!c.ext.accepts_model("claude-opus-5-preview"));
+        assert!(c.ext.accepts_model("claude-opus-5"));
     }
 
     #[test]
     fn surrounding_wildcards() {
         let c = sample(&["*haiku*"]);
-        assert!(!c.accepts_model("claude-haiku-4-5-20251001"));
-        assert!(c.accepts_model("claude-opus-5"));
+        assert!(!c.ext.accepts_model("claude-haiku-4-5-20251001"));
+        assert!(c.ext.accepts_model("claude-opus-5"));
     }
 
     /// 実運用の除外リスト (fable 専用アカウント)。
@@ -429,18 +405,19 @@ mod tests {
             "claude-sonnet-*",
             "claude-haiku-*",
         ]);
-        assert!(c.accepts_model("claude-fable-5"));
-        assert!(!c.accepts_model("claude-opus-5"));
-        assert!(!c.accepts_model("claude-sonnet-5"));
-        assert!(!c.accepts_model("claude-haiku-4-5-20251001"));
+        assert!(c.ext.accepts_model("claude-fable-5"));
+        assert!(!c.ext.accepts_model("claude-opus-5"));
+        assert!(!c.ext.accepts_model("claude-sonnet-5"));
+        assert!(!c.ext.accepts_model("claude-haiku-4-5-20251001"));
     }
 
     /// 保存する形。触ってよい層が先、payload が最後。
     #[test]
     fn writes_the_documented_shape() {
         let mut c = sample(&["claude-opus-*"]);
-        c.last_refresh = "2026-07-27T18:54:00+09:00".into();
-        c.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
+        c.ext.last_refresh = "2026-07-27T18:54:00+09:00".into();
+        c.ext
+            .record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], NOW);
 
         let json = serde_json::to_string_pretty(&c).unwrap();
         let written: serde_json::Map<String, Value> = serde_json::from_str(&json).unwrap();
@@ -496,10 +473,12 @@ mod tests {
             let mut before = StoredCredential::new(payload);
             before.priority = 7;
             before.disabled = true;
-            before.excluded_models = vec!["claude-haiku-*".to_owned()];
-            before.last_refresh = "2026-07-27T18:54:00+09:00".into();
-            before.denied_beta_expires_ms = 3_600_000;
-            before.record_denied_beta(&["oauth-2025-04-20".to_owned()], NOW);
+            before.ext.excluded_models = vec!["claude-haiku-*".to_owned()];
+            before.ext.last_refresh = "2026-07-27T18:54:00+09:00".into();
+            before.ext.denied_beta_expires_ms = 3_600_000;
+            before
+                .ext
+                .record_denied_beta(&["oauth-2025-04-20".to_owned()], NOW);
 
             let json = serde_json::to_string(&before).unwrap();
             let after: StoredCredential = serde_json::from_str(&json).unwrap();
@@ -508,7 +487,7 @@ mod tests {
             assert_eq!(after.payload.type_name(), before.payload.type_name());
             assert_eq!(after.payload.secret(), before.payload.secret());
             assert_eq!(after.payload.account_id(), before.payload.account_id());
-            assert_eq!(after.denied_beta_expires_ms, 3_600_000);
+            assert_eq!(after.ext.denied_beta_expires_ms, 3_600_000);
         }
     }
 
@@ -569,9 +548,12 @@ mod tests {
         let c: StoredCredential = serde_json::from_str(raw).unwrap();
         assert_eq!(c.priority, 0);
         assert!(!c.disabled);
-        assert!(c.excluded_models.is_empty());
-        assert!(c.denied_beta.is_empty());
-        assert_eq!(c.denied_beta_expires_ms, 86_400_000, "default is 24 hours");
+        assert!(c.ext.excluded_models.is_empty());
+        assert!(c.ext.denied_beta.is_empty());
+        assert_eq!(
+            c.ext.denied_beta_expires_ms, 86_400_000,
+            "default is 24 hours"
+        );
 
         let err = serde_json::from_str::<StoredCredential>(r#"{"type": "claude_oauth"}"#)
             .unwrap_err()
@@ -604,8 +586,8 @@ mod tests {
 
     fn with_denied(flag: &str, at: i64, expires_ms: u64) -> StoredCredential {
         let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
-        c.denied_beta_expires_ms = expires_ms;
-        c.record_denied_beta(&[flag.to_owned()], at);
+        c.ext.denied_beta_expires_ms = expires_ms;
+        c.ext.record_denied_beta(&[flag.to_owned()], at);
         c
     }
 
@@ -613,15 +595,15 @@ mod tests {
     #[test]
     fn unknown_flag_is_sent() {
         let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
-        assert!(!c.denies_beta("context-management-2025-06-27", NOW));
+        assert!(!c.ext.denies_beta("context-management-2025-06-27", NOW));
     }
 
     /// 期限内の記録は落とす。
     #[test]
     fn recently_denied_flag_is_dropped() {
         let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
-        assert!(c.denies_beta("advisor-tool-2026-03-01", NOW));
-        assert!(c.denies_beta("advisor-tool-2026-03-01", NOW + 3600));
+        assert!(c.ext.denies_beta("advisor-tool-2026-03-01", NOW));
+        assert!(c.ext.denies_beta("advisor-tool-2026-03-01", NOW + 3600));
     }
 
     /// 期限が切れたら試す (upstream が対応していれば戻る)。
@@ -629,46 +611,55 @@ mod tests {
     fn expired_denial_is_retried() {
         let c = with_denied("advisor-tool-2026-03-01", NOW, DAY_MS);
         assert!(
-            c.denies_beta("advisor-tool-2026-03-01", NOW + 86_399),
+            c.ext.denies_beta("advisor-tool-2026-03-01", NOW + 86_399),
             "still dropped under 24 hours"
         );
         assert!(
-            !c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400),
+            !c.ext.denies_beta("advisor-tool-2026-03-01", NOW + 86_400),
             "retried once 24 hours pass"
         );
-        assert!(!c.denies_beta("advisor-tool-2026-03-01", NOW + 86_400 * 30));
+        assert!(
+            !c.ext
+                .denies_beta("advisor-tool-2026-03-01", NOW + 86_400 * 30)
+        );
     }
 
     /// 間隔は credential ごとに変えられる。
     #[test]
     fn interval_is_configurable() {
         let c = with_denied("f", NOW, 3_600_000);
-        assert!(c.denies_beta("f", NOW + 3599));
-        assert!(!c.denies_beta("f", NOW + 3600), "retried after 1 hour");
+        assert!(c.ext.denies_beta("f", NOW + 3599));
+        assert!(!c.ext.denies_beta("f", NOW + 3600), "retried after 1 hour");
 
         let never = with_denied("f", NOW, 0);
-        assert!(!never.denies_beta("f", NOW), "with 0, retried every time");
+        assert!(
+            !never.ext.denies_beta("f", NOW),
+            "with 0, retried every time"
+        );
     }
 
     /// 時刻が読めない記録は落とさない (書き損じで機能を永久に失わない)。
     #[test]
     fn unreadable_timestamp_is_retried() {
         let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
-        c.denied_beta.insert("f".to_owned(), "きのう".to_owned());
-        assert!(!c.denies_beta("f", NOW));
+        c.ext
+            .denied_beta
+            .insert("f".to_owned(), "きのう".to_owned());
+        assert!(!c.ext.denies_beta("f", NOW));
     }
 
     /// 落とす一覧は、期限内のものだけになる。
     #[test]
     fn denied_set_holds_only_live_records() {
         let mut c = StoredCredential::new(Payload::ClaudeOauth(oauth("at")));
-        c.record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
-        c.record_denied_beta(&["fresh".to_owned()], NOW);
+        c.ext
+            .record_denied_beta(&["old".to_owned()], NOW - 86_400 * 2);
+        c.ext.record_denied_beta(&["fresh".to_owned()], NOW);
 
-        let denied = c.denied_beta_at(NOW);
+        let denied = c.ext.denied_beta_at(NOW);
         assert_eq!(denied, BTreeSet::from(["fresh".to_owned()]));
         assert!(
-            c.denied_beta.contains_key("old"),
+            c.ext.denied_beta.contains_key("old"),
             "an expired record itself is not removed"
         );
     }
@@ -677,10 +668,11 @@ mod tests {
     #[test]
     fn re_denial_updates_the_timestamp() {
         let mut c = with_denied("f", NOW, DAY_MS);
-        c.record_denied_beta(&["f".to_owned()], NOW + 86_400 * 3);
+        c.ext
+            .record_denied_beta(&["f".to_owned()], NOW + 86_400 * 3);
 
-        assert_eq!(c.denied_beta.len(), 1, "does not grow on duplicates");
-        assert!(c.denies_beta("f", NOW + 86_400 * 3));
+        assert_eq!(c.ext.denied_beta.len(), 1, "does not grow on duplicates");
+        assert!(c.ext.denies_beta("f", NOW + 86_400 * 3));
     }
 
     /// 設定側の語から種別を引ける。login できない種別は弾く。

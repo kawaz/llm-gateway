@@ -32,8 +32,8 @@ mod tests {
 
         let got = store.load(&CredentialId::new("bedrock")).unwrap();
         assert_eq!(got.payload.secret(), "ak");
-        assert_eq!(got.excluded_models, vec!["claude-opus-*"]);
-        assert!(!got.accepts_model("claude-opus-5"));
+        assert_eq!(got.ext.excluded_models, vec!["claude-opus-*"]);
+        assert!(!got.ext.accepts_model("claude-opus-5"));
     }
 
     /// 旧形式 (平坦・cpa 互換) はどのファイルかを言って断る。

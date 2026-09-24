@@ -90,7 +90,7 @@ DR-0030 §1 の表の汎用層 5 項目 (認証の差し替え、credential の�
 **credential/stored (保存形)**
 
 - 保存ファイルの形は変えない (互換が要る。既存の credential ファイルは kawaz の手元に実在する)
-- 推し: core は `StoredCredential<X, P>` を持ち、トップの汎用欄 (`priority` / `disabled` / `last_refresh`) + `#[serde(flatten)] ext: X` + `payload: P` とする。llm-gateway は `X = LlmExt { excluded_models, denied_beta_expires_ms, denied_beta }`、`P = Payload` (今の enum) を与え、`pub type StoredCredential = gateway_core::StoredCredential<LlmExt, Payload>` で既存名を保つ
+- 推し: core は `StoredCredential<X, P>` を持ち、トップの汎用欄 (`priority` / `disabled`) + `#[serde(flatten)] ext: X` + `payload: P` とする。`last_refresh` は汎用欄に置かない: 書くのは refresh を適用する側 (`Refresher` の実装) だけで、静的 secret / JWKS には refresh が無いため (帰結として現行ファイルのキー順がそのまま保てる)。llm-gateway は `X = LlmExt { excluded_models, last_refresh, denied_beta_expires_ms, denied_beta }`、`P = Payload` (今の enum) を与え、`pub type StoredCredential = gateway_core::StoredCredential<LlmExt, Payload>` で既存名を保つ
 - 注意: 現行は手書きの `Serialize` で**キー順を固定**している (人が読む層を先に出すため)。flatten と手書き Serialize の組み合わせで順序が崩れないかは実装時に試験で固定する (§6.2)
 - 汎用パススルー用の静的 secret (API key / bearer) の payload は core 側に `StaticSecret` として新設し、llm-gateway の `Payload` enum にもその variant を足す (DR-0030 §7 の xAI 用「plain な API key の bearer」と同じ形なので共用できる)
 
@@ -165,6 +165,8 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - やらないこと: `denial` / router / events / stats / daemon には触らない。ns 認証の `jwt` / `issued` は足さない (enum の variant も作らない)。設定の書き方は変えない
 
 - 1a 実施済み: `Persistence` / `FileStore<V>` / `CredentialId` / core `Error` (`RefreshFailureClass` を含む) を core へ移し、`Persistence` を DR-0031 §2 (1) の形 (書き込みと読み直しは権利越し、版は `Option`) にした。llm-gateway は `pub use` と別名 (`FileStore = FileStore<StoredCredential>`、`CredentialPersistence`) で既存パスを保ち、`Error` へは同名 variant へ写す `From` を足した。控えの型 `Cached` は `Held` に改名
+
+- 1b-1 実施済み: `AuthState` / `AuthStatus` を core へ移し (`quota` は re-export)、`StoredCredential<X, P>` (トップは `priority` / `disabled`、書き出しの並びは core が固定し `type` / `payload` は trait `TaggedPayload` が出す) に総称化。llm-gateway は `LlmExt` と `pub type StoredCredential` で保ち、拡張欄への参照は `.ext.` 経由にした
 
 段 1 は diff が最も大きい。さらに割るなら **1a = `Persistence` / `FileStore` / `CredentialId` / `time` / core `Error`**、**1b = `CredentialStore` + `Refresher` + `AuthState` + `StoredCredential` の総称化**、**1c = ns 認証** の 3 つに切れる (各々単独で `just ci` が通る)。worker が 1 PR で扱いきれないと判断したらこちらで進める。
 

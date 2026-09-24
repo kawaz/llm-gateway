@@ -4654,9 +4654,9 @@ advisor-tool-2026-03-01";
         let learned = store.saved();
         for flag in CLIENT_BETA.split(',') {
             assert!(
-                learned.denied_beta.contains_key(flag),
+                learned.ext.denied_beta.contains_key(flag),
                 "the name is unknown, so what was sent is remembered: {:?}",
-                learned.denied_beta
+                learned.ext.denied_beta
             );
         }
 
@@ -4687,7 +4687,9 @@ advisor-tool-2026-03-01";
     async fn learned_beta_is_dropped_before_sending() {
         let up = FakeUpstream::always(200).await;
         let mut known = valid_credential();
-        known.record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], now_unix());
+        known
+            .ext
+            .record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], now_unix());
         let store = StaticStore::holding(known);
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
@@ -4727,7 +4729,7 @@ advisor-tool-2026-03-01";
     async fn expired_denial_is_tried_again() {
         let up = FakeUpstream::always(200).await;
         let mut stale = valid_credential();
-        stale.record_denied_beta(
+        stale.ext.record_denied_beta(
             &["advisor-tool-2026-03-01".to_owned()],
             now_unix() - 86_400 * 2,
         );
@@ -4784,7 +4786,7 @@ advisor-tool-2026-03-01";
         );
         assert_eq!(up.hits(), 1, "not resent");
         assert!(
-            store.saved().denied_beta.is_empty(),
+            store.saved().ext.denied_beta.is_empty(),
             "not remembered when it wasn't beta's fault"
         );
     }
@@ -4821,7 +4823,7 @@ advisor-tool-2026-03-01";
 
         let learned = store.saved();
         assert_eq!(
-            learned.denied_beta.keys().collect::<Vec<_>>(),
+            learned.ext.denied_beta.keys().collect::<Vec<_>>(),
             vec!["advisor-tool-2026-03-01"],
             "a passing flag is not caught up in it"
         );
@@ -4860,12 +4862,13 @@ advisor-tool-2026-03-01";
         let json = serde_json::to_string(&store.saved()).unwrap();
         let reloaded: StoredCredential = serde_json::from_str(&json).unwrap();
         assert_eq!(
-            reloaded.denied_beta_at(now_unix()).len(),
+            reloaded.ext.denied_beta_at(now_unix()).len(),
             3,
             "still marked for dropping after reload: {json}"
         );
         assert!(
             reloaded
+                .ext
                 .denied_beta
                 .values()
                 .all(|t| t == &format_rfc3339(crate::credential::time::parse_rfc3339(t).unwrap())),

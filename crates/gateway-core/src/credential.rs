@@ -4,8 +4,13 @@ use std::fmt;
 
 use crate::Result;
 
+pub mod auth;
 pub mod file;
+pub mod stored;
 pub mod time;
+
+pub use auth::{AuthState, AuthStatus};
+pub use stored::{StoredCredential, TaggedPayload};
 
 /// 認証情報の識別子。ファイル名の stem をそのまま使う。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
