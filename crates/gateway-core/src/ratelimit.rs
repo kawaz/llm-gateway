@@ -242,22 +242,27 @@ pub struct RateLimiter {
     /// (鍵, バケットの番号) → (窓の始まり, 数)。1 本の判定と書き込みはこの錠の
     /// 中で行うので、同じ書き手の中では重ならない。
     memory: Mutex<HashMap<(String, usize), (i64, u64)>>,
-    store: Box<dyn CounterStore<RequestCount>>,
+    store: Box<dyn CounterStore<Windows>>,
 }
+
+/// 1 つの鍵の日 / 月の窓ごとの数。鍵 1 つ・書き手 1 つにつき 1 ファイルに
+/// まとめるので、複数の窓への加算が 1 回の書き込み (rename) で揃って入る。
+/// 窓の名前は [`window_key`]。
+pub type Windows = std::collections::BTreeMap<String, RequestCount>;
 
 /// 何も置かない器。`day` / `month` を宣言しない使い方のためにある。
 struct Nowhere;
 
-impl CounterStore<RequestCount> for Nowhere {
-    fn read_own(&self, _bucket: &str) -> std::io::Result<RequestCount> {
+impl CounterStore<Windows> for Nowhere {
+    fn read_own(&self, _bucket: &str) -> std::io::Result<Windows> {
         Err(std::io::Error::other("no place to keep day / month counts"))
     }
-    fn write_own(&self, _bucket: &str, _value: &RequestCount) -> std::io::Result<()> {
+    fn write_own(&self, _bucket: &str, _value: &Windows) -> std::io::Result<()> {
         Err(std::io::Error::other("no place to keep day / month counts"))
     }
-    fn read_merged(&self, _bucket: &str) -> Merged<RequestCount> {
+    fn read_merged(&self, _bucket: &str) -> Merged<Windows> {
         Merged {
-            value: RequestCount(0),
+            value: Windows::new(),
             missing: vec!["*".to_owned()],
         }
     }
@@ -280,7 +285,7 @@ impl RateLimiter {
     }
 
     /// `day` / `month` を `store` に置く器。
-    pub fn new(store: Box<dyn CounterStore<RequestCount>>) -> Self {
+    pub fn new(store: Box<dyn CounterStore<Windows>>) -> Self {
         Self {
             memory: Mutex::new(HashMap::new()),
             store,
@@ -299,14 +304,32 @@ impl RateLimiter {
             return Ok(None);
         }
         let mut memory = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
+        // 日 / 月は全部の窓を 1 回で読む (鍵 1 つにつき 1 ファイル)。
+        let stored = if limits
+            .iter()
+            .any(|l| matches!(l.per, Per::Day | Per::Month))
+        {
+            let merged = self.store.read_merged(key);
+            if !merged.missing.is_empty() {
+                return Err(Refused::Unavailable(format!(
+                    "cannot read the day / month counts of: {}",
+                    merged.missing.join(", ")
+                )));
+            }
+            merged.value
+        } else {
+            Windows::new()
+        };
         let mut seen = Vec::with_capacity(limits.len());
         for (index, limit) in limits.iter().enumerate() {
             let (start, end) = limit.window(now_secs);
             match limit.per {
                 Per::Minute | Per::Hour => {
                     let slot = memory.entry((key.to_owned(), index)).or_insert((start, 0));
-                    // 窓が進んだら数え直す。時計が戻って前の窓を指した時は、今の
-                    // 窓のまま数える (数え直すと、既に数えた分を忘れて通しすぎる)。
+                    // 窓が進んだら数え直す。時計が戻って前の窓を指した時は、数は
+                    // 覚えている窓のまま持つ (数え直すと、既に数えた分を忘れて
+                    // 通しすぎる)。空くまでの秒は今の時刻の窓で数える (覚えている
+                    // 窓の終わりで数えると、戻った分だけ長く待たせる)。
                     if start > slot.0 {
                         *slot = (start, 0);
                     }
@@ -314,26 +337,18 @@ impl RateLimiter {
                         index,
                         limit,
                         used: slot.1,
-                        end: end.max(slot.0 + 1),
+                        end,
                         stored: None,
                     });
                 }
                 Per::Day | Per::Month => {
-                    let bucket = stored_bucket(key, limit, start);
-                    let merged = self.store.read_merged(&bucket);
-                    if !merged.missing.is_empty() {
-                        return Err(Refused::Unavailable(format!(
-                            "cannot read the `{}` counts of: {}",
-                            limit.label(),
-                            merged.missing.join(", ")
-                        )));
-                    }
+                    let window = window_key(limit, start);
                     seen.push(Seen {
                         index,
                         limit,
-                        used: merged.value.0,
+                        used: stored.get(&window).map_or(0, |c| c.0),
                         end,
-                        stored: Some(bucket),
+                        stored: Some(window),
                     });
                 }
             }
@@ -357,17 +372,25 @@ impl RateLimiter {
         }
 
         // 置き場へ先に書く。書けなければメモリにも足さずに断る (送る前に数える。
-        // 送ってから書くと、書き損ねた分だけ枠を超える)。
-        for s in &seen {
-            if let Some(bucket) = &s.stored {
-                let own = self
-                    .store
-                    .read_own(bucket)
-                    .map_err(|e| Refused::Unavailable(format!("cannot read own count: {e}")))?;
-                self.store
-                    .write_own(bucket, &RequestCount(own.0 + 1))
-                    .map_err(|e| Refused::Unavailable(format!("cannot write own count: {e}")))?;
-            }
+        // 送ってから書くと、書き損ねた分だけ枠を超える)。全部の窓を 1 回で書く
+        // ので、一部の窓だけ数えた状態は残らない。今の窓に無い名前 (過ぎた窓) は
+        // ここで落とし、ファイルに溜めない。
+        if seen.iter().any(|s| s.stored.is_some()) {
+            let own = self
+                .store
+                .read_own(key)
+                .map_err(|e| Refused::Unavailable(format!("cannot read own count: {e}")))?;
+            let next: Windows = seen
+                .iter()
+                .filter_map(|s| s.stored.as_ref())
+                .map(|window| {
+                    let mine = own.get(window).map_or(0, |c| c.0);
+                    (window.clone(), RequestCount(mine + 1))
+                })
+                .collect();
+            self.store
+                .write_own(key, &next)
+                .map_err(|e| Refused::Unavailable(format!("cannot write own count: {e}")))?;
         }
         for s in &seen {
             if s.stored.is_none()
@@ -389,20 +412,13 @@ impl RateLimiter {
     }
 }
 
-/// 日 / 月のバケットの置き場の鍵。`<鍵>/<per>-<tz>-<窓の始まり>`。
+/// 日 / 月の窓の名前。`<per>@<tz>@<窓の始まりの unix 秒>`。
 ///
-/// 窓の始まり (unix 秒) を名前にするので、窓が進めば別のファイルになり、
-/// 数え直しにファイルを消す必要がない。tz を入れるのは、同じ始まりを持つ
-/// 別の宣言と混ざらないため。
-fn stored_bucket(key: &str, limit: &Limit, start: i64) -> String {
-    let tz: String = limit
-        .tz
-        .written
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let key = crate::persist::sanitize_writer(key);
-    format!("{key}/{}-{tz}-{start}", limit.per.as_str())
+/// 窓の始まりを名前に入れるので、窓が進めば別の名前になり数え直しになる。
+/// tz は書かれたまま入れる (同じ始まりを持つ別の宣言と混ざらない)。ファイル
+/// 名ではなくファイルの中の鍵なので、符号化は要らない。
+fn window_key(limit: &Limit, start: i64) -> String {
+    format!("{}@{}@{start}", limit.per.as_str(), limit.tz.written)
 }
 
 #[cfg(test)]
@@ -578,9 +594,11 @@ mod tests {
         )];
         let t = at("2026-09-24T03:00:00Z");
         // 4,998 本を数えた書き手の置き場を用意する (1 本ずつ書くと遅いので、累計を直に置く)。
-        let bucket = stored_bucket("k", &limits[0], limits[0].window(t).0);
+        let window = window_key(&limits[0], limits[0].window(t).0);
         let files = crate::counter::FileCounters::new(dir.path(), "a");
-        files.write_own(&bucket, &RequestCount(4998)).unwrap();
+        files
+            .write_own("k", &Windows::from([(window, RequestCount(4998))]))
+            .unwrap();
         {
             let first = stored(dir.path(), "a");
             first.take("k", &limits, t).unwrap();
@@ -619,8 +637,7 @@ mod tests {
         let t = at("2026-09-24T03:00:00Z");
         let a = stored(dir.path(), "a");
         a.take("k", &limits, t).unwrap();
-        let bucket = stored_bucket("k", &limits[0], limits[0].window(t).0);
-        std::fs::write(dir.path().join(format!("{bucket}.b.json")), "{ broken").unwrap();
+        std::fs::write(dir.path().join("k.b.json"), "{ broken").unwrap();
         assert!(matches!(a.take("k", &limits, t), Err(Refused::Unavailable(m)) if m.contains('b')));
     }
 
@@ -670,5 +687,68 @@ mod tests {
             RateLimiter::in_memory().take("k", &limits, 0),
             Err(Refused::Unavailable(_))
         ));
+    }
+
+    /// 日と月の 2 つの窓は 1 回で書く。書けなければどちらも数えない。
+    #[test]
+    fn day_and_month_are_written_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [
+            limit(r#"{ requests = 10, per = "day" }"#),
+            limit(r#"{ requests = 10, per = "month" }"#),
+        ];
+        let t = at("2026-09-24T03:00:00Z");
+        let a = stored(dir.path(), "a");
+        a.take("k", &limits, t).unwrap();
+        let own: Windows = crate::counter::FileCounters::new(dir.path(), "a")
+            .read_own("k")
+            .unwrap();
+        assert_eq!(own.len(), 2);
+        assert!(own.values().all(|c| c.0 == 1));
+    }
+
+    /// 過ぎた窓は、次に書くときにファイルから落ちる。
+    #[test]
+    fn a_past_window_does_not_pile_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 10, per = "day" }"#)];
+        let a = stored(dir.path(), "a");
+        a.take("k", &limits, at("2026-09-24T03:00:00Z")).unwrap();
+        a.take("k", &limits, at("2026-09-25T03:00:00Z")).unwrap();
+        let own: Windows = crate::counter::FileCounters::new(dir.path(), "a")
+            .read_own("k")
+            .unwrap();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert!(
+            own.keys()
+                .all(|k| k.ends_with(&at("2026-09-25T00:00:00Z").to_string()))
+        );
+    }
+
+    /// tz だけが違う宣言は別の窓として数える。
+    #[test]
+    fn zones_that_look_alike_are_counted_apart() {
+        let plus = limit(r#"{ requests = 1, per = "day", tz = "Etc/GMT+1" }"#);
+        let minus = limit(r#"{ requests = 1, per = "day", tz = "Etc/GMT-1" }"#);
+        let t = at("2026-09-24T12:00:00Z");
+        assert_ne!(
+            window_key(&plus, plus.window(t).0),
+            window_key(&minus, minus.window(t).0)
+        );
+    }
+
+    /// 時計が戻っても、空くまでの秒は今の時刻の窓で数える。
+    #[test]
+    fn a_rewound_clock_does_not_inflate_retry_after() {
+        let buckets = RateLimiter::in_memory();
+        let limits = [limit(r#"{ requests = 1, per = "hour" }"#)];
+        let t = at("2026-09-24T10:30:00Z");
+        buckets.take("k", &limits, t).unwrap();
+        let rewound = at("2026-09-24T09:59:00Z");
+        let refused = exceeded(buckets.take("k", &limits, rewound));
+        assert_eq!(
+            refused.retry_after_secs, 60,
+            "the hour of 09:59 ends in a minute"
+        );
     }
 }

@@ -156,7 +156,7 @@ LLM 経路 (案 B): routing が候補 credential を並べた後、各候補を�
 - ゴール: 再起動と複数 writer を跨いで日 / 月を数え、`missing` で 503 を返す
 - 完了条件: `CounterStore` trait を core に切る (DR-0031 §5 の「(3) を切る」はここ)、file backend、2 writer を模した test (片方のファイルを壊す → 503、両方の加算で満杯 → 429)、書き込み失敗で通さない test
 - やらないこと: 予約方式 (`k > 1`)
-- 3c 実施済み: `gateway_core::counter::{CounterStore, FileCounters, RequestCount}` (writer 別ファイル、置き場は `[ratelimit] dir`、既定 `$XDG_STATE_HOME/llm-gateway/ratelimit/<秘密>/<per>-<tz>-<窓の始まり>.<writer>.json`)、`gateway_core::ratelimit::RateLimiter` が分 / 時 (メモリ) と日 / 月 (`CounterStore`) を 1 本の判定にまとめる。`missing` か自分の書き込み失敗で 503 (`Retry-After: 60`、知らせは `ratelimit_unavailable`)。書くのは判定を通った後・送信の前。`CounterStore` には DR-0031 の案の 2 操作に加えて `read_own` を足した (自分の累計を読んで +1 を書くため)
+- 3c 実施済み: `gateway_core::counter::{CounterStore, FileCounters, RequestCount}` (writer 別ファイル、置き場は `[ratelimit] dir`、既定 `$XDG_STATE_HOME/llm-gateway/ratelimit/<秘密 (percent-encoding)>.<writer>.json`。中身は窓 (`<per>@<tz>@<始まり>`) ごとの数で、日と月を 1 回の書き込みで揃え、過ぎた窓は書くときに落とす)、`gateway_core::ratelimit::RateLimiter` が分 / 時 (メモリ) と日 / 月 (`CounterStore`) を 1 本の判定にまとめる。`missing` か自分の書き込み失敗で 503 (`Retry-After: 60`、知らせは `ratelimit_unavailable`)。書くのは判定を通った後・送信の前。`CounterStore` には DR-0031 の案の 2 操作に加えて `read_own` を足した (自分の累計を読んで +1 を書くため)
 
 **段 3d (後続、案 B を採る場合): LLM 経路への適用**
 - ゴール: LLM credential に `limits` を書け、満杯の候補は次へ回る

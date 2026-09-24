@@ -923,6 +923,23 @@ impl RateLimitStore {
     }
 }
 
+/// 固定の秘密の id を検査する。id は置き場のファイル名 (`<id>.json`) になるので、
+/// 英数字と `.` `_` `-` だけを許し、`.` で始まるものは断る。
+fn check_secret_id(id: &str) -> Result<()> {
+    let ok = !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "secret id `{id}` may contain only letters, digits, `.`, `_` and `-`, and must not start with `.`"
+        )))
+    }
+}
+
 /// 固定の秘密 1 つの宣言。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1345,6 +1362,13 @@ impl Config {
                 )));
             }
             validate_route(name, route, self)?;
+        }
+        for id in self
+            .secrets
+            .keys()
+            .chain(self.upstreams.values().map(|u| &u.secret))
+        {
+            check_secret_id(id)?;
         }
         for (name, upstream) in &self.upstreams {
             gateway_core::upstream::check_name(name, &RESERVED_UPSTREAM_NAMES)

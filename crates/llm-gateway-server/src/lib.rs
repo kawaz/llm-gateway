@@ -4849,13 +4849,8 @@ allow = ["GET /v1/items"]
         let get = || authed(reqwest::Client::new().get(format!("{base}/ns-default/u/a")));
         assert_eq!(get().send().await.unwrap().status(), 201);
 
-        // 2026-09-24 (UTC) の窓の、別の書き手のファイルを壊す。
-        let start = 1_790_158_500i64.div_euclid(86_400) * 86_400;
-        std::fs::write(
-            counts.path().join(format!("ex/day-UTC-{start}.other.json")),
-            "{ broken",
-        )
-        .unwrap();
+        // 同じ秘密の、別の書き手のファイルを壊す。
+        std::fs::write(counts.path().join("ex.other.json"), "{ broken").unwrap();
         let refused = get().send().await.unwrap();
         assert_eq!(refused.status(), 503);
         assert!(refused.headers().get("retry-after").is_some());
@@ -4864,6 +4859,26 @@ allow = ["GET /v1/items"]
             1,
             "the second one did not go out"
         );
+    }
+
+    /// 日の枠: 他の書き手のファイルが読めない (壊れた symlink) と 503 で、上流には出さない。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_broken_count_link_is_a_503() {
+        let counts = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            counts.path().join("gone"),
+            counts.path().join("ex.other.json"),
+        )
+        .unwrap();
+        let (base, seen, _clock, _dir) =
+            limited_with(r#"[{ requests = 100, per = "day" }]"#, Some(counts.path())).await;
+        let resp = authed(reqwest::Client::new().get(format!("{base}/ns-default/u/a")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     /// 日の枠: 自分の数を書けなければ 503 で、上流には出さない。
@@ -4878,6 +4893,20 @@ allow = ["GET /v1/items"]
             .unwrap();
         assert_eq!(resp.status(), 503);
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// 秘密の id はファイル名になるので、許す文字の外は読み込みで断る。
+    #[test]
+    fn a_secret_id_is_checked_on_load() {
+        for id in ["a/b", ".hidden", "a b"] {
+            let config: llm_gateway::Config =
+                toml::from_str(&format!("[secrets.\"{id}\"]\nlimits = []\n")).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("secret id"), "{id}: {err}");
+        }
+        let fine: llm_gateway::Config =
+            toml::from_str("[secrets.\"a.b-c_d\"]\nlimits = []\n").unwrap();
+        fine.validate().unwrap();
     }
 
     /// 予約名は行き先の名前にできない (読み込みで断る)。

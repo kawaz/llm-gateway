@@ -93,8 +93,9 @@ writer ごとに自分の分だけを書き、読む時に全 writer 分を merg
 
 ```rust
 trait CounterStore<C: Mergeable> {
-    fn write_own(&self, writer, bucket, value: &C) -> Result<()>;
-    fn read_merged(&self, bucket) -> Result<Merged<C>>;  // Merged { value, missing }
+    fn read_own(&self, bucket) -> Result<C>;             // 自分の分 (まだ無ければ単位元)
+    fn write_own(&self, bucket, value: &C) -> Result<()>;  // 自分の累計で上書き
+    fn read_merged(&self, bucket) -> Merged<C>;          // Merged { value, missing }
 }
 ```
 
@@ -145,7 +146,7 @@ trait SnapshotStore<T> {
 
 `gateway-core-split.md` の段 1 / 段 3 で (1) を先に形にする。(3) は段 2 の `Stats<C: Mergeable>` が器になるが、backend 差し替えの trait としては (1) の流儀が固まってから切る。(2) と (4) は分割の範囲外で、2 つ目の backend を入れる時に切る。
 
-(3) は `rate-limit-and-allowlist.md` の段 3c で `gateway_core::counter::CounterStore` として切った (`read_own` / `write_own` / `read_merged -> Merged { value, missing }`、file backend は `FileCounters`)。載っているのは fail-closed の日 / 月バケットだけで、閲覧用の日次集計 (`Stats`) は周期 flush の best-effort なので載せ替えていない。
+(3) は `rate-limit-and-allowlist.md` の段 3c で `gateway_core::counter::CounterStore` として切った (上の 3 操作、file backend は `FileCounters`)。日 / 月のバケットは鍵 (秘密) 1 つ・書き手 1 つにつき 1 ファイルに窓ごとの数をまとめ、複数の窓への加算を 1 回の書き込みで揃える。載っているのは fail-closed の日 / 月バケットだけで、閲覧用の日次集計 (`Stats`) は周期 flush の best-effort なので載せ替えていない。
 
 ## Alternatives Considered
 
