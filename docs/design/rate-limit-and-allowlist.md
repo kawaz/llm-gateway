@@ -150,6 +150,7 @@ LLM 経路 (案 B): routing が候補 credential を並べた後、各候補を�
 - ゴール: credential 宣言の `limits` を読み、分 / 時の超過を 429 + `Retry-After` + `X-RateLimit-*` で返す
 - 完了条件: 設定の置き場の整理 (§2.1 (a))、境界計算の単体 test (UTC、DST 切替日、月末、閏年)、tz crate の導入
 - やらないこと: 日 / 月、永続化
+- 3b 実施済み: `gateway_core::ratelimit` (`Limit` / `Per` / `Zone`、`jiff` で日 / 月の現地境界、`MemoryBuckets`)、`[secrets.<id>] limits` (旧 `[secrets] type` / `dir` は `[secret_store]` へ移ったと断る)、判定は秘密の読み出しと宛先の組み立ての後・送信の直前で秘密の id を鍵に数える、429 + `Retry-After` + `X-RateLimit-*` (残り秒、上流の同名ヘッダは落とす)、知らせの `refused = rate_limited` + `bucket` + `retry_after_secs`。日 / 月の宣言は読み込みで断る (3c まで)。鍵は秘密の id だけで `Principal` は使わない (DR-0030 §3 の数える単位は credential)
 
 **段 3c: 日 / 月バケット (`CounterStore` の fail-closed 実装)**
 - ゴール: 再起動と複数 writer を跨いで日 / 月を数え、`missing` で 503 を返す

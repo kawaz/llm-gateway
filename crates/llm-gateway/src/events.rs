@@ -386,6 +386,12 @@ pub struct Passthrough {
     /// 行き先の側か読めない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
+    /// `rate_limited` のとき、埋まっていたバケット (`minute` / `hour` 等)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    /// `rate_limited` のとき、クライアントへ返した `Retry-After` (秒)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
 }
 
 impl Passthrough {
@@ -675,7 +681,9 @@ mod tests {
             status: 200,
             duration_ms: 12,
             secret: "ex".into(),
-            refused: Some("ns_allow".into()),
+            refused: Some("rate_limited".into()),
+            bucket: Some("minute".into()),
+            retry_after_secs: Some(30),
         });
         let text = serde_json::to_string(&notice).unwrap();
         let back: Notice = serde_json::from_str(&text).unwrap();

@@ -882,12 +882,33 @@ async fn passthrough<P: CredentialPersistence + 'static>(
 
     use llm_gateway::passthrough::Refusal;
     match relayed {
-        Ok(resp) => {
+        Ok(relayed) => {
+            let resp = relayed.response;
             let status = resp.status();
-            let headers = llm_gateway::passthrough::relayed_response_headers(resp.headers());
+            let mut headers = llm_gateway::passthrough::relayed_response_headers(resp.headers());
+            if let Some(quota) = &relayed.quota {
+                put_quota(&mut headers, quota, None);
+            }
             let mut out = Response::new(Body::from_stream(resp.bytes_stream()));
             *out.status_mut() = status;
             *out.headers_mut() = headers;
+            out
+        }
+        Err(Refusal::RateLimited(exceeded)) => {
+            let mut out = refused(
+                ns_name,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                &format!(
+                    "the gateway's `{}` limit for upstream `{upstream}` is used up; retry after {}s",
+                    exceeded.bucket, exceeded.retry_after_secs
+                ),
+            );
+            put_quota(
+                out.headers_mut(),
+                &exceeded.quota,
+                Some(exceeded.retry_after_secs),
+            );
             out
         }
         Err(refusal) => {
@@ -925,6 +946,7 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                     warn!(ns = %ns_name, %upstream, %reason, "cannot reach the upstream");
                     "upstream unreachable".to_owned()
                 }
+                Refusal::RateLimited(_) => unreachable!("answered above"),
             };
             let kind = match refusal {
                 Refusal::UnknownUpstream
@@ -933,10 +955,40 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                 | Refusal::UpstreamAllow { method_only: false } => "not_found_error",
                 Refusal::NsAllow { method_only: true }
                 | Refusal::UpstreamAllow { method_only: true } => "invalid_request_error",
-                Refusal::Secret(_) | Refusal::Unreachable(_) => "api_error",
+                Refusal::Secret(_) | Refusal::Unreachable(_) | Refusal::RateLimited(_) => {
+                    "api_error"
+                }
             };
             refused(ns_name, status, kind, &message)
         }
+    }
+}
+
+/// gateway 自身のバケットの残量を応答に載せる (DR-0030 §3)。
+///
+/// 上流が同名のヘッダを返していても落とす。2 つの枠の値が混ざると、どちらで
+/// 止まったのか読めなくなる。`X-RateLimit-Reset` は窓が終わるまでの残り秒。
+fn put_quota(
+    headers: &mut HeaderMap,
+    quota: &llm_gateway::passthrough::Quota,
+    retry_after_secs: Option<u64>,
+) {
+    for name in [
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+        "retry-after",
+    ] {
+        headers.remove(name);
+    }
+    let mut put = |name: &'static str, value: u64| {
+        headers.insert(name, axum::http::HeaderValue::from(value));
+    };
+    put("x-ratelimit-limit", quota.limit);
+    put("x-ratelimit-remaining", quota.remaining);
+    put("x-ratelimit-reset", quota.reset_secs);
+    if let Some(secs) = retry_after_secs {
+        put("retry-after", secs);
     }
 }
 
@@ -4140,6 +4192,9 @@ mod passthrough_tests {
                     [
                         ("content-type", "text/event-stream"),
                         ("x-upstream-note", "kept"),
+                        // 上流自身の枠。gateway が自分の枠を出す時は落とされる。
+                        ("x-ratelimit-remaining", "999"),
+                        ("retry-after", "7"),
                     ],
                     "data: {\"n\":1}\n\ndata: [DONE]\n\n",
                 )
@@ -4634,9 +4689,146 @@ allow = ["GET /v1/items"]
             std::path::PathBuf::from("/tmp/s")
         );
 
-        let old: llm_gateway::Config = toml::from_str("[secrets]\ntype = \"file\"\n").unwrap();
-        let err = old.validate().unwrap_err().to_string();
+        let err = toml::from_str::<llm_gateway::Config>("[secrets]\ntype = \"file\"\n")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("[secret_store]"), "{err}");
+    }
+
+    /// 枠のある秘密で gateway を立てる。時計は `clock` で動かせる。
+    async fn limited(
+        limits: &str,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<Seen>>>,
+        llm_gateway::credential::refreshing::Clock,
+        tempfile::TempDir,
+    ) {
+        let (upstream, seen) = fake_upstream().await;
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            secrets.path().join("ex.json"),
+            r#"{"type":"static","payload":{"value":"sk"}}"#,
+        )
+        .unwrap();
+        let config: llm_gateway::Config = toml::from_str(&format!(
+            "[secret_store]\ntype = \"file\"\ndir = \"{}\"\n[secrets.ex]\nlimits = {limits}\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\nauth_token = \"{TOKEN}\"\n[ns.default.allow]\nu = [\"GET /a\"]\n",
+            secrets.path().display()
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        // 2026-09-24T10:15:00Z。窓の途中から始め、残り秒を読めるようにする。
+        let clock = llm_gateway::credential::refreshing::Clock::fixed(1_790_158_500);
+        let mut gateway = llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap();
+        gateway.set_passthrough_clock(clock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = super::router(Arc::new(gateway));
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+        (format!("http://{addr}"), seen, clock, secrets)
+    }
+
+    /// 60 本 / 分の宣言で 61 本目は 429。残量と `Retry-After` は gateway 自身の値で、
+    /// 上流の同名ヘッダは落とす。窓が進めば戻る。
+    #[tokio::test]
+    async fn the_61st_request_in_a_minute_is_refused() {
+        let (base, seen, clock, _dir) = limited(r#"[{ requests = 60, per = "minute" }]"#).await;
+        let client = reqwest::Client::new();
+        let get = || authed(client.get(format!("{base}/ns-default/u/a")));
+        for n in 1..=60u64 {
+            let resp = get().send().await.unwrap();
+            assert_eq!(resp.status(), 201, "request {n}");
+            assert_eq!(resp.headers()["x-ratelimit-limit"], "60");
+            assert_eq!(
+                resp.headers()["x-ratelimit-remaining"],
+                (60 - n).to_string().as_str(),
+                "the upstream's own value is replaced"
+            );
+            assert_eq!(resp.headers()["x-ratelimit-reset"], "60");
+            assert!(
+                resp.headers().get("retry-after").is_none(),
+                "the upstream's is dropped"
+            );
+        }
+        clock.set(1_790_158_500 + 45);
+        let refused = get().send().await.unwrap();
+        assert_eq!(refused.status(), 429);
+        assert_eq!(refused.headers()["retry-after"], "15");
+        assert_eq!(refused.headers()["x-ratelimit-remaining"], "0");
+        assert_eq!(refused.headers()["x-ratelimit-reset"], "15");
+        assert_eq!(seen.lock().unwrap().len(), 60, "the 61st never went out");
+
+        clock.set(1_790_158_500 + 60);
+        assert_eq!(
+            get().send().await.unwrap().status(),
+            201,
+            "the next window opens"
+        );
+    }
+
+    /// 枠で断ったことは、どのバケットかと一緒に知らせに載る。
+    #[tokio::test]
+    async fn a_rate_limited_refusal_is_announced() {
+        let (upstream, _seen) = fake_upstream().await;
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            secrets.path().join("ex.json"),
+            r#"{"type":"static","payload":{"value":"sk"}}"#,
+        )
+        .unwrap();
+        let config: llm_gateway::Config = toml::from_str(&format!(
+            "[secret_store]\ntype = \"file\"\ndir = \"{}\"\n[secrets.ex]\nlimits = [{{ requests = 1, per = \"hour\" }}]\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\n",
+            secrets.path().display()
+        ))
+        .unwrap();
+        let gateway = llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap();
+        let mut watching = gateway.events().subscribe();
+        let ns_allow = [("u".to_owned(), vec!["GET /a".parse().unwrap()])].into();
+        let headers = axum::http::HeaderMap::new();
+        for _ in 0..2 {
+            let _ = gateway
+                .relay(llm_gateway::passthrough::Relay {
+                    principal: llm_gateway::config::Principal {
+                        ns: "default".into(),
+                        subject: None,
+                        kid: None,
+                    },
+                    ns_allow: &ns_allow,
+                    upstream: "u",
+                    method: axum::http::Method::GET,
+                    path: "/a",
+                    query: None,
+                    headers: &headers,
+                    body: futures_util::stream::empty::<Result<axum::body::Bytes, std::io::Error>>(
+                    ),
+                })
+                .await;
+        }
+        let _first = watching.try_recv().unwrap();
+        let json = serde_json::to_value(watching.try_recv().unwrap()).unwrap();
+        assert_eq!(json["status"], 429);
+        assert_eq!(json["refused"], "rate_limited");
+        assert_eq!(json["bucket"], "hour");
+        assert!(json["retry_after_secs"].as_u64().unwrap() >= 1, "{json}");
+    }
+
+    /// 日 / 月の枠は再起動を跨いで数える必要があり、まだ数えられないので読み込みで断る。
+    #[test]
+    fn day_and_month_limits_are_not_accepted_yet() {
+        for per in ["day", "month"] {
+            let config: llm_gateway::Config = toml::from_str(&format!(
+                "[secrets.ex]\nlimits = [{{ requests = 1, per = \"{per}\" }}]\n"
+            ))
+            .unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("not supported yet"), "{per}: {err}");
+        }
     }
 
     /// 予約名は行き先の名前にできない (読み込みで断る)。
@@ -4687,7 +4879,7 @@ allow = ["GET /v1/items"]
             })
             .await
             .unwrap();
-        assert_eq!(resp.status(), 201);
+        assert_eq!(resp.response.status(), 201);
         let notice = watching.try_recv().unwrap();
         assert_eq!(notice.name(), "passthrough");
         let json = serde_json::to_value(&notice).unwrap();

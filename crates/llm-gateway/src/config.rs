@@ -118,13 +118,16 @@ pub struct Config {
     #[serde(default)]
     pub secret_store: SecretStore,
 
-    /// 秘密ごとの設定 (`[secrets.<id>]`) の予約地。今は何も書けない。
+    /// 固定の秘密ごとの宣言 (`[secrets.<id>]`、DR-0030 §3)。キーは秘密の id。
     ///
-    /// 置き場の設定を書いていた `[secrets] type` を、読み込みで理由付きで
-    /// 断るために受ける (`deny_unknown_fields` の一般的な文言では、どこへ
-    /// 移ったのか分からない)。
-    #[serde(default, rename = "secrets", skip_serializing)]
-    secrets_table: Option<toml::Table>,
+    /// 枠 (`limits`) はキーの持ち主と上流の約束なので、行き先でなく秘密の側に
+    /// 書く (同じ秘密を 2 つの行き先で使っても枠は 1 つ)。
+    #[serde(
+        default,
+        deserialize_with = "secret_specs",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub secrets: BTreeMap<String, SecretSpec>,
 
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
@@ -893,6 +896,40 @@ impl Store {
     }
 }
 
+/// 固定の秘密 1 つの宣言。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretSpec {
+    /// この秘密で上流へ出してよい数。どれか 1 つでも埋まったら 429。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<gateway_core::ratelimit::Limit>,
+}
+
+/// `[secrets]` を読む。置き場の設定 (`type` / `dir`) を書いていた形は、移った先を
+/// 言って断る (id として読むと、何が違うのか分からない型の誤りになる)。
+fn secret_specs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, SecretSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let table = toml::Table::deserialize(deserializer)?;
+    let mut specs = BTreeMap::new();
+    for (id, value) in table {
+        if !value.is_table() && matches!(id.as_str(), "type" | "dir") {
+            return Err(D::Error::custom(
+                "`[secrets] type` / `dir` moved to `[secret_store]` (write `[secret_store]` with `type = \"file\"`)",
+            ));
+        }
+        let spec: SecretSpec = value
+            .try_into()
+            .map_err(|e| D::Error::custom(format!("secrets.{id}: {e}")))?;
+        specs.insert(id, spec);
+    }
+    Ok(specs)
+}
+
 /// URL で `/ns-<ns>/` の直後の段に gateway が使っている名前。行き先の名前に
 /// できない (`llm` は LLM 経路の移行先として押さえておく、DR-0030 §2)。
 pub const RESERVED_UPSTREAM_NAMES: [&str; 3] = ["v1", "llm-gateway", "llm"];
@@ -1282,16 +1319,16 @@ impl Config {
             }
             validate_route(name, route, self)?;
         }
-        if let Some(table) = &self.secrets_table {
-            if table.contains_key("type") || table.contains_key("dir") {
-                return Err(Error::Config(
-                    "`[secrets] type` / `dir` moved to `[secret_store]` (write `[secret_store]` with `type = \"file\"`)".to_owned(),
-                ));
-            }
-            if !table.is_empty() {
-                return Err(Error::Config(
-                    "per-secret settings (`[secrets.<id>]`) are not supported yet".to_owned(),
-                ));
+        for (id, spec) in &self.secrets {
+            for limit in &spec.limits {
+                if matches!(
+                    limit.per,
+                    gateway_core::ratelimit::Per::Day | gateway_core::ratelimit::Per::Month
+                ) {
+                    return Err(Error::Config(format!(
+                        "secrets.{id}: limits per \"day\" / \"month\" are not supported yet; use \"minute\" or \"hour\""
+                    )));
+                }
             }
         }
         for (name, upstream) in &self.upstreams {

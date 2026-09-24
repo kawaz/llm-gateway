@@ -68,6 +68,8 @@ url = { version = "2", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false }
 # SSE のバイト列中継。reqwest の bytes_stream が返す型に合わせる。
 bytes = "1"
+# 日 / 月のバケットの現地の境界 (DR-0030 §3)。IANA の tz DB を同梱して、実行環境の DB に左右されない。
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 tempfile = "3"
 # OS に焼き込む実行ファイルのパスを、同じ binary を指す PATH 上の安定な
 # symlink に解決する (dev build / Cellar 直を焼くと再ビルド・upgrade で壊れる)。

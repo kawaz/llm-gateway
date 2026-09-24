@@ -20,6 +20,8 @@ use gateway_core::credential::secret::{StaticSecretStore, StoredSecret};
 use gateway_core::upstream::{AuthPlacement, Decision, UpstreamSpec};
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 
+pub use gateway_core::ratelimit::Quota;
+
 use crate::config::Config;
 use crate::events::{self, Events};
 use crate::{Error, Result};
@@ -53,6 +55,8 @@ pub enum Refusal {
     Secret(String),
     /// 上流に届かなかった (502)。
     Unreachable(String),
+    /// gateway 自身のバケットが埋まっている (429、DR-0030 §3)。
+    RateLimited(gateway_core::ratelimit::Exceeded),
 }
 
 impl Refusal {
@@ -64,6 +68,7 @@ impl Refusal {
             | Self::NsAllow { .. }
             | Self::UpstreamAllow { .. } => 404,
             Self::Secret(_) | Self::Unreachable(_) => 502,
+            Self::RateLimited(_) => 429,
         }
     }
 
@@ -75,6 +80,7 @@ impl Refusal {
             Self::NsAllow { .. } => "ns_allow",
             Self::UpstreamAllow { .. } => "upstream_allow",
             Self::Secret(_) => "secret",
+            Self::RateLimited(_) => "rate_limited",
             Self::Unreachable(_) => "unreachable",
         }
     }
@@ -113,6 +119,20 @@ pub struct Passthrough {
     http: reqwest::Client,
     /// 行き先を 1 つも書いていなければ置き場を開かない (ディレクトリも作らない)。
     secrets: Option<StaticSecretStore<FileStore<StoredSecret>>>,
+    /// 秘密の id → その秘密の枠 (`[secrets.<id>].limits`)。
+    limits: BTreeMap<String, Vec<gateway_core::ratelimit::Limit>>,
+    /// 秘密ごとの分 / 時のバケット。メモリだけで、再起動で消える。
+    buckets: gateway_core::ratelimit::MemoryBuckets,
+    /// 窓の境界を決める時計。試験で固定するために挟んである。
+    clock: gateway_core::credential::refreshing::Clock,
+}
+
+/// 上流まで届いた 1 本。
+#[derive(Debug)]
+pub struct Relayed {
+    pub response: reqwest::Response,
+    /// gateway 自身のバケットの残量。枠を宣言していない秘密では `None`。
+    pub quota: Option<gateway_core::ratelimit::Quota>,
 }
 
 impl Passthrough {
@@ -137,7 +157,20 @@ impl Passthrough {
             upstreams: config.upstreams.clone(),
             http,
             secrets,
+            limits: config
+                .secrets
+                .iter()
+                .filter(|(_, spec)| !spec.limits.is_empty())
+                .map(|(id, spec)| (id.clone(), spec.limits.clone()))
+                .collect(),
+            buckets: gateway_core::ratelimit::MemoryBuckets::new(),
+            clock: gateway_core::credential::refreshing::Clock::System,
         })
+    }
+
+    /// 窓の境界を決める時計を差し替える (試験用)。
+    pub fn set_clock(&mut self, clock: gateway_core::credential::refreshing::Clock) {
+        self.clock = clock;
     }
 
     /// 中継する。返すのは上流の応答そのもの (状態・ヘッダ・本文を変えずに流す)。
@@ -147,7 +180,7 @@ impl Passthrough {
         &self,
         events: &Events,
         request: Relay<'_, S>,
-    ) -> std::result::Result<reqwest::Response, Refusal>
+    ) -> std::result::Result<Relayed, Refusal>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -166,8 +199,15 @@ impl Passthrough {
             Some(spec) => self.send(spec, request).await,
         };
         let (status, refused) = match &outcome {
-            Ok(resp) => (resp.status().as_u16(), None),
+            Ok(relayed) => (relayed.response.status().as_u16(), None),
             Err(refusal) => (refusal.status(), Some(refusal.reason().to_owned())),
+        };
+        let (bucket, retry_after_secs) = match &outcome {
+            Err(Refusal::RateLimited(exceeded)) => (
+                Some(exceeded.bucket.clone()),
+                Some(exceeded.retry_after_secs),
+            ),
+            _ => (None, None),
         };
         events.publish(events::Passthrough {
             kind: events::Passthrough::KIND.to_owned(),
@@ -182,6 +222,8 @@ impl Passthrough {
             duration_ms: started.elapsed().as_millis() as u64,
             secret: spec.map(|s| s.secret.clone()).unwrap_or_default(),
             refused,
+            bucket,
+            retry_after_secs,
         });
         outcome
     }
@@ -190,7 +232,7 @@ impl Passthrough {
         &self,
         spec: &UpstreamSpec,
         request: Relay<'_, S>,
-    ) -> std::result::Result<reqwest::Response, Refusal>
+    ) -> std::result::Result<Relayed, Refusal>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -221,8 +263,6 @@ impl Passthrough {
             .ok_or_else(|| Refusal::Secret("no secret store is open".into()))?
             .get(&CredentialId::new(spec.secret.as_str()))
             .map_err(|e| Refusal::Secret(Error::from(e).to_string()))?;
-        // レート制限はここに入る (秘密を読めた後、送る前。読めずに 502 になる
-        // 要求や、allowlist の外の要求を数えないため)。
 
         let mut headers = forwarded_headers(request.headers, &spec.auth);
         let (name, value) = match &spec.auth {
@@ -245,14 +285,26 @@ impl Passthrough {
         let url = spec
             .target(request.path, request.query)
             .map_err(Refusal::Unreachable)?;
+        // 枠は送る直前に数える。秘密が読めずに 502 になる要求や allowlist の外の
+        // 要求は上流の枠を減らさないので数えない (計画 rate-limit-and-allowlist §4)。
+        // 受理した時点で数え、上流が失敗を返しても 1 と数える。
+        let quota = match self.limits.get(&spec.secret) {
+            Some(limits) => self
+                .buckets
+                .take(&spec.secret, limits, self.clock.now_unix())
+                .map_err(Refusal::RateLimited)?,
+            None => None,
+        };
         // 本文は 1 度しか読めないので、流したら取り返せない。断るのはここより前。
-        self.http
+        let response = self
+            .http
             .request(request.method, url)
             .headers(headers)
             .body(reqwest::Body::wrap_stream(request.body))
             .send()
             .await
-            .map_err(|e| Refusal::Unreachable(e.to_string()))
+            .map_err(|e| Refusal::Unreachable(e.to_string()))?;
+        Ok(Relayed { response, quota })
     }
 }
 

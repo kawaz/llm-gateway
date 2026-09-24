@@ -233,6 +233,24 @@ type = "file"               # 既定の置き場: $XDG_STATE_HOME/llm-gateway/se
 - 設定に無い行き先・当たるパスが無い: **404**。パスは当たるが method が違う: **405**。秘密が読めない・上流に届かない: **502**。前の 3 つでは上流へ何も送らない
 - 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。gateway 自身が断った時は `refused` に理由が載る: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (上流が答えた時は状態コードに関わらず無い)。日次集計には積まない
 
+### 枠 (`[secrets.<id>] limits`)
+
+gateway が秘密ごとに自分で数え、上流に断られる前に止める (DR-0030 §3)。枠は行き先でなく秘密の持ち物で、同じ秘密を使う 2 つの行き先は枠を共有する。
+
+```toml
+[secrets.xai]
+limits = [
+  { requests = 60,  per = "minute" },
+  { requests = 1000, per = "hour" },
+]
+```
+
+- `per` は `"minute"` か `"hour"`。窓は固定窓で、UTC の整数分 / 整数時で切る (`tz` を書くと断る)。`"day"` / `"month"` (`tz` に IANA 名か `±HH:MM`) は読むが今は断る。再起動を跨いで数える必要があり、まだ実装していない
+- 数はメモリで持ち、gateway を再起動すると 0 から数え直す
+- 宣言した枠は全部に空きが要る。1 つでも埋まれば断る。数えるのは gateway が送った時点で、上流の応答に関わらず 1 と数える。手前で断った要求 (allowlist、秘密が読めない) は数えない
+- 埋まった時: **429** と `Retry-After` (埋まった窓のうち最も遅く空くものまでの秒) を返し、上流には送らない。知らせには `refused: "rate_limited"`、`bucket` (例: `minute`)、`retry_after_secs` が載る
+- 枠のある秘密の応答には、最も詰まっている枠 (残りの割合が最も小さいもの) の `X-RateLimit-Limit` / `-Remaining` / `-Reset` を付ける。`-Reset` はその窓が終わるまでの秒。これは gateway 自身の値で、上流の同名ヘッダ (と `Retry-After`) は落とす。2 つの値を混ぜない
+
 ### namespace の allowlist (`[ns.<name>.allow]`)
 
 ```toml

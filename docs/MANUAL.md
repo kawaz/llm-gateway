@@ -231,6 +231,24 @@ A secret file is kept apart from credentials. Its smallest form is `{"type":"sta
 - Not configured, or no allowed path matches: **404**. The path matches but the method does not: **405**. The secret cannot be read, or the upstream cannot be reached: **502**. In the first three cases nothing is sent to the upstream
 - Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). When the gateway itself refused, `refused` says why: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (absent when the upstream answered, whatever its status). Nothing is added to the daily totals
 
+### Limits (`[secrets.<id>] limits`)
+
+The gateway counts requests itself, per secret, and stops them before the upstream does (DR-0030 §3). The limit belongs to the secret, not to the upstream: two upstreams that share a secret share its limit.
+
+```toml
+[secrets.xai]
+limits = [
+  { requests = 60,  per = "minute" },
+  { requests = 1000, per = "hour" },
+]
+```
+
+- `per` is `"minute"` or `"hour"`. Windows are fixed and cut on whole UTC minutes / hours; `tz` is refused on them. `"day"` / `"month"` (with a `tz` of an IANA name or a `±HH:MM` offset) are read but refused for now: they must survive a restart, which is not implemented yet
+- The counts live in memory and start over when the gateway restarts
+- Every declared limit must have room; if any one is used up, the request is refused. A request is counted when the gateway sends it, whatever the upstream answers. Requests refused earlier (allow lists, an unreadable secret) are not counted
+- When the limit is used up: **429** with `Retry-After` (seconds until the latest-ending full window reopens), and nothing is sent to the upstream. The event carries `refused: "rate_limited"`, `bucket` (for example `minute`) and `retry_after_secs`
+- Responses on a limited secret carry `X-RateLimit-Limit` / `-Remaining` / `-Reset` for the tightest limit (the lowest remaining share). `-Reset` is the seconds until that window ends. These are the gateway's own numbers: an upstream's headers of the same names (and its `Retry-After`) are dropped so the two are never mixed
+
 ### Namespace allow list (`[ns.<name>.allow]`)
 
 ```toml

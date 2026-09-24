@@ -7,6 +7,7 @@
 //! - [`pattern`] `*` だけを扱う名前の照合
 //! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
 //! - [`upstream`] 無変換で中継する行き先の設定と、通してよいかの判定
+//! - [`ratelimit`] gateway が自分で数える時間バケット (固定窓の境界とメモリの器)
 //! - [`stats`] 日次の集計を書き手ごとのファイルに置き、読むときに合わせる器
 //! - [`config`] 設定を土台に重ねる規則、パスの開き方、既定の置き場
 //! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
@@ -25,6 +26,7 @@ pub mod events;
 pub mod ns;
 pub mod pattern;
 pub mod persist;
+pub mod ratelimit;
 pub mod stats;
 pub mod upstream;
 

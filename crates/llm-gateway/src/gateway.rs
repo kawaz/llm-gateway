@@ -270,12 +270,17 @@ impl<P: CredentialPersistence> Gateway<P> {
     pub async fn relay<S, E>(
         &self,
         request: crate::passthrough::Relay<'_, S>,
-    ) -> std::result::Result<reqwest::Response, crate::passthrough::Refusal>
+    ) -> std::result::Result<crate::passthrough::Relayed, crate::passthrough::Refusal>
     where
         S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         self.passthrough.relay(&self.events, request).await
+    }
+
+    /// 中継の枠の窓を決める時計を差し替える (試験用)。
+    pub fn set_passthrough_clock(&mut self, clock: crate::credential::refreshing::Clock) {
+        self.passthrough.set_clock(clock);
     }
 
     /// 転送のたびに起きたことを流す口 (DR-0012)。
