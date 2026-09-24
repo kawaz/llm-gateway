@@ -47,3 +47,11 @@ type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/sec
 
 - [ ] a: このまま (確認済み)
 - [ ] b: 直してほしい点あり (本ファイルか ccmsg で)
+
+### JW-C1: Claude Code 向けを固定 token から長寿命 JWT に切り替える (v0.59.0 で可能、稼働 config の変更は kawaz と)
+
+v0.59.0 で ns 認証 `jwt` と helper CLI (`llm-gateway auth keygen` / `jwks` / `sign`) が入った。手順は [runbook](runbooks/ns-auth-jwt-rotation.md): `keygen` → `jwks --ns <ns>` の TOML 断片を dotfiles の config に → restart → `sign --sub <機械名> --ttl <日数>` の JWT を各 Claude 設定の `ANTHROPIC_AUTH_TOKEN` に → 動作確認。3 面 (personal / emrd / zunsystem) の settings.json と codex の config も同じ token で差し替える。統括は稼働 config と Claude 設定を勝手に触らないので、着手の合図が要る。未確認: Claude Code が約 300 byte の JWT を `ANTHROPIC_AUTH_TOKEN` に載せて問題なく送るか (runbook の手順 5 で確かめる)。
+
+- [ ] a: 統括が runbook どおりに進めてよい (config と settings.json の編集を含む、各面の順序は unstable → personal → emrd → zunsystem)
+- [ ] b: kawaz が自分でやる
+- [ ] c: まだやらない
