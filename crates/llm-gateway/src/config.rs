@@ -129,6 +129,10 @@ pub struct Config {
     )]
     pub secrets: BTreeMap<String, SecretSpec>,
 
+    /// 日 / 月の枠の数の置き場 (DR-0030 §3)。
+    #[serde(default)]
+    pub ratelimit: RateLimitStore,
+
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
     /// 何を隠すか・どう振り分けるか・短い名前をどうするかは、使う人ごとに
@@ -896,6 +900,29 @@ impl Store {
     }
 }
 
+/// 日 / 月の枠の数の置き場。書き手 (待ち受け先) ごとのファイルに書き、読むときに
+/// 合わせる。消えると数え直しになり、その日 / 月の枠を超えて通しうるので state に置く。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitStore {
+    /// 省略時は `$XDG_STATE_HOME/llm-gateway/ratelimit`。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "path_expand::serde_opt_path"
+    )]
+    pub dir: Option<PathBuf>,
+}
+
+impl RateLimitStore {
+    /// 実際に使う置き場。
+    pub fn resolve_dir(&self) -> PathBuf {
+        self.dir
+            .clone()
+            .unwrap_or_else(|| default_state_dir().join("ratelimit"))
+    }
+}
+
 /// 固定の秘密 1 つの宣言。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1318,18 +1345,6 @@ impl Config {
                 )));
             }
             validate_route(name, route, self)?;
-        }
-        for (id, spec) in &self.secrets {
-            for limit in &spec.limits {
-                if matches!(
-                    limit.per,
-                    gateway_core::ratelimit::Per::Day | gateway_core::ratelimit::Per::Month
-                ) {
-                    return Err(Error::Config(format!(
-                        "secrets.{id}: limits per \"day\" / \"month\" are not supported yet; use \"minute\" or \"hour\""
-                    )));
-                }
-            }
         }
         for (name, upstream) in &self.upstreams {
             gateway_core::upstream::check_name(name, &RESERVED_UPSTREAM_NAMES)

@@ -57,6 +57,9 @@ pub enum Refusal {
     Unreachable(String),
     /// gateway 自身のバケットが埋まっている (429、DR-0030 §3)。
     RateLimited(gateway_core::ratelimit::Exceeded),
+    /// 日 / 月の枠を数えられない (503)。他の書き手の分が読めない、または自分の
+    /// 分を書けない。
+    RateLimitUnavailable(String),
 }
 
 impl Refusal {
@@ -69,6 +72,7 @@ impl Refusal {
             | Self::UpstreamAllow { .. } => 404,
             Self::Secret(_) | Self::Unreachable(_) => 502,
             Self::RateLimited(_) => 429,
+            Self::RateLimitUnavailable(_) => 503,
         }
     }
 
@@ -81,6 +85,7 @@ impl Refusal {
             Self::UpstreamAllow { .. } => "upstream_allow",
             Self::Secret(_) => "secret",
             Self::RateLimited(_) => "rate_limited",
+            Self::RateLimitUnavailable(_) => "ratelimit_unavailable",
             Self::Unreachable(_) => "unreachable",
         }
     }
@@ -121,8 +126,8 @@ pub struct Passthrough {
     secrets: Option<StaticSecretStore<FileStore<StoredSecret>>>,
     /// 秘密の id → その秘密の枠 (`[secrets.<id>].limits`)。
     limits: BTreeMap<String, Vec<gateway_core::ratelimit::Limit>>,
-    /// 秘密ごとの分 / 時のバケット。メモリだけで、再起動で消える。
-    buckets: gateway_core::ratelimit::MemoryBuckets,
+    /// 秘密ごとのバケット。分 / 時はメモリ、日 / 月は書き手ごとのファイル。
+    buckets: gateway_core::ratelimit::RateLimiter,
     /// 窓の境界を決める時計。試験で固定するために挟んである。
     clock: gateway_core::credential::refreshing::Clock,
 }
@@ -163,7 +168,14 @@ impl Passthrough {
                 .filter(|(_, spec)| !spec.limits.is_empty())
                 .map(|(id, spec)| (id.clone(), spec.limits.clone()))
                 .collect(),
-            buckets: gateway_core::ratelimit::MemoryBuckets::new(),
+            // 書き手の名前は待ち受け先。同じ置き場を別ポートの gateway と共有しても、
+            // 互いのファイルを書かない (DR-0011 と同じ)。
+            buckets: gateway_core::ratelimit::RateLimiter::new(Box::new(
+                gateway_core::counter::FileCounters::new(
+                    config.ratelimit.resolve_dir(),
+                    &config.server.listen,
+                ),
+            )),
             clock: gateway_core::credential::refreshing::Clock::System,
         })
     }
@@ -292,7 +304,12 @@ impl Passthrough {
             Some(limits) => self
                 .buckets
                 .take(&spec.secret, limits, self.clock.now_unix())
-                .map_err(Refusal::RateLimited)?,
+                .map_err(|refused| match refused {
+                    gateway_core::ratelimit::Refused::Exceeded(e) => Refusal::RateLimited(e),
+                    gateway_core::ratelimit::Refused::Unavailable(reason) => {
+                        Refusal::RateLimitUnavailable(reason)
+                    }
+                })?,
             None => None,
         };
         // 本文は 1 度しか読めないので、流したら取り返せない。断るのはここより前。

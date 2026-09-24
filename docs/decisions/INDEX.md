@@ -44,4 +44,4 @@ Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは�
 | [DR-0028](DR-0028-daemon-service-subcommands.md) | 🟡 部分実装 | プロセスの起動と常駐を `daemon` (instance の操作) / `service` (OS への登録) に分ける |
 | [DR-0029](DR-0029-stats-origin-axis.md) | ✅ 実装済 | 日次集計の鍵にモデルの下の「出した側」(origin) を足す (keepalive の自送信を本数・トークン・USD で分けて読む) |
 | [DR-0030](DR-0030-general-purpose-auth-gateway.md) | ⬜ 未実装 | 汎用の認証 gateway を crate として下に敷き、LLM をその上の 1 利用者にする (任意 API への認証差し替えパススルー、自主レート制限、ns の allowlist と JWT 認証) |
-| [DR-0031](DR-0031-store-layer.md) | ⬜ 未実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |
+| [DR-0031](DR-0031-store-layer.md) | 🟡 部分実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |

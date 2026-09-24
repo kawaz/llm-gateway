@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 
+use crate::counter::{CounterStore, RequestCount};
+use crate::stats::Merged;
+
 use jiff::tz::{Offset, TimeZone};
 use jiff::{Timestamp, ToSpan as _};
 use serde::de::{self, Deserializer};
@@ -216,16 +219,72 @@ pub struct Exceeded {
     pub quota: Quota,
 }
 
-/// 鍵ごと・バケットごとの固定窓のカウンタ。メモリだけで持ち、再起動で消える。
-#[derive(Default)]
-pub struct MemoryBuckets {
-    /// (鍵, バケットの番号) → (窓の始まり, 数)。
-    counts: Mutex<HashMap<(String, usize), (i64, u64)>>,
+/// 通さなかった理由。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// 枠が埋まっている (429)。
+    Exceeded(Exceeded),
+    /// 日 / 月の枠を数えられない (503)。他の書き手の分が読めない、または自分の
+    /// 分を書けない。枠が埋まったのではなく、gateway が判定できない状態。
+    Unavailable(String),
 }
 
-impl MemoryBuckets {
-    pub fn new() -> Self {
-        Self::default()
+/// 鍵ごと・バケットごとの固定窓のカウンタ。
+///
+/// `minute` / `hour` はメモリだけで持ち、再起動で消える。`day` / `month` は
+/// 再起動と書き手を跨いで数えるので [`CounterStore`] に置き、fail-closed で
+/// 扱う: 他の書き手の分が 1 つでも読めなければ通さず、送る前に自分の累計を
+/// 書き、書けなければ通さない (DR-0031 §2 (3))。
+///
+/// 書き手の間で「読む → 判定 → 書く」が重なると、上限を書き手の数 − 1 件まで
+/// 超えうる (裁定済み、計画 rate-limit-and-allowlist §7)。
+pub struct RateLimiter {
+    /// (鍵, バケットの番号) → (窓の始まり, 数)。1 本の判定と書き込みはこの錠の
+    /// 中で行うので、同じ書き手の中では重ならない。
+    memory: Mutex<HashMap<(String, usize), (i64, u64)>>,
+    store: Box<dyn CounterStore<RequestCount>>,
+}
+
+/// 何も置かない器。`day` / `month` を宣言しない使い方のためにある。
+struct Nowhere;
+
+impl CounterStore<RequestCount> for Nowhere {
+    fn read_own(&self, _bucket: &str) -> std::io::Result<RequestCount> {
+        Err(std::io::Error::other("no place to keep day / month counts"))
+    }
+    fn write_own(&self, _bucket: &str, _value: &RequestCount) -> std::io::Result<()> {
+        Err(std::io::Error::other("no place to keep day / month counts"))
+    }
+    fn read_merged(&self, _bucket: &str) -> Merged<RequestCount> {
+        Merged {
+            value: RequestCount(0),
+            missing: vec!["*".to_owned()],
+        }
+    }
+}
+
+/// 数える途中の 1 バケット。
+struct Seen<'a> {
+    index: usize,
+    limit: &'a Limit,
+    used: u64,
+    end: i64,
+    /// 日 / 月なら置き場の鍵。
+    stored: Option<String>,
+}
+
+impl RateLimiter {
+    /// `minute` / `hour` だけを数える器。
+    pub fn in_memory() -> Self {
+        Self::new(Box::new(Nowhere))
+    }
+
+    /// `day` / `month` を `store` に置く器。
+    pub fn new(store: Box<dyn CounterStore<RequestCount>>) -> Self {
+        Self {
+            memory: Mutex::new(HashMap::new()),
+            store,
+        }
     }
 
     /// 1 本を受けてよいか。よければ全バケットに 1 を足し、最も詰まっている
@@ -235,22 +294,49 @@ impl MemoryBuckets {
         key: &str,
         limits: &[Limit],
         now_secs: i64,
-    ) -> Result<Option<Quota>, Exceeded> {
+    ) -> Result<Option<Quota>, Refused> {
         if limits.is_empty() {
             return Ok(None);
         }
-        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut memory = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
         let mut seen = Vec::with_capacity(limits.len());
-        for (i, limit) in limits.iter().enumerate() {
+        for (index, limit) in limits.iter().enumerate() {
             let (start, end) = limit.window(now_secs);
-            let slot = counts.entry((key.to_owned(), i)).or_insert((start, 0));
-            // 窓が進んだら数え直す。時計が戻って前の窓を指した時は、今の窓の
-            // まま数える (数え直すと、既に数えた分を忘れて通しすぎる)。
-            if start > slot.0 {
-                *slot = (start, 0);
+            match limit.per {
+                Per::Minute | Per::Hour => {
+                    let slot = memory.entry((key.to_owned(), index)).or_insert((start, 0));
+                    // 窓が進んだら数え直す。時計が戻って前の窓を指した時は、今の
+                    // 窓のまま数える (数え直すと、既に数えた分を忘れて通しすぎる)。
+                    if start > slot.0 {
+                        *slot = (start, 0);
+                    }
+                    seen.push(Seen {
+                        index,
+                        limit,
+                        used: slot.1,
+                        end: end.max(slot.0 + 1),
+                        stored: None,
+                    });
+                }
+                Per::Day | Per::Month => {
+                    let bucket = stored_bucket(key, limit, start);
+                    let merged = self.store.read_merged(&bucket);
+                    if !merged.missing.is_empty() {
+                        return Err(Refused::Unavailable(format!(
+                            "cannot read the `{}` counts of: {}",
+                            limit.label(),
+                            merged.missing.join(", ")
+                        )));
+                    }
+                    seen.push(Seen {
+                        index,
+                        limit,
+                        used: merged.value.0,
+                        end,
+                        stored: Some(bucket),
+                    });
+                }
             }
-            let end = end.max(slot.0 + 1);
-            seen.push((i, limit, slot.1, end));
         }
 
         let quota_of = |limit: &Limit, used: u64, end: i64| Quota {
@@ -258,27 +344,42 @@ impl MemoryBuckets {
             remaining: limit.requests.saturating_sub(used),
             reset_secs: (end - now_secs).max(0) as u64,
         };
-        let full: Vec<_> = seen
+        if let Some(full) = seen
             .iter()
-            .filter(|(_, limit, used, _)| *used >= limit.requests)
-            .collect();
-        if let Some((_, limit, used, end)) = full.iter().max_by_key(|(_, _, _, end)| *end) {
-            return Err(Exceeded {
-                bucket: limit.label(),
-                retry_after_secs: (*end - now_secs).max(1) as u64,
-                quota: quota_of(limit, *used, *end),
-            });
+            .filter(|s| s.used >= s.limit.requests)
+            .max_by_key(|s| s.end)
+        {
+            return Err(Refused::Exceeded(Exceeded {
+                bucket: full.limit.label(),
+                retry_after_secs: (full.end - now_secs).max(1) as u64,
+                quota: quota_of(full.limit, full.used, full.end),
+            }));
         }
 
-        for (i, _, _, _) in &seen {
-            if let Some(slot) = counts.get_mut(&(key.to_owned(), *i)) {
+        // 置き場へ先に書く。書けなければメモリにも足さずに断る (送る前に数える。
+        // 送ってから書くと、書き損ねた分だけ枠を超える)。
+        for s in &seen {
+            if let Some(bucket) = &s.stored {
+                let own = self
+                    .store
+                    .read_own(bucket)
+                    .map_err(|e| Refused::Unavailable(format!("cannot read own count: {e}")))?;
+                self.store
+                    .write_own(bucket, &RequestCount(own.0 + 1))
+                    .map_err(|e| Refused::Unavailable(format!("cannot write own count: {e}")))?;
+            }
+        }
+        for s in &seen {
+            if s.stored.is_none()
+                && let Some(slot) = memory.get_mut(&(key.to_owned(), s.index))
+            {
                 slot.1 += 1;
             }
         }
         // 残量の比率が最も小さいもの (最も詰まっているもの) を出す。
         let tightest = seen
             .iter()
-            .map(|(_, limit, used, end)| quota_of(limit, used + 1, *end))
+            .map(|s| quota_of(s.limit, s.used + 1, s.end))
             .min_by(|a, b| {
                 let ra = a.remaining as f64 / a.limit as f64;
                 let rb = b.remaining as f64 / b.limit as f64;
@@ -286,6 +387,22 @@ impl MemoryBuckets {
             });
         Ok(tightest)
     }
+}
+
+/// 日 / 月のバケットの置き場の鍵。`<鍵>/<per>-<tz>-<窓の始まり>`。
+///
+/// 窓の始まり (unix 秒) を名前にするので、窓が進めば別のファイルになり、
+/// 数え直しにファイルを消す必要がない。tz を入れるのは、同じ始まりを持つ
+/// 別の宣言と混ざらないため。
+fn stored_bucket(key: &str, limit: &Limit, start: i64) -> String {
+    let tz: String = limit
+        .tz
+        .written
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let key = crate::persist::sanitize_writer(key);
+    format!("{key}/{}-{tz}-{start}", limit.per.as_str())
 }
 
 #[cfg(test)]
@@ -298,6 +415,13 @@ mod tests {
             l: Limit,
         }
         toml::from_str::<Wrap>(&format!("l = {text}")).unwrap().l
+    }
+
+    fn exceeded(result: Result<Option<Quota>, Refused>) -> Exceeded {
+        match result {
+            Err(Refused::Exceeded(e)) => e,
+            other => panic!("expected a full bucket, got {other:?}"),
+        }
     }
 
     fn at(rfc3339: &str) -> i64 {
@@ -396,12 +520,12 @@ mod tests {
 
     #[test]
     fn the_bucket_fills_and_reopens_on_the_next_window() {
-        let buckets = MemoryBuckets::new();
+        let buckets = RateLimiter::in_memory();
         let limits = [limit(r#"{ requests = 2, per = "minute" }"#)];
         let t = at("2026-09-24T10:15:10Z");
         assert_eq!(buckets.take("k", &limits, t).unwrap().unwrap().remaining, 1);
         assert_eq!(buckets.take("k", &limits, t).unwrap().unwrap().remaining, 0);
-        let refused = buckets.take("k", &limits, t).unwrap_err();
+        let refused = exceeded(buckets.take("k", &limits, t));
         assert_eq!(refused.retry_after_secs, 50);
         assert_eq!(refused.bucket, "minute");
         // 別の鍵は別に数える。
@@ -418,7 +542,7 @@ mod tests {
     /// どれか 1 つでも埋まれば止め、埋まっていない側にも数を足さない。
     #[test]
     fn every_bucket_must_have_room() {
-        let buckets = MemoryBuckets::new();
+        let buckets = RateLimiter::in_memory();
         let limits = [
             limit(r#"{ requests = 5, per = "minute" }"#),
             limit(r#"{ requests = 2, per = "hour" }"#),
@@ -431,7 +555,7 @@ mod tests {
             "the tightest one is reported"
         );
         buckets.take("k", &limits, t).unwrap();
-        let refused = buckets.take("k", &limits, t + 120).unwrap_err();
+        let refused = exceeded(buckets.take("k", &limits, t + 120));
         assert_eq!(refused.bucket, "hour");
         assert_eq!(
             refused.retry_after_secs,
@@ -439,5 +563,112 @@ mod tests {
         );
         // 次の分の窓でも、時の窓が埋まっている間は通らない。
         assert!(buckets.take("k", &limits, t + 180).is_err());
+    }
+
+    fn stored(dir: &std::path::Path, writer: &str) -> RateLimiter {
+        RateLimiter::new(Box::new(crate::counter::FileCounters::new(dir, writer)))
+    }
+
+    /// 日次 5,000 本で 5,001 本目は断る。器を作り直しても (再起動) 累計は残る。
+    #[test]
+    fn a_day_counts_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(
+            r#"{ requests = 5000, per = "day", tz = "Asia/Tokyo" }"#,
+        )];
+        let t = at("2026-09-24T03:00:00Z");
+        // 4,998 本を数えた書き手の置き場を用意する (1 本ずつ書くと遅いので、累計を直に置く)。
+        let bucket = stored_bucket("k", &limits[0], limits[0].window(t).0);
+        let files = crate::counter::FileCounters::new(dir.path(), "a");
+        files.write_own(&bucket, &RequestCount(4998)).unwrap();
+        {
+            let first = stored(dir.path(), "a");
+            first.take("k", &limits, t).unwrap();
+        }
+        // 作り直しても (再起動)、4,999 本目までを覚えている。
+        let again = stored(dir.path(), "a");
+        let q = again.take("k", &limits, t).unwrap().unwrap();
+        assert_eq!(q.remaining, 0, "the 5,000th fits");
+        let refused = exceeded(again.take("k", &limits, t));
+        assert_eq!(refused.bucket, "day@Asia/Tokyo");
+        assert_eq!(
+            refused.retry_after_secs,
+            (at("2026-09-24T15:00:00Z") - t) as u64
+        );
+    }
+
+    /// 2 つの書き手の分は合わせて数える。
+    #[test]
+    fn two_writers_share_one_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 3, per = "day" }"#)];
+        let t = at("2026-09-24T03:00:00Z");
+        let (a, b) = (stored(dir.path(), "a"), stored(dir.path(), "b"));
+        a.take("k", &limits, t).unwrap();
+        b.take("k", &limits, t).unwrap();
+        let q = a.take("k", &limits, t).unwrap().unwrap();
+        assert_eq!(q.remaining, 0);
+        exceeded(b.take("k", &limits, t));
+    }
+
+    /// 他の書き手の分が読めなければ、枠に余裕があっても通さない。
+    #[test]
+    fn an_unreadable_writer_stops_the_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 100, per = "day" }"#)];
+        let t = at("2026-09-24T03:00:00Z");
+        let a = stored(dir.path(), "a");
+        a.take("k", &limits, t).unwrap();
+        let bucket = stored_bucket("k", &limits[0], limits[0].window(t).0);
+        std::fs::write(dir.path().join(format!("{bucket}.b.json")), "{ broken").unwrap();
+        assert!(matches!(a.take("k", &limits, t), Err(Refused::Unavailable(m)) if m.contains('b')));
+    }
+
+    /// 自分の分を書けなければ通さず、分のバケットにも数えない。
+    #[test]
+    fn a_failed_write_stops_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        // 置き場のはずの場所をファイルで塞ぐ。
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        let limiter = stored(&blocked, "a");
+        let limits = [
+            limit(r#"{ requests = 1, per = "minute" }"#),
+            limit(r#"{ requests = 100, per = "day" }"#),
+        ];
+        let t = at("2026-09-24T03:00:00Z");
+        assert!(matches!(
+            limiter.take("k", &limits, t),
+            Err(Refused::Unavailable(_))
+        ));
+        let only_minute = [limit(r#"{ requests = 1, per = "minute" }"#)];
+        assert!(
+            limiter.take("k", &only_minute, t).is_ok(),
+            "the minute was not spent"
+        );
+    }
+
+    /// 月の窓が進めば (tz 付きの境界で) 空く。
+    #[test]
+    fn a_month_reopens_at_the_local_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 1, per = "month", tz = "+09:00" }"#)];
+        let a = stored(dir.path(), "a");
+        a.take("k", &limits, at("2026-09-30T14:59:59Z")).unwrap();
+        exceeded(a.take("k", &limits, at("2026-09-30T14:59:59Z")));
+        assert!(
+            a.take("k", &limits, at("2026-09-30T15:00:00Z")).is_ok(),
+            "October in Tokyo"
+        );
+    }
+
+    /// 置き場の無い器では、日 / 月は数えられないので通さない。
+    #[test]
+    fn a_memory_only_limiter_refuses_days() {
+        let limits = [limit(r#"{ requests = 1, per = "day" }"#)];
+        assert!(matches!(
+            RateLimiter::in_memory().take("k", &limits, 0),
+            Err(Refused::Unavailable(_))
+        ));
     }
 }

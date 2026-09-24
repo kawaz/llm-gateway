@@ -1,6 +1,6 @@
 # DR-0031: 永続化の器を一貫性の意味論で 4 つの trait に切り、file backend をその 1 実装にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24、未実装。gateway-core 分割の段 1 で (1) から切る)
+- Status: Accepted (kawaz 裁定 2026-09-24、部分実装: (1) `Persistence` と (3) `CounterStore` を切った。(2) / (4) は未実装)
 - Date: 2026-09-24
 
 ## Context
@@ -144,6 +144,8 @@ trait SnapshotStore<T> {
 ### 5. 導入の順序
 
 `gateway-core-split.md` の段 1 / 段 3 で (1) を先に形にする。(3) は段 2 の `Stats<C: Mergeable>` が器になるが、backend 差し替えの trait としては (1) の流儀が固まってから切る。(2) と (4) は分割の範囲外で、2 つ目の backend を入れる時に切る。
+
+(3) は `rate-limit-and-allowlist.md` の段 3c で `gateway_core::counter::CounterStore` として切った (`read_own` / `write_own` / `read_merged -> Merged { value, missing }`、file backend は `FileCounters`)。載っているのは fail-closed の日 / 月バケットだけで、閲覧用の日次集計 (`Stats`) は周期 flush の best-effort なので載せ替えていない。
 
 ## Alternatives Considered
 

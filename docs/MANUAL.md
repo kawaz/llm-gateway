@@ -240,11 +240,15 @@ The gateway counts requests itself, per secret, and stops them before the upstre
 limits = [
   { requests = 60,  per = "minute" },
   { requests = 1000, per = "hour" },
+  { requests = 5000, per = "day", tz = "America/Los_Angeles" },
+  { requests = 100000, per = "month", tz = "+09:00" },
 ]
 ```
 
-- `per` is `"minute"` or `"hour"`. Windows are fixed and cut on whole UTC minutes / hours; `tz` is refused on them. `"day"` / `"month"` (with a `tz` of an IANA name or a `±HH:MM` offset) are read but refused for now: they must survive a restart, which is not implemented yet
-- The counts live in memory and start over when the gateway restarts
+- `per` is `"minute"`, `"hour"`, `"day"` or `"month"`. Windows are fixed. Minutes and hours are cut on whole UTC minutes / hours (`tz` is refused on them) and their counts live in memory, starting over when the gateway restarts
+- Days and months are cut at local midnight in `tz` (an IANA name or a `±HH:MM` offset; UTC when omitted). A DST day is 23 or 25 hours long and keeps the same limit. Their counts survive a restart: each gateway writes its own count to a file under `[ratelimit] dir` (default `$XDG_STATE_HOME/llm-gateway/ratelimit`) **before** sending, and every request sums the files of all gateways sharing that directory
+- If another gateway's count cannot be read, or this gateway cannot write its own, the request is refused with **503** (`Retry-After: 60`) and nothing is sent. The limit is not known to be used up, so it is not a 429. The event carries `refused: "ratelimit_unavailable"`
+- Gateways sharing a directory can pass a day / month limit by at most (number of gateways − 1) requests when they count at the same instant
 - Every declared limit must have room; if any one is used up, the request is refused. A request is counted when the gateway sends it, whatever the upstream answers. Requests refused earlier (allow lists, an unreadable secret) are not counted
 - When the limit is used up: **429** with `Retry-After` (seconds until the latest-ending full window reopens), and nothing is sent to the upstream. The event carries `refused: "rate_limited"`, `bucket` (for example `minute`) and `retry_after_secs`
 - Responses on a limited secret carry `X-RateLimit-Limit` / `-Remaining` / `-Reset` for the tightest limit (the lowest remaining share). `-Reset` is the seconds until that window ends. These are the gateway's own numbers: an upstream's headers of the same names (and its `Retry-After`) are dropped so the two are never mixed

@@ -946,6 +946,10 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                     warn!(ns = %ns_name, %upstream, %reason, "cannot reach the upstream");
                     "upstream unreachable".to_owned()
                 }
+                Refusal::RateLimitUnavailable(reason) => {
+                    warn!(ns = %ns_name, %upstream, %reason, "cannot count the upstream limits");
+                    "rate limit counts unavailable".to_owned()
+                }
                 Refusal::RateLimited(_) => unreachable!("answered above"),
             };
             let kind = match refusal {
@@ -955,11 +959,20 @@ async fn passthrough<P: CredentialPersistence + 'static>(
                 | Refusal::UpstreamAllow { method_only: false } => "not_found_error",
                 Refusal::NsAllow { method_only: true }
                 | Refusal::UpstreamAllow { method_only: true } => "invalid_request_error",
-                Refusal::Secret(_) | Refusal::Unreachable(_) | Refusal::RateLimited(_) => {
-                    "api_error"
-                }
+                Refusal::Secret(_)
+                | Refusal::Unreachable(_)
+                | Refusal::RateLimited(_)
+                | Refusal::RateLimitUnavailable(_) => "api_error",
             };
-            refused(ns_name, status, kind, &message)
+            let unavailable = matches!(refusal, Refusal::RateLimitUnavailable(_));
+            let mut out = refused(ns_name, status, kind, &message);
+            if unavailable {
+                // 枠が埋まったのではなく数えられない (運用の異常)。直るまでの目安は
+                // 分からないので、次の分の窓で読み直す目安を渡す。
+                out.headers_mut()
+                    .insert("retry-after", axum::http::HeaderValue::from(60u64));
+            }
+            out
         }
     }
 }
@@ -4696,14 +4709,19 @@ allow = ["GET /v1/items"]
     }
 
     /// 枠のある秘密で gateway を立てる。時計は `clock` で動かせる。
-    async fn limited(
-        limits: &str,
-    ) -> (
+    type Limited = (
         String,
         Arc<Mutex<Vec<Seen>>>,
         llm_gateway::credential::refreshing::Clock,
         tempfile::TempDir,
-    ) {
+    );
+
+    async fn limited(limits: &str) -> Limited {
+        limited_with(limits, None).await
+    }
+
+    /// `ratelimit_dir` を省くと、秘密の置き場の下の `ratelimit` に数を置く。
+    async fn limited_with(limits: &str, ratelimit_dir: Option<&std::path::Path>) -> Limited {
         let (upstream, seen) = fake_upstream().await;
         let secrets = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4712,7 +4730,11 @@ allow = ["GET /v1/items"]
         )
         .unwrap();
         let config: llm_gateway::Config = toml::from_str(&format!(
-            "[secret_store]\ntype = \"file\"\ndir = \"{}\"\n[secrets.ex]\nlimits = {limits}\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\nauth_token = \"{TOKEN}\"\n[ns.default.allow]\nu = [\"GET /a\"]\n",
+            "[ratelimit]\ndir = \"{}\"\n[secret_store]\ntype = \"file\"\ndir = \"{}\"\n[secrets.ex]\nlimits = {limits}\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\nauth_token = \"{TOKEN}\"\n[ns.default.allow]\nu = [\"GET /a\"]\n",
+            ratelimit_dir
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| secrets.path().join("ratelimit"))
+                .display(),
             secrets.path().display()
         ))
         .unwrap();
@@ -4818,17 +4840,44 @@ allow = ["GET /v1/items"]
         assert!(json["retry_after_secs"].as_u64().unwrap() >= 1, "{json}");
     }
 
-    /// 日 / 月の枠は再起動を跨いで数える必要があり、まだ数えられないので読み込みで断る。
-    #[test]
-    fn day_and_month_limits_are_not_accepted_yet() {
-        for per in ["day", "month"] {
-            let config: llm_gateway::Config = toml::from_str(&format!(
-                "[secrets.ex]\nlimits = [{{ requests = 1, per = \"{per}\" }}]\n"
-            ))
+    /// 日の枠: 他の書き手の数が読めなければ 503 で、上流には出さない。
+    #[tokio::test]
+    async fn an_unreadable_day_count_is_a_503() {
+        let counts = tempfile::tempdir().unwrap();
+        let (base, seen, _clock, _dir) =
+            limited_with(r#"[{ requests = 100, per = "day" }]"#, Some(counts.path())).await;
+        let get = || authed(reqwest::Client::new().get(format!("{base}/ns-default/u/a")));
+        assert_eq!(get().send().await.unwrap().status(), 201);
+
+        // 2026-09-24 (UTC) の窓の、別の書き手のファイルを壊す。
+        let start = 1_790_158_500i64.div_euclid(86_400) * 86_400;
+        std::fs::write(
+            counts.path().join(format!("ex/day-UTC-{start}.other.json")),
+            "{ broken",
+        )
+        .unwrap();
+        let refused = get().send().await.unwrap();
+        assert_eq!(refused.status(), 503);
+        assert!(refused.headers().get("retry-after").is_some());
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the second one did not go out"
+        );
+    }
+
+    /// 日の枠: 自分の数を書けなければ 503 で、上流には出さない。
+    #[tokio::test]
+    async fn a_day_count_that_cannot_be_written_is_a_503() {
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        let (base, seen, _clock, _dir) =
+            limited_with(r#"[{ requests = 100, per = "day" }]"#, Some(blocked.path())).await;
+        let resp = authed(reqwest::Client::new().get(format!("{base}/ns-default/u/a")))
+            .send()
+            .await
             .unwrap();
-            let err = config.validate().unwrap_err().to_string();
-            assert!(err.contains("not supported yet"), "{per}: {err}");
-        }
+        assert_eq!(resp.status(), 503);
+        assert!(seen.lock().unwrap().is_empty());
     }
 
     /// 予約名は行き先の名前にできない (読み込みで断る)。

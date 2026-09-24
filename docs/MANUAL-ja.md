@@ -242,11 +242,15 @@ gateway が秘密ごとに自分で数え、上流に断られる前に止める
 limits = [
   { requests = 60,  per = "minute" },
   { requests = 1000, per = "hour" },
+  { requests = 5000, per = "day", tz = "America/Los_Angeles" },
+  { requests = 100000, per = "month", tz = "+09:00" },
 ]
 ```
 
-- `per` は `"minute"` か `"hour"`。窓は固定窓で、UTC の整数分 / 整数時で切る (`tz` を書くと断る)。`"day"` / `"month"` (`tz` に IANA 名か `±HH:MM`) は読むが今は断る。再起動を跨いで数える必要があり、まだ実装していない
-- 数はメモリで持ち、gateway を再起動すると 0 から数え直す
+- `per` は `"minute"` / `"hour"` / `"day"` / `"month"`。窓は固定窓。分と時は UTC の整数分 / 整数時で切り (`tz` を書くと断る)、数はメモリで持つので再起動すると 0 から数え直す
+- 日と月は `tz` (IANA 名か `±HH:MM`、省略時は UTC) の現地 0 時で切る。DST の切替日は 23 / 25 時間で、上限は変えない。数は再起動を跨ぐ: 各 gateway は送る**前に**自分の数を `[ratelimit] dir` (既定 `$XDG_STATE_HOME/llm-gateway/ratelimit`) の下のファイルに書き、判定のたびに同じ置き場を使う全 gateway の分を足し合わせる
+- 他の gateway の数が読めない、または自分の数を書けない時は **503** (`Retry-After: 60`) で断り、上流へは送らない。枠が埋まったと分かったわけではないので 429 にはしない。知らせには `refused: "ratelimit_unavailable"` が載る
+- 同じ置き場を使う gateway が同時に数えると、日 / 月の枠を最大 (gateway の数 − 1) 本まで超えうる
 - 宣言した枠は全部に空きが要る。1 つでも埋まれば断る。数えるのは gateway が送った時点で、上流の応答に関わらず 1 と数える。手前で断った要求 (allowlist、秘密が読めない) は数えない
 - 埋まった時: **429** と `Retry-After` (埋まった窓のうち最も遅く空くものまでの秒) を返し、上流には送らない。知らせには `refused: "rate_limited"`、`bucket` (例: `minute`)、`retry_after_secs` が載る
 - 枠のある秘密の応答には、最も詰まっている枠 (残りの割合が最も小さいもの) の `X-RateLimit-Limit` / `-Remaining` / `-Reset` を付ける。`-Reset` はその窓が終わるまでの秒。これは gateway 自身の値で、上流の同名ヘッダ (と `Retry-After`) は落とす。2 つの値を混ぜない
