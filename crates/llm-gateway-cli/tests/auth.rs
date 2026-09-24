@@ -112,3 +112,58 @@ fn missing_arguments_are_named() {
     let bad = run(&["auth", "jwks"], "{\"kty\":\"RSA\"}");
     assert!(!bad.status.success());
 }
+
+/// `auth keygen` → `auth jwks` → 設定 → `auth sign` の出力をそのまま `Bearer` に載せると、
+/// 立てた gateway の jwt の ns が通す。
+#[tokio::test]
+async fn a_cli_minted_token_opens_a_jwt_namespace() {
+    let private = stdout(&["auth", "keygen", "--kid", "e2e-key"], "");
+    let keys = stdout(&["auth", "jwks", "--ns", "claude"], &private);
+    let token = stdout(&["auth", "sign", "--sub", "e2e", "--ttl", "1h"], &private);
+
+    let state = tempfile::tempdir().unwrap();
+    let config: llm_gateway::Config = toml::from_str(&format!(
+        r#"
+[routes.a]
+provider = "anthropic"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5"]
+
+[ns.claude]
+auth = "jwt"
+max_ttl = "1d"
+
+{keys}"#
+    ))
+    .unwrap();
+    config.validate().unwrap();
+    let store =
+        llm_gateway::credential::file::FileStore::open(state.path().join("credentials")).unwrap();
+    let gateway = std::sync::Arc::new(llm_gateway::Gateway::new(&config, store).unwrap());
+    gateway.refresh_models().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = llm_gateway_server::router(gateway);
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+
+    let client = reqwest::Client::new();
+    let models = client
+        .get(format!("http://{addr}/ns-claude/v1/models"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(models.status(), 200);
+    let without = client
+        .get(format!("http://{addr}/ns-claude/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(without.status(), 401);
+}

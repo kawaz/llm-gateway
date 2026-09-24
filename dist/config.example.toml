@@ -219,6 +219,20 @@ haiku = "claude-haiku-*"
 # auth_token = "別の乱数"
 # routes = ["claude-work"]
 
+# 固定 token の代わりに、Ed25519 で署名した JWT で通す namespace (DR-0030 §6)。
+# 鍵と token は `llm-gateway auth keygen` / `auth jwks` / `auth sign` で手元で作る
+# (手順は docs/runbooks/ns-auth-jwt-rotation.md)。鍵の追加・削除は restart で反映。
+#
+# [ns.claude]
+# auth = "jwt"
+# max_ttl = "400d"                       # これより長い寿命の token は断る
+# # iss = "llm-gateway-cli"              # 書いたら一致を要求
+# # aud = "ns-claude"                    # 書いたら含まれることを要求
+#
+# [ns.claude.keys.claude-mbp-2026-09]    # 表のキーが kid (機械ごとに 1 本)
+# alg = "EdDSA"
+# public = "<auth jwks --ns claude の出力の public>"
+
 # 登録した上流へ無変換で中継する (DR-0030 §2)。URL は /ns-<ns>/<名前>/<rest>。
 # 認証だけを登録済みの秘密に差し替え、本文・ヘッダ・応答は変えない。
 # allow に無い METHOD / パスは 404 / 405 で、上流には出さない。
