@@ -55,6 +55,8 @@ pub struct Gateway<P: CredentialPersistence> {
     /// 要らない。
     keepalive: Arc<keepalive::Keepalive>,
     tap: Arc<Tap>,
+    /// 登録した行き先への無変換の中継 (DR-0030 §2)。
+    passthrough: crate::passthrough::Passthrough,
     status: crate::status::Manager,
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
 }
@@ -154,6 +156,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             keepalive,
             events,
             tap,
+            passthrough: crate::passthrough::Passthrough::new(config)?,
             status: crate::status::Manager::new(config),
             web_logins: Mutex::new(HashMap::new()),
         })
@@ -261,6 +264,20 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// provider なので、集計の器には引き当て役を渡す (DR-0014 §4)。
     pub fn stats_report(&self, days: usize, now_ms: i64) -> stats::Report {
         self.stats.report(days, now_ms, &RoutePricing(&self.router))
+    }
+
+    /// 登録した行き先へ無変換で中継する (DR-0030 §2)。結果は知らせにも流す。
+    pub async fn relay<S, E>(
+        &self,
+        request: crate::passthrough::Relay<'_, S>,
+    ) -> std::result::Result<reqwest::Response, crate::passthrough::Refusal>
+    where
+        S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.passthrough
+            .relay(&self.http, &self.events, request)
+            .await
     }
 
     /// 転送のたびに起きたことを流す口 (DR-0012)。
@@ -6268,7 +6285,9 @@ keepalive_horizon = "8h"
         loop {
             match watching.recv().await.unwrap() {
                 events::Notice::Request(event) => return *event,
-                events::Notice::Response(_) | events::Notice::CacheExpired(_) => continue,
+                events::Notice::Response(_)
+                | events::Notice::CacheExpired(_)
+                | events::Notice::Passthrough(_) => continue,
             }
         }
     }

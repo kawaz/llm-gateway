@@ -207,6 +207,33 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/models
 
 `originator` か `User-Agent` で codex を名乗る相手 (codex CLI) には、同じ一覧を ChatGPT backend の形 (`{"models": […]}`) で返す。中身は backend の記述そのままで、並ぶのはこの namespace が見せるモデルだけ (DR-0025 §7)。
 
+## パススルー (`/{ns}/{upstream}/{rest}`)
+
+登録した上流へ、1 本を変えずに中継する (DR-0030 §2 / §4 / §5)。gateway が差し替えるのは認証だけで、クライアントの `Authorization` (載せ方がヘッダ指定なら、そのヘッダのクライアントの値も) を落として登録済みの秘密を載せる。method・その他のヘッダ・本文・状態コード・応答ヘッダ・応答本文 (SSE を含む) はそのまま流す。`Host` は上流のもの。
+
+```toml
+[upstreams."api.x.ai"]      # 名前。上流の FQDN を書く慣習で、任意のラベルも書ける
+url = "https://api.x.ai"    # 起点。<rest> をそのまま連結する (path prefix を含めてよい)
+secret = "xai"              # 固定の秘密の id (secrets/xai.json)
+auth = "bearer"             # 載せ方: "bearer" (Authorization: Bearer) か { header = "x-api-key" }
+allow = ["GET /v1/models", "POST /v1/chat/completions", "GET /v1/files/*"]
+
+[secrets]
+type = "file"               # 既定の置き場: $XDG_STATE_HOME/llm-gateway/secrets/<id>.json
+```
+
+秘密のファイルは認証情報とは別の置き場に置く。最小の形は `{"type":"static","payload":{"value":"..."}}` で、`priority` / `disabled` は省略でき、省略したまま書き戻される。ファイルを書き換えると次のリクエストで読み直す (ファイルの版、DR-0010)。
+
+- URL は `/ns-<ns>/<名前>/<rest>` で、必ず namespace の下。namespace のトークンは LLM 経路と同じく検査する
+- 名前に使えるのは英数字と `.` `_` `-` だけ。`v1` / `llm-gateway` / `llm` は予約名で、設定の読み込みで断る
+- `allow` は `"METHOD パスのパターン"` (`*` は任意の並び)。照合するのは `<rest>` のパスだけで、クエリ文字列はそのまま上流へ渡す
+- 設定に無い行き先・当たるパスが無い: **404**。パスは当たるが method が違う: **405**。秘密が読めない・上流に届かない: **502**。前の 3 つでは上流へ何も送らない
+- 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。日次集計には積まない
+
+```bash
+curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization: Bearer <namespace のトークン>'
+```
+
 ## 運用系
 
 `/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。運用系はいずれも認証を持たない。境界は手前で引く。
@@ -388,7 +415,7 @@ id: 42
 data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
 
-`seq` は **gateway 全体の通し番号**で、起動から 1 ずつ増える (最初の 1 件が 1)。`request` / `response` / `cache_expired` の種類をまたいで同じ列を数えるので、どの見物人も同じ知らせを同じ番号で受け取る。SSE の `id:` にも同じ値が載る。前に受けた `seq` + 1 でない番号が来たら間が欠けている (落とした数は `/llm-gateway/self` の `events.dropped`、どこが欠けたかは `seq` の飛び)。gateway は履歴を持たないので、再接続時の `Last-Event-ID` は読まず、送り直さない。`boot` は起動の印 (Unix ミリ秒、`/llm-gateway/self` の `boot` と同じ値) で、変わったら `seq` が 1 から振り直されたと読む (欠落ではない)。webhook の各件も同じ 2 欄を持つ。
+`seq` は **gateway 全体の通し番号**で、起動から 1 ずつ増える (最初の 1 件が 1)。`request` / `response` / `cache_expired` / `passthrough` の種類をまたいで同じ列を数えるので、どの見物人も同じ知らせを同じ番号で受け取る。SSE の `id:` にも同じ値が載る。前に受けた `seq` + 1 でない番号が来たら間が欠けている (落とした数は `/llm-gateway/self` の `events.dropped`、どこが欠けたかは `seq` の飛び)。gateway は履歴を持たないので、再接続時の `Last-Event-ID` は読まず、送り直さない。`boot` は起動の印 (Unix ミリ秒、`/llm-gateway/self` の `boot` と同じ値) で、変わったら `seq` が 1 から振り直されたと読む (欠落ではない)。webhook の各件も同じ 2 欄を持つ。
 
 `prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。
 

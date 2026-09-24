@@ -30,6 +30,7 @@ pub mod events;
 pub mod exchange;
 pub mod gateway;
 pub mod metering;
+pub mod passthrough;
 pub use gateway_core::pattern;
 pub mod preset;
 pub mod provider;

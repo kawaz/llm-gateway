@@ -14,7 +14,7 @@ use axum::extract::{ConnectInfo, Form, Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -61,6 +61,9 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
+        // 登録した行き先への無変換の中継 (DR-0030 §2)。上の固定の段 (`v1`) が
+        // 先に当たるので、`v1` / `llm-gateway` / `llm` は行き先の名前にできない。
+        .route("/{ns}/{upstream}/{*rest}", any(passthrough))
         .with_state(gateway)
 }
 
@@ -811,6 +814,98 @@ async fn forward<P: CredentialPersistence + 'static>(
             })
         }
         Err(e) => span.in_scope(|| error_response(&ns_name, &e)),
+    }
+}
+
+/// 登録した行き先へ無変換で中継する (DR-0030 §2 / §4)。
+///
+/// 通すかどうかの判定 (未登録の行き先・許可外の `METHOD パス` は 404 / 405) と
+/// 認証の差し替えは [`Gateway::relay`]。ここは namespace の解決と ns 認証、
+/// 応答の組み立てだけを持つ。本文は読まずにそのまま流す。
+async fn passthrough<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_owned();
+    // `/ns-<ns>/<upstream>/<rest>`。axum が 3 段以上を保証している。
+    let mut segments = path.trim_start_matches('/').splitn(3, '/');
+    let (Some(first), Some(upstream), Some(rest)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // 中継は namespace の下にだけ置く (DR-0006)。付けない形は持たない。
+    // 予約名の段 (`/ns-x/llm-gateway/...` 等) は gateway 自身の口の続きで、
+    // 行き先ではない。ns の有無や認証に関わらず、そこには何も無い。
+    let Some(ns_name) = first.strip_prefix("ns-") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if llm_gateway::config::RESERVED_UPSTREAM_NAMES.contains(&upstream) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(ns) = gateway.namespace(ns_name) else {
+        return unknown_namespace(ns_name, &gateway.namespace_names());
+    };
+    if let Some(denied) = rejection(ns, ns_name, &parts.headers) {
+        return denied;
+    }
+
+    let rest_path = format!("/{rest}");
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let relayed = gateway
+        .relay(llm_gateway::passthrough::Relay {
+            ns: ns_name,
+            upstream,
+            method: parts.method.clone(),
+            path: &rest_path,
+            query: &query,
+            headers: &parts.headers,
+            body: body.into_data_stream(),
+        })
+        .await;
+
+    use llm_gateway::passthrough::Refusal;
+    match relayed {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = llm_gateway::passthrough::relayed_response_headers(resp.headers());
+            let mut out = Response::new(Body::from_stream(resp.bytes_stream()));
+            *out.status_mut() = status;
+            *out.headers_mut() = headers;
+            out
+        }
+        Err(refusal) => {
+            let status =
+                StatusCode::from_u16(refusal.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let message = match &refusal {
+                Refusal::UnknownUpstream => format!("upstream `{upstream}` is not configured"),
+                Refusal::NotAllowed => format!(
+                    "`{} {rest_path}` is not in the allow list of upstream `{upstream}`",
+                    parts.method
+                ),
+                Refusal::MethodNotAllowed => format!(
+                    "`{}` is not allowed for `{rest_path}` on upstream `{upstream}`",
+                    parts.method
+                ),
+                Refusal::Secret(reason) => {
+                    format!("cannot use the secret for upstream `{upstream}`: {reason}")
+                }
+                Refusal::Unreachable(reason) => {
+                    format!("could not reach upstream `{upstream}`: {reason}")
+                }
+            };
+            let kind = match refusal {
+                Refusal::UnknownUpstream | Refusal::NotAllowed => "not_found_error",
+                Refusal::MethodNotAllowed => "invalid_request_error",
+                Refusal::Secret(_) | Refusal::Unreachable(_) => "api_error",
+            };
+            refused(ns_name, status, kind, &message)
+        }
     }
 }
 
@@ -3960,5 +4055,299 @@ models = ["m"]
         let report: Value = response.json().await.unwrap();
         assert_eq!(report["services"][0]["id"], "provider");
         assert_eq!(report["services"][0]["official"]["state"], "unknown");
+    }
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::tests::{TOKEN, authed, serve_with_default_ns};
+    use std::sync::{Arc, Mutex};
+
+    /// 偽の上流が受けた 1 本。
+    #[derive(Debug, Clone, Default)]
+    struct Seen {
+        method: String,
+        path_and_query: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Seen {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// 受けたものを覚え、固定の SSE とヘッダを返す上流。
+    async fn fake_upstream() -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let (parts, body) = request.into_parts();
+                let body = axum::body::to_bytes(body, 1 << 20).await.unwrap().to_vec();
+                recorder.lock().unwrap().push(Seen {
+                    method: parts.method.to_string(),
+                    path_and_query: parts
+                        .uri
+                        .path_and_query()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                    headers: parts
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_owned()))
+                        .collect(),
+                    body,
+                });
+                (
+                    axum::http::StatusCode::CREATED,
+                    [
+                        ("content-type", "text/event-stream"),
+                        ("x-upstream-note", "kept"),
+                    ],
+                    "data: {\"n\":1}\n\ndata: [DONE]\n\n",
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    struct Setup {
+        base: String,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        _secrets: tempfile::TempDir,
+    }
+
+    /// `api.example.test` (bearer) と `keyed` (ヘッダ指定) の 2 つの行き先を持つ gateway。
+    async fn setup() -> Setup {
+        let (upstream, seen) = fake_upstream().await;
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            secrets.path().join("ex.json"),
+            r#"{"type":"static","payload":{"value":"sk-registered"}}"#,
+        )
+        .unwrap();
+        let config = format!(
+            r#"
+[secrets]
+type = "file"
+dir = "{dir}"
+
+[upstreams."api.example.test"]
+url = "{upstream}/base"
+secret = "ex"
+auth = "bearer"
+allow = ["GET /v1/items", "POST /v1/items/*"]
+
+[upstreams.keyed]
+url = "{upstream}"
+secret = "ex"
+auth = {{ header = "x-api-key" }}
+allow = ["GET /v1/items"]
+
+[upstreams.nosecret]
+url = "{upstream}"
+secret = "missing"
+auth = "bearer"
+allow = ["GET /v1/items"]
+"#,
+            dir = secrets.path().display(),
+        );
+        Setup {
+            base: serve_with_default_ns(&config).await,
+            seen,
+            _secrets: secrets,
+        }
+    }
+
+    /// 認証だけを登録済みのものへ差し替え、他は変えずに往復する。
+    #[tokio::test]
+    async fn the_authorization_is_replaced_and_the_rest_is_untouched() {
+        let s = setup().await;
+        let resp = authed(
+            reqwest::Client::new()
+                .post(format!(
+                    "{}/ns-default/api.example.test/v1/items/7?q=a%20b&x=1",
+                    s.base
+                ))
+                .header("x-client-note", "as-is")
+                .body("{\"raw\": true}"),
+        )
+        .send()
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), 201, "the upstream status is returned as-is");
+        assert_eq!(resp.headers()["x-upstream-note"], "kept");
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "data: {\"n\":1}\n\ndata: [DONE]\n\n",
+            "the SSE body is relayed byte for byte"
+        );
+
+        let seen = s.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.method, "POST");
+        assert_eq!(seen.path_and_query, "/base/v1/items/7?q=a%20b&x=1");
+        assert_eq!(seen.header("authorization"), Some("Bearer sk-registered"));
+        assert!(
+            !seen.headers.iter().any(|(_, v)| v.contains(TOKEN)),
+            "the client's token never reaches the upstream"
+        );
+        assert_eq!(seen.header("x-client-note"), Some("as-is"));
+        assert_eq!(seen.body, b"{\"raw\": true}");
+    }
+
+    /// ヘッダ指定の載せ方では、そのヘッダに秘密を載せ、クライアントの同名の値は落とす。
+    #[tokio::test]
+    async fn a_named_header_carries_the_secret() {
+        let s = setup().await;
+        let resp = authed(
+            reqwest::Client::new()
+                .get(format!("{}/ns-default/keyed/v1/items", s.base))
+                .header("x-api-key", "client-value"),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 201);
+        let seen = s.seen.lock().unwrap()[0].clone();
+        assert_eq!(seen.header("x-api-key"), Some("sk-registered"));
+        assert_eq!(seen.header("authorization"), None);
+    }
+
+    /// 未登録の行き先・許可外のパス・許可外の method は、上流に問い合わせずに断る。
+    #[tokio::test]
+    async fn what_is_not_declared_never_reaches_the_upstream() {
+        let s = setup().await;
+        let client = reqwest::Client::new();
+        for (method, path, status) in [
+            ("GET", "/ns-default/unknown.example/v1/items", 404),
+            ("GET", "/ns-default/api.example.test/v1/other", 404),
+            ("DELETE", "/ns-default/api.example.test/v1/items", 405),
+        ] {
+            let resp = authed(client.request(method.parse().unwrap(), format!("{}{path}", s.base)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{method} {path}");
+        }
+        assert!(s.seen.lock().unwrap().is_empty(), "nothing went out");
+    }
+
+    /// 秘密が読めなければ 502 で、上流には出さない。
+    #[tokio::test]
+    async fn an_unreadable_secret_is_a_502() {
+        let s = setup().await;
+        let resp =
+            authed(reqwest::Client::new().get(format!("{}/ns-default/nosecret/v1/items", s.base)))
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), 502);
+        assert!(s.seen.lock().unwrap().is_empty());
+    }
+
+    /// ns 認証は LLM 経路と同じく効く。
+    #[tokio::test]
+    async fn the_namespace_token_is_checked_first() {
+        let s = setup().await;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/ns-default/api.example.test/v1/items", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert!(s.seen.lock().unwrap().is_empty());
+    }
+
+    /// 既存の LLM 経路と gateway 自身の口は、中継の経路に飲まれない。
+    #[tokio::test]
+    async fn existing_paths_keep_their_meaning() {
+        let s = setup().await;
+        let client = reqwest::Client::new();
+        let models = authed(client.get(format!("{}/ns-default/v1/models", s.base)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 200, "the LLM list still answers");
+        let healthz = client
+            .get(format!("{}/llm-gateway/healthz", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(healthz.status(), 200);
+        for reserved in ["llm-gateway", "llm", "v1"] {
+            let resp = authed(client.get(format!("{}/ns-default/{reserved}/x/y", s.base)))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "{reserved}");
+        }
+        assert!(s.seen.lock().unwrap().is_empty());
+    }
+
+    /// 予約名は行き先の名前にできない (読み込みで断る)。
+    #[test]
+    fn a_reserved_name_is_refused_on_load() {
+        for name in ["v1", "llm-gateway", "llm", "a/b"] {
+            let config: llm_gateway::Config = toml::from_str(&format!(
+                "[upstreams.\"{name}\"]\nurl = \"https://x.test\"\nsecret = \"s\"\nauth = \"bearer\"\nallow = []\n"
+            ))
+            .unwrap();
+            assert!(config.validate().is_err(), "{name}");
+        }
+    }
+
+    /// 中継 1 本ごとに `passthrough` の知らせが流れる。クエリは載せない。
+    #[tokio::test]
+    async fn each_relay_is_announced() {
+        let (upstream, _seen) = fake_upstream().await;
+        let secrets = tempfile::tempdir().unwrap();
+        std::fs::write(
+            secrets.path().join("ex.json"),
+            r#"{"type":"static","payload":{"value":"sk"}}"#,
+        )
+        .unwrap();
+        let config: llm_gateway::Config = toml::from_str(&format!(
+            "[secrets]\ntype = \"file\"\ndir = \"{}\"\n[upstreams.u]\nurl = \"{upstream}\"\nsecret = \"ex\"\nauth = \"bearer\"\nallow = [\"GET /a\"]\n[ns.default]\n",
+            secrets.path().display()
+        ))
+        .unwrap();
+        let gateway = llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap();
+        let mut watching = gateway.events().subscribe();
+        let headers = axum::http::HeaderMap::new();
+        let body = futures_util::stream::empty::<Result<axum::body::Bytes, std::io::Error>>();
+        let resp = gateway
+            .relay(llm_gateway::passthrough::Relay {
+                ns: "default",
+                upstream: "u",
+                method: axum::http::Method::GET,
+                path: "/a",
+                query: "?secret=1",
+                headers: &headers,
+                body,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let notice = watching.try_recv().unwrap();
+        assert_eq!(notice.name(), "passthrough");
+        let json = serde_json::to_value(&notice).unwrap();
+        assert_eq!(json["upstream"], "u");
+        assert_eq!(json["path"], "/a");
+        assert_eq!(json["status"], 201);
+        assert_eq!(json["secret"], "ex");
+        assert!(!json.to_string().contains("secret=1"), "{json}");
     }
 }

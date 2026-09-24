@@ -50,6 +50,19 @@ DR-0006 が「gateway の機能はすべて ns 配下」と決めた形をその
 
 対象ホストは **設定に書いたものだけ** (§4)。任意の URL を中継する open proxy にしない。
 
+確定した設定の形 (gateway-core 分割 段 3、統括 2026-09-24):
+
+```toml
+[upstreams."api.x.ai"]      # 名前 = 既定は apifqdn、任意ラベル可。英数字と . _ - のみ。予約名: v1 / llm-gateway / llm
+url = "https://api.x.ai"    # <rest> をそのまま連結
+secret = "xai"              # 固定の秘密の id ([secrets] の置き場の xai.json。最小形 {"type":"static","payload":{"value":"..."}})
+auth = "bearer"             # 載せ方: "bearer" / { header = "x-api-key" }。上流 API の形なので上流側に書く
+allow = ["GET /v1/models", "POST /v1/chat/completions"]   # "METHOD path-pattern"。外れは 404 / 405 で上流に出さない
+
+[secrets]
+type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/secrets。credential とはディレクトリを分ける
+```
+
 ### 3. レート制限は gateway が自分で数える
 
 上流が枠情報をくれるかに依存せず、gateway 自身が**時間バケットのカウンタ**を持つ。

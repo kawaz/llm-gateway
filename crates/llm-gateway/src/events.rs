@@ -352,6 +352,40 @@ impl Response {
     }
 }
 
+/// 無変換の中継 1 本 (DR-0030 §2)。
+///
+/// 中継には model もトークンも無いので、転送の知らせ ([`Event`]) とは欄が
+/// 重ならない。種類として分ける。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Passthrough {
+    /// 受け取る側が種類を見分ける印。値は常に `passthrough`。
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// 受けた時刻 (Unix ミリ秒)。
+    pub ts: i64,
+    /// gateway 全体の通し番号 ([`Events::publish`] が振る)。
+    pub seq: u64,
+    /// どの起動の番号か ([`Events::boot`])。
+    pub boot: i64,
+    pub ns: String,
+    /// 行き先の名前 (`[upstreams.<name>]`)。
+    pub upstream: String,
+    pub method: String,
+    /// `<rest>` のパス。クエリは含めない (秘密や個人の値が載りうるため)。
+    pub path: String,
+    /// クライアントへ返した状態コード。gateway が断った場合 (404 / 405 / 502) も入る。
+    pub status: u16,
+    /// 受けてから応答のヘッダが返るまで (ミリ秒)。
+    pub duration_ms: u64,
+    /// 載せた固定の秘密の識別子。未登録の行き先では空。
+    pub secret: String,
+}
+
+impl Passthrough {
+    /// 種類の印。
+    pub const KIND: &'static str = "passthrough";
+}
+
 /// 約束した寿命が果たされずに終わった、という取り消し (DR-0012)。
 ///
 /// `cache_expires_at` は送る前に立てた見込みで、上流の都合や機械のサスペンドで
@@ -413,6 +447,8 @@ pub enum Notice {
     CacheExpired(CacheExpired),
     /// 応答が閉じた知らせ。
     Response(Box<Response>),
+    /// 無変換の中継。
+    Passthrough(Box<Passthrough>),
     /// 転送の知らせ。欄が多く、他の 3 種より大きいので箱に入れる
     /// (この列は 1 件流すたびに写される)。
     Request(Box<Event>),
@@ -425,6 +461,7 @@ impl Notice {
             Self::Request(_) => "request",
             Self::Response(_) => Response::KIND,
             Self::CacheExpired(_) => CacheExpired::KIND,
+            Self::Passthrough(_) => Passthrough::KIND,
         }
     }
 
@@ -434,6 +471,7 @@ impl Notice {
             Self::Request(event) => event.seq,
             Self::Response(response) => response.seq,
             Self::CacheExpired(expired) => expired.seq,
+            Self::Passthrough(relayed) => relayed.seq,
         }
     }
 
@@ -441,7 +479,7 @@ impl Notice {
     pub fn request(&self) -> Option<&Event> {
         match self {
             Self::Request(event) => Some(event),
-            Self::Response(_) | Self::CacheExpired(_) => None,
+            Self::Response(_) | Self::CacheExpired(_) | Self::Passthrough(_) => None,
         }
     }
 
@@ -449,7 +487,7 @@ impl Notice {
     pub fn response(&self) -> Option<&Response> {
         match self {
             Self::Response(response) => Some(response),
-            Self::Request(_) | Self::CacheExpired(_) => None,
+            Self::Request(_) | Self::CacheExpired(_) | Self::Passthrough(_) => None,
         }
     }
 }
@@ -461,6 +499,7 @@ impl gateway_core::events::Stamped for Notice {
             Self::Request(event) => (&mut event.seq, &mut event.boot),
             Self::Response(response) => (&mut response.seq, &mut response.boot),
             Self::CacheExpired(expired) => (&mut expired.seq, &mut expired.boot),
+            Self::Passthrough(relayed) => (&mut relayed.seq, &mut relayed.boot),
         };
         *to_seq = seq;
         *to_boot = boot;
@@ -476,6 +515,12 @@ impl From<Event> for Notice {
 impl From<Response> for Notice {
     fn from(response: Response) -> Self {
         Self::Response(Box::new(response))
+    }
+}
+
+impl From<Passthrough> for Notice {
+    fn from(relayed: Passthrough) -> Self {
+        Self::Passthrough(Box::new(relayed))
     }
 }
 
@@ -606,6 +651,30 @@ mod tests {
             events.dropped(),
             "the gap is what was dropped"
         );
+    }
+
+    /// 中継の知らせは読み戻しても中継の種類のまま (転送の知らせに飲まれない)。
+    #[test]
+    fn a_passthrough_notice_reads_back_as_itself() {
+        let notice = Notice::from(Passthrough {
+            kind: Passthrough::KIND.to_owned(),
+            ts: NOW,
+            seq: 3,
+            boot: 1,
+            ns: "default".into(),
+            upstream: "api.example.test".into(),
+            method: "GET".into(),
+            path: "/v1/items".into(),
+            status: 200,
+            duration_ms: 12,
+            secret: "ex".into(),
+        });
+        let text = serde_json::to_string(&notice).unwrap();
+        let back: Notice = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, notice);
+        assert_eq!(back.name(), "passthrough");
+        assert_eq!(back.seq(), 3);
+        assert!(back.request().is_none() && back.response().is_none());
     }
 
     /// 番号は JSON で時刻の隣に出る。

@@ -218,3 +218,18 @@ haiku = "claude-haiku-*"
 # [ns.work]
 # auth_token = "別の乱数"
 # routes = ["claude-work"]
+
+# 登録した上流へ無変換で中継する (DR-0030 §2)。URL は /ns-<ns>/<名前>/<rest>。
+# 認証だけを登録済みの秘密に差し替え、本文・ヘッダ・応答は変えない。
+# allow に無い METHOD / パスは 404 / 405 で、上流には出さない。
+#
+# [upstreams."api.x.ai"]
+# url = "https://api.x.ai"
+# secret = "xai"            # 秘密のファイル: $XDG_STATE_HOME/llm-gateway/secrets/xai.json
+#                           # 中身は {"type":"static","payload":{"value":"..."}}
+# auth = "bearer"           # または { header = "x-api-key" }
+# allow = ["GET /v1/models", "POST /v1/chat/completions"]
+#
+# [secrets]
+# type = "file"
+# dir = "~/.local/state/llm-gateway/secrets"

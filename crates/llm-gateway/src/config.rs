@@ -106,6 +106,18 @@ pub struct Config {
     #[serde(default)]
     pub webhook: Webhook,
 
+    /// 無変換で中継する行き先 (DR-0030 §2)。`/ns-<ns>/<名前>/<rest>` で使う。
+    ///
+    /// 名前は既定で上流の FQDN を書く慣習で、任意のラベルも書ける。
+    /// [`RESERVED_UPSTREAM_NAMES`] は URL の同じ段を gateway が使っているので
+    /// 名前にできない。
+    #[serde(default)]
+    pub upstreams: BTreeMap<String, gateway_core::upstream::UpstreamSpec>,
+
+    /// 中継に載せる固定の秘密の置き場 (DR-0030 §5)。
+    #[serde(default)]
+    pub secrets: Secrets,
+
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
     /// 何を隠すか・どう振り分けるか・短い名前をどうするかは、使う人ごとに
@@ -865,6 +877,42 @@ impl Store {
     }
 }
 
+/// URL で `/ns-<ns>/` の直後の段に gateway が使っている名前。行き先の名前に
+/// できない (`llm` は LLM 経路の移行先として押さえておく、DR-0030 §2)。
+pub const RESERVED_UPSTREAM_NAMES: [&str; 3] = ["v1", "llm-gateway", "llm"];
+
+/// 固定の秘密の置き場 (DR-0030 §5)。認証情報とはディレクトリを分ける。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Secrets {
+    /// 1 秘密 1 ファイル (`<id>.json`)。平文。
+    File {
+        /// 省略時は `$XDG_STATE_HOME/llm-gateway/secrets`。
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "path_expand::serde_opt_path"
+        )]
+        dir: Option<PathBuf>,
+    },
+}
+
+impl Default for Secrets {
+    fn default() -> Self {
+        Self::File { dir: None }
+    }
+}
+
+impl Secrets {
+    /// 実際に使う置き場。
+    pub fn resolve_dir(&self) -> PathBuf {
+        match self {
+            Self::File { dir: Some(d) } => d.clone(),
+            Self::File { dir: None } => default_state_dir().join("secrets"),
+        }
+    }
+}
+
 /// 使用量の日次集計の置き場 (DR-0011)。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1217,6 +1265,10 @@ impl Config {
                 )));
             }
             validate_route(name, route, self)?;
+        }
+        for name in self.upstreams.keys() {
+            gateway_core::upstream::check_name(name, &RESERVED_UPSTREAM_NAMES)
+                .map_err(Error::Config)?;
         }
         for (name, ns) in &self.namespaces {
             if name.is_empty() {

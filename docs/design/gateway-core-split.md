@@ -196,6 +196,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 検証: `just ci`。server の試験で、ローカルの偽上流に対し「Authorization の差し替え」「本文・ヘッダ・SSE 応答の無変換」「未登録名・許可外 endpoint が上流へ届かない」「既存 LLM 経路が同じ応答」を確かめる。静的 secret の読み出しが `StaticSecretStore` (§5) 経由であること
 - やらないこと: `/ns-<ns>/llm/<provider>/...` への移行と旧 URL の alias (QUESTIONS.md で裁定中)。レート制限と ns ごとの allowlist (手順 3)。`jwt` (手順 4)。複数 credential の使い分けと denial fallback (後続)
 - 3a 実施済み: `gateway_core::upstream::{UpstreamSpec, AuthPlacement, Allow, Decision, check_name}` (設定の形、`METHOD パス` の照合で 404 / 405 / 通す、予約名の検査) と `gateway_core::credential::secret::{StaticSecret, StoredSecret, StaticSecretStore}` (固定の秘密、`Persistence` の `load` + `version` だけで読む、読めなければ失敗)。秘密のファイルは `priority` / `disabled` を省略でき、既定値なら省いたまま書き戻す (`TaggedPayload::OMITS_DEFAULT_TOP`)
+- 3b 実施済み: server に `/{ns}/{upstream}/{*rest}` (予約名の段は 404)、llm-gateway に `[upstreams]` / `[secrets]` の設定と `passthrough` (認証の差し替えと無変換の中継、`Notice::Passthrough` の知らせ)。stats には積まない。段 3 はこれで完了
 
 ### 後続 (本分割の境界の外): credential の使い分けの汎用化
 

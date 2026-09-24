@@ -205,6 +205,33 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/models
 {"object": "list", "data": [{"id": "claude-opus-5", "object": "model", "type": "model"}]}
 ```
 
+## Pass-through (`/{ns}/{upstream}/{rest}`)
+
+Relays a request unchanged to an upstream you registered (DR-0030 §2 / §4 / §5). The gateway swaps only the authentication: it drops the client's `Authorization` (and, when the secret goes into a named header, the client's value of that header), sets the registered secret, and passes the method, the rest of the headers, the body, the status, the response headers and the response body (SSE included) through untouched. `Host` is the upstream's.
+
+```toml
+[upstreams."api.x.ai"]      # the name; by convention the API's FQDN, any label is allowed
+url = "https://api.x.ai"    # the origin; <rest> is appended to it as-is (a path prefix is allowed)
+secret = "xai"              # the id of a static secret (secrets/xai.json)
+auth = "bearer"             # how to send it: "bearer" (Authorization: Bearer) or { header = "x-api-key" }
+allow = ["GET /v1/models", "POST /v1/chat/completions", "GET /v1/files/*"]
+
+[secrets]
+type = "file"               # default directory: $XDG_STATE_HOME/llm-gateway/secrets/<id>.json
+```
+
+A secret file is kept apart from credentials. Its smallest form is `{"type":"static","payload":{"value":"..."}}`; `priority` / `disabled` may be omitted and are written back omitted. A change to the file is picked up on the next request (the file version, DR-0010).
+
+- URL: `/ns-<ns>/<name>/<rest>`, always under a namespace. The namespace token is checked as on the LLM paths
+- Names may contain only letters, digits, `.`, `_` and `-`. `v1`, `llm-gateway` and `llm` are reserved and refused when the configuration is read
+- `allow` entries are `"METHOD path-pattern"` (`*` matches any run). Only the path of `<rest>` is matched; the query string is passed on as-is
+- Not configured, or no allowed path matches: **404**. The path matches but the method does not: **405**. The secret cannot be read, or the upstream cannot be reached: **502**. In the first three cases nothing is sent to the upstream
+- Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). Nothing is added to the daily totals
+
+```bash
+curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization: Bearer <namespace token>'
+```
+
 ## Operations
 
 These live under `/llm-gateway/` so they never collide with upstream API names (DR-0006). None of them carry authentication; the boundary is drawn in front.
@@ -386,7 +413,7 @@ id: 42
 data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":"default","model":"claude-opus-5","credential":"personal","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000}
 ```
 
-`seq` is a **gateway-wide sequence number**: it starts at 1 when the process starts and goes up by one for every event of any type (`request` / `response` / `cache_expired`), so every watcher sees the same event under the same number. It is also sent as the SSE `id:`. A watcher that receives something other than the previous `seq` + 1 has missed events in between (the count of what was dropped is `events.dropped` in `/llm-gateway/self`; where the gap is shows in `seq`). The gateway keeps no history, so a reconnecting `Last-Event-ID` is ignored and nothing is replayed. `boot` identifies the process start (Unix ms, the same value as `boot` in `/llm-gateway/self`); when it changes, `seq` has restarted from 1 and the jump is not a loss. Webhook deliveries carry the same two fields on every item.
+`seq` is a **gateway-wide sequence number**: it starts at 1 when the process starts and goes up by one for every event of any type (`request` / `response` / `cache_expired` / `passthrough`), so every watcher sees the same event under the same number. It is also sent as the SSE `id:`. A watcher that receives something other than the previous `seq` + 1 has missed events in between (the count of what was dropped is `events.dropped` in `/llm-gateway/self`; where the gap is shows in `seq`). The gateway keeps no history, so a reconnecting `Last-Event-ID` is ignored and nothing is replayed. `boot` identifies the process start (Unix ms, the same value as `boot` in `/llm-gateway/self`); when it changes, `seq` has restarted from 1 and the jump is not a loss. Webhook deliveries carry the same two fields on every item.
 
 `prefix` is an 8-digit hash of the first block of the system prompt, marking which conversation series a request belongs to; when it cannot be derived, the field is omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in the Responses shape is `codex`, and the gateway's own resend is `keepalive`). `cache_ttl_secs` is **how long the prefix this request leaves behind lives**, in seconds: it follows the strategy that was applied, and for an untouched body it reads the `cache_control` that was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300). `cache_expires_at` is that moment. A request that leaves no breakpoint omits both, and so does an attempt the upstream refused (non-2xx): it placed no cache, so it promises no lifetime and carries none of the `cache_*` fields below either. If routes were skipped during route selection, `skipped` lists each credential and the reason.
 
