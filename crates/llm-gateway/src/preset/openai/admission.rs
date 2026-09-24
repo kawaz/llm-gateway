@@ -40,7 +40,8 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
     loop {
         if let Some(end) = event_end(&prefix) {
             if end > MAX_EVENT {
-                return Err(crate::Error::Config(
+                return Err(crate::Error::upstream_response(
+                    "OpenAI API",
                     "OpenAI response leading event is too large".to_owned(),
                 ));
             }
@@ -49,7 +50,8 @@ async fn admit(response: Response, model: &str, observed_at: i64) -> Result<Admi
             break;
         }
         if prefix.len() > MAX_EVENT {
-            return Err(crate::Error::Config(
+            return Err(crate::Error::upstream_response(
+                "OpenAI API",
                 "OpenAI response leading event is too large".to_owned(),
             ));
         }

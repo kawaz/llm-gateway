@@ -87,7 +87,10 @@ impl Translator {
                 output.extend(self.line(&line)?);
             } else {
                 if self.held.len() + self.event.len() >= MAX_EVENT {
-                    return Err(Error::Config("Responses SSE event is too large".to_owned()));
+                    return Err(Error::upstream_response(
+                        "Responses API",
+                        "Responses SSE event is too large".to_owned(),
+                    ));
                 }
                 self.held.push(byte);
             }
@@ -199,7 +202,8 @@ impl Translator {
                 let index = match self.block {
                     Some(Block::Tool(index)) => index,
                     _ => {
-                        return Err(Error::Config(
+                        return Err(Error::upstream_response(
+                            "Responses API",
                             "tool arguments arrived before the tool item".to_owned(),
                         ));
                     }

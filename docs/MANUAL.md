@@ -165,10 +165,12 @@ Errors:
 | --- | --- | --- |
 | Namespace token mismatch | 401 | `authentication_error` |
 | Body unreadable / not JSON | 400 | `invalid_request_error` |
-| Body cannot be translated into the route's format (e.g. a `document` block inside `tool_result` on an OpenAI route) | 400 | `invalid_request_error` |
+| Body cannot be translated into the route's format (e.g. a `document` block inside `tool_result` on an OpenAI route), or has no `model` | 400 | `invalid_request_error` |
 | Unknown namespace | 404 | `invalid_request_error` |
 | Model on no route | 404 | `not_found_error` |
 | Every route failed / upstream unreachable | 503 | `api_error` |
+| The upstream answered but its response could not be used (unexpected stream shape, too large, broken off while reading) | 502 | `api_error` |
+| A problem in the gateway itself or its configuration | 500 | `api_error` |
 
 ### `POST /{ns}/v1/responses`
 

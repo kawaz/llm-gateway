@@ -311,12 +311,16 @@ impl MessageCollector {
     }
 
     fn start_message(&mut self, event: &Value) -> Result<()> {
-        let message = event
-            .get("message")
-            .ok_or_else(|| Error::Config("Messages SSE message_start has no message".to_owned()))?;
+        let message = event.get("message").ok_or_else(|| {
+            Error::upstream_response(
+                "Messages API",
+                "Messages SSE message_start has no message".to_owned(),
+            )
+        })?;
         let content = message.get("content").and_then(Value::as_array);
         if !message.is_object() || content.is_none() {
-            return Err(Error::Config(
+            return Err(Error::upstream_response(
+                "Messages API",
                 "Messages SSE message_start message has an unexpected shape".to_owned(),
             ));
         }
@@ -340,11 +344,9 @@ impl MessageCollector {
     }
 
     fn apply_delta(&mut self, event: &Value) -> Result<()> {
-        let index = event
-            .get("index")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| Error::Config("Messages SSE delta has no index".to_owned()))?
-            as usize;
+        let index = event.get("index").and_then(Value::as_u64).ok_or_else(|| {
+            Error::upstream_response("Messages API", "Messages SSE delta has no index".to_owned())
+        })? as usize;
         let delta = event.get("delta").unwrap_or(&Value::Null);
         match delta.get("type").and_then(Value::as_str).unwrap_or("") {
             "text_delta" => {
@@ -354,13 +356,17 @@ impl MessageCollector {
                     .get_mut(index)
                     .and_then(Value::as_object_mut)
                     .ok_or_else(|| {
-                        Error::Config("Messages SSE text delta has no block".to_owned())
+                        Error::upstream_response(
+                            "Messages API",
+                            "Messages SSE text delta has no block".to_owned(),
+                        )
                     })?;
                 let current = block
                     .entry("text")
                     .or_insert_with(|| Value::String(String::new()));
                 let Value::String(current) = current else {
-                    return Err(Error::Config(
+                    return Err(Error::upstream_response(
+                        "Messages API",
                         "Messages SSE text block's text is not a string".to_owned(),
                     ));
                 };
@@ -391,7 +397,12 @@ impl MessageCollector {
             .content_mut()
             .get_mut(index)
             .and_then(Value::as_object_mut)
-            .ok_or_else(|| Error::Config("Messages SSE tool delta has no block".to_owned()))?;
+            .ok_or_else(|| {
+                Error::upstream_response(
+                    "Messages API",
+                    "Messages SSE tool delta has no block".to_owned(),
+                )
+            })?;
         block.insert("input".to_owned(), input);
         Ok(())
     }
@@ -507,7 +518,7 @@ pub fn model_of(body: &Value) -> Result<&str> {
     body.get("model")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Config("request has no model".to_owned()))
+        .ok_or_else(|| Error::UntranslatableRequest("request has no model".to_owned()))
 }
 
 /// 正規形の `model` を、upstream が求める名前に替える。

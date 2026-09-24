@@ -94,7 +94,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             // 扱いになって別の認証情報へ流れてしまう。
             .http2_keep_alive_while_idle(true)
             .build()
-            .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
+            .map_err(|e| Error::Internal(format!("could not build the HTTP client: {e}")))?;
 
         let unrouted = config.namespaces_without_routing();
         if !unrouted.is_empty() {

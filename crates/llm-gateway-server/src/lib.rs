@@ -1180,12 +1180,17 @@ fn error_response(ns: &str, e: &Error) -> Response {
         Error::AllUpstreamsFailed { .. } | Error::UpstreamUnreachable { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, "api_error")
         }
+        // 上流は応えたが、中身が使えなかった。
+        Error::UpstreamResponse { .. } => (StatusCode::BAD_GATEWAY, "api_error"),
         Error::Credential { .. } | Error::Refresh { .. } => {
             (StatusCode::UNAUTHORIZED, "authentication_error")
         }
-        Error::Config(_) | Error::Json(_) | Error::UntranslatableRequest(_) => {
+        // request 本文の問題。
+        Error::Json(_) | Error::UntranslatableRequest(_) => {
             (StatusCode::BAD_REQUEST, "invalid_request_error")
         }
+        // 設定の誤りと gateway 自身の失敗は、クライアントには直せない。
+        Error::Config(_) | Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
     };
 
@@ -3865,6 +3870,40 @@ type = "codex_oauth"
             "{message}"
         );
         assert!(!message.contains("configuration"), "{message}");
+    }
+
+    /// 失敗の分類ごとの status: request 本文は 400、上流の中身は 502、上流に届かない
+    /// のは 503、設定と内部は 500。
+    #[tokio::test]
+    async fn each_kind_of_failure_gets_its_status() {
+        for (error, status, kind) in [
+            (
+                Error::UntranslatableRequest("request has no model".into()),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+            ),
+            (
+                Error::upstream_response("Messages API", "response reading was interrupted"),
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+            ),
+            (
+                Error::Internal("could not build the HTTP client".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+            ),
+            (
+                Error::Config("route `a` has no discovery credential".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+            ),
+        ] {
+            let response = error_response("default", &error);
+            assert_eq!(response.status(), status, "{error}");
+            let body: serde_json::Value =
+                serde_json::from_str(&response_body(response).await).unwrap();
+            assert_eq!(body["error"]["type"], kind, "{error}");
+        }
     }
 
     async fn response_body(response: Response) -> String {

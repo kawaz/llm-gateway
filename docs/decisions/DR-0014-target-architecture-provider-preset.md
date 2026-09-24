@@ -130,6 +130,7 @@ BedrockProvider (preset)
 - **config type の `relay` (素通し転送先) は現名のまま残す**
 - **全滅時の自前 429 生成は router の責務** (「候補が空」の判断として)。あわせて events にも出すよう直す (overview §6-#8 の乖離を解消)
 - overview §5.2 の d / f / g / h / i / j はこの裁定に機械的に追従する (裁定不要)
+- **失敗の分類 (2026-09-24 追記)**: `Error::Config` は設定の読み込みだけに使う。request 本文の問題は `UntranslatableRequest` (400)、上流が応えたが中身が使えない (SSE の形が想定外 / 大きすぎる / 読み取りが途中で切れた / 枠や一覧の応答が解釈できない) は `UpstreamResponse { provider, reason }` (502、`provider` は経路名か、手元に無ければ相手の API 名)、gateway 自身の失敗は `Internal` (500)。上流に届かない (`UpstreamUnreachable`) と全滅 (`AllUpstreamsFailed`) は従来どおり 503。経路切替 (`Switch::to_next` / `observe_failure`) はエラーの文字列を理由に使うだけで variant を見ないので、分類を変えても切替の挙動は変わらない
 
 ### 9. `ResponseAdmission` — 本文先頭を見てからの採用判定 (実装時に追加、2026-08-11)
 

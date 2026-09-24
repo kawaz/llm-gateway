@@ -44,6 +44,16 @@ pub enum Error {
         body: String,
     },
 
+    /// upstream は応えたが、中身が使えない (形が想定外、大きすぎる、読み取りが
+    /// 途中で切れた)。`provider` は経路の名前か、経路の名前が手元に無い場所では
+    /// 相手の API の名前 (`Messages API` 等)。
+    #[error("{provider} returned an unusable response: {reason}")]
+    UpstreamResponse { provider: String, reason: String },
+
+    /// gateway 自身の内部の失敗 (設定でも request でも上流でもないもの)。
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// upstream に届かなかった (接続失敗 / タイムアウト)。
     #[error("could not reach {provider}: {source}")]
     UpstreamUnreachable {
@@ -84,6 +94,16 @@ pub enum Error {
 ///
 /// 包む variant を足さないのは、利用側 (server) が `Refresh` 等を直に
 /// 照合しているため。包むと照合が 1 段深くなる (gateway-core-split §6.3)。
+impl Error {
+    /// [`Error::UpstreamResponse`] を作る。
+    pub fn upstream_response(provider: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::UpstreamResponse {
+            provider: provider.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 impl From<gateway_core::Error> for Error {
     fn from(e: gateway_core::Error) -> Self {
         use gateway_core::Error as Core;

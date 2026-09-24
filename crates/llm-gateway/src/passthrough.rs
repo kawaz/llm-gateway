@@ -157,7 +157,7 @@ impl Passthrough {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| Error::Config(format!("could not build the HTTP client: {e}")))?;
+            .map_err(|e| Error::Internal(format!("could not build the HTTP client: {e}")))?;
         Ok(Self {
             upstreams: config.upstreams.clone(),
             http,

@@ -151,10 +151,9 @@ async fn body(
         })?;
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| Error::Config(format!("could not read the model list: {e}")))?;
+    let text = resp.text().await.map_err(|e| {
+        Error::upstream_response("model list", format!("could not read the model list: {e}"))
+    })?;
 
     if !status.is_success() {
         return Err(Error::UpstreamStatus {

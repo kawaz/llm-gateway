@@ -654,8 +654,9 @@ mod tests {
     fn nothing_is_recorded_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
             let mut obs = plain(
-                body(vec![Err(Error::Config(
-                    "response reading was interrupted".into(),
+                body(vec![Err(Error::upstream_response(
+                    "Messages API",
+                    "response reading was interrupted",
                 ))]),
                 request_span(),
             );
@@ -733,8 +734,9 @@ mod tests {
     fn no_silence_is_counted_when_no_chunk_arrives() {
         let logs = logs_of(|| async {
             let mut obs = plain(
-                body(vec![Err(Error::Config(
-                    "response reading was interrupted".into(),
+                body(vec![Err(Error::upstream_response(
+                    "Messages API",
+                    "response reading was interrupted",
                 ))]),
                 request_span(),
             );
@@ -753,7 +755,10 @@ mod tests {
             let mut obs = plain(
                 body(vec![
                     Ok(Bytes::from_static(b"data: {}\n")),
-                    Err(Error::Config("response reading was interrupted".into())),
+                    Err(Error::upstream_response(
+                        "Messages API",
+                        "response reading was interrupted",
+                    )),
                 ]),
                 request_span(),
             );
@@ -1006,7 +1011,10 @@ mod tests {
         let stats = new_stats();
         let broken = body(vec![
             Ok(Bytes::from_static(b"123")),
-            Err(Error::Config("response reading was interrupted".into())),
+            Err(Error::upstream_response(
+                "Messages API",
+                "response reading was interrupted",
+            )),
         ]);
 
         let mut saw_error = false;
@@ -1243,7 +1251,10 @@ mod tests {
         let mut obs = observe(
             body(vec![
                 Ok(Bytes::from_static(b"123")),
-                Err(Error::Config("response reading was interrupted".into())),
+                Err(Error::upstream_response(
+                    "Messages API",
+                    "response reading was interrupted",
+                )),
             ]),
             counter(),
             Arc::new(Stats::new(dir.path(), "test")),

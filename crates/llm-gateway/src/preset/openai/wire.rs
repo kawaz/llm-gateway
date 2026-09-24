@@ -122,9 +122,10 @@ impl Wire for OpenAiWire {
                 .bytes_stream()
                 .map(|chunk| {
                     chunk.map_err(|error| {
-                        Error::Config(format!(
-                            "Responses API response reading was interrupted: {error}"
-                        ))
+                        Error::upstream_response(
+                            "Responses API",
+                            format!("Responses API response reading was interrupted: {error}"),
+                        )
                     })
                 })
                 .boxed();

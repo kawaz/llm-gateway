@@ -58,7 +58,10 @@ impl QuotaApi for OauthUsage {
             fetch(http, &self.base_url, credential)
                 .await
                 .ok_or_else(|| {
-                    Error::Config("could not fetch or parse the quota response".to_owned())
+                    Error::upstream_response(
+                        "Anthropic quota API",
+                        "could not fetch or parse the quota response".to_owned(),
+                    )
                 })
         })
     }

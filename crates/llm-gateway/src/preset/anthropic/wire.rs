@@ -132,7 +132,10 @@ impl Wire for AnthropicWire {
                 .bytes_stream()
                 .map(|chunk| {
                     chunk.map_err(|e| {
-                        Error::Config(format!("response reading was interrupted: {e}"))
+                        Error::upstream_response(
+                            "Messages API",
+                            format!("response reading was interrupted: {e}"),
+                        )
                     })
                 })
                 .boxed();
