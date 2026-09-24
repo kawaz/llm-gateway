@@ -32,6 +32,10 @@ pub trait CounterStore<C: Mergeable>: Send + Sync {
 /// `bucket` はファイル名の中で percent-encoding する (英数字と `-` `_` 以外を
 /// `%XX`)。可逆なので、別の `bucket` が同じファイルに合流しない。書き込みは
 /// 一時ファイル経由の rename なので、読み手は書きかけを見ない。
+///
+/// 自分のファイルを読んで書き直す間 (read → rename) に排他は掛けない。同じ
+/// 書き手の名前で同時に動くプロセスは 1 つだけ、が前提 (利用側は書き手の名前に
+/// 待ち受け先を使うので、同じ名前の 2 つ目は待ち受けの衝突で立ち上がれない)。
 pub struct FileCounters {
     dir: PathBuf,
     writer: String,

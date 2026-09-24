@@ -373,21 +373,23 @@ impl RateLimiter {
 
         // 置き場へ先に書く。書けなければメモリにも足さずに断る (送る前に数える。
         // 送ってから書くと、書き損ねた分だけ枠を超える)。全部の窓を 1 回で書く
-        // ので、一部の窓だけ数えた状態は残らない。今の窓に無い名前 (過ぎた窓) は
-        // ここで落とし、ファイルに溜めない。
+        // ので、一部の窓だけ数えた状態は残らない。
+        //
+        // 落とすのは、終わってから 1 窓分以上たった窓だけ。今の窓・直前の窓・
+        // 先の窓は残す。時計が前の窓へ戻った時に、その窓の数が消えて枠が丸ごと
+        // 戻るのを防ぐ (分 / 時が数を保持するのと同じ)。
         if seen.iter().any(|s| s.stored.is_some()) {
             let own = self
                 .store
                 .read_own(key)
                 .map_err(|e| Refused::Unavailable(format!("cannot read own count: {e}")))?;
-            let next: Windows = seen
-                .iter()
-                .filter_map(|s| s.stored.as_ref())
-                .map(|window| {
-                    let mine = own.get(window).map_or(0, |c| c.0);
-                    (window.clone(), RequestCount(mine + 1))
-                })
+            let mut next: Windows = own
+                .into_iter()
+                .filter(|(window, _)| still_relevant(window, now_secs))
                 .collect();
+            for window in seen.iter().filter_map(|s| s.stored.as_ref()) {
+                next.entry(window.clone()).or_default().0 += 1;
+            }
             self.store
                 .write_own(key, &next)
                 .map_err(|e| Refused::Unavailable(format!("cannot write own count: {e}")))?;
@@ -419,6 +421,29 @@ impl RateLimiter {
 /// 名ではなくファイルの中の鍵なので、符号化は要らない。
 fn window_key(limit: &Limit, start: i64) -> String {
     format!("{}@{}@{start}", limit.per.as_str(), limit.tz.written)
+}
+
+/// 置き場に残しておく窓か。終わりが `now − 1 窓分` より前の窓だけを落とす。
+///
+/// 窓の長さは名前の `per` から見積もる (日は DST の 25 時間、月は 31 日)。長めに
+/// 見積もるのは、残しすぎは害が無く、消しすぎると数を失うため。名前の読めない
+/// ものは落とす。
+fn still_relevant(window: &str, now_secs: i64) -> bool {
+    let mut parts = window.splitn(2, '@');
+    let per = parts.next().unwrap_or("");
+    let Some(start) = window
+        .rsplit('@')
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return false;
+    };
+    let len = match per {
+        "day" => 25 * 3600,
+        "month" => 31 * 86_400,
+        _ => return false,
+    };
+    start.saturating_add(2 * len) >= now_secs
 }
 
 #[cfg(test)]
@@ -707,22 +732,50 @@ mod tests {
         assert!(own.values().all(|c| c.0 == 1));
     }
 
-    /// 過ぎた窓は、次に書くときにファイルから落ちる。
+    fn own_windows(dir: &std::path::Path) -> Windows {
+        crate::counter::FileCounters::new(dir, "a")
+            .read_own("k")
+            .unwrap()
+    }
+
+    /// 2 窓以上前の窓は、次に書くときにファイルから落ちる。
     #[test]
-    fn a_past_window_does_not_pile_up() {
+    fn a_long_past_window_does_not_pile_up() {
         let dir = tempfile::tempdir().unwrap();
         let limits = [limit(r#"{ requests = 10, per = "day" }"#)];
         let a = stored(dir.path(), "a");
-        a.take("k", &limits, at("2026-09-24T03:00:00Z")).unwrap();
+        a.take("k", &limits, at("2026-09-22T03:00:00Z")).unwrap();
         a.take("k", &limits, at("2026-09-25T03:00:00Z")).unwrap();
-        let own: Windows = crate::counter::FileCounters::new(dir.path(), "a")
-            .read_own("k")
-            .unwrap();
+        let own = own_windows(dir.path());
         assert_eq!(own.len(), 1, "{own:?}");
         assert!(
             own.keys()
                 .all(|k| k.ends_with(&at("2026-09-25T00:00:00Z").to_string()))
         );
+    }
+
+    /// 翌日に数えた後で前日へ戻っても、前日の数は残っていて枠は戻らない。
+    #[test]
+    fn a_rewind_to_the_previous_day_keeps_its_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 1, per = "day" }"#)];
+        let a = stored(dir.path(), "a");
+        let yesterday = at("2026-09-24T23:00:00Z");
+        a.take("k", &limits, yesterday).unwrap();
+        a.take("k", &limits, at("2026-09-25T01:00:00Z")).unwrap();
+        exceeded(a.take("k", &limits, yesterday));
+    }
+
+    /// 先の窓で数えた後に戻って、また進めても、先の窓の数は消えない。
+    #[test]
+    fn a_future_window_survives_a_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = [limit(r#"{ requests = 1, per = "day" }"#)];
+        let a = stored(dir.path(), "a");
+        let tomorrow = at("2026-09-25T01:00:00Z");
+        a.take("k", &limits, tomorrow).unwrap();
+        a.take("k", &limits, at("2026-09-24T23:00:00Z")).unwrap();
+        exceeded(a.take("k", &limits, tomorrow));
     }
 
     /// tz だけが違う宣言は別の窓として数える。
