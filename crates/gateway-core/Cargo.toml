@@ -12,6 +12,8 @@ description = "gateway の汎用層: 認証の代行・保存・照合など、�
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

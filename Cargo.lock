@@ -368,9 +368,11 @@ name = "gateway-core"
 version = "0.54.0"
 dependencies = [
  "libc",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -793,6 +795,7 @@ name = "llm-gateway-cli"
 version = "0.54.0"
 dependencies = [
  "axum",
+ "gateway-core",
  "llm-gateway",
  "llm-gateway-server",
  "reqwest",
@@ -811,6 +814,7 @@ version = "0.54.0"
 dependencies = [
  "axum",
  "futures-util",
+ "gateway-core",
  "llm-gateway",
  "reqwest",
  "serde",

@@ -28,5 +28,7 @@ reqwest = { workspace = true }
 stable-which = { workspace = true }
 
 [dev-dependencies]
+# 置き場の試験用実装が汎用層の Result を返すため。
+gateway-core = { path = "../gateway-core" }
 # 設定ファイルを試験ごとに使い捨てる (実運用の設定を触らせない)。
 tempfile = { workspace = true }

@@ -8,11 +8,7 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshFailureClass {
-    ReloginRequired,
-    Degraded,
-}
+pub use gateway_core::error::RefreshFailureClass;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -82,6 +78,24 @@ pub enum Error {
 
     #[error("could not parse JSON: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// 汎用層のエラーを同じ名前の variant へ写す。
+///
+/// 包む variant を足さないのは、利用側 (server) が `Refresh` 等を直に
+/// 照合しているため。包むと照合が 1 段深くなる (gateway-core-split §6.3)。
+impl From<gateway_core::Error> for Error {
+    fn from(e: gateway_core::Error) -> Self {
+        use gateway_core::Error as Core;
+        match e {
+            Core::Credential { id, reason } => Self::Credential { id, reason },
+            Core::Refresh { id, reason, class } => Self::Refresh { id, reason, class },
+            Core::Login { reason } => Self::Login { reason },
+            Core::Config(reason) => Self::Config(reason),
+            Core::Io(e) => Self::Io(e),
+            Core::Json(e) => Self::Json(e),
+        }
+    }
 }
 
 /// 1 経路ぶんの失敗記録。どこで何が起きたかを残す。

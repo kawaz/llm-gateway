@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use llm_gateway::Config;
 use llm_gateway::config::CredentialSpec;
 use llm_gateway::credential::file::FileStore;
-use llm_gateway::credential::{CredentialId, Kind, Persistence, StoredCredential, oauth};
+use llm_gateway::credential::{CredentialId, CredentialPersistence, Kind, StoredCredential, oauth};
 
 use crate::failure::Failure;
 use crate::help;
@@ -86,14 +86,14 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
 /// 土台を読んでから書くまでを締め出す (DR-0010)。再ログインするのは refresh
 /// token が失効したときで、その裏では常駐している側が同じ認証情報の更新を
 /// 試している。締め出さないと、認可の結果と相手の書き込みが互いを消し合う。
-fn save<P: Persistence>(
+fn save<P: CredentialPersistence>(
     store: &P,
     id: &CredentialId,
     kind: Kind,
     tokens: &oauth::Tokens,
 ) -> llm_gateway::Result<StoredCredential> {
-    let _guard = store.lock(id)?;
-    llm_gateway::credential::save_login(store, id, kind, tokens)
+    let guard = store.lock(id)?;
+    llm_gateway::credential::save_login(store, &guard, kind, tokens)
 }
 
 fn parse(args: &[String]) -> Result<Args, Failure> {
@@ -225,6 +225,7 @@ fn open_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_gateway::credential::Persistence;
     use std::sync::{Arc, Mutex};
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -265,28 +266,32 @@ mod tests {
     }
 
     impl Persistence for Recorder {
+        type Value = StoredCredential;
         type Guard = Mark;
 
-        fn load(&self, _id: &CredentialId) -> llm_gateway::Result<StoredCredential> {
+        fn load(&self, _id: &CredentialId) -> gateway_core::Result<StoredCredential> {
             self.note("load");
             self.current
                 .lock()
                 .unwrap()
                 .clone()
-                .ok_or_else(|| llm_gateway::Error::Credential {
+                .ok_or_else(|| gateway_core::Error::Credential {
                     id: "c".to_owned(),
                     reason: "not stored yet".to_owned(),
                 })
         }
-        fn store(&self, _id: &CredentialId, v: &StoredCredential) -> llm_gateway::Result<()> {
+        fn reload(&self, _guard: &Mark) -> gateway_core::Result<StoredCredential> {
+            self.load(&CredentialId::new("c"))
+        }
+        fn store(&self, _guard: &Mark, v: &StoredCredential) -> gateway_core::Result<()> {
             self.note("store");
             *self.current.lock().unwrap() = Some(v.clone());
             Ok(())
         }
-        fn list(&self) -> llm_gateway::Result<Vec<CredentialId>> {
+        fn list(&self) -> gateway_core::Result<Vec<CredentialId>> {
             Ok(vec![])
         }
-        fn lock(&self, _id: &CredentialId) -> llm_gateway::Result<Self::Guard> {
+        fn lock(&self, _id: &CredentialId) -> gateway_core::Result<Self::Guard> {
             self.note("lock");
             Ok(Mark(Arc::clone(&self.steps)))
         }

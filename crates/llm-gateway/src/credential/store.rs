@@ -17,7 +17,7 @@ use crate::error::RefreshFailureClass;
 use crate::{Error, Result};
 
 use super::time::{format_rfc3339, parse_rfc3339};
-use super::{CredentialId, Payload, Persistence, StoredCredential, oauth};
+use super::{CredentialId, CredentialPersistence, Payload, StoredCredential, oauth};
 
 /// 期限のこれだけ手前から更新に入る。
 ///
@@ -91,19 +91,19 @@ fn refresh_failure_of(e: &Error) -> RefreshFailure {
 ///
 /// 版を持たないと、他のプロセスが書いた結果に期限切れまで気づけない。
 #[derive(Clone)]
-struct Cached {
+struct Held {
     value: Arc<StoredCredential>,
     version: Option<u64>,
 }
 
-pub struct CredentialStore<P: Persistence> {
+pub struct CredentialStore<P: CredentialPersistence> {
     inner: Arc<Inner<P>>,
 }
 
 /// 中身は共有されているので、複製しても同じ控え・同じ進行中の印を見る。
 ///
 /// 要求から切り離した仕事 (裏で様子を聞きに行く等) へ持ち出すために要る。
-impl<P: Persistence> Clone for CredentialStore<P> {
+impl<P: CredentialPersistence> Clone for CredentialStore<P> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -115,7 +115,7 @@ impl<P: Persistence> Clone for CredentialStore<P> {
 ///
 /// 更新は要求とは切り離した仕事として走らせるので、控えも進行中の印も
 /// 「誰か 1 人のもの」にできない。まとめて抱えて渡す。
-struct Inner<P: Persistence> {
+struct Inner<P: CredentialPersistence> {
     persistence: P,
     http: reqwest::Client,
     /// 進行中の更新。同じ id への 2 人目以降はここに相乗りする。
@@ -125,7 +125,7 @@ struct Inner<P: Persistence> {
     /// 待ちを挟まないので待たない錠で足りる。
     in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
     /// 読み出しのたびにファイルを開かないための控え。
-    cache: RwLock<HashMap<CredentialId, Cached>>,
+    held: RwLock<HashMap<CredentialId, Held>>,
     auth: RwLock<HashMap<CredentialId, crate::quota::AuthState>>,
     clock: Clock,
     /// 更新先の差し替え口。テストで手元のサーバへ向けるために持つ。
@@ -153,7 +153,7 @@ impl Clock {
     }
 }
 
-impl<P: Persistence> CredentialStore<P> {
+impl<P: CredentialPersistence> CredentialStore<P> {
     pub fn new(persistence: P, http: reqwest::Client) -> Self {
         Self::with_clock(persistence, http, Clock::System, None)
     }
@@ -169,7 +169,7 @@ impl<P: Persistence> CredentialStore<P> {
                 persistence,
                 http,
                 in_flight: Mutex::new(HashMap::new()),
-                cache: RwLock::new(HashMap::new()),
+                held: RwLock::new(HashMap::new()),
                 auth: RwLock::new(HashMap::new()),
                 clock,
                 token_url_override,
@@ -189,8 +189,8 @@ impl<P: Persistence> CredentialStore<P> {
         kind: super::Kind,
         tokens: &super::oauth::Tokens,
     ) -> Result<StoredCredential> {
-        let _guard = self.inner.lock(id).await?;
-        let credential = super::save_login(&self.inner.persistence, id, kind, tokens)?;
+        let guard = self.inner.lock(id).await?;
+        let credential = super::save_login(&self.inner.persistence, &guard, kind, tokens)?;
         self.inner.remember(id, credential.clone()).await;
         self.inner.record_auth(id, &Ok(())).await;
         Ok(credential)
@@ -213,7 +213,7 @@ impl<P: Persistence> CredentialStore<P> {
     }
 }
 
-impl<P: Persistence> Inner<P> {
+impl<P: CredentialPersistence> Inner<P> {
     async fn acquire(self: &Arc<Self>, id: &CredentialId) -> Result<Credential> {
         let current = self.read(id).await?;
 
@@ -241,15 +241,15 @@ impl<P: Persistence> Inner<P> {
         }
         // 読んで直して書くまでの間、他のプロセスを締め出す。挟まれると、
         // 相手が書いた更新を古い土台で上書きして消す。
-        let _guard = self.lock(id).await?;
+        let guard = self.lock(id).await?;
 
         // 控えではなく置き場から積み直す。控えを土台にすると、別のプロセスが
         // 更新した token を古い値で上書きして消す。
-        let current = self.reload(id).await?;
+        let current = self.reload_locked(&guard, id).await?;
         let mut next = (*current).clone();
         next.record_denied_beta(flags, self.clock.now_unix());
 
-        self.persistence.store(id, &next)?;
+        self.persistence.store(&guard, &next)?;
         self.remember(id, next).await;
         Ok(())
     }
@@ -267,12 +267,13 @@ impl<P: Persistence> Inner<P> {
                 id: id.to_string(),
                 reason: format!("could not wait for the credential lock: {e}"),
             })?
+            .map_err(Error::from)
     }
 
     /// 現在の内容を返す。控えが今の版のままならそれを使う。
     async fn read(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
         let version = self.persistence.version(id);
-        if let Some(hit) = self.cache.read().await.get(id) {
+        if let Some(hit) = self.held.read().await.get(id) {
             if hit.version == version {
                 return Ok(Arc::clone(&hit.value));
             }
@@ -284,22 +285,44 @@ impl<P: Persistence> Inner<P> {
     /// 置き場から読み直し、控えを入れ替える。
     ///
     /// 同じ置き場を複数のプロセスが共有しているので、控えだけを見ていると
-    /// 他のプロセスが書いた結果に気づけない。書き込みの前と、refresh token を
-    /// 使う前は、ここを通って最新を掴む。
+    /// 他のプロセスが書いた結果に気づけない。
     async fn reload(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
         // 版を先に見る。読んだ後に見ると、読み終えてから書かれた中身を
         // 「今の版」として覚え、その更新に気づけなくなる。逆の順なら、
         // 取りこぼしても次の読み出しで版が食い違って読み直しになる。
         let version = self.persistence.version(id);
-        let value = Arc::new(self.persistence.load(id)?);
-        self.cache.write().await.insert(
+        let value = self.persistence.load(id)?;
+        Ok(self.hold(id, value, version).await)
+    }
+
+    /// 書き換えの権利の下で読み直し、控えを入れ替える。
+    ///
+    /// 書き込みの前と、refresh token を使う前は、ここを通って最新を掴む。
+    async fn reload_locked(
+        &self,
+        guard: &P::Guard,
+        id: &CredentialId,
+    ) -> Result<Arc<StoredCredential>> {
+        let version = self.persistence.version(id);
+        let value = self.persistence.reload(guard)?;
+        Ok(self.hold(id, value, version).await)
+    }
+
+    async fn hold(
+        &self,
+        id: &CredentialId,
+        value: StoredCredential,
+        version: Option<u64>,
+    ) -> Arc<StoredCredential> {
+        let value = Arc::new(value);
+        self.held.write().await.insert(
             id.clone(),
-            Cached {
+            Held {
                 value: Arc::clone(&value),
                 version,
             },
         );
-        Ok(value)
+        value
     }
 
     /// 自分が書いた内容を控えに載せる。
@@ -308,9 +331,9 @@ impl<P: Persistence> Inner<P> {
     /// この間に他のプロセスが割り込むことはない。
     async fn remember(&self, id: &CredentialId, value: StoredCredential) {
         let version = self.persistence.version(id);
-        self.cache.write().await.insert(
+        self.held.write().await.insert(
             id.clone(),
-            Cached {
+            Held {
                 value: Arc::new(value),
                 version,
             },
@@ -429,9 +452,9 @@ impl<P: Persistence> Inner<P> {
         // ここで待たされ、権利を得た時点の読み直しで「相手が済ませた」と分かり、
         // 更新に入らずに済む。束ねているのは同じプロセスの中だけなので、
         // ここに来るのは 1 プロセスにつき 1 本。
-        let _guard = self.lock(id).await?;
+        let guard = self.lock(id).await?;
 
-        let current = self.reload(id).await?;
+        let current = self.reload_locked(&guard, id).await?;
         let (Some(kind), Some(refresh_token)) = (
             current.payload.oauth_kind(),
             current.payload.refresh_token(),
@@ -470,7 +493,7 @@ Issue a new key and save the credential again"
             Err(e) => {
                 // 読み直せなかったときも断られた理由を返す。ここを `?` にすると
                 // 原因が「更新を断られた」から「置き場を読めない」にすり替わる。
-                let Ok(latest) = self.reload(id).await else {
+                let Ok(latest) = self.reload_locked(&guard, id).await else {
                     return Err(e);
                 };
                 if self.needs_refresh(&latest) {
@@ -487,7 +510,7 @@ Issue a new key and save the credential again"
         // 保存が先。ここで落ちると新しい token を失うが、控えだけ更新して
         // 保存に失敗するよりはよい (次回起動時に古い token で動こうとして
         // 弾かれ、原因が分からなくなる)。
-        self.persistence.store(id, &next)?;
+        self.persistence.store(&guard, &next)?;
         self.remember(id, next).await;
         Ok(())
     }
@@ -531,7 +554,7 @@ fn apply_refresh(credential: &mut StoredCredential, response: oauth::RefreshResp
 /// 走り切った経路だけで後始末をすると、途中で panic した場合に印が残り、
 /// その認証情報を求めた全員が来ない合図を待ち続ける (process を入れ替える
 /// まで戻らない)。[`Drop`] に寄せておけば、走り切っても落ちても同じ道を通る。
-struct RefreshHandoff<P: Persistence> {
+struct RefreshHandoff<P: CredentialPersistence> {
     inner: Arc<Inner<P>>,
     id: CredentialId,
     tx: RefreshSignal,
@@ -539,7 +562,7 @@ struct RefreshHandoff<P: Persistence> {
     outcome: Option<std::result::Result<(), RefreshFailure>>,
 }
 
-impl<P: Persistence> RefreshHandoff<P> {
+impl<P: CredentialPersistence> RefreshHandoff<P> {
     fn new(inner: Arc<Inner<P>>, id: CredentialId, tx: RefreshSignal) -> Self {
         Self {
             inner,
@@ -555,7 +578,7 @@ impl<P: Persistence> RefreshHandoff<P> {
     }
 }
 
-impl<P: Persistence> Drop for RefreshHandoff<P> {
+impl<P: CredentialPersistence> Drop for RefreshHandoff<P> {
     fn drop(&mut self) {
         // 印を外してから配る。逆にすると、起きた側が残った印を見て次の
         // 更新に入れなくなる。
@@ -576,6 +599,7 @@ impl<P: Persistence> Drop for RefreshHandoff<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::Persistence;
     use crate::credential::file::FileStore;
     use crate::credential::stored::{ApiKey, CodexTokens, OauthTokens, Payload, StoredCredential};
     use std::sync::Mutex as StdMutex;
@@ -694,9 +718,10 @@ mod tests {
     }
 
     impl Persistence for Spy {
+        type Value = StoredCredential;
         type Guard = tokio::sync::OwnedMutexGuard<()>;
 
-        fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
+        fn load(&self, _id: &CredentialId) -> gateway_core::Result<StoredCredential> {
             let n = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
             assert!(
                 n != self.panic_at.load(Ordering::SeqCst),
@@ -712,16 +737,23 @@ mod tests {
             }
             Ok(self.current.lock().unwrap().clone())
         }
-        fn store(&self, _id: &CredentialId, value: &StoredCredential) -> Result<()> {
+        fn reload(&self, _guard: &Self::Guard) -> gateway_core::Result<StoredCredential> {
+            self.load(&CredentialId::new("c"))
+        }
+        fn store(
+            &self,
+            _guard: &Self::Guard,
+            value: &StoredCredential,
+        ) -> gateway_core::Result<()> {
             *self.current.lock().unwrap() = value.clone();
             self.stores.fetch_add(1, Ordering::SeqCst);
             self.version.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn list(&self) -> Result<Vec<CredentialId>> {
+        fn list(&self) -> gateway_core::Result<Vec<CredentialId>> {
             Ok(vec![CredentialId::new("c")])
         }
-        fn lock(&self, _id: &CredentialId) -> Result<Self::Guard> {
+        fn lock(&self, _id: &CredentialId) -> gateway_core::Result<Self::Guard> {
             Ok(Arc::clone(&self.guard).blocking_lock_owned())
         }
         fn version(&self, _id: &CredentialId) -> Option<u64> {
@@ -886,7 +918,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         process_over(FileStore::open(dir).unwrap(), server)
     }
 
-    fn process_over<P: Persistence>(
+    fn process_over<P: CredentialPersistence>(
         disk: P,
         server: Option<&FakeTokenServer>,
     ) -> CredentialStore<P> {
@@ -945,7 +977,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         log: Log,
         /// 先に落とすと、待っている側が起きてから記録することになる。
         /// [`Drop`] の本体はフィールドより先に走るので順序は保たれる。
-        _inner: <FileStore as Persistence>::Guard,
+        inner: <FileStore as Persistence>::Guard,
     }
 
     impl Drop for Noted {
@@ -955,19 +987,23 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     }
 
     impl Persistence for Watched {
+        type Value = StoredCredential;
         type Guard = Noted;
 
-        fn load(&self, id: &CredentialId) -> Result<StoredCredential> {
+        fn load(&self, id: &CredentialId) -> gateway_core::Result<StoredCredential> {
             self.inner.load(id)
         }
-        fn store(&self, id: &CredentialId, value: &StoredCredential) -> Result<()> {
-            self.note("writes");
-            self.inner.store(id, value)
+        fn reload(&self, guard: &Noted) -> gateway_core::Result<StoredCredential> {
+            self.inner.reload(&guard.inner)
         }
-        fn list(&self) -> Result<Vec<CredentialId>> {
+        fn store(&self, guard: &Noted, value: &StoredCredential) -> gateway_core::Result<()> {
+            self.note("writes");
+            self.inner.store(&guard.inner, value)
+        }
+        fn list(&self) -> gateway_core::Result<Vec<CredentialId>> {
             self.inner.list()
         }
-        fn lock(&self, id: &CredentialId) -> Result<Self::Guard> {
+        fn lock(&self, id: &CredentialId) -> gateway_core::Result<Self::Guard> {
             // 掴みに行く直前に知らせる。相手が持っている限り、この後は待つ。
             self.note("waits");
             self.entering.notify_one();
@@ -976,7 +1012,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Ok(Noted {
                 who: self.who,
                 log: Arc::clone(&self.log),
-                _inner: inner,
+                inner,
             })
         }
         fn version(&self, id: &CredentialId) -> Option<u64> {
@@ -987,7 +1023,9 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     /// 置き場に認証情報を 1 つ置く。
     fn place(dir: &std::path::Path, c: StoredCredential) -> CredentialId {
         let id = CredentialId::new("c");
-        FileStore::open(dir).unwrap().store(&id, &c).unwrap();
+        let store = FileStore::open(dir).unwrap();
+        let guard = store.lock(&id).unwrap();
+        store.store(&guard, &c).unwrap();
         id
     }
 
@@ -1179,9 +1217,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert!(mine.auth_state(&id).await.is_some());
 
         // 期限はまだ先のまま。控えの期限切れでは気づけない書き換え。
+        let guard = elsewhere.lock(&id).unwrap();
         elsewhere
-            .store(&id, &cred_with("at-elsewhere", &at(3600)))
+            .store(&guard, &cred_with("at-elsewhere", &at(3600)))
             .unwrap();
+        drop(guard);
 
         assert_eq!(
             mine.acquire(&id).await.unwrap().bearer(),

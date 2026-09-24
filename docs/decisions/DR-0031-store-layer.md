@@ -44,22 +44,22 @@ unit 間の連携は今、全部「共有ファイル + flock」で実装され�
 「掴む → 最新を読む → 更新して書く」を 1 単位として、同じ鍵を同時に書き換えるのは 1 者に限る。
 
 ```rust
-trait Persistence {
+// 段 1a で確定 (crates/gateway-core/src/credential.rs)
+trait Persistence: Send + Sync + 'static {
     type Value;
-    type Guard<'a>: Locked<Value = Self::Value>;  // drop で手放す
-    fn lock(&self, id) -> Result<Self::Guard<'_>>; // 取れるまで待つ
-    fn load(&self, id) -> Result<Self::Value>;     // 権利なしの読み出し
-    fn version(&self, id) -> Result<Option<Version>>;
-    fn list(&self) -> Result<Vec<Id>>;
-}
-trait Locked {                // 権利を持つ間だけ書ける
-    type Value;
-    fn reload(&self) -> Result<Self::Value>;
-    fn store(&self, value: &Self::Value) -> Result<()>;
+    type Guard: Send + Sync + 'static;                     // drop で手放す。どの id の権利かを覚えている
+    fn lock(&self, id: &CredentialId) -> Result<Self::Guard>;  // 取れるまで待つ
+    fn load(&self, id: &CredentialId) -> Result<Self::Value>;  // 権利なしの読み出し
+    fn reload(&self, guard: &Self::Guard) -> Result<Self::Value>;           // 権利の下で読み直す
+    fn store(&self, guard: &Self::Guard, value: &Self::Value) -> Result<()>; // 権利なしでは呼べない
+    fn version(&self, id: &CredentialId) -> Option<u64>;  // 版なし・取得失敗は None
+    fn list(&self) -> Result<Vec<CredentialId>>;
 }
 ```
 
-- **順序の契約**: 書き換えは「`lock` で権利を取る → その権利の下で最新を読み直す → 書く → 権利を手放す」の 1 単位で行う。読み直しは権利を取った**後**にする (取る前に読んだ内容を土台にすると、待っている間に相手が書いたものを消す。DR-0010 のロック区間)。上の案は書き込みを guard のメソッドにして、権利なしでは書けない形にしている
+書き込みと読み直しは権利の型のメソッドにせず、権利を引数に取る。権利を取るまでの待ちはブロックするので利用側は専用スレッドへ逃がして権利を持ち帰り、権利は置き場を借用できない (`'static`)。権利のメソッドにすると各実装の権利が置き場への共有参照を抱える必要が出るため。権利なしでは書けないという契約は同じ。`version` の `Result` は、失敗を版なしと同じに扱う契約なので外した。
+
+- **順序の契約**: 書き換えは「`lock` で権利を取る → その権利の下で最新を読み直す → 書く → 権利を手放す」の 1 単位で行う。読み直しは権利を取った**後**にする (取る前に読んだ内容を土台にすると、待っている間に相手が書いたものを消す。DR-0010 のロック区間)。上の形は `reload` / `store` に権利を要求し、権利なしでは書けない形にしている
 - `lock` / `store`: **fail-closed**。refresh は失敗したら古い token を使い続けるのでなく失敗を返す (二重 refresh で refresh token を焼く事故を防ぐ)
 - `load`: **fail-closed**。静的 secret と JWKS も、読めなければ認証を通さない
 - `version`: 版を持たない置き場は `None` を返してよい (DR-0010、DR-0022)。`None` 同士は「変わっていない」とみなし、控えをそのまま使う (DR-0010 の意味論のまま)。版の取得に失敗した時も版なしと区別せず同じ扱いにする

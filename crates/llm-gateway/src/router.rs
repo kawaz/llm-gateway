@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::config::{self, Config, Namespace, RouteSpec};
 use crate::credential::time::now_unix;
-use crate::credential::{CredentialId, CredentialStore, Persistence};
+use crate::credential::{CredentialId, CredentialPersistence, CredentialStore};
 use crate::denial::{Availability, Denial, PROBE_INTERVAL, Reason, Scope};
 use crate::discovery::{self, Model};
 use crate::egress::{Headers, Response};
@@ -345,7 +345,7 @@ impl Router {
     ///
     /// 聞けなかった upstream は前回の結果を残す。一時的に繋がらないだけで
     /// 公開しているモデルが消えるのは困る。
-    pub async fn refresh<P: Persistence>(
+    pub async fn refresh<P: CredentialPersistence>(
         &self,
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
@@ -412,7 +412,7 @@ impl Router {
     /// 1 つの credential に一覧を聞く。
     ///
     /// 返すのは「クライアント向けの名前 → upstream での名前」。
-    async fn discover<P: Persistence>(
+    async fn discover<P: CredentialPersistence>(
         &self,
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
@@ -453,7 +453,7 @@ impl Router {
     ///
     /// 聞きに行く先は最初の codex 経路 1 つだけ。同じ backend を見ている
     /// 経路が複数あっても返る記述は同じで、聞く数だけ待たされる。
-    pub async fn codex_details<P: Persistence>(
+    pub async fn codex_details<P: CredentialPersistence>(
         &self,
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,

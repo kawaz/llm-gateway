@@ -164,6 +164,8 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 検証: `just ci`。既存試験 (`credential/store.rs` の refresh 競合試験群、server の `tokenless` / `locked` ns 試験) が移動後も同じ名前で緑。追加で「現行形式の credential ファイル (claude_oauth / codex_oauth / bedrock_api_key の 3 種) を読み書きしてバイト一致」の試験を置く
 - やらないこと: `denial` / router / events / stats / daemon には触らない。ns 認証の `jwt` / `issued` は足さない (enum の variant も作らない)。設定の書き方は変えない
 
+- 1a 実施済み: `Persistence` / `FileStore<V>` / `CredentialId` / core `Error` (`RefreshFailureClass` を含む) を core へ移し、`Persistence` を DR-0031 §2 (1) の形 (書き込みと読み直しは権利越し、版は `Option`) にした。llm-gateway は `pub use` と別名 (`FileStore = FileStore<StoredCredential>`、`CredentialPersistence`) で既存パスを保ち、`Error` へは同名 variant へ写す `From` を足した。控えの型 `Cached` は `Held` に改名
+
 段 1 は diff が最も大きい。さらに割るなら **1a = `Persistence` / `FileStore` / `CredentialId` / `time` / core `Error`**、**1b = `CredentialStore` + `Refresher` + `AuthState` + `StoredCredential` の総称化**、**1c = ns 認証** の 3 つに切れる (各々単独で `just ci` が通る)。worker が 1 PR で扱いきれないと判断したらこちらで進める。
 
 ### 段 2: events broker / stats 合算 / daemon

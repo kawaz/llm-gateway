@@ -19,7 +19,7 @@ use crate::cache::{self, keepalive};
 use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms, to_unix_secs};
-use crate::credential::{Credential, CredentialId, CredentialStore, Kind, Persistence};
+use crate::credential::{Credential, CredentialId, CredentialPersistence, CredentialStore, Kind};
 use crate::denial::Probing;
 use crate::egress::{self, EgressRequest, Headers, RequestShape, Response, SentResponse};
 use crate::error::UpstreamAttempt;
@@ -34,7 +34,7 @@ use crate::stats::{self, Stats};
 use crate::tap::Tap;
 use crate::{Error, Result};
 
-pub struct Gateway<P: Persistence> {
+pub struct Gateway<P: CredentialPersistence> {
     config: Config,
     router: Arc<Router>,
     credentials: CredentialStore<P>,
@@ -59,7 +59,7 @@ pub struct Gateway<P: Persistence> {
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
 }
 
-impl<P: Persistence> Gateway<P> {
+impl<P: CredentialPersistence> Gateway<P> {
     pub fn new(config: &Config, persistence: P) -> Result<Self> {
         let http = reqwest::Client::builder()
             // upstream の応答は長い。生成が続く限り待つ必要があるので、
@@ -1741,7 +1741,7 @@ struct Sample {
 /// 束ねるのに対し、[`Response`] は HTTP の応答そのもの (状態・ヘッダ・本文) を
 /// 表すため。集計の都合を応答の型に混ぜると、転送に関係のない項目が
 /// upstream の応答を表す構造体に溜まっていく (DR-0011)。
-impl<P: Persistence> keepalive::Sender for Gateway<P> {
+impl<P: CredentialPersistence> keepalive::Sender for Gateway<P> {
     fn send<'a>(&'a self, kept: &'a keepalive::Kept) -> egress::BoxFuture<'a, keepalive::Outcome> {
         Box::pin(async move { self.send_keepalive(kept).await })
     }
@@ -1996,9 +1996,9 @@ fn mark_expired_windows(snapshot: &mut quota::Snapshot, now_ms: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::StoredCredential;
     use crate::credential::stored::{CodexTokens, OauthTokens, Payload};
     use crate::credential::time::{format_rfc3339, now_unix};
+    use crate::credential::{Persistence, StoredCredential};
     use crate::denial::{self, Availability, Denial, Reason, Scope};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
@@ -2274,20 +2274,24 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     }
 
     impl Persistence for StaticStore {
+        type Value = StoredCredential;
         /// 置き場を共有する相手がいないので、締め出すものが無い。
         type Guard = ();
 
-        fn load(&self, _id: &CredentialId) -> Result<StoredCredential> {
+        fn load(&self, _id: &CredentialId) -> gateway_core::Result<StoredCredential> {
             Ok(self.credential.lock().unwrap().clone())
         }
-        fn store(&self, _id: &CredentialId, v: &StoredCredential) -> Result<()> {
+        fn reload(&self, _guard: &()) -> gateway_core::Result<StoredCredential> {
+            Ok(self.credential.lock().unwrap().clone())
+        }
+        fn store(&self, _guard: &(), v: &StoredCredential) -> gateway_core::Result<()> {
             *self.credential.lock().unwrap() = v.clone();
             Ok(())
         }
-        fn list(&self) -> Result<Vec<CredentialId>> {
+        fn list(&self) -> gateway_core::Result<Vec<CredentialId>> {
             Ok(vec![])
         }
-        fn lock(&self, _id: &CredentialId) -> Result<Self::Guard> {
+        fn lock(&self, _id: &CredentialId) -> gateway_core::Result<Self::Guard> {
             Ok(())
         }
         /// 版は `touch` でしか動かない。書き換えるのは自分だけなので、
@@ -2315,7 +2319,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     }
 
     /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。
-    fn preset_of<'a, P: Persistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
+    fn preset_of<'a, P: CredentialPersistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
         gw.router.preset(name).expect("present in config")
     }
 
@@ -2328,7 +2332,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     const NS: &str = crate::config::DEFAULT_NAMESPACE;
 
     /// 既定の namespace。
-    fn ns<P: Persistence>(gw: &Gateway<P>) -> &Namespace {
+    fn ns<P: CredentialPersistence>(gw: &Gateway<P>) -> &Namespace {
         gw.namespace(NS).expect("the default always exists")
     }
 

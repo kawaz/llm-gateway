@@ -6,8 +6,13 @@
 //!
 //! - [`pattern`] `*` だけを扱う名前の照合
 //! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
+//! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
+//! - [`error`] この層のエラー
 
 pub mod credential;
+pub mod error;
 pub mod pattern;
 pub mod persist;
+
+pub use error::{Error, Result};

@@ -22,7 +22,7 @@ use tracing::{Instrument as _, error, warn};
 
 use llm_gateway::config::{Authorization, Namespace};
 use llm_gateway::credential::time::{now_unix, now_unix_ms};
-use llm_gateway::credential::{CredentialId, Persistence};
+use llm_gateway::credential::{CredentialId, CredentialPersistence};
 use llm_gateway::egress::RequestShape;
 use llm_gateway::gateway::Ingress;
 use llm_gateway::{Error, Gateway, exchange};
@@ -35,7 +35,7 @@ use tokio::sync::broadcast::error::RecvError;
 /// メモリを食い潰されないため。
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
-pub fn router<P: Persistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
+pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
     Router::new()
         // namespace 付き。`/ns-personal/v1/messages` のように使う。
         .route("/{ns}/v1/messages", post(messages))
@@ -89,7 +89,9 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-async fn login_index<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
+async fn login_index<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+) -> Response {
     let mut rows = String::new();
     for (name, kind) in gateway.login_credentials() {
         let escaped = html_escape(&name);
@@ -103,7 +105,7 @@ async fn login_index<P: Persistence + 'static>(State(gateway): State<Arc<Gateway
     html_page("llm-gateway login", &rows)
 }
 
-async fn login_start<P: Persistence + 'static>(
+async fn login_start<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
@@ -162,7 +164,7 @@ impl ResponseStatus for Response {
     }
 }
 
-async fn finish_web_login<P: Persistence + 'static>(
+async fn finish_web_login<P: CredentialPersistence + 'static>(
     gateway: &Gateway<P>,
     name: &str,
     auth: llm_gateway::credential::oauth::WebAuthorization,
@@ -207,7 +209,7 @@ fn pasted_code(value: &str) -> Result<(&str, Option<&str>), &'static str> {
     }
 }
 
-async fn login_finish<P: Persistence + 'static>(
+async fn login_finish<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(name): AxumPath<String>,
     Form(form): Form<LoginForm>,
@@ -279,7 +281,9 @@ async fn version() -> Response {
 /// ように (DR-0012)。
 ///
 /// 認証を掛けないのは healthz と同じ扱い。
-async fn self_report<P: Persistence + 'static>(State(gateway): State<Arc<Gateway<P>>>) -> Response {
+async fn self_report<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+) -> Response {
     json_utf8(Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "boot": gateway.events().boot(),
@@ -294,7 +298,7 @@ async fn self_report<P: Persistence + 'static>(State(gateway): State<Arc<Gateway
 ///
 /// `?refresh=true` のときだけ能動プローブに入る。既定を便乗のみにするのは、
 /// usage の確認が usage を勝手に消費する構図を避けるため。
-async fn usage<P: Persistence + 'static>(
+async fn usage<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -310,7 +314,7 @@ async fn usage<P: Persistence + 'static>(
 ///
 /// 解除の口は持たない。その会話から実リクエストが 1 本来れば、そこで控えが
 /// 置き直される (DR-0027 決定 3)。
-async fn keepalive_pause<P: Persistence + 'static>(
+async fn keepalive_pause<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     body: Json<PauseRequest>,
 ) -> Response {
@@ -324,7 +328,7 @@ struct PauseRequest {
 }
 
 /// configured upstream の公式状態と実測状態を返す。
-async fn status<P: Persistence + 'static>(
+async fn status<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -359,7 +363,7 @@ fn json_utf8(body: impl IntoResponse) -> Response {
 /// どの生成元からでも読めるようにしておく。主な相手はサーバ同士で話す
 /// ccmsg だが、様子を見るのにブラウザから直接開けると早い。認証を持たない
 /// 口なので、生成元で絞っても守れるものが増えない。
-async fn events<P: Persistence + 'static>(
+async fn events<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
 ) -> impl IntoResponse {
     let watching = gateway.events().subscribe();
@@ -409,7 +413,7 @@ fn sse_line(notice: &llm_gateway::events::Notice) -> SseEvent {
 }
 
 /// 直接 loopback から接続した購読者へ転送の詳細を流す (DR-0017)。
-async fn tap<P: Persistence + 'static>(
+async fn tap<P: CredentialPersistence + 'static>(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
@@ -501,7 +505,7 @@ fn tap_options(query: Option<&str>) -> Result<llm_gateway::tap::Options, String>
 ///
 /// `?days=N` で直近 N 日に絞る。既定を 7 日にするのは、全期間を返すと日が
 /// 経つほど応答が伸びるため。`days=0` なら全部。
-async fn stats<P: Persistence + 'static>(
+async fn stats<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -621,7 +625,7 @@ fn apply_thinking_display(body: &mut Value, display: Option<llm_gateway::config:
 }
 
 /// upstream へ渡して、返ってきたものをそのまま返す。
-async fn messages<P: Persistence + 'static>(
+async fn messages<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -632,7 +636,7 @@ async fn messages<P: Persistence + 'static>(
 ///
 /// 本文は model 欄の解決以外そのままで、応答も無変換で返す。認証だけ
 /// gateway が差し替える。
-async fn responses<P: Persistence + 'static>(
+async fn responses<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -640,7 +644,7 @@ async fn responses<P: Persistence + 'static>(
 }
 
 /// 1 本を転送する。受け口ごとに違うのは、受けた本文の形だけ。
-async fn forward<P: Persistence + 'static>(
+async fn forward<P: CredentialPersistence + 'static>(
     gateway: Arc<Gateway<P>>,
     request: Request,
     shape: RequestShape,
@@ -813,7 +817,7 @@ async fn forward<P: Persistence + 'static>(
 /// 使えるモデルの一覧。クライアントのモデル選択に出る。
 ///
 /// 何が見えるかは namespace ごとに違う。
-async fn models<P: Persistence + 'static>(
+async fn models<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     request: Request,
 ) -> Response {
@@ -1009,17 +1013,20 @@ fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use llm_gateway::credential::{CredentialId, OauthTokens, Payload, StoredCredential};
+    use llm_gateway::credential::{
+        CredentialId, OauthTokens, Payload, Persistence, StoredCredential,
+    };
     use std::sync::{Mutex, OnceLock};
     use tokio::net::TcpListener;
 
     pub(crate) struct StaticStore;
 
     impl Persistence for StaticStore {
+        type Value = StoredCredential;
         /// 置き場を共有する相手がいないので、締め出すものが無い。
         type Guard = ();
 
-        fn load(&self, _id: &CredentialId) -> llm_gateway::Result<StoredCredential> {
+        fn load(&self, _id: &CredentialId) -> gateway_core::Result<StoredCredential> {
             Ok(StoredCredential::new(Payload::ClaudeOauth(OauthTokens {
                 access_token: "tok".into(),
                 refresh_token: "rt".into(),
@@ -1029,13 +1036,16 @@ pub(crate) mod tests {
                 extra: Default::default(),
             })))
         }
-        fn store(&self, _id: &CredentialId, _v: &StoredCredential) -> llm_gateway::Result<()> {
+        fn reload(&self, _guard: &()) -> gateway_core::Result<StoredCredential> {
+            self.load(&CredentialId::new("c"))
+        }
+        fn store(&self, _guard: &(), _v: &StoredCredential) -> gateway_core::Result<()> {
             Ok(())
         }
-        fn list(&self) -> llm_gateway::Result<Vec<CredentialId>> {
+        fn list(&self) -> gateway_core::Result<Vec<CredentialId>> {
             Ok(vec![])
         }
-        fn lock(&self, _id: &CredentialId) -> llm_gateway::Result<Self::Guard> {
+        fn lock(&self, _id: &CredentialId) -> gateway_core::Result<Self::Guard> {
             Ok(())
         }
         /// 版を持たない。中身が動かないので控えを疑う理由が無い。
