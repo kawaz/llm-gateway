@@ -85,7 +85,7 @@ impl Refresher for OauthRefresher {
         &self,
         id: &CredentialId,
         current: &StoredCredential,
-        now_unix: i64,
+        clock: &Clock,
     ) -> gateway_core::Result<StoredCredential> {
         let (Some(kind), Some(refresh_token)) = (
             current.payload.oauth_kind(),
@@ -110,7 +110,7 @@ Issue a new key and save the credential again"
         .map_err(|e| refresh_error(id, e))?;
 
         let mut next = current.clone();
-        apply_refresh(&mut next, resp, now_unix);
+        apply_refresh(&mut next, resp, clock.now_unix());
         Ok(next)
     }
 }
@@ -579,7 +579,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         CredentialStore::with_clock(
             disk,
             reqwest::Client::new(),
-            Clock::Fixed(NOW),
+            Clock::fixed(NOW),
             server.map(|s| s.url.clone()),
         )
     }
@@ -970,7 +970,11 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let err = store
             .inner
             .refresher()
-            .refresh(&CredentialId::new("c"), &api_key_cred(&at(-1)), NOW)
+            .refresh(
+                &CredentialId::new("c"),
+                &api_key_cred(&at(-1)),
+                &Clock::fixed(NOW),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1071,6 +1075,42 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert!(
             store.inner.refreshes_in_flight() == 0,
             "a leftover in-progress mark makes every later attempt wait forever"
+        );
+    }
+
+    /// 新しい期限と更新時刻は、更新先の応答を受けた後の時刻で刻む。
+    ///
+    /// 送る前の時刻で刻むと、応答が遅いほど期限が手前にずれ、保存した直後
+    /// から更新が要る扱いになって、取り出すたびに更新を繰り返しうる。
+    #[tokio::test]
+    async fn the_new_deadline_counts_from_when_the_response_arrived() {
+        let server = FakeTokenServer::start_gated().await;
+        let clock = Clock::fixed(NOW);
+        let store = CredentialStore::with_clock(
+            Spy::new(cred(&at(-1))),
+            reqwest::Client::new(),
+            clock.clone(),
+            Some(server.url.clone()),
+        );
+        let id = CredentialId::new("c");
+
+        let pending = {
+            let (store, id) = (store.clone(), id.clone());
+            tokio::spawn(async move { store.acquire(&id).await })
+        };
+        server.wait_for_hit().await;
+        // 応答が 1 時間かかった。
+        let arrived = NOW + 3600;
+        clock.set(arrived);
+        server.release();
+        pending.await.unwrap().unwrap();
+
+        let saved = store.inner.persistence().current.lock().unwrap().clone();
+        assert_eq!(saved.payload.expired(), format_rfc3339(arrived + 28_800));
+        assert_eq!(saved.ext.last_refresh, format_rfc3339(arrived));
+        assert!(
+            !store.inner.refresher().needs_refresh(&saved, arrived),
+            "just refreshed, so no refresh is needed yet"
         );
     }
 

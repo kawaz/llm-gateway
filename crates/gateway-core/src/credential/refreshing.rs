@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::{RwLock, broadcast};
@@ -34,13 +35,18 @@ pub trait Refresher: Send + Sync + 'static {
 
     /// 更新して、保存すべき次の値を返す。書き換えの権利の下で呼ばれる。
     ///
+    /// 新しい値に刻む時刻 (期限の起点、更新した時刻) は、更新先の応答を
+    /// 受けた**後**に `clock` から取ること。送る前に取ると、応答が遅いほど
+    /// 期限が手前にずれ、保存した直後から「更新が要る」と判定されて
+    /// 取り出すたびに更新を繰り返しうる。
+    ///
     /// 失敗は [`Error::Refresh`] で返すと、分類 (再認可が要るか) がそのまま
     /// 待っている側と認証の観測に届く。それ以外の失敗は `Degraded` 扱い。
     fn refresh(
         &self,
         id: &CredentialId,
         current: &Self::Value,
-        now_unix: i64,
+        clock: &Clock,
     ) -> impl Future<Output = Result<Self::Value>> + Send;
 }
 
@@ -129,18 +135,30 @@ where
 #[derive(Clone)]
 pub enum Clock {
     System,
-    /// 常にこの時刻 (Unix 秒) を返す。
-    Fixed(i64),
+    /// [`Clock::set`] で置いた時刻 (Unix 秒) を返す。複製は同じ時刻を共有する。
+    Manual(Arc<AtomicI64>),
 }
 
 impl Clock {
-    fn now_unix(&self) -> i64 {
+    /// この時刻で止まった時計。
+    pub fn fixed(now_unix: i64) -> Self {
+        Self::Manual(Arc::new(AtomicI64::new(now_unix)))
+    }
+
+    /// 止まった時計の針を動かす。[`Clock::System`] では何もしない。
+    pub fn set(&self, now_unix: i64) {
+        if let Self::Manual(t) = self {
+            t.store(now_unix, Ordering::SeqCst);
+        }
+    }
+
+    pub fn now_unix(&self) -> i64 {
         match self {
             Self::System => std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
-            Self::Fixed(t) => *t,
+            Self::Manual(t) => t.load(Ordering::SeqCst),
         }
     }
 }
@@ -437,11 +455,7 @@ where
             return Ok(());
         }
 
-        let next = match self
-            .refresher
-            .refresh(id, &current, self.clock.now_unix())
-            .await
-        {
+        let next = match self.refresher.refresh(id, &current, &self.clock).await {
             Ok(next) => next,
             // 断られた理由が「別のプロセスが先に使った」なら、その結果はもう
             // 置き場にある。拾えたら回復し、拾えなければ元の理由を返す。
