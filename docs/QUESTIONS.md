@@ -28,4 +28,22 @@ kawaz の指摘 (2026-09-24): opus を自走から外す根拠は無い (メイ�
 
 ## 確認待ち
 
-（現在なし）
+### PT-C1: 汎用パススルー (DR-0030 §2、分割の段 3) の対外仕様の具体形
+
+DR-0030 §2 / §4 / §5 の裁定の範囲内で統括が確定し実装に進めた形。見て違和感があれば止めてほしい (無ければそのまま)。
+
+```toml
+[upstreams."api.x.ai"]      # 名前 = 既定は apifqdn、任意ラベル可。予約名: v1 / llm-gateway / llm
+url = "https://api.x.ai"    # <rest> をそのまま連結
+secret = "xai"              # 静的 secret の id (secrets/xai.json)
+auth = "bearer"             # 載せ方: "bearer" / { header = "x-api-key" }。上流 API の形なので上流側に書く
+allow = ["GET /v1/models", "POST /v1/chat/completions"]   # "METHOD path-pattern"、* は 1 個。外れは 404 / 405 で上流に出さない
+
+[secrets]
+type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/secrets/<id>.json。credential とはディレクトリを分ける
+```
+
+秘密ファイルの最小形は `{"type":"static","payload":{"value":"..."}}` (DR-0010 の版 + flock、読めなければ 502)。URL は `/ns-<ns>/<name>/<rest>` (ns 認証は LLM 経路と同じ)。クライアントの `Authorization` は必ず落とし、`Host` は上流に、他は本文・ヘッダ・応答 (SSE 含む) とも無変換。events に `passthrough` を 1 種追加 (`ns` / `upstream` / `method` / `path` / `status` / `duration_ms` / `secret`)。stats には積まない (回数は手順 3 のレート制限バケットで)。
+
+- [ ] a: このまま (確認済み)
+- [ ] b: 直してほしい点あり (本ファイルか ccmsg で)
