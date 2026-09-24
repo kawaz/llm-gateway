@@ -18,40 +18,15 @@
 
 ## 裁定待ち
 
-### GA-Q4: `reference/delegation/model-effort-matrix` の残り 2 点 (GA-Q3 の a / b は裁定済み、編集して差分説明)
-
-kawaz の指摘 (2026-09-24): opus を自走から外す根拠は無い (メインが手綱を取る worker なら心配不要)。統括も同意 (今日の opus-medium は多段実装を裁定どおり自走した。sol の利点は能力でなく費用と速度)。
-
-- [ ] a: 既存の「不具合調査・デバッグ・原因の再現追跡 → sol-high」行を「sol-high / opus-high どちらも可。前提の裏取りが要る (仕様・パス・field 名を疑う) 場面は opus-high、試行回数で当てる場面は sol-high」に緩める
-- [ ] b: メインの effort の注記は今は足さない。2026-10-01 頃の low / medium 比較 (memory に記録) の結果で決める (推し)
-- [ ] c: メインの effort の注記を今足す (「medium 既定、途中で変えない」)
+（現在なし）
 
 ## 確認待ち
 
-### PT-C1: 汎用パススルー (DR-0030 §2、分割の段 3) の対外仕様の具体形
+### JW-C1: Claude Code 向けを固定 token から長寿命 JWT に切り替える (裁定済み a、進行中)
 
-DR-0030 §2 / §4 / §5 の裁定の範囲内で統括が確定し実装に進めた形。見て違和感があれば止めてほしい (無ければそのまま)。
+kawaz 裁定 (2026-09-25): 統括が [runbook](runbooks/ns-auth-jwt-rotation.md) どおりに進めてよい (config と settings.json の編集を含む、順序は unstable → personal → emrd → zunsystem)。
 
-```toml
-[upstreams."api.x.ai"]      # 名前 = 既定は apifqdn、任意ラベル可。予約名: v1 / llm-gateway / llm
-url = "https://api.x.ai"    # <rest> をそのまま連結
-secret = "xai"              # 静的 secret の id (secrets/xai.json)
-auth = "bearer"             # 載せ方: "bearer" / { header = "x-api-key" }。上流 API の形なので上流側に書く
-allow = ["GET /v1/models", "POST /v1/chat/completions"]   # "METHOD path-pattern"、* は任意の並び。外れは 404 / 405 で上流に出さない
+制約: 認証方式は ns 単位で `token` か `jwt` のどちらか一方なので、ns を切り替えた瞬間にその ns を使う走行中セッション (personal は llm-gateway 統括と codex) は再起動まで 401 になる (Caddy は 401 で fail over しない)。手順は (1) 鍵と JWT と settings.json の準備 (無停止) → (2) ns ごとに config 切替 + そのセッションの再起動。
 
-[secret_store]
-type = "file"               # 既定の置き場 $XDG_STATE_HOME/llm-gateway/secrets/<id>.json。credential とはディレクトリを分ける
-```
-
-秘密ファイルの最小形は `{"type":"static","payload":{"value":"..."}}` (DR-0010 の版 + flock、読めなければ 502)。URL は `/ns-<ns>/<name>/<rest>` (ns 認証は LLM 経路と同じ)。クライアントの `Authorization` は必ず落とし、`Host` は上流に、他は本文・ヘッダ・応答 (SSE 含む) とも無変換。events に `passthrough` を 1 種追加 (`ns` / `upstream` / `method` / `path` / `status` / `duration_ms` / `secret`)。stats には積まない (回数は手順 3 のレート制限バケットで)。
-
-- [ ] a: このまま (確認済み)
-- [ ] b: 直してほしい点あり (本ファイルか ccmsg で)
-
-### JW-C1: Claude Code 向けを固定 token から長寿命 JWT に切り替える (v0.59.0 で可能、稼働 config の変更は kawaz と)
-
-v0.59.0 で ns 認証 `jwt` と helper CLI (`llm-gateway auth keygen` / `jwks` / `sign`) が入った。手順は [runbook](runbooks/ns-auth-jwt-rotation.md): `keygen` → `jwks --ns <ns>` の TOML 断片を dotfiles の config に → restart → `sign --sub <機械名> --ttl <日数>` の JWT を各 Claude 設定の `ANTHROPIC_AUTH_TOKEN` に → 動作確認。3 面 (personal / emrd / zunsystem) の settings.json と codex の config も同じ token で差し替える。統括は稼働 config と Claude 設定を勝手に触らないので、着手の合図が要る。未確認: Claude Code が約 300 byte の JWT を `ANTHROPIC_AUTH_TOKEN` に載せて問題なく送るか (runbook の手順 5 で確かめる)。
-
-- [ ] a: 統括が runbook どおりに進めてよい (config と settings.json の編集を含む、各面の順序は unstable → personal → emrd → zunsystem)
-- [ ] b: kawaz が自分でやる
-- [ ] c: まだやらない
+- [ ] a: (2) の personal の切替をこのセッションを切る合図と同時に行う (統括推し)
+- [ ] b: (1) だけ先に済ませ、(2) は kawaz が合図する別のタイミングで
