@@ -1,6 +1,6 @@
 ---
 title: codex CLI 経由のトラフィックが origin `unknown` で記録され `codex` にならない
-status: open
+status: resolved
 category: bug
 created: 2026-09-23T19:02:54+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-24T17:16:38+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0024","dr/DR-0025","dr/DR-0029","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
