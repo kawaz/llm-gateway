@@ -924,8 +924,8 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    match ns.authorize(presented) {
-        Authorization::Accepted | Authorization::Open => None,
+    match ns.auth.verify(name, presented) {
+        Authorization::Accepted(_) | Authorization::Open => None,
         Authorization::WrongToken => Some(refused(
             name,
             StatusCode::UNAUTHORIZED,

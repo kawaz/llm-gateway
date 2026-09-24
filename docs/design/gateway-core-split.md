@@ -172,6 +172,8 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 
 - 1b-2b 実施済み: `credential::refreshing` (`Refresher` / `CredentialStore<P, R>` / `Clock`) を中身を変えずに `gateway_core::credential::refreshing` へ移し、llm-gateway は `pub use` で同じパスを保つ
 
+- 1c 実施済み: `gateway_core::ns::{NsAuth, Principal, Authorization}` を置き、server は `NsAuth::verify(ns, Authorization ヘッダ)` を呼ぶ。`Principal` は `{ ns, subject: Option, kid: Option }` で、固定トークンでは `subject` / `kid` は `None`。`Namespace` は `deny_unknown_fields` のため flatten でなく `#[serde(rename = "auth_token")] auth: NsAuth` (中身は文字列 1 つ) で持ち、設定の書き方は変わらない。方式の enum は `jwt` を足す段で作る (今は方式が 1 つなので型に出さない)。段 1 はこれで完了
+
 段 1 は diff が最も大きい。さらに割るなら **1a = `Persistence` / `FileStore` / `CredentialId` / `time` / core `Error`**、**1b = `CredentialStore` + `Refresher` + `AuthState` + `StoredCredential` の総称化**、**1c = ns 認証** の 3 つに切れる (各々単独で `just ci` が通る)。worker が 1 PR で扱いきれないと判断したらこちらで進める。
 
 ### 段 2: events broker / stats 合算 / daemon
@@ -216,6 +218,7 @@ issue `2026-09-15-store-layer-for-replaceable-persistence` は Store 層を 4 �
 ### 6.2 テストの移動で壊れそうな箇所
 
 - `credential/store.rs` の試験 (`Spy` / `Watched` / `FakeTokenServer`) は oauth の token endpoint を偽物で立てて refresh 競合を検証している。core へ移すと oauth が居ないので、**試験用の `Refresher` を core の試験内に書き直す**必要がある。oauth の HTTP 形 (form / JSON) を確かめている部分は llm-gateway 側に残す。ここを雑に割ると「single-flight の試験」と「oauth 方言の試験」が片方ずつ消える
+- 段 1b の実際: 試験は llm-gateway 側に残し、`OauthRefresher` と偽の token サーバを通して core の store を試している。core 単体の束ね試験 (試験用 `Refresher`) は、core を単独で使う利用者が出た時に足す
 - `credential/stored.rs` の手書き `Serialize` (キー順固定) と `#[serde(flatten)]` の相性: 既存ファイルとのバイト一致試験 (段 1 の完了条件) で固定するまで信用しない
 - カバレッジ下限 85% は `--workspace` 全体で測っているので crate が増えても下限は割らないはずだが、core に試験の薄い新コード (backend 選択の enum 等) が入ると全体値が下がる。段ごとに `just test` の数値を記録する
 - `lib.rs` の `provider_neutrality` の `GENERIC` 列挙に `events.rs` / `stats.rs` 等が載っており、`every_listed_module_exists` がファイル実在を確かめている。段 2 でファイルを割った後も llm-gateway 側に同名ファイルが残るなら緑のままだが、名前を変えたら列挙も直す (直さなければ赤になるので気づける)

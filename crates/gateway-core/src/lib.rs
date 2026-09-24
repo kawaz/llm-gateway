@@ -10,9 +10,11 @@
 //! - [`credential::refreshing`] 更新を束ねて使える状態で渡す窓口 ([`credential::refreshing::CredentialStore`])
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
 //! - [`error`] この層のエラー
+//! - [`ns`] namespace の入口での認証 ([`ns::NsAuth::verify`] → [`ns::Principal`])
 
 pub mod credential;
 pub mod error;
+pub mod ns;
 pub mod pattern;
 pub mod persist;
 

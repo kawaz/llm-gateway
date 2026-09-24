@@ -105,11 +105,7 @@ remove disabled from [server], or register another configuration",
         let open: Vec<&str> = gateway
             .namespace_names()
             .into_iter()
-            .filter(|name| {
-                gateway
-                    .namespace(name)
-                    .is_some_and(|ns| ns.auth_token.is_none())
-            })
+            .filter(|name| gateway.namespace(name).is_some_and(|ns| ns.auth.is_open()))
             .collect();
         if !open.is_empty() {
             tracing::info!(

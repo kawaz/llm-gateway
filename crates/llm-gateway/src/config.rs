@@ -153,8 +153,12 @@ pub struct Namespace {
     /// 引く運用では、ここで二重に認証を求める意味がないうえ、クライアントに
     /// トークンを持たせること自体が邪魔になる (Claude Code は
     /// `ANTHROPIC_AUTH_TOKEN` があるとサブスクとしての振る舞いをやめる)。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
+    #[serde(
+        rename = "auth_token",
+        default,
+        skip_serializing_if = "NsAuth::is_open"
+    )]
+    pub auth: NsAuth,
 
     /// この namespace で使う経路。空なら全部。
     ///
@@ -1508,43 +1512,9 @@ impl Namespace {
             None => false,
         }
     }
-
-    /// クライアントが名乗ったトークンを検査する。
-    ///
-    /// `auth_token` を書いていない namespace は、トークンの有無にかかわらず
-    /// 通す (DR-0006)。境界は手前で引く前提。
-    pub fn authorize(&self, presented: Option<&str>) -> Authorization {
-        let Some(expected) = &self.auth_token else {
-            return Authorization::Open;
-        };
-        // `Bearer xxx` でも `xxx` でも受ける。クライアントによって送り方が違う。
-        let matched = presented.is_some_and(|p| {
-            let p = p.strip_prefix("Bearer ").unwrap_or(p).trim();
-            p == expected
-        });
-        if matched {
-            Authorization::Accepted
-        } else {
-            Authorization::WrongToken
-        }
-    }
 }
 
-/// トークン検査の結果。
-///
-/// bool で返すと「なぜ通ったか」が消える。トークンが合って通ったのと、
-/// そもそも検査していないのとでは意味が違い、記録に残す価値も違う
-/// (DR-0006)。列挙にしておくと `match` が網羅を強制するので、通す枝と
-/// 拒む枝のどちらも書き落とせない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Authorization {
-    /// トークンが合っている。
-    Accepted,
-    /// トークンが違う (名乗っていない場合を含む)。
-    WrongToken,
-    /// この namespace は誰でも通す (`auth_token` を書いていない)。
-    Open,
-}
+pub use gateway_core::ns::{Authorization, NsAuth, Principal};
 
 /// 既定の認証情報の置き場。
 ///
@@ -1620,8 +1590,8 @@ auth_token = "t"
             "what it wrote itself"
         );
         assert_eq!(
-            config.namespace("default").unwrap().auth_token.as_deref(),
-            Some("t"),
+            config.namespace("default").unwrap().auth,
+            NsAuth::token("t"),
             "what comes from the base"
         );
         assert!(config.routes.contains_key("a"));
@@ -1734,11 +1704,11 @@ o = "claude-opus-*"
     #[test]
     fn namespace_without_token_accepts_everyone() {
         let ns = Namespace::default();
-        assert_eq!(ns.auth_token, None, "the unwritten state");
+        assert!(ns.auth.is_open(), "the unwritten state");
 
         for presented in [None, Some("anything"), Some("Bearer anything"), Some("")] {
             assert_eq!(
-                ns.authorize(presented),
+                ns.auth.verify("n", presented),
                 Authorization::Open,
                 "{presented:?} passes too"
             );
@@ -1752,18 +1722,25 @@ o = "claude-opus-*"
     #[test]
     fn configured_token_is_matched_both_ways() {
         let ns = Namespace {
-            auth_token: Some("s3cret".to_owned()),
+            auth: NsAuth::token("s3cret"),
             ..Namespace::default()
         };
 
         for ok in ["s3cret", "Bearer s3cret"] {
-            assert_eq!(ns.authorize(Some(ok)), Authorization::Accepted, "{ok}");
+            assert!(
+                matches!(ns.auth.verify("n", Some(ok)), Authorization::Accepted(_)),
+                "{ok}"
+            );
         }
         for bad in ["", "nope", "Bearer nope", "bearer s3cret", "s3cretx"] {
-            assert_eq!(ns.authorize(Some(bad)), Authorization::WrongToken, "{bad}");
+            assert_eq!(
+                ns.auth.verify("n", Some(bad)),
+                Authorization::WrongToken,
+                "{bad}"
+            );
         }
         assert_eq!(
-            ns.authorize(None),
+            ns.auth.verify("n", None),
             Authorization::WrongToken,
             "not identifying is treated the same as a mismatch"
         );
@@ -2732,7 +2709,7 @@ mod example_tests {
             "an example of a short name"
         );
         assert!(
-            ns(&config).auth_token.is_some(),
+            !ns(&config).auth.is_open(),
             "following the template as-is enables auth (unset means deny-all, so the example is needed)"
         );
         assert!(
