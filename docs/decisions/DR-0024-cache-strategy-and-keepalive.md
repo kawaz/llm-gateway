@@ -48,7 +48,7 @@ keepalive_horizon = "8h"
 | `1h` | 全ブレークポイントの ttl を 1h に強制 (差分 write が 2 倍、60 分以内の再開が read になる) |
 | `keepalive` | `1h` と同じ本文にした上で、idle を検知して cache を繋ぐ (繋ぎ方は DR-0027 の自送信。main / sub どちらにも書ける) |
 
-照合は alias 解決後のモデル名。呼び出し元の判定は anthropic 方言の preset が行い、core はその値だけを見る (DR-0014 の境界):
+照合は alias 解決後のモデル名。呼び出し元の判定は入口 (ingress) が受けた本文の形 (Messages 形式) から読み、送り先の経路 (preset) には依らない。core はその値だけを見る (DR-0014 の境界):
 
 | origin | 見分け方 | 当てる戦略 |
 |---|---|---|

@@ -6,7 +6,9 @@
 //! 載せるのは後者 — こちらが本文から起こした鍵を外へ出しても、受け取った側は
 //! 自分の会話と突き合わせられない。
 //!
-//! どちらもクライアント方言の知識なので、ここに集めてある。
+//! もう 1 つ、リクエストを出した側 ([`messages_origin`]) も本文の形から読む。
+//!
+//! どれもクライアント方言の知識なので、ここに集めてある。
 //!
 //! 導出規則は cpa (`sdk/cliproxy/auth/selector.go`) の挙動に合わせてある。
 //! 移行期に cpa と併存させたとき、両者が同じ会話を同じキーとみなすため。
@@ -15,6 +17,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash as _, Hasher as _};
 
 use serde_json::Value;
+
+mod origin;
+
+pub use origin::messages_origin;
 
 /// クライアントが会話の id を載せてくるリクエストヘッダ。
 ///

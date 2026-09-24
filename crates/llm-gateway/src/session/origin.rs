@@ -17,39 +17,38 @@
 
 use serde_json::Value;
 
-use crate::provider::{CallerOrigin, RequestOrigin};
+use crate::provider::RequestOrigin;
 
-/// `metadata.user_id` から呼び出し元を読む。
-pub struct MetadataOrigin;
-
-impl CallerOrigin for MetadataOrigin {
-    fn origin(&self, body: &Value) -> RequestOrigin {
-        let Some(raw) = body
-            .get("metadata")
-            .and_then(|metadata| metadata.get("user_id"))
-            .and_then(Value::as_str)
-        else {
-            return RequestOrigin::Unknown;
-        };
-        // 旧形式 (`user_<hash>_account__session_<uuid>`) には親の欄が無い。
-        // 名乗り方が違うだけで「サブエージェントではない」とは言えないので、
-        // 読めない形は Unknown のまま返す。
-        let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(raw) else {
-            return RequestOrigin::Unknown;
-        };
-        if fields
-            .get("parent_session_id")
-            .is_some_and(|parent| !parent.is_null())
-            || billing_field(body, "cc_is_subagent=") == Some("true")
-        {
-            return RequestOrigin::Sub;
-        }
-        match billing_field(body, "cc_entrypoint=") {
-            // 対話セッション。続きが来る前提で扱ってよい。
-            Some(INTERACTIVE) | None => RequestOrigin::Main,
-            // `claude -p` のような 1 回きりの呼び出し。
-            Some(_) => RequestOrigin::Oneshot,
-        }
+/// Messages 形式の本文から呼び出し元を読む。
+///
+/// 読むのは本文の形で、送り先の経路ではない。同じ Claude Code の
+/// リクエストは、どの upstream へ通訳して送っても同じ答えになる。
+pub fn messages_origin(body: &Value) -> RequestOrigin {
+    let Some(raw) = body
+        .get("metadata")
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+    else {
+        return RequestOrigin::Unknown;
+    };
+    // 旧形式 (`user_<hash>_account__session_<uuid>`) には親の欄が無い。
+    // 名乗り方が違うだけで「サブエージェントではない」とは言えないので、
+    // 読めない形は Unknown のまま返す。
+    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(raw) else {
+        return RequestOrigin::Unknown;
+    };
+    if fields
+        .get("parent_session_id")
+        .is_some_and(|parent| !parent.is_null())
+        || billing_field(body, "cc_is_subagent=") == Some("true")
+    {
+        return RequestOrigin::Sub;
+    }
+    match billing_field(body, "cc_entrypoint=") {
+        // 対話セッション。続きが来る前提で扱ってよい。
+        Some(INTERACTIVE) | None => RequestOrigin::Main,
+        // `claude -p` のような 1 回きりの呼び出し。
+        Some(_) => RequestOrigin::Oneshot,
     }
 }
 
@@ -83,12 +82,12 @@ mod tests {
     use serde_json::json;
 
     fn origin(user_id: Value) -> RequestOrigin {
-        MetadataOrigin.origin(&json!({"metadata": {"user_id": user_id}}))
+        messages_origin(&json!({"metadata": {"user_id": user_id}}))
     }
 
     /// 親を持たない名乗りと、請求ヘッダに載る入り口の組み合わせ。
     fn from_entrypoint(entrypoint: &str) -> RequestOrigin {
-        MetadataOrigin.origin(&json!({
+        messages_origin(&json!({
             "metadata": {"user_id": r#"{"session_id":"8f17d3dd"}"#},
             "system": [{
                 "type": "text",
@@ -144,7 +143,7 @@ mod tests {
             ]),
         ] {
             assert_eq!(
-                MetadataOrigin.origin(&json!({
+                messages_origin(&json!({
                     "metadata": {"user_id": r#"{"session_id":"8f17d3dd"}"#},
                     "system": system,
                 })),
@@ -159,7 +158,7 @@ mod tests {
     fn a_subagent_stays_a_subagent_whatever_its_entrypoint() {
         for entrypoint in ["cli", "sdk-cli"] {
             assert_eq!(
-                MetadataOrigin.origin(&json!({
+                messages_origin(&json!({
                     "metadata": {"user_id": r#"{"session_id":"a","parent_session_id":"b"}"#},
                     "system": [{
                         "type": "text",
@@ -179,7 +178,7 @@ mod tests {
     #[test]
     fn a_request_that_bills_itself_as_a_subagent_is_a_subagent() {
         assert_eq!(
-            MetadataOrigin.origin(&json!({
+            messages_origin(&json!({
                 "metadata": {"user_id": r#"{"session_id":"8f17d3dd"}"#},
                 "system": [{
                     "type": "text",
@@ -202,11 +201,7 @@ mod tests {
             json!({"metadata": {"user_id": "user_abc_account__session_deadbeef"}}),
             json!({"metadata": {"user_id": ""}}),
         ] {
-            assert_eq!(
-                MetadataOrigin.origin(&body),
-                RequestOrigin::Unknown,
-                "{body}"
-            );
+            assert_eq!(messages_origin(&body), RequestOrigin::Unknown, "{body}");
         }
     }
 }

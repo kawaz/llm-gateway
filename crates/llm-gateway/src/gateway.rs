@@ -614,7 +614,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                     // (DR-0014 §4)。受け取り口は preset を知らないので、読む役を
                     // 応答と一緒に持たせて渡す。
                     let usage = usage_observer(route.preset.as_ref(), &resp);
-                    let (origin, cache_strategy) = call.cache_view(route.preset.as_ref());
+                    let (origin, cache_strategy) = call.cache_view();
                     // 送る本文で `cache_control` が変わるのは戦略を書いた場合
                     // だけで、そこは戦略から寿命が決まる。読んで決めるのは
                     // 素通しのときだけなので、書き換え前の本文で同じ答えになる。
@@ -1120,7 +1120,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         }
         // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
-        let (origin, strategy) = call.cache_view(route.preset.as_ref());
+        let (origin, strategy) = call.cache_view();
         // この 1 本の時刻は**ここで 1 回だけ**読む。知らせの `ts` にも、
         // 連鎖の起点にも同じ値を使う。
         let sent_at_ms = now_unix_ms();
@@ -1657,16 +1657,14 @@ impl<'a> Call<'a> {
 
     /// この経路へ送るときの、出した側と効かせる prompt cache 戦略 (DR-0024)。
     ///
-    /// 呼び出し元 (メイン / サブエージェント) を読めるのは方言を知っている
-    /// 経路だけなので、経路ごとに聞く。同じ本文なら答えも同じで、経路を
-    /// 何度試しても本文は同じになる。
-    fn cache_view(&self, preset: &Preset) -> (RequestOrigin, Option<CacheStrategy>) {
-        // Responses 形式の本文に、出した側を見分ける手掛かりは無い (見分け方は
-        // 正規形の方言の読み方)。経路へ聞いても答えは `Unknown` にしかならず、
-        // 「codex CLI から来た」という確かな素性を捨てることになる (DR-0025)。
+    /// 出した側は入力の形で決まり、送り先の経路には依らない。同じ本文を
+    /// どの upstream へ通訳しても、出した側は同じ。
+    fn cache_view(&self) -> (RequestOrigin, Option<CacheStrategy>) {
+        // Responses 形式の本文に、出した側を見分ける手掛かりは無い。入ってきた
+        // 形そのものが「codex CLI から来た」という確かな素性になる (DR-0025)。
         let origin = match self.shape {
             RequestShape::Responses => RequestOrigin::Codex,
-            RequestShape::Messages => preset.request_origin(self.body),
+            RequestShape::Messages => crate::session::messages_origin(self.body),
         };
         (
             origin,
@@ -7214,6 +7212,62 @@ routes = ["first", "second"]
         assert_eq!(event.origin, "codex");
         assert_eq!(event.model, "m");
         assert_eq!(event.status, 200);
+    }
+
+    /// Messages 形式の 1 本は、openai 経路へ通訳して送っても出した側を読む。
+    ///
+    /// 出した側は入力の形の属性で、送り先の経路の属性ではない。Claude Code の
+    /// サブエージェントが gpt-* を名指ししても `sub` のまま流れる。
+    #[tokio::test]
+    async fn a_messages_request_sent_to_an_openai_route_keeps_its_origin() {
+        let codex = responses_upstream().await;
+        let gw = gateway_with(
+            r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "URL/backend-api/codex"
+models = ["gpt-6-sol"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["gpt-6-sol"]
+routes = ["codex"]
+"#
+            .replace("URL", &codex.url)
+            .as_str(),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        for (user_id, expected) in [(MAIN, "main"), (SUB, "sub")] {
+            let (mut body, headers) = conversation(json!({}));
+            body["model"] = json!("gpt-6-sol");
+            body["tools"] = json!([{"name": "Bash", "input_schema": {"type": "object"}}]);
+            body["metadata"] = json!({"user_id": user_id});
+            let forwarded = gw
+                .forward(
+                    ns(&gw),
+                    NS,
+                    Ingress {
+                        path: "/v1/messages",
+                        query: None,
+                        shape: RequestShape::Messages,
+                    },
+                    body,
+                    headers,
+                )
+                .await
+                .unwrap();
+            assert_eq!(forwarded.route, "codex");
+            assert_eq!(forwarded.origin, expected);
+            let event = announced(watching.recv().await.unwrap());
+            assert_eq!(event.origin, expected);
+        }
     }
 
     /// codex backend が返した記述を、namespace が見せるモデルだけに絞って渡す。

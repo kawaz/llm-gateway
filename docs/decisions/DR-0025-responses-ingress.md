@@ -42,7 +42,7 @@ path 文字列から起こさないのは、**どの受け口をどの形で生�
 
 ### 4. 素性は `origin: "codex"`
 
-出した側の見分け (`main` / `sub` / `oneshot`、DR-0024) は Messages 形式の本文 (`metadata.user_id` と `system` の請求ヘッダ) の読み方なので、Responses 形式では付かない。経路へ聞いても `unknown` にしかならない。
+出した側の見分け (`main` / `sub` / `oneshot`、DR-0024) は Messages 形式の本文 (`metadata.user_id` と `system` の請求ヘッダ) の読み方なので、Responses 形式では付かない。出した側は入力の形で決まり、出力の経路には依らない (Messages 形式を openai 経路へ通訳して送っても `main` / `sub` を読む)。
 
 そこで **受けた形そのものを素性にする**。`RequestOrigin::Codex` を足し、知らせ (DR-0012) の `origin` に `"codex"` として出る。`unknown` と潰さないのは、「codex CLI から来た」が確かな情報であることと、prompt cache の扱いが Messages とは別だとこの 1 語で分かるため。
 

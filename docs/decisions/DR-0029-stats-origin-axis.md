@@ -9,7 +9,7 @@ DR-0027 で keepalive は合図の注入をやめ、gateway が最後に転送�
 
 ところが DR-0011 の日次集計は **credential × モデル × 日** の 3 軸しか持たない。このため「ping が何本出て、いくら掛かったか」を集計から取り出せない。`docs/findings/2026-09-08-keepalive-field-observation.md` の実運用評価では、セッション jsonl を走査して ping 分を手で引くという**今回限りの遡及手段**で代替している。gateway の外の成果物 (セッションログの形式と置き場) に依存する数え方で、正本にできない。
 
-素性そのものは既にある。`provider::RequestOrigin` (DR-0012) が `main` / `sub` / `oneshot` / `codex` / `unknown` / `keepalive` の 1 語を答え、転送のたびに知らせ (`/llm-gateway/events`) へ載っている。**知らせは流れて消える** ので、日をまたいで振り返る口 (stats) には残らない。
+素性そのものは既にある。`provider::RequestOrigin` (DR-0012) が `main` / `sub` / `oneshot` / `codex` / `unknown` / `keepalive` の 1 語を答え、転送のたびに知らせ (`/llm-gateway/events`) へ載っている。この 1 語は入力の形で決まり、送り先の経路には依らない (DR-0024 / DR-0025)。**知らせは流れて消える** ので、日をまたいで振り返る口 (stats) には残らない。
 
 ## Decision
 

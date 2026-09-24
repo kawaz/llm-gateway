@@ -128,11 +128,6 @@ impl RequestOrigin {
     }
 }
 
-/// リクエスト本文から呼び出し元を読む任意 capability。
-pub trait CallerOrigin: Send + Sync {
-    fn origin(&self, body: &serde_json::Value) -> RequestOrigin;
-}
-
 /// 応答から provider 固有の quota・拒否・usage・単価を読む。
 pub trait Metering: Send + Sync {
     /// 応答ヘッダに quota が載っていれば正規スナップショットへ写す。
@@ -220,7 +215,6 @@ pub struct Preset {
     response_admission: Option<Arc<dyn ResponseAdmission>>,
     quota_api: Option<Arc<dyn QuotaApi>>,
     negotiation: Option<Arc<dyn Negotiation>>,
-    caller_origin: Option<Arc<dyn CallerOrigin>>,
     /// まだ何も観測していないときに、枠について言えること。
     unobserved: Support,
     state: RouteState,
@@ -242,7 +236,6 @@ impl Preset {
             response_admission: None,
             quota_api: None,
             negotiation: None,
-            caller_origin: None,
             // 何も宣言しない経路について言えることは無い。「取れない」と
             // 断じるのも「まだ観測していない」と言うのも、こちらの推測になる。
             unobserved: Support::UpstreamDependent,
@@ -276,22 +269,6 @@ impl Preset {
     pub fn with_negotiation(mut self, negotiation: Arc<dyn Negotiation>) -> Self {
         self.negotiation = Some(negotiation);
         self
-    }
-
-    pub fn with_caller_origin(mut self, caller_origin: Arc<dyn CallerOrigin>) -> Self {
-        self.caller_origin = Some(caller_origin);
-        self
-    }
-
-    /// このリクエストを出した側 (DR-0024)。
-    ///
-    /// 読み方を持たない経路では [`RequestOrigin::Unknown`]。「見分けが付かない」
-    /// は判断できる値なので、capability の有無を呼び出し側に見せない。
-    pub fn request_origin(&self, body: &serde_json::Value) -> RequestOrigin {
-        match &self.caller_origin {
-            Some(reader) => reader.origin(body),
-            None => RequestOrigin::Unknown,
-        }
     }
 
     pub fn name(&self) -> &str {
