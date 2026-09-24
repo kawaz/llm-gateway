@@ -367,7 +367,9 @@ dependencies = [
 name = "gateway-core"
 version = "0.55.0"
 dependencies = [
+ "axum",
  "libc",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",

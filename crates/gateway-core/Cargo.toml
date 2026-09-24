@@ -15,8 +15,10 @@ libc = { workspace = true }
 rustix = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "process", "io-util", "fs", "time"] }
+reqwest = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+axum = { workspace = true }

@@ -11,12 +11,14 @@
 //! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
 //! - [`credential::refreshing`] 更新を束ねて使える状態で渡す窓口 ([`credential::refreshing::CredentialStore`])
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
+//! - [`daemon`] 登録した台を起こして生かし続ける監督者と、その登録簿・言葉
 //! - [`error`] この層のエラー
 //! - [`events`] 起きたことを通し番号付きで見ている人へ流す口
 //! - [`ns`] namespace の入口での認証 ([`ns::NsAuth::verify`] → [`ns::Principal`])
 
 pub mod config;
 pub mod credential;
+pub mod daemon;
 pub mod error;
 pub mod events;
 pub mod ns;

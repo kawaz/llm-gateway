@@ -25,10 +25,13 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
 
     let rest = &args[1..];
     match args[0].as_str() {
-        "run" => run::foreground(&Registry::open(), rest),
-        "add" => add(&Registry::open(), rest),
-        "remove" => remove(&Registry::open(), rest),
-        "list" => list(&Registry::open(), control::running_now()),
+        "run" => run::foreground(&llm_gateway::daemon::registry::open(), rest),
+        "add" => add(&llm_gateway::daemon::registry::open(), rest),
+        "remove" => remove(&llm_gateway::daemon::registry::open(), rest),
+        "list" => list(
+            &llm_gateway::daemon::registry::open(),
+            control::running_now(),
+        ),
         "supervise" => control::supervise(rest),
         op @ ("start" | "stop" | "restart" | "status") => control::ask(op, rest),
         "log" => control::log(rest),

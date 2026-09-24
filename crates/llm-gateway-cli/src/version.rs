@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use llm_gateway::daemon::protocol::{self, Request, Which};
-use llm_gateway::daemon::registry::Registry;
 use serde_json::{Value, json};
 
 use crate::failure::Failure;
@@ -25,7 +24,7 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
         )));
     }
 
-    let registry = Registry::open();
+    let registry = llm_gateway::daemon::registry::open();
     let units: Vec<(String, PathBuf)> = registry
         .list()?
         .into_iter()

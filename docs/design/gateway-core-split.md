@@ -106,6 +106,10 @@ DR-0030 §1 の表の汎用層 5 項目 (認証の差し替え、credential の�
 - llm-gateway: `Counters` (`requests` + `tokens: TokenUsage`)、`InputBasis`、旧形式の読み替え、`ByOrigin`、`Report` の整形
 - 自主レート制限の日次バケット (DR-0030 §3) は同じ `Stats<C>` の上に `C = RequestCount` として載る (段 3 以降、手順 3 の範囲)
 
+**daemon**
+
+- 監督者は台の設定の読み方 (設定ファイル → 待ち受け先) と問い合わせパス (healthz / self / version) を利用側から受け取る (関数値と文字列の `UnitProbe`)。置き場 (状態ディレクトリ) も引数で受け、core は製品名も LLM の設定も知らない
+
 **ns 認証**
 
 - 現在は `llm-gateway-server` の関数 (`auth_token` を書いていない ns は検査せず通す、`Bearer <t>` と `<t>` の両方を受ける)
@@ -184,6 +188,7 @@ DR-0014 §3 のテストは `crates/llm-gateway/src/lib.rs` の `mod provider_ne
 - 2a 実施済み: `gateway_core::events::{Events<E>, Watching<E>, Stamped}` (通し番号・起動の印・落とした数・broadcast)。番号を押すのは trait `Stamped` で、`Notice` が実装する。llm-gateway は `pub type Events = Events<Notice>` / `Watching` で既存の名前を保つ
 - 2b 実施済み: `gateway_core::stats::{Stats<C: Mergeable>, Mergeable, Merged}` (日の振り分け、書き手別ファイル、読み戻し、ミリ秒日付の寄せ直し、閲覧時の合算)。`Mergeable` は core が `BTreeMap<K, V: Mergeable>` に鍵ごとの合算として実装し、llm-gateway は `Counters` / `ByOrigin` に実装する (`ByCredential` は `BTreeMap` の別名なので、孤児規則で llm-gateway 側からは実装できない)。合算 `merged` は DR-0031 §2 (3) の `Merged { value, missing }` を返し、読めなかったファイルの書き手を `missing` に挙げる。閲覧 (`Stats::report`) は best-effort なので `missing` を見ない。llm-gateway の `Stats` は鍵 (credential × model × origin) と値付けを持つ薄い包み
 - 2c 実施済み: `gateway_core::config::{extends, path_expand, default_state_dir(app), xdg_dir}`。core は製品名を知らないので置き場の最後の 1 段は呼び出し側が渡し、llm-gateway の `default_state_dir()` は `"llm-gateway"` を渡す包みで置き場は変わらない。extends の試験の設定例は中立な名前に書き換えた
+- 2d 実施済み: `gateway_core::daemon::{protocol, registry, supervisor}`。`Supervisor::new` は `UnitProbe` を取り、`socket_path` / `log_dir` / `registry::default_dir` は状態ディレクトリを引数に取る。llm-gateway の `daemon::{protocol, registry, supervisor}` は core を glob で再公開し、既定の置き場の関数と `registry::open()` / `supervisor::open()` / `PROBE` を足す (CLI の `Registry::open()` / `Supervisor::open()` は関数呼び出しに変わった)。段 2 はこれで完了
 
 ### 段 3: 汎用パススルー route
 

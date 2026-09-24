@@ -3,14 +3,15 @@
 //! やることは 3 つだけ:
 //!
 //! - 登録簿で `enabled` になっている台を `<binary_path> daemon run <unit>` として起こす
-//! - 落ちたら間を置いて起こし直す (`/llm-gateway/healthz` が返れば間隔を戻す)
+//! - 落ちたら間を置いて起こし直す (healthz が返れば間隔を戻す)
 //! - unix socket で受けた頼み (start / stop / restart / status / reload / log) に答える
 //!
 //! **設定は読まない**。読むのは子の `daemon run` で、監督者が設定に触るのは
-//! 待ち受け先 (healthz の宛先) を知るときだけ。
+//! 待ち受け先 (healthz の宛先) を知るときだけ。その読み方と問い合わせの
+//! パスは利用側が [`UnitProbe`] で渡す (監督者は台の設定の形も製品も知らない)。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,9 +73,24 @@ struct Watched {
     last_exit: Option<String>,
 }
 
+/// 走っている台への問い合わせ方。台の設定の形と口は利用側が知っている。
+#[derive(Clone, Copy)]
+pub struct UnitProbe {
+    /// 台の設定ファイルから待ち受け先 (`host:port`) を引く。読めなければ `None`
+    /// (その台には問い合わせない)。
+    pub listen_of: fn(&Path) -> Option<String>,
+    /// 起きたかを聞く口。2xx が返れば起きている。
+    pub health_path: &'static str,
+    /// 版と配り損ねを答える口 (JSON の `version` / `events`)。
+    pub self_path: &'static str,
+    /// `self_path` を持たない版に、版だけを聞く口 (JSON の `version`)。
+    pub version_path: &'static str,
+}
+
 /// 監督者。
 pub struct Supervisor {
     registry: Registry,
+    probe: UnitProbe,
     logs: PathBuf,
     socket: PathBuf,
     watched: Mutex<HashMap<String, Watched>>,
@@ -128,19 +144,11 @@ impl From<crate::daemon::registry::Error> for Refused {
 type Answer = Result<serde_json::Value, Refused>;
 
 impl Supervisor {
-    /// 既定の置き場で組み立てる。
-    pub fn open() -> Self {
-        Self::new(
-            Registry::open(),
-            protocol::log_dir(),
-            protocol::socket_path(),
-        )
-    }
-
-    pub fn new(registry: Registry, logs: PathBuf, socket: PathBuf) -> Self {
+    pub fn new(registry: Registry, logs: PathBuf, socket: PathBuf, probe: UnitProbe) -> Self {
         let (lines, _) = broadcast::channel(1024);
         Self {
             registry,
+            probe,
             logs,
             socket,
             watched: Mutex::new(HashMap::new()),
@@ -325,7 +333,7 @@ impl Supervisor {
             // 待ち受け先が読めない設定は、起きたかどうかを聞けない。
             return Ok(());
         };
-        if healthy(&listen, HEALTH_WAIT).await {
+        if healthy(&listen, self.probe.health_path, HEALTH_WAIT).await {
             self.reset_backoff(name).await;
             return Ok(());
         }
@@ -333,7 +341,8 @@ impl Supervisor {
             "health_timeout",
             name,
             format!(
-                "`{name}` did not answer /llm-gateway/healthz at {listen} within {}s",
+                "`{name}` did not answer {} at {listen} within {}s",
+                self.probe.health_path,
                 HEALTH_WAIT.as_secs()
             ),
         ))
@@ -440,7 +449,7 @@ impl Supervisor {
                         let me = Arc::clone(&self);
                         let named = name.clone();
                         tokio::spawn(async move {
-                            if healthy(&listen, HEALTH_WAIT).await {
+                            if healthy(&listen, me.probe.health_path, HEALTH_WAIT).await {
                                 me.reset_backoff(&named).await;
                             }
                         });
@@ -666,7 +675,7 @@ impl Supervisor {
             let Some(listen) = self.listen_of(&row.unit) else {
                 continue;
             };
-            if let Some(answer) = ask_self(&listen).await {
+            if let Some(answer) = ask_self(&listen, &self.probe).await {
                 row.version = answer.version;
                 row.events = answer.events;
             }
@@ -732,9 +741,7 @@ impl Supervisor {
     /// 台の待ち受け先 (healthz の宛先)。読めなければ聞かない。
     fn listen_of(&self, name: &str) -> Option<String> {
         let unit = self.registry.get(name).ok()?;
-        crate::Config::load(&unit.config)
-            .ok()
-            .map(|config| config.server.listen)
+        (self.probe.listen_of)(&unit.config)
     }
 }
 
@@ -757,17 +764,17 @@ struct SelfAnswer {
 
 /// 走っている台に、自分の状態 (版と配り損ね) を聞く。
 ///
-/// `/llm-gateway/self` を持たない版には `/llm-gateway/version` で版だけ聞く。
+/// 自己申告の口 (`self_path`) を持たない版には `version_path` で版だけ聞く。
 /// 入れ替えたのに上げ直していない古い台こそ版を見せたい相手なので、新しい口が
 /// 無いことを理由に版まで失わない。どちらにも答えない版は「分からない」で
 /// あって、異常ではない。
-async fn ask_self(listen: &str) -> Option<SelfAnswer> {
+async fn ask_self(listen: &str, probe: &UnitProbe) -> Option<SelfAnswer> {
     let authority = reachable_authority(listen);
-    let resp = get(&format!("http://{authority}/llm-gateway/self")).await?;
+    let resp = get(&format!("http://{authority}{}", probe.self_path)).await?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         // 返事はしたので、古い口に聞き直す。黙っている台に 2 回待たされない
         // よう、聞き直すのはこの場合だけ。
-        let resp = get(&format!("http://{authority}/llm-gateway/version")).await?;
+        let resp = get(&format!("http://{authority}{}", probe.version_path)).await?;
         let body = json_of(resp).await?;
         return Some(SelfAnswer {
             version: body.get("version")?.as_str().map(str::to_owned),
@@ -887,8 +894,8 @@ async fn write_line(
 }
 
 /// healthz が返るまで待つ。返らないまま時間切れなら `false`。
-async fn healthy(listen: &str, limit: Duration) -> bool {
-    let url = format!("http://{}/llm-gateway/healthz", reachable_authority(listen));
+async fn healthy(listen: &str, path: &str, limit: Duration) -> bool {
+    let url = format!("http://{}{path}", reachable_authority(listen));
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + limit;
 
@@ -1002,6 +1009,20 @@ mod tests {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
+    /// 試験の台の設定は `[server] listen = "…"` だけを読む。
+    fn listen_in(config: &Path) -> Option<String> {
+        let raw = std::fs::read_to_string(config).ok()?;
+        let table: toml::Table = toml::from_str(&raw).ok()?;
+        Some(table.get("server")?.get("listen")?.as_str()?.to_owned())
+    }
+
+    const PROBE: UnitProbe = UnitProbe {
+        listen_of: listen_in,
+        health_path: "/unit/healthz",
+        self_path: "/unit/self",
+        version_path: "/unit/version",
+    };
+
     struct World {
         _dir: tempfile::TempDir,
         supervisor: Arc<Supervisor>,
@@ -1017,6 +1038,7 @@ mod tests {
             registry.clone(),
             root.join("logs"),
             root.join("supervisor.sock"),
+            PROBE,
         ));
         World {
             _dir: dir,
@@ -1391,7 +1413,7 @@ mod tests {
 
         tokio::spawn(async move {
             let app = axum::Router::new().route(
-                "/llm-gateway/healthz",
+                "/unit/healthz",
                 axum::routing::get(|| async { axum::http::StatusCode::OK }),
             );
             let _ = axum::serve(listener, app).await;
@@ -1467,7 +1489,7 @@ mod tests {
         // 本人が答え始めた後の要求では改めて聞く。最初の失敗を保持しない。
         tokio::spawn(async move {
             let app = axum::Router::new().route(
-                "/llm-gateway/version",
+                "/unit/version",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({"version": "0.1.2"}))
                 }),
@@ -1507,7 +1529,7 @@ mod tests {
         world.register("stable", &binary, true);
         tokio::spawn(async move {
             let app = axum::Router::new().route(
-                "/llm-gateway/self",
+                "/unit/self",
                 axum::routing::get(|| async {
                     axum::Json(serde_json::json!({"version": "0.1.3", "events": {"dropped": 7}}))
                 }),
@@ -1558,16 +1580,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            let app = axum::Router::new().route(
-                "/llm-gateway/healthz",
-                axum::routing::get(|| async { "ok" }),
-            );
+            let app =
+                axum::Router::new().route("/unit/healthz", axum::routing::get(|| async { "ok" }));
             let _ = axum::serve(listener, app).await;
         });
 
-        assert!(healthy(&listen, Duration::from_secs(10)).await);
+        assert!(healthy(&listen, PROBE.health_path, Duration::from_secs(10)).await);
         // 誰も居ない先は、待っても返らない。
-        assert!(!healthy("127.0.0.1:1", Duration::from_millis(400)).await);
+        assert!(!healthy("127.0.0.1:1", PROBE.health_path, Duration::from_millis(400)).await);
     }
 
     /// 待ち受けの書き方は、そのままでは宛先にならない。

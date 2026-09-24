@@ -97,7 +97,7 @@ pub struct UnitStatus {
     pub since_ms: Option<u64>,
     /// 今動いているプロセスが載せている版。
     ///
-    /// ディスクの binary ではなく、走っている本人 (`GET /llm-gateway/self`)
+    /// ディスクの binary ではなく、走っている本人 (利用側が決めた自己申告の口)
     /// が答えたもの。答えられない版が走っていることもあるので `null` を許す。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -134,17 +134,15 @@ pub struct LogLine {
 
 /// 監督者の待ち受け先。
 ///
-/// 状態ディレクトリに置く。cache に置くと、掃除された拍子に「監督者は
+/// 状態ディレクトリに置く。消してよい一時置き場に置くと、掃除された拍子に「監督者は
 /// 居るのに繋げない」が起きる。
-pub fn socket_path() -> PathBuf {
-    crate::config::default_state_dir()
-        .join("daemon")
-        .join("supervisor.sock")
+pub fn socket_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon").join("supervisor.sock")
 }
 
 /// 子が書いたものの置き場。
-pub fn log_dir() -> PathBuf {
-    crate::config::default_state_dir().join("logs")
+pub fn log_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("logs")
 }
 
 /// 1 台ぶんのログ。
@@ -250,19 +248,15 @@ mod tests {
         );
     }
 
-    /// 待ち受け先とログは、消えると困るので state の下 (cache ではない)。
+    /// 待ち受け先とログは、消えると困るので state の下 (消してよい一時置き場ではない)。
     #[test]
     fn the_supervisor_lives_under_the_state_directory() {
-        assert!(
-            socket_path().ends_with("llm-gateway/daemon/supervisor.sock"),
-            "{}",
-            socket_path().display()
+        let state = Path::new("/state/app");
+        assert_eq!(
+            socket_path(state),
+            PathBuf::from("/state/app/daemon/supervisor.sock")
         );
-        assert!(
-            log_dir().ends_with("llm-gateway/logs"),
-            "{}",
-            log_dir().display()
-        );
+        assert_eq!(log_dir(state), PathBuf::from("/state/app/logs"));
         assert_eq!(
             log_path(Path::new("/var/log"), "stable"),
             PathBuf::from("/var/log/stable.log")

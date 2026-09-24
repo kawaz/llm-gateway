@@ -8,7 +8,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use llm_gateway::daemon::protocol::{self, Request, Which};
-use llm_gateway::daemon::supervisor::Supervisor;
 
 use crate::failure::Failure;
 use crate::options::split;
@@ -22,7 +21,7 @@ pub fn supervise(args: &[String]) -> Result<ExitCode, Failure> {
     }
     init_logging();
 
-    let supervisor = Arc::new(Supervisor::open());
+    let supervisor = Arc::new(llm_gateway::daemon::supervisor::open());
     runtime()?
         .block_on(async move { supervisor.supervise().await })
         .map_err(Failure::from)?;
@@ -102,7 +101,7 @@ pub fn log(args: &[String]) -> Result<ExitCode, Failure> {
 /// 追い続けないぶんだけ、監督者が居なくても答えられる。書いたものは
 /// 監督者の持ち物ではなくファイルなので、居ないことを理由に断らない。
 fn dump(which: &Which) -> Result<ExitCode, Failure> {
-    let registry = llm_gateway::daemon::registry::Registry::open();
+    let registry = llm_gateway::daemon::registry::open();
     let names = which
         .choose(&registry.names(), true)
         .map_err(|message| Failure::new("unit_required", message))?;

@@ -91,6 +91,8 @@ binary を unit ごとに持つのは、いま走っている 2 台が **別の�
 
 登録された unit ごとに `<binary_path> daemon run <unit>` を子プロセスとして起動し、落ちたら backoff を置いて上げ直す。SIGTERM を受けたら子を順に止めて終わる。監督者自身は HTTP を持たず、設定の解釈もしない — 解釈するのは子の `daemon run` である。
 
+監督者は台の設定の読み方 (設定ファイル → 待ち受け先) と問い合わせパス (healthz / self / version) を利用側から受け取る (gateway-core 分割 段 2、`gateway_core::daemon::supervisor::UnitProbe`)。
+
 `start` / `stop` / `restart` / `status` は子を直接叩かず、unix socket 経由で**監督者へ要求する**。`start` / `stop` は登録簿の `enabled` (= desired state) を監督者が書き換えて子へ反映する。監督者が起動していなければ、CLI は `supervisor_not_running` エラーと、`daemon supervise` または `service start` を実行するための hint を返す。監督者不在時に CLI が子を直接起動・判定する経路は持たない。登録簿の変化を定期的に舐めて差分を見つける作りにもせず、要求ごとに反映する (ポーリングは間隔に根拠が無く、往復を取りこぼす)。
 
 ### 4. `restart --all` は 1 台ずつ (rolling)

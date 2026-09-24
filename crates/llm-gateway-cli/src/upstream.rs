@@ -5,7 +5,6 @@
 
 use std::process::ExitCode;
 
-use llm_gateway::daemon::registry::Registry;
 use llm_gateway::status::{OfficialState, Report};
 
 use crate::destination;
@@ -36,7 +35,10 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
 
 fn status(args: &[String]) -> Result<ExitCode, Failure> {
     let parsed = parse(args)?;
-    let target = destination::resolve(&Registry::open(), parsed.unit.as_deref())?;
+    let target = destination::resolve(
+        &llm_gateway::daemon::registry::open(),
+        parsed.unit.as_deref(),
+    )?;
     let report: Report = destination::ask(
         &target,
         "status",

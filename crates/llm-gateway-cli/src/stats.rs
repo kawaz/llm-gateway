@@ -7,7 +7,6 @@
 use std::collections::BTreeSet;
 use std::process::ExitCode;
 
-use llm_gateway::daemon::registry::Registry;
 use llm_gateway::metering::TokenKind;
 use llm_gateway::stats::{Counters, InputBasis, Report, UNKNOWN_ORIGIN};
 
@@ -50,7 +49,10 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
         return Ok(ExitCode::SUCCESS);
     }
     let parsed = parse(args)?;
-    let target = destination::resolve(&Registry::open(), parsed.unit.as_deref())?;
+    let target = destination::resolve(
+        &llm_gateway::daemon::registry::open(),
+        parsed.unit.as_deref(),
+    )?;
     let report: Report = destination::ask(&target, "stats", &format!("?days={}", parsed.days))?;
     print!("{}", render(&report, parsed.by));
     Ok(ExitCode::SUCCESS)

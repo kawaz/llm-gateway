@@ -1,6 +1,6 @@
 //! 走らせる 1 台 (unit) の登録簿 (DR-0028 決定 2)。
 //!
-//! 1 unit 1 ファイル。`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml` に
+//! 1 unit 1 ファイル。`<状態ディレクトリ>/daemon/units/<name>.toml` に
 //! 設定ファイルの場所・実行ファイルの場所・`enabled` (desired state) を書く。
 //!
 //! 登録簿は**起動しない**。ここにあるのは「何を 1 台として数えるか」だけで、
@@ -77,11 +77,6 @@ impl Registry {
     /// 置き場を指して開く。ディレクトリは書くときに作る。
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
-    }
-
-    /// 既定の置き場で開く。
-    pub fn open() -> Self {
-        Self::at(default_dir())
     }
 
     pub fn dir(&self) -> &Path {
@@ -206,11 +201,9 @@ impl Registry {
     }
 }
 
-/// 既定の置き場。
-pub fn default_dir() -> PathBuf {
-    crate::config::default_state_dir()
-        .join("daemon")
-        .join("units")
+/// 既定の置き場。`state_dir` は利用側の状態ディレクトリ。
+pub fn default_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon").join("units")
 }
 
 /// 設定ファイルの名前から付ける既定の unit 名。
@@ -250,7 +243,7 @@ mod tests {
     fn unit(config: &str) -> Unit {
         Unit {
             config: PathBuf::from(config),
-            binary_path: PathBuf::from("/usr/local/bin/llm-gateway"),
+            binary_path: PathBuf::from("/usr/local/bin/unit"),
             enabled: true,
             added_at: "2026-09-09T00:00:00Z".to_owned(),
         }
@@ -412,14 +405,10 @@ mod tests {
         );
     }
 
-    /// 既定の置き場は state の下 (消えると再登録が要るので cache ではない)。
+    /// 既定の置き場は state の下 (消えると再登録が要るので、消してよい一時置き場ではない)。
     #[test]
     fn the_default_directory_sits_under_the_state_directory() {
-        let dir = default_dir();
-        assert!(
-            dir.ends_with("llm-gateway/daemon/units"),
-            "{}",
-            dir.display()
-        );
+        let dir = default_dir(Path::new("/state/app"));
+        assert!(dir.ends_with("app/daemon/units"), "{}", dir.display());
     }
 }

@@ -7,7 +7,6 @@
 use std::process::ExitCode;
 
 use llm_gateway::credential::time::{format_rfc3339_ms, to_unix_secs};
-use llm_gateway::daemon::registry::Registry;
 use llm_gateway::quota::{CredentialUsage, Report, Window};
 
 use crate::destination::{self, Target};
@@ -29,7 +28,10 @@ pub fn run(args: &[String]) -> Result<ExitCode, Failure> {
         return Ok(ExitCode::SUCCESS);
     }
     let parsed = parse(args)?;
-    let target = destination::resolve(&Registry::open(), parsed.unit.as_deref())?;
+    let target = destination::resolve(
+        &llm_gateway::daemon::registry::open(),
+        parsed.unit.as_deref(),
+    )?;
     let report: Report = ask(&target, parsed.refresh)?;
     print!("{}", render(&report));
     Ok(ExitCode::SUCCESS)
