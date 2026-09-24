@@ -1,6 +1,6 @@
 ---
 title: Error::Config が設定読み込み以外の失敗に流用されている
-status: open
+status: resolved
 category: bug
 created: 2026-09-23T18:21:09+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-24T16:29:56+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented:c741705c","dr/DR-0014#8","doc/MANUAL-error-table"]
 blocked_by:
 origin: 自リポ TODO
 ---

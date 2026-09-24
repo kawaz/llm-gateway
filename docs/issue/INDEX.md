@@ -4,7 +4,6 @@
 |---|---|---|---|---|
 | 2026-09-24 | bug | open | [keepalive-restore-test-double-send-in-ci](./2026-09-24-keepalive-restore-test-double-send-in-ci.md) | keepalive の復元テストが CI で 1 回だけ 2 回送出 (`2 != 1`) した真因が未特定 |
 | 2026-09-23 | bug | open | [codex-cli-traffic-recorded-as-unknown-origin](./2026-09-23-codex-cli-traffic-recorded-as-unknown-origin.md) | codex CLI 経由のトラフィックが origin `unknown` で記録され `codex` にならない |
-| 2026-09-23 | bug | open | [error-config-reused-for-non-config-failures](./2026-09-23-error-config-reused-for-non-config-failures.md) | Error::Config が設定読み込み以外の失敗 (SSE 読み取り・model 欠落・応答中断) に流用されている |
 | 2026-09-17 | design | open | [plan-command-routing-and-quota-forecast](./2026-09-17-plan-command-routing-and-quota-forecast.md) | plan command で routing 解決 + quota forecast を pull 型で出す |
 | 2026-09-15 | design | open | [store-layer-for-replaceable-persistence](./2026-09-15-store-layer-for-replaceable-persistence.md) | 永続化の器を Store 層として責務で切り、file backend を差し替え可能にする |
 | 2026-09-14 | task | open | [keepalive-absence-tests-can-pass-vacuously](./2026-09-14-keepalive-absence-tests-can-pass-vacuously.md) | keepalive の「何も送られない」テストが判断回数を検証せず vacuous に pass しうる |
