@@ -128,7 +128,7 @@ public = "<Ed25519 公開鍵 32 バイトの base64url>"
 
 `issued` の方向: access / refresh とも JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場は §5)。**発行の口は 2 つ** (kawaz 裁定 2026-09-24): 最初の 1 本 (bootstrap) は host 上の **CLI** が署名鍵ファイルを直接読んで refresh token を標準出力に出す (gateway は保存しない。kid ごとの最終発行時刻だけ DR-0010 の flock 下で記録)。refresh はアプリが自分で行うので **HTTP の token endpoint** (`POST /ns-<ns>/auth/token`、OAuth 2 の `grant_type=refresh_token` の形に合わせ、標準クライアントがそのまま使える) を持つ。access の寿命と refresh の rotation は §未確定の方向どおり。
 
-**Claude Code 向けの最初の運用は `jwt` 方式の長寿命 token** (kawaz 裁定 2026-09-24)。Claude Code 側に token を更新する仕組みが無いので `issued` の refresh は使えず、ns 設定で長寿命を許した JWT を CLI で鋳造して配り、ローテは手動 (新 kid を先に配って旧 kid を消す) で定期的に行う。ローテの周期と手順は runbook に書く。`issued` の HTTP endpoint は refresh を自前で回せるアプリが出た段階でよい。
+**Claude Code 向けの最初の運用は `jwt` 方式の長寿命 token** (kawaz 裁定 2026-09-24)。Claude Code 側に token を更新する仕組みが無いので `issued` の refresh は使えず、ns 設定で長寿命を許した JWT を CLI で鋳造して配り、ローテは手動 (新 kid を先に配って旧 kid を消す) で定期的に行う。ローテの周期と手順は runbook に書く (`docs/runbooks/ns-auth-jwt-rotation.md`、既定の周期は 180 日)。`issued` の HTTP endpoint は refresh を自前で回せるアプリが出た段階でよい。
 
 **helper CLI** (鍵ペア生成 + JWKS 断片の出力 + 手元での署名 + 上記の bootstrap 発行) を用意するが、**生成物を標準出力に出すだけで gateway は保存しない**。アプリの秘密鍵を gateway が作って持つ形にすると、§5 の「自前の秘密は `issued` 用の JWKS 1 つだけ」が崩れる。
 
