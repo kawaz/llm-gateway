@@ -1,21 +1,17 @@
 //! 認証情報を使える状態で渡す窓口。
 //!
-//! 期限が近ければ更新してから返す。同じ認証情報への同時要求は 1 回の更新に
-//! 束ね、全員が同じ結果を受け取る。束ねないと、並行リクエストの数だけ更新が
-//! 走り、後発が `refresh_token_reused` で弾かれて再ログインが要る状態に落ちる。
-//!
-//! 置き場は他のプロセスとも共有しているので、束ねるだけでは足りない。書き換え
-//! の間は置き場のロックで締め出し、読み出しでは控えの版を照合して相手の書き
-//! 込みに気づく (DR-0010)。
+//! 束ね方・締め出し・版の追従は [`super::refreshing`] が持つ。ここは OAuth の
+//! 更新 ([`OauthRefresher`]) と、取り出した値を upstream に載せる形
+//! ([`Credential`]) への写しを持つ。
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
-use tokio::sync::{RwLock, broadcast};
+use gateway_core::error::RefreshFailureClass;
 
-use crate::error::RefreshFailureClass;
-use crate::{Error, Result};
+use crate::Result;
 
+use super::refreshing::{self, Clock, Refresher};
 use super::time::{format_rfc3339, parse_rfc3339};
 use super::{CredentialId, CredentialPersistence, Payload, StoredCredential, oauth};
 
@@ -60,95 +56,88 @@ impl Credential {
     }
 }
 
-/// 更新の結果を待っている側へ配るための合図。
-#[derive(Debug, Clone)]
-struct RefreshFailure {
-    reason: String,
-    class: RefreshFailureClass,
+/// OAuth の refresh token で更新する。
+pub struct OauthRefresher {
+    http: reqwest::Client,
+    /// 更新先の差し替え口。テストで手元のサーバへ向けるために持つ。
+    token_url_override: Option<String>,
 }
 
-type RefreshSignal = broadcast::Sender<std::result::Result<(), RefreshFailure>>;
+impl Refresher for OauthRefresher {
+    type Value = StoredCredential;
 
-/// 待っている側へ配る言葉。
-///
-/// 更新の失敗は理由だけを渡す。丸ごと渡すと、受け取った側がもう一度
-/// [`Error::Refresh`] に包んで「更新に失敗しました: 更新に失敗しました: …」に
-/// なる。
-fn refresh_failure_of(e: &Error) -> RefreshFailure {
+    fn needs_refresh(&self, c: &StoredCredential, now_unix: i64) -> bool {
+        // 更新の口が無いもの (API キー認証) は、期限が過ぎていても更新に
+        // 走らない。走らせても直らず、失敗の理由が認証情報の期限切れから
+        // 「更新できません」にすり替わって原因が見えなくなる。
+        if c.payload.oauth_kind().is_none() {
+            return false;
+        }
+        match parse_rfc3339(c.payload.expired()) {
+            Some(exp) => exp - now_unix <= REFRESH_MARGIN_SECS,
+            // 期限が読めないものは更新しない。壊れた値を根拠に
+            // refresh token を使い切るほうが害が大きい。
+            None => false,
+        }
+    }
+
+    async fn refresh(
+        &self,
+        id: &CredentialId,
+        current: &StoredCredential,
+        now_unix: i64,
+    ) -> gateway_core::Result<StoredCredential> {
+        let (Some(kind), Some(refresh_token)) = (
+            current.payload.oauth_kind(),
+            current.payload.refresh_token(),
+        ) else {
+            return Err(gateway_core::Error::Refresh {
+                id: id.to_string(),
+                reason: "cannot refresh a non-OAuth credential. \
+Issue a new key and save the credential again"
+                    .to_owned(),
+                class: RefreshFailureClass::Degraded,
+            });
+        };
+        let resp = oauth::refresh_at(
+            &self.http,
+            id,
+            kind,
+            refresh_token,
+            self.token_url_override.as_deref(),
+        )
+        .await
+        .map_err(|e| refresh_error(id, e))?;
+
+        let mut next = current.clone();
+        apply_refresh(&mut next, resp, now_unix);
+        Ok(next)
+    }
+}
+
+/// 更新の失敗を汎用層の言葉へ写す。分類を持たない失敗は `Degraded`。
+fn refresh_error(id: &CredentialId, e: crate::Error) -> gateway_core::Error {
     match e {
-        Error::Refresh { reason, class, .. } => RefreshFailure {
-            reason: reason.clone(),
-            class: *class,
-        },
-        other => RefreshFailure {
+        crate::Error::Refresh { id, reason, class } => {
+            gateway_core::Error::Refresh { id, reason, class }
+        }
+        other => gateway_core::Error::Refresh {
+            id: id.to_string(),
             reason: other.to_string(),
             class: RefreshFailureClass::Degraded,
         },
     }
 }
 
-/// 控えの 1 件。読んだ時点の版を一緒に持つ。
-///
-/// 版を持たないと、他のプロセスが書いた結果に期限切れまで気づけない。
-#[derive(Clone)]
-struct Held {
-    value: Arc<StoredCredential>,
-    version: Option<u64>,
-}
-
 pub struct CredentialStore<P: CredentialPersistence> {
-    inner: Arc<Inner<P>>,
+    inner: refreshing::CredentialStore<P, OauthRefresher>,
 }
 
 /// 中身は共有されているので、複製しても同じ控え・同じ進行中の印を見る。
-///
-/// 要求から切り離した仕事 (裏で様子を聞きに行く等) へ持ち出すために要る。
 impl<P: CredentialPersistence> Clone for CredentialStore<P> {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-/// 共有される中身。
-///
-/// 更新は要求とは切り離した仕事として走らせるので、控えも進行中の印も
-/// 「誰か 1 人のもの」にできない。まとめて抱えて渡す。
-struct Inner<P: CredentialPersistence> {
-    persistence: P,
-    http: reqwest::Client,
-    /// 進行中の更新。同じ id への 2 人目以降はここに相乗りする。
-    ///
-    /// 待たない Mutex なのは、印を外すのが [`RefreshHandoff`] の [`Drop`] で、
-    /// そこで await できないため。持っている間にするのは印の出し入れだけで、
-    /// 待ちを挟まないので待たない錠で足りる。
-    in_flight: Mutex<HashMap<CredentialId, RefreshSignal>>,
-    /// 読み出しのたびにファイルを開かないための控え。
-    held: RwLock<HashMap<CredentialId, Held>>,
-    auth: RwLock<HashMap<CredentialId, crate::quota::AuthState>>,
-    clock: Clock,
-    /// 更新先の差し替え口。テストで手元のサーバへ向けるために持つ。
-    token_url_override: Option<String>,
-}
-
-/// 現在時刻の取り出し口。テストで固定するために挟んである。
-#[derive(Clone)]
-pub enum Clock {
-    System,
-    #[cfg(test)]
-    Fixed(i64),
-}
-
-impl Clock {
-    fn now_unix(&self) -> i64 {
-        match self {
-            Self::System => std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            #[cfg(test)]
-            Self::Fixed(t) => *t,
+            inner: self.inner.clone(),
         }
     }
 }
@@ -164,22 +153,19 @@ impl<P: CredentialPersistence> CredentialStore<P> {
         clock: Clock,
         token_url_override: Option<String>,
     ) -> Self {
+        let refresher = OauthRefresher {
+            http,
+            token_url_override,
+        };
         Self {
-            inner: Arc::new(Inner {
-                persistence,
-                http,
-                in_flight: Mutex::new(HashMap::new()),
-                held: RwLock::new(HashMap::new()),
-                auth: RwLock::new(HashMap::new()),
-                clock,
-                token_url_override,
-            }),
+            inner: refreshing::CredentialStore::with_clock(persistence, refresher, clock),
         }
     }
 
     /// 使える認証情報を返す。期限が近ければ更新してから返す。
     pub async fn acquire(&self, id: &CredentialId) -> Result<Credential> {
-        self.inner.acquire(id).await
+        let current = self.inner.acquire(id).await?;
+        Ok(to_credential(id, &current, self.inner.now_unix()))
     }
 
     /// login で得た token を、現在の内容を土台にして保存する。
@@ -187,18 +173,35 @@ impl<P: CredentialPersistence> CredentialStore<P> {
         &self,
         id: &CredentialId,
         kind: super::Kind,
-        tokens: &super::oauth::Tokens,
+        tokens: &oauth::Tokens,
     ) -> Result<StoredCredential> {
-        let guard = self.inner.lock(id).await?;
-        let credential = super::save_login(&self.inner.persistence, &guard, kind, tokens)?;
-        self.inner.remember(id, credential.clone()).await;
+        let saved = self
+            .inner
+            .update(id, |existing| {
+                Ok(Some(tokens.to_stored(kind, existing.ok().as_ref())))
+            })
+            .await?;
         self.inner.record_auth(id, &Ok(())).await;
-        Ok(credential)
+        Ok(saved.expect("login always writes"))
     }
 
     /// upstream が拒否した beta フラグを覚える (DR-0003)。
+    ///
+    /// 覚えないと同じ 400 を毎回踏む。時刻を一緒に置くのは、upstream が
+    /// 対応したときに自動で戻すため。
     pub async fn record_denied_beta(&self, id: &CredentialId, flags: &[String]) -> Result<()> {
-        self.inner.record_denied_beta(id, flags).await
+        if flags.is_empty() {
+            return Ok(());
+        }
+        let now = self.inner.now_unix();
+        self.inner
+            .update(id, |current| {
+                let mut next = current?;
+                next.ext.record_denied_beta(flags, now);
+                Ok(Some(next))
+            })
+            .await?;
+        Ok(())
     }
 
     /// 置き場に入っている今の版 (DR-0010)。控えではなく置き場を見る。
@@ -206,322 +209,20 @@ impl<P: CredentialPersistence> CredentialStore<P> {
     /// 中身を読まずに「他のプロセスが書き換えたか」を知るのに使う。
     /// 版を持たない置き場では常に `None` なので、変わっていない扱いになる。
     pub fn version(&self, id: &CredentialId) -> Option<u64> {
-        self.inner.persistence.version(id)
+        self.inner.version(id)
     }
+
     pub async fn auth_state(&self, id: &CredentialId) -> Option<crate::quota::AuthState> {
-        self.inner.auth.read().await.get(id).cloned()
+        self.inner.auth_state(id).await
     }
 }
 
-impl<P: CredentialPersistence> Inner<P> {
-    async fn acquire(self: &Arc<Self>, id: &CredentialId) -> Result<Credential> {
-        let current = self.read(id).await?;
-
-        if !self.needs_refresh(&current) {
-            return Ok(self.to_credential(id, &current));
-        }
-
-        self.refresh_once(id).await?;
-
-        let refreshed = self.read(id).await?;
-        Ok(self.to_credential(id, &refreshed))
-    }
-
-    /// upstream が拒否した beta フラグを覚える (DR-0003)。
-    ///
-    /// 覚えないと同じ 400 を毎回踏む。時刻を一緒に置くのは、upstream が
-    /// 対応したときに自動で戻すため。
-    async fn record_denied_beta(
-        self: &Arc<Self>,
-        id: &CredentialId,
-        flags: &[String],
-    ) -> Result<()> {
-        if flags.is_empty() {
-            return Ok(());
-        }
-        // 読んで直して書くまでの間、他のプロセスを締め出す。挟まれると、
-        // 相手が書いた更新を古い土台で上書きして消す。
-        let guard = self.lock(id).await?;
-
-        // 控えではなく置き場から積み直す。控えを土台にすると、別のプロセスが
-        // 更新した token を古い値で上書きして消す。
-        let current = self.reload_locked(&guard, id).await?;
-        let mut next = (*current).clone();
-        next.ext.record_denied_beta(flags, self.clock.now_unix());
-
-        self.persistence.store(&guard, &next)?;
-        self.remember(id, next).await;
-        Ok(())
-    }
-
-    /// 書き換えの権利を取る。手放すのは戻り値を落としたとき。
-    ///
-    /// 取れるまでの待ちはブロックするので、専用のスレッドへ逃がす。待ちの
-    /// 間は寝ていて、相手が手放した時点で起きる (様子を見に行かない)。
-    async fn lock(self: &Arc<Self>, id: &CredentialId) -> Result<P::Guard> {
-        let me = Arc::clone(self);
-        let owned = id.clone();
-        tokio::task::spawn_blocking(move || me.persistence.lock(&owned))
-            .await
-            .map_err(|e| Error::Credential {
-                id: id.to_string(),
-                reason: format!("could not wait for the credential lock: {e}"),
-            })?
-            .map_err(Error::from)
-    }
-
-    /// 現在の内容を返す。控えが今の版のままならそれを使う。
-    async fn read(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
-        let version = self.persistence.version(id);
-        if let Some(hit) = self.held.read().await.get(id) {
-            if hit.version == version {
-                return Ok(Arc::clone(&hit.value));
-            }
-            self.auth.write().await.remove(id);
-        }
-        self.reload(id).await
-    }
-
-    /// 置き場から読み直し、控えを入れ替える。
-    ///
-    /// 同じ置き場を複数のプロセスが共有しているので、控えだけを見ていると
-    /// 他のプロセスが書いた結果に気づけない。
-    async fn reload(&self, id: &CredentialId) -> Result<Arc<StoredCredential>> {
-        // 版を先に見る。読んだ後に見ると、読み終えてから書かれた中身を
-        // 「今の版」として覚え、その更新に気づけなくなる。逆の順なら、
-        // 取りこぼしても次の読み出しで版が食い違って読み直しになる。
-        let version = self.persistence.version(id);
-        let value = self.persistence.load(id)?;
-        Ok(self.hold(id, value, version).await)
-    }
-
-    /// 書き換えの権利の下で読み直し、控えを入れ替える。
-    ///
-    /// 書き込みの前と、refresh token を使う前は、ここを通って最新を掴む。
-    async fn reload_locked(
-        &self,
-        guard: &P::Guard,
-        id: &CredentialId,
-    ) -> Result<Arc<StoredCredential>> {
-        let version = self.persistence.version(id);
-        let value = self.persistence.reload(guard)?;
-        Ok(self.hold(id, value, version).await)
-    }
-
-    async fn hold(
-        &self,
-        id: &CredentialId,
-        value: StoredCredential,
-        version: Option<u64>,
-    ) -> Arc<StoredCredential> {
-        let value = Arc::new(value);
-        self.held.write().await.insert(
-            id.clone(),
-            Held {
-                value: Arc::clone(&value),
-                version,
-            },
-        );
-        value
-    }
-
-    /// 自分が書いた内容を控えに載せる。
-    ///
-    /// 版は書いた後に読む。書き換えの権利を持っている間しか呼ばないので、
-    /// この間に他のプロセスが割り込むことはない。
-    async fn remember(&self, id: &CredentialId, value: StoredCredential) {
-        let version = self.persistence.version(id);
-        self.held.write().await.insert(
-            id.clone(),
-            Held {
-                value: Arc::new(value),
-                version,
-            },
-        );
-    }
-
-    fn needs_refresh(&self, c: &StoredCredential) -> bool {
-        // 更新の口が無いもの (API キー認証) は、期限が過ぎていても更新に
-        // 走らない。走らせても直らず、失敗の理由が認証情報の期限切れから
-        // 「更新できません」にすり替わって原因が見えなくなる。
-        if c.payload.oauth_kind().is_none() {
-            return false;
-        }
-        match parse_rfc3339(c.payload.expired()) {
-            Some(exp) => exp - self.clock.now_unix() <= REFRESH_MARGIN_SECS,
-            // 期限が読めないものは更新しない。壊れた値を根拠に
-            // refresh token を使い切るほうが害が大きい。
-            None => false,
-        }
-    }
-
-    /// 進行中の印を開く。
-    ///
-    /// 毒 (持ち手が panic した印) は無視して中身を使う。入っているのは印だけ
-    /// で、途中まで書き換えた不整合な状態にならない。加えてここを開くのは
-    /// 後始末の [`Drop`] でもあり、そこで panic すると process ごと落ちる。
-    fn in_flight(&self) -> MutexGuard<'_, HashMap<CredentialId, RefreshSignal>> {
-        self.in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// 更新を 1 回だけ走らせ、その結果を待つ。
-    ///
-    /// 更新そのものは要求から切り離した仕事として走らせる。要求は途中で
-    /// 消える (クライアントが切る、上位が諦める) が、更新は途中で消えては
-    /// 困る — refresh token は 1 回しか使えないので、送った後に投げ出すと
-    /// 結果を受け取れないまま焼いたことになる。進行中の印を外すのも
-    /// 切り離した側なので、要求が消えても後続が待ちっぱなしにならない。
-    async fn refresh_once(self: &Arc<Self>, id: &CredentialId) -> Result<()> {
-        let mut result = {
-            let mut in_flight = self.in_flight();
-            match in_flight.get(id) {
-                // 先着がいれば、その結果を待つ側に回る。
-                Some(tx) => tx.subscribe(),
-                None => {
-                    let (tx, rx) = broadcast::channel(1);
-                    in_flight.insert(id.clone(), tx.clone());
-
-                    let me = Arc::clone(self);
-                    let owned = id.clone();
-                    tokio::spawn(async move {
-                        // 印を外して結果を配るのは handoff に任せる。仕事が
-                        // 途中で落ちても必ず通る道にしておかないと、待って
-                        // いる側が来ない合図を待ち続ける。
-                        let mut handoff = RefreshHandoff::new(Arc::clone(&me), owned.clone(), tx);
-                        let outcome = me.do_refresh(&owned).await;
-                        me.record_auth(&owned, &outcome).await;
-                        handoff.finish(outcome.as_ref().map(|_| ()).map_err(refresh_failure_of));
-                    });
-                    rx
-                }
-            }
-        };
-
-        match result.recv().await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(failure)) => Err(Error::Refresh {
-                id: id.to_string(),
-                reason: failure.reason,
-                class: failure.class,
-            }),
-            // 結果が配られる前に消えた = 更新できたか分からない。
-            Err(_) => Err(Error::Refresh {
-                id: id.to_string(),
-                reason: "did not receive the refresh result".to_owned(),
-                class: RefreshFailureClass::Degraded,
-            }),
-        }
-    }
-
-    async fn record_auth(&self, id: &CredentialId, outcome: &Result<()>) {
-        let observed_at_ms = crate::credential::time::to_unix_ms(self.clock.now_unix());
-        let (status, reason) = match outcome {
-            Ok(()) => (crate::quota::AuthStatus::Ok, None),
-            Err(error) => {
-                let failure = refresh_failure_of(error);
-                let status = match failure.class {
-                    RefreshFailureClass::ReloginRequired => {
-                        crate::quota::AuthStatus::ReloginRequired
-                    }
-                    RefreshFailureClass::Degraded => crate::quota::AuthStatus::Degraded,
-                };
-                (status, Some(failure.reason))
-            }
-        };
-        self.auth.write().await.insert(
-            id.clone(),
-            crate::quota::AuthState {
-                status,
-                reason,
-                hint: None,
-                login_path: None,
-                observed_at: observed_at_ms,
-            },
-        );
-    }
-
-    /// 実際の更新。保存まで済ませる。
-    ///
-    /// 控えではなく置き場から読み直してから入る。refresh token は 1 回しか
-    /// 使えないので、控えを信じて走ると、同じ置き場を共有する別のプロセスが
-    /// 既に使い切った値を送ることになる。
-    async fn do_refresh(self: &Arc<Self>, id: &CredentialId) -> Result<()> {
-        // 読み直しから保存までを丸ごと締め出す。同じ置き場を使う別のプロセスは
-        // ここで待たされ、権利を得た時点の読み直しで「相手が済ませた」と分かり、
-        // 更新に入らずに済む。束ねているのは同じプロセスの中だけなので、
-        // ここに来るのは 1 プロセスにつき 1 本。
-        let guard = self.lock(id).await?;
-
-        let current = self.reload_locked(&guard, id).await?;
-        let (Some(kind), Some(refresh_token)) = (
-            current.payload.oauth_kind(),
-            current.payload.refresh_token(),
-        ) else {
-            return Err(Error::Refresh {
-                id: id.to_string(),
-                reason: "cannot refresh a non-OAuth credential. \
-Issue a new key and save the credential again"
-                    .to_owned(),
-                class: RefreshFailureClass::Degraded,
-            });
-        };
-
-        // 読み直した時点で期限に余裕があるなら、別のプロセスが更新を済ませて
-        // いる。ここで走らせても、有効な refresh token を 1 つ捨てるだけ。
-        if !self.needs_refresh(&current) {
-            return Ok(());
-        }
-
-        let resp = match oauth::refresh_at(
-            &self.http,
-            id,
-            kind,
-            refresh_token,
-            self.token_url_override.as_deref(),
-        )
-        .await
-        {
-            Ok(resp) => resp,
-            // 断られた理由が「別のプロセスが先に使った」なら、その結果はもう
-            // 置き場にある。拾えたら回復し、拾えなければ元の理由を返す。
-            //
-            // Design rationale: 失敗の種別で振り分けていない。読み直して有効
-            // なら成功、古いままなら失敗、という判定は理由に依らず正しく、
-            // 種別を見分けるには理由の文字列を当てにするしかないため。
-            Err(e) => {
-                // 読み直せなかったときも断られた理由を返す。ここを `?` にすると
-                // 原因が「更新を断られた」から「置き場を読めない」にすり替わる。
-                let Ok(latest) = self.reload_locked(&guard, id).await else {
-                    return Err(e);
-                };
-                if self.needs_refresh(&latest) {
-                    return Err(e);
-                }
-                return Ok(());
-            }
-        };
-
-        let now = self.clock.now_unix();
-        let mut next = (*current).clone();
-        apply_refresh(&mut next, resp, now);
-
-        // 保存が先。ここで落ちると新しい token を失うが、控えだけ更新して
-        // 保存に失敗するよりはよい (次回起動時に古い token で動こうとして
-        // 弾かれ、原因が分からなくなる)。
-        self.persistence.store(&guard, &next)?;
-        self.remember(id, next).await;
-        Ok(())
-    }
-
-    fn to_credential(&self, id: &CredentialId, c: &StoredCredential) -> Credential {
-        Credential {
-            id: id.clone(),
-            token: Arc::from(c.payload.secret()),
-            account_id: c.payload.account_id().map(str::to_owned),
-            denied_beta: c.ext.denied_beta_at(self.clock.now_unix()),
-        }
+fn to_credential(id: &CredentialId, c: &StoredCredential, now_unix: i64) -> Credential {
+    Credential {
+        id: id.clone(),
+        token: Arc::from(c.payload.secret()),
+        account_id: c.payload.account_id().map(str::to_owned),
+        denied_beta: c.ext.denied_beta_at(now_unix),
     }
 }
 
@@ -547,53 +248,6 @@ fn apply_refresh(credential: &mut StoredCredential, response: oauth::RefreshResp
         tokens.id_token = Some(id_token);
     }
     credential.ext.last_refresh = format_rfc3339(now);
-}
-
-/// 切り離した更新の後始末。落ちるときに印を外して結果を配る。
-///
-/// 走り切った経路だけで後始末をすると、途中で panic した場合に印が残り、
-/// その認証情報を求めた全員が来ない合図を待ち続ける (process を入れ替える
-/// まで戻らない)。[`Drop`] に寄せておけば、走り切っても落ちても同じ道を通る。
-struct RefreshHandoff<P: CredentialPersistence> {
-    inner: Arc<Inner<P>>,
-    id: CredentialId,
-    tx: RefreshSignal,
-    /// 走り切った結果。無いまま落ちたら、途中で途切れたということ。
-    outcome: Option<std::result::Result<(), RefreshFailure>>,
-}
-
-impl<P: CredentialPersistence> RefreshHandoff<P> {
-    fn new(inner: Arc<Inner<P>>, id: CredentialId, tx: RefreshSignal) -> Self {
-        Self {
-            inner,
-            id,
-            tx,
-            outcome: None,
-        }
-    }
-
-    /// 走り切った結果を預ける。配るのは落ちるとき。
-    fn finish(&mut self, outcome: std::result::Result<(), RefreshFailure>) {
-        self.outcome = Some(outcome);
-    }
-}
-
-impl<P: CredentialPersistence> Drop for RefreshHandoff<P> {
-    fn drop(&mut self) {
-        // 印を外してから配る。逆にすると、起きた側が残った印を見て次の
-        // 更新に入れなくなる。
-        self.inner.in_flight().remove(&self.id);
-
-        // 途切れた理由は追わない。待っている側にできるのは「もう一度頼む」
-        // だけなので、panic の中身を運んでも打つ手は変わらない。
-        let outcome = self.outcome.take().unwrap_or_else(|| {
-            Err(RefreshFailure {
-                reason: "the refresh task ended unexpectedly".to_owned(),
-                class: RefreshFailureClass::Degraded,
-            })
-        });
-        let _ = self.tx.send(outcome);
-    }
 }
 
 #[cfg(test)]
@@ -1051,7 +705,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Watched::open(dir.path(), "behind", &log),
             Some(&server),
         ));
-        let waiting = behind.inner.persistence.bell();
+        let waiting = behind.inner.persistence().bell();
 
         let first = {
             let (store, id) = (Arc::clone(&ahead), id.clone());
@@ -1119,7 +773,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             Watched::open(dir.path(), "record", &log),
             None,
         ));
-        let waiting = recording.inner.persistence.bell();
+        let waiting = recording.inner.persistence().bell();
 
         let refresh = {
             let (store, id) = (Arc::clone(&refreshing), id.clone());
@@ -1199,7 +853,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(got.bearer(), "Bearer at-1");
         assert_eq!(server.hits(), 1, "the same refresh token is not hit twice");
         assert!(
-            store.inner.in_flight().is_empty(),
+            store.inner.refreshes_in_flight() == 0,
             "a leftover in-progress mark makes every later attempt wait forever"
         );
     }
@@ -1244,7 +898,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-1");
         assert_eq!(
-            store.inner.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence().stores.load(Ordering::SeqCst),
             0,
             "not refreshed while still valid"
         );
@@ -1257,14 +911,23 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert!(
             !store
                 .inner
-                .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1)))
+                .refresher()
+                .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS + 1)), NOW)
         );
-        assert!(store.inner.needs_refresh(&cred(&at(REFRESH_MARGIN_SECS))));
         assert!(
-            store.inner.needs_refresh(&cred(&at(0))),
+            store
+                .inner
+                .refresher()
+                .needs_refresh(&cred(&at(REFRESH_MARGIN_SECS)), NOW)
+        );
+        assert!(
+            store.inner.refresher().needs_refresh(&cred(&at(0)), NOW),
             "exactly at expiry"
         );
-        assert!(store.inner.needs_refresh(&cred(&at(-1))), "already expired");
+        assert!(
+            store.inner.refresher().needs_refresh(&cred(&at(-1)), NOW),
+            "already expired"
+        );
     }
 
     /// 期限が壊れていても更新に走らない。refresh token を無駄に使わない。
@@ -1272,7 +935,10 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     fn unreadable_expiry_does_not_trigger_refresh() {
         let store = store_with(cred(""));
         for bad in ["", "not-a-date", "2026-07", "yesterday"] {
-            assert!(!store.inner.needs_refresh(&cred(bad)), "{bad:?}");
+            assert!(
+                !store.inner.refresher().needs_refresh(&cred(bad), NOW),
+                "{bad:?}"
+            );
         }
     }
 
@@ -1283,8 +949,18 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     #[test]
     fn api_key_is_never_refreshed() {
         let store = store_with(api_key_cred(&at(-1)));
-        assert!(!store.inner.needs_refresh(&api_key_cred(&at(-1))));
-        assert!(!store.inner.needs_refresh(&api_key_cred(&at(0))));
+        assert!(
+            !store
+                .inner
+                .refresher()
+                .needs_refresh(&api_key_cred(&at(-1)), NOW)
+        );
+        assert!(
+            !store
+                .inner
+                .refresher()
+                .needs_refresh(&api_key_cred(&at(0)), NOW)
+        );
     }
 
     /// それでも更新を頼まれたら、何をすればよいかを言って断る。
@@ -1293,7 +969,8 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let store = store_with(api_key_cred(&at(-1)));
         let err = store
             .inner
-            .do_refresh(&CredentialId::new("c"))
+            .refresher()
+            .refresh(&CredentialId::new("c"), &api_key_cred(&at(-1)), NOW)
             .await
             .unwrap_err()
             .to_string();
@@ -1307,7 +984,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let store = store_with(api_key_cred(&at(-1)));
         let got = store.acquire(&CredentialId::new("c")).await.unwrap();
         assert_eq!(got.api_key(), "ak-1");
-        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence().stores.load(Ordering::SeqCst), 0);
     }
 
     /// 拒否された beta フラグを覚えて保存する。
@@ -1321,7 +998,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .await
             .unwrap();
 
-        let saved = store.inner.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence().current.lock().unwrap().clone();
         assert_eq!(
             saved
                 .ext
@@ -1331,7 +1008,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             &format_rfc3339(NOW),
             "the checked time is recorded alongside it"
         );
-        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.persistence().stores.load(Ordering::SeqCst), 1);
     }
 
     /// 覚えることが無ければ書かない (無駄な書き込みで競合を増やさない)。
@@ -1342,7 +1019,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .record_denied_beta(&CredentialId::new("c"), &[])
             .await
             .unwrap();
-        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence().stores.load(Ordering::SeqCst), 0);
     }
 
     /// 取り出した認証情報には、期限内の拒否リストだけが乗る。
@@ -1392,7 +1069,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             "everyone fails because the refresh target is unreachable"
         );
         assert!(
-            store.inner.in_flight().is_empty(),
+            store.inner.refreshes_in_flight() == 0,
             "a leftover in-progress mark makes every later attempt wait forever"
         );
     }
@@ -1408,9 +1085,9 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-1", "the new token is returned");
         assert_eq!(server.hits(), 1);
-        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 1);
+        assert_eq!(store.inner.persistence().stores.load(Ordering::SeqCst), 1);
 
-        let saved = store.inner.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence().current.lock().unwrap().clone();
         assert_eq!(saved.payload.secret(), "at-1");
         assert_eq!(
             saved.payload.refresh_token(),
@@ -1449,7 +1126,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(server.hits(), 1, "the refresh target is hit only once");
         assert_eq!(
-            store.inner.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence().stores.load(Ordering::SeqCst),
             1,
             "saved only once too"
         );
@@ -1480,7 +1157,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         let id = CredentialId::new("c");
 
         assert!(store.acquire(&id).await.is_err());
-        assert!(store.inner.in_flight().is_empty());
+        assert!(store.inner.refreshes_in_flight() == 0);
 
         // 2 回目も同じように失敗する (待ちっぱなしにならない)。
         assert!(store.acquire(&id).await.is_err());
@@ -1507,7 +1184,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert!(failed.contains("unexpectedly"), "{failed}");
         assert_eq!(server.hits(), 0, "fails before reaching the refresh target");
         assert!(
-            store.inner.in_flight().is_empty(),
+            store.inner.refreshes_in_flight() == 0,
             "a leftover mark makes every later attempt wait forever"
         );
 
@@ -1537,7 +1214,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
 
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
         assert_eq!(server.hits(), 0, "does not hit the refresh target");
-        assert_eq!(store.inner.persistence.stores.load(Ordering::SeqCst), 0);
+        assert_eq!(store.inner.persistence().stores.load(Ordering::SeqCst), 0);
     }
 
     /// 断られても、置き場が新しくなっていれば回復する。
@@ -1556,7 +1233,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
         assert_eq!(got.bearer(), "Bearer at-elsewhere");
         assert_eq!(server.hits(), 1, "tried once before being denied");
         assert_eq!(
-            store.inner.persistence.stores.load(Ordering::SeqCst),
+            store.inner.persistence().stores.load(Ordering::SeqCst),
             0,
             "merely observed, so it does not write it back itself"
         );
@@ -1577,7 +1254,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .to_string();
 
         assert!(err.contains("log in again"), "{err}");
-        assert!(store.inner.in_flight().is_empty());
+        assert!(store.inner.refreshes_in_flight() == 0);
     }
 
     /// refresh の最終結果は失敗分類と時刻を記録し、次の成功で ok に遷移して理由を消す。
@@ -1585,7 +1262,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     async fn auth_state_moves_from_relogin_required_to_ok() {
         let store = store_sharing(Spy::new(cred(&at(3600))));
         let id = CredentialId::new("c");
-        let rejected = Err(Error::Refresh {
+        let rejected = Err(gateway_core::Error::Refresh {
             id: id.to_string(),
             reason: "token rejected; run `llm-gateway login --type claude_oauth c`".to_owned(),
             class: RefreshFailureClass::ReloginRequired,
@@ -1622,7 +1299,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
     async fn transient_refresh_failure_records_degraded_auth() {
         let store = store_sharing(Spy::new(cred(&at(3600))));
         let id = CredentialId::new("c");
-        let transient = Err(Error::Refresh {
+        let transient = Err(gateway_core::Error::Refresh {
             id: id.to_string(),
             reason: "the refresh endpoint returned 503; this may be a transient failure".to_owned(),
             class: RefreshFailureClass::Degraded,
@@ -1649,7 +1326,7 @@ content-length: {}\r\nconnection: close\r\n\r\n{body}",
             .await
             .unwrap();
 
-        let saved = store.inner.persistence.current.lock().unwrap().clone();
+        let saved = store.inner.persistence().current.lock().unwrap().clone();
         assert_eq!(
             saved.payload.secret(),
             "at-elsewhere",

@@ -9,6 +9,7 @@ use crate::Result;
 
 pub mod file;
 pub mod oauth;
+pub mod refreshing;
 pub mod store;
 pub mod stored;
 pub use gateway_core::credential::time;
