@@ -41,6 +41,12 @@ DR-0009 の credential 切替は「上流に断られたら別経路を試す」
 - 実 request の観測 (feature gate + 枠の壁が前提で `-p` では使えない。tap / events はヘッダを記録しないので `--debug` ログか別の観測口が要る)
 - 課金 (表示は「uses your weekly limit」まで)
 
+### 補足 (kawaz 2026-09-25)
+
+X の投稿の読み: `/low-priority` は **5h 枠の壁に当たった後も (遅くてよければ) 作業を続けられる機能で、週枠を消費する**。binary の文言「Continue now at lower priority (uses your weekly limit)」「You've used this week's lower-priority allowance」と整合 (低優先度で使える量にも週の上限がある)。
+
+含意: slow の request は 7d 枠を削るので、DR-0018 (spend_down) / DR-0019 (pace_cap) の判断とも噛み合わせが要る。裁定点に追加: slow 付き request を pace_cap の階段予算の対象にするか (本人が週枠の前借りを選んでいるので gateway が抑えるのは二重制限)、それとも通常どおり抑えるか。
+
 ## 受け入れ条件
 
 - [ ] slow request の扱いを DR-0009 の追補 (または新 DR) として裁定
