@@ -1,6 +1,6 @@
 ---
 title: ns 認証 token 方式の固定文字列比較が定数時間でない
-status: open
+status: resolved
 category: bug
 created: 2026-09-24T16:05:18+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-09-24T16:29:34+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:実装 (ee817e48): token 方式の照合を SHA-256 経由の subtle::ConstantTimeEq に (長さ差も一定時間)。既存試験は同名で緑"]
 blocked_by:
 origin: 自リポ TODO
 ---
