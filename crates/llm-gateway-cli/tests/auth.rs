@@ -102,6 +102,30 @@ fn a_signed_token_passes_the_gateway_check() {
     assert_eq!(verified.kid, kid);
 }
 
+/// 長すぎる `--ttl` は、期限が桁あふれする前に引数の誤りとして断る。
+#[test]
+fn an_overlong_ttl_is_refused() {
+    let private = stdout(&["auth", "keygen"], "");
+    for ttl in ["9223372036854775807s", "106751991167301d"] {
+        let out = run(&["auth", "sign", "--sub", "x", "--ttl", ttl], &private);
+        assert!(!out.status.success(), "{ttl}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("ttl"),
+            "{ttl}"
+        );
+    }
+}
+
+/// `--` はオプションの終わり。`auth` は位置引数を取らないので、続きがあれば断る。
+#[test]
+fn a_double_dash_ends_the_options() {
+    let private = stdout(&["auth", "keygen"], "");
+    assert!(run(&["auth", "jwks", "--"], &private).status.success());
+    let out = run(&["auth", "jwks", "--", "extra"], &private);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("extra"));
+}
+
 /// 足りない引数は、標準入力を待たずに言う。help は引数なしでも出る。
 #[test]
 fn missing_arguments_are_named() {

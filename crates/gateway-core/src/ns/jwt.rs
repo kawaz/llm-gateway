@@ -148,31 +148,42 @@ impl JwtAuth {
         key.verify_strict(signed.as_bytes(), &Signature::from_bytes(&sig))
             .map_err(|_| Reason::BadSignature)?;
 
+        // 時刻の計算は i128 で行う。claim は署名済みでも任意の i64 を持てるので、
+        // i64 のまま足し引きすると端の値で桁あふれし、判定が逆転しうる。
         let claims = decode_json(payload_b64)?;
-        let exp = claims
-            .get("exp")
-            .and_then(Value::as_i64)
-            .ok_or(Reason::Malformed)?;
-        if now_secs > exp + SKEW_SECS {
+        let time = |name: &str| -> Result<Option<i128>, Reason> {
+            match claims.get(name) {
+                None => Ok(None),
+                Some(v) => v
+                    .as_i64()
+                    .map(|t| Some(i128::from(t)))
+                    .ok_or(Reason::Malformed),
+            }
+        };
+        let (now, skew, max_ttl) = (
+            i128::from(now_secs),
+            i128::from(SKEW_SECS),
+            i128::from(self.max_ttl_secs),
+        );
+        let exp = time("exp")?.ok_or(Reason::Malformed)?;
+        if now > exp + skew {
             return Err(Reason::Expired);
         }
-        if exp - now_secs > self.max_ttl_secs {
+        if exp - now > max_ttl {
             return Err(Reason::TtlExceeded);
         }
-        if let Some(iat) = claims.get("iat") {
-            let iat = iat.as_i64().ok_or(Reason::Malformed)?;
-            if iat > now_secs + SKEW_SECS {
+        if let Some(iat) = time("iat")? {
+            if iat > now + skew {
                 return Err(Reason::NotYetValid);
             }
-            if exp - iat > self.max_ttl_secs {
+            if exp - iat > max_ttl {
                 return Err(Reason::TtlExceeded);
             }
         }
-        if let Some(nbf) = claims.get("nbf") {
-            let nbf = nbf.as_i64().ok_or(Reason::Malformed)?;
-            if now_secs + SKEW_SECS < nbf {
-                return Err(Reason::NotYetValid);
-            }
+        if let Some(nbf) = time("nbf")?
+            && now + skew < nbf
+        {
+            return Err(Reason::NotYetValid);
         }
         let subject = claims
             .get("sub")
@@ -404,6 +415,63 @@ pub(crate) mod tests {
         );
         let unsigned = format!("{}.", token.rsplit_once('.').unwrap().0);
         assert!(auth().verify(&unsigned, NOW).is_err());
+    }
+
+    /// 時刻の claim が i64 の端の値でも、桁あふれせずに断る。
+    #[test]
+    fn extreme_times_are_refused_without_overflow() {
+        for c in [
+            json!({"sub": "m", "exp": i64::MAX}),
+            json!({"sub": "m", "exp": i64::MIN}),
+            json!({"sub": "m", "exp": NOW + 10, "iat": i64::MIN}),
+            json!({"sub": "m", "exp": NOW + 10, "iat": i64::MAX}),
+            json!({"sub": "m", "exp": NOW + 10, "nbf": i64::MAX}),
+        ] {
+            let token = sign(&signing_key(1), &header(), &c);
+            assert!(auth().verify(&token, NOW).is_err(), "{c}");
+            // 今が端の値でも落ちない (結果は問わない。桁あふれしないことを見る)。
+            let _ = auth().verify(&token, i64::MAX);
+            let _ = auth().verify(&token, i64::MIN);
+        }
+    }
+
+    /// 古典的な alg 取り違え: 公開鍵のバイト列を HMAC の鍵にして、HS256 で正しく
+    /// 署名した token。検証の方法は鍵の型で決まるので、署名を見る前に断る。
+    #[test]
+    fn an_hs256_token_keyed_with_the_public_key_is_refused() {
+        use sha2::{Digest as _, Sha256};
+        fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+            let mut block = [0u8; 64];
+            if key.len() > 64 {
+                block[..32].copy_from_slice(&Sha256::digest(key));
+            } else {
+                block[..key.len()].copy_from_slice(key);
+            }
+            let pad = |byte: u8| block.map(|b| b ^ byte);
+            let inner = Sha256::new()
+                .chain_update(pad(0x36))
+                .chain_update(message)
+                .finalize();
+            Sha256::new()
+                .chain_update(pad(0x5c))
+                .chain_update(inner)
+                .finalize()
+                .into()
+        }
+        let public = signing_key(1).verifying_key();
+        let head = B64.encode(br#"{"alg":"HS256","kid":"k1"}"#);
+        let body = B64.encode(serde_json::to_vec(&claims()).unwrap());
+        let input = format!("{head}.{body}");
+        for key in [
+            public.to_bytes().to_vec(),
+            public_key_text(&public).into_bytes(),
+        ] {
+            let token = format!(
+                "{input}.{}",
+                B64.encode(hmac_sha256(&key, input.as_bytes()))
+            );
+            assert_eq!(auth().verify(&token, NOW), Err(Reason::AlgMismatch));
+        }
     }
 
     #[test]

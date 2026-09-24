@@ -180,6 +180,7 @@ sign options:
 
 global options:
   --help, -h        show this help
+  --                end of options (auth commands take no other arguments)
 ";
 
 /// help を求められているか。

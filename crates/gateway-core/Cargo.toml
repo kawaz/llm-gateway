@@ -24,5 +24,7 @@ reqwest = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# jwt の試験で、HS256 の取り違え攻撃の token を手で作る。
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 axum = { workspace = true }

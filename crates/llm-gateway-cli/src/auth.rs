@@ -60,6 +60,16 @@ fn parse(args: &[String], one: &[&str], many: &[&str]) -> Result<Parsed, Failure
     let mut parsed = Parsed::default();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
+        // `--` から後ろは位置引数。`auth` の命令は位置引数を取らないので、何か
+        // 続けば断る (オプションと取り違えたまま黙って進まない)。
+        if arg == "--" {
+            if let Some(extra) = it.next() {
+                return Err(Failure::from(format!(
+                    "`{extra}` is not expected; `auth` commands take options only"
+                )));
+            }
+            break;
+        }
         match split(arg) {
             Some((key, inline)) if one.contains(&key) => {
                 let value = take_value(key, inline, &mut it)?;
@@ -162,7 +172,10 @@ fn sign(parsed: &Parsed) -> Result<String, Failure> {
         .map_err(|e| Failure::from(format!("--ttl: {e}")))?;
     let (kid, key) = read_key(parsed)?;
     let now = llm_gateway::credential::time::now_unix();
-    let mut claims = json!({"sub": subject, "iat": now, "exp": now + ttl});
+    let exp = now
+        .checked_add(ttl)
+        .ok_or_else(|| Failure::from("--ttl is too long to put an expiry on the token"))?;
+    let mut claims = json!({"sub": subject, "iat": now, "exp": exp});
     if let Some(iss) = parsed.get("iss") {
         claims["iss"] = json!(iss);
     }
