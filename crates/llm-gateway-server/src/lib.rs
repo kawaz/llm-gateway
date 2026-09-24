@@ -859,8 +859,8 @@ async fn passthrough<P: CredentialPersistence + 'static>(
             subject: None,
             kid: None,
         },
-        Authorization::WrongToken => {
-            return rejection(ns, ns_name, &parts.headers)
+        refused @ (Authorization::WrongToken | Authorization::Rejected(_)) => {
+            return denied(ns_name, &refused)
                 .unwrap_or_else(|| StatusCode::UNAUTHORIZED.into_response());
         }
     };
@@ -1115,7 +1115,15 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    match ns.auth.verify(name, presented) {
+    denied(name, &ns.auth.verify(name, presented))
+}
+
+/// 認証の結果が「通さない」なら返す応答。
+///
+/// `jwt` 方式で通らなかった理由はログにだけ残し、応答では区別しない (kid の
+/// 有無や期限切れを外から探らせない)。
+fn denied(name: &str, verdict: &Authorization) -> Option<Response> {
+    match verdict {
         Authorization::Accepted(_) | Authorization::Open => None,
         Authorization::WrongToken => Some(refused(
             name,
@@ -1123,6 +1131,20 @@ fn rejection(ns: &Namespace, name: &str, headers: &HeaderMap) -> Option<Response
             "authentication_error",
             &format!("namespace `{name}` has the wrong token"),
         )),
+        Authorization::Rejected(reason) => {
+            warn!(ns = %name, reason = %reason, "refused a namespace token");
+            let mut response = refused(
+                name,
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                &format!("namespace `{name}` did not accept the token"),
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Bearer error=\"invalid_token\""),
+            );
+            Some(response)
+        }
     }
 }
 

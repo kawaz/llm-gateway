@@ -258,6 +258,7 @@ impl From<Namespace> for NamespaceRepr {
         let (auth, auth_token) = match n.auth {
             NsAuth::Open => (None, None),
             NsAuth::Token(token) => (None, Some(token)),
+            NsAuth::Jwt(_) => unreachable!("the jwt method is not read from the configuration yet"),
         };
         Self {
             filter: n.filter,

@@ -1,0 +1,411 @@
+//! namespace 認証の `jwt` 方式 (DR-0030 §6)。
+//!
+//! JWS compact (`b64(header).b64(payload).b64(sig)`) を自前で読み、Ed25519 で
+//! 検証する。**alg は kid ごとに設定で固定し、ヘッダの `alg` は照合にしか使わない**
+//! — 鍵の型 ([`VerifyingKey`]) が alg そのものなので、ヘッダの申告で検証の
+//! 方法が変わる経路が構造上無い。
+//!
+//! 失敗の理由 ([`Reason`]) は呼び出し側のログのためだけに返す。応答で区別すると、
+//! kid の有無や期限切れを外から探らせることになる。
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use ed25519_dalek::{Signature, VerifyingKey};
+use serde_json::Value;
+
+/// 時計の揺れの許し (秒)。
+pub const SKEW_SECS: i64 = 60;
+
+/// `sub` の長さの上限 (バイト)。知らせのキーになるので長さを抑える。
+const MAX_SUBJECT_LEN: usize = 128;
+
+/// 通さなかった理由。応答には出さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// 3 段に割れない、base64url / JSON として読めない、必須の claim が無い等。
+    Malformed,
+    /// ヘッダの `kid` が無い、または設定に無い。
+    UnknownKid,
+    /// ヘッダの `alg` が kid の設定値と違う (`none` を含む)。
+    AlgMismatch,
+    /// 理解できない拡張 (`crit`) を要求している。
+    Crit,
+    /// 署名が合わない。
+    BadSignature,
+    /// `exp` を過ぎている。
+    Expired,
+    /// `nbf` より前、または `iat` が先の時刻。
+    NotYetValid,
+    /// 寿命が `max_ttl` を超える。
+    TtlExceeded,
+    /// `sub` / `iss` / `aud` が要件に合わない。
+    Claims,
+}
+
+impl Reason {
+    /// ログに出す語。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::UnknownKid => "unknown_kid",
+            Self::AlgMismatch => "alg_mismatch",
+            Self::Crit => "crit",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::TtlExceeded => "ttl_exceeded",
+            Self::Claims => "claims",
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// 検査を通った token の主体。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    pub subject: String,
+    pub kid: String,
+}
+
+/// `jwt` 方式の設定。
+#[derive(Clone, PartialEq, Eq)]
+pub struct JwtAuth {
+    /// kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
+    pub keys: BTreeMap<String, VerifyingKey>,
+    /// 受ける寿命の上限 (秒)。`exp - now` (と `iat` があれば `exp - iat`) で測る。
+    pub max_ttl_secs: i64,
+    /// 書いたら `iss` の一致を要求する。
+    pub iss: Option<String>,
+    /// 書いたら `aud` (文字列か配列) に含まれることを要求する。
+    pub aud: Option<String>,
+}
+
+impl fmt::Debug for JwtAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwtAuth")
+            .field("kids", &self.keys.keys().collect::<Vec<_>>())
+            .field("max_ttl_secs", &self.max_ttl_secs)
+            .field("iss", &self.iss)
+            .field("aud", &self.aud)
+            .finish()
+    }
+}
+
+/// 設定に書く公開鍵 (Ed25519 の 32 バイトの base64url、パディング無し) を読む。
+pub fn parse_public_key(raw: &str) -> Result<VerifyingKey, String> {
+    let bytes = B64
+        .decode(raw.trim())
+        .map_err(|e| format!("the public key is not base64url without padding: {e}"))?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|b: Vec<u8>| format!("an Ed25519 public key is 32 bytes, not {}", b.len()))?;
+    VerifyingKey::from_bytes(&bytes).map_err(|e| format!("not an Ed25519 public key: {e}"))
+}
+
+impl JwtAuth {
+    /// token を検査する。`now_secs` は unix 秒。
+    ///
+    /// 順序: 形 → ヘッダ (kid / alg / crit) → 署名 → claim。claim は署名が通って
+    /// から読む (誰が書いたか分からない値を解釈しない)。
+    pub fn verify(&self, token: &str, now_secs: i64) -> Result<Verified, Reason> {
+        let mut parts = token.split('.');
+        let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Reason::Malformed);
+        };
+
+        let header = decode_json(header_b64)?;
+        let kid = header
+            .get("kid")
+            .and_then(Value::as_str)
+            .ok_or(Reason::UnknownKid)?;
+        let key = self.keys.get(kid).ok_or(Reason::UnknownKid)?;
+        if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
+            return Err(Reason::AlgMismatch);
+        }
+        if header.get("crit").is_some() {
+            return Err(Reason::Crit);
+        }
+
+        let sig: [u8; 64] = B64
+            .decode(sig_b64)
+            .map_err(|_| Reason::Malformed)?
+            .try_into()
+            .map_err(|_| Reason::BadSignature)?;
+        // 署名の入力は受け取った先頭 2 段の生のバイト列 (再エンコードしない)。
+        let signed = &token[..header_b64.len() + 1 + payload_b64.len()];
+        key.verify_strict(signed.as_bytes(), &Signature::from_bytes(&sig))
+            .map_err(|_| Reason::BadSignature)?;
+
+        let claims = decode_json(payload_b64)?;
+        let exp = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .ok_or(Reason::Malformed)?;
+        if now_secs > exp + SKEW_SECS {
+            return Err(Reason::Expired);
+        }
+        if exp - now_secs > self.max_ttl_secs {
+            return Err(Reason::TtlExceeded);
+        }
+        if let Some(iat) = claims.get("iat") {
+            let iat = iat.as_i64().ok_or(Reason::Malformed)?;
+            if iat > now_secs + SKEW_SECS {
+                return Err(Reason::NotYetValid);
+            }
+            if exp - iat > self.max_ttl_secs {
+                return Err(Reason::TtlExceeded);
+            }
+        }
+        if let Some(nbf) = claims.get("nbf") {
+            let nbf = nbf.as_i64().ok_or(Reason::Malformed)?;
+            if now_secs + SKEW_SECS < nbf {
+                return Err(Reason::NotYetValid);
+            }
+        }
+        let subject = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .ok_or(Reason::Malformed)?;
+        if subject.is_empty()
+            || subject.len() > MAX_SUBJECT_LEN
+            || subject.chars().any(char::is_control)
+        {
+            return Err(Reason::Claims);
+        }
+        if let Some(iss) = &self.iss
+            && claims.get("iss").and_then(Value::as_str) != Some(iss.as_str())
+        {
+            return Err(Reason::Claims);
+        }
+        if let Some(aud) = &self.aud {
+            let named = match claims.get("aud") {
+                Some(Value::String(one)) => one == aud,
+                Some(Value::Array(many)) => many.iter().any(|v| v.as_str() == Some(aud)),
+                _ => false,
+            };
+            if !named {
+                return Err(Reason::Claims);
+            }
+        }
+        Ok(Verified {
+            subject: subject.to_owned(),
+            kid: kid.to_owned(),
+        })
+    }
+}
+
+fn decode_json(part: &str) -> Result<Value, Reason> {
+    let bytes = B64.decode(part).map_err(|_| Reason::Malformed)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| Reason::Malformed)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(Reason::Malformed)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use serde_json::json;
+
+    pub(crate) const NOW: i64 = 1_790_158_500;
+
+    pub(crate) fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// ヘッダと claim を署名した token を作る。
+    pub(crate) fn sign(key: &SigningKey, header: &Value, claims: &Value) -> String {
+        let head = B64.encode(serde_json::to_vec(header).unwrap());
+        let body = B64.encode(serde_json::to_vec(claims).unwrap());
+        let input = format!("{head}.{body}");
+        let sig = key.sign(input.as_bytes());
+        format!("{input}.{}", B64.encode(sig.to_bytes()))
+    }
+
+    pub(crate) fn auth() -> JwtAuth {
+        JwtAuth {
+            keys: [("k1".to_owned(), signing_key(1).verifying_key())].into(),
+            max_ttl_secs: 86_400,
+            iss: None,
+            aud: None,
+        }
+    }
+
+    fn header() -> Value {
+        json!({"alg": "EdDSA", "kid": "k1", "typ": "JWT"})
+    }
+
+    fn claims() -> Value {
+        json!({"sub": "mbp", "exp": NOW + 3600, "iat": NOW})
+    }
+
+    #[test]
+    fn a_signed_token_round_trips() {
+        let token = sign(&signing_key(1), &header(), &claims());
+        assert_eq!(
+            auth().verify(&token, NOW),
+            Ok(Verified {
+                subject: "mbp".into(),
+                kid: "k1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let token = sign(&signing_key(1), &header(), &claims());
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let forged =
+            B64.encode(serde_json::to_vec(&json!({"sub": "root", "exp": NOW + 3600})).unwrap());
+        parts[1] = &forged;
+        assert_eq!(
+            auth().verify(&parts.join("."), NOW),
+            Err(Reason::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_token_signed_by_another_key_is_refused() {
+        let token = sign(&signing_key(2), &header(), &claims());
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::BadSignature));
+    }
+
+    #[test]
+    fn an_expired_token_is_refused_after_the_skew() {
+        let c = json!({"sub": "mbp", "exp": NOW - SKEW_SECS});
+        let token = sign(&signing_key(1), &header(), &c);
+        assert!(auth().verify(&token, NOW).is_ok(), "within the skew");
+        assert_eq!(auth().verify(&token, NOW + 1), Err(Reason::Expired));
+    }
+
+    #[test]
+    fn an_unknown_kid_is_refused() {
+        let token = sign(
+            &signing_key(1),
+            &json!({"alg": "EdDSA", "kid": "other"}),
+            &claims(),
+        );
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::UnknownKid));
+        let token = sign(&signing_key(1), &json!({"alg": "EdDSA"}), &claims());
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::UnknownKid));
+    }
+
+    /// ヘッダの alg を書き換えても、検証の方法は変わらず、照合で断る。
+    #[test]
+    fn a_rewritten_alg_is_refused() {
+        for alg in ["RS256", "HS256", "none", "ES256"] {
+            let token = sign(
+                &signing_key(1),
+                &json!({"alg": alg, "kid": "k1"}),
+                &claims(),
+            );
+            assert_eq!(
+                auth().verify(&token, NOW),
+                Err(Reason::AlgMismatch),
+                "{alg}"
+            );
+        }
+        // 署名欄を空にした `none` 形も通らない。
+        let token = sign(
+            &signing_key(1),
+            &json!({"alg": "none", "kid": "k1"}),
+            &claims(),
+        );
+        let unsigned = format!("{}.", token.rsplit_once('.').unwrap().0);
+        assert!(auth().verify(&unsigned, NOW).is_err());
+    }
+
+    #[test]
+    fn crit_is_refused() {
+        let token = sign(
+            &signing_key(1),
+            &json!({"alg": "EdDSA", "kid": "k1", "crit": ["b64"]}),
+            &claims(),
+        );
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::Crit));
+    }
+
+    #[test]
+    fn the_lifetime_is_capped() {
+        let c = json!({"sub": "mbp", "exp": NOW + 86_400 + 1});
+        let token = sign(&signing_key(1), &header(), &c);
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::TtlExceeded));
+        let c = json!({"sub": "mbp", "exp": NOW + 10, "iat": NOW - 86_400});
+        let token = sign(&signing_key(1), &header(), &c);
+        assert_eq!(
+            auth().verify(&token, NOW),
+            Err(Reason::TtlExceeded),
+            "exp - iat"
+        );
+    }
+
+    #[test]
+    fn a_future_iat_or_nbf_is_refused_past_the_skew() {
+        let at = |iat: i64| json!({"sub": "mbp", "exp": NOW + 3600, "iat": iat});
+        let ok = sign(&signing_key(1), &header(), &at(NOW + SKEW_SECS));
+        assert!(auth().verify(&ok, NOW).is_ok());
+        let ahead = sign(&signing_key(1), &header(), &at(NOW + SKEW_SECS + 1));
+        assert_eq!(auth().verify(&ahead, NOW), Err(Reason::NotYetValid));
+        let nbf = json!({"sub": "mbp", "exp": NOW + 3600, "nbf": NOW + SKEW_SECS + 1});
+        let token = sign(&signing_key(1), &header(), &nbf);
+        assert_eq!(auth().verify(&token, NOW), Err(Reason::NotYetValid));
+    }
+
+    #[test]
+    fn required_claims_and_configured_iss_aud() {
+        for c in [
+            json!({"exp": NOW + 10}),
+            json!({"sub": "mbp"}),
+            json!({"sub": "", "exp": NOW + 10}),
+            json!({"sub": "a\nb", "exp": NOW + 10}),
+        ] {
+            let token = sign(&signing_key(1), &header(), &c);
+            assert!(auth().verify(&token, NOW).is_err(), "{c}");
+        }
+        let strict = JwtAuth {
+            iss: Some("cli".into()),
+            aud: Some("ns-a".into()),
+            ..auth()
+        };
+        let good = json!({"sub": "m", "exp": NOW + 10, "iss": "cli", "aud": ["x", "ns-a"]});
+        assert!(
+            strict
+                .verify(&sign(&signing_key(1), &header(), &good), NOW)
+                .is_ok()
+        );
+        let wrong = json!({"sub": "m", "exp": NOW + 10, "iss": "cli", "aud": "x"});
+        assert_eq!(
+            strict.verify(&sign(&signing_key(1), &header(), &wrong), NOW),
+            Err(Reason::Claims)
+        );
+    }
+
+    #[test]
+    fn malformed_tokens_are_refused() {
+        for bad in ["", "a.b", "a.b.c.d", "!!.!!.!!", "e30.e30.e30"] {
+            assert!(auth().verify(bad, NOW).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn public_keys_are_read_from_base64url() {
+        let key = signing_key(1).verifying_key();
+        let written = B64.encode(key.to_bytes());
+        assert_eq!(parse_public_key(&written), Ok(key));
+        assert!(parse_public_key("AAAA").is_err());
+        assert!(parse_public_key(&format!("{written}=")).is_err());
+    }
+}

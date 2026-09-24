@@ -3,6 +3,8 @@
 //! 検証の出口は方式によらず「Bearer → 主体 ([`Principal`])」に揃える
 //! (DR-0030 §6)。下流は主体だけを見ればよく、方式が増えても変わらない。
 
+pub mod jwt;
+
 /// 検証を通った相手。
 ///
 /// 固定トークンの方式では、誰が名乗ったかも、どの鍵で確かめたかも分からない
@@ -26,6 +28,8 @@ pub enum Authorization {
     Accepted(Principal),
     /// トークンが違う (名乗っていない場合を含む)。
     WrongToken,
+    /// `jwt` 方式で通らなかった。理由はログのためだけにあり、応答で区別しない。
+    Rejected(jwt::Reason),
     /// この namespace は誰でも通す (トークンを設定していない)。
     Open,
 }
@@ -42,6 +46,8 @@ pub enum NsAuth {
     Open,
     /// この固定トークンを名乗った相手だけを通す。
     Token(String),
+    /// 設定した公開鍵で署名された JWT を名乗った相手を通す。
+    Jwt(jwt::JwtAuth),
 }
 
 impl NsAuth {
@@ -76,6 +82,23 @@ impl NsAuth {
                     Authorization::WrongToken
                 }
             }
+            Self::Jwt(auth) => {
+                let Some(token) = presented.map(|p| p.strip_prefix("Bearer ").unwrap_or(p).trim())
+                else {
+                    return Authorization::Rejected(jwt::Reason::Malformed);
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs() as i64);
+                match auth.verify(token, now) {
+                    Ok(verified) => Authorization::Accepted(Principal {
+                        ns: ns.to_owned(),
+                        subject: Some(verified.subject),
+                        kid: Some(verified.kid),
+                    }),
+                    Err(reason) => Authorization::Rejected(reason),
+                }
+            }
         }
     }
 }
@@ -107,5 +130,35 @@ mod tests {
         for bad in [None, Some("Bearer t"), Some("")] {
             assert_eq!(auth.verify("n", bad), Authorization::WrongToken);
         }
+    }
+
+    /// `jwt` 方式は署名された token の主体 (sub / kid) を返し、名乗らない相手は断る。
+    #[test]
+    fn a_jwt_yields_its_subject_and_kid() {
+        use jwt::tests::{auth, sign, signing_key};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let token = sign(
+            &signing_key(1),
+            &serde_json::json!({"alg": "EdDSA", "kid": "k1"}),
+            &serde_json::json!({"sub": "mbp", "exp": now + 600}),
+        );
+        let ns = NsAuth::Jwt(auth());
+        assert!(!ns.is_open());
+        assert_eq!(
+            ns.verify("n", Some(&format!("Bearer {token}"))),
+            Authorization::Accepted(Principal {
+                ns: "n".into(),
+                subject: Some("mbp".into()),
+                kid: Some("k1".into()),
+            })
+        );
+        assert!(matches!(ns.verify("n", None), Authorization::Rejected(_)));
+        assert!(matches!(
+            ns.verify("n", Some("Bearer nope")),
+            Authorization::Rejected(jwt::Reason::Malformed)
+        ));
     }
 }
