@@ -9,7 +9,7 @@ repository.workspace = true
 description = "llm-gateway core: ルーティング / バックエンドアダプタ / クレデンシャル"
 
 [dependencies]
-gateway-core = { path = "../gateway-core", version = "0.56" }
+gateway-core = { path = "../gateway-core", version = "0.57" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # login の受け口 (ブラウザからの戻りを 1 回だけ受ける) に使う。
