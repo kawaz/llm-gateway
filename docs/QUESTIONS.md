@@ -30,3 +30,10 @@ kawaz 裁定 (2026-09-25): 統括が [runbook](runbooks/ns-auth-jwt-rotation.md)
 
 - [ ] a: (2) の personal の切替をこのセッションを切る合図と同時に行う (統括推し)
 - [ ] b: (1) だけ先に済ませ、(2) は kawaz が合図する別のタイミングで
+
+JW-C1β: (1) の着手に要る秘密鍵 (`auth keygen` の JWK、機械ごと 1 本) の置き場。runbook は「パスワードマネージャに移してファイルは消す」とだけ言う。
+
+- [ ] a: 1Password の personal vault に item を作り、`auth sign` は `op run` 経由で `op://` 参照から読む (統括推し。`secret-hygiene` rule の透過運用そのまま、AI が秘密鍵の値を見ない)
+- [ ] b: `~/.config/llm-gateway/private/` (gitignore 下、chmod 600) に置く
+
+JW-C1γ: 監督者の 0.59.2 化 (`llm-gateway version` は `supervisor.running = 0.56.0`、`restart_needed = true`、動作に支障なし)。`service stop` は抱えている stable / unstable も落とすので、gateway 経由の全セッション (この統括を含む) の走行中 request が切れる。(2) の personal 切替と同じ再起動の窓で一緒にやる想定。別の窓が良ければ指示を。
