@@ -1,6 +1,6 @@
 # DR-0030: 汎用の認証 gateway を下に敷き、LLM をその上の 1 利用者にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24、鍵束の置き場を §5 / §6 の `keys_file` に改定 2026-09-29)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)。§5 / §6 の鍵束ファイル (`keys_file`、mtime で読み直し) と §6 `issued` は未実装
+- Status: Accepted (kawaz 裁定 2026-09-24、鍵束の置き場を §5 / §6 の `keys_file` に改定 2026-09-29)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)。§5 / §6 の鍵束ファイル (`keys_file`、mtime で読み直し) は v0.60.0 で実装済み、§6 `issued` は未実装
 - Date: 2026-09-17
 
 ## Context

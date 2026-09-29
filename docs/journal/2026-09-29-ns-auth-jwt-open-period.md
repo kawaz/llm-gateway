@@ -29,3 +29,9 @@ JW-C1 の「切替タイミング a/b」は前提が違っていた。稼働 con
 - JW-C2 → a: kawaz が手元で実行。3 面の `ANTHROPIC_AUTH_TOKEN` が JWT (3 分割)、`ANTHROPIC_DEFAULT_SONNET_MODEL = claude-sonnet-5-5[1m]`、codex に `http_headers` を確認 (値は見ていない)
 - JW-C1γ → a: 監督者の更新は各 ns の `auth = "jwt"` 切替の最初の restart 窓で一緒に
 - 次: 走行中セッションの入れ替わりを待ち、unstable → stable で `auth = "jwt"` を入れる (`<ns>.keys.toml` の中身 + `max_ttl = "400d"`)。同じ窓で `service stop` → `service start` (監督者を最新に)
+
+## 鍵束の置き場を変えた (同日夕方、v0.60.0)
+
+`private/` に秘密鍵 `<kid>.jwk` と公開鍵断片 `<ns>.keys.toml` が混在し、auto モードの分類器が公開鍵断片の読み取りまで止めて統括が切替作業に進めなかったのが発端。kawaz 裁定で鍵束は **ns ごとに 1 ファイル `keys/<ns>.jwks.jsonl`** (1 行 1 JWK、秘密鍵込み・600、ファイルが正本、検証時に mtime を見て読み直す) に変え、config の `[ns.<ns>.keys.<kid>]` 表は `keys_file` に置き換えた (DR-0030 §5 / §6、design §5 段 7、runbook / MANUAL 更新済み)。
+
+切替の残り: v0.60.0 の Release 後、3 つの `.jwk` を各 ns の `keys/<ns>.jwks.jsonl` に 1 行ずつ畳み、`.keys.toml` と `private/` を消し、各 ns に `auth = "jwt"` + `keys_file` + `max_ttl = "400d"` を書いて unstable → stable で restart (同じ窓で `service stop` → `service start`)。貼り済みの JWT は鍵が同じなので有効なまま。
