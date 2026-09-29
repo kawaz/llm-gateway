@@ -1,6 +1,6 @@
 # DR-0030: 汎用の認証 gateway を下に敷き、LLM をその上の 1 利用者にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)、§6 `issued` は未実装
+- Status: Accepted (kawaz 裁定 2026-09-24、鍵束の置き場を §5 / §6 の `keys_file` に改定 2026-09-29)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)。§5 / §6 の鍵束ファイル (`keys_file`、mtime 監視) と §6 `issued` は未実装
 - Date: 2026-09-17
 
 ## Context
@@ -83,14 +83,16 @@ LLM 専用だった間は、通る先が config の routing で閉じていた�
 
 この帰結として: **ns 認証が実質 dummy (固定 token を配っただけ) でよいのは、その ns の allowlist が読み取り系に閉じている場合に限る。**
 
-### 5. 秘密の置き場 — 預かりものはファイル、自前の秘密は JWKS 1 つだけ
+### 5. 秘密の置き場 — 預かりものはファイル、自前の鍵束は ns ごとに 1 ファイル
 
 汎用パススルー用のキー・bearer (静的 secret) は、**Store 層の interface を切って設定でプラガブル**にし、第一版の backend は今の credential と同じ**生のファイル** (kawaz 裁定 2026-09-24)。ファイルの版と排他は DR-0010 の仕組みをそのまま使う。後から `op://` 解決や cache-warden に差し替える時は backend を足すだけで、読む側は変えない。
 
-**gateway が持つ自身の秘密は、`issued` (§6) 用の署名鍵 = JWKS ただ 1 つ。** これ以外は全部「他所から預かったキー」であって gateway が作ったものではない、という区別を保つ。その JWKS の置き場も段階を踏む:
+**gateway が持つ自身の秘密は、ns ごとの鍵束 (JWKS) だけ** (kawaz 裁定 2026-09-29)。鍵束は `jwt` の検証と `issued` の発行 (§6) で共用し、これ以外は全部「他所から預かったキー」であって gateway が作ったものではない、という区別を保つ。鍵束の形:
 
-1. **初期はファイル管理** — 他の credential と同じ扱い (版 + flock)
-2. **cache-warden が稼働したら、そちらへ移す** — issue `2026-09-15-store-layer-for-replaceable-persistence` の Store 層の backend として
+- **ns ごとに 1 ファイル、1 行 1 JWK の jsonl** (`<ns>.jwks.jsonl`)。各行は `auth keygen` の出力そのもの (`{"kty":"OKP","crv":"Ed25519","kid":…,"d":…,"x":…}`) で、秘密鍵を含むので 600。公開鍵だけを見たい・配りたい時は `auth jwks` で抜き出す (配る形にラップするのはその時でよい)
+- **ファイルが正本**。追加は行の追記 (`keygen >> file`)、失効は行の削除。gateway は起動時に読んでメモリに持ち、mtime の変化 (credential と同じ監視) で読み直す。restart は要らない
+- 鍵束は設定 (`[ns.<ns>] keys_file`) から参照する。鍵の追加・失効は設定と寿命が違う (ローテで 180 日ごとに増減する) ので設定には埋めない
+- **Store 層 (issue `2026-09-15-store-layer-for-replaceable-persistence`) の 1 品目**。1 行 1 レコードなので backend を差し替えても「追記 / 削除 / 全読み」の意味論がそのまま乗る。cache-warden が稼働したらそちらへ移す
 
 平文ファイルで置く期間の危険度は預かりキーより高い (§Consequences)。
 
@@ -101,36 +103,34 @@ ns 設定の `auth` を方式の enum にする。**検証の出口は方式に�
 | 方式 | 中身 |
 |---|---|
 | `token` | 固定文字列の照合。既存アプリ向けの最低線 (現行 `auth_token` の位置) |
-| `jwt` | ns 設定が持つ JWKS (kid → 公開鍵) で検証する |
-| `issued` | gateway 自身が IdP として access / refresh を発行する |
+| `jwt` | ns の鍵束 (`keys_file`、§5) の kid → 公開鍵で検証する |
+| `issued` | gateway 自身が IdP として access / refresh を発行する。署名鍵は同じ鍵束 |
 
-確定した設定の形 (ns 認証 `jwt` の段 3、`docs/design/ns-auth-jwt.md`):
+確定した設定の形 (`docs/design/ns-auth-jwt.md`):
 
 ```toml
 [ns.claude]
 auth = "jwt"              # 方式名。省けば auth_token の有無で token / 無検査
+keys_file = "~/.config/llm-gateway/keys/claude.jwks.jsonl"   # 必須。1 行 1 JWK (§5)
 max_ttl = "400d"          # 必須
 iss = "llm-gateway-cli"   # 任意
 aud = "ns-claude"         # 任意
-
-[ns.claude.keys.claude-mbp-2026-09]   # kid ごとの表 (extends で鍵ごとにマージ)
-alg = "EdDSA"
-public = "<Ed25519 公開鍵 32 バイトの base64url>"
 ```
 
 `jwt` の規定:
 
-- **alg は kid ごとに設定で固定し、JWT ヘッダの `alg` を信用しない**。ヘッダの申告で検証アルゴリズムを選ぶと、鍵の取り違えと `none` 系の事故の口になる
-- 鍵種は **Ed25519**
+- **検証アルゴリズムは鍵の `kty` / `crv` から決め、JWT ヘッダの `alg` を信用しない**。ヘッダの申告で検証アルゴリズムを選ぶと、鍵の取り違えと `none` 系の事故の口になる
+- 鍵種は **Ed25519** (`kty = "OKP"`, `crv = "Ed25519"`)。鍵束に他の種があれば読み込みエラー
 - **必須の検証は「有効な署名 + 既知の kid + `exp` + 基本 claim」**。`iss` / `aud` の照合は **ns ごとの任意** (受け手が 1 つしかいない配置で aud を必須にすると、既存アプリに意味のない設定を強いる)
 - **寿命の上限は ns 設定で決める**。既存アプリ向けに長寿命の JWT を許す ns を作れる
-- **失効は kid の削除、ローテーションは新しい kid を先に配ってから旧 kid を消す** (JWKS に両方が載る期間を作る)
+- **失効は鍵束からの行の削除、ローテーションは新しい kid を先に配ってから旧 kid を消す** (鍵束に両方が載る期間を作る)。反映は mtime 監視で、restart を挟まない
+- `keys_file` は設定のパス欄 (`~` と環境変数を開く)。`extends` の派生で上書きすればファイルごと差し替わる (鍵単位のマージはしない。鍵束の中身は設定でなくファイルの責務)
 
-`issued` の方向: access / refresh とも JWT とし、gateway の署名鍵は JWK (JWKS) として管理する (置き場は §5)。**発行の口は 2 つ** (kawaz 裁定 2026-09-24): 最初の 1 本 (bootstrap) は host 上の **CLI** が署名鍵ファイルを直接読んで refresh token を標準出力に出す (gateway は保存しない。kid ごとの最終発行時刻だけ DR-0010 の flock 下で記録)。refresh はアプリが自分で行うので **HTTP の token endpoint** (`POST /ns-<ns>/auth/token`、OAuth 2 の `grant_type=refresh_token` の形に合わせ、標準クライアントがそのまま使える) を持つ。access の寿命と refresh の rotation は §未確定の方向どおり。
+`issued` の方向: access / refresh とも JWT とし、署名鍵は ns の鍵束 (§5) の 1 行。**発行の口は 2 つ** (kawaz 裁定 2026-09-24): 最初の 1 本 (bootstrap) は host 上の **CLI** が署名鍵ファイルを直接読んで refresh token を標準出力に出す (gateway は保存しない。kid ごとの最終発行時刻だけ DR-0010 の flock 下で記録)。refresh はアプリが自分で行うので **HTTP の token endpoint** (`POST /ns-<ns>/auth/token`、OAuth 2 の `grant_type=refresh_token` の形に合わせ、標準クライアントがそのまま使える) を持つ。access の寿命と refresh の rotation は §未確定の方向どおり。
 
 **Claude Code 向けの最初の運用は `jwt` 方式の長寿命 token** (kawaz 裁定 2026-09-24)。Claude Code 側に token を更新する仕組みが無いので `issued` の refresh は使えず、ns 設定で長寿命を許した JWT を CLI で鋳造して配り、ローテは手動 (新 kid を先に配って旧 kid を消す) で定期的に行う。ローテの周期と手順は runbook に書く (`docs/runbooks/ns-auth-jwt-rotation.md`、既定の周期は 180 日)。`issued` の HTTP endpoint は refresh を自前で回せるアプリが出た段階でよい。
 
-**helper CLI** (鍵ペア生成 + JWKS 断片の出力 + 手元での署名 + 上記の bootstrap 発行) を用意するが、**生成物を標準出力に出すだけで gateway は保存しない**。アプリの秘密鍵を gateway が作って持つ形にすると、§5 の「自前の秘密は `issued` 用の JWKS 1 つだけ」が崩れる。
+**helper CLI** (鍵ペア生成 + 公開鍵の抜き出し + 手元での署名 + 上記の bootstrap 発行) を用意する。`keygen` は JWK 1 行を標準出力に出すだけで、鍵束への追記は利用者が `>>` で行う (鍵束の窓口を将来 daemon 経由に寄せる時も、正本がファイルであることは変えない)。`sign` は鍵束ファイルと `--kid` で秘密鍵を選ぶ。
 
 ### 7. 進め方
 
@@ -164,7 +164,7 @@ public = "<Ed25519 公開鍵 32 バイトの base64url>"
 - **副作用のある API が通りうる**ので、ns 認証の設計不足が実害に変わる。§4 の allowlist はその歯止めであり、省略できない
 - **パススルーは `Cookie` 等の認証以外のヘッダもそのまま上流へ渡す** (§2 の無変換の帰結)。クライアントは手元のアプリが前提で、ブラウザのように他所の cookie を勝手に載せる相手は想定しない
 - **静的 secret の版は更新時刻 (mtime) だけで比べる** (DR-0010 と同じ制約)。同じ時刻の粒度で 2 度書き換えると読み直しを取りこぼしうる
-- **`issued` の署名鍵は、預かりキーより漏洩の影響が広い。** 上流キーが漏れれば漏れた 1 本の枠を使われるが、署名鍵が漏れれば**任意の ns の access token を偽造できる** — allowlist も ns の区分も丸ごと迂回される。平文ファイルで置く期間 (cache-warden 以前、§5) はこの差が剥き出しなので、**鍵ローテの runbook を `issued` 稼働の前提条件とする** (漏洩に気づいてから手順を考えるのでは、発行済み token が生きている間ずっと偽造が通る)
+- **鍵束の秘密鍵は、預かりキーより漏洩の影響が広い。** 上流キーが漏れれば漏れた 1 本の枠を使われるが、秘密鍵が漏れれば**その ns の token を偽造できる** (`jwt` の長寿命 token も `issued` の access も) — allowlist も ns の区分も丸ごと迂回される。平文ファイルで置く期間 (cache-warden 以前、§5) はこの差が剥き出しなので、**鍵ローテの runbook を `issued` 稼働の前提条件とする** (漏洩に気づいてから手順を考えるのでは、発行済み token が生きている間ずっと偽造が通る)
 - 既存の LLM 経路の振る舞い (routing / denial / spend_down / pace_cap / cache / stats) は変えない。汎用層へ移るのは所有であって挙動ではない
 
 ### やらないこと
