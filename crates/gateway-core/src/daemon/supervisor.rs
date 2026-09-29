@@ -473,7 +473,10 @@ impl Supervisor {
             Err(e) => Reloaded::failed(
                 name,
                 "bad_answer",
-                format!("could not read what `{name}` answered ({e}): {line}"),
+                format!(
+                    "could not read what `{name}` answered ({e}): {}",
+                    excerpt(&line)
+                ),
             ),
         }
     }
@@ -841,6 +844,20 @@ impl Supervisor {
         let unit = self.registry.get(name).ok()?;
         (self.probe.listen_of)(&unit.config)
     }
+}
+
+/// 答えに添える、台が返したものの先頭。全文を返すと、台が書いた何でも
+/// 監督者の答えとしてそのまま流れる。
+fn excerpt(line: &str) -> String {
+    const SHOWN: usize = 200;
+    if line.len() <= SHOWN {
+        return line.to_owned();
+    }
+    let mut end = SHOWN;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &line[..end], line.len())
 }
 
 /// 台の様子に、監督者自身の版を添えて返す。
@@ -1478,6 +1495,26 @@ mod tests {
                 .contains("no control socket"),
             "{units:?}"
         );
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// 読めない答えは、先頭だけ添えて返す。
+    #[tokio::test]
+    async fn an_unreadable_answer_is_shown_only_in_part() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, true);
+        world.supervisor.reload().await;
+        world.until("a", |s| s.running).await;
+        a_control_socket_that_answers(&world, "a", Box::leak("x".repeat(1000).into_boxed_str()));
+
+        let answer = world.supervisor.reload_unit("a").await;
+
+        let error = answer.error.unwrap();
+        assert_eq!(error.kind, "bad_answer");
+        assert!(error.message.len() < 400, "{}", error.message);
+        assert!(error.message.ends_with("(1000 bytes)"), "{}", error.message);
 
         world.supervisor.shutdown().await;
     }

@@ -663,6 +663,7 @@ $ llm-gateway daemon reload --all
 | `not_running` | 台が走っていない (起きる時に設定を読む) | — |
 | `no_answer` | 台が 45 秒以内に答えなかった。差し替わったかは `daemon log` で見る | 不明 |
 | `unreachable` | 制御口に繋げなかった | 旧設定のまま |
+| `bad_answer` | 台の答えが読めなかった (`message` には答えの先頭 200 バイトまで) | 不明 |
 
 reload で変えられない欄 (変えたら `daemon restart`): `[server]` の `listen` / `binary_path` / `disabled`、`[store]`、`[stats]`、`[discovery]`、`[webhook]`、`[status]`、`routes.<name>.status_source`、`[upstreams]`、`[secret_store]`、`[secrets]`、`[ratelimit]`。`message` には旧→新の値を並べる (`[webhook]` / `[upstreams]` / `[secrets]` は秘密を含みうるので欄名だけ)。
 

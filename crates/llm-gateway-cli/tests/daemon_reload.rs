@@ -12,12 +12,13 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_llm-gateway")
 }
 
-fn unused_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// 互いに違う空きポートを `N` 個。全部を掴んだまま番号を取るので、同じ番号が
+/// 2 度出ない (他のプロセスに取られうるのは、既存の daemon 試験と同じ)。
+fn unused_ports<const N: usize>() -> [u16; N] {
+    let held: Vec<TcpListener> = (0..N)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    std::array::from_fn(|i| held[i].local_addr().unwrap().port())
 }
 
 /// 監督者。落とす時は SIGTERM で、抱えた台も畳ませる。
@@ -114,7 +115,7 @@ fn reloading_everything_reports_every_unit_and_fails_if_one_failed() {
     // unix socket のパス長の上限 (macOS 104 バイト) に収めるため短く。
     let state: PathBuf = root.path().join("s");
     std::fs::create_dir_all(&state).unwrap();
-    let (port_a, port_b) = (unused_port(), unused_port());
+    let [port_a, port_b, moved] = unused_ports();
     let (a, b) = (root.path().join("a.toml"), root.path().join("b.toml"));
     std::fs::write(&a, config(root.path(), port_a, "")).unwrap();
     std::fs::write(&b, config(root.path(), port_b, "")).unwrap();
@@ -144,7 +145,7 @@ fn reloading_everything_reports_every_unit_and_fails_if_one_failed() {
 
     // a は通る変更、b は変えられない欄 (listen) も変える。
     std::fs::write(&a, config(root.path(), port_a, ADDS_N)).unwrap();
-    std::fs::write(&b, config(root.path(), unused_port(), ADDS_N)).unwrap();
+    std::fs::write(&b, config(root.path(), moved, ADDS_N)).unwrap();
 
     let reloaded = cli(&state, &["daemon", "reload", "--all"]);
     assert!(!reloaded.status.success(), "one unit failed");

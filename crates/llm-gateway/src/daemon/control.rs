@@ -7,13 +7,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::protocol::{self, ControlRequest, ReloadFailure, Reloaded};
 use crate::credential::CredentialPersistence;
 use crate::gateway::ReloadError;
 use crate::{Config, Gateway};
+
+/// 頼みの 1 行を待つ上限。
+const REQUEST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 頼みの 1 行の長さの上限 (バイト)。頼みは `{"op":"reload"}` 程度。
+const REQUEST_LIMIT: u64 = 64 * 1024;
 
 /// 開いている制御口。落とすと socket も消す。
 pub struct ControlSocket {
@@ -90,9 +96,15 @@ async fn answer<P: CredentialPersistence>(
     gateway: &Gateway<P>,
 ) {
     let (reading, mut writing) = stream.into_split();
-    let Ok(Some(line)) = BufReader::new(reading).lines().next_line().await else {
-        return;
-    };
+    // 読み直しは 1 つずつ通すので、改行を寄越さない繋がりが 1 本あると
+    // 監督者の頼みが後ろで待たされる。1 行を読む時間と長さに上限を置く。
+    let mut line = Vec::new();
+    let mut limited = BufReader::new(reading).take(REQUEST_LIMIT + 1);
+    match tokio::time::timeout(REQUEST_WAIT, limited.read_until(b'\n', &mut line)).await {
+        Ok(Ok(_)) if line.ends_with(b"\n") => {}
+        _ => return,
+    }
+    let line = String::from_utf8_lossy(&line);
     let result = match serde_json::from_str::<ControlRequest>(&line) {
         Ok(ControlRequest::Reload) => reload(unit, config_path, gateway).await,
         Err(e) => Reloaded::failed(
@@ -279,6 +291,19 @@ routes = ["a"]
         let serving = Arc::clone(&socket);
         let (config, gateway) = (u.config.clone(), Arc::clone(&u.gateway));
         let task = tokio::spawn(async move { serving.serve("u", &config, gateway).await });
+
+        // 改行を寄越さない繋がりがあっても、上限で閉じて次の頼みに答える。
+        let mut silent = UnixStream::connect(&path).await.unwrap();
+        silent.write_all(b"{\"op\":").await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            REQUEST_WAIT * 2,
+            tokio::io::AsyncReadExt::read_to_end(&mut silent, &mut rest),
+        )
+        .await
+        .expect("closed at the limit")
+        .unwrap();
+        assert!(rest.is_empty());
 
         let answer = protocol::ask(&path, &ControlRequest::Reload).await.unwrap();
         assert_eq!(answer, r#"{"unit":"u","ok":true}"#);

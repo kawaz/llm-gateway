@@ -661,6 +661,7 @@ $ llm-gateway daemon reload --all
 | `not_running` | The unit is not running (it reads its configuration when it starts) | — |
 | `no_answer` | The unit did not answer within 45 seconds; see `daemon log` for whether it reloaded | Unknown |
 | `unreachable` | The control socket could not be reached | Unchanged |
+| `bad_answer` | The unit's answer could not be read (`message` carries at most its first 200 bytes) | Unknown |
 
 Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `binary_path` / `disabled`, `[store]`, `[stats]`, `[discovery]`, `[webhook]`, `[status]`, `routes.<name>.status_source`, `[upstreams]`, `[secret_store]`, `[secrets]`, `[ratelimit]`. The `message` shows the old and new values (`[webhook]` / `[upstreams]` / `[secrets]` may hold secrets, so only the field is named).
 
