@@ -22,3 +22,10 @@ JW-C1 の「切替タイミング a/b」は前提が違っていた。稼働 con
 1. (kawaz 手動) JWT の鋳造と貼り付け: sub は `claude-personal` / `claude-bare` / `claude-emrd` / `codex-personal`、ttl 180d
 2. 走行中セッションの入れ替わりを待つ
 3. ns ごとに `auth = "jwt"` + `max_ttl = "400d"` + `<ns>.keys.toml` の中身を config に足し、unstable → stable で restart、疎通と `subject` / `kid` の記録を確認
+
+## 裁定と実行 (同日午後)
+
+- JW-C1β → b: 秘密鍵は `~/.config/llm-gateway/private/` のまま。1Password は Touch ID が要りリモート作業中に詰まるため。cache-warden が実用になったらそちらへ移行
+- JW-C2 → a: kawaz が手元で実行。3 面の `ANTHROPIC_AUTH_TOKEN` が JWT (3 分割)、`ANTHROPIC_DEFAULT_SONNET_MODEL = claude-sonnet-5-5[1m]`、codex に `http_headers` を確認 (値は見ていない)
+- JW-C1γ → a: 監督者の更新は各 ns の `auth = "jwt"` 切替の最初の restart 窓で一緒に
+- 次: 走行中セッションの入れ替わりを待ち、unstable → stable で `auth = "jwt"` を入れる (`<ns>.keys.toml` の中身 + `max_ttl = "400d"`)。同じ窓で `service stop` → `service start` (監督者を最新に)
