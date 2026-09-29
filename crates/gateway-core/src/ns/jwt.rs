@@ -10,6 +10,10 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::UNIX_EPOCH;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -77,11 +81,31 @@ pub struct Verified {
     pub kid: String,
 }
 
+/// 鍵束の各行から秘密鍵を読み、kid で引ける形にする。エラーには秘密鍵の内容を含めない。
+pub fn read_key_ring(text: &str) -> Result<BTreeMap<String, SigningKey>, String> {
+    let mut keys = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line_no = index + 1;
+        let (kid, key) = read_private_jwk(line).map_err(|e| format!("line {line_no}: {e}"))?;
+        let kid = kid.ok_or_else(|| format!("line {line_no}: JWK needs `kid`"))?;
+        if keys.insert(kid.clone(), key).is_some() {
+            return Err(format!(
+                "line {line_no}: duplicate kid `{kid}`; remove one line"
+            ));
+        }
+    }
+    Ok(keys)
+}
+
 /// `jwt` 方式の設定。
-#[derive(Clone, PartialEq, Eq)]
 pub struct JwtAuth {
-    /// kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
-    pub keys: BTreeMap<String, VerifyingKey>,
+    /// 鍵束の置き場。テストで直接作る場合だけ `None`。
+    pub keys_file: Option<PathBuf>,
+    /// mtime と kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
+    keys: RwLock<(Option<u64>, Arc<BTreeMap<String, VerifyingKey>>)>,
     /// 受ける寿命の上限 (秒)。`exp - now` (と `iat` があれば `exp - iat`) で測る。
     pub max_ttl_secs: i64,
     /// 書いたら `iss` の一致を要求する。
@@ -90,10 +114,137 @@ pub struct JwtAuth {
     pub aud: Option<String>,
 }
 
+impl Clone for JwtAuth {
+    fn clone(&self) -> Self {
+        Self {
+            keys_file: self.keys_file.clone(),
+            keys: RwLock::new(self.keys.read().unwrap_or_else(|e| e.into_inner()).clone()),
+            max_ttl_secs: self.max_ttl_secs,
+            iss: self.iss.clone(),
+            aud: self.aud.clone(),
+        }
+    }
+}
+
+impl PartialEq for JwtAuth {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys_file == other.keys_file
+            && self.keys.read().unwrap_or_else(|e| e.into_inner()).1
+                == other.keys.read().unwrap_or_else(|e| e.into_inner()).1
+            && self.max_ttl_secs == other.max_ttl_secs
+            && self.iss == other.iss
+            && self.aud == other.aud
+    }
+}
+
+impl Eq for JwtAuth {}
+
+impl JwtAuth {
+    pub fn from_file(
+        path: PathBuf,
+        max_ttl_secs: i64,
+        iss: Option<String>,
+        aud: Option<String>,
+    ) -> Result<Self, String> {
+        let mtime = key_ring_mtime(&path).map_err(|e| {
+            format!(
+                "keys_file `{}`: {e}; check the file and its permissions",
+                path.display()
+            )
+        })?;
+        let keys = load_public_keys(&path)?;
+        Ok(Self {
+            keys_file: Some(path),
+            keys: RwLock::new((Some(mtime), Arc::new(keys))),
+            max_ttl_secs,
+            iss,
+            aud,
+        })
+    }
+
+    pub fn from_keys(
+        keys: BTreeMap<String, VerifyingKey>,
+        max_ttl_secs: i64,
+        iss: Option<String>,
+        aud: Option<String>,
+    ) -> Self {
+        Self {
+            keys_file: None,
+            keys: RwLock::new((None, Arc::new(keys))),
+            max_ttl_secs,
+            iss,
+            aud,
+        }
+    }
+
+    pub fn kids(&self) -> Vec<String> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn current_keys(&self) -> Arc<BTreeMap<String, VerifyingKey>> {
+        let Some(path) = &self.keys_file else {
+            return Arc::clone(&self.keys.read().unwrap_or_else(|e| e.into_inner()).1);
+        };
+        let mtime = match key_ring_mtime(path) {
+            Ok(mtime) => mtime,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot stat key ring; keeping previous keys");
+                return Arc::clone(&self.keys.read().unwrap_or_else(|e| e.into_inner()).1);
+            }
+        };
+        let current = self.keys.read().unwrap_or_else(|e| e.into_inner());
+        if current.0 == Some(mtime) {
+            return Arc::clone(&current.1);
+        }
+        drop(current);
+        let mut state = self.keys.write().unwrap_or_else(|e| e.into_inner());
+        if state.0 != Some(mtime) {
+            match load_public_keys(path) {
+                Ok(keys) => *state = (Some(mtime), Arc::new(keys)),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
+                }
+            }
+        }
+        Arc::clone(&state.1)
+    }
+}
+
+fn key_ring_mtime(path: &Path) -> Result<u64, std::io::Error> {
+    let modified = fs::metadata(path)?.modified()?;
+    let since_epoch = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+    Ok(since_epoch.as_nanos() as u64)
+}
+
+fn load_public_keys(path: &Path) -> Result<BTreeMap<String, VerifyingKey>, String> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "keys_file `{}`: {e}; check the file and its permissions",
+            path.display()
+        )
+    })?;
+    read_key_ring(&text)
+        .map(|keys| {
+            keys.into_iter()
+                .map(|(kid, key)| (kid, key.verifying_key()))
+                .collect()
+        })
+        .map_err(|e| format!("keys_file `{}`: {e}; fix the key ring", path.display()))
+}
+
 impl fmt::Debug for JwtAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JwtAuth")
-            .field("kids", &self.keys.keys().collect::<Vec<_>>())
+            .field("keys_file", &self.keys_file)
+            .field("kids", &self.kids())
             .field("max_ttl_secs", &self.max_ttl_secs)
             .field("iss", &self.iss)
             .field("aud", &self.aud)
@@ -130,7 +281,8 @@ impl JwtAuth {
             .get("kid")
             .and_then(Value::as_str)
             .ok_or(Reason::UnknownKid)?;
-        let key = self.keys.get(kid).ok_or(Reason::UnknownKid)?;
+        let keys = self.current_keys();
+        let key = keys.get(kid).ok_or(Reason::UnknownKid)?;
         if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
             return Err(Reason::AlgMismatch);
         }
@@ -325,12 +477,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn auth() -> JwtAuth {
-        JwtAuth {
-            keys: [("k1".to_owned(), signing_key(1).verifying_key())].into(),
-            max_ttl_secs: 86_400,
-            iss: None,
-            aud: None,
-        }
+        JwtAuth::from_keys(
+            [("k1".to_owned(), signing_key(1).verifying_key())].into(),
+            86_400,
+            None,
+            None,
+        )
     }
 
     fn header() -> Value {
@@ -558,6 +710,79 @@ pub(crate) mod tests {
         let mut mixed: Value = serde_json::from_str(&jwk).unwrap();
         mixed["x"] = json!(public_key_text(&signing_key(2).verifying_key()));
         assert!(read_private_jwk(&mixed.to_string()).is_err());
+    }
+
+    #[test]
+    fn key_ring_reads_lines_and_rejects_invalid_entries() {
+        let first = private_jwk("a", &signing_key(1)).to_string();
+        let second = private_jwk("b", &signing_key(2)).to_string();
+        let ring = read_key_ring(&format!("{first}\n\n{second}\n")).unwrap();
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring["a"].verifying_key(), signing_key(1).verifying_key());
+        assert_eq!(ring["b"].verifying_key(), signing_key(2).verifying_key());
+
+        let mut wrong_x: Value = serde_json::from_str(&first).unwrap();
+        wrong_x["x"] = json!(public_key_text(&signing_key(2).verifying_key()));
+        let mut no_kid: Value = serde_json::from_str(&first).unwrap();
+        no_kid.as_object_mut().unwrap().remove("kid");
+        let mut no_private: Value = serde_json::from_str(&first).unwrap();
+        no_private.as_object_mut().unwrap().remove("d");
+        let mut wrong_curve: Value = serde_json::from_str(&first).unwrap();
+        wrong_curve["crv"] = json!("X25519");
+        for bad in [
+            "not JSON".to_owned(),
+            wrong_curve.to_string(),
+            no_private.to_string(),
+            wrong_x.to_string(),
+            no_kid.to_string(),
+            first.clone(),
+        ] {
+            let error = read_key_ring(&format!("{first}\n\n{bad}")).unwrap_err();
+            assert!(error.contains("line 3"), "{error}");
+            assert!(!error.contains("\"d\":"), "{error}");
+        }
+    }
+
+    #[test]
+    fn key_ring_reloads_on_mtime_change_and_keeps_last_valid_ring() {
+        use std::fs::{self, File, FileTimes};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring.jsonl");
+        let first = private_jwk("a", &signing_key(1)).to_string();
+        let second = private_jwk("b", &signing_key(2)).to_string();
+        let write_at = |text: &str, seconds: u64| {
+            fs::write(&path, text).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        };
+        let a = super::sign(&signing_key(1), "a", &claims());
+        let b = super::sign(&signing_key(2), "b", &claims());
+        write_at(&first, 100);
+        let auth = JwtAuth::from_file(path.clone(), 86_400, None, None).unwrap();
+        assert!(auth.verify(&a, NOW).is_ok());
+        assert_eq!(auth.verify(&b, NOW), Err(Reason::UnknownKid));
+        write_at(&format!("{first}\n{second}\n"), 101);
+        assert!(auth.verify(&b, NOW).is_ok());
+        write_at("not JSON", 102);
+        assert!(auth.verify(&a, NOW).is_ok());
+        assert!(auth.verify(&b, NOW).is_ok());
+        write_at(&second, 103);
+        assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));
+        assert!(auth.verify(&b, NOW).is_ok());
+        write_at(&first, 103);
+        assert!(
+            auth.verify(&b, NOW).is_ok(),
+            "unchanged mtime does not reload"
+        );
+        assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));
     }
 
     #[test]

@@ -204,17 +204,6 @@ pub enum AuthKind {
     Jwt,
 }
 
-/// `jwt` 方式の 1 本の公開鍵 (`[ns.<name>.keys.<kid>]`)。
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeySpec {
-    /// 今は `EdDSA` だけ。token のヘッダの `alg` はこれと照合するだけで、検証の方法は
-    /// ここで決まる。
-    pub alg: String,
-    /// Ed25519 公開鍵 32 バイトの base64url (パディング無し)。
-    pub public: String,
-}
-
 /// `90d` / `12h` / `30m` / `45s` の長さを秒に直す。
 pub fn parse_duration_secs(raw: &str) -> std::result::Result<i64, String> {
     let hint = || {
@@ -265,9 +254,15 @@ pub struct NamespaceRepr {
     /// `token` 方式の合言葉。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_token: Option<String>,
-    /// `jwt` 方式の公開鍵。キーが kid。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    keys: BTreeMap<String, KeySpec>,
+    /// `jwt` 方式の秘密鍵を含む鍵束ファイル。
+    #[serde(
+        default,
+        with = "path_expand::serde_opt_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    keys_file: Option<PathBuf>,
+    #[serde(default, skip_serializing)]
+    keys: Option<toml::Value>,
     /// `jwt` 方式で受ける寿命の上限 (`400d` など)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_ttl: Option<String>,
@@ -289,16 +284,21 @@ impl TryFrom<NamespaceRepr> for Namespace {
     type Error = String;
 
     fn try_from(r: NamespaceRepr) -> std::result::Result<Self, String> {
+        if r.keys.is_some() {
+            return Err("`keys` is replaced by `keys_file`; move the keys into a jsonl file (see docs/runbooks/ns-auth-jwt-rotation.md)".to_owned());
+        }
         let jwt_fields =
-            !r.keys.is_empty() || r.max_ttl.is_some() || r.iss.is_some() || r.aud.is_some();
+            r.keys_file.is_some() || r.max_ttl.is_some() || r.iss.is_some() || r.aud.is_some();
         let auth = match (r.auth, r.auth_token) {
             (Some(AuthKind::Jwt), Some(_)) => {
                 return Err("auth = \"jwt\" does not use `auth_token`; remove it".to_owned());
             }
-            (Some(AuthKind::Jwt), None) => NsAuth::Jwt(jwt_auth(r.keys, r.max_ttl, r.iss, r.aud)?),
+            (Some(AuthKind::Jwt), None) => {
+                NsAuth::Jwt(jwt_auth(r.keys_file, r.max_ttl, r.iss, r.aud)?)
+            }
             (_, _) if jwt_fields => {
                 return Err(
-                    "`keys` / `max_ttl` / `iss` / `aud` belong to auth = \"jwt\"; add it or remove them"
+                    "`keys_file` / `max_ttl` / `iss` / `aud` belong to auth = \"jwt\"; add it or remove them"
                         .to_owned(),
                 );
             }
@@ -323,58 +323,31 @@ impl TryFrom<NamespaceRepr> for Namespace {
 
 /// `jwt` 方式の欄を検証済みの設定に畳む。
 fn jwt_auth(
-    keys: BTreeMap<String, KeySpec>,
+    keys_file: Option<PathBuf>,
     max_ttl: Option<String>,
     iss: Option<String>,
     aud: Option<String>,
 ) -> std::result::Result<gateway_core::ns::jwt::JwtAuth, String> {
-    if keys.is_empty() {
-        return Err("auth = \"jwt\" needs at least one `[ns.<name>.keys.<kid>]`".to_owned());
-    }
+    let path = keys_file.ok_or(
+        "auth = \"jwt\" needs `keys_file` (one JWK per line, as `llm-gateway auth keygen` writes)",
+    )?;
     let max_ttl = max_ttl.ok_or("auth = \"jwt\" needs `max_ttl` (for example `180d`)")?;
-    let mut verifying = BTreeMap::new();
-    for (kid, key) in keys {
-        if key.alg != "EdDSA" {
-            return Err(format!(
-                "keys.{kid}: alg must be \"EdDSA\" (got \"{}\")",
-                key.alg
-            ));
-        }
-        let parsed = gateway_core::ns::jwt::parse_public_key(&key.public)
-            .map_err(|e| format!("keys.{kid}: {e}"))?;
-        verifying.insert(kid, parsed);
-    }
-    Ok(gateway_core::ns::jwt::JwtAuth {
-        keys: verifying,
-        max_ttl_secs: parse_duration_secs(&max_ttl).map_err(|e| format!("max_ttl: {e}"))?,
+    gateway_core::ns::jwt::JwtAuth::from_file(
+        path,
+        parse_duration_secs(&max_ttl).map_err(|e| format!("max_ttl: {e}"))?,
         iss,
         aud,
-    })
+    )
 }
 
 impl From<Namespace> for NamespaceRepr {
     fn from(n: Namespace) -> Self {
-        use base64::Engine as _;
-        let (mut keys, mut max_ttl, mut iss, mut aud) = (BTreeMap::new(), None, None, None);
+        let (mut keys_file, mut max_ttl, mut iss, mut aud) = (None, None, None, None);
         let (auth, auth_token) = match n.auth {
             NsAuth::Open => (None, None),
             NsAuth::Token(token) => (None, Some(token)),
             NsAuth::Jwt(jwt) => {
-                keys = jwt
-                    .keys
-                    .iter()
-                    .map(|(kid, key)| {
-                        let public =
-                            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.to_bytes());
-                        (
-                            kid.clone(),
-                            KeySpec {
-                                alg: "EdDSA".to_owned(),
-                                public,
-                            },
-                        )
-                    })
-                    .collect();
+                keys_file = jwt.keys_file;
                 max_ttl = Some(format_duration_secs(jwt.max_ttl_secs));
                 (iss, aud) = (jwt.iss, jwt.aud);
                 (Some(AuthKind::Jwt), None)
@@ -387,7 +360,8 @@ impl From<Namespace> for NamespaceRepr {
             aliases: n.aliases,
             auth,
             auth_token,
-            keys,
+            keys_file,
+            keys: None,
             max_ttl,
             iss,
             aud,
@@ -2092,64 +2066,77 @@ o = "claude-opus-*"
     /// `jwt` 方式の欄は `auth = "jwt"` とだけ組み合わせられ、鍵と `max_ttl` が要る。
     #[test]
     fn the_jwt_fields_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("keys.jsonl");
+        std::fs::write(
+            &ring,
+            gateway_core::ns::jwt::private_jwk("k1", &gateway_core::ns::jwt::signing_key(&[1; 32]))
+                .to_string(),
+        )
+        .unwrap();
         let ns = |body: &str| toml::from_str::<Config>(&format!("[ns.a]\n{body}"));
-        // Ed25519 の公開鍵 (種 [1; 32])。
-        let public = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
         let jwt = |extra: &str| {
             format!(
-                "auth = \"jwt\"\nmax_ttl = \"400d\"\n{extra}[ns.a.keys.k1]\nalg = \"EdDSA\"\npublic = \"{public}\"\n"
+                "auth = \"jwt\"\nkeys_file = \"{}\"\nmax_ttl = \"400d\"\n{extra}",
+                ring.display()
             )
         };
         let ok = ns(&jwt("iss = \"cli\"\n")).unwrap();
         let NsAuth::Jwt(auth) = &ok.namespaces["a"].auth else {
             panic!("jwt expected")
         };
+        assert_eq!(auth.kids(), ["k1"]);
+        assert_eq!(auth.keys_file.as_deref(), Some(ring.as_path()));
         assert_eq!(auth.max_ttl_secs, 400 * 86_400);
         assert_eq!(auth.iss.as_deref(), Some("cli"));
         let again = toml::to_string(&ok).unwrap();
         assert!(
-            again.contains(public) && again.contains("max_ttl = \"400d\""),
+            again.contains("keys_file = ") && !again.contains("\"d\""),
             "{again}"
         );
-
         for (bad, why) in [
-            ("auth = \"jwt\"\nmax_ttl = \"1d\"\n", "keys"),
-            (&*jwt("auth_token = \"t\"\n"), "auth_token"),
-            (&*jwt("").replace("max_ttl = \"400d\"\n", ""), "max_ttl"),
-            (&*jwt("").replace("EdDSA", "RS256"), "EdDSA"),
-            (&*jwt("").replace(public, "AAAA"), "32 bytes"),
-            (&*jwt("").replace("400d", "forever"), "duration"),
-            ("auth_token = \"t\"\nmax_ttl = \"1d\"\n", "belong to"),
+            ("auth = \"jwt\"\nmax_ttl = \"1d\"\n".to_owned(), "keys_file"),
+            (jwt("auth_token = \"t\"\n"), "auth_token"),
+            (jwt("").replace("max_ttl = \"400d\"\n", ""), "max_ttl"),
+            (jwt("").replace("400d", "forever"), "duration"),
+            ("auth_token = \"t\"\nkeys_file = \"unused\"\n".to_owned(), "belong to"),
+            ("auth = \"jwt\"\nmax_ttl = \"1d\"\n[ns.a.keys.k1]\nalg = \"EdDSA\"\npublic = \"AAAA\"\n".to_owned(), "keys_file"),
         ] {
-            let err = ns(bad).unwrap_err().to_string();
+            let err = ns(&bad).unwrap_err().to_string();
             assert!(err.contains(why), "{why}: {err}");
         }
     }
 
-    /// `keys` は kid ごとの表なので、土台と派生の鍵は並ぶ (DR-0013 の表のマージ)。
     #[test]
-    fn keys_from_a_base_and_a_derived_file_are_merged() {
+    fn a_derived_keys_file_replaces_the_base_ring() {
         let dir = tempfile::tempdir().unwrap();
         let key = |kid: &str| {
-            format!(
-                "[ns.a.keys.{kid}]\nalg = \"EdDSA\"\npublic = \"iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\"\n"
-            )
+            gateway_core::ns::jwt::private_jwk(kid, &gateway_core::ns::jwt::signing_key(&[1; 32]))
+                .to_string()
         };
+        std::fs::write(dir.path().join("base.jsonl"), key("old")).unwrap();
+        std::fs::write(dir.path().join("new.jsonl"), key("new")).unwrap();
         std::fs::write(
             dir.path().join("base.toml"),
-            format!("[ns.a]\nauth = \"jwt\"\nmax_ttl = \"1d\"\n{}", key("old")),
+            format!(
+                "[ns.a]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"{}\"\n",
+                dir.path().join("base.jsonl").display()
+            ),
         )
         .unwrap();
         std::fs::write(
             dir.path().join("here.toml"),
-            format!("extends = \"base.toml\"\n{}", key("new")),
+            format!(
+                "extends = \"base.toml\"\n[ns.a]\nkeys_file = \"{}\"\n",
+                dir.path().join("new.jsonl").display()
+            ),
         )
         .unwrap();
         let config = Config::load(&dir.path().join("here.toml")).unwrap();
         let NsAuth::Jwt(auth) = &config.namespaces["a"].auth else {
             panic!("jwt expected")
         };
-        assert_eq!(auth.keys.keys().collect::<Vec<_>>(), ["new", "old"]);
+        assert_eq!(auth.kids(), ["new"]);
     }
 
     /// 書いてあれば、合っているものだけ通す。
