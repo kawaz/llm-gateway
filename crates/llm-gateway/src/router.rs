@@ -253,11 +253,94 @@ impl Catalog {
     }
 }
 
-pub struct Router {
+/// 走っている設定と、その設定から組んだ経路。
+///
+/// 読み直しで丸ごと差し替える単位 (DR-0032 決定 3)。リクエストは入口でこれを
+/// 1 回掴み、最後まで同じものを見る。設定と経路を別々に掴むと、新しい設定に
+/// 無い経路を古い経路表で引く、といった食い違いが起きる。
+pub struct Active {
     config: Config,
     /// 設定 1 件につき 1 つ。**経路の状態を持つので作り直さない** —
     /// リクエストごとに組み直すと、断られた印も枠の観測も毎回消える。
     presets: BTreeMap<String, Arc<Preset>>,
+}
+
+impl Active {
+    fn new(config: Config) -> Self {
+        let presets = config
+            .routes
+            .iter()
+            .map(|(name, route)| {
+                (
+                    name.clone(),
+                    Arc::new(preset::from_spec(name, route, &config)),
+                )
+            })
+            .collect();
+        Self { config, presets }
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// 名前で経路の preset を引く。設定に無ければ `None`。
+    pub fn preset(&self, name: &str) -> Option<&Arc<Preset>> {
+        self.presets.get(name)
+    }
+
+    /// 設定順の (名前, preset)。
+    pub fn presets(&self) -> impl Iterator<Item = (&str, &Arc<Preset>)> {
+        self.presets
+            .iter()
+            .map(|(name, preset)| (name.as_str(), preset))
+    }
+}
+
+/// namespace 1 つと、それを読んだ設定。
+///
+/// 1 本のリクエストが見る namespace は、そのリクエストが掴んだ設定の中の
+/// ものでなければならない。namespace だけを持ち回ると、途中で設定が
+/// 差し替わった時に「古い namespace × 新しい経路表」を引いてしまう。
+#[derive(Clone)]
+pub struct NamespaceView {
+    active: Arc<Active>,
+    name: String,
+}
+
+impl NamespaceView {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// この namespace を読んだ設定と経路。
+    pub fn active(&self) -> &Arc<Active> {
+        &self.active
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.active.config
+    }
+}
+
+impl std::ops::Deref for NamespaceView {
+    type Target = Namespace;
+
+    fn deref(&self) -> &Namespace {
+        self.active
+            .config
+            .namespace(&self.name)
+            .expect("a view is only made for a namespace its configuration declares")
+    }
+}
+
+pub struct Router {
+    /// 走っている設定。読み直しで差し替わる。
+    ///
+    /// Design rationale: 読むのはリクエストの入口と裏の仕事の頭で 1 回ずつ、
+    /// 掴んでいる間にするのは `Arc` の複製だけなので、lock-free の置き場
+    /// (arc-swap) を足さず std の `RwLock` で持つ。
+    active: std::sync::RwLock<Arc<Active>>,
     catalog: RwLock<Catalog>,
     /// 会話と経路の結びつき。鍵は (namespace 名, 会話, モデル)。
     ///
@@ -279,29 +362,49 @@ pub struct Router {
 }
 
 struct Binding {
-    route: Arc<Route>,
+    /// 通った経路の名前。経路そのものを持つと、読み直しの後も古い経路表を
+    /// 掴み続ける。
+    route: String,
     seen: Instant,
 }
 
 impl Router {
     pub fn new(config: Config, events: Arc<Events>) -> Self {
-        let presets = config
-            .routes
-            .iter()
-            .map(|(name, route)| {
-                (
-                    name.clone(),
-                    Arc::new(preset::from_spec(name, route, &config)),
-                )
-            })
-            .collect();
         Self {
-            config,
-            presets,
+            active: std::sync::RwLock::new(Arc::new(Active::new(config))),
             catalog: RwLock::new(Catalog::default()),
             affinity: Mutex::new(HashMap::new()),
             events,
         }
+    }
+
+    /// 今走っている設定と経路。掴んだものは差し替えの後も変わらない。
+    pub fn active(&self) -> Arc<Active> {
+        Arc::clone(
+            &self
+                .active
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// 今走っている設定の namespace。
+    pub fn namespace(&self, name: &str) -> Option<NamespaceView> {
+        let active = self.active();
+        active.config.namespace(name)?;
+        Some(NamespaceView {
+            active,
+            name: name.to_owned(),
+        })
+    }
+
+    /// 設定を差し替える。走行中のリクエストは掴んだ設定のまま終わる。
+    pub async fn reload(&self, config: Config) {
+        let active = Arc::new(Active::new(config));
+        *self
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = active;
     }
 
     /// 起きたことを流す口。
@@ -309,26 +412,15 @@ impl Router {
         &self.events
     }
 
-    /// 名前で経路の preset を引く。設定に無ければ `None`。
-    pub fn preset(&self, name: &str) -> Option<&Arc<Preset>> {
-        self.presets.get(name)
-    }
-
-    /// 設定順の (名前, preset)。
-    pub fn presets(&self) -> impl Iterator<Item = (&str, &Arc<Preset>)> {
-        self.presets
-            .iter()
-            .map(|(name, preset)| (name.as_str(), preset))
-    }
-
     /// 一覧を聞きに行く先の認証情報。設定順、重複は除く。
     ///
     /// 一覧が取れるかどうかはこの認証情報次第なので、これらの更新を
     /// 見ていれば「入れ直したのに一覧が古いまま」を避けられる。
     pub fn discovery_credentials(&self) -> Vec<CredentialId> {
+        let active = self.active();
         let mut ids: Vec<CredentialId> = Vec::new();
-        for route in self.config.routes.values() {
-            if route.discovery_flavor(&self.config).is_none() {
+        for route in active.config.routes.values() {
+            if route.discovery_flavor(&active.config).is_none() {
                 continue;
             }
             if let Some(name) = route.credential.as_deref() {
@@ -353,11 +445,12 @@ impl Router {
         let mut by_route: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let previous = self.catalog.read().await;
 
+        let active = self.active();
         let now = crate::credential::time::now_unix();
-        for (name, route) in &self.config.routes {
+        for (name, route) in &active.config.routes {
             // 組織ごと断られている経路は、聞いても同じ 403 が返る。前回の
             // 一覧をそのまま持ち越して、1 時間ごとの警告を出さない。
-            let paused = self
+            let paused = active
                 .preset(name)
                 .and_then(|preset| preset.org_not_allowed(now))
                 .is_some();
@@ -376,7 +469,7 @@ impl Router {
                     .cloned()
                     .unwrap_or_else(declared)
             };
-            let found = match route.discovery_flavor(&self.config) {
+            let found = match route.discovery_flavor(&active.config) {
                 Some(_) if paused => keep_previous(),
                 Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
                     Ok(found) => found,
@@ -402,7 +495,7 @@ impl Router {
         // モデルは upstream に出てから表に載るまでのあいだ、黙って旧世代の
         // 単価で計算されるか、コストの欄ごと消える。見るのは呼べるモデルだけ。
         let catalog = Catalog { by_route };
-        for gap in crate::preset::pricing::gaps(catalog.reachable(&self.config)) {
+        for gap in crate::preset::pricing::gaps(catalog.reachable(&active.config)) {
             warn!(%gap, "the price table does not describe this model");
         }
 
@@ -434,9 +527,9 @@ impl Router {
     /// この namespace に見せるモデル名 (エイリアスを含む)。
     ///
     /// 一覧そのものは共有だが、**何を見せるかは namespace ごとに違う**。
-    pub async fn models(&self, ns: &Namespace) -> Vec<String> {
+    pub async fn models(&self, ns: &NamespaceView) -> Vec<String> {
         let catalog = self.catalog.read().await;
-        let visible = catalog.visible(ns, &self.config);
+        let visible = catalog.visible(ns, ns.config());
 
         let mut all: Vec<String> = visible.keys().cloned().collect();
         all.extend(aliases_for(ns, &visible).into_keys());
@@ -457,15 +550,16 @@ impl Router {
         &self,
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
-        ns: &Namespace,
+        ns: &NamespaceView,
         client_version: &str,
     ) -> Result<Vec<Value>> {
-        let visible = self.catalog.read().await.visible(ns, &self.config);
+        let config = ns.config();
+        let visible = self.catalog.read().await.visible(ns, config);
 
-        let Some((name, route)) = ns.usable_routes(&self.config).into_iter().find_map(|name| {
-            let route = self.config.routes.get(name)?;
+        let Some((name, route)) = ns.usable_routes(config).into_iter().find_map(|name| {
+            let route = config.routes.get(name)?;
             route
-                .discovery_flavor(&self.config)
+                .discovery_flavor(config)
                 .is_some_and(discovery::Flavor::carries_model_details)
                 .then_some((name, route))
         }) else {
@@ -494,9 +588,9 @@ impl Router {
     }
 
     /// エイリアスなら実際のモデル名に直す。
-    pub async fn resolve(&self, ns: &Namespace, model: &str) -> String {
+    pub async fn resolve(&self, ns: &NamespaceView, model: &str) -> String {
         let catalog = self.catalog.read().await;
-        let visible = catalog.visible(ns, &self.config);
+        let visible = catalog.visible(ns, ns.config());
         aliases_for(ns, &visible)
             .get(model)
             .cloned()
@@ -507,9 +601,9 @@ impl Router {
     ///
     /// 設定の優先順そのままではなく、**そのモデルを扱える credential だけ**に
     /// 絞ったもの。設定を見ただけでは分からないので、確認に使える。
-    pub async fn route_names(&self, ns: &Namespace, model: &str) -> Vec<String> {
+    pub async fn route_names(&self, ns: &NamespaceView, model: &str) -> Vec<String> {
         let catalog = self.catalog.read().await;
-        let visible = catalog.visible(ns, &self.config);
+        let visible = catalog.visible(ns, ns.config());
         let model = aliases_for(ns, &visible)
             .get(model)
             .cloned()
@@ -519,14 +613,14 @@ impl Router {
             return Vec::new();
         };
         let now = now_unix();
-        ns.route_groups_for(&model, &self.config)
+        ns.route_groups_for(&model, ns.config())
             .into_iter()
             .flat_map(|group| {
                 let mut equal: Vec<&str> = group
                     .into_iter()
                     .filter(|name| available.iter().any(|available| available == name))
                     .collect();
-                equal.sort_by_key(|name| self.reset_order_key(name, now));
+                equal.sort_by_key(|name| reset_order_key(ns.active(), name, now));
                 equal
             })
             .map(str::to_owned)
@@ -539,7 +633,7 @@ impl Router {
     /// 呼び出し側から渡す。
     pub async fn routes_for(
         &self,
-        ns: &Namespace,
+        ns: &NamespaceView,
         ns_name: &str,
         model: &str,
         session: &SessionKey,
@@ -550,27 +644,27 @@ impl Router {
 
     async fn routes_for_at(
         &self,
-        ns: &Namespace,
+        ns: &NamespaceView,
         ns_name: &str,
         model: &str,
         session: &SessionKey,
         now: i64,
     ) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
-        let visible = catalog.visible(ns, &self.config);
+        let visible = catalog.visible(ns, ns.config());
         let available = visible
             .get(model)
             .ok_or_else(|| Error::UnknownModel(model.to_owned()))?;
 
         // モデル非対応の経路を除いた後もグループ境界を保ち、同格の中だけを並べ替える。
         let mut routes = Vec::new();
-        for group in ns.route_groups_for(model, &self.config) {
+        for group in ns.route_groups_for(model, ns.config()) {
             let mut equal: Vec<Arc<Route>> = group
                 .into_iter()
                 .filter(|name| available.iter().any(|available| available == name))
-                .filter_map(|name| self.build_route(&catalog, ns, name, model))
+                .filter_map(|name| build_route(ns.active(), &catalog, ns, name, model))
                 .collect();
-            equal.sort_by_key(|route| self.reset_order_key(route.name(), now));
+            equal.sort_by_key(|route| reset_order_key(ns.active(), route.name(), now));
             routes.extend(equal);
         }
         drop(catalog);
@@ -591,7 +685,7 @@ impl Router {
 
         let key = (ns_name.to_owned(), session.clone(), model.to_owned());
         if let Some(bound) = affinity.get(&key)
-            && let Some(at) = routes.iter().position(|r| r.name() == bound.route.name())
+            && let Some(at) = routes.iter().position(|r| r.name() == bound.route)
         {
             // 抜いて先頭へ差し込む。入れ替えると、先頭にいた経路が抜けた穴へ
             // 飛んで残りの優先順が入れ替わる (前回通った経路の後ろは、設定に
@@ -700,38 +794,6 @@ impl Router {
         routes.extend(rest);
     }
 
-    fn reset_order_key(&self, route: &str, now: i64) -> (bool, i64) {
-        self.presets
-            .get(route)
-            .and_then(|preset| preset.quota())
-            .and_then(|snapshot| snapshot.seven_day)
-            .and_then(|window| window.reset)
-            .filter(|reset| *reset > now)
-            .map_or((true, 0), |reset| (false, reset))
-    }
-
-    fn build_route(
-        &self,
-        catalog: &Catalog,
-        ns: &Namespace,
-        name: &str,
-        model: &str,
-    ) -> Option<Arc<Route>> {
-        let route = self.config.routes.get(name)?;
-        let preset = self.presets.get(name)?;
-        Some(Arc::new(Route {
-            preset: Arc::clone(preset),
-            credential: route.credential.as_deref().map(CredentialId::new),
-            pace_cap: ns.pace_cap_for(model, name),
-            spend_down_within: ns.spend_down_for(model),
-            // upstream での名前が違う場合だけ書き換える。
-            upstream_model: catalog
-                .upstream_name(name, model)
-                .filter(|upstream| *upstream != model)
-                .map(str::to_owned),
-        }))
-    }
-
     /// この namespace / モデルで、その経路を今も使えるか (DR-0024 §2)。
     ///
     /// 候補に居ること (namespace が許し、upstream が扱う) と、締め出しにも
@@ -739,11 +801,11 @@ impl Router {
     /// 直前に通った経路が塞がっていれば、その会話は別の credential へ流れ、
     /// 延ばしたい cache には届かない。
     pub async fn usable(&self, ns_name: &str, model: &str, name: &str, now: i64) -> bool {
-        let Some(ns) = self.config.namespace(ns_name) else {
+        let Some(ns) = self.namespace(ns_name) else {
             return false;
         };
         let allowed = ns
-            .route_groups_for(model, &self.config)
+            .route_groups_for(model, ns.config())
             .into_iter()
             .flatten()
             .any(|candidate| candidate == name);
@@ -753,11 +815,11 @@ impl Router {
 
         let catalog = self.catalog.read().await;
         let handled = catalog
-            .visible(ns, &self.config)
+            .visible(&ns, ns.config())
             .get(model)
             .is_some_and(|available| available.iter().any(|available| available == name));
         let route = handled
-            .then(|| self.build_route(&catalog, ns, name, model))
+            .then(|| build_route(ns.active(), &catalog, &ns, name, model))
             .flatten();
         drop(catalog);
 
@@ -779,7 +841,7 @@ impl Router {
         self.affinity.lock().await.insert(
             (ns_name.to_owned(), session.clone(), model.to_owned()),
             Binding {
-                route: Arc::clone(route),
+                route: route.name().to_owned(),
                 seen: Instant::now(),
             },
         );
@@ -804,6 +866,39 @@ impl Router {
             })
             .collect();
     }
+}
+
+/// 同格の経路を並べる鍵。週の窓のリセットが近い順、読めない経路は後ろ。
+fn reset_order_key(active: &Active, route: &str, now: i64) -> (bool, i64) {
+    active
+        .preset(route)
+        .and_then(|preset| preset.quota())
+        .and_then(|snapshot| snapshot.seven_day)
+        .and_then(|window| window.reset)
+        .filter(|reset| *reset > now)
+        .map_or((true, 0), |reset| (false, reset))
+}
+
+fn build_route(
+    active: &Active,
+    catalog: &Catalog,
+    ns: &Namespace,
+    name: &str,
+    model: &str,
+) -> Option<Arc<Route>> {
+    let route = active.config.routes.get(name)?;
+    let preset = active.preset(name)?;
+    Some(Arc::new(Route {
+        preset: Arc::clone(preset),
+        credential: route.credential.as_deref().map(CredentialId::new),
+        pace_cap: ns.pace_cap_for(model, name),
+        spend_down_within: ns.spend_down_for(model),
+        // upstream での名前が違う場合だけ書き換える。
+        upstream_model: catalog
+            .upstream_name(name, model)
+            .filter(|upstream| *upstream != model)
+            .map(str::to_owned),
+    }))
 }
 
 /// どの経路も断られているときに返す応答。
@@ -1075,8 +1170,8 @@ spend_down_within = "25%"
     const NS: &str = crate::config::DEFAULT_NAMESPACE;
 
     /// 既定の namespace。
-    fn ns(r: &Router) -> &Namespace {
-        r.config.namespace(NS).expect("the default always exists")
+    fn ns(r: &Router) -> NamespaceView {
+        r.namespace(NS).expect("the default always exists")
     }
 
     fn session(name: &str) -> SessionKey {
@@ -1158,11 +1253,14 @@ exclude = ["route-hidden-*"]
 
         let catalog = r.catalog.read().await;
         assert_eq!(
-            catalog.reachable(&r.config).into_iter().collect::<Vec<_>>(),
+            catalog
+                .reachable(r.active().config())
+                .into_iter()
+                .collect::<Vec<_>>(),
             vec!["visible-unpriced-1"]
         );
         // 隠していないモデルの抜けは、これまでどおり見つかる。
-        let gaps = crate::preset::pricing::gaps(catalog.reachable(&r.config));
+        let gaps = crate::preset::pricing::gaps(catalog.reachable(r.active().config()));
         assert_eq!(
             gaps.iter().map(|gap| gap.model).collect::<Vec<_>>(),
             vec!["visible-unpriced-1"]
@@ -1173,7 +1271,7 @@ exclude = ["route-hidden-*"]
     async fn follows_routing_rules() {
         let r = router().await;
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
@@ -1187,7 +1285,7 @@ exclude = ["route-hidden-*"]
             None,
         )
         .unwrap();
-        r.preset(route).unwrap().restore_quota(snapshot);
+        r.active().preset(route).unwrap().restore_quota(snapshot);
     }
 
     /// 同格グループでは、未来にある 7 日枠 reset が近い経路から試す。
@@ -1197,7 +1295,7 @@ exclude = ["route-hidden-*"]
         observe_seven_day_reset(&r, "bedrock", NOW + 200);
         observe_seven_day_reset(&r, "oauth-a", NOW + 100);
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
@@ -1209,7 +1307,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         observe_seven_day_reset(&r, "oauth-a", NOW + 100);
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
@@ -1222,7 +1320,7 @@ exclude = ["route-hidden-*"]
         observe_seven_day_reset(&r, "bedrock", NOW);
         observe_seven_day_reset(&r, "oauth-a", NOW + 100);
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "bedrock"]);
@@ -1233,7 +1331,7 @@ exclude = ["route-hidden-*"]
     async fn equal_group_keeps_declared_order_when_all_resets_are_unknown() {
         let r = router().await;
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-fable-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a"]);
@@ -1247,7 +1345,7 @@ exclude = ["route-hidden-*"]
         observe_seven_day_reset(&r, "oauth-a", NOW + 100);
         observe_seven_day_reset(&r, "oauth-b", NOW + 50);
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a", "oauth-b"]);
@@ -1261,8 +1359,8 @@ exclude = ["route-hidden-*"]
     /// 使い切りを設定してある面。
     const SPEND_NS: &str = "spend";
 
-    fn spend_ns(r: &Router) -> &Namespace {
-        r.config.namespace(SPEND_NS).expect("declared in CONFIG")
+    fn spend_ns(r: &Router) -> NamespaceView {
+        r.namespace(SPEND_NS).expect("declared in CONFIG")
     }
 
     /// 周期と reset を申告した窓を 1 つ持たせる。
@@ -1271,12 +1369,12 @@ exclude = ["route-hidden-*"]
             .with_reset(reset)
             .with_window_seconds(window_seconds);
         let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
-        r.preset(route).unwrap().restore_quota(snapshot);
+        r.active().preset(route).unwrap().restore_quota(snapshot);
     }
 
     async fn spend_order(r: &Router) -> Vec<String> {
         r.routes_for_at(
-            spend_ns(r),
+            &spend_ns(r),
             SPEND_NS,
             "claude-sonnet-5",
             &session("s1"),
@@ -1347,7 +1445,10 @@ exclude = ["route-hidden-*"]
             None,
         )
         .unwrap();
-        r.preset("oauth-b").unwrap().restore_quota(snapshot);
+        r.active()
+            .preset("oauth-b")
+            .unwrap()
+            .restore_quota(snapshot);
 
         assert_eq!(spend_order(&r).await, ["bedrock", "oauth-a", "oauth-b"]);
     }
@@ -1377,7 +1478,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + 60));
         let got = r
-            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["bedrock", "oauth-a", "oauth-b"]);
@@ -1393,7 +1494,7 @@ exclude = ["route-hidden-*"]
         let session = session("s1");
         // bedrock に貼り付いた会話を作る。
         let routes = r
-            .routes_for_at(spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
+            .routes_for_at(&spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
             .await
             .unwrap();
         r.remember(SPEND_NS, &session, "claude-sonnet-5", &routes[0])
@@ -1403,7 +1504,7 @@ exclude = ["route-hidden-*"]
         // その後 oauth-b のリセットが間際になっても、先頭は貼り付いた方のまま。
         observe_window(&r, "oauth-b", Some(WEEK), Some(NOW + 60));
         let got = r
-            .routes_for_at(spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
+            .routes_for_at(&spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
             .await
             .unwrap();
         assert_eq!(
@@ -1419,8 +1520,8 @@ exclude = ["route-hidden-*"]
     const PACED_NS: &str = "paced";
     const DAY: i64 = 24 * 60 * 60;
 
-    fn paced_ns(r: &Router) -> &Namespace {
-        r.config.namespace(PACED_NS).expect("declared in CONFIG")
+    fn paced_ns(r: &Router) -> NamespaceView {
+        r.namespace(PACED_NS).expect("declared in CONFIG")
     }
 
     /// 窓の頭から `elapsed` 経ち、`utilization` まで使った状態にする。
@@ -1432,14 +1533,14 @@ exclude = ["route-hidden-*"]
         .with_reset(Some(NOW + WEEK as i64 - elapsed))
         .with_window_seconds(Some(WEEK));
         let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
-        r.preset(route).unwrap().restore_quota(snapshot);
+        r.active().preset(route).unwrap().restore_quota(snapshot);
     }
 
     /// 上限を見たうえで今使える経路。
     async fn paced_ready(r: &Router) -> Vec<String> {
         let routes = r
             .routes_for_at(
-                paced_ns(r),
+                &paced_ns(r),
                 PACED_NS,
                 "claude-sonnet-5",
                 &session("s1"),
@@ -1472,7 +1573,7 @@ exclude = ["route-hidden-*"]
         observe_usage(&r, "oauth-b", 3 * DAY, 5.0 / 7.0);
         let routes = r
             .routes_for_at(
-                paced_ns(&r),
+                &paced_ns(&r),
                 PACED_NS,
                 "claude-sonnet-5",
                 &session("s1"),
@@ -1504,7 +1605,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         let routes = r
             .routes_for_at(
-                paced_ns(&r),
+                &paced_ns(&r),
                 PACED_NS,
                 "claude-sonnet-5",
                 &session("s1"),
@@ -1536,7 +1637,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         observe_usage(&r, "oauth-a", 60, 1.0);
         let routes = r
-            .routes_for_at(ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
+            .routes_for_at(&ns(&r), NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
         let Selection::Ready {
@@ -1557,7 +1658,7 @@ exclude = ["route-hidden-*"]
         observe_usage(&r, "oauth-b", 3 * DAY, 0.1);
         let routes = r
             .routes_for_at(
-                paced_ns(&r),
+                &paced_ns(&r),
                 PACED_NS,
                 "claude-sonnet-5",
                 &session("s1"),
@@ -1590,7 +1691,10 @@ exclude = ["route-hidden-*"]
         }
         .with_reset(Some(NOW + WEEK as i64));
         let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
-        r.preset("oauth-a").unwrap().restore_quota(snapshot);
+        r.active()
+            .preset("oauth-a")
+            .unwrap()
+            .restore_quota(snapshot);
         observe_usage(&r, "oauth-b", 3 * DAY, 0.1);
 
         assert_eq!(paced_ready(&r).await, ["oauth-b"]);
@@ -1603,7 +1707,7 @@ exclude = ["route-hidden-*"]
         observe_usage(&r, "oauth-a", 3 * DAY, 1.0);
 
         const ONLY_NS: &str = "paced-only";
-        let ns = r.config.namespace(ONLY_NS).expect("declared in CONFIG");
+        let ns = &r.namespace(ONLY_NS).expect("declared in CONFIG");
         let routes = r
             .routes_for_at(ns, ONLY_NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
@@ -1637,7 +1741,7 @@ exclude = ["route-hidden-*"]
     async fn a_pace_cap_inside_an_equal_group_applies() {
         let r = router().await;
         const GROUP_NS: &str = "paced-group";
-        let ns = r.config.namespace(GROUP_NS).expect("declared in CONFIG");
+        let ns = &r.namespace(GROUP_NS).expect("declared in CONFIG");
 
         // グループの相手 (bedrock) と外の経路は素通し。oauth-a だけ使い過ぎ。
         observe_usage(&r, "bedrock", 3 * DAY, 1.0);
@@ -1665,8 +1769,8 @@ exclude = ["route-hidden-*"]
     async fn a_capped_out_route_is_not_promoted_by_spend_down() {
         let r = router().await;
         const ORDER_NS: &str = "paced-order";
-        let ns = r.config.namespace(ORDER_NS).expect("declared in CONFIG");
-        async fn order(r: &Router, ns: &Namespace) -> String {
+        let ns = &r.namespace(ORDER_NS).expect("declared in CONFIG");
+        async fn order(r: &Router, ns: &NamespaceView) -> String {
             names(
                 &r.routes_for_at(ns, "paced-order", "claude-sonnet-5", &session("s1"), NOW)
                     .await
@@ -1690,7 +1794,7 @@ exclude = ["route-hidden-*"]
 
     /// 上限つきの経路 1 本を、指定の面から取り出す。
     async fn capped_route(r: &Router, ns_name: &str, route: &str) -> Arc<Route> {
-        let ns = r.config.namespace(ns_name).expect("declared in CONFIG");
+        let ns = &r.namespace(ns_name).expect("declared in CONFIG");
         r.routes_for_at(ns, ns_name, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap()
@@ -1783,7 +1887,7 @@ exclude = ["route-hidden-*"]
     async fn unrouted_model_uses_whoever_can_serve_it() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), NS, "claude-opus-5", &session("s1"))
+            .routes_for(&ns(&r), NS, "claude-opus-5", &session("s1"))
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a", "oauth-b"]);
@@ -1794,7 +1898,7 @@ exclude = ["route-hidden-*"]
     async fn excluded_credential_is_not_offered() {
         let r = router().await;
         let got = r
-            .routes_for(ns(&r), NS, "claude-haiku-4-5-20251001", &session("s1"))
+            .routes_for(&ns(&r), NS, "claude-haiku-4-5-20251001", &session("s1"))
             .await
             .unwrap();
         assert_eq!(names(&got), vec!["oauth-a"], "oauth-b excludes haiku");
@@ -1804,7 +1908,7 @@ exclude = ["route-hidden-*"]
     async fn unknown_model_is_rejected() {
         let r = router().await;
         let err = r
-            .routes_for(ns(&r), NS, "no-such-model", &session("s1"))
+            .routes_for(&ns(&r), NS, "no-such-model", &session("s1"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no-such-model"), "{err}");
@@ -1818,7 +1922,7 @@ exclude = ["route-hidden-*"]
     async fn carries_the_upstream_model_name_only_where_needed() {
         let r = router().await;
         let routes = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
+            .routes_for(&ns(&r), NS, "claude-fable-5", &session("s1"))
             .await
             .unwrap();
 
@@ -1839,11 +1943,11 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let first = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         let again = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
 
@@ -1853,7 +1957,7 @@ exclude = ["route-hidden-*"]
         );
         // 別のモデルで引いた経路も、同じ credential なら同じ preset。
         let other_model = r
-            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first[0].preset, &other_model[0].preset));
@@ -1865,7 +1969,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         let s = session("s1");
         let routes = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         routes[0]
@@ -1874,7 +1978,7 @@ exclude = ["route-hidden-*"]
             .expect("429 is denied");
 
         let again = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         assert!(matches!(
@@ -1888,7 +1992,7 @@ exclude = ["route-hidden-*"]
     async fn select_drops_the_denied_routes() {
         let r = router().await;
         let routes = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &session("s1"))
+            .routes_for(&ns(&r), NS, "claude-fable-5", &session("s1"))
             .await
             .unwrap();
         routes[0]
@@ -1919,7 +2023,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         let model = "claude-fable-5";
         let routes = r
-            .routes_for(ns(&r), NS, model, &session("s1"))
+            .routes_for(&ns(&r), NS, model, &session("s1"))
             .await
             .unwrap();
         for route in &routes {
@@ -1967,7 +2071,7 @@ exclude = ["route-hidden-*"]
         let r = router().await;
         let model = "claude-fable-5";
         let routes = r
-            .routes_for(ns(&r), NS, model, &session("s1"))
+            .routes_for(&ns(&r), NS, model, &session("s1"))
             .await
             .unwrap();
         for route in &routes {
@@ -2025,10 +2129,10 @@ exclude = ["route-hidden-*"]
     #[tokio::test]
     async fn aliases_resolve_to_concrete_models() {
         let r = router().await;
-        assert_eq!(r.resolve(ns(&r), "opus").await, "claude-opus-5");
-        assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
+        assert_eq!(r.resolve(&ns(&r), "opus").await, "claude-opus-5");
+        assert_eq!(r.resolve(&ns(&r), "fable").await, "claude-fable-5");
         assert_eq!(
-            r.resolve(ns(&r), "haiku").await,
+            r.resolve(&ns(&r), "haiku").await,
             "claude-haiku-4-5-20251001"
         );
     }
@@ -2037,15 +2141,15 @@ exclude = ["route-hidden-*"]
     #[tokio::test]
     async fn non_alias_passes_through() {
         let r = router().await;
-        assert_eq!(r.resolve(ns(&r), "claude-opus-5").await, "claude-opus-5");
-        assert_eq!(r.resolve(ns(&r), "unknown").await, "unknown");
+        assert_eq!(r.resolve(&ns(&r), "claude-opus-5").await, "claude-opus-5");
+        assert_eq!(r.resolve(&ns(&r), "unknown").await, "unknown");
     }
 
     /// 一覧にはエイリアスも並べる。短い名前で選べるようにする。
     #[tokio::test]
     async fn model_list_includes_aliases() {
         let r = router().await;
-        let models = r.models(ns(&r)).await;
+        let models = r.models(&ns(&r)).await;
         assert!(models.contains(&"claude-opus-5".to_owned()));
         assert!(models.contains(&"opus".to_owned()));
         assert!(models.contains(&"fable".to_owned()));
@@ -2060,13 +2164,13 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let first = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         r.remember(NS, &s, "claude-fable-5", &first[1]).await;
 
         let again = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         assert_eq!(names(&again), vec!["oauth-a", "bedrock"]);
@@ -2083,7 +2187,7 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let routes = r
-            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
             .await
             .unwrap();
         assert_eq!(names(&routes), vec!["bedrock", "oauth-a", "oauth-b"]);
@@ -2091,7 +2195,7 @@ exclude = ["route-hidden-*"]
         r.remember(NS, &s, "claude-sonnet-5", &routes[2]).await;
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+                &r.routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
                     .await
                     .unwrap()
             ),
@@ -2106,14 +2210,14 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let routes = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
 
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-fable-5", &session("s2"))
+                &r.routes_for(&ns(&r), NS, "claude-fable-5", &session("s2"))
                     .await
                     .unwrap()
             ),
@@ -2121,7 +2225,11 @@ exclude = ["route-hidden-*"]
             "has no effect on a different conversation"
         );
         assert_eq!(
-            names(&r.routes_for(ns(&r), NS, "claude-opus-5", &s).await.unwrap()),
+            names(
+                &r.routes_for(&ns(&r), NS, "claude-opus-5", &s)
+                    .await
+                    .unwrap()
+            ),
             vec!["oauth-a", "oauth-b"],
             "has no effect on a different model"
         );
@@ -2139,21 +2247,21 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let main = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         r.remember(NS, &s, "claude-fable-5", &main[1]).await;
 
         // 同じ会話を名乗る、別モデルの 1 本。
         let side = r
-            .routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+            .routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
             .await
             .unwrap();
         r.remember(NS, &s, "claude-sonnet-5", &side[2]).await;
 
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                &r.routes_for(&ns(&r), NS, "claude-fable-5", &s)
                     .await
                     .unwrap()
             ),
@@ -2162,7 +2270,7 @@ exclude = ["route-hidden-*"]
         );
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-sonnet-5", &s)
+                &r.routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
                     .await
                     .unwrap()
             ),
@@ -2178,7 +2286,7 @@ exclude = ["route-hidden-*"]
         let s = session("s1");
 
         let routes = r
-            .routes_for(ns(&r), NS, "claude-fable-5", &s)
+            .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
         r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
@@ -2186,7 +2294,7 @@ exclude = ["route-hidden-*"]
 
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                &r.routes_for(&ns(&r), NS, "claude-fable-5", &s)
                     .await
                     .unwrap()
             ),
@@ -2202,7 +2310,7 @@ exclude = ["route-hidden-*"]
     async fn bindings_do_not_cross_namespaces() {
         let r = router().await;
         let s = session("s1");
-        let other = r.config.namespace("other").expect("present in config");
+        let other = &r.namespace("other").expect("present in config");
 
         let routes = r
             .routes_for(other, "other", "claude-fable-5", &s)
@@ -2221,7 +2329,7 @@ exclude = ["route-hidden-*"]
         );
         assert_eq!(
             names(
-                &r.routes_for(ns(&r), NS, "claude-fable-5", &s)
+                &r.routes_for(&ns(&r), NS, "claude-fable-5", &s)
                     .await
                     .unwrap()
             ),
@@ -2245,13 +2353,13 @@ exclude = ["route-hidden-*"]
             "claude-haiku-4-5-20251001",
         ] {
             let actual: Vec<String> = r
-                .routes_for(ns(&r), NS, model, &s)
+                .routes_for(&ns(&r), NS, model, &s)
                 .await
                 .unwrap()
                 .iter()
                 .map(|route| route.name().to_owned())
                 .collect();
-            assert_eq!(r.route_names(ns(&r), model).await, actual, "{model}");
+            assert_eq!(r.route_names(&ns(&r), model).await, actual, "{model}");
         }
     }
 
@@ -2262,18 +2370,18 @@ exclude = ["route-hidden-*"]
     async fn aliases_can_point_at_other_aliases() {
         let r = router().await;
         assert_eq!(
-            r.resolve(ns(&r), "claude-opus").await,
+            r.resolve(&ns(&r), "claude-opus").await,
             "claude-opus-5",
             "first hop"
         );
         assert_eq!(
-            r.resolve(ns(&r), "opus").await,
+            r.resolve(&ns(&r), "opus").await,
             "claude-opus-5",
             "second hop"
         );
-        assert_eq!(r.resolve(ns(&r), "fable").await, "claude-fable-5");
+        assert_eq!(r.resolve(&ns(&r), "fable").await, "claude-fable-5");
         assert_eq!(
-            r.resolve(ns(&r), "haiku").await,
+            r.resolve(&ns(&r), "haiku").await,
             "claude-haiku-4-5-20251001"
         );
     }
@@ -2318,15 +2426,15 @@ exclude = ["route-hidden-*"]
     async fn route_names_resolves_aliases() {
         let r = router().await;
         assert_eq!(
-            r.route_names(ns(&r), "fable").await,
-            r.route_names(ns(&r), "claude-fable-5").await
+            r.route_names(&ns(&r), "fable").await,
+            r.route_names(&ns(&r), "claude-fable-5").await
         );
     }
 
     #[tokio::test]
     async fn route_names_is_empty_for_unknown_model() {
         let r = router().await;
-        assert!(r.route_names(ns(&r), "no-such-model").await.is_empty());
+        assert!(r.route_names(&ns(&r), "no-such-model").await.is_empty());
     }
 
     /// 一覧が空なら何も出さない (起動直後で discovery 前の状態)。
@@ -2334,9 +2442,9 @@ exclude = ["route-hidden-*"]
     async fn empty_catalog_serves_nothing() {
         let config: Config = toml::from_str(CONFIG).unwrap();
         let r = build(config);
-        assert!(r.models(ns(&r)).await.is_empty());
+        assert!(r.models(&ns(&r)).await.is_empty());
         assert!(
-            r.routes_for(ns(&r), NS, "claude-opus-5", &session("s"))
+            r.routes_for(&ns(&r), NS, "claude-opus-5", &session("s"))
                 .await
                 .is_err()
         );

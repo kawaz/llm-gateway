@@ -864,7 +864,7 @@ impl Serialize for WindowSpan {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Discovery {
     /// 一覧を取り直す間隔 (秒)。
@@ -896,7 +896,7 @@ fn default_watch_secs() -> u64 {
     60
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
     /// 待ち受け先。
@@ -953,7 +953,7 @@ fn default_listen() -> String {
 /// 見る側が繋ぎに来る形 (SSE) だと、待ち受けを複数並べたときに**掴んだ 1 つの
 /// 面の分しか見えない**。こちらから送れば、面がいくつあっても同じ受け口に
 /// 集まる。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Webhook {
     /// 受け口の根。ここに受け取る側が決めたパスを足した先へ送る。
@@ -1036,7 +1036,7 @@ fn default_token_file() -> PathBuf {
 }
 
 /// 認証情報の置き場。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Store {
     /// 1 認証情報 1 ファイル。平文。
@@ -1069,7 +1069,7 @@ impl Store {
 
 /// 日 / 月の枠の数の置き場。書き手 (待ち受け先) ごとのファイルに書き、読むときに
 /// 合わせる。消えると数え直しになり、その日 / 月の枠を超えて通しうるので state に置く。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitStore {
     /// 省略時は `$XDG_STATE_HOME/llm-gateway/ratelimit`。
@@ -1108,7 +1108,7 @@ fn check_secret_id(id: &str) -> Result<()> {
 }
 
 /// 固定の秘密 1 つの宣言。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretSpec {
     /// この秘密で上流へ出してよい数。どれか 1 つでも埋まったら 429。
@@ -1146,7 +1146,7 @@ where
 pub const RESERVED_UPSTREAM_NAMES: [&str; 3] = ["v1", "llm-gateway", "llm"];
 
 /// 固定の秘密の置き場 (DR-0030 §5)。認証情報とはディレクトリを分ける。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretStore {
     /// 1 秘密 1 ファイル (`<id>.json`)。平文。
@@ -1178,7 +1178,7 @@ impl SecretStore {
 }
 
 /// 使用量の日次集計の置き場 (DR-0011)。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Stats {
     /// 省略時は `$XDG_STATE_HOME/llm-gateway/stats`。
@@ -1266,7 +1266,7 @@ impl CredentialSpec {
 }
 
 /// upstream service status の設定。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusConfig {
     #[serde(default = "default_status_refresh_interval", with = "human_duration")]
@@ -1313,7 +1313,7 @@ fn default_status_request_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StatusSourceSpec {
     StatuspageV2 {
@@ -1627,6 +1627,60 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// 読み直しでは変えられない欄のうち、`other` で値が変わったもの (DR-0032 決定 4)。
+    ///
+    /// どれも走っているプロセスが起動時に掴むか写し取るもので、設定を
+    /// 差し替えても効かない。変わっていれば読み直し全体を断る — 他の欄だけ
+    /// 差し替えると、ファイルの値と走っている値が食い違ったままになる。
+    pub fn fixed_at_start_changes(&self, other: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        let mut check = |label: &'static str, same: bool| {
+            if !same {
+                changed.push(label);
+            }
+        };
+        // 待ち受けている socket そのもの。
+        check("[server] listen", self.server.listen == other.server.listen);
+        // 監督者が子を起こす時に使う unit の定義。
+        check(
+            "[server] binary_path",
+            self.server.binary_path == other.server.binary_path,
+        );
+        check(
+            "[server] disabled",
+            self.server.disabled == other.server.disabled,
+        );
+        // credential の置き場は起動時に開く。
+        check("[store]", self.store == other.store);
+        // 集計の置き場と、送り直す役の上限 (keepalive の控え) は起動時に写す。
+        check("[stats]", self.stats == other.stats);
+        // 一覧を取り直す仕事は起動時の間隔で回り続ける。
+        check("[discovery]", self.discovery == other.discovery);
+        // 送り先は起動時に立てた仕事が持つ。
+        check("[webhook]", self.webhook == other.webhook);
+        // upstream status の取得は起動時の設定と経路の対応で回る。対応を
+        // 持たない経路の出入りは status の側に関わらない。
+        check("[status]", self.status == other.status);
+        check(
+            "routes.<name>.status_source",
+            self.status_sources() == other.status_sources(),
+        );
+        // 無変換の中継は行き先・秘密の置き場・枠を起動時に組む。
+        check("[upstreams]", self.upstreams == other.upstreams);
+        check("[secret_store]", self.secret_store == other.secret_store);
+        check("[secrets]", self.secrets == other.secrets);
+        check("[ratelimit]", self.ratelimit == other.ratelimit);
+        changed
+    }
+
+    /// status_source を書いた経路と、その source。
+    fn status_sources(&self) -> BTreeMap<&str, &str> {
+        self.routes
+            .iter()
+            .filter_map(|(name, route)| Some((name.as_str(), route.status_source.as_deref()?)))
+            .collect()
     }
 
     /// 名前で namespace を引く。書いていなければ無い。
@@ -2257,6 +2311,37 @@ status_source = "used"
         .unwrap();
 
         assert_eq!(c.status_sources_without_routes(), vec!["unused"]);
+    }
+
+    /// 経路と status source の対応は読み直しで変えられないが、対応を持たない
+    /// 経路の出入りは妨げない (DR-0032 決定 4)。
+    #[test]
+    fn only_routes_with_a_status_source_pin_the_reload() {
+        const BASE: &str = r#"
+[status.sources.used]
+type = "link"
+page_url = "https://status.example/used"
+
+[routes.a]
+provider = "anthropic"
+status_source = "used"
+"#;
+        let before = parse(BASE).unwrap();
+
+        let plain_route_added = parse(&format!(
+            "{BASE}\n[routes.b]\nprovider = \"anthropic\"\nurl = \"https://b.example\"\n"
+        ))
+        .unwrap();
+        assert!(before.fixed_at_start_changes(&plain_route_added).is_empty());
+
+        let sourced_route_added = parse(&format!(
+            "{BASE}\n[routes.b]\nprovider = \"anthropic\"\nstatus_source = \"used\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            before.fixed_at_start_changes(&sourced_route_added),
+            ["routes.<name>.status_source"]
+        );
     }
 
     #[test]

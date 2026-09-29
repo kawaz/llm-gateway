@@ -21,18 +21,14 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
         let gateway = Gateway::new(&config, store).map_err(|e| Failure::from(e.to_string()))?;
         gateway.refresh_models().await;
 
-        let names: Vec<String> = gateway
-            .namespace_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let names = gateway.namespace_names();
         let mut any = false;
 
         for (i, ns_name) in names.iter().enumerate() {
             let Some(ns) = gateway.namespace(ns_name) else {
                 continue;
             };
-            let models = gateway.models(ns).await;
+            let models = gateway.models(&ns).await;
             if models.is_empty() {
                 continue;
             }
@@ -46,7 +42,7 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
                 println!("[{ns_name}]");
             }
             for model in &models {
-                let route = gateway.route_names(ns, model).await.join(" → ");
+                let route = gateway.route_names(&ns, model).await.join(" → ");
                 println!("{model}\t{route}");
             }
         }

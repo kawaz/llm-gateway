@@ -742,7 +742,7 @@ async fn forward<P: CredentialPersistence + 'static>(
     match gateway
         .forward_as(
             principal.as_ref(),
-            ns,
+            &ns,
             &ns_name,
             Ingress {
                 path: &path,
@@ -1026,7 +1026,7 @@ async fn models<P: CredentialPersistence + 'static>(
     let Some(ns) = gateway.namespace(&ns_name) else {
         return unknown_namespace(&ns_name, &gateway.namespace_names());
     };
-    if let Some(denied) = rejection(ns, &ns_name, request.headers()) {
+    if let Some(denied) = rejection(&ns, &ns_name, request.headers()) {
         return denied;
     }
 
@@ -1034,7 +1034,7 @@ async fn models<P: CredentialPersistence + 'static>(
         // codex は自分の版を `client_version` に添えて聞いてくる。upstream は
         // これで見せる範囲を決めるので、こちらの版に置き換えずそのまま渡す。
         let client_version = client_version(request.uri().query());
-        let models = match gateway.codex_models(ns, &client_version).await {
+        let models = match gateway.codex_models(&ns, &client_version).await {
             Ok(models) => models,
             // 取れなくても空で返す。codex CLI は空の一覧を「差し替えるものが
             // 無い」と読んで内蔵の記述を使い続けるので、こちらの一時的な不調が
@@ -1048,7 +1048,7 @@ async fn models<P: CredentialPersistence + 'static>(
     }
 
     let data: Vec<Value> = gateway
-        .models(ns)
+        .models(&ns)
         .await
         .into_iter()
         .map(|id| json!({"id": id, "object": "model", "type": "model"}))
@@ -1105,7 +1105,7 @@ fn client_version(query: Option<&str>) -> String {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned())
 }
 
-fn unknown_namespace(name: &str, known: &[&str]) -> Response {
+fn unknown_namespace(name: &str, known: &[String]) -> Response {
     client_error(
         name,
         StatusCode::NOT_FOUND,

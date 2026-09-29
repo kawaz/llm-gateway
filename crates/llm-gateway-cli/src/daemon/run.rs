@@ -102,7 +102,7 @@ remove disabled from [server], or register another configuration",
 
         // 誰でも通る面は、起動時に名前を出す。手前で境界を引く運用では正しい
         // 姿だが、そのつもりが無いまま開いているのが一番危ない。
-        let open: Vec<&str> = gateway
+        let open: Vec<String> = gateway
             .namespace_names()
             .into_iter()
             .filter(|name| gateway.namespace(name).is_some_and(|ns| ns.auth.is_open()))

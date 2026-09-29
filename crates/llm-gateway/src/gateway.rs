@@ -16,7 +16,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::cache::{self, keepalive};
-use crate::config::{CacheRule, CacheStrategy, Config, Namespace};
+use crate::config::{CacheRule, CacheStrategy, Config};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms, to_unix_secs};
 use crate::credential::{Credential, CredentialId, CredentialPersistence, CredentialStore, Kind};
@@ -28,14 +28,13 @@ use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
 use crate::quota::{self, QuotaLimit, QuotaStore};
-use crate::router::{Route, Router, Selection};
+use crate::router::{NamespaceView, Route, Router, Selection};
 use crate::session;
 use crate::stats::{self, Stats};
 use crate::tap::Tap;
 use crate::{Error, Result};
 
 pub struct Gateway<P: CredentialPersistence> {
-    config: Config,
     router: Arc<Router>,
     credentials: CredentialStore<P>,
     http: reqwest::Client,
@@ -59,6 +58,49 @@ pub struct Gateway<P: CredentialPersistence> {
     passthrough: crate::passthrough::Passthrough,
     status: crate::status::Manager,
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
+}
+
+/// 設定として通るが、書き落としの疑いがある箇所を挙げる。
+///
+/// 起動時と読み直しの両方で言う。読み直しで書き落としを持ち込んでも、
+/// 黙って効かせない。
+fn warn_about_gaps(config: &Config) {
+    let unrouted = config.namespaces_without_routing();
+    if !unrouted.is_empty() {
+        warn!(
+            namespaces = %unrouted.join(", "),
+            "no routing rule is written; every model falls back to the declared order of credentials"
+        );
+    }
+    let unaliased = config.namespaces_without_aliases();
+    if !unaliased.is_empty() {
+        warn!(
+            namespaces = %unaliased.join(", "),
+            "no short name of its own is written"
+        );
+    }
+
+    for (ns_name, model) in config.keepalive_horizon_without_pricing(&|model| {
+        crate::preset::pricing::for_model(model).is_some()
+    }) {
+        warn!(
+            namespace = ns_name,
+            model,
+            hours = crate::config::DEFAULT_KEEPALIVE_HORIZON.as_secs() / 3600,
+            "no price is known for this model, so the keepalive horizon falls back to the default"
+        );
+    }
+}
+
+/// 設定を読み直せなかった理由。
+#[derive(Debug, thiserror::Error)]
+pub enum ReloadError {
+    /// 起動時に掴んだ欄が変わっている (DR-0032 決定 4)。旧設定のまま走り続けている。
+    #[error(
+        "{} changed; these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them",
+        fields.join(", ")
+    )]
+    RestartRequired { fields: Vec<&'static str> },
 }
 
 impl<P: CredentialPersistence> Gateway<P> {
@@ -96,31 +138,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             .build()
             .map_err(|e| Error::Internal(format!("could not build the HTTP client: {e}")))?;
 
-        let unrouted = config.namespaces_without_routing();
-        if !unrouted.is_empty() {
-            warn!(
-                namespaces = %unrouted.join(", "),
-                "no routing rule is written; every model falls back to the declared order of credentials"
-            );
-        }
-        let unaliased = config.namespaces_without_aliases();
-        if !unaliased.is_empty() {
-            warn!(
-                namespaces = %unaliased.join(", "),
-                "no short name of its own is written"
-            );
-        }
-
-        for (ns_name, model) in config.keepalive_horizon_without_pricing(&|model| {
-            crate::preset::pricing::for_model(model).is_some()
-        }) {
-            warn!(
-                namespace = ns_name,
-                model,
-                hours = crate::config::DEFAULT_KEEPALIVE_HORIZON.as_secs() / 3600,
-                "no price is known for this model, so the keepalive horizon falls back to the default"
-            );
-        }
+        warn_about_gaps(config);
 
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
@@ -145,7 +163,6 @@ impl<P: CredentialPersistence> Gateway<P> {
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
-            config: config.clone(),
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
             // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
@@ -164,7 +181,9 @@ impl<P: CredentialPersistence> Gateway<P> {
 
     /// Web login の対象として宣言された credential 一覧。
     pub fn login_credentials(&self) -> Vec<(String, &'static str)> {
-        self.config
+        self.router
+            .active()
+            .config()
             .credentials
             .iter()
             .map(|(name, spec)| (name.clone(), spec.type_name()))
@@ -179,7 +198,8 @@ impl<P: CredentialPersistence> Gateway<P> {
         auth: WebAuthorization,
         now: i64,
     ) -> Result<String> {
-        let Some(spec) = self.config.credentials.get(name) else {
+        let active = self.router.active();
+        let Some(spec) = active.config().credentials.get(name) else {
             return Err(Error::Credential {
                 id: name.to_owned(),
                 reason: "not configured".into(),
@@ -263,7 +283,8 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// USD は読み出しのたびに換算する。単価を知っているのは答えた経路の
     /// provider なので、集計の器には引き当て役を渡す (DR-0014 §4)。
     pub fn stats_report(&self, days: usize, now_ms: i64) -> stats::Report {
-        self.stats.report(days, now_ms, &RoutePricing(&self.router))
+        self.stats
+            .report(days, now_ms, &RoutePricing(&self.router.active()))
     }
 
     /// 登録した行き先へ無変換で中継する (DR-0030 §2)。結果は知らせにも流す。
@@ -306,7 +327,8 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         // 読み戻した観測は、それを持つべき経路へ渡す。置き場はディスクとの
         // 出入りを担い、今の値は経路が持つ (DR-0014 §3)。
-        for (name, preset) in self.router.presets() {
+        let active = self.router.active();
+        for (name, preset) in active.presets() {
             if let Some(snapshot) = self.usage.get(&CredentialId::new(name)).await {
                 preset.restore_quota(snapshot);
             }
@@ -405,18 +427,50 @@ impl<P: CredentialPersistence> Gateway<P> {
             .collect()
     }
 
+    /// 設定を差し替える (DR-0032 決定 3)。
+    ///
+    /// `config` は読み込みと検証を済ませたもの。起動時に掴んだ欄が変わって
+    /// いれば全体を断り、旧設定のまま走り続ける。走行中のリクエストは掴んだ
+    /// 設定で最後まで走り、差し替えは次のリクエストから効く。返る前に
+    /// モデルの一覧も新しい経路で取り直すので、返った時点で新しい設定が
+    /// すべて効いている。
+    pub async fn reload(&self, config: Config) -> std::result::Result<(), ReloadError> {
+        let fields = self
+            .router
+            .active()
+            .config()
+            .fixed_at_start_changes(&config);
+        if !fields.is_empty() {
+            return Err(ReloadError::RestartRequired { fields });
+        }
+        warn_about_gaps(&config);
+        self.router.reload(config).await;
+        self.refresh_models().await;
+        info!("reloaded the configuration");
+        Ok(())
+    }
+
     /// 名前で namespace を引く。無ければ `None`。
-    pub fn namespace(&self, name: &str) -> Option<&Namespace> {
-        self.config.namespace(name)
+    ///
+    /// 返るのは今走っている設定の namespace で、リクエストはこれを最後まで
+    /// 持ち回る。途中で設定が差し替わっても、このリクエストは同じ設定を見る。
+    pub fn namespace(&self, name: &str) -> Option<NamespaceView> {
+        self.router.namespace(name)
     }
 
     /// 公開している namespace 名。
-    pub fn namespace_names(&self) -> Vec<&str> {
-        self.config.namespace_names()
+    pub fn namespace_names(&self) -> Vec<String> {
+        self.router
+            .active()
+            .config()
+            .namespace_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// この namespace に見せるモデル名。
-    pub async fn models(&self, ns: &Namespace) -> Vec<String> {
+    pub async fn models(&self, ns: &NamespaceView) -> Vec<String> {
         self.router.models(ns).await
     }
 
@@ -424,14 +478,18 @@ impl<P: CredentialPersistence> Gateway<P> {
     ///
     /// codex 経路を持たない namespace では空。`client_version` は聞きに来た
     /// クライアントが名乗った版で、upstream が見せる範囲を決める。
-    pub async fn codex_models(&self, ns: &Namespace, client_version: &str) -> Result<Vec<Value>> {
+    pub async fn codex_models(
+        &self,
+        ns: &NamespaceView,
+        client_version: &str,
+    ) -> Result<Vec<Value>> {
         self.router
             .codex_details(&self.http, &self.credentials, ns, client_version)
             .await
     }
 
     /// このモデルを実際に試す順。設定の優先順のうち、扱える経路だけ。
-    pub async fn route_names(&self, ns: &Namespace, model: &str) -> Vec<String> {
+    pub async fn route_names(&self, ns: &NamespaceView, model: &str) -> Vec<String> {
         self.router.route_names(ns, model).await
     }
 
@@ -440,7 +498,7 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// 受け口が受け取った宛先と形は [`Ingress`] にまとめて渡す。
     pub async fn forward(
         &self,
-        ns: &Namespace,
+        ns: &NamespaceView,
         ns_name: &str,
         received: Ingress<'_>,
         body: Value,
@@ -455,7 +513,7 @@ impl<P: CredentialPersistence> Gateway<P> {
     pub async fn forward_as(
         &self,
         principal: Option<&gateway_core::ns::Principal>,
-        ns: &Namespace,
+        ns: &NamespaceView,
         ns_name: &str,
         received: Ingress<'_>,
         mut body: Value,
@@ -968,7 +1026,7 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// 経路は名前で引き直す。控えた時点の `Arc<Route>` を持ち回ると、締め出しも
     /// 候補の入れ替わりも見ないまま古い経路へ出し続けることになる。
     async fn send_keepalive(&self, kept: &keepalive::Kept) -> keepalive::Outcome {
-        let Some(ns) = self.config.namespace(&kept.ns) else {
+        let Some(ns) = self.router.namespace(&kept.ns) else {
             warn!(ns = %kept.ns, "the namespace this conversation used is gone; not replaying");
             return keepalive::Outcome::Unsent;
         };
@@ -976,7 +1034,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         let session = session::derive(&body, &kept.headers);
         let routes = match self
             .router
-            .routes_for(ns, &kept.ns, &kept.model, &session)
+            .routes_for(&ns, &kept.ns, &kept.model, &session)
             .await
         {
             Ok(routes) => routes,
@@ -1286,11 +1344,13 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 報告に載る時刻は Unix ミリ秒 (DR-0012)。締め出しの印だけは秒で持つ。
         let now_ms = now_unix_ms();
         let now_secs = crate::credential::time::to_unix_secs(now_ms);
+        let active = self.router.active();
+        let config = active.config();
         let mut credentials = Vec::new();
-        for (name, route) in &self.config.routes {
+        for (name, route) in &config.routes {
             // 今の観測も、観測が無いときに何と言えるかも、持っているのは経路
             // (DR-0014 §3)。置き場はディスクとの出入りだけを担う。
-            let preset = self.router.preset(name);
+            let preset = active.preset(name);
             let mut snapshot = preset.and_then(|preset| preset.quota());
             if let Some(snapshot) = snapshot.as_mut() {
                 mark_expired_windows(snapshot, now_ms);
@@ -1300,7 +1360,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                 quota::Support::UpstreamDependent,
                 |preset| preset.quota_support(),
             );
-            let credential = route.credential(&self.config);
+            let credential = route.credential(config);
             let credential_type =
                 credential.map_or("none", crate::config::CredentialSpec::type_name);
 
@@ -1368,7 +1428,8 @@ impl<P: CredentialPersistence> Gateway<P> {
         let mut errors = std::collections::BTreeMap::new();
         let mut limits = std::collections::BTreeMap::new();
 
-        for (name, preset) in self.router.presets() {
+        let active = self.router.active();
+        for (name, preset) in active.presets() {
             if preset.quota_api().is_none() {
                 continue;
             }
@@ -1377,8 +1438,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             if preset.org_not_allowed(now_unix()).is_some() {
                 continue;
             }
-            let Some(credential_name) = self
-                .config
+            let Some(credential_name) = active
+                .config()
                 .routes
                 .get(name)
                 .and_then(|route| route.credential.as_deref())
@@ -1894,9 +1955,9 @@ struct Probed {
 
 /// 集計の 1 行の単価を、その行を出した経路へ聞く役。
 ///
-/// 単価表は provider の側にあり (DR-0014 §4)、経路を引けるのは router なので、
-/// 両者を繋ぐのがここの仕事になる。
-struct RoutePricing<'a>(&'a Router);
+/// 単価表は provider の側にあり (DR-0014 §4)、経路を持つのは走っている設定
+/// なので、両者を繋ぐのがここの仕事になる。
+struct RoutePricing<'a>(&'a crate::router::Active);
 
 impl PricingSource for RoutePricing<'_> {
     fn pricing(&self, credential: &str, model: &str) -> Option<Pricing> {
@@ -2357,8 +2418,8 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     }
 
     /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。
-    fn preset_of<'a, P: CredentialPersistence>(gw: &'a Gateway<P>, name: &str) -> &'a Arc<Preset> {
-        gw.router.preset(name).expect("present in config")
+    fn preset_of<P: CredentialPersistence>(gw: &Gateway<P>, name: &str) -> Arc<Preset> {
+        Arc::clone(gw.router.active().preset(name).expect("present in config"))
     }
 
     /// 流れた 1 件を、転送の知らせとして読む。
@@ -2370,7 +2431,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     const NS: &str = crate::config::DEFAULT_NAMESPACE;
 
     /// 既定の namespace。
-    fn ns<P: CredentialPersistence>(gw: &Gateway<P>) -> &Namespace {
+    fn ns<P: CredentialPersistence>(gw: &Gateway<P>) -> NamespaceView {
         gw.namespace(NS).expect("the default always exists")
     }
 
@@ -2455,7 +2516,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2484,7 +2545,7 @@ routes = ["a"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2509,7 +2570,7 @@ routes = ["a"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2546,7 +2607,7 @@ routes = ["a"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2582,7 +2643,7 @@ routes = ["a"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2624,7 +2685,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2667,7 +2728,7 @@ opus = "claude-opus-*"
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2708,7 +2769,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2749,7 +2810,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2832,7 +2893,7 @@ routes = ["down", "alive"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2876,7 +2937,7 @@ routes = ["nowhere", "alive"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2919,7 +2980,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -2984,7 +3045,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3014,7 +3075,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3049,7 +3110,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3084,7 +3145,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3119,7 +3180,7 @@ routes = ["a", "b"]
         for _ in 0..2 {
             let resp = gw
                 .forward(
-                    ns(&gw),
+                    &ns(&gw),
                     NS,
                     Ingress {
                         path: "/v1/messages",
@@ -3178,6 +3239,7 @@ routes = ["a", "b"]
         ))
         .await;
 
+        let default_ns = ns(&gw);
         let ask = |model: &str| {
             let body = json!({
                 "model": model,
@@ -3186,7 +3248,7 @@ routes = ["a", "b"]
                 "metadata": {"user_id": r#"{"session_id":"s1"}"#},
             });
             gw.forward(
-                ns(&gw),
+                &default_ns,
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3228,7 +3290,7 @@ routes = ["a", "b"]
 
         let mut watching = gw.events().subscribe();
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3266,7 +3328,7 @@ routes = ["a", "b"]
         let mut watching = gw.events().subscribe();
         let started_ms = crate::credential::time::now_unix_ms();
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3304,7 +3366,7 @@ routes = ["a", "b"]
 
         let mut watching = gw.events().subscribe();
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3351,7 +3413,7 @@ routes = ["a", "b"]
         let mut watching = gw.events().subscribe();
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3399,7 +3461,7 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3432,7 +3494,7 @@ routes = ["a", "b"]
         let past = now_unix() - 1;
         preset_of(&gw, "a").deny(window_closed(past), past);
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3471,7 +3533,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3502,7 +3564,7 @@ routes = ["a", "b"]
             let gw = gateway(&two_credentials(&broken.url, &spare.url)).await;
 
             gw.forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3631,7 +3693,7 @@ routes = ["a"]
         let probing = preset_of(&gw, "a")
             .claim_ask(now)
             .expect("the token is available");
-        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
+        gw.probe_in_background(&CredentialId::new("a"), &preset_of(&gw, "a"), probing)
             .await
             .unwrap();
 
@@ -3661,7 +3723,7 @@ routes = ["a"]
         let probing = preset_of(&gw, "a")
             .claim_ask(now)
             .expect("the token is available");
-        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
+        gw.probe_in_background(&CredentialId::new("a"), &preset_of(&gw, "a"), probing)
             .await
             .unwrap();
 
@@ -3695,7 +3757,7 @@ routes = ["a"]
         let probing = preset_of(&gw, "a")
             .claim_ask(now)
             .expect("can probe even without a mark");
-        gw.probe_in_background(&CredentialId::new("a"), preset_of(&gw, "a"), probing)
+        gw.probe_in_background(&CredentialId::new("a"), &preset_of(&gw, "a"), probing)
             .await
             .unwrap();
 
@@ -3760,7 +3822,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3822,7 +3884,7 @@ routes = ["a", "b"]
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3858,7 +3920,7 @@ routes = ["a", "b"]
         preset_of(&gw, "a").deny(window_closed(now + 100_000), now - denial::PROBE_INTERVAL);
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -3892,7 +3954,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3934,7 +3996,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -3966,7 +4028,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4034,7 +4096,7 @@ routes = ["codex", "spare"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4074,7 +4136,7 @@ routes = ["codex", "spare"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4116,7 +4178,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4143,7 +4205,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4171,7 +4233,7 @@ routes = ["a"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4218,7 +4280,7 @@ routes = ["first", "second"]
 
         let err = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4271,7 +4333,7 @@ routes = ["flaky", "alive"]
 
         // 1 回目: flaky が落ちていて alive が通る。
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4287,7 +4349,7 @@ routes = ["flaky", "alive"]
 
         // 2 回目: flaky は復帰しているが、通った alive を先に試す。
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4334,7 +4396,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4397,7 +4459,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4436,7 +4498,7 @@ routes = ["a", "b"]
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4468,7 +4530,7 @@ routes = ["a", "b"]
         let gw = gateway(&two_credentials(&limited.url, &spare.url)).await;
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4487,7 +4549,7 @@ routes = ["a", "b"]
         );
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4523,7 +4585,7 @@ routes = ["a"]
         .await;
         let err = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4555,7 +4617,7 @@ routes = ["a"]
         .await;
         assert!(
             gw.forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4585,7 +4647,7 @@ models = ["z-model", "a-model"]
         )
         .await;
         assert_eq!(
-            gw.models(ns(&gw)).await,
+            gw.models(&ns(&gw)).await,
             vec!["a-model", "z-model"],
             "sorted by name"
         );
@@ -4610,14 +4672,14 @@ opus = "claude-opus-*"
         )
         .await;
         assert_eq!(
-            gw.models(ns(&gw)).await,
+            gw.models(&ns(&gw)).await,
             vec!["claude-opus-5", "opus"],
             "the hidden 4-8 is absent; opus is an alias"
         );
 
         let err = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4658,7 +4720,7 @@ advisor-tool-2026-03-01";
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4700,7 +4762,7 @@ advisor-tool-2026-03-01";
 
         // 覚えた分は、同じ工程の次の転送から効く (毎回 400 を踏まない)。
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4733,7 +4795,7 @@ advisor-tool-2026-03-01";
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4775,7 +4837,7 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store).await;
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -4804,7 +4866,7 @@ advisor-tool-2026-03-01";
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4845,7 +4907,7 @@ advisor-tool-2026-03-01";
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -4884,7 +4946,7 @@ advisor-tool-2026-03-01";
         let gw = gateway_with(&oauth_config(&up.url), store.clone()).await;
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -5067,7 +5129,7 @@ models = ["m"]
         let gw = gateway(&oauth_config(&up.url)).await;
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -5310,7 +5372,7 @@ main = "keepalive"
         body["system"] = json!([{"type": "text", "text": "you are here", "cache_control": {"type": "ephemeral"}}]);
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5388,7 +5450,7 @@ main = "keepalive"
         body["system"] = json!([{"type": "text", "text": "you are here"}]);
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5451,7 +5513,7 @@ main = "keepalive"
         body["system"] = json!([{"type": "text", "text": "you are here"}]);
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5530,7 +5592,7 @@ main = "keepalive"
         let (body, headers) = conversation(json!({}));
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5602,7 +5664,7 @@ main = "keepalive"
         body["system"] = json!([{"type": "text", "text": "you are here"}]);
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5722,13 +5784,13 @@ opus = "claude-opus-*"
         .await;
 
         assert!(
-            gw.models(ns(&gw)).await.contains(&"opus".to_owned()),
+            gw.models(&ns(&gw)).await.contains(&"opus".to_owned()),
             "the short name appears in the listing too"
         );
 
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5768,7 +5830,7 @@ routes = ["route"]
             let gw = gateway(&status_route(&upstream.url)).await;
             let _ = gw
                 .forward(
-                    ns(&gw),
+                    &ns(&gw),
                     NS,
                     Ingress {
                         path: "/v1/messages",
@@ -5795,7 +5857,7 @@ routes = ["route"]
         let gw = gateway(&status_route(&upstream.url)).await;
         let resp = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5821,7 +5883,7 @@ routes = ["route"]
         let gw = gateway(&status_route(&upstream.url)).await;
         let first = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5842,7 +5904,7 @@ routes = ["route"]
         preset_of(&gw, "route").allow(MODEL);
         let second = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -5909,7 +5971,7 @@ routes = ["route"]
         let response = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             gw.forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6080,7 +6142,7 @@ sub = "none"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6119,7 +6181,7 @@ sub = "none"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6160,7 +6222,7 @@ main = "1h"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6212,7 +6274,7 @@ main = "1h"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6238,7 +6300,7 @@ main = "1h"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6331,7 +6393,7 @@ keepalive_horizon = "8h"
         let (body, headers) = conversation(json!({}));
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6373,7 +6435,7 @@ keepalive_horizon = "8h"
         let (body, headers) = conversation(json!({}));
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6423,7 +6485,7 @@ keepalive_horizon = "8h"
             let (body, headers) = conversation(json!({}));
             let forwarded = gw
                 .forward(
-                    ns(gw),
+                    &ns(gw),
                     NS,
                     Ingress {
                         path: "/v1/messages",
@@ -6509,7 +6571,7 @@ keepalive_horizon = "8h"
         let (body, headers) = conversation(json!({}));
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6582,7 +6644,7 @@ keepalive_horizon = "8h"
             let (body, headers) = conversation(json!({"model": priced}));
             let forwarded = gw
                 .forward(
-                    ns(&gw),
+                    &ns(&gw),
                     NS,
                     Ingress {
                         path: "/v1/messages",
@@ -6634,7 +6696,7 @@ main = "1h"
 
         let (body, headers) = conversation(json!({}));
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -6674,7 +6736,7 @@ main = "1h"
         body.as_object_mut().unwrap().remove("tools");
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6715,7 +6777,7 @@ sub = "5m"
 
         let (body, headers) = conversation(json!({}));
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -6735,7 +6797,7 @@ sub = "5m"
         let (mut sub, headers) = conversation(json!({}));
         sub["metadata"] = json!({"user_id": SUB});
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -6765,7 +6827,7 @@ sub = "5m"
 
         let (body, headers) = conversation(json!({}));
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -6785,7 +6847,7 @@ sub = "5m"
         );
 
         gw.forward(
-            ns(&gw),
+            &ns(&gw),
             NS,
             Ingress {
                 path: "/v1/messages",
@@ -6826,7 +6888,7 @@ sub = "5m"
         }]);
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -6949,7 +7011,7 @@ routes = ["spare", "codex"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/responses",
@@ -7003,7 +7065,7 @@ routes = ["spare", "codex"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/responses",
@@ -7065,7 +7127,7 @@ routes = ["spare"]
 
         let error = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/responses",
@@ -7131,7 +7193,7 @@ routes = ["first", "second"]
 
         let error = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -7190,7 +7252,7 @@ routes = ["first", "second"]
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/responses",
@@ -7251,7 +7313,7 @@ routes = ["codex"]
             body["metadata"] = json!({"user_id": user_id});
             let forwarded = gw
                 .forward(
-                    ns(&gw),
+                    &ns(&gw),
                     NS,
                     Ingress {
                         path: "/v1/messages",
@@ -7319,7 +7381,7 @@ exclude = ["unlisted"]
         .await;
 
         let listed = gw
-            .codex_models(ns(&gw), crate::discovery::CODEX_CLIENT_VERSION)
+            .codex_models(&ns(&gw), crate::discovery::CODEX_CLIENT_VERSION)
             .await
             .unwrap();
         assert_eq!(
@@ -7334,7 +7396,10 @@ exclude = ["unlisted"]
         );
 
         assert!(
-            gw.codex_models(ns(&gw), "0.43.0").await.unwrap().is_empty(),
+            gw.codex_models(&ns(&gw), "0.43.0")
+                .await
+                .unwrap()
+                .is_empty(),
             "the client's own version decides what the upstream shows"
         );
     }
@@ -7359,7 +7424,7 @@ models = ["m"]
         .await;
 
         assert!(
-            gw.codex_models(ns(&gw), "0.153.4")
+            gw.codex_models(&ns(&gw), "0.153.4")
                 .await
                 .unwrap()
                 .is_empty()
@@ -7520,7 +7585,7 @@ routes = ["a"]
         body["stream"] = json!(true);
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -7575,7 +7640,7 @@ main = "keepalive"
         body["system"] = json!([{"type": "text", "text": "you are here", "cache_control": {"type": "ephemeral"}}]);
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/messages",
@@ -7618,7 +7683,7 @@ main = "keepalive"
 
         let forwarded = gw
             .forward(
-                ns(&gw),
+                &ns(&gw),
                 NS,
                 Ingress {
                     path: "/v1/responses",
@@ -7647,5 +7712,129 @@ main = "keepalive"
         )
         .await;
         assert_eq!(seen, CHUNKS.concat(), "not a byte is changed");
+    }
+
+    /// 読み直しの試験で使う設定。`m` を `to` の経路へ送る。経路 `a` / `b` は
+    /// どちらも書いておき、振り分けだけを変えられるようにする。
+    fn two_routes(a: &str, b: &str, to: &str) -> String {
+        format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{a}"
+models = ["m"]
+
+[routes.b]
+provider = "anthropic"
+url = "{b}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["{to}"]
+"#
+        )
+    }
+
+    fn loaded(config_toml: &str) -> Config {
+        let config: Config = toml::from_str(config_toml).unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    async fn forward_on(gw: &Gateway<StaticStore>, view: &NamespaceView) -> u16 {
+        let forwarded = gw
+            .forward(
+                view,
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let status = forwarded.response.status;
+        drain(gw, forwarded).await;
+        status
+    }
+
+    /// 差し替え前に掴んだリクエストは旧設定で最後まで走り、差し替え後の
+    /// リクエストは新しい設定を見る (DR-0032 決定 3)。
+    #[tokio::test]
+    async fn a_request_keeps_the_configuration_it_started_with() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_routes(&a.url, &b.url, "a")).await;
+
+        let started = ns(&gw);
+        gw.reload(loaded(&two_routes(&a.url, &b.url, "b")))
+            .await
+            .unwrap();
+
+        assert_eq!(forward_on(&gw, &started).await, 200);
+        assert_eq!(
+            (a.hits(), b.hits()),
+            (1, 0),
+            "the old routing still applies"
+        );
+
+        assert_eq!(forward_on(&gw, &ns(&gw)).await, 200);
+        assert_eq!(
+            (a.hits(), b.hits()),
+            (1, 1),
+            "the next request sees the new routing"
+        );
+    }
+
+    /// 起動時に掴む欄が変わっていれば、他の欄も含めて何も差し替えない
+    /// (DR-0032 決定 4)。
+    #[tokio::test]
+    async fn a_changed_fixed_field_refuses_the_whole_reload() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_routes(&a.url, &b.url, "a")).await;
+
+        let moved = format!(
+            "[server]\nlisten = \"127.0.0.1:1\"\n\n[stats]\nuncached_keep = 1\n{}",
+            two_routes(&a.url, &b.url, "b")
+        );
+        let err = gw.reload(loaded(&moved)).await.unwrap_err();
+        let ReloadError::RestartRequired { fields } = &err;
+        assert_eq!(fields, &["[server] listen", "[stats]"]);
+        assert!(err.to_string().contains("restart the unit"));
+
+        assert_eq!(forward_on(&gw, &ns(&gw)).await, 200);
+        assert_eq!(
+            (a.hits(), b.hits()),
+            (1, 0),
+            "the routing written next to the refused field is not applied either"
+        );
+    }
+
+    /// 読み直しで足した経路のモデルは、返った時点で一覧に載っている。
+    #[tokio::test]
+    async fn a_route_added_by_a_reload_is_listed_when_it_returns() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_routes(&a.url, &b.url, "a")).await;
+        assert!(!gw.models(&ns(&gw)).await.contains(&"n".to_owned()));
+
+        let added = format!(
+            r#"{}
+[routes.c]
+provider = "anthropic"
+url = "{}"
+models = ["n"]
+"#,
+            two_routes(&a.url, &b.url, "a"),
+            b.url
+        );
+        gw.reload(loaded(&added)).await.unwrap();
+
+        assert!(gw.models(&ns(&gw)).await.contains(&"n".to_owned()));
     }
 }
