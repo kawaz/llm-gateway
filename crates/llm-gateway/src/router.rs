@@ -505,7 +505,9 @@ impl Router {
     ) -> Vec<String> {
         let mut failures = Vec::new();
         let mut by_route: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        let previous = self.catalog.read().await;
+        // 前回の一覧は写して持つ。錠を握ったまま upstream を待つと、その間
+        // 読み直しが一覧を片付けられずに止まる。
+        let previous = self.catalog.read().await.by_route.clone();
 
         let active = self.active();
         let now = crate::credential::time::now_unix();
@@ -525,7 +527,6 @@ impl Router {
             };
             let keep_previous = || {
                 previous
-                    .by_route
                     .get(name)
                     .filter(|models| !models.is_empty())
                     .cloned()
@@ -561,7 +562,6 @@ impl Router {
             };
             by_route.insert(name.clone(), with_declared_fallback(found, route));
         }
-        drop(previous);
 
         let total: usize = by_route.values().map(BTreeMap::len).sum();
         info!(
@@ -577,7 +577,17 @@ impl Router {
             warn!(%gap, "the price table does not describe this model");
         }
 
-        *self.catalog.write().await = catalog;
+        // 聞いている間に読み直されたなら、この一覧は旧い経路表のもの。書くと
+        // 新しい経路の一覧を消すか、捨てた経路を戻す。読み直しの後の取り直しが
+        // 新しい経路表で書くので、ここでは捨てる。比べるのは一覧の錠の内側
+        // (読み直しは差し替えてから一覧の錠を取る)。掴んだ `active` を最後まで
+        // 持っているので、同じ番地に別の設定が載ることはない。
+        let mut current = self.catalog.write().await;
+        if !Arc::ptr_eq(&active, &self.active()) {
+            info!("the configuration was reloaded while fetching; dropping this model list");
+            return failures;
+        }
+        *current = catalog;
         failures
     }
 
@@ -910,15 +920,26 @@ impl Router {
     }
 
     /// 実際に使えた経路を覚える。
+    ///
+    /// `ns` を読んだ設定が今の設定でなければ覚えない。読み直しの前に始まった
+    /// リクエストが、捨てた経路や credential の変わった同名経路へ会話を
+    /// 結びつけ直すのを防ぐ — 結びつきを 1 つ失うより、旧い枠に会話を
+    /// 固定する方が害が大きい。
     pub async fn remember(
         &self,
-        ns_name: &str,
+        ns: &NamespaceView,
         session: &SessionKey,
         model: &str,
         route: &Arc<Route>,
     ) {
-        self.affinity.lock().await.insert(
-            (ns_name.to_owned(), session.clone(), model.to_owned()),
+        // 読み直しは結びつきの錠を握ったまま差し替えるので、錠の内側で
+        // 比べれば差し替えの途中を見ない。
+        let mut affinity = self.affinity.lock().await;
+        if !Arc::ptr_eq(ns.active(), &self.active()) {
+            return;
+        }
+        affinity.insert(
+            (ns.name().to_owned(), session.clone(), model.to_owned()),
             Binding {
                 route: route.name().to_owned(),
                 seen: Instant::now(),
@@ -1600,7 +1621,7 @@ exclude = ["route-hidden-*"]
             .routes_for_at(&spend_ns(&r), SPEND_NS, "claude-sonnet-5", &session, NOW)
             .await
             .unwrap();
-        r.remember(SPEND_NS, &session, "claude-sonnet-5", &routes[0])
+        r.remember(&spend_ns(&r), &session, "claude-sonnet-5", &routes[0])
             .await;
         assert_eq!(routes[0].name(), "bedrock");
 
@@ -2270,7 +2291,7 @@ exclude = ["route-hidden-*"]
             .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
-        r.remember(NS, &s, "claude-fable-5", &first[1]).await;
+        r.remember(&ns(&r), &s, "claude-fable-5", &first[1]).await;
 
         let again = r
             .routes_for(&ns(&r), NS, "claude-fable-5", &s)
@@ -2295,7 +2316,7 @@ exclude = ["route-hidden-*"]
             .unwrap();
         assert_eq!(names(&routes), vec!["bedrock", "oauth-a", "oauth-b"]);
 
-        r.remember(NS, &s, "claude-sonnet-5", &routes[2]).await;
+        r.remember(&ns(&r), &s, "claude-sonnet-5", &routes[2]).await;
         assert_eq!(
             names(
                 &r.routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
@@ -2316,7 +2337,7 @@ exclude = ["route-hidden-*"]
             .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
-        r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
+        r.remember(&ns(&r), &s, "claude-fable-5", &routes[1]).await;
 
         assert_eq!(
             names(
@@ -2353,14 +2374,14 @@ exclude = ["route-hidden-*"]
             .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
-        r.remember(NS, &s, "claude-fable-5", &main[1]).await;
+        r.remember(&ns(&r), &s, "claude-fable-5", &main[1]).await;
 
         // 同じ会話を名乗る、別モデルの 1 本。
         let side = r
             .routes_for(&ns(&r), NS, "claude-sonnet-5", &s)
             .await
             .unwrap();
-        r.remember(NS, &s, "claude-sonnet-5", &side[2]).await;
+        r.remember(&ns(&r), &s, "claude-sonnet-5", &side[2]).await;
 
         assert_eq!(
             names(
@@ -2392,8 +2413,8 @@ exclude = ["route-hidden-*"]
             .routes_for(&ns(&r), NS, "claude-fable-5", &s)
             .await
             .unwrap();
-        r.remember(NS, &s, "claude-fable-5", &routes[1]).await;
-        r.remember(NS, &s, "claude-fable-5", &routes[0]).await;
+        r.remember(&ns(&r), &s, "claude-fable-5", &routes[1]).await;
+        r.remember(&ns(&r), &s, "claude-fable-5", &routes[0]).await;
 
         assert_eq!(
             names(
@@ -2419,7 +2440,13 @@ exclude = ["route-hidden-*"]
             .routes_for(other, "other", "claude-fable-5", &s)
             .await
             .unwrap();
-        r.remember("other", &s, "claude-fable-5", &routes[1]).await;
+        r.remember(
+            &r.namespace("other").unwrap(),
+            &s,
+            "claude-fable-5",
+            &routes[1],
+        )
+        .await;
 
         assert_eq!(
             names(
@@ -2653,9 +2680,34 @@ routes = ["a", "b"]
             );
             observe_window(&r, name, Some(7 * 86_400), Some(NOW + 3600));
         }
-        r.remember(NS, &session("s-a"), SONNET, &routes[0]).await;
-        r.remember(NS, &session("s-b"), SONNET, &routes[1]).await;
+        r.remember(&ns(&r), &session("s-a"), SONNET, &routes[0])
+            .await;
+        r.remember(&ns(&r), &session("s-b"), SONNET, &routes[1])
+            .await;
         r
+    }
+
+    /// 読み直しの前に経路を選んだリクエストが後から通っても、結びつきを
+    /// 作らない。捨てた経路や枠の変わった同名経路へ会話を貼り直さない。
+    #[tokio::test]
+    async fn a_request_from_before_a_reload_does_not_bind_its_conversation() {
+        let r = observed_before_reload().await;
+        let before = ns(&r);
+        let routes = r
+            .routes_for(&before, NS, SONNET, &session("s-c"))
+            .await
+            .unwrap();
+
+        reload_with(&r, AFTER_RELOAD).await;
+        let kept = r.affinity.lock().await.len();
+        r.remember(&before, &session("s-c"), SONNET, &routes[0])
+            .await;
+
+        assert_eq!(r.affinity.lock().await.len(), kept, "nothing was bound");
+        // 今の設定で通ったものは覚える。
+        r.remember(&ns(&r), &session("s-c"), SONNET, &routes[0])
+            .await;
+        assert_eq!(r.affinity.lock().await.len(), kept + 1);
     }
 
     async fn reload_with(r: &Router, config_toml: &str) {

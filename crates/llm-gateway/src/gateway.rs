@@ -693,7 +693,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                     // 貼り付けるのは通った経路だけ。断られた先を覚えると、
                     // 次の転送も同じところから始めることになる。
                     if resp.status / 100 == 2 {
-                        self.router.remember(ns_name, &session, &model, route).await;
+                        self.router.remember(ns, &session, &model, route).await;
                         // 通ったなら締め出しの根拠は消えている。
                         route.preset.allow(&model);
                     }
@@ -7909,6 +7909,59 @@ models = ["n"]
         );
         assert_eq!(outcome.warnings.len(), 1);
         assert!(outcome.warnings[0].contains("route `a`"));
+    }
+
+    /// 読み直しの前に始まった一覧の取り直しが後から終わっても、新しい経路表の
+    /// 一覧を旧い経路表のもので上書きしない (DR-0032 決定 3)。
+    #[tokio::test]
+    async fn a_model_list_fetched_for_the_previous_configuration_is_dropped() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // 一覧の問い合わせを受けたら知らせ、放してもらうまで答えない相手。
+        let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate_url = format!("http://{}", gate.local_addr().unwrap());
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let (asked, release) = (Arc::clone(&asked), Arc::clone(&release));
+            tokio::spawn(async move {
+                let (mut sock, _) = gate.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let _ = sock.read(&mut buf).await;
+                asked.notify_one();
+                release.notified().await;
+                let resp = format!(
+                    "HTTP/1.1 200 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{MODELS}",
+                    MODELS.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+        let gw =
+            Arc::new(Gateway::new(&loaded(&oauth_config(&gate_url)), StaticStore::new()).unwrap());
+        let refreshing = {
+            let gw = Arc::clone(&gw);
+            tokio::spawn(async move { gw.refresh_models().await })
+        };
+        asked.notified().await;
+
+        // 経路 a を捨て、経路 x だけにする。
+        let x = FakeUpstream::always(200).await;
+        let replaced = format!(
+            "[routes.x]\nprovider = \"anthropic\"\nurl = \"{}\"\nmodels = [\"m\"]\n\n[[ns.default.routing]]\nmodels = [\"m\"]\nroutes = [\"x\"]\n",
+            x.url
+        );
+        gw.reload(loaded(&replaced)).await.unwrap();
+        assert_eq!(gw.route_names(&ns(&gw), "m").await, ["x"]);
+
+        release.notify_one();
+        refreshing.await.unwrap();
+
+        assert_eq!(
+            gw.route_names(&ns(&gw), "m").await,
+            ["x"],
+            "the list fetched for route `a` did not overwrite the new one"
+        );
     }
 
     /// 応じない upstream を待ち続けず、上限で打ち切って返る。
