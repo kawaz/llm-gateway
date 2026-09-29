@@ -11,7 +11,7 @@
 ## 前提
 
 - `llm-gateway` の CLI が手元にあること (`auth keygen` / `auth jwks` / `auth sign`)
-- 鍵束は ns ごとに 1 ファイル、1 行 1 JWK の jsonl (秘密鍵込み、600)。置き場の例は `~/.config/llm-gateway/keys/<ns>.jwks.jsonl`。ファイルが正本で、鍵の追加は行の追記、失効は行の削除
+- 鍵束は ns ごとに 1 ファイル、1 行 1 JWK の jsonl (秘密鍵込み、600)。置き場の例は `~/.config/llm-gateway/keys/<ns>.jwks.jsonl`。ファイルが正本で、鍵の追加は行の追記、失効は行の削除。追加は `>>` の追記、削除は一時ファイルに書いて `mv` で置き換える (rename で原子的に)
 - **鍵束の変更に restart は要らない**。gateway は検証のたびに鍵束の mtime を見て、変わっていれば読み直す (反映は次のリクエストから)。restart が要るのは設定ファイル (`auth = "jwt"` / `keys_file` 等) を変えた時だけ
 - kid は **機械 (または用途) ごとに 1 本**。1 台分だけを失効できるようにするため
 - 以下の例は ns が `claude`、鍵束が `~/.config/llm-gateway/keys/claude.jwks.jsonl`
@@ -71,11 +71,16 @@ token の ttl は鍵の周期 + 猶予にしておく。
    ```
 2. **新しい kid で各クライアントの token を鋳造し直して貼り替える** (初回の手順 2〜3、`--kid claude-mbp-2027-03`)。走行中の Claude Code のセッションは起動時の env を持ち続けるので、全セッションの再起動を待つ
 3. **旧 kid の利用が 0 になったのを確かめる。** `/llm-gateway/events` で旧 kid の `kid` が来なくなったこと
-4. **鍵束から旧 kid の行を削除する。** これが旧 kid の失効で、次のリクエストから反映される (restart 無し)
+4. **鍵束から旧 kid の行を削除する。** これが旧 kid の失効で、次のリクエストから反映される (restart 無し)。削除は一時ファイルに書いて `mv` で置き換える (rename なので gateway は書きかけを見ない。エディタで直接上書きすると、先頭の数行だけ書かれた途中を読んで他の kid を一時的に失いうる)
+
+   ```bash
+   ring=~/.config/llm-gateway/keys/claude.jwks.jsonl
+   grep -v '"kid":"claude-mbp-2026-09"' "$ring" > "$ring.tmp" && chmod 600 "$ring.tmp" && mv "$ring.tmp" "$ring"
+   ```
 
 ### 漏洩時
 
-1. **漏れた kid の行を鍵束から即座に削除する。** 次のリクエストから、その kid で鋳造した token は全て通らなくなる。別の kid で鋳造した機械は影響を受けない
+1. **漏れた kid の行を鍵束から即座に削除する** (ローテの手順 4 と同じく、一時ファイルに書いて `mv` で置き換える)。次のリクエストから、その kid で鋳造した token は全て通らなくなる。別の kid で鋳造した機械は影響を受けない
 2. 必要なら、その機械のために新しい kid で初回の手順 1〜3 をやり直す (鍵束への追記と token の貼り替え。restart は要らない)
 3. 鍵束ファイル自体が漏れた疑いがある時は全行が漏洩扱い。新しい kid の行を追記して全機械の token を鋳造し直し、古い行を全て削除する
 
