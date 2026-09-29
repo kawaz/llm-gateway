@@ -1,6 +1,6 @@
 # Runbook: ns 認証 `jwt` の鍵の鋳造・ローテ・失効
 
-- Last Updated: 2026-09-24
+- Last Updated: 2026-09-29
 
 ## 適用ケース
 
@@ -17,6 +17,18 @@
 - `keys` は kid ごとの表なので、`extends` した派生のファイルに足した鍵は土台に加わる。**失効は、その kid を定義しているファイルから消す** (派生側からは土台の kid を消せない)
 
 ## 手順
+
+### `auth` 未設定 (Open) の ns を無停止で `jwt` に移す
+
+認証方式は ns 単位で 1 つなので、`auth = "jwt"` を書いた瞬間、その ns を使う走行中セッションは token を持っていなければ 401 になる (手前の Caddy は 401 で fail over しない)。ns が Open (`auth` 未設定) のうちは gateway が `Authorization` を検査しないので、**先にクライアント全部へ JWT を配り、走行中セッションが入れ替わるのを待ってから config を切り替える**。この「配布済みだが未検査」の期間が移行期間で、token と jwt を同時に受ける方式を gateway に足す必要はない。
+
+1. 鍵を作り、公開鍵の TOML 断片を作っておく (初回の手順 1〜2 の前半。**config には貼らない**。`keys` は `auth = "jwt"` と同時にしか書けず、片方だけだと `check` が落ちる)
+2. JWT を鋳造し、クライアントに貼る (初回の手順 4)。Claude Code は `settings.json` の `env.ANTHROPIC_AUTH_TOKEN`、codex は `[model_providers.<id>]` の `http_headers = { Authorization = "Bearer <JWT>" }`。この時点で新旧どちらの値でも通る
+3. その ns を使う走行中セッションが自然に再起動され切るのを待つ (急がない)。残っているものは `ccmsg peers` 等で数える
+4. ns ごとに `auth = "jwt"` / `max_ttl` / `keys` を config に足し、`check` → unstable から restart (初回の手順 3)。**貼った JWT が正しいかはここで初めて検査される**ので、unstable で `claude -p --model claude-haiku-4-5-20251001 'Reply with the single word: ok' < /dev/null` の疎通を見てから stable に進む
+5. 初回の手順 5 で `subject` / `kid` の記録を確かめる
+
+秘密鍵の置き場: `~/.config/llm-gateway/private/<kid>.jwk` (dotfiles では `/config/llm-gateway/private` を gitignore 済み、ディレクトリは 700)。公開鍵の断片は同じ場所の `<ns>.keys.toml`。パスワードマネージャへ移すなら移した後にファイルを消す。
 
 ### 初回の鋳造
 
