@@ -1,6 +1,6 @@
 # DR-0030: 汎用の認証 gateway を下に敷き、LLM をその上の 1 利用者にする
 
-- Status: Accepted (kawaz 裁定 2026-09-24、鍵束の置き場を §5 / §6 の `keys_file` に改定 2026-09-29)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)。§5 / §6 の鍵束ファイル (`keys_file`、mtime 監視) と §6 `issued` は未実装
+- Status: Accepted (kawaz 裁定 2026-09-24、鍵束の置き場を §5 / §6 の `keys_file` に改定 2026-09-29)。§1 crate 分割・§2 パススルー・§3 レート制限・§4 allowlist・§6 `jwt` (helper CLI と runbook 込み) は実装済み (v0.55.0〜v0.59.0)。§5 / §6 の鍵束ファイル (`keys_file`、mtime で読み直し) と §6 `issued` は未実装
 - Date: 2026-09-17
 
 ## Context
@@ -90,7 +90,7 @@ LLM 専用だった間は、通る先が config の routing で閉じていた�
 **gateway が持つ自身の秘密は、ns ごとの鍵束 (JWKS) だけ** (kawaz 裁定 2026-09-29)。鍵束は `jwt` の検証と `issued` の発行 (§6) で共用し、これ以外は全部「他所から預かったキー」であって gateway が作ったものではない、という区別を保つ。鍵束の形:
 
 - **ns ごとに 1 ファイル、1 行 1 JWK の jsonl** (`<ns>.jwks.jsonl`)。各行は `auth keygen` の出力そのもの (`{"kty":"OKP","crv":"Ed25519","kid":…,"d":…,"x":…}`) で、秘密鍵を含むので 600。公開鍵だけを見たい・配りたい時は `auth jwks` で抜き出す (配る形にラップするのはその時でよい)
-- **ファイルが正本**。追加は行の追記 (`keygen >> file`)、失効は行の削除。gateway は起動時に読んでメモリに持ち、mtime の変化 (credential と同じ監視) で読み直す。restart は要らない
+- **ファイルが正本**。追加は行の追記 (`keygen >> file`)、失効は行の削除。gateway は起動時に読んでメモリに持ち、検証のたびに stat して mtime が変わっていれば読み直す (読めなければ前の束を保って警告)。restart は要らない
 - 鍵束は設定 (`[ns.<ns>] keys_file`) から参照する。鍵の追加・失効は設定と寿命が違う (ローテで 180 日ごとに増減する) ので設定には埋めない
 - **Store 層 (issue `2026-09-15-store-layer-for-replaceable-persistence`) の 1 品目**。1 行 1 レコードなので backend を差し替えても「追記 / 削除 / 全読み」の意味論がそのまま乗る。cache-warden が稼働したらそちらへ移す
 
@@ -123,7 +123,7 @@ aud = "ns-claude"         # 任意
 - 鍵種は **Ed25519** (`kty = "OKP"`, `crv = "Ed25519"`)。鍵束に他の種があれば読み込みエラー
 - **必須の検証は「有効な署名 + 既知の kid + `exp` + 基本 claim」**。`iss` / `aud` の照合は **ns ごとの任意** (受け手が 1 つしかいない配置で aud を必須にすると、既存アプリに意味のない設定を強いる)
 - **寿命の上限は ns 設定で決める**。既存アプリ向けに長寿命の JWT を許す ns を作れる
-- **失効は鍵束からの行の削除、ローテーションは新しい kid を先に配ってから旧 kid を消す** (鍵束に両方が載る期間を作る)。反映は mtime 監視で、restart を挟まない
+- **失効は鍵束からの行の削除、ローテーションは新しい kid を先に配ってから旧 kid を消す** (鍵束に両方が載る期間を作る)。反映は次のリクエストの検証から (mtime の変化で読み直す)、restart を挟まない
 - `keys_file` は設定のパス欄 (`~` と環境変数を開く)。`extends` の派生で上書きすればファイルごと差し替わる (鍵単位のマージはしない。鍵束の中身は設定でなくファイルの責務)
 
 `issued` の方向: access / refresh とも JWT とし、署名鍵は ns の鍵束 (§5) の 1 行。**発行の口は 2 つ** (kawaz 裁定 2026-09-24): 最初の 1 本 (bootstrap) は host 上の **CLI** が署名鍵ファイルを直接読んで refresh token を標準出力に出す (gateway は保存しない。kid ごとの最終発行時刻だけ DR-0010 の flock 下で記録)。refresh はアプリが自分で行うので **HTTP の token endpoint** (`POST /ns-<ns>/auth/token`、OAuth 2 の `grant_type=refresh_token` の形に合わせ、標準クライアントがそのまま使える) を持つ。access の寿命と refresh の rotation は §未確定の方向どおり。
