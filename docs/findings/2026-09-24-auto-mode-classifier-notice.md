@@ -79,3 +79,13 @@ Claude Code 2.1.284 を `ANTHROPIC_BASE_URL=http://127.0.0.1:11301/ns-personal`�
 ### 結論と未確認事項
 
 unstable 経路の実 request には `safeguards` があり、実 response には `available` の `safeguard_results` があった。少なくともこの request では gateway 側の改修事項を確認できない。通知は gateway host 等から機械的に構成され、実際の server-side 判定成功とは独立して出るため、通知の文言を gateway の非互換性の証拠にはできない。2026-09-24 の keepalive に `safeguards` が無かった理由と、2026-09-29 に通知が再出現した session のすべての tool-use 判定結果は未確認。実 request の `anthropic-beta` ヘッダの個々の値と `/status` の Auto mode server 行も未観測。
+
+### 2026-09-29 の切り分け結果 (kawaz の実機、Claude Code 2.1.283 / 2.1.284、`claude-fable-5[1m]`、stable 経由)
+
+| 起動 | 権限モード | `/status` の Auto mode server |
+|---|---|---|
+| env 未設定 (settings.json のまま) | auto | Disabled (2.1.283 の統括、2.1.284 の後継とも) |
+| `CLAUDE_CODE_AUTO_MODE_SERVER=1 claude` | auto | **Enabled** |
+| `CLAUDE_CODE_AUTO_MODE_SERVER=1 claude` | auto 以外 | Disabled (server review は auto モードだけが頼むので仕様どおり) |
+
+結論: 版差でもモデル差でも gateway の互換性でもなく、**この環境では既定で server review を頼んでいない**。env を明示すれば gateway 越しに Enabled になる。恒久対処は各面の `settings.json` の `env` に `CLAUDE_CODE_AUTO_MODE_SERVER=1` を足すこと (通知は fallback した session にしか出ないので消える)。既定で off になる条件 (`oee(e)` の `!QJ()&&!hRe()&&!(Ie()==="firstParty"&&SRe())` のどれか。gateway 経由だと managed settings / feature flag が fetch されない点が候補) は未確認。
