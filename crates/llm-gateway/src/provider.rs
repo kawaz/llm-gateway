@@ -217,7 +217,9 @@ pub struct Preset {
     negotiation: Option<Arc<dyn Negotiation>>,
     /// まだ何も観測していないときに、枠について言えること。
     unobserved: Support,
-    state: RouteState,
+    /// 締め出しの印と枠の観測。設定を読み直しても同じ枠を指す経路では、
+    /// 組み直した preset がこれを引き継ぐ (DR-0032)。
+    state: Arc<RouteState>,
 }
 
 impl Preset {
@@ -239,8 +241,17 @@ impl Preset {
             // 何も宣言しない経路について言えることは無い。「取れない」と
             // 断じるのも「まだ観測していない」と言うのも、こちらの推測になる。
             unobserved: Support::UpstreamDependent,
-            state: RouteState::new(),
+            state: Arc::new(RouteState::new()),
         }
+    }
+
+    /// `prior` の状態 (締め出しの印・枠の観測) を引き継ぐ。
+    ///
+    /// 写すのではなく共有する。読み直しの前に始まったリクエストは `prior` の
+    /// 側に観測を落とすので、写すとその分が新しい経路から消える。
+    pub fn with_state_of(mut self, prior: &Preset) -> Self {
+        self.state = Arc::clone(&prior.state);
+        self
     }
 
     pub fn with_response_admission(

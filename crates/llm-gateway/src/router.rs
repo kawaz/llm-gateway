@@ -280,6 +280,38 @@ impl Active {
         Self { config, presets }
     }
 
+    /// `prior` の後を継ぐ設定を組む。返すのは、状態を引き継いだ経路の名前。
+    ///
+    /// 引き継ぐのは名前・credential・provider が前後で同じ経路だけ。締め出しも
+    /// 枠の観測もその credential の枠についてのもので、枠が変われば意味を
+    /// 失う。名前が消えた経路の状態は捨てる。
+    fn succeeding(prior: &Active, config: Config) -> (Self, BTreeSet<String>) {
+        let mut carried = BTreeSet::new();
+        let presets = config
+            .routes
+            .iter()
+            .map(|(name, route)| {
+                let built = preset::from_spec(name, route, &config);
+                let preset = match prior.preset(name) {
+                    Some(old)
+                        if same_quota(
+                            prior.config.routes.get(name),
+                            &prior.config,
+                            route,
+                            &config,
+                        ) =>
+                    {
+                        carried.insert(name.clone());
+                        built.with_state_of(old)
+                    }
+                    _ => built,
+                };
+                (name.clone(), Arc::new(preset))
+            })
+            .collect();
+        (Self { config, presets }, carried)
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -399,12 +431,30 @@ impl Router {
     }
 
     /// 設定を差し替える。走行中のリクエストは掴んだ設定のまま終わる。
+    ///
+    /// 経路の状態・会話の結びつきは、同じ枠を指し続ける経路の分だけ残す
+    /// ([`Active::succeeding`])。それ以外の経路の結びつきと一覧は捨てる —
+    /// 枠が変わった同名の経路へ、前の credential で通った会話を貼り付けない。
     pub async fn reload(&self, config: Config) {
-        let active = Arc::new(Active::new(config));
-        *self
-            .active
+        // 結びつきを先に押さえる。差し替えてから押さえると、新しい設定で
+        // 通ったリクエストの結びつきを、捨てる側で拾ってしまう。
+        let mut affinity = self.affinity.lock().await;
+        let carried = {
+            let mut active = self
+                .active
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (next, carried) = Active::succeeding(&active, config);
+            *active = Arc::new(next);
+            carried
+        };
+        affinity.retain(|_, bound| carried.contains(&bound.route));
+        drop(affinity);
+        self.catalog
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = active;
+            .await
+            .by_route
+            .retain(|name, _| carried.contains(name));
     }
 
     /// 起きたことを流す口。
@@ -866,6 +916,30 @@ impl Router {
             })
             .collect();
     }
+}
+
+/// 読み直しの前後で、同じ経路名が同じ枠を指しているか。
+///
+/// 枠は credential の持ち主と upstream の約束なので、credential (名前と種類)
+/// と話す相手 (provider) が同じなら同じ枠とみなす。接続先や header の変更は
+/// 枠を変えない。
+fn same_quota(
+    before: Option<&RouteSpec>,
+    before_config: &Config,
+    after: &RouteSpec,
+    after_config: &Config,
+) -> bool {
+    let Some(before) = before else {
+        return false;
+    };
+    let kind = |route: &RouteSpec, config: &Config| {
+        route
+            .credential(config)
+            .map(config::CredentialSpec::type_name)
+    };
+    before.provider == after.provider
+        && before.credential == after.credential
+        && kind(before, before_config) == kind(after, after_config)
 }
 
 /// 同格の経路を並べる鍵。週の窓のリセットが近い順、読めない経路は後ろ。
@@ -2469,5 +2543,172 @@ exclude = ["route-hidden-*"]
         // 一覧が取れた経路はそのまま。宣言に上書きされない。
         let found: BTreeMap<_, _> = [("a".to_owned(), "up.a".to_owned())].into();
         assert_eq!(with_declared_fallback(found.clone(), declared), found);
+    }
+
+    /// 読み直しの試験の設定。経路 `a` / `b` / `gone` はそれぞれ別の credential。
+    const BEFORE_RELOAD: &str = r#"
+[credentials.a]
+type = "claude_oauth"
+
+[credentials.b]
+type = "claude_oauth"
+
+[credentials.c]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
+
+[routes.b]
+provider = "anthropic"
+credential = "b"
+
+[routes.gone]
+provider = "anthropic"
+credential = "c"
+
+[[ns.default.routing]]
+models = ["claude-sonnet-5"]
+routes = ["a", "b", "gone"]
+"#;
+
+    /// `a` は接続先だけ変え、`b` は別の credential を指し、`gone` は消す。
+    const AFTER_RELOAD: &str = r#"
+[credentials.a]
+type = "claude_oauth"
+
+[credentials.c]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
+url = "https://moved.invalid"
+
+[routes.b]
+provider = "anthropic"
+credential = "c"
+
+[[ns.default.routing]]
+models = ["claude-sonnet-5"]
+routes = ["a", "b"]
+"#;
+
+    const SONNET: &str = "claude-sonnet-5";
+
+    /// 3 経路すべてに締め出し・枠の観測・会話の結びつきを持たせた router。
+    async fn observed_before_reload() -> Router {
+        let config: Config = toml::from_str(BEFORE_RELOAD).unwrap();
+        config.validate().unwrap();
+        let r = build(config);
+        r.set_catalog(&[
+            ("a", &[(SONNET, SONNET)]),
+            ("b", &[(SONNET, SONNET)]),
+            ("gone", &[(SONNET, SONNET)]),
+        ])
+        .await;
+        let routes = r
+            .routes_for(&ns(&r), NS, SONNET, &session("s-a"))
+            .await
+            .unwrap();
+        for (route, name) in routes.iter().zip(["a", "b", "gone"]) {
+            assert_eq!(route.name(), name);
+            route.preset.deny(
+                Denial {
+                    until: NOW + 600,
+                    reason: Reason::Limited,
+                    scope: Scope::Everything,
+                },
+                NOW,
+            );
+            observe_window(&r, name, Some(7 * 86_400), Some(NOW + 3600));
+        }
+        r.remember(NS, &session("s-a"), SONNET, &routes[0]).await;
+        r.remember(NS, &session("s-b"), SONNET, &routes[1]).await;
+        r
+    }
+
+    async fn reload_with(r: &Router, config_toml: &str) {
+        let config: Config = toml::from_str(config_toml).unwrap();
+        config.validate().unwrap();
+        r.reload(config).await;
+    }
+
+    fn denied(r: &Router, route: &str) -> bool {
+        let active = r.active();
+        let preset = active.preset(route).expect("declared in the configuration");
+        matches!(
+            preset.availability(SONNET, NOW),
+            Availability::Denied { .. }
+        )
+    }
+
+    /// 同じ枠を指し続ける経路は、締め出し・枠の観測・結びつきを読み直しの後も
+    /// 持つ (DR-0032 実装時の判断)。接続先の変更は枠を変えない。
+    #[tokio::test]
+    async fn a_reload_keeps_the_state_of_a_route_on_the_same_quota() {
+        let r = observed_before_reload().await;
+
+        reload_with(&r, AFTER_RELOAD).await;
+
+        assert!(denied(&r, "a"), "the denial is still in force");
+        assert!(
+            r.active().preset("a").unwrap().quota().is_some(),
+            "the observed quota is kept"
+        );
+        r.set_catalog(&[("a", &[(SONNET, SONNET)]), ("b", &[(SONNET, SONNET)])])
+            .await;
+        assert_eq!(
+            names(
+                &r.routes_for(&ns(&r), NS, SONNET, &session("s-a"))
+                    .await
+                    .unwrap()
+            ),
+            vec!["a", "b"],
+            "the conversation stays on its route"
+        );
+    }
+
+    /// credential が変わった同名の経路は新規、消えた経路は跡形も無い。
+    #[tokio::test]
+    async fn a_reload_drops_the_state_of_a_route_whose_quota_changed_or_vanished() {
+        let r = observed_before_reload().await;
+        let before = r.active();
+
+        reload_with(&r, AFTER_RELOAD).await;
+
+        assert!(!denied(&r, "b"), "a new credential starts undenied");
+        assert!(r.active().preset("b").unwrap().quota().is_none());
+        assert!(r.active().preset("gone").is_none());
+        assert_eq!(
+            r.catalog
+                .read()
+                .await
+                .by_route
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["a"],
+            "only a carried route keeps its model list until the next refresh"
+        );
+
+        r.set_catalog(&[("a", &[(SONNET, SONNET)]), ("b", &[(SONNET, SONNET)])])
+            .await;
+        assert_eq!(
+            names(
+                &r.routes_for(&ns(&r), NS, SONNET, &session("s-b"))
+                    .await
+                    .unwrap()
+            ),
+            vec!["a", "b"],
+            "the conversation bound to the old credential falls back to the written order"
+        );
+
+        // 読み直しの前に掴んだ設定の経路は、前の状態のまま走り終える。
+        assert!(matches!(
+            before.preset("b").unwrap().availability(SONNET, NOW),
+            Availability::Denied { .. }
+        ));
     }
 }
