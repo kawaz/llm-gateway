@@ -25,7 +25,7 @@
 
 | ケース | 一次資料からの期待 | 実態 | 根拠 / 制限 |
 |---|---|---|---|
-| 同じ account / Sonnet 5.5、履歴無改変 | thinking 再利用、200、drop なし | **未測定**。2026-09-30、gateway 0.60.0、unstable 11301 / `ns-personal`。beta 有・無の turn 1 はともに HTTP 429、`input_transformations: null`、`usage: null`、署名付き block なし。turn 2 は未実施。 | `/v1/models` は `claude-sonnet-5-5` を返した。SSE で beta 有の試行は個人経路と別環境経路が各 429、beta 無は経路 `-` が 429。成功した同一 route 2 turn は確認できず。 |
+| 同じ account / Sonnet 5.5、履歴無改変 | thinking 再利用、200、drop なし | **未測定**。2026-09-30、gateway 0.60.0、unstable 11301 / `ns-personal`。beta 有・無の turn 1 はともに HTTP 429（初回、再測、2 分後の最終再測で同じ結果）、`input_transformations: null`、`usage: null`、署名付き block なし。turn 2 は未実施。 | `/v1/models` は `claude-sonnet-5-5` を返した。SSE で beta 有の試行は個人経路と別環境経路が各 429、beta 無は経路 `-` が 429。成功した同一 route 2 turn は確認できず。 |
 | 異なる key だが同一 account または linked account / Sonnet 5.5 | account が同一または linked なら使用可 | **API 実機未検証** | key 単位でなく account 単位との文書の語義。linked の識別規則は未公表。 |
 | 異なる非 linked account / Sonnet 5.5 | 200、旧 thinking は drop。beta header 有りなら `organization_binding_mismatch` | **API 実機未検証** | account binding の明文。400 と予想してはいけない。 |
 | 同一 account / Sonnet 5.5、先行 message を改変 | 新 account は既定で 400、`drop_block` 指定なら 200＋drop | **未実施**（2026-09-30）。beta 有の turn 1 が HTTP 429、`input_transformations: null`、署名付き block を得られなかった。 | prefix check / enforcement。2026-08-31 00:00 UTC 以降作成 account では既定強制。旧 account は `thinking.block_binding.prefix_mismatch_behavior` 指定で強制し、指定しなければ不一致を通す。account 作成日は未確認。 |
