@@ -40,6 +40,18 @@ gateway は DR-0009 の fail over (401/403/429/529/5xx) と pace_cap / denial �
 
 kawaz 裁定待ち: どの候補で行くか、実機検証を許可する account 2 つ。
 
+## 実測 2026-09-30 (research doc 参照)
+
+別 account (`claude-emrd` で生成 → `claude-kawazzz`) への再送は 200 で thinking が黙って落ちる。`input_tokens` が同一 account の対照より thinking_tokens 分少ない。beta `thinking-binding-controls-2026-08-01` を付けても `input_transformations` は `[]` で、理由は報告されない。同一 account の履歴改変では `prefix_binding_mismatch` が出るので header 自体は効いている。
+
+よって候補 (1) の「header で drop を観測」は成立しない。候補を見直す:
+
+- (1') 同一 account 優先 + 切替時に thinking を含む会話は切替を拒否する (client に 429/503 と retry-after を返す)
+- (2') 切替時に thinking block を gateway が剥がして送る (どのみち落ちるので明示的に落として挙動を読めるようにする、events に記録)
+- (3') `input_tokens` の期待値との差で事後検知して events に `thinking_dropped_suspected` を出す (検知のみ)
+
+裁定点: (1')/(2')/(3') の組み合わせ、route → account 対応を設定で表す形。
+
 ## 受け入れ条件
 
 - [ ] 候補 (1)〜(4) のどれで行くか裁定される
