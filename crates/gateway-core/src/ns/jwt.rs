@@ -114,7 +114,12 @@ type Table = Arc<BTreeMap<String, VerifyingKey>>;
 /// ファイルから作ったものは、[`KeyRing::current`] のたびに mtime を見て、変わって
 /// いれば読み直す。読み直しに失敗したら前の束を保つ (書きかけのファイルで全鍵を
 /// 失わない)。1 行でも不正なら束全体を採らない。
-pub struct KeyRing {
+///
+/// clone は中身を共有する。設定を clone して持つ複数の部品が、それぞれ別に読み直さない。
+#[derive(Clone)]
+pub struct KeyRing(Arc<Inner>);
+
+struct Inner {
     /// 鍵束の置き場。[`KeyRing::from_keys`] で作ったものは `None` (読み直さない)。
     path: Option<PathBuf>,
     /// 最後に見た mtime (読み直しに失敗した時も記録する) と、最後に読めた kid → 公開鍵。
@@ -125,23 +130,23 @@ impl KeyRing {
     /// 鍵束ファイルを読む。読めなければ (無い・権限・不正行) エラー。
     pub fn from_file(path: PathBuf) -> Result<Self, String> {
         let (mtime, keys) = load(&path)?;
-        Ok(Self {
+        Ok(Self(Arc::new(Inner {
             path: Some(path),
             state: RwLock::new((Some(mtime), Arc::new(keys))),
-        })
+        })))
     }
 
     /// 与えた表をそのまま持つ (読み直さない)。
     pub fn from_keys(keys: BTreeMap<String, VerifyingKey>) -> Self {
-        Self {
+        Self(Arc::new(Inner {
             path: None,
             state: RwLock::new((None, Arc::new(keys))),
-        }
+        }))
     }
 
     /// 鍵束ファイルの置き場。
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
+        self.0.path.as_deref()
     }
 
     /// 最後に読んだ束の kid (読み直しはしない)。
@@ -150,12 +155,12 @@ impl KeyRing {
     }
 
     fn snapshot(&self) -> Table {
-        Arc::clone(&self.state.read().unwrap_or_else(|e| e.into_inner()).1)
+        Arc::clone(&self.0.state.read().unwrap_or_else(|e| e.into_inner()).1)
     }
 
     /// 今の束。ファイルの mtime が記録と違えば読み直してから返す。
     pub fn current(&self) -> Arc<BTreeMap<String, VerifyingKey>> {
-        let Some(path) = &self.path else {
+        let Some(path) = &self.0.path else {
             return self.snapshot();
         };
         let mtime = match mtime_of(path) {
@@ -166,14 +171,14 @@ impl KeyRing {
             }
         };
         {
-            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            let state = self.0.state.read().unwrap_or_else(|e| e.into_inner());
             if state.0 == Some(mtime) {
                 return Arc::clone(&state.1);
             }
         }
         // 書きロックの下で stat し直し、記録する mtime と読む中身を同じ stat に揃える。
         // 同時に変化を見た他のリクエストは、ここで記録済みの mtime を見て読み直さない。
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.0.state.write().unwrap_or_else(|e| e.into_inner());
         match mtime_of(path) {
             Ok(mtime) if state.0 == Some(mtime) => {}
             // 失敗しても見た mtime は記録する (表は前の束のまま)。同じ mtime の間は
@@ -193,19 +198,10 @@ impl KeyRing {
     }
 }
 
-impl Clone for KeyRing {
-    fn clone(&self) -> Self {
-        Self {
-            path: self.path.clone(),
-            state: RwLock::new(self.state.read().unwrap_or_else(|e| e.into_inner()).clone()),
-        }
-    }
-}
-
 /// 置き場と、その時点の表で比べる。
 impl PartialEq for KeyRing {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.snapshot() == other.snapshot()
+        self.0.path == other.0.path && self.snapshot() == other.snapshot()
     }
 }
 
@@ -214,7 +210,7 @@ impl Eq for KeyRing {}
 impl fmt::Debug for KeyRing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KeyRing")
-            .field("path", &self.path)
+            .field("path", &self.0.path)
             .field("kids", &self.kids())
             .finish()
     }
@@ -478,6 +474,13 @@ pub fn read_private_jwk(text: &str) -> Result<(Option<String>, ed25519_dalek::Si
         || jwk.get("crv").and_then(Value::as_str) != Some("Ed25519")
     {
         return Err("the key must be an Ed25519 JWK (kty = OKP, crv = Ed25519)".to_owned());
+    }
+    if let Some(alg) = jwk.get("alg")
+        && alg.as_str() != Some("EdDSA")
+    {
+        return Err(format!(
+            "the JWK says alg = {alg}, but an Ed25519 key is used with EdDSA; fix or remove `alg`"
+        ));
     }
     let d = jwk
         .get("d")
@@ -770,6 +773,8 @@ pub(crate) mod tests {
         no_kid.as_object_mut().unwrap().remove("kid");
         let mut no_private: Value = serde_json::from_str(&first).unwrap();
         no_private.as_object_mut().unwrap().remove("d");
+        let mut wrong_alg: Value = serde_json::from_str(&first).unwrap();
+        wrong_alg["alg"] = json!("RS256");
         let mut wrong_curve: Value = serde_json::from_str(&first).unwrap();
         wrong_curve["crv"] = json!("X25519");
         for bad in [
@@ -778,12 +783,55 @@ pub(crate) mod tests {
             no_private.to_string(),
             wrong_x.to_string(),
             no_kid.to_string(),
+            wrong_alg.to_string(),
             first.clone(),
         ] {
             let error = read_key_ring(&format!("{first}\n\n{bad}")).unwrap_err();
             assert!(error.contains("line 3"), "{error}");
             assert!(!error.contains("\"d\":"), "{error}");
         }
+    }
+
+    /// `alg` の申告は、あれば EdDSA との一致を要求する (方式は kty / crv で決まる)。
+    #[test]
+    fn a_declared_alg_must_be_eddsa() {
+        let mut jwk = private_jwk("a", &signing_key(1));
+        jwk["alg"] = json!("EdDSA");
+        assert!(read_key_ring(&jwk.to_string()).is_ok());
+        jwk["alg"] = json!("ES256");
+        let error = read_key_ring(&format!("\n{jwk}")).unwrap_err();
+        assert!(error.contains("line 2") && error.contains("alg"), "{error}");
+    }
+
+    /// clone は状態を共有する。片方で読み直せば、もう片方も新しい表を返す。
+    #[test]
+    fn a_cloned_key_ring_shares_the_reload() {
+        use std::fs::{self, File, FileTimes};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring.jsonl");
+        let write_at = |text: &str, seconds: u64| {
+            fs::write(&path, text).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        };
+        write_at(&private_jwk("a", &signing_key(1)).to_string(), 100);
+        let ring = KeyRing::from_file(path.clone()).unwrap();
+        let other = ring.clone();
+        write_at(&private_jwk("b", &signing_key(2)).to_string(), 101);
+        assert_eq!(ring.current().keys().collect::<Vec<_>>(), ["b"]);
+        assert_eq!(
+            other.kids(),
+            ["b"],
+            "the clone sees the reload without reading"
+        );
     }
 
     #[test]
