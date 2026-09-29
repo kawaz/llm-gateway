@@ -113,7 +113,9 @@ pub enum ReloadError {
         "{}; these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them",
         changes.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
     )]
-    RestartRequired { changes: Vec<crate::config::FixedChange> },
+    RestartRequired {
+        changes: Vec<crate::config::FixedChange>,
+    },
 }
 
 impl ReloadError {
@@ -476,7 +478,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             .active()
             .config()
             .fixed_at_start_changes(&config);
-        if !fields.is_empty() {
+        if !changes.is_empty() {
             return Err(ReloadError::RestartRequired { changes });
         }
         warn_about_gaps(&config);
@@ -7849,7 +7851,7 @@ routes = ["{to}"]
         assert_eq!(err.fields(), ["[server] listen", "[stats]"]);
         let said = err.to_string();
         assert!(
-            said.contains("[server] listen changed (127.0.0.1:0 -> 127.0.0.1:1)"),
+            said.contains("[server] listen changed (127.0.0.1:11300 -> 127.0.0.1:1)"),
             "{said}"
         );
         assert!(said.contains("restart the unit"), "{said}");

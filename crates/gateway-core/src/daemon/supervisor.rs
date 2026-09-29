@@ -5,6 +5,7 @@
 //! - 登録簿で `enabled` になっている台を `<binary_path> daemon run <unit>` として起こす
 //! - 落ちたら間を置いて起こし直す (healthz が返れば間隔を戻す)
 //! - unix socket で受けた頼み (start / stop / restart / status / reload / log) に答える
+//! - 設定の読み直しを、台ごとの制御口へ中継する (DR-0032 決定 2)
 //!
 //! **設定は読まない**。読むのは子の `daemon run` で、監督者が設定に触るのは
 //! 待ち受け先 (healthz の宛先) を知るときだけ。その読み方と問い合わせの
@@ -20,7 +21,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use crate::daemon::protocol::{self, LogLine, Request, UnitStatus, Which};
+use crate::daemon::protocol::{
+    self, ControlRequest, LogLine, Reloaded, Request, UnitStatus, Which,
+};
 use crate::daemon::registry::{Registry, Unit};
 
 /// 落ちた子を起こし直すまでの、最初の間。
@@ -45,6 +48,12 @@ const HEALTH_WAIT: Duration = Duration::from_secs(30);
 /// 答えないなら「分からない」でよい。状態を出す道の途中なので、長く待つと
 /// `daemon status` 自体が返らなくなる。
 const VERSION_WAIT: Duration = Duration::from_secs(2);
+
+/// 台に設定を読み直させて、答えを待つ上限。
+///
+/// 台は差し替えた後にモデルの一覧を取り直してから答える (その上限は台の側で
+/// 30 秒)。それより長く取り、台が答えられない時だけ打ち切る。
+const RELOAD_WAIT: Duration = Duration::from_secs(45);
 
 /// healthz を叩き直す間隔。
 ///
@@ -93,6 +102,8 @@ pub struct Supervisor {
     probe: UnitProbe,
     logs: PathBuf,
     socket: PathBuf,
+    /// 台ごとの制御口が並ぶ場所。
+    controls: PathBuf,
     watched: Mutex<HashMap<String, Watched>>,
     /// 状態が動いたことの合図 (待っている側を起こす)。
     changed: Notify,
@@ -144,13 +155,20 @@ impl From<crate::daemon::registry::Error> for Refused {
 type Answer = Result<serde_json::Value, Refused>;
 
 impl Supervisor {
-    pub fn new(registry: Registry, logs: PathBuf, socket: PathBuf, probe: UnitProbe) -> Self {
+    pub fn new(
+        registry: Registry,
+        logs: PathBuf,
+        socket: PathBuf,
+        controls: PathBuf,
+        probe: UnitProbe,
+    ) -> Self {
         let (lines, _) = broadcast::channel(1024);
         Self {
             registry,
             probe,
             logs,
             socket,
+            controls,
             watched: Mutex::new(HashMap::new()),
             changed: Notify::new(),
             lines,
@@ -256,10 +274,20 @@ impl Supervisor {
                 let names = self.choose(&which, true)?;
                 Ok(units_answer(self.status_of(&names).await?))
             }
-            Request::Reload => {
+            Request::Reload(which) => {
+                // 登録簿を先に拾う。足したばかりの台も指せるように。
                 self.reload().await;
-                let names = self.registry.names();
-                Ok(units_answer(self.status_of(&names).await?))
+                let names = self.choose(&which, false)?;
+                let mut units = Vec::new();
+                // 1 台が失敗しても残りを続ける。読み直しは台の生死を動かさない
+                // ので、前の台の結果を待って止める理由が無い (DR-0032 決定 5)。
+                for name in &names {
+                    units.push(self.reload_unit(name).await);
+                }
+                Ok(serde_json::json!({
+                    "supervisor_version": env!("CARGO_PKG_VERSION"),
+                    "units": units,
+                }))
             }
             // 追従は [`Self::answer`] が先に拾っている。
             Request::Log(_) => Err(Refused::new(
@@ -377,6 +405,76 @@ impl Supervisor {
             if !units.iter().any(|(n, _)| *n == name) {
                 self.terminate(&name).await;
             }
+        }
+    }
+
+    /// 1 台に設定を読み直させる。
+    ///
+    /// 設定を解釈するのは台の側で、監督者は制御口へ中継して答えを返すだけ。
+    pub async fn reload_unit(&self, name: &str) -> Reloaded {
+        let running = {
+            let watched = self.watched.lock().await;
+            watched.get(name).and_then(|s| s.pid).is_some()
+        };
+        if !running {
+            return Reloaded::failed(
+                name,
+                "not_running",
+                format!(
+                    "`{name}` is not running; it reads its configuration when it starts. run `daemon start {name}`"
+                ),
+            );
+        }
+
+        let path = protocol::control_path(&self.controls, name);
+        let asked =
+            tokio::time::timeout(RELOAD_WAIT, protocol::ask(&path, &ControlRequest::Reload)).await;
+        let line = match asked {
+            Ok(Ok(line)) => line,
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                // 制御口を持たない版が走っている。繋げないことを失敗として隠さない。
+                return Reloaded::failed(
+                    name,
+                    "restart_required",
+                    "this unit's version has no control socket; restart it",
+                );
+            }
+            Ok(Err(e)) => {
+                return Reloaded::failed(
+                    name,
+                    "unreachable",
+                    format!(
+                        "could not reach `{name}` at {}: {e}. restart the unit",
+                        path.display()
+                    ),
+                );
+            }
+            Err(_) => {
+                return Reloaded::failed(
+                    name,
+                    "no_answer",
+                    format!(
+                        "`{name}` did not answer within {}s; whether it reloaded is unknown. see `llm-gateway daemon log {name}`",
+                        RELOAD_WAIT.as_secs()
+                    ),
+                );
+            }
+        };
+        match serde_json::from_str::<Reloaded>(&line) {
+            Ok(mut answer) => {
+                answer.unit = name.to_owned();
+                answer
+            }
+            Err(e) => Reloaded::failed(
+                name,
+                "bad_answer",
+                format!("could not read what `{name}` answered ({e}): {line}"),
+            ),
         }
     }
 
@@ -1038,6 +1136,7 @@ mod tests {
             registry.clone(),
             root.join("logs"),
             root.join("supervisor.sock"),
+            root.join("control"),
             PROBE,
         ));
         World {
@@ -1305,6 +1404,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer["units"].as_array().unwrap().len(), 1);
+    }
+
+    /// 制御口の代わりに、決まった答えを 1 度だけ返す口を開く。
+    fn a_control_socket_that_answers(world: &World, unit: &str, answer: &'static str) {
+        let dir = world.root.join("control");
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = UnixListener::bind(protocol::control_path(&dir, unit)).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reading, mut writing) = stream.into_split();
+            let asked = BufReader::new(reading).lines().next_line().await.unwrap();
+            assert_eq!(asked.as_deref(), Some(r#"{"op":"reload"}"#));
+            writing.write_all(answer.as_bytes()).await.unwrap();
+            writing.write_all(b"\n").await.unwrap();
+        });
+    }
+
+    /// 読み直しは指された台の制御口へ中継し、失敗した台があっても残りを
+    /// 続けて全台の結果を並べる (DR-0032 決定 5)。
+    #[tokio::test]
+    async fn a_reload_is_relayed_to_each_unit_and_every_result_is_listed() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, true);
+        world.register("b", &binary, true);
+        world.register("c", &binary, true);
+        world.register("d", &binary, false);
+        world.supervisor.reload().await;
+        world.until("a", |s| s.running).await;
+        world.until("b", |s| s.running).await;
+        world.until("c", |s| s.running).await;
+
+        a_control_socket_that_answers(
+            &world,
+            "a",
+            r#"{"unit":"a","ok":false,"error":{"kind":"invalid_config","message":"bad"}}"#,
+        );
+        a_control_socket_that_answers(&world, "b", r#"{"unit":"b","ok":true}"#);
+        // c は制御口を持たない版として走っている。d は止まっている。
+
+        let answer = world
+            .supervisor
+            .handle(Request::Reload(Which::all()))
+            .await
+            .unwrap();
+        let units: Vec<Reloaded> = serde_json::from_value(answer["units"].clone()).unwrap();
+        let kinds: Vec<(&str, bool, Option<&str>)> = units
+            .iter()
+            .map(|u| {
+                (
+                    u.unit.as_str(),
+                    u.ok,
+                    u.error.as_ref().map(|e| e.kind.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("a", false, Some("invalid_config")),
+                ("b", true, None),
+                ("c", false, Some("restart_required")),
+                ("d", false, Some("not_running")),
+            ]
+        );
+        assert!(
+            units[2]
+                .error
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("no control socket"),
+            "{units:?}"
+        );
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// 読み直しは台を動かす命令なので、指されていなければ断る。
+    #[tokio::test]
+    async fn a_reload_needs_a_target() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, false);
+
+        let refused = world
+            .supervisor
+            .handle(Request::Reload(Which::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, "unit_required");
     }
 
     /// 読めない要求は、繋がりを黙って落とさずに理由を返す。

@@ -24,8 +24,9 @@ pub enum Request {
     Restart(Which),
     /// どうしているか。
     Status(Which),
-    /// 登録簿を読み直して、望みとの差を埋める。
-    Reload,
+    /// 登録簿を読み直して望みとの差を埋め、指された台に設定を読み直させる
+    /// (DR-0032 決定 2)。
+    Reload(Which),
     /// 書いたものを流し続ける (答えは JSONL)。
     Log(Which),
 }
@@ -132,6 +133,61 @@ pub struct LogLine {
     pub offset: u64,
 }
 
+/// 監督者が子の制御口に頼むこと (DR-0032 決定 2)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ControlRequest {
+    /// 設定を読み直す。
+    Reload,
+}
+
+/// 1 台の読み直しの結果 (DR-0032 決定 5)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Reloaded {
+    pub unit: String,
+    /// 新しい設定に差し替わったか。`false` なら旧設定のまま走っている。
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ReloadFailure>,
+    /// 差し替えは済んだが、気に留めてほしいこと。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// 読み直せなかった理由。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ReloadFailure {
+    pub kind: String,
+    pub message: String,
+    /// `restart_required` のとき、変わっていた欄の名前。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
+impl Reloaded {
+    pub fn done(unit: &str, warnings: Vec<String>) -> Self {
+        Self {
+            unit: unit.to_owned(),
+            ok: true,
+            error: None,
+            warnings,
+        }
+    }
+
+    pub fn failed(unit: &str, kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            unit: unit.to_owned(),
+            ok: false,
+            error: Some(ReloadFailure {
+                kind: kind.to_owned(),
+                message: message.into(),
+                fields: Vec::new(),
+            }),
+            warnings: Vec::new(),
+        }
+    }
+}
+
 /// 監督者の待ち受け先。
 ///
 /// 状態ディレクトリに置く。消してよい一時置き場に置くと、掃除された拍子に「監督者は
@@ -150,23 +206,39 @@ pub fn log_path(dir: &Path, unit: &str) -> PathBuf {
     dir.join(format!("{unit}.log"))
 }
 
+/// 子の制御口の置き場 (DR-0032 決定 2)。
+///
+/// 子の HTTP とは分け、外から届かない unix socket にだけ置く。置き場は
+/// 状態ディレクトリと unit の名前で決まるので、子にも監督者にも教えない。
+pub fn control_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon").join("control")
+}
+
+/// 1 台ぶんの制御口。
+pub fn control_path(dir: &Path, unit: &str) -> PathBuf {
+    dir.join(format!("{unit}.sock"))
+}
+
 /// 頼んで、1 行の答えを受け取る。
-pub async fn ask(socket: &Path, request: &Request) -> std::io::Result<String> {
+pub async fn ask<T: Serialize>(socket: &Path, request: &T) -> std::io::Result<String> {
     let stream = UnixStream::connect(socket).await?;
     let mut lines = send(stream, request).await?;
     match lines.next_line().await? {
         Some(line) => Ok(line),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "the supervisor closed the connection without answering",
+            format!(
+                "{} closed the connection without answering",
+                socket.display()
+            ),
         )),
     }
 }
 
 /// 頼みを書いて、答えを読む口を返す。`log` はここから流れ続ける。
-pub async fn send(
+pub async fn send<T: Serialize>(
     stream: UnixStream,
-    request: &Request,
+    request: &T,
 ) -> std::io::Result<tokio::io::Lines<BufReader<UnixStream>>> {
     let mut stream = stream;
     let mut text = serde_json::to_string(request)?;
@@ -195,8 +267,21 @@ mod tests {
             Request::Status(Which::default())
         );
         assert_eq!(
-            serde_json::from_str::<Request>(r#"{"op":"reload"}"#).unwrap(),
-            Request::Reload
+            serde_json::from_str::<Request>(r#"{"op":"reload","unit":"stable"}"#).unwrap(),
+            Request::Reload(Which::named("stable"))
+        );
+    }
+
+    /// 読み直しの答えは、成功なら `ok` だけ、失敗なら理由を添える。
+    #[test]
+    fn a_reload_result_carries_only_what_it_has() {
+        assert_eq!(
+            serde_json::to_string(&Reloaded::done("a", Vec::new())).unwrap(),
+            r#"{"unit":"a","ok":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Reloaded::failed("a", "invalid_config", "bad")).unwrap(),
+            r#"{"unit":"a","ok":false,"error":{"kind":"invalid_config","message":"bad"}}"#
         );
     }
 
@@ -257,6 +342,10 @@ mod tests {
             PathBuf::from("/state/app/daemon/supervisor.sock")
         );
         assert_eq!(log_dir(state), PathBuf::from("/state/app/logs"));
+        assert_eq!(
+            control_path(&control_dir(state), "stable"),
+            PathBuf::from("/state/app/daemon/control/stable.sock")
+        );
         assert_eq!(
             log_path(Path::new("/var/log"), "stable"),
             PathBuf::from("/var/log/stable.log")

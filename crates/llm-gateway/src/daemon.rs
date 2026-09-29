@@ -6,6 +6,9 @@
 //! - [`registry`] どの設定を 1 台として走らせるかの登録簿
 //! - [`supervisor`] 登録された台を抱えて生かし続ける監督者
 //! - [`protocol`] 監督者に頼むときの言葉
+//! - [`control`] 走っている台が監督者から設定の読み直しを受ける口
+
+pub mod control;
 
 pub mod protocol {
     pub use gateway_core::daemon::protocol::*;
@@ -15,6 +18,11 @@ pub mod protocol {
     /// 監督者の待ち受け先。
     pub fn socket_path() -> PathBuf {
         gateway_core::daemon::protocol::socket_path(&crate::config::default_state_dir())
+    }
+
+    /// 台ごとの制御口が並ぶ場所 (DR-0032 決定 2)。
+    pub fn control_dir() -> PathBuf {
+        gateway_core::daemon::protocol::control_dir(&crate::config::default_state_dir())
     }
 
     /// 子が書いたものの置き場。
@@ -100,6 +108,7 @@ pub mod supervisor {
             super::registry::open(),
             super::protocol::log_dir(),
             super::protocol::socket_path(),
+            super::protocol::control_dir(),
             PROBE,
         )
     }

@@ -1177,6 +1177,60 @@ impl SecretStore {
     }
 }
 
+/// 読み直しでは変えられない欄の、1 つの変化 (DR-0032 決定 4)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedChange {
+    /// 欄の名前 (`[server] listen` のように設定に書く形)。
+    pub field: &'static str,
+    /// 旧と新の値。秘密を含みうる欄は `None` (欄名だけを出す)。
+    pub values: Option<(String, String)>,
+}
+
+impl FixedChange {
+    fn shown<T: Serialize + PartialEq + ?Sized>(
+        into: &mut Vec<Self>,
+        field: &'static str,
+        before: &T,
+        after: &T,
+    ) {
+        if before != after {
+            into.push(Self {
+                field,
+                values: Some((shown_value(before), shown_value(after))),
+            });
+        }
+    }
+
+    fn hidden(into: &mut Vec<Self>, field: &'static str, same: bool) {
+        if !same {
+            into.push(Self {
+                field,
+                values: None,
+            });
+        }
+    }
+}
+
+impl std::fmt::Display for FixedChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.values {
+            Some((before, after)) => write!(f, "{} changed ({before} -> {after})", self.field),
+            None => write!(f, "{} changed", self.field),
+        }
+    }
+}
+
+/// 欄の値を 1 行で見せる形。文字列はそのまま、書かれていなければ `unset`、
+/// 表は JSON の 1 行にする。
+fn shown_value<T: Serialize + ?Sized>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(text)) => text,
+        Ok(serde_json::Value::Null) => "unset".to_owned(),
+        Ok(other) => other.to_string(),
+        Err(e) => format!("<{e}>"),
+    }
+}
+
 /// 使用量の日次集計の置き場 (DR-0011)。
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1634,44 +1688,54 @@ impl Config {
     /// どれも走っているプロセスが起動時に掴むか写し取るもので、設定を
     /// 差し替えても効かない。変わっていれば読み直し全体を断る — 他の欄だけ
     /// 差し替えると、ファイルの値と走っている値が食い違ったままになる。
-    pub fn fixed_at_start_changes(&self, other: &Config) -> Vec<&'static str> {
+    ///
+    /// 旧→新の値を添えるのは、どこを戻せば読み直せるかを探さずに済むため。
+    /// 秘密を含みうる欄 (送り先の URL、中継の宛先と秘密) は欄名だけにする。
+    pub fn fixed_at_start_changes(&self, other: &Config) -> Vec<FixedChange> {
         let mut changed = Vec::new();
-        let mut check = |label: &'static str, same: bool| {
-            if !same {
-                changed.push(label);
-            }
-        };
+        let c = &mut changed;
         // 待ち受けている socket そのもの。
-        check("[server] listen", self.server.listen == other.server.listen);
-        // 監督者が子を起こす時に使う unit の定義。
-        check(
-            "[server] binary_path",
-            self.server.binary_path == other.server.binary_path,
+        FixedChange::shown(
+            c,
+            "[server] listen",
+            &self.server.listen,
+            &other.server.listen,
         );
-        check(
+        // 監督者が子を起こす時に使う unit の定義。
+        FixedChange::shown(
+            c,
+            "[server] binary_path",
+            &self.server.binary_path,
+            &other.server.binary_path,
+        );
+        FixedChange::shown(
+            c,
             "[server] disabled",
-            self.server.disabled == other.server.disabled,
+            &self.server.disabled,
+            &other.server.disabled,
         );
         // credential の置き場は起動時に開く。
-        check("[store]", self.store == other.store);
+        FixedChange::shown(c, "[store]", &self.store, &other.store);
         // 集計の置き場と、送り直す役の上限 (keepalive の控え) は起動時に写す。
-        check("[stats]", self.stats == other.stats);
+        FixedChange::shown(c, "[stats]", &self.stats, &other.stats);
         // 一覧を取り直す仕事は起動時の間隔で回り続ける。
-        check("[discovery]", self.discovery == other.discovery);
-        // 送り先は起動時に立てた仕事が持つ。
-        check("[webhook]", self.webhook == other.webhook);
+        FixedChange::shown(c, "[discovery]", &self.discovery, &other.discovery);
+        // 送り先は起動時に立てた仕事が持つ。URL に token を埋める送り先がある。
+        FixedChange::hidden(c, "[webhook]", self.webhook == other.webhook);
         // upstream status の取得は起動時の設定と経路の対応で回る。対応を
         // 持たない経路の出入りは status の側に関わらない。
-        check("[status]", self.status == other.status);
-        check(
+        FixedChange::shown(c, "[status]", &self.status, &other.status);
+        FixedChange::shown(
+            c,
             "routes.<name>.status_source",
-            self.status_sources() == other.status_sources(),
+            &self.status_sources(),
+            &other.status_sources(),
         );
         // 無変換の中継は行き先・秘密の置き場・枠を起動時に組む。
-        check("[upstreams]", self.upstreams == other.upstreams);
-        check("[secret_store]", self.secret_store == other.secret_store);
-        check("[secrets]", self.secrets == other.secrets);
-        check("[ratelimit]", self.ratelimit == other.ratelimit);
+        FixedChange::hidden(c, "[upstreams]", self.upstreams == other.upstreams);
+        FixedChange::shown(c, "[secret_store]", &self.secret_store, &other.secret_store);
+        FixedChange::hidden(c, "[secrets]", self.secrets == other.secrets);
+        FixedChange::shown(c, "[ratelimit]", &self.ratelimit, &other.ratelimit);
         changed
     }
 
@@ -2338,9 +2402,41 @@ status_source = "used"
             "{BASE}\n[routes.b]\nprovider = \"anthropic\"\nstatus_source = \"used\"\n"
         ))
         .unwrap();
+        let changes = before.fixed_at_start_changes(&sourced_route_added);
+        assert_eq!(changes.len(), 1);
         assert_eq!(
-            before.fixed_at_start_changes(&sourced_route_added),
-            ["routes.<name>.status_source"]
+            changes[0].to_string(),
+            r#"routes.<name>.status_source changed ({"a":"used"} -> {"a":"used","b":"used"})"#
+        );
+    }
+
+    /// 断る理由には旧→新の値を添える。秘密を含みうる欄は名前だけ
+    /// (DR-0032 決定 5)。
+    #[test]
+    fn a_fixed_change_shows_its_values_unless_they_may_hold_a_secret() {
+        let before = parse("[server]\nlisten = \"127.0.0.1:11301\"\n").unwrap();
+        let after = parse(
+            r#"
+[server]
+listen = "127.0.0.1:11303"
+
+[webhook]
+base_url = "https://hooks.example/T000/B000/secret-token"
+"#,
+        )
+        .unwrap();
+
+        let said: Vec<String> = before
+            .fixed_at_start_changes(&after)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "[server] listen changed (127.0.0.1:11301 -> 127.0.0.1:11303)",
+                "[webhook] changed",
+            ]
         );
     }
 

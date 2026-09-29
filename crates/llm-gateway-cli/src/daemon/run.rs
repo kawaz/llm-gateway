@@ -81,6 +81,30 @@ remove disabled from [server], or register another configuration",
                 Failure::from(format!("could not listen on {}: {e}", config.server.listen))
             })?;
 
+        // 監督者から設定の読み直しを受ける口 (DR-0032 決定 2)。開けなくても
+        // 台は動かす — 読み直しが restart で代わるだけで、中継を止める理由にはならない。
+        let control = match llm_gateway::daemon::control::ControlSocket::open(unit) {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    socket = %llm_gateway::daemon::protocol::control_path(
+                        &llm_gateway::daemon::protocol::control_dir(),
+                        unit
+                    )
+                    .display(),
+                    "cannot open the control socket; `daemon reload` will not reach this unit (restart it to apply configuration changes)"
+                );
+                None
+            }
+        };
+        let controlling = control.as_ref().map(|socket| {
+            let socket = Arc::clone(socket);
+            let gateway = Arc::clone(&gateway);
+            let (unit, config_path) = (unit.to_owned(), config_path.to_path_buf());
+            tokio::spawn(async move { socket.serve(&unit, &config_path, gateway).await })
+        });
+
         // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
         gateway.refresh_models().await;
 
@@ -166,6 +190,12 @@ remove disabled from [server], or register another configuration",
             webhook.abort();
             let _ = webhook.await;
         }
+        // 止まった台に読み直しを頼めないよう、制御口を消してから最後の保存へ。
+        if let Some(controlling) = controlling {
+            controlling.abort();
+            let _ = controlling.await;
+        }
+        drop(control);
 
         // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
         // 直前の分を失わない。
