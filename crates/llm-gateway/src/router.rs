@@ -492,6 +492,18 @@ impl Router {
         http: &reqwest::Client,
         credentials: &CredentialStore<P>,
     ) {
+        self.refresh_until(http, credentials, None).await;
+    }
+
+    /// [`Self::refresh`] を `deadline` までに打ち切る。聞けなかった経路ごとに
+    /// 理由を 1 行ずつ返す (聞けなかった経路は前回の結果か設定の宣言を使う)。
+    pub async fn refresh_until<P: CredentialPersistence>(
+        &self,
+        http: &reqwest::Client,
+        credentials: &CredentialStore<P>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
         let mut by_route: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         let previous = self.catalog.read().await;
 
@@ -521,13 +533,29 @@ impl Router {
             };
             let found = match route.discovery_flavor(&active.config) {
                 Some(_) if paused => keep_previous(),
-                Some(flavor) => match self.discover(http, credentials, name, route, flavor).await {
-                    Ok(found) => found,
-                    Err(e) => {
-                        warn!(route = %name, %e, "cannot fetch the model list; using the saved or configured list");
-                        keep_previous()
+                Some(flavor) => {
+                    let asking = self.discover(http, credentials, name, route, flavor);
+                    let asked = match deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline, asking)
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(Error::Internal(
+                                    "the model list did not arrive in time".to_owned(),
+                                ))
+                            }),
+                        None => asking.await,
+                    };
+                    match asked {
+                        Ok(found) => found,
+                        Err(e) => {
+                            warn!(route = %name, %e, "cannot fetch the model list; using the saved or configured list");
+                            failures.push(format!(
+                                "route `{name}`: cannot fetch the model list ({e}); using the saved or configured list until the next refresh"
+                            ));
+                            keep_previous()
+                        }
                     }
-                },
+                }
                 // 聞けない upstream は設定に書かれたものを使う。
                 None => declared(),
             };
@@ -550,6 +578,7 @@ impl Router {
         }
 
         *self.catalog.write().await = catalog;
+        failures
     }
 
     /// 1 つの credential に一覧を聞く。

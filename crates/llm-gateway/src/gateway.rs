@@ -92,15 +92,37 @@ fn warn_about_gaps(config: &Config) {
     }
 }
 
+/// 読み直しの後にモデルの一覧を取り直す時間の上限。
+///
+/// 読み直しは命じた人が結果を待っている。upstream が応じないまま待ち続けると、
+/// 差し替えは済んでいるのに返事が返らない。
+const RELOAD_REFRESH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 読み直しが済んだ結果。
+#[derive(Debug, Default)]
+pub struct ReloadOutcome {
+    /// 差し替えは済んだが、気に留めてほしいこと (一覧を取り直せなかった経路など)。
+    pub warnings: Vec<String>,
+}
+
 /// 設定を読み直せなかった理由。
 #[derive(Debug, thiserror::Error)]
 pub enum ReloadError {
     /// 起動時に掴んだ欄が変わっている (DR-0032 決定 4)。旧設定のまま走り続けている。
     #[error(
-        "{} changed; these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them",
-        fields.join(", ")
+        "{}; these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them",
+        changes.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
     )]
-    RestartRequired { fields: Vec<&'static str> },
+    RestartRequired { changes: Vec<crate::config::FixedChange> },
+}
+
+impl ReloadError {
+    /// 断った理由になった欄の名前。
+    pub fn fields(&self) -> Vec<&'static str> {
+        match self {
+            Self::RestartRequired { changes } => changes.iter().map(|c| c.field).collect(),
+        }
+    }
 }
 
 impl<P: CredentialPersistence> Gateway<P> {
@@ -431,23 +453,44 @@ impl<P: CredentialPersistence> Gateway<P> {
     ///
     /// `config` は読み込みと検証を済ませたもの。起動時に掴んだ欄が変わって
     /// いれば全体を断り、旧設定のまま走り続ける。走行中のリクエストは掴んだ
-    /// 設定で最後まで走り、差し替えは次のリクエストから効く。返る前に
-    /// モデルの一覧も新しい経路で取り直すので、返った時点で新しい設定が
-    /// すべて効いている。
-    pub async fn reload(&self, config: Config) -> std::result::Result<(), ReloadError> {
-        let fields = self
+    /// 設定で最後まで走り、差し替えは次のリクエストから効く。
+    ///
+    /// 差し替えた後、新しい経路でモデルの一覧を取り直す
+    /// ([`RELOAD_REFRESH_LIMIT`] まで)。取り直せなかった経路があっても
+    /// 差し替えは済んでいるので `Ok` を返し、理由は `warnings` に添える —
+    /// 成否は「設定が差し替わったか」で決まり、upstream の一時的な不調で
+    /// 旧設定のままだと読み違えさせない。
+    pub async fn reload(&self, config: Config) -> std::result::Result<ReloadOutcome, ReloadError> {
+        self.reload_within(config, RELOAD_REFRESH_LIMIT).await
+    }
+
+    /// [`Self::reload`] の中身。上限を引数で受けるのは、試験から実時間を
+    /// 待たずに打ち切りを通すため。
+    async fn reload_within(
+        &self,
+        config: Config,
+        refresh_limit: std::time::Duration,
+    ) -> std::result::Result<ReloadOutcome, ReloadError> {
+        let changes = self
             .router
             .active()
             .config()
             .fixed_at_start_changes(&config);
         if !fields.is_empty() {
-            return Err(ReloadError::RestartRequired { fields });
+            return Err(ReloadError::RestartRequired { changes });
         }
         warn_about_gaps(&config);
         self.router.reload(config).await;
-        self.refresh_models().await;
         info!("reloaded the configuration");
-        Ok(())
+        let warnings = self
+            .router
+            .refresh_until(
+                &self.http,
+                &self.credentials,
+                Some(tokio::time::Instant::now() + refresh_limit),
+            )
+            .await;
+        Ok(ReloadOutcome { warnings })
     }
 
     /// 名前で namespace を引く。無ければ `None`。
@@ -7803,9 +7846,13 @@ routes = ["{to}"]
             two_routes(&a.url, &b.url, "b")
         );
         let err = gw.reload(loaded(&moved)).await.unwrap_err();
-        let ReloadError::RestartRequired { fields } = &err;
-        assert_eq!(fields, &["[server] listen", "[stats]"]);
-        assert!(err.to_string().contains("restart the unit"));
+        assert_eq!(err.fields(), ["[server] listen", "[stats]"]);
+        let said = err.to_string();
+        assert!(
+            said.contains("[server] listen changed (127.0.0.1:0 -> 127.0.0.1:1)"),
+            "{said}"
+        );
+        assert!(said.contains("restart the unit"), "{said}");
 
         assert_eq!(forward_on(&gw, &ns(&gw)).await, 200);
         assert_eq!(
@@ -7833,8 +7880,57 @@ models = ["n"]
             two_routes(&a.url, &b.url, "a"),
             b.url
         );
-        gw.reload(loaded(&added)).await.unwrap();
+        let outcome = gw.reload(loaded(&added)).await.unwrap();
 
+        assert!(outcome.warnings.is_empty());
         assert!(gw.models(&ns(&gw)).await.contains(&"n".to_owned()));
+    }
+
+    /// 一覧を取り直せなくても差し替えは済んでいて、理由は warnings に添わる。
+    #[tokio::test]
+    async fn a_reload_succeeds_even_when_the_model_list_cannot_be_refreshed() {
+        // 閉じた口。一覧を聞きに行くと接続を断られる。
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let gw = gateway(&oauth_config(&closed_url)).await;
+
+        let with_other = format!(
+            "{}\n[[ns.other.routing]]\nmodels = [\"m\"]\nroutes = [\"a\"]\n",
+            oauth_config(&closed_url)
+        );
+        let outcome = gw.reload(loaded(&with_other)).await.unwrap();
+
+        assert!(
+            gw.namespace("other").is_some(),
+            "the configuration is swapped"
+        );
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(outcome.warnings[0].contains("route `a`"));
+    }
+
+    /// 応じない upstream を待ち続けず、上限で打ち切って返る。
+    #[tokio::test]
+    async fn a_reload_does_not_wait_for_a_silent_upstream() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_routes(&a.url, &b.url, "a")).await;
+        // 受け付けるが何も返さない相手。
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_url = format!("http://{}", silent.local_addr().unwrap());
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            gw.reload_within(
+                loaded(&oauth_config(&silent_url)),
+                std::time::Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the refresh is cut off at its limit")
+        .unwrap();
+
+        assert!(outcome.warnings[0].contains("did not arrive in time"));
+        assert!(gw.namespace(NS).unwrap().config().routes.contains_key("a"));
     }
 }
