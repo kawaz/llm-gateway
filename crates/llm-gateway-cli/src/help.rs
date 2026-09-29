@@ -150,28 +150,33 @@ llm-gateway auth — make keys and tokens for namespaces that use auth = \"jwt\"
 usage:
   llm-gateway auth <command> [options]
 
-everything is written to stdout and nothing is saved. keep the private key
-yourself (a password manager, or a file readable only by you), and read it
-back from stdin with --key - (the default).
+everything is written to stdout and nothing is saved. the key ring (the file
+keys_file points at) holds one JWK per line, private keys included; append to
+it yourself with >>, and keep it readable only by you (chmod 600). jwks and
+sign read the key ring from --key <file>, or from stdin with --key - (the
+default).
+
+  llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl
+  llm-gateway auth sign --key ~/.config/llm-gateway/keys/claude.jwks.jsonl \\
+    --kid claude-mbp-2026-09 --sub kawaz-mbp --ttl 180d
 
 commands:
-  keygen            make an Ed25519 key pair and print the private key as a JWK
-  jwks              print the public key to paste into the configuration
-  sign              print a JWT signed with the private key
+  keygen            make an Ed25519 key pair and print it as one JWK line
+                    (private key included)
+  jwks              print the key ring's public keys as a JSON Web Key Set
+  sign              print a JWT signed with a private key from the key ring
 
 keygen options:
   --kid <kid>       key id (default: today's date and 4 random hex digits)
 
 jwks options:
-  --key <file>      private key JWK to read, - for stdin (default: -)
-  --kid <kid>       key id to print (default: the kid in the JWK)
-  --ns <name>       namespace name to put in the TOML (default: <name>)
-  --format <form>   toml (a [ns.<name>.keys.<kid>] table, the default)
-                    or jwks (a JSON Web Key Set)
+  --key <file>      key ring to read, - for stdin (default: -)
+  --kid <kid>       print only this key (default: every key in the key ring)
 
 sign options:
-  --key <file>      private key JWK to read, - for stdin (default: -)
-  --kid <kid>       key id to put in the header (default: the kid in the JWK)
+  --key <file>      key ring to read, - for stdin (default: -)
+  --kid <kid>       which key in the key ring to sign with (may be left out
+                    only when the key ring has one key)
   --sub <subject>   who the token is for (required; shows up as subject in events)
   --ttl <duration>  how long it lives, like 180d / 12h / 30m (required;
                     the namespace's max_ttl caps what it accepts)

@@ -33,45 +33,65 @@ fn stdout(args: &[&str], stdin: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// keygen の秘密鍵を jwks に食わせると、同じ公開鍵が設定の形と JWKS の形で出る。
-#[test]
-fn jwks_prints_the_public_half_of_keygen() {
-    let private = stdout(&["auth", "keygen", "--kid", "mbp-2026-09"], "");
-    let jwk: serde_json::Value = serde_json::from_str(&private).unwrap();
-    let x = jwk["x"].as_str().unwrap();
-
-    let toml_text = stdout(&["auth", "jwks", "--ns", "claude"], &private);
-    assert!(
-        toml_text.starts_with("[ns.claude.keys.mbp-2026-09]\n"),
-        "{toml_text}"
-    );
-    let table: toml::Table = toml::from_str(&toml_text).unwrap();
-    let key = &table["ns"]["claude"]["keys"]["mbp-2026-09"];
-    assert_eq!(key["alg"].as_str(), Some("EdDSA"));
-    assert_eq!(key["public"].as_str(), Some(x));
-
-    let set: serde_json::Value =
-        serde_json::from_str(&stdout(&["auth", "jwks", "--format", "jwks"], &private)).unwrap();
-    assert_eq!(set["keys"][0]["x"].as_str(), Some(x));
-    assert_eq!(set["keys"][0]["kid"].as_str(), Some("mbp-2026-09"));
-    assert!(
-        set["keys"][0].get("d").is_none(),
-        "the private part never leaves"
-    );
+/// `keygen >> ring` を 2 回した鍵束を書く。
+fn two_key_ring(dir: &std::path::Path) -> std::path::PathBuf {
+    let ring = dir.join("claude.jwks.jsonl");
+    let mut text = stdout(&["auth", "keygen", "--kid", "mbp"], "");
+    text.push_str(&stdout(&["auth", "keygen", "--kid", "mini"], ""));
+    std::fs::write(&ring, text).unwrap();
+    ring
 }
 
-/// sign で鋳造した token は、jwks の公開鍵を載せた検証を通る。
+/// jwks は鍵束の全行の公開鍵を出し、秘密の部分 (`d`) は出さない。`--kid` で 1 本に絞れる。
+#[test]
+fn jwks_prints_the_public_half_of_the_key_ring() {
+    let dir = tempfile::tempdir().unwrap();
+    let ring = two_key_ring(dir.path());
+    let key = ring.to_str().unwrap();
+    let text = std::fs::read_to_string(&ring).unwrap();
+    let private: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    let set: serde_json::Value =
+        serde_json::from_str(&stdout(&["auth", "jwks", "--key", key], "")).unwrap();
+    let keys = set["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 2);
+    for (public, private) in keys.iter().zip(&private) {
+        assert_eq!(public["kid"], private["kid"]);
+        assert_eq!(public["x"], private["x"]);
+        assert!(public.get("d").is_none(), "the private part never leaves");
+    }
+    assert!(
+        !stdout(&["auth", "jwks", "--key", key], "").contains(private[0]["d"].as_str().unwrap())
+    );
+
+    let one: serde_json::Value =
+        serde_json::from_str(&stdout(&["auth", "jwks", "--kid", "mini"], &text)).unwrap();
+    assert_eq!(one["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(one["keys"][0]["kid"].as_str(), Some("mini"));
+    assert!(one["keys"][0].get("d").is_none());
+
+    let missing = run(&["auth", "jwks", "--key", key, "--kid", "nope"], "");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("mbp, mini"));
+}
+
+/// `keygen >> ring` を 2 回 → `sign --kid` で鋳造した token は、同じ鍵束を読んだ
+/// gateway の検証を通り、kid はその行のもの。
 #[test]
 fn a_signed_token_passes_the_gateway_check() {
-    let private = stdout(&["auth", "keygen"], "");
-    let jwk: serde_json::Value = serde_json::from_str(&private).unwrap();
-    let kid = jwk["kid"].as_str().unwrap().to_owned();
+    let dir = tempfile::tempdir().unwrap();
+    let ring = two_key_ring(dir.path());
     let token = stdout(
         &[
             "auth",
             "sign",
             "--key",
-            "-",
+            ring.to_str().unwrap(),
+            "--kid",
+            "mini",
             "--sub",
             "kawaz-mbp",
             "--ttl",
@@ -81,25 +101,71 @@ fn a_signed_token_passes_the_gateway_check() {
             "--aud",
             "ns-claude",
         ],
-        &private,
+        "",
     );
-    let auth = jwt::JwtAuth {
-        keys: [(
-            kid.clone(),
-            jwt::parse_public_key(jwk["x"].as_str().unwrap()).unwrap(),
-        )]
-        .into(),
-        max_ttl_secs: 180 * 86_400,
-        iss: Some("cli".into()),
-        aud: Some("ns-claude".into()),
-    };
+    let auth = jwt::JwtAuth::from_file(
+        ring,
+        180 * 86_400,
+        Some("cli".into()),
+        Some("ns-claude".into()),
+    )
+    .unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
     let verified = auth.verify(token.trim(), now).unwrap();
     assert_eq!(verified.subject, "kawaz-mbp");
-    assert_eq!(verified.kid, kid);
+    assert_eq!(verified.kid, "mini");
+}
+
+/// `--kid` を省けるのは 1 行の鍵束だけ。複数行なら候補を挙げて断る。
+#[test]
+fn sign_without_kid_needs_a_one_line_ring() {
+    let one = stdout(&["auth", "keygen", "--kid", "only"], "");
+    assert!(
+        run(&["auth", "sign", "--sub", "x", "--ttl", "1h"], &one)
+            .status
+            .success()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let ring = two_key_ring(dir.path());
+    let out = run(
+        &[
+            "auth",
+            "sign",
+            "--key",
+            ring.to_str().unwrap(),
+            "--sub",
+            "x",
+            "--ttl",
+            "1h",
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("2 keys") && err.contains("--kid") && err.contains("mbp, mini"),
+        "{err}"
+    );
+    let out = run(
+        &[
+            "auth",
+            "sign",
+            "--key",
+            ring.to_str().unwrap(),
+            "--kid",
+            "nope",
+            "--sub",
+            "x",
+            "--ttl",
+            "1h",
+        ],
+        "",
+    );
+    assert!(!out.status.success());
 }
 
 /// 長すぎる `--ttl` は、期限が桁あふれする前に引数の誤りとして断る。
@@ -137,15 +203,16 @@ fn missing_arguments_are_named() {
     assert!(!bad.status.success());
 }
 
-/// `auth keygen` → `auth jwks` → 設定 → `auth sign` の出力をそのまま `Bearer` に載せると、
+/// `auth keygen` → 鍵束 → 設定の `keys_file` → `auth sign` の出力をそのまま `Bearer` に載せると、
 /// 立てた gateway の jwt の ns が通す。
 #[tokio::test]
 async fn a_cli_minted_token_opens_a_jwt_namespace() {
     let private = stdout(&["auth", "keygen", "--kid", "e2e-key"], "");
-    let keys = stdout(&["auth", "jwks", "--ns", "claude"], &private);
     let token = stdout(&["auth", "sign", "--sub", "e2e", "--ttl", "1h"], &private);
 
     let state = tempfile::tempdir().unwrap();
+    let ring = state.path().join("claude.jwks.jsonl");
+    std::fs::write(&ring, &private).unwrap();
     let config: llm_gateway::Config = toml::from_str(&format!(
         r#"
 [routes.a]
@@ -156,8 +223,9 @@ models = ["claude-opus-5"]
 [ns.claude]
 auth = "jwt"
 max_ttl = "1d"
-
-{keys}"#
+keys_file = "{}"
+"#,
+        ring.display()
     ))
     .unwrap();
     config.validate().unwrap();

@@ -1,9 +1,10 @@
 //! ns 認証 `jwt` の鍵と token を手元で作る (DR-0030 §6)。
 //!
-//! どれも標準出力に出すだけで、何も保存しない。秘密鍵をどこに置くか
-//! (1Password / 権限を絞ったファイル) は使う人が決める。gateway が持つ秘密は
-//! `issued` 用の署名鍵だけ、という線 (DR-0030 §5) をここで崩さない。
+//! どれも標準出力に出すだけで、何も保存しない。鍵束 (`keys_file`、1 行 1 JWK) への
+//! 追記は利用者が `>>` で行う。CLI が秘密をどこかに置くと、鍵束の窓口がファイルと
+//! CLI の 2 つに割れる (DR-0030 §5)。
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::process::ExitCode;
 
@@ -22,7 +23,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     let rest = &args[1..];
     let out = match args[0].as_str() {
         "keygen" => keygen(&parse(rest, &["kid"], &[])?)?,
-        "jwks" => jwks(&parse(rest, &["key", "kid", "ns", "format"], &[])?)?,
+        "jwks" => jwks(&parse(rest, &["key", "kid"], &[])?)?,
         "sign" => sign(&parse(
             rest,
             &["key", "kid", "sub", "ttl", "iss"],
@@ -106,62 +107,73 @@ fn keygen(parsed: &Parsed) -> Result<String, Failure> {
     Ok(format!("{}\n", jwt::private_jwk(&kid, &key)))
 }
 
-/// 秘密鍵を読む。`-` (既定) は標準入力。`--kid` があれば JWK の kid より優先する。
-fn read_key(parsed: &Parsed) -> Result<(String, jwt::SigningKey), Failure> {
+/// 鍵束 (1 行 1 JWK) を読む。`-` (既定) は標準入力。
+fn read_ring(parsed: &Parsed) -> Result<BTreeMap<String, jwt::SigningKey>, Failure> {
     let source = parsed.get("key").unwrap_or("-");
     let text = if source == "-" {
         let mut text = String::new();
         std::io::stdin()
             .read_to_string(&mut text)
-            .map_err(|e| Failure::from(format!("could not read the key from stdin: {e}")))?;
+            .map_err(|e| Failure::from(format!("could not read the key ring from stdin: {e}")))?;
         text
     } else {
         std::fs::read_to_string(source)
             .map_err(|e| Failure::from(format!("could not read {source}: {e}")))?
     };
-    let (kid, key) = jwt::read_private_jwk(&text).map_err(Failure::from)?;
-    let kid = parsed
-        .get("kid")
-        .map(str::to_owned)
-        .or(kid)
-        .ok_or_else(|| Failure::from("the key has no kid; give --kid"))?;
-    Ok((kid, key))
+    let ring = jwt::read_key_ring(&text)
+        .map_err(|e| Failure::from(format!("the key ring {source}: {e}")))?;
+    if ring.is_empty() {
+        return Err(Failure::from(format!(
+            "the key ring {source} has no keys; append one with `llm-gateway auth keygen >> <file>`"
+        )));
+    }
+    Ok(ring)
 }
 
-/// 設定に貼る公開鍵 (TOML の断片) か、JWKS の JSON を出す。
-fn jwks(parsed: &Parsed) -> Result<String, Failure> {
-    let (kid, key) = read_key(parsed)?;
-    let public = key.verifying_key();
-    match parsed.get("format").unwrap_or("toml") {
-        "toml" => {
-            let ns = parsed.get("ns").unwrap_or("<name>");
-            Ok(format!(
-                "[ns.{ns}.keys.{}]\nalg = \"EdDSA\"\npublic = \"{}\"\n",
-                toml_key(&kid),
-                jwt::public_key_text(&public)
-            ))
-        }
-        "jwks" => Ok(format!(
-            "{}\n",
-            json!({"keys": [jwt::public_jwk(&kid, &public)]})
-        )),
-        other => Err(Failure::from(format!(
-            "--format is `toml` or `jwks`, not `{other}`"
+/// `--kid` の行を選ぶ。省けば、1 行の鍵束ならその行。
+fn pick(
+    mut ring: BTreeMap<String, jwt::SigningKey>,
+    kid: Option<&str>,
+) -> Result<(String, jwt::SigningKey), Failure> {
+    let listed = ring_kids(&ring);
+    match kid {
+        Some(kid) => match ring.remove(kid) {
+            Some(key) => Ok((kid.to_owned(), key)),
+            None => Err(Failure::from(format!(
+                "the key ring has no kid `{kid}`; give one of: {}",
+                listed
+            ))),
+        },
+        None if ring.len() == 1 => Ok(ring.pop_first().expect("one key")),
+        None => Err(Failure::from(format!(
+            "the key ring has {} keys; give --kid (one of: {})",
+            ring.len(),
+            listed
         ))),
     }
 }
 
-/// TOML の鍵として書ける形 (素の鍵で書けなければ引用する)。
-fn toml_key(kid: &str) -> String {
-    if !kid.is_empty()
-        && kid
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        kid.to_owned()
-    } else {
-        Value::String(kid.to_owned()).to_string()
-    }
+fn ring_kids(ring: &BTreeMap<String, jwt::SigningKey>) -> String {
+    ring.keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 鍵束の公開鍵だけを JWKS の JSON で出す。`--kid` があればその 1 本。
+fn jwks(parsed: &Parsed) -> Result<String, Failure> {
+    let ring = read_ring(parsed)?;
+    let keys: Vec<Value> = match parsed.get("kid") {
+        Some(kid) => {
+            let (kid, key) = pick(ring, Some(kid))?;
+            vec![jwt::public_jwk(&kid, &key.verifying_key())]
+        }
+        None => ring
+            .iter()
+            .map(|(kid, key)| jwt::public_jwk(kid, &key.verifying_key()))
+            .collect(),
+    };
+    Ok(format!("{}\n", json!({ "keys": keys })))
 }
 
 /// 秘密鍵で JWT を鋳造し、1 行で出す。`iat = now`、`exp = now + ttl`。
@@ -170,7 +182,7 @@ fn sign(parsed: &Parsed) -> Result<String, Failure> {
     let subject = parsed.need("sub")?;
     let ttl = llm_gateway::config::parse_duration_secs(parsed.need("ttl")?)
         .map_err(|e| Failure::from(format!("--ttl: {e}")))?;
-    let (kid, key) = read_key(parsed)?;
+    let (kid, key) = pick(read_ring(parsed)?, parsed.get("kid"))?;
     let now = llm_gateway::credential::time::now_unix();
     let exp = now
         .checked_add(ttl)
