@@ -45,3 +45,4 @@ Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは�
 | [DR-0029](DR-0029-stats-origin-axis.md) | ✅ 実装済 | 日次集計の鍵にモデルの下の「出した側」(origin) を足す (keepalive の自送信を本数・トークン・USD で分けて読む) |
 | [DR-0030](DR-0030-general-purpose-auth-gateway.md) | 🟡 部分実装 | 汎用の認証 gateway を crate として下に敷き、LLM をその上の 1 利用者にする (任意 API への認証差し替えパススルー、自主レート制限、ns の allowlist と JWT 認証) |
 | [DR-0031](DR-0031-store-layer.md) | 🟡 部分実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |
+| [DR-0032](DR-0032-daemon-reload.md) | ⬜ 未実装 | 設定の読み直しを `daemon reload` で明示的に行う (CLI → 監督者 → unit ごとの制御 socket、`check` と同じ経路で検証して通った時だけ差し替え、変えられない欄の変更は restart を求めて断る) |
