@@ -47,20 +47,25 @@ A namespace can instead accept Ed25519-signed JWTs (DR-0030 §6). The token is s
 ```toml
 [ns.claude]
 auth = "jwt"
+keys_file = "~/.config/llm-gateway/keys/claude.jwks.jsonl"   # required; the key ring, one JWK per line
 max_ttl = "400d"          # required; a token living longer than this (exp - now, and exp - iat when iat is present) is refused
 iss = "llm-gateway-cli"   # optional; when written, the token's iss must match
 aud = "ns-claude"         # optional; when written, the token's aud (a string or an array) must contain it
-
-[ns.claude.keys.claude-mbp-2026-09]   # the table key is the kid
-alg = "EdDSA"                          # the only one accepted
-public = "<Ed25519 public key, 32 bytes, base64url without padding>"
 ```
 
-- `auth` names the method: omit it and `auth_token` decides (`token` when present, unchecked when absent), or write `auth = "token"` / `auth = "jwt"`. Fields of the other method (`auth_token` with `jwt`, `keys` / `max_ttl` / `iss` / `aud` without it) are refused when the configuration is read
-- A token passes when its header names a configured `kid`, its `alg` is `EdDSA` (the header's `alg` is only compared, never used to pick the algorithm), it carries no `crit`, the signature verifies, `exp` and `sub` are present, and the times hold within 60 seconds of skew (`exp` not passed, `iat` / `nbf` not in the future, the lifetime within `max_ttl`)
+The key ring `claude.jwks.jsonl` holds one JWK per line, each line exactly what `llm-gateway auth keygen` prints (private key included; make the file mode 600). During a rotation the old and new lines sit side by side:
+
+```
+{"kty":"OKP","crv":"Ed25519","kid":"claude-mbp-2026-09","d":"…","x":"…"}
+{"kty":"OKP","crv":"Ed25519","kid":"claude-mbp-2027-03","d":"…","x":"…"}
+```
+
+- `auth` names the method: omit it and `auth_token` decides (`token` when present, unchecked when absent), or write `auth = "token"` / `auth = "jwt"`. Fields of the other method (`auth_token` with `jwt`, `keys_file` / `max_ttl` / `iss` / `aud` without it) are refused when the configuration is read
+- `keys_file` expands `~` and environment variables like the other path fields. The file is the source of truth: add a key by appending a line, revoke one by deleting its line. Every line needs a `kid`; a non-Ed25519 line or a duplicate kid is a read error
+- A token passes when its header names a `kid` in the key ring, its `alg` is `EdDSA` (the algorithm comes from the key's `kty` / `crv`; the header's `alg` is only compared), it carries no `crit`, the signature verifies, `exp` and `sub` are present, and the times hold within 60 seconds of skew (`exp` not passed, `iat` / `nbf` not in the future, the lifetime within `max_ttl`)
 - Every failure returns the same 401 with `WWW-Authenticate: Bearer error="invalid_token"`; which check failed is only written to the log
-- `keys` is a table keyed by kid, so a file that `extends` another adds keys to the base instead of replacing them. To revoke a key, delete its kid from the file that defines it
-- **The configuration is read when the gateway starts; a key added or removed takes effect only after a restart** (`daemon restart`). During a rolling restart the old key keeps working on a unit that has not restarted yet
+- A file that `extends` another and writes `keys_file` replaces the key ring as a whole (keys are not merged one by one). The valid keys are exactly the contents of the one file the namespace's `keys_file` points to
+- **Changes to the key ring take effect without a restart.** The gateway reads the key ring at startup and, on every verification, checks the mtime of `keys_file` and rereads it when it changed. Delete a line and that kid's tokens are refused from the next request on. A key ring that cannot be read at startup (missing, permissions, a bad line) stops the gateway from starting; a failed reread while running logs a warning and keeps verifying with the previous key ring
 
 ## Prompt cache strategy (`[[ns.<name>.cache]]`)
 
@@ -623,19 +628,18 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 
 ### `auth` — keys and tokens for `jwt` namespaces
 
-Everything is printed to stdout; nothing is saved. Keep the private key yourself (a password manager, or a file only you can read) and feed it back on stdin (`--key -`, the default) or from a file (`--key <file>`).
+Everything is printed to stdout; nothing is saved. Appending to the key ring (`keys_file`) is up to you, with `>>`. The key ring is read from a file (`--key <file>`) or from stdin (`--key -`, the default).
 
 ```bash
-llm-gateway auth keygen --kid claude-mbp-2026-09 > claude-mbp-2026-09.jwk   # private key as a JWK
-chmod 600 claude-mbp-2026-09.jwk
-llm-gateway auth jwks --ns claude < claude-mbp-2026-09.jwk                   # [ns.claude.keys.<kid>] to paste
-llm-gateway auth jwks --format jwks < claude-mbp-2026-09.jwk                 # the same key as a JWKS
-llm-gateway auth sign --sub kawaz-mbp --ttl 180d < claude-mbp-2026-09.jwk     # one JWT on one line
+llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl   # append one line to the key ring
+chmod 600 ~/.config/llm-gateway/keys/claude.jwks.jsonl                                              # when the file is new
+llm-gateway auth jwks --key ~/.config/llm-gateway/keys/claude.jwks.jsonl                            # public keys only, as a JWKS
+llm-gateway auth sign --key ~/.config/llm-gateway/keys/claude.jwks.jsonl --kid claude-mbp-2026-09 --sub kawaz-mbp --ttl 180d   # one JWT on one line
 ```
 
-- `keygen [--kid <kid>]`: the kid defaults to today's date and four random hex digits
-- `jwks [--key <file|->] [--kid <kid>] [--ns <name>] [--format toml|jwks]`: `toml` (the default) is the table to add under the namespace; `jwks` is `{"keys":[…]}` without the private part
-- `sign [--key <file|->] [--kid <kid>] --sub <subject> --ttl <duration> [--iss <iss>] [--aud <aud>]...`: `iat` is now and `exp` is now + ttl. The namespace's `max_ttl` is checked by the gateway, not here
+- `keygen [--kid <kid>]`: prints an Ed25519 key pair as one JWK line (`{"kty":"OKP","crv":"Ed25519","kid":…,"d":…,"x":…}`). The kid defaults to today's date and four random hex digits
+- `jwks [--key <jwks.jsonl|->] [--kid <kid>]`: prints the key ring's public keys only, as `{"keys":[…]}` (no `d`) on one line. `--kid` narrows it to one key (a kid not in the key ring is an error)
+- `sign [--key <jwks.jsonl|->] [--kid <kid>] --sub <subject> --ttl <duration> [--iss <iss>] [--aud <aud>]...`: signs with the private key on the `--kid` line of the key ring. Without `--kid`, a one-line key ring uses that line and a longer one is an error. `iat` is now and `exp` is now + ttl; `--ttl` takes the same format as `max_ttl`. The namespace's `max_ttl` is checked by the gateway, not here (the configuration file is not read)
 
 ### `version` — installed against running
 

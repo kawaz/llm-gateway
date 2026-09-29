@@ -47,20 +47,25 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 ```toml
 [ns.claude]
 auth = "jwt"
+keys_file = "~/.config/llm-gateway/keys/claude.jwks.jsonl"   # 必須。1 行 1 JWK の鍵束
 max_ttl = "400d"          # 必須。これより長い寿命 (exp - now、iat があれば exp - iat も) の token は断る
 iss = "llm-gateway-cli"   # 任意。書いたら token の iss の一致を要求する
 aud = "ns-claude"         # 任意。書いたら token の aud (文字列か配列) に含まれることを要求する
-
-[ns.claude.keys.claude-mbp-2026-09]   # 表のキーが kid
-alg = "EdDSA"                          # 今はこれだけ
-public = "<Ed25519 公開鍵 32 バイトの base64url (パディング無し)>"
 ```
 
-- `auth` は方式名。省けば `auth_token` の有無で決まり (有れば `token`、無ければ無検査)、`auth = "token"` / `auth = "jwt"` と明示もできる。別の方式の欄 (`jwt` での `auth_token`、`jwt` 以外での `keys` / `max_ttl` / `iss` / `aud`) は設定の読み込みで断る
-- 通るのは、ヘッダの `kid` が設定にあり、`alg` が `EdDSA` (ヘッダの `alg` は照合するだけで、検証の方法の選択には使わない)、`crit` が無く、署名が合い、`exp` と `sub` があり、時刻が 60 秒の揺れの内で合う (`exp` を過ぎていない、`iat` / `nbf` が先の時刻でない、寿命が `max_ttl` 以内) token
+鍵束 `claude.jwks.jsonl` は 1 行 1 JWK で、各行は `llm-gateway auth keygen` の出力そのもの (秘密鍵込み。権限は 600 にする)。ローテ中は新旧 2 行が並ぶ:
+
+```
+{"kty":"OKP","crv":"Ed25519","kid":"claude-mbp-2026-09","d":"…","x":"…"}
+{"kty":"OKP","crv":"Ed25519","kid":"claude-mbp-2027-03","d":"…","x":"…"}
+```
+
+- `auth` は方式名。省けば `auth_token` の有無で決まり (有れば `token`、無ければ無検査)、`auth = "token"` / `auth = "jwt"` と明示もできる。別の方式の欄 (`jwt` での `auth_token`、`jwt` 以外での `keys_file` / `max_ttl` / `iss` / `aud`) は設定の読み込みで断る
+- `keys_file` は他のパス欄と同じく `~` と環境変数を開く。鍵束はファイルが正本で、鍵の追加は行の追記、失効は行の削除。各行に `kid` が要り、Ed25519 でない行・kid の重複は読み込みエラー
+- 通るのは、ヘッダの `kid` が鍵束にあり、`alg` が `EdDSA` (検証の方式は鍵の `kty` / `crv` から決め、ヘッダの `alg` は照合するだけ)、`crit` が無く、署名が合い、`exp` と `sub` があり、時刻が 60 秒の揺れの内で合う (`exp` を過ぎていない、`iat` / `nbf` が先の時刻でない、寿命が `max_ttl` 以内) token
 - 通らなかった時は理由に関わらず同じ 401 と `WWW-Authenticate: Bearer error="invalid_token"` を返す。どの検査で落ちたかはログにだけ残す
-- `keys` は kid をキーにした表なので、`extends` した派生のファイルに書いた鍵は土台の鍵に加わる (置き換えない)。鍵を失効させるには、その kid を定義しているファイルから消す
-- **設定は起動時に読む。鍵の追加・削除 (失効) は再起動 (`daemon restart`) で反映される**。rolling restart の間、まだ再起動していない unit では古い鍵が通る
+- `extends` した派生のファイルで `keys_file` を書くと、鍵束はファイルごと差し替わる (鍵単位のマージはしない)。有効な鍵は、その ns の `keys_file` が指す 1 ファイルの中身だけで決まる
+- **鍵束の変更は restart 無しで反映される**。gateway は起動時に鍵束を読み、検証のたびに `keys_file` の mtime を見て、変わっていれば読み直す。行を消せば次のリクエストからその kid の token は通らない。起動時に鍵束が読めない (無い・権限・不正な行) と起動を止める。稼働中の読み直しに失敗したら警告をログに出し、前の鍵束で検証を続ける
 
 ## prompt cache 戦略 (`[[ns.<name>.cache]]`)
 
@@ -625,19 +630,18 @@ llm-gateway <command> [options]
 
 ### `auth` — `jwt` の namespace の鍵と token
 
-どれも標準出力に出すだけで、何も保存しない。秘密鍵は自分で持ち (パスワードマネージャか、自分だけが読めるファイル)、標準入力 (`--key -`、既定) かファイル (`--key <file>`) で渡す。
+どれも標準出力に出すだけで、何も保存しない。鍵束 (`keys_file`) への追記は利用者が `>>` で行う。鍵束は `--key <file>` か標準入力 (`--key -`、既定) で渡す。
 
 ```bash
-llm-gateway auth keygen --kid claude-mbp-2026-09 > claude-mbp-2026-09.jwk   # 秘密鍵 (JWK)
-chmod 600 claude-mbp-2026-09.jwk
-llm-gateway auth jwks --ns claude < claude-mbp-2026-09.jwk                   # 貼る [ns.claude.keys.<kid>]
-llm-gateway auth jwks --format jwks < claude-mbp-2026-09.jwk                 # 同じ鍵の JWKS
-llm-gateway auth sign --sub kawaz-mbp --ttl 180d < claude-mbp-2026-09.jwk     # JWT を 1 行
+llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl   # 鍵束に 1 行追記
+chmod 600 ~/.config/llm-gateway/keys/claude.jwks.jsonl                                              # 新規作成時
+llm-gateway auth jwks --key ~/.config/llm-gateway/keys/claude.jwks.jsonl                            # 公開鍵だけの JWKS
+llm-gateway auth sign --key ~/.config/llm-gateway/keys/claude.jwks.jsonl --kid claude-mbp-2026-09 --sub kawaz-mbp --ttl 180d   # JWT を 1 行
 ```
 
-- `keygen [--kid <kid>]`: kid の既定は今日の日付と 16 進 4 桁の乱数
-- `jwks [--key <file|->] [--kid <kid>] [--ns <name>] [--format toml|jwks]`: `toml` (既定) は namespace の下に足す表、`jwks` は秘密の部分を含まない `{"keys":[…]}`
-- `sign [--key <file|->] [--kid <kid>] --sub <subject> --ttl <長さ> [--iss <iss>] [--aud <aud>]...`: `iat` は今、`exp` は今 + ttl。namespace の `max_ttl` との照合は gateway 側で行い、ここでは見ない
+- `keygen [--kid <kid>]`: Ed25519 鍵ペアを JWK 1 行 (`{"kty":"OKP","crv":"Ed25519","kid":…,"d":…,"x":…}`) で出す。kid の既定は今日の日付と 16 進 4 桁の乱数
+- `jwks [--key <jwks.jsonl|->] [--kid <kid>]`: 鍵束の公開鍵だけを `{"keys":[…]}` (`d` を含まない) で 1 行に出す。`--kid` で 1 本に絞れる (鍵束に無い kid はエラー)
+- `sign [--key <jwks.jsonl|->] [--kid <kid>] --sub <subject> --ttl <長さ> [--iss <iss>] [--aud <aud>]...`: 鍵束から `--kid` の行の秘密鍵で署名する。`--kid` を省くと、鍵束が 1 行ならそれを使い、複数行ならエラー。`iat` は今、`exp` は今 + ttl。`--ttl` は `max_ttl` と同じ書式。namespace の `max_ttl` との照合は gateway 側で行い、ここでは見ない (設定ファイルは読まない)
 
 ### `version` — 置いてある版と走っている版
 
