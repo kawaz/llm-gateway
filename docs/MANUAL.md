@@ -589,6 +589,18 @@ On success it returns HTML saying "Credential `<name>` was updated." An empty st
 
 Saving goes through the same path as the CLI login (it takes the credential lock and writes back on top of what exists), so it never fights with the background refresh.
 
+## Making changes take effect
+
+A running unit rereads each input on a different trigger. What to do after changing one:
+
+| Input | Reread when | What to do |
+| --- | --- | --- |
+| Credentials (`<store>/<name>.json`) | The mtime is watched periodically and the file reread when it changed (`[discovery] watch_secs`) | Nothing |
+| Key ring (`keys_file`) | Every JWT verification stats it and rereads it when the mtime changed | Nothing (effective from the next request) |
+| Configuration file (including its `extends` bases) | Only when told to by `daemon reload` | `llm-gateway daemon reload <unit>\|--all` |
+
+The configuration file alone is not watched: watching would pick up a half-saved file, or a moment where an `extends` base is rewritten but the file deriving from it is not yet. Say it is finished with `daemon reload`. Some fields are taken when the unit starts and cannot change on a reload; changing them needs a restart (see `daemon reload`).
+
 ## CLI commands
 
 ```
@@ -622,9 +634,35 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 | `daemon list` | List the registered units |
 | `daemon start\|stop\|restart <unit>\|--all` | Ask the supervisor to move them |
 | `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
+| `daemon reload <unit>\|--all` | Have the units reread their configuration file (no restart) |
 | `daemon log [<unit>]\|--all` | Show what they wrote (`--follow` to keep reading) |
 
-`start` / `stop` / `restart` / `status` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.
+`start` / `stop` / `restart` / `status` / `reload` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.
+
+#### `daemon reload <unit>|--all`
+
+Has running units reread their configuration file. The unit is not taken down, so what it has learned while running stays: which conversation is bound to which route, and each route's lockouts and quota observations (for routes whose name, credential, and provider are the same before and after). Without a name or `--all` it refuses.
+
+- The supervisor first rereads the registry, then relays to the units pointed at. A unit takes the request on a control socket only the supervisor connects to (`$XDG_STATE_HOME/llm-gateway/daemon/control/<unit>.sock`)
+- The unit reads the whole configuration the way `llm-gateway check` does (folding `extends`, through validation) and swaps it in only if that passes. If it cannot be read or fails validation, nothing is swapped and the unit keeps running the previous configuration
+- Requests already running finish with the configuration they started with; the new one applies from the next request
+- After swapping, the unit refetches the model lists over the new routes before answering (for up to 30 seconds). If some route could not be asked, the swap has still happened: the answer is `ok: true` with `warnings`
+- `--all` keeps reloading the other units when one fails, and lists every result. If any unit is `ok: false`, the exit status is non-zero (the answer goes to stderr)
+
+```
+$ llm-gateway daemon reload --all
+{"supervisor_version":"…","units":[{"unit":"stable","ok":true},{"unit":"unstable","ok":false,"error":{"kind":"restart_required","message":"[server] listen changed (127.0.0.1:11301 -> 127.0.0.1:11303); these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them","fields":["[server] listen"]}}]}
+```
+
+| `error.kind` | Meaning | The unit's configuration |
+| --- | --- | --- |
+| `invalid_config` | The configuration cannot be read or fails validation (`message` is what `check` says) | Unchanged |
+| `restart_required` | A field taken at start changed (listed in `fields`), or the running version has no control socket | Unchanged |
+| `not_running` | The unit is not running (it reads its configuration when it starts) | — |
+| `no_answer` | The unit did not answer within 45 seconds; see `daemon log` for whether it reloaded | Unknown |
+| `unreachable` | The control socket could not be reached | Unchanged |
+
+Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `binary_path` / `disabled`, `[store]`, `[stats]`, `[discovery]`, `[webhook]`, `[status]`, `routes.<name>.status_source`, `[upstreams]`, `[secret_store]`, `[secrets]`, `[ratelimit]`. The `message` shows the old and new values (`[webhook]` / `[upstreams]` / `[secrets]` may hold secrets, so only the field is named).
 
 ### `auth` — keys and tokens for `jwt` namespaces
 

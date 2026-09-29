@@ -12,7 +12,7 @@
 
 - `llm-gateway` の CLI が手元にあること (`auth keygen` / `auth jwks` / `auth sign`)
 - 鍵束は ns ごとに 1 ファイル、1 行 1 JWK の jsonl (秘密鍵込み、600)。置き場の例は `~/.config/llm-gateway/keys/<ns>.jwks.jsonl`。ファイルが正本で、鍵の追加は行の追記、失効は行の削除。追加は `>>` の追記、削除は一時ファイルに書いて `mv` で置き換える (rename で原子的に)
-- **鍵束の変更に restart は要らない**。gateway は検証のたびに鍵束の mtime を見て、変わっていれば読み直す (反映は次のリクエストから)。restart が要るのは設定ファイル (`auth = "jwt"` / `keys_file` 等) を変えた時だけ
+- **鍵束の変更に restart は要らない**。gateway は検証のたびに鍵束の mtime を見て、変わっていれば読み直す (反映は次のリクエストから)。設定ファイル (`auth = "jwt"` / `keys_file` 等) を変えた時は `daemon reload` で読み直させる (restart は要らない。ns の認証は reload で変えられる欄)
 - kid は **機械 (または用途) ごとに 1 本**。1 台分だけを失効できるようにするため
 - 以下の例は ns が `claude`、鍵束が `~/.config/llm-gateway/keys/claude.jwks.jsonl`
 
@@ -25,7 +25,7 @@
 1. 鍵束を作る (初回の手順 1)。**設定にはまだ書かない**。`keys_file` は `auth = "jwt"` と同時にしか書けず、片方だけだと `check` が落ちる
 2. JWT を鋳造し、クライアントに貼る (初回の手順 2〜3)。Claude Code は `settings.json` の `env.ANTHROPIC_AUTH_TOKEN`、codex は `[model_providers.<id>]` の `http_headers = { Authorization = "Bearer <JWT>" }`。この時点で新旧どちらの値でも通る
 3. その ns を使う走行中セッションが自然に再起動され切るのを待つ (急がない)。残っているものは `ccmsg peers` 等で数える
-4. ns に `auth = "jwt"` / `keys_file` / `max_ttl` を書き、`check` → unstable から rolling restart (初回の手順 4)。**貼った JWT が正しいかはここで初めて検査される**ので、unstable で `claude -p --model claude-haiku-4-5-20251001 'Reply with the single word: ok' < /dev/null` の疎通を見てから stable に進む
+4. ns に `auth = "jwt"` / `keys_file` / `max_ttl` を書き、`check` → `llm-gateway daemon reload unstable` (初回の手順 4)。**貼った JWT が正しいかはここで初めて検査される**ので、unstable で `claude -p --model claude-haiku-4-5-20251001 'Reply with the single word: ok' < /dev/null` の疎通を見てから `llm-gateway daemon reload stable` に進む。unstable と stable が同じ設定ファイルを読んでいる場合、ファイルを書いた時点ではどちらも変わらず、reload した台から順に切り替わる
 5. 初回の手順 5 で `subject` / `kid` の記録を確かめる
 
 ### 初回の鋳造
@@ -46,7 +46,7 @@
 
 3. **クライアントに持たせる。** Claude Code なら `settings.json` の `env.ANTHROPIC_AUTH_TOKEN` に入れ、`ANTHROPIC_BASE_URL` を `…/ns-claude` にする
 
-4. **設定に `keys_file` を書いて読み込ませる。** 設定を初めて変える時だけ restart が要る
+4. **設定に `keys_file` を書いて読み直させる。** 鍵束と違って設定は見張られないので、書き終えたら `daemon reload` で伝える
    ```toml
    [ns.claude]
    auth = "jwt"
@@ -55,9 +55,9 @@
    ```
    ```bash
    llm-gateway check --config <設定ファイル>
-   llm-gateway daemon restart --all
+   llm-gateway daemon reload --all
    ```
-   期待結果: `check` がエラーを出さず、restart が全 unit で healthz まで戻る
+   期待結果: `check` がエラーを出さず、reload の答えが全 unit で `"ok":true`。`ok: false` の unit は旧設定のまま走っているので、`error.message` を直して reload し直す
 
 5. **確かめる。** 新しい Claude Code のセッションで 1 往復し、`/llm-gateway/events` の `request` に `subject` / `kid` が載ることを見る
 

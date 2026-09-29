@@ -1,6 +1,6 @@
 # DR-0032: 設定の読み直しを `daemon reload` で行う (監督者経由 + unit ごとの制御 socket)
 
-- Status: Accepted (kawaz 裁定 2026-09-30、未実装)
+- Status: Accepted (kawaz 裁定 2026-09-30)。決定 1〜6 は実装済み (`daemon reload`、unit ごとの制御 socket、MANUAL の契機の表)
 - Date: 2026-09-30
 
 ## 文脈

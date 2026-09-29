@@ -591,6 +591,18 @@ curl -sS http://127.0.0.1:8402/llm-gateway/login/personal \
 
 保存は CLI の login と同じ経路を通る (credential のロックを取り、既存を土台に書き戻す)。常駐の refresh 処理と消し合わない。
 
+## 書き換えを効かせる
+
+走っている台は、入力ごとに違う契機で読み直す。書き換えた後に何をすれば効くかは次のとおり。
+
+| 入力 | 読み直す契機 | すること |
+| --- | --- | --- |
+| credential (`<store>/<name>.json`) | 周期的に mtime を見張り、変わっていれば読み直す (`[discovery] watch_secs`) | 何もしない |
+| 鍵束 (`keys_file`) | JWT を検証するたびに stat し、mtime が変わっていれば読み直す | 何もしない (次のリクエストから効く) |
+| 設定ファイル (`extends` の土台を含む) | `daemon reload` で命じた時だけ | `llm-gateway daemon reload <unit>\|--all` |
+
+設定ファイルだけは見張らない。保存途中や、`extends` の土台と派生を順に書き換える途中を拾わないため、書き終えたことを `daemon reload` で伝える。一部の欄は起動時に掴むので reload では変えられず、変えたら restart が要る (`daemon reload` の節)。
+
 ## CLI コマンド対応表
 
 ```
@@ -624,9 +636,35 @@ llm-gateway <command> [options]
 | `daemon list` | 登録されている台を並べる |
 | `daemon start\|stop\|restart <unit>\|--all` | 監督者に頼んで上げ下げする |
 | `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
+| `daemon reload <unit>\|--all` | 台に設定ファイルを読み直させる (restart 無し) |
 | `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
 
-`start` / `stop` / `restart` / `status` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
+`start` / `stop` / `restart` / `status` / `reload` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
+
+#### `daemon reload <unit>|--all`
+
+走っている台に設定ファイルを読み直させる。台を落とさないので、会話と経路の結びつき・経路ごとの締め出しや枠の観測はそのまま残る (経路名と、その経路の credential / provider が前後で同じもの)。名前も `--all` も無ければ断る。
+
+- 監督者は先に登録簿を読み直し、それから指された台へ中継する。台は監督者だけが繋ぐ制御口 (`$XDG_STATE_HOME/llm-gateway/daemon/control/<unit>.sock`) で受ける
+- 台は `llm-gateway check` と同じ経路 (`extends` を畳み、検証まで) で設定全体を読み、通った時だけ差し替える。読めない・検証に落ちた時は何も差し替えず、旧設定のまま走り続ける
+- 走行中のリクエストは始まった時の設定で最後まで走り、差し替えは次のリクエストから効く
+- 差し替えた後、新しい経路でモデルの一覧を取り直してから答える (上限 30 秒)。取り直せなかった経路があっても差し替えは済んでいて、`ok: true` に `warnings` を添える
+- `--all` は 1 台が失敗しても残りの台を読み直し、全台の結果を並べる。1 台でも `ok: false` なら exit は非 0 (答えは stderr)
+
+```
+$ llm-gateway daemon reload --all
+{"supervisor_version":"…","units":[{"unit":"stable","ok":true},{"unit":"unstable","ok":false,"error":{"kind":"restart_required","message":"[server] listen changed (127.0.0.1:11301 -> 127.0.0.1:11303); these are fixed when the unit starts, so the configuration was not reloaded. restart the unit to apply them","fields":["[server] listen"]}}]}
+```
+
+| `error.kind` | 意味 | 台の設定 |
+| --- | --- | --- |
+| `invalid_config` | 設定が読めない・検証に落ちた (`message` は `check` と同じ) | 旧設定のまま |
+| `restart_required` | 起動時に掴む欄が変わっている (`fields` にその欄)。または制御口を持たない版が走っている | 旧設定のまま |
+| `not_running` | 台が走っていない (起きる時に設定を読む) | — |
+| `no_answer` | 台が 45 秒以内に答えなかった。差し替わったかは `daemon log` で見る | 不明 |
+| `unreachable` | 制御口に繋げなかった | 旧設定のまま |
+
+reload で変えられない欄 (変えたら `daemon restart`): `[server]` の `listen` / `binary_path` / `disabled`、`[store]`、`[stats]`、`[discovery]`、`[webhook]`、`[status]`、`routes.<name>.status_source`、`[upstreams]`、`[secret_store]`、`[secrets]`、`[ratelimit]`。`message` には旧→新の値を並べる (`[webhook]` / `[upstreams]` / `[secrets]` は秘密を含みうるので欄名だけ)。
 
 ### `auth` — `jwt` の namespace の鍵と token
 
