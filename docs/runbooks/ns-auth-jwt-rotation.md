@@ -44,7 +44,7 @@
    ```
    期待結果: 1 行の JWT。`--sub` は機械ごとに分けると、知らせ (`/llm-gateway/events` の `subject` / `kid`) で見分けられる。`--ttl` は `max_ttl` 以下
 
-3. **クライアントに持たせる。** Claude Code なら `settings.json` の `env.ANTHROPIC_AUTH_TOKEN` に入れ、`ANTHROPIC_BASE_URL` を `…/claude` (ns のパス) にする
+3. **クライアントに持たせる。** Claude Code なら `settings.json` の `env.ANTHROPIC_AUTH_TOKEN` に入れ、`ANTHROPIC_BASE_URL` を `…/ns-claude` にする
 
 4. **設定に `keys_file` を書いて読み込ませる。** 設定を初めて変える時だけ restart が要る
    ```toml
