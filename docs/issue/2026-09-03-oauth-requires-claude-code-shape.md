@@ -3,7 +3,7 @@ title: サブスク OAuth 経路は Claude Code 形の request のみ通す (429
 status: open
 category: tech-memo
 created: 2026-09-03T12:10:29+09:00
-last_read:
+last_read: 2026-09-30T08:38:11+09:00
 open_entered: 2026-09-03T12:10:29+09:00
 wip_entered:
 blocked_entered:
