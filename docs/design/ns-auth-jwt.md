@@ -173,8 +173,8 @@ Phase 0 の 3 行 (完了条件):
       - 検証側は秘密鍵を持つ必要が無いので、`JwtAuth` には今どおり `VerifyingKey` の表を渡す (読み込んだ直後に `verifying_key()` へ落とす)。署名側 (CLI の `sign`、後の `issued`) だけが `SigningKey` を使う
       - `parse_public_key` (base64url 生 32 byte の読み取り) と `public_key_text` は設定から公開鍵を読む経路が無くなるので、残る呼び出し元 (`public_jwk` の `x` 等) を grep で確かめて不要なら消す
    3. **稼働中の再読込**
-      - **検証の入口で読み直す** (per-request check。監視用の task は立てない)。`JwtAuth` は `keys_file` のパスと、最後に読んだ時の mtime を持つ。`JwtAuth::verify` (`NsAuth::verify` の `Jwt` 枝から呼ばれる) の入口で `keys_file` を stat し、記録した mtime と違えば鍵束を読み直して表と mtime を差し替えてから検証する。mtime の取り方は `FileStore::version` (`crates/gateway-core/src/credential/file.rs`、`modified()` の UNIX epoch からの ns) と揃える。stat は 1 リクエスト 1 回で、中身は mtime が変わった時だけ読む
-      - `JwtAuth` は今 `Config` の中に不変で居て、`Gateway::namespace()` が `&Namespace` を返し `NsAuth::verify(&self, …)` が読むだけ。`&self` のまま差し替えられるよう、鍵の表と mtime を `std::sync::RwLock` で内部可変にする (`RwLock<(Option<u64>, Arc<BTreeMap<String, VerifyingKey>>)>` 等。読み手はロックを短く取って `Arc` を clone し、検証はロックの外で行う。`arc-swap` は足さない)。同時に複数のリクエストが変化を見た時は、書きロックを取った後で mtime を見直し、読み直しを 1 回に抑える。`JwtAuth` の `#[derive(Clone, PartialEq, Eq)]` は設定の比較・テストで使われているので、手書きの実装 (パス・`max_ttl` 等と、その時点の表で比べる) に置き換える
+      - **検証の入口で読み直す** (per-request check。監視用の task は立てない)。鍵束は `gateway_core::ns::jwt::KeyRing` (`keys_file` のパス、最後に読んだ時の mtime、kid → 公開鍵の表) が持ち、`JwtAuth` は `ring: KeyRing` と `max_ttl` / `iss` / `aud` を持つ。`JwtAuth::verify` (`NsAuth::verify` の `Jwt` 枝から呼ばれる) の入口で `KeyRing::current()` が `keys_file` を stat し、記録した mtime と違えば鍵束を読み直して表と mtime を差し替え、その時点の表を返す。署名・claim の検査はその表に対して行う。mtime の取り方は `FileStore::version` (`crates/gateway-core/src/credential/file.rs`、`modified()` の UNIX epoch からの ns) と揃える。stat は 1 リクエスト 1 回で、中身は mtime が変わった時だけ読む
+      - `JwtAuth` は今 `Config` の中に不変で居て、`Gateway::namespace()` が `&Namespace` を返し `NsAuth::verify(&self, …)` が読むだけ。`&self` のまま差し替えられるよう、`KeyRing` の中で鍵の表と mtime を `std::sync::RwLock` で内部可変にする (`RwLock<(Option<u64>, Arc<BTreeMap<String, VerifyingKey>>)>` 等。読み手はロックを短く取って `Arc` を clone し、検証はロックの外で行う。`arc-swap` は足さない)。同時に複数のリクエストが変化を見た時は、書きロックを取った後で stat し直し、記録する mtime と読む中身を同じ stat に揃えて、読み直しを 1 回に抑える。`KeyRing` の `Clone` / `PartialEq` は手書き (パスと、その時点の表で比べる) で、`JwtAuth` はそれを使って derive する
       - 読み直しで失敗した (不正行・kid 重複・一時的に読めない) 時は **前の鍵束を持ち続け**、ログに警告を出す。書きかけのファイルを拾って全鍵を失う事故を避ける。mtime の粒度で同時刻に 2 度書くと取りこぼしうる点は DR-0030 Consequences の静的 secret と同じ制約として受ける
       - 利用者が `>>` や手編集で書くので、書き込みは rename 経由とは限らない。追記の途中を読むと最終行が欠けて不正行になるが、上の「失敗したら前の束を保つ」で次のリクエストで拾い直せる
    4. **CLI** (`crates/llm-gateway-cli/src/auth.rs`、help は `crates/llm-gateway-cli/src/help.rs`)
@@ -192,7 +192,7 @@ Phase 0 の 3 行 (完了条件):
       - runbook `docs/runbooks/ns-auth-jwt-rotation.md` の各手順を §3「Claude Code 向けの運用」の形に: 「Open の ns を無停止で `jwt` に移す」は鍵束を先に作って token を配ってから `auth = "jwt"` と `keys_file` を書いて rolling restart、「初回の鋳造」は `keygen >>` + `chmod 600` + `sign --kid`、「ローテ」と「漏洩時」は行の追記・削除で restart 無し (反映は次のリクエストから)、「失敗時の切り分け」に鍵束の読み込みエラー (起動時は起動失敗、稼働中は警告ログで前の束を保持) を足す
    7. **`check` の有効 kid 一覧**: `crates/llm-gateway-cli/src/check.rs` は今 ns ごとに routing / aliases / cache の数を出している。`jwt` の ns について `keys_file` のパスと有効な kid の一覧を同じ並びに足す (鍵束の読み込みエラーもここで出る)。extends のどのファイルが定義元かを追う必要は無くなったが、「どの鍵束を指し、中に何があるか」を 1 コマンドで確かめる口として価値がある。秘密鍵は出さない
 
-`issued` との境界: 検証器 (`JwtAuth`) は「kid → 公開鍵」の表を受けるだけにし、表の出どころを知らない。鍵束は `jwt` と `issued` で共用し、手順 5 は同じ鍵束の秘密鍵で署名する側 (kid ごとの最終発行時刻、token endpoint、bootstrap) を足す。
+`issued` との境界: 検証器 (`JwtAuth`) の検査は「kid → 公開鍵」の表を受けるだけにし、表の出どころ (ファイルか、与えた表か) は `KeyRing` が持つ。鍵束は `jwt` と `issued` で共用し、手順 5 は同じ鍵束の秘密鍵で署名する側 (kid ごとの最終発行時刻、token endpoint、bootstrap) を足す。
 
 ## 6. リスク・未確認
 
