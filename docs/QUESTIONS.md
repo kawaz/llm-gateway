@@ -31,14 +31,14 @@
 
 ### JW-C2: JWT の鋳造と貼り付けを kawaz の手元で実行
 
-`settings.json` / codex config への書き込みは auto モード分類器が「Secret-Store Writes」で拒否した。以下を `!` で実行してほしい (値は表示しない。`.bak-jwt-20260929` を残す)。gateway は ns が Open のうちは検査しないので、貼った直後から新旧どちらの値でも通る。
+`settings.json` / codex config への書き込みは auto モード分類器が拒否した (JWT は Secret-Store Writes、`ANTHROPIC_DEFAULT_SONNET_MODEL` の変更も Self-Modification)。以下を `!` で実行してほしい (値は表示しない。`.bak-jwt-20260929` を残す)。gateway は ns が Open のうちは検査しないので、貼った直後から新旧どちらの値でも通る。同じ run で既定 Sonnet を `claude-sonnet-5-5[1m]` に切り替える (gateway 経由の疎通と stats 記録は統括が確認済み、`docs/research/2026-09-29-sonnet-5-5-adoption.md`)。
 
 ```bash
 umask 077; P=~/.config/llm-gateway/private
 for ns in personal bare emrd; do
   f=~/.claude-$ns/settings.json; cp "$f" "$f.bak-jwt-20260929"
   llm-gateway auth sign --sub "claude-$ns" --ttl 180d < "$P/$ns-2026-09.jwk" > "$P/.tok"
-  jq --rawfile t "$P/.tok" '.env.ANTHROPIC_AUTH_TOKEN = ($t | rtrimstr("\n"))' "$f" > "$f.new" && mv "$f.new" "$f"
+  jq --rawfile t "$P/.tok" '.env.ANTHROPIC_AUTH_TOKEN = ($t | rtrimstr("\n")) | .env.ANTHROPIC_DEFAULT_SONNET_MODEL = "claude-sonnet-5-5[1m]"' "$f" > "$f.new" && mv "$f.new" "$f"
 done
 llm-gateway auth sign --sub codex-personal --ttl 180d < "$P/personal-2026-09.jwk" > "$P/.tok"
 C=~/.codex/config.toml; cp "$C" "$C.bak-jwt-20260929"
