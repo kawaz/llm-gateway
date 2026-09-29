@@ -29,21 +29,26 @@ while (($#)); do
 done
 [[ -n $turn1_out && -z $turn2_in || -z $turn1_out && -n $turn2_in ]] || usage
 [[ $edit_prefix == false || -n $turn2_in ]] || usage
-command -v jq >/dev/null && command -v curl >/dev/null || { printf 'curl and jq are required\n' >&2; exit 2; }
+command -v jq >/dev/null && command -v curl >/dev/null && command -v claude >/dev/null || { printf 'curl, jq and claude are required\n' >&2; exit 2; }
 
-first='What is 7 plus 5? Answer with the number only.'
-if [[ $edit_prefix == true ]]; then first='What is 7 plus 6? Answer with the number only.'; fi
+version=$(claude --version | cut -d ' ' -f 1)
+system=$(jq -n --arg version "$version" --arg introduction "You are Claude Code, Anthropic's official CLI for Claude." '[{"type":"text","text":("x-anthropic-billing-header: cc_version=" + $version + "; cc_entrypoint=cli;")},{"type":"text","text":$introduction}]')
+first='A three-digit number has digits summing to 12. The tens digit is twice the hundreds digit. Reversing the digits makes a number 396 greater than the original. Find the number and briefly explain the constraints.'
+if [[ $edit_prefix == true ]]; then first='A three-digit number has digits summing to 13. The tens digit is twice the hundreds digit. Reversing the digits makes a number 396 greater than the original. Find the number and briefly explain the constraints.'; fi
+second='What is the sum of the original number and its reversed number? Explain briefly.'
 if [[ -n $turn2_in ]]; then
   jq -e 'type == "array" and any(.[]; .type == "thinking" and (.signature | type == "string"))' "$turn2_in" >/dev/null || { printf 'Input must contain a signed thinking block\n' >&2; exit 2; }
-  body=$(jq -n --arg model "$model" --arg first "$first" --slurpfile content "$turn2_in" '{model:$model,max_tokens:1024,thinking:{type:"adaptive"},output_config:{effort:"low"},messages:[{role:"user",content:$first},{role:"assistant",content:$content[0]},{role:"user",content:"What is 9 plus 4? Answer with the number only."}]}')
+  body=$(jq -n --arg model "$model" --arg first "$first" --arg second "$second" --argjson system "$system" --slurpfile content "$turn2_in" '{model:$model,max_tokens:1024,thinking:{type:"adaptive"},output_config:{effort:"high"},system:$system,metadata:{user_id:"preserved-thinking-probe"},messages:[{role:"user",content:$first},{role:"assistant",content:$content[0]},{role:"user",content:$second}]}')
 else
-  body=$(jq -n --arg model "$model" --arg first "$first" '{model:$model,max_tokens:1024,thinking:{type:"adaptive"},output_config:{effort:"low"},messages:[{role:"user",content:$first}]}')
+  body=$(jq -n --arg model "$model" --arg first "$first" --arg second "$second" --argjson system "$system" '{model:$model,max_tokens:1024,thinking:{type:"adaptive"},output_config:{effort:"high"},system:$system,metadata:{user_id:"preserved-thinking-probe"},messages:[{role:"user",content:$first}]}')
 fi
 response=$(mktemp)
 trap 'rm -f "$response"' EXIT
 printf 'Probe mode: %s; beta: %s; edited prefix: %s\n' "$(if [[ -n $turn1_out ]]; then printf turn1; else printf turn2; fi)" "$beta" "$edit_prefix"
-headers=(-H 'content-type: application/json' -H 'anthropic-version: 2023-06-01')
-if [[ $beta == true ]]; then headers+=(-H 'anthropic-beta: thinking-binding-controls-2026-08-01'); fi
+headers=(-H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -H "User-Agent: claude-cli/$version" -H 'x-app: cli')
+beta_flags='oauth-2025-04-20,claude-code-20250219'
+if [[ $beta == true ]]; then beta_flags+=',thinking-binding-controls-2026-08-01'; fi
+headers+=(-H "anthropic-beta: $beta_flags")
 status=$(curl -sS --max-time 120 -o "$response" -w '%{http_code}' -X POST "$base/$ns/v1/messages" "${headers[@]}" --data-binary "$body")
 printf 'HTTP status: %s\n' "$status"
 jq -c '{input_transformations: (.input_transformations // null), usage: (.usage // null), stop_reason: (.stop_reason // null), blocks: [.content[]? | {type, has_signature: (has("signature"))}], error: (.error // null)}' "$response"
