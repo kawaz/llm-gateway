@@ -117,7 +117,7 @@ type Table = Arc<BTreeMap<String, VerifyingKey>>;
 pub struct KeyRing {
     /// 鍵束の置き場。[`KeyRing::from_keys`] で作ったものは `None` (読み直さない)。
     path: Option<PathBuf>,
-    /// 最後に読んだ時の mtime と、その時の kid → 公開鍵。
+    /// 最後に見た mtime (読み直しに失敗した時も記録する) と、最後に読めた kid → 公開鍵。
     state: RwLock<(Option<u64>, Table)>,
 }
 
@@ -174,19 +174,19 @@ impl KeyRing {
         // 書きロックの下で stat し直し、記録する mtime と読む中身を同じ stat に揃える。
         // 同時に変化を見た他のリクエストは、ここで記録済みの mtime を見て読み直さない。
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        let result = mtime_of(path)
-            .map_err(|e| unreadable(path, e))
-            .and_then(|mtime| {
-                if state.0 == Some(mtime) {
-                    return Ok(None);
+        match mtime_of(path) {
+            Ok(mtime) if state.0 == Some(mtime) => {}
+            // 失敗しても見た mtime は記録する (表は前の束のまま)。同じ mtime の間は
+            // 読み直しも警告も繰り返さず、書き換わって mtime が変われば読み直す。
+            Ok(mtime) => match read_keys(path) {
+                Ok(keys) => *state = (Some(mtime), Arc::new(keys)),
+                Err(error) => {
+                    state.0 = Some(mtime);
+                    tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
                 }
-                read_keys(path).map(|keys| Some((mtime, keys)))
-            });
-        match result {
-            Ok(None) => {}
-            Ok(Some((mtime, keys))) => *state = (Some(mtime), Arc::new(keys)),
+            },
             Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
+                tracing::warn!(path = %path.display(), error = %unreadable(path, error), "cannot reload key ring; keeping previous keys")
             }
         }
         Arc::clone(&state.1)
@@ -825,6 +825,12 @@ pub(crate) mod tests {
         write_at("not JSON", 102);
         assert!(auth.verify(&a, NOW).is_ok());
         assert!(auth.verify(&b, NOW).is_ok());
+        // 失敗した mtime のままなら読み直さない (中身を正しくしても mtime が同じなら拾わない)。
+        write_at(&second, 102);
+        assert!(
+            auth.verify(&a, NOW).is_ok(),
+            "a failed mtime is not retried"
+        );
         write_at(&second, 103);
         assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));
         assert!(auth.verify(&b, NOW).is_ok());
