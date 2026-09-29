@@ -5077,8 +5077,16 @@ mod jwt_tests {
         )
     }
 
-    fn config() -> String {
-        format!(
+    /// 設定と、その `keys_file` が指す鍵束。鍵束は返した `TempDir` が生きている間だけある。
+    fn config() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("claude.jwks.jsonl");
+        std::fs::write(
+            &ring,
+            gateway_core::ns::jwt::private_jwk("mbp-2026-09", &key()).to_string(),
+        )
+        .unwrap();
+        let text = format!(
             r#"
 [routes.a]
 provider = "anthropic"
@@ -5088,22 +5096,21 @@ models = ["claude-opus-5"]
 [ns.claude]
 auth = "jwt"
 max_ttl = "1d"
-
-[ns.claude.keys.mbp-2026-09]
-alg = "EdDSA"
-public = "{}"
+keys_file = "{}"
 
 [ns.claude.allow]
 nothing = ["GET /x"]
 "#,
-            B64.encode(key().verifying_key().to_bytes())
-        )
+            ring.display()
+        );
+        (dir, text)
     }
 
     /// 設定から読んだ `jwt` の ns は、署名した token の主体 (sub / kid) を返す。
     #[test]
     fn the_configured_namespace_yields_the_principal() {
-        let config: llm_gateway::Config = toml::from_str(&config()).unwrap();
+        let (_ring, config) = config();
+        let config: llm_gateway::Config = toml::from_str(&config).unwrap();
         config.validate().unwrap();
         let ns = config.namespace("claude").unwrap();
         assert_eq!(
@@ -5121,8 +5128,9 @@ nothing = ["GET /x"]
     #[tokio::test]
     async fn the_request_notice_names_the_subject() {
         let (upstream, _seen) = super::tests::recording_upstream().await;
+        let (_ring, text) = config();
         let config: llm_gateway::Config =
-            toml::from_str(&config().replace("http://127.0.0.1:9", &upstream)).unwrap();
+            toml::from_str(&text.replace("http://127.0.0.1:9", &upstream)).unwrap();
         let gateway = std::sync::Arc::new(
             llm_gateway::Gateway::new(&config, crate::tests::StaticStore).unwrap(),
         );
@@ -5164,7 +5172,8 @@ nothing = ["GET /x"]
     /// せずに 401 (`WWW-Authenticate: Bearer error="invalid_token"`)。
     #[tokio::test]
     async fn a_signed_token_passes_and_the_rest_get_the_same_401() {
-        let base = serve(&config()).await;
+        let (_ring, config) = config();
+        let base = serve(&config).await;
         let client = reqwest::Client::new();
         let models = |token: &str| {
             client
