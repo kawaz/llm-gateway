@@ -226,17 +226,29 @@ static TABLE: &[Row] = &[
         ],
         ANTHROPIC_REFINEMENTS,
     ),
-    // sonnet-5 は 2026-08-31 まで導入価格 ($2/$10) が案内されている。表には
-    // 通常価格を置く — 導入価格が自分の契約に効いているか確認できておらず、
-    // 期限切れを取りこぼすと黙って安く見積もり続けるため。
+    // Sonnet 5.5 は 5 と同額だが、5 系の glob より前に自分の行を持つ。glob に
+    // 飲まれると gap detection が新モデルを名指しできない (2026-09-29 確認 / pricing doc)。
+    row(
+        &["claude-sonnet-5-5", "claude-sonnet-5-5-*"],
+        &[
+            (INPUT, 2.0),
+            (OUTPUT, 10.0),
+            (CACHE_WRITE, 2.5),
+            (CACHE_WRITE_1H, 4.0),
+            (CACHE_READ, 0.2),
+        ],
+        ANTHROPIC_REFINEMENTS,
+    ),
+    // Sonnet 5 の $2/$10 は標準価格 (pricing doc の脚注: 2026-09-01 の $3/$15 への
+    // 改定は行われない。2026-09-29 確認)。
     row(
         &["claude-sonnet-5", "claude-sonnet-5-*"],
         &[
-            (INPUT, 3.0),
-            (OUTPUT, 15.0),
-            (CACHE_WRITE, 3.75),
-            (CACHE_WRITE_1H, 6.0),
-            (CACHE_READ, 0.3),
+            (INPUT, 2.0),
+            (OUTPUT, 10.0),
+            (CACHE_WRITE, 2.5),
+            (CACHE_WRITE_1H, 4.0),
+            (CACHE_READ, 0.2),
         ],
         ANTHROPIC_REFINEMENTS,
     ),
@@ -510,6 +522,19 @@ mod tests {
             rate("claude-opus-5", &TokenKind::input_cache_read()),
             Some(0.5)
         );
+    }
+
+    /// Sonnet 5.5 は 5 と同額で、5 系の glob ではなく自分の行に当たる。
+    #[test]
+    fn sonnet_5_5_has_its_own_row_at_sonnet_5_rates() {
+        assert_eq!(rate("claude-sonnet-5-5", &TokenKind::input()), Some(2.0));
+        assert_eq!(rate("claude-sonnet-5-5", &TokenKind::output()), Some(10.0));
+        assert_eq!(rate("claude-sonnet-5", &TokenKind::input()), Some(2.0));
+        assert_eq!(
+            rate("claude-sonnet-5", &TokenKind::input_cache_read()),
+            Some(0.2)
+        );
+        assert_eq!(gaps(["claude-sonnet-5-5"]), vec![]);
     }
 
     /// 日付付きの形も同じ行に当たる。

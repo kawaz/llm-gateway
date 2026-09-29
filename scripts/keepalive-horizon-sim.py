@@ -24,7 +24,9 @@ MODEL_RATES = {
     "claude-fable-5": (1.0, 20.0),
     "claude-mythos-5": (1.0, 20.0),
     "claude-opus-5": (0.5, 10.0),
+    "claude-opus-5-5": (0.2, 8.0),
     "claude-sonnet-5": (0.2, 4.0),
+    "claude-sonnet-5-5": (0.2, 4.0),
 }
 BRANCH_HOURS = {"5.1系": 80 * 55 / 60, "その他": 20 * 55 / 60}
 HORIZONS = range(97)
