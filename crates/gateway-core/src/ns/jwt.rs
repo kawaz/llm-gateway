@@ -97,6 +97,12 @@ pub fn read_key_ring(text: &str) -> Result<BTreeMap<String, SigningKey>, String>
             ));
         }
     }
+    if keys.is_empty() {
+        return Err(
+            "the key ring has no keys; append one with `llm-gateway auth keygen >> <file>`"
+                .to_owned(),
+        );
+    }
     Ok(keys)
 }
 
@@ -781,6 +787,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_empty_key_ring_is_an_error() {
+        for text in ["", "\n", "  \n\n"] {
+            let error = read_key_ring(text).unwrap_err();
+            assert!(error.contains("no keys"), "{error}");
+        }
+    }
+
+    #[test]
     fn key_ring_reloads_on_mtime_change_and_keeps_last_valid_ring() {
         use std::fs::{self, File, FileTimes};
         use std::time::{Duration, SystemTime};
@@ -814,7 +828,19 @@ pub(crate) mod tests {
         write_at(&second, 103);
         assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));
         assert!(auth.verify(&b, NOW).is_ok());
-        write_at(&first, 103);
+        write_at("", 104);
+        assert!(
+            auth.verify(&b, NOW).is_ok(),
+            "a truncated ring keeps the last one"
+        );
+        write_at("\n\n", 105);
+        assert!(
+            auth.verify(&b, NOW).is_ok(),
+            "blank lines only keep the last one"
+        );
+        write_at(&second, 106);
+        assert!(auth.verify(&b, NOW).is_ok());
+        write_at(&first, 106);
         assert!(
             auth.verify(&b, NOW).is_ok(),
             "unchanged mtime does not reload"

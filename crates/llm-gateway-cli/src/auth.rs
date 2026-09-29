@@ -120,14 +120,7 @@ fn read_ring(parsed: &Parsed) -> Result<BTreeMap<String, jwt::SigningKey>, Failu
         std::fs::read_to_string(source)
             .map_err(|e| Failure::from(format!("could not read {source}: {e}")))?
     };
-    let ring = jwt::read_key_ring(&text)
-        .map_err(|e| Failure::from(format!("the key ring {source}: {e}")))?;
-    if ring.is_empty() {
-        return Err(Failure::from(format!(
-            "the key ring {source} has no keys; append one with `llm-gateway auth keygen >> <file>`"
-        )));
-    }
-    Ok(ring)
+    jwt::read_key_ring(&text).map_err(|e| Failure::from(format!("{source}: {e}")))
 }
 
 /// `--kid` の行を選ぶ。省けば、1 行の鍵束ならその行。
