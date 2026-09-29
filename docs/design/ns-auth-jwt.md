@@ -46,7 +46,7 @@ aud = "ns-claude"         # 任意。書いたら aud (文字列 or 配列) に�
   `NsAuth::token()` / `is_open()` / `verify()` の外形は保ち、`Serialize` は上の生の欄へ戻す形で書く (`check` 等で設定を書き出す経路を崩さないため)
 - **鍵は設定の外、ns ごとの鍵束ファイル** (DR-0030 §5)。鍵の追加・失効は設定と寿命が違う (ローテで 180 日ごとに増減する) ので設定に埋めない。鍵束は `jwt` の検証と `issued` の署名で共用する
 - **鍵束の形**: 1 行 1 JWK の jsonl。各行は `{"kty":"OKP","crv":"Ed25519","kid":…,"d":…,"x":…}` で、秘密鍵 (`d`) を含む。検証の方式は行の `kty` / `crv` から決め、Ed25519 以外の行は読み込みエラー。ファイルが正本で、追加は行の追記、失効は行の削除
-- **反映**: gateway は起動時に読んでメモリに持ち、mtime の変化で読み直す。restart は要らない
+- **反映**: gateway は起動時に読んでメモリに持ち、検証のたびに mtime を見て、変わっていれば読み直す。restart は要らない
 
 ### `extends` (DR-0013) との相性
 
@@ -127,11 +127,11 @@ llm-gateway auth sign [--key <jwks.jsonl|->] [--kid <kid>] --sub <subject> --ttl
 
 kid は機械ごとに 1 本。ローテ (既定は鍵 180 日、token の ttl は鍵周期 + 猶予):
 
-1. 新しい鍵を keygen して鍵束に**追記** (旧 kid の行は残す)。restart は要らない (mtime 監視で読み直す)
+1. 新しい鍵を keygen して鍵束に**追記** (旧 kid の行は残す)。restart は要らない (次のリクエストの検証で mtime の変化を見て読み直す)
 2. 新 kid で各機械の token を鋳造し直して貼り替え。走行中の Claude セッションは起動時の env を持ち続けるので、全セッションの再起動を待つ
 3. events で旧 kid の利用が 0 になったのを確かめて旧 kid の行を鍵束から削除。これが失効
 
-漏洩時: 該当 kid の行を即削除 (次の監視周期でその kid の token は全て失効)。別 kid で鋳造した他の機械は影響を受けない (kid を機械ごとに分ける理由)。鍵束ファイル自体が漏れた疑いがある時は全行が漏洩扱い。
+漏洩時: 該当 kid の行を即削除 (次のリクエストからその kid の token は全て失効)。別 kid で鋳造した他の機械は影響を受けない (kid を機械ごとに分ける理由)。鍵束ファイル自体が漏れた疑いがある時は全行が漏洩扱い。
 
 ## 4. Principal の下流
 
@@ -173,10 +173,10 @@ Phase 0 の 3 行 (完了条件):
       - 検証側は秘密鍵を持つ必要が無いので、`JwtAuth` には今どおり `VerifyingKey` の表を渡す (読み込んだ直後に `verifying_key()` へ落とす)。署名側 (CLI の `sign`、後の `issued`) だけが `SigningKey` を使う
       - `parse_public_key` (base64url 生 32 byte の読み取り) と `public_key_text` は設定から公開鍵を読む経路が無くなるので、残る呼び出し元 (`public_jwk` の `x` 等) を grep で確かめて不要なら消す
    3. **稼働中の再読込**
-      - 今の「credential と同じ監視」の実体は `Gateway::keep_models_fresh_every` (`crates/llm-gateway/src/gateway.rs`) のループで、間隔は `[discovery] watch_secs` (既定 60 秒)、版は `FileStore::version` (`crates/gateway-core/src/credential/file.rs`、mtime の ns 値) を `credential_versions()` で集めて比べる。このループはモデル一覧の取り直しに結び付いているので、鍵束の監視をそこへ混ぜず、**同じ間隔 (`discovery.watch_secs`) と同じ版の取り方 (mtime) で別の task を立てる**。起動は `crates/llm-gateway-cli/src/daemon/run.rs` で `keep_models_fresh` を spawn している箇所に並べる
-      - `JwtAuth` は今 `Config` の中に不変で居て、`Gateway::namespace()` が `&Namespace` を返し `NsAuth::verify(&self, …)` が読むだけ。再読込のため、`JwtAuth` の鍵の表を内部可変にする (`RwLock<Arc<BTreeMap<…>>>` 等、読み手はロックを短く取って `Arc` を clone。workspace に `arc-swap` は無いので足すかどうかは実装者が決める)。`JwtAuth` の `#[derive(Clone, PartialEq, Eq)]` は設定の比較・テストで使われているので、表の扱いを実装時に合わせる
+      - **検証の入口で読み直す** (per-request check。監視用の task は立てない)。`JwtAuth` は `keys_file` のパスと、最後に読んだ時の mtime を持つ。`JwtAuth::verify` (`NsAuth::verify` の `Jwt` 枝から呼ばれる) の入口で `keys_file` を stat し、記録した mtime と違えば鍵束を読み直して表と mtime を差し替えてから検証する。mtime の取り方は `FileStore::version` (`crates/gateway-core/src/credential/file.rs`、`modified()` の UNIX epoch からの ns) と揃える。stat は 1 リクエスト 1 回で、中身は mtime が変わった時だけ読む
+      - `JwtAuth` は今 `Config` の中に不変で居て、`Gateway::namespace()` が `&Namespace` を返し `NsAuth::verify(&self, …)` が読むだけ。`&self` のまま差し替えられるよう、鍵の表と mtime を `std::sync::RwLock` で内部可変にする (`RwLock<(Option<u64>, Arc<BTreeMap<String, VerifyingKey>>)>` 等。読み手はロックを短く取って `Arc` を clone し、検証はロックの外で行う。`arc-swap` は足さない)。同時に複数のリクエストが変化を見た時は、書きロックを取った後で mtime を見直し、読み直しを 1 回に抑える。`JwtAuth` の `#[derive(Clone, PartialEq, Eq)]` は設定の比較・テストで使われているので、手書きの実装 (パス・`max_ttl` 等と、その時点の表で比べる) に置き換える
       - 読み直しで失敗した (不正行・kid 重複・一時的に読めない) 時は **前の鍵束を持ち続け**、ログに警告を出す。書きかけのファイルを拾って全鍵を失う事故を避ける。mtime の粒度で同時刻に 2 度書くと取りこぼしうる点は DR-0030 Consequences の静的 secret と同じ制約として受ける
-      - 利用者が `>>` や手編集で書くので、書き込みは rename 経由とは限らない。追記の途中を読むと最終行が欠けて不正行になるが、上の「失敗したら前の束を保つ」で次の周期に拾い直せる
+      - 利用者が `>>` や手編集で書くので、書き込みは rename 経由とは限らない。追記の途中を読むと最終行が欠けて不正行になるが、上の「失敗したら前の束を保つ」で次のリクエストで拾い直せる
    4. **CLI** (`crates/llm-gateway-cli/src/auth.rs`、help は `crates/llm-gateway-cli/src/help.rs`)
       - `keygen`: 出力は今と同じ JWK 1 行 (変更なし)。help に「`>>` で鍵束に追記する」例を足す
       - `jwks`: 引数を `--key` / `--kid` だけにする (`--ns` と `--format` を撤去、TOML 断片の `toml_key` も撤去)。入力を鍵束として読み、全行 (`--kid` があればその 1 行、無ければエラー) の公開鍵を `{"keys":[…]}` で出す
@@ -185,20 +185,20 @@ Phase 0 の 3 行 (完了条件):
    5. **テスト**
       - `gateway-core`: jsonl の読込 (複数行・空行)、不正行 (JSON でない / Ed25519 でない / `d` 無し / `x` 不一致 / `kid` 無し) がエラーで、文に行番号があり秘密鍵が出ない、kid 重複がエラー
       - `llm-gateway` の設定: `keys_file` の読み込みと `~` 展開、`auth = "jwt"` で `keys_file` 無しがエラー、`jwt` 以外で `keys_file` がエラー、旧 `[ns.<ns>.keys.<kid>]` が移行先を示すエラー、`extends` の派生で `keys_file` を書けばファイルごと差し替わる (今の `keys_from_a_base_and_a_derived_file_are_merged` を置き換える)
-      - 再読込: 鍵束から行を消すとその kid の token が restart 無しで 401 になる、行を足すと通る、不正な書き換えでは前の鍵束が残る。監視の間隔は `keep_models_fresh_every` と同じく引数で受け、試験では実時間を待たない
+      - 再読込: 鍵束から行を消すとその kid の token が restart 無しで 401 になる、行を足すと通る、不正な書き換えでは前の鍵束が残る。いずれも鍵束を書き換えて mtime を進めた (試験では `File::set_modified` で明示的に進め、時刻の粒度に頼らない) 次の `verify` で反映されることを確かめる。mtime が変わらなければ読み直さない (中身を書き換えても mtime を戻せば前の表で検証される) ことも縛る
       - CLI (`crates/llm-gateway-cli/tests/auth.rs`): `keygen >> ring` を 2 回 → `sign --kid` の出力が gateway 側の検証 (`JwtAuth::verify`) を通る往復、`--kid` 省略で 1 行なら通り複数行ならエラー、`jwks` の出力に `d` が無い
    6. **docs**
-      - `docs/MANUAL-ja.md` / `docs/MANUAL.md` の「`jwt` の namespace」(``### `jwt` の namespace`` / ``### `jwt` namespaces``) を `keys_file` と鍵束の形 (1 行 1 JWK、600、mtime で読み直す) に書き換え、「失効は restart で反映」の記述を「鍵束の行を消すと `discovery.watch_secs` 以内に反映」に改める。「`auth` — `jwt` の namespace の鍵と token」(``### `auth` — keys and tokens for `jwt` namespaces``) の例と引数一覧を §3 の形にする
-      - runbook `docs/runbooks/ns-auth-jwt-rotation.md` の各手順を §3「Claude Code 向けの運用」の形に: 「Open の ns を無停止で `jwt` に移す」は鍵束を先に作って token を配ってから `auth = "jwt"` と `keys_file` を書いて rolling restart、「初回の鋳造」は `keygen >>` + `chmod 600` + `sign --kid`、「ローテ」と「漏洩時」は行の追記・削除で restart 無し (反映は `watch_secs` 以内)、「失敗時の切り分け」に鍵束の読み込みエラー (起動時は起動失敗、稼働中は警告ログで前の束を保持) を足す
+      - `docs/MANUAL-ja.md` / `docs/MANUAL.md` の「`jwt` の namespace」(``### `jwt` の namespace`` / ``### `jwt` namespaces``) を `keys_file` と鍵束の形 (1 行 1 JWK、600、mtime で読み直す) に書き換え、「失効は restart で反映」の記述を「鍵束の行を消すと次のリクエストから反映」に改める。「`auth` — `jwt` の namespace の鍵と token」(``### `auth` — keys and tokens for `jwt` namespaces``) の例と引数一覧を §3 の形にする
+      - runbook `docs/runbooks/ns-auth-jwt-rotation.md` の各手順を §3「Claude Code 向けの運用」の形に: 「Open の ns を無停止で `jwt` に移す」は鍵束を先に作って token を配ってから `auth = "jwt"` と `keys_file` を書いて rolling restart、「初回の鋳造」は `keygen >>` + `chmod 600` + `sign --kid`、「ローテ」と「漏洩時」は行の追記・削除で restart 無し (反映は次のリクエストから)、「失敗時の切り分け」に鍵束の読み込みエラー (起動時は起動失敗、稼働中は警告ログで前の束を保持) を足す
    7. **`check` の有効 kid 一覧**: `crates/llm-gateway-cli/src/check.rs` は今 ns ごとに routing / aliases / cache の数を出している。`jwt` の ns について `keys_file` のパスと有効な kid の一覧を同じ並びに足す (鍵束の読み込みエラーもここで出る)。extends のどのファイルが定義元かを追う必要は無くなったが、「どの鍵束を指し、中に何があるか」を 1 コマンドで確かめる口として価値がある。秘密鍵は出さない
 
 `issued` との境界: 検証器 (`JwtAuth`) は「kid → 公開鍵」の表を受けるだけにし、表の出どころを知らない。鍵束は `jwt` と `issued` で共用し、手順 5 は同じ鍵束の秘密鍵で署名する側 (kid ごとの最終発行時刻、token endpoint、bootstrap) を足す。
 
 ## 6. リスク・未確認
 
-- **長寿命 JWT の漏洩窓**: 失効手段は鍵束からの kid の行の削除だけなので、漏れた token は行を消して次の監視周期が来るまで ns の全権限で通る。token 単位の失効 (jti の拒否リスト) は持たない。緩和は kid の粒度を細かくする (機械ごと) ことと、ns の allowlist / 枠。漏れた token は `settings.json` (平文) から漏れるのが典型で、これは現行の固定 token と同じ危険度。jwt で良くなるのは「どの機械の token か (sub / kid) が events で分かる」「1 台分だけ失効できる」点
+- **長寿命 JWT の漏洩窓**: 失効手段は鍵束からの kid の行の削除だけなので、漏れた token は行を消すまで ns の全権限で通る。token 単位の失効 (jti の拒否リスト) は持たない。緩和は kid の粒度を細かくする (機械ごと) ことと、ns の allowlist / 枠。漏れた token は `settings.json` (平文) から漏れるのが典型で、これは現行の固定 token と同じ危険度。jwt で良くなるのは「どの機械の token か (sub / kid) が events で分かる」「1 台分だけ失効できる」点
 - **鍵束の秘密鍵が平文ファイルに居る**: 鍵束は検証と署名の共用で秘密鍵を含む (600)。漏れればその ns の token を偽造でき、allowlist も ns の区分も迂回される (DR-0030 Consequences)。cache-warden 稼働までは平文の期間で、runbook の漏洩時手順 (全行の入れ替え) がその歯止め
-- **再読込の反映の遅れ**: 行の削除から失効までは最大 `discovery.watch_secs` (既定 60 秒)。mtime の粒度で同時刻に 2 度書くと取りこぼしうる (DR-0030 Consequences の静的 secret と同じ制約)。rolling restart 中の 2 unit はそれぞれが鍵束を監視するので、反映の遅れは unit ごとに最大 1 周期
+- **同じ mtime での書き換え**: 版を mtime だけで比べるので、時刻の粒度の内で 2 度書くと 2 度目を取りこぼしうる (DR-0030 Consequences の静的 secret と同じ制約)。行を消したのに通る時は、鍵束を `touch` し直せば次のリクエストで読み直す
 - **書きかけの鍵束**: `>>` や手編集は rename 経由でないので、読み手が途中を見うる。読み直しの失敗では前の束を保つので、欠けた行を拾っても鍵を失わない。ただし「一部の行だけ正しく読めた状態」を採らないよう、1 行でも不正なら束全体を不採用にする
 - **時計**: gateway 機の時計が大きくずれると全 token が一斉に失効 / 通過する。skew 60 秒を超えるずれは NTP 前提で扱わない
 - **`ed25519-dalek` の版**: 2 系の `verify_strict` を前提にしている。workspace の他依存 (`sha2` 等) との版衝突は未確認
@@ -224,7 +224,7 @@ Phase 0 の 3 行 (完了条件):
 
 1. 鍵は設定の `[ns.<ns>.keys.<kid>]` 表でなく、`[ns.<ns>] keys_file = "<path>"` (必須、`~` / 環境変数を開くパス欄) が指す ns ごとの鍵束ファイル。`extends` の派生で上書きすればファイルごと差し替わり、鍵単位のマージはしない
 2. 鍵束は `<ns>.jwks.jsonl`、1 行 1 JWK (`auth keygen` の出力そのもの、秘密鍵込み、600)。ファイルが正本で、追加は追記・失効は行の削除。将来 daemon 経由の窓口を足しても正本はファイル (Store 層の 1 品目)
-3. gateway は起動時に読んでメモリに持ち、mtime の変化 (credential と同じ監視、`watch_secs`) で読み直す。restart は要らない
+3. gateway は起動時に読んでメモリに持ち、検証のたびに `keys_file` の mtime を見て、変わっていれば読み直す (per-request check、監視用の task は立てない)。読み直しに失敗したら前の束を保って警告する。restart は要らない
 4. 検証の方式は鍵の `kty` / `crv` から決め、ヘッダの `alg` は信用しない。Ed25519 以外の行は読み込みエラー
 5. `jwt` の検証と `issued` の署名で同じ鍵束を共用する
 6. CLI: `auth keygen` は JWK 1 行を標準出力 (追記は利用者が `>>`)。`auth jwks --key <jwks.jsonl> [--kid <kid>]` は公開鍵だけの JWKS JSON (TOML 断片は出さない)。`auth sign --key <jwks.jsonl> --kid <kid> --sub … --ttl …` で秘密鍵を選び、`--kid` 省略時は 1 行ならそれ・複数ならエラー。`--key -` の標準入力は維持
