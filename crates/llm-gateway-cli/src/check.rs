@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use llm_gateway::Config;
+use llm_gateway::config::NsAuth;
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Persistence};
 
@@ -140,20 +141,25 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
 /// namespace ごとの要約行。
 ///
 /// 名前を並べるだけでは、節が丸ごと消えていても「居る」ようにしか見えない。
-/// 数を並べると、0 が並んだ行がその場で目に入る。
+/// 数を並べると、0 が並んだ行がその場で目に入る。`jwt` の namespace には、
+/// 指している鍵束と中の kid を続けて出す (秘密鍵は出さない)。
 fn namespace_summary_lines(config: &Config) -> Vec<String> {
-    config
-        .namespaces
-        .iter()
-        .map(|(name, ns)| {
-            format!(
-                "  {name:<11}{} routing, {} aliases, {} cache",
-                ns.routing.len(),
-                ns.aliases.len(),
-                ns.cache.len()
-            )
-        })
-        .collect()
+    let mut lines = Vec::new();
+    for (name, ns) in &config.namespaces {
+        lines.push(format!(
+            "  {name:<11}{} routing, {} aliases, {} cache",
+            ns.routing.len(),
+            ns.aliases.len(),
+            ns.cache.len()
+        ));
+        if let NsAuth::Jwt(jwt) = &ns.auth {
+            if let Some(path) = jwt.ring.path() {
+                lines.push(format!("  {:<11}keys_file {}", "", path.display()));
+            }
+            lines.push(format!("  {:<11}kids {}", "", jwt.ring.kids().join(", ")));
+        }
+    }
+    lines
 }
 
 /// 待ち受け行。
@@ -255,6 +261,40 @@ main = "keepalive"
                 "  work       1 routing, 1 aliases, 1 cache".to_owned(),
             ]
         );
+    }
+
+    /// `jwt` の namespace は、鍵束のパスと kid を要約行の下に出す。秘密鍵は出さない。
+    #[test]
+    fn a_jwt_namespace_shows_its_key_ring() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ring = dir.path().join("claude.jwks.jsonl");
+        let jwk = |kid: &str, seed: u8| {
+            llm_gateway::config::jwt::private_jwk(
+                kid,
+                &llm_gateway::config::jwt::signing_key(&[seed; 32]),
+            )
+        };
+        std::fs::write(&ring, format!("{}\n{}\n", jwk("mbp", 1), jwk("mini", 2))).unwrap();
+        let path = dir.path().join("dummy.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[ns.claude]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"{}\"\n",
+                ring.display()
+            ),
+        )
+        .unwrap();
+        let lines = namespace_summary_lines(&load(&path).unwrap());
+        assert_eq!(
+            lines,
+            vec![
+                "  claude     0 routing, 0 aliases, 0 cache".to_owned(),
+                format!("             keys_file {}", ring.display()),
+                "             kids mbp, mini".to_owned(),
+            ]
+        );
+        let secret = jwk("mbp", 1)["d"].as_str().unwrap().to_owned();
+        assert!(!lines.concat().contains(&secret));
     }
 
     /// 待ち受け行は、無効かどうかで書き分ける。住所そのものは伏せない。
