@@ -1,6 +1,6 @@
 //! 監督者に頼む口 (DR-0028 決定 3)。
 //!
-//! `start` / `stop` / `restart` / `status` は、自分では何も動かさない。
+//! `start` / `stop` / `restart` / `status` / `reload` は、自分では何も動かさない。
 //! socket 越しに監督者へ渡し、返ってきたものをそのまま出す。監督者が
 //! 居なければ断る — 代わりに子を起こすと、止める相手が誰なのか分からなくなる。
 
@@ -38,6 +38,7 @@ pub fn ask(op: &str, args: &[String]) -> Result<ExitCode, Failure> {
         "stop" => Request::Stop(which),
         "restart" => Request::Restart(which),
         "status" => Request::Status(which),
+        "reload" => Request::Reload(which),
         other => return Err(Failure::from(format!("there is no `daemon {other}`"))),
     };
 
@@ -176,10 +177,16 @@ fn target(args: &[String], bare_is_all: bool) -> Result<Which, Failure> {
 }
 
 /// 監督者の答えを出す。断られていれば stderr へ回して非 0 で終わる。
+///
+/// 台ごとの結果 (`reload`) は、1 台でも `ok: false` なら全体を失敗として
+/// 扱う。並べた答えはそのまま出すので、どの台が通ったかは読み取れる。
 fn print(answer: &str) -> Result<ExitCode, Failure> {
     let value: serde_json::Value = serde_json::from_str(answer)
         .map_err(|e| Failure::from(format!("could not read the answer: {e}")))?;
-    if value.get("error").is_some() {
+    let a_unit_failed = value["units"]
+        .as_array()
+        .is_some_and(|units| units.iter().any(|u| u["ok"] == serde_json::json!(false)));
+    if value.get("error").is_some() || a_unit_failed {
         eprintln!("{answer}");
         return Ok(ExitCode::FAILURE);
     }
@@ -259,6 +266,15 @@ mod tests {
             ExitCode::FAILURE
         );
         assert!(print("not json").is_err());
+        // 1 台でも読み直せなければ非 0。
+        assert_eq!(
+            print(r#"{"units":[{"unit":"a","ok":true}]}"#).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            print(r#"{"units":[{"unit":"a","ok":true},{"unit":"b","ok":false}]}"#).unwrap(),
+            ExitCode::FAILURE
+        );
     }
 
     /// 繋がらないときは、繋げる方法まで言う。

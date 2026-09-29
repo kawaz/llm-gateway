@@ -64,8 +64,8 @@ usage:
   llm-gateway daemon <command> [options]
 
 a unit is one configuration file, registered under a name. `run` starts one in
-the foreground; `start` / `stop` / `restart` / `status` ask the supervisor, and
-say so if it is not running.
+the foreground; `start` / `stop` / `restart` / `status` / `reload` ask the
+supervisor, and say so if it is not running.
 
 commands:
   run <unit>              run one unit in the foreground
@@ -77,11 +77,22 @@ commands:
   stop <unit>|--all       ask the supervisor to stop it
   restart <unit>|--all    ask the supervisor to restart it (one at a time)
   status [<unit>]|--all   ask the supervisor how they are doing
+  reload <unit>|--all     re-read the registry, then have the unit re-read its configuration
   log [<unit>]|--all      show what they wrote
 
 add options:
   --name <name>     name of the unit
                     (default: the configuration file name without its extension)
+
+reload:
+  the unit reads its configuration the same way `llm-gateway check` does and swaps
+  it in only if it is valid; otherwise it keeps running the previous one. requests
+  already running finish with the configuration they started with. the answer is
+  {units: [{unit, ok, error?, warnings?}]}, and the exit status is
+  non-zero if any unit failed (--all still reloads the rest).
+  fixed at start (changing them needs `restart`): [server] listen / binary_path /
+  disabled, [store], [stats], [discovery], [webhook], [status],
+  routes.<name>.status_source, [upstreams], [secret_store], [secrets], [ratelimit]
 
 log options:
   --follow          keep printing as more is written (this one needs the supervisor,

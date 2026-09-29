@@ -1,7 +1,7 @@
 //! この端末で走らせる台の操作 (DR-0028 決定 1〜4)。
 //!
 //! 登録簿を触るのは `add` / `remove` / `list`、実際に走らせるのは `run`。
-//! `start` / `stop` / `restart` / `status` は監督者への要求で、監督者が居ない
+//! `start` / `stop` / `restart` / `status` / `reload` は監督者への要求で、監督者が居ない
 //! なら断る — 代わりに自分で起こしたりはしない (所有者が 2 つになる)。
 
 pub mod control;
@@ -33,7 +33,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
             control::running_now(),
         ),
         "supervise" => control::supervise(rest),
-        op @ ("start" | "stop" | "restart" | "status") => control::ask(op, rest),
+        op @ ("start" | "stop" | "restart" | "status" | "reload") => control::ask(op, rest),
         "log" => control::log(rest),
         other => Err(Failure::from(format!(
             "there is no `daemon {other}` command. see `llm-gateway daemon --help`"
@@ -370,6 +370,7 @@ mod tests {
             "stop",
             "restart",
             "status",
+            "reload",
             "log",
         ] {
             assert!(
@@ -379,7 +380,7 @@ mod tests {
             );
         }
         // 逆向き: help に無いものは受け付けない。
-        let e = dispatch(&args(&["reload"])).unwrap_err();
+        let e = dispatch(&args(&["reboot"])).unwrap_err();
         assert!(e.message().contains("there is no"), "{e:?}");
     }
 
