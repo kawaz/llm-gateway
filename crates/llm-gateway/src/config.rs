@@ -347,7 +347,7 @@ impl From<Namespace> for NamespaceRepr {
             NsAuth::Open => (None, None),
             NsAuth::Token(token) => (None, Some(token)),
             NsAuth::Jwt(jwt) => {
-                keys_file = jwt.keys_file;
+                keys_file = jwt.ring.path().map(Path::to_path_buf);
                 max_ttl = Some(format_duration_secs(jwt.max_ttl_secs));
                 (iss, aud) = (jwt.iss, jwt.aud);
                 (Some(AuthKind::Jwt), None)
@@ -2085,8 +2085,8 @@ o = "claude-opus-*"
         let NsAuth::Jwt(auth) = &ok.namespaces["a"].auth else {
             panic!("jwt expected")
         };
-        assert_eq!(auth.kids(), ["k1"]);
-        assert_eq!(auth.keys_file.as_deref(), Some(ring.as_path()));
+        assert_eq!(auth.ring.kids(), ["k1"]);
+        assert_eq!(auth.ring.path(), Some(ring.as_path()));
         assert_eq!(auth.max_ttl_secs, 400 * 86_400);
         assert_eq!(auth.iss.as_deref(), Some("cli"));
         let again = toml::to_string(&ok).unwrap();
@@ -2100,11 +2100,28 @@ o = "claude-opus-*"
             (jwt("").replace("max_ttl = \"400d\"\n", ""), "max_ttl"),
             (jwt("").replace("400d", "forever"), "duration"),
             ("auth_token = \"t\"\nkeys_file = \"unused\"\n".to_owned(), "belong to"),
-            ("auth = \"jwt\"\nmax_ttl = \"1d\"\n[ns.a.keys.k1]\nalg = \"EdDSA\"\npublic = \"AAAA\"\n".to_owned(), "keys_file"),
+            ("auth = \"jwt\"\nmax_ttl = \"1d\"\n[ns.a.keys.k1]\nalg = \"EdDSA\"\npublic = \"AAAA\"\n".to_owned(), "`keys` is replaced by `keys_file`"),
+            (jwt("").replace(&ring.display().to_string(), &dir.path().join("none.jsonl").display().to_string()), "check the file"),
         ] {
             let err = ns(&bad).unwrap_err().to_string();
             assert!(err.contains(why), "{why}: {err}");
         }
+    }
+
+    /// `keys_file` も他のパスの欄と同じく `~` を開く。開いた先で読みに行くので、
+    /// 無いファイルのエラーに開いた後のパスが出る。
+    #[test]
+    fn keys_file_opens_the_tilde() {
+        let home = std::env::var("HOME").expect("tests run with a home");
+        let err = toml::from_str::<Config>(
+            "[ns.a]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"~/llm-gateway-test-no-such-ring.jsonl\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("{home}/llm-gateway-test-no-such-ring.jsonl")),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2136,7 +2153,7 @@ o = "claude-opus-*"
         let NsAuth::Jwt(auth) = &config.namespaces["a"].auth else {
             panic!("jwt expected")
         };
-        assert_eq!(auth.kids(), ["new"]);
+        assert_eq!(auth.ring.kids(), ["new"]);
     }
 
     /// 書いてあれば、合っているものだけ通す。

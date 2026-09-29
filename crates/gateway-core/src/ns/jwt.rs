@@ -1,9 +1,9 @@
 //! namespace 認証の `jwt` 方式 (DR-0030 §6)。
 //!
 //! JWS compact (`b64(header).b64(payload).b64(sig)`) を自前で読み、Ed25519 で
-//! 検証する。**alg は kid ごとに設定で固定し、ヘッダの `alg` は照合にしか使わない**
-//! — 鍵の型 ([`VerifyingKey`]) が alg そのものなので、ヘッダの申告で検証の
-//! 方法が変わる経路が構造上無い。
+//! 検証する。**検証の方式は鍵束の行の `kty` / `crv` で決まり、ヘッダの `alg` は
+//! 照合にしか使わない** — 鍵の型 ([`VerifyingKey`]) が alg そのものなので、ヘッダの
+//! 申告で検証の方法が変わる経路が構造上無い。
 //!
 //! 失敗の理由 ([`Reason`]) は呼び出し側のログのためだけに返す。応答で区別すると、
 //! kid の有無や期限切れを外から探らせることになる。
@@ -100,12 +100,159 @@ pub fn read_key_ring(text: &str) -> Result<BTreeMap<String, SigningKey>, String>
     Ok(keys)
 }
 
+/// kid → 公開鍵の表。読み手は `Arc` を clone してロックの外で使う。
+type Table = Arc<BTreeMap<String, VerifyingKey>>;
+
+/// 検証用の鍵束 (kid → 公開鍵)。
+///
+/// ファイルから作ったものは、[`KeyRing::current`] のたびに mtime を見て、変わって
+/// いれば読み直す。読み直しに失敗したら前の束を保つ (書きかけのファイルで全鍵を
+/// 失わない)。1 行でも不正なら束全体を採らない。
+pub struct KeyRing {
+    /// 鍵束の置き場。[`KeyRing::from_keys`] で作ったものは `None` (読み直さない)。
+    path: Option<PathBuf>,
+    /// 最後に読んだ時の mtime と、その時の kid → 公開鍵。
+    state: RwLock<(Option<u64>, Table)>,
+}
+
+impl KeyRing {
+    /// 鍵束ファイルを読む。読めなければ (無い・権限・不正行) エラー。
+    pub fn from_file(path: PathBuf) -> Result<Self, String> {
+        let (mtime, keys) = load(&path)?;
+        Ok(Self {
+            path: Some(path),
+            state: RwLock::new((Some(mtime), Arc::new(keys))),
+        })
+    }
+
+    /// 与えた表をそのまま持つ (読み直さない)。
+    pub fn from_keys(keys: BTreeMap<String, VerifyingKey>) -> Self {
+        Self {
+            path: None,
+            state: RwLock::new((None, Arc::new(keys))),
+        }
+    }
+
+    /// 鍵束ファイルの置き場。
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// 最後に読んだ束の kid (読み直しはしない)。
+    pub fn kids(&self) -> Vec<String> {
+        self.snapshot().keys().cloned().collect()
+    }
+
+    fn snapshot(&self) -> Table {
+        Arc::clone(&self.state.read().unwrap_or_else(|e| e.into_inner()).1)
+    }
+
+    /// 今の束。ファイルの mtime が記録と違えば読み直してから返す。
+    pub fn current(&self) -> Arc<BTreeMap<String, VerifyingKey>> {
+        let Some(path) = &self.path else {
+            return self.snapshot();
+        };
+        let mtime = match mtime_of(path) {
+            Ok(mtime) => mtime,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot stat key ring; keeping previous keys");
+                return self.snapshot();
+            }
+        };
+        {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            if state.0 == Some(mtime) {
+                return Arc::clone(&state.1);
+            }
+        }
+        // 書きロックの下で stat し直し、記録する mtime と読む中身を同じ stat に揃える。
+        // 同時に変化を見た他のリクエストは、ここで記録済みの mtime を見て読み直さない。
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let result = mtime_of(path)
+            .map_err(|e| unreadable(path, e))
+            .and_then(|mtime| {
+                if state.0 == Some(mtime) {
+                    return Ok(None);
+                }
+                read_keys(path).map(|keys| Some((mtime, keys)))
+            });
+        match result {
+            Ok(None) => {}
+            Ok(Some((mtime, keys))) => *state = (Some(mtime), Arc::new(keys)),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
+            }
+        }
+        Arc::clone(&state.1)
+    }
+}
+
+impl Clone for KeyRing {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            state: RwLock::new(self.state.read().unwrap_or_else(|e| e.into_inner()).clone()),
+        }
+    }
+}
+
+/// 置き場と、その時点の表で比べる。
+impl PartialEq for KeyRing {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for KeyRing {}
+
+impl fmt::Debug for KeyRing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyRing")
+            .field("path", &self.path)
+            .field("kids", &self.kids())
+            .finish()
+    }
+}
+
+fn mtime_of(path: &Path) -> Result<u64, std::io::Error> {
+    let modified = fs::metadata(path)?.modified()?;
+    let since_epoch = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?;
+    Ok(since_epoch.as_nanos() as u64)
+}
+
+fn unreadable(path: &Path, e: std::io::Error) -> String {
+    format!(
+        "keys_file `{}`: {e}; check the file and its permissions",
+        path.display()
+    )
+}
+
+/// mtime を取ってから中身を読む。間に書き換えがあっても、記録する mtime が古い側に
+/// なるだけで、次の [`KeyRing::current`] で読み直される。
+fn load(path: &Path) -> Result<(u64, BTreeMap<String, VerifyingKey>), String> {
+    let mtime = mtime_of(path).map_err(|e| unreadable(path, e))?;
+    Ok((mtime, read_keys(path)?))
+}
+
+fn read_keys(path: &Path) -> Result<BTreeMap<String, VerifyingKey>, String> {
+    let text = fs::read_to_string(path).map_err(|e| unreadable(path, e))?;
+    Ok(read_key_ring(&text)
+        .map_err(|e| format!("keys_file `{}`: {e}; fix the key ring", path.display()))?
+        .into_iter()
+        .map(|(kid, key)| (kid, key.verifying_key()))
+        .collect())
+}
+
 /// `jwt` 方式の設定。
+///
+/// 鍵束 ([`KeyRing`]) の出どころは知らない。署名・claim の検査は、入口で取った
+/// その時点の表に対して行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtAuth {
-    /// 鍵束の置き場。テストで直接作る場合だけ `None`。
-    pub keys_file: Option<PathBuf>,
-    /// mtime と kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
-    keys: RwLock<(Option<u64>, Arc<BTreeMap<String, VerifyingKey>>)>,
+    /// kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
+    pub ring: KeyRing,
     /// 受ける寿命の上限 (秒)。`exp - now` (と `iat` があれば `exp - iat`) で測る。
     pub max_ttl_secs: i64,
     /// 書いたら `iss` の一致を要求する。
@@ -114,31 +261,6 @@ pub struct JwtAuth {
     pub aud: Option<String>,
 }
 
-impl Clone for JwtAuth {
-    fn clone(&self) -> Self {
-        Self {
-            keys_file: self.keys_file.clone(),
-            keys: RwLock::new(self.keys.read().unwrap_or_else(|e| e.into_inner()).clone()),
-            max_ttl_secs: self.max_ttl_secs,
-            iss: self.iss.clone(),
-            aud: self.aud.clone(),
-        }
-    }
-}
-
-impl PartialEq for JwtAuth {
-    fn eq(&self, other: &Self) -> bool {
-        self.keys_file == other.keys_file
-            && self.keys.read().unwrap_or_else(|e| e.into_inner()).1
-                == other.keys.read().unwrap_or_else(|e| e.into_inner()).1
-            && self.max_ttl_secs == other.max_ttl_secs
-            && self.iss == other.iss
-            && self.aud == other.aud
-    }
-}
-
-impl Eq for JwtAuth {}
-
 impl JwtAuth {
     pub fn from_file(
         path: PathBuf,
@@ -146,16 +268,8 @@ impl JwtAuth {
         iss: Option<String>,
         aud: Option<String>,
     ) -> Result<Self, String> {
-        let mtime = key_ring_mtime(&path).map_err(|e| {
-            format!(
-                "keys_file `{}`: {e}; check the file and its permissions",
-                path.display()
-            )
-        })?;
-        let keys = load_public_keys(&path)?;
         Ok(Self {
-            keys_file: Some(path),
-            keys: RwLock::new((Some(mtime), Arc::new(keys))),
+            ring: KeyRing::from_file(path)?,
             max_ttl_secs,
             iss,
             aud,
@@ -169,98 +283,12 @@ impl JwtAuth {
         aud: Option<String>,
     ) -> Self {
         Self {
-            keys_file: None,
-            keys: RwLock::new((None, Arc::new(keys))),
+            ring: KeyRing::from_keys(keys),
             max_ttl_secs,
             iss,
             aud,
         }
     }
-
-    pub fn kids(&self) -> Vec<String> {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .1
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    fn current_keys(&self) -> Arc<BTreeMap<String, VerifyingKey>> {
-        let Some(path) = &self.keys_file else {
-            return Arc::clone(&self.keys.read().unwrap_or_else(|e| e.into_inner()).1);
-        };
-        let mtime = match key_ring_mtime(path) {
-            Ok(mtime) => mtime,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cannot stat key ring; keeping previous keys");
-                return Arc::clone(&self.keys.read().unwrap_or_else(|e| e.into_inner()).1);
-            }
-        };
-        let current = self.keys.read().unwrap_or_else(|e| e.into_inner());
-        if current.0 == Some(mtime) {
-            return Arc::clone(&current.1);
-        }
-        drop(current);
-        let mut state = self.keys.write().unwrap_or_else(|e| e.into_inner());
-        if state.0 != Some(mtime) {
-            match load_public_keys(path) {
-                Ok(keys) => *state = (Some(mtime), Arc::new(keys)),
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
-                }
-            }
-        }
-        Arc::clone(&state.1)
-    }
-}
-
-fn key_ring_mtime(path: &Path) -> Result<u64, std::io::Error> {
-    let modified = fs::metadata(path)?.modified()?;
-    let since_epoch = modified
-        .duration_since(UNIX_EPOCH)
-        .map_err(std::io::Error::other)?;
-    Ok(since_epoch.as_nanos() as u64)
-}
-
-fn load_public_keys(path: &Path) -> Result<BTreeMap<String, VerifyingKey>, String> {
-    let text = fs::read_to_string(path).map_err(|e| {
-        format!(
-            "keys_file `{}`: {e}; check the file and its permissions",
-            path.display()
-        )
-    })?;
-    read_key_ring(&text)
-        .map(|keys| {
-            keys.into_iter()
-                .map(|(kid, key)| (kid, key.verifying_key()))
-                .collect()
-        })
-        .map_err(|e| format!("keys_file `{}`: {e}; fix the key ring", path.display()))
-}
-
-impl fmt::Debug for JwtAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JwtAuth")
-            .field("keys_file", &self.keys_file)
-            .field("kids", &self.kids())
-            .field("max_ttl_secs", &self.max_ttl_secs)
-            .field("iss", &self.iss)
-            .field("aud", &self.aud)
-            .finish()
-    }
-}
-
-/// 設定に書く公開鍵 (Ed25519 の 32 バイトの base64url、パディング無し) を読む。
-pub fn parse_public_key(raw: &str) -> Result<VerifyingKey, String> {
-    let bytes = B64
-        .decode(raw.trim())
-        .map_err(|e| format!("the public key is not base64url without padding: {e}"))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|b: Vec<u8>| format!("an Ed25519 public key is 32 bytes, not {}", b.len()))?;
-    VerifyingKey::from_bytes(&bytes).map_err(|e| format!("not an Ed25519 public key: {e}"))
 }
 
 impl JwtAuth {
@@ -269,6 +297,16 @@ impl JwtAuth {
     /// 順序: 形 → ヘッダ (kid / alg / crit) → 署名 → claim。claim は署名が通って
     /// から読む (誰が書いたか分からない値を解釈しない)。
     pub fn verify(&self, token: &str, now_secs: i64) -> Result<Verified, Reason> {
+        self.verify_with(&self.ring.current(), token, now_secs)
+    }
+
+    /// 与えた表で検査する。鍵束の読み直しとは切り離してある。
+    fn verify_with(
+        &self,
+        keys: &BTreeMap<String, VerifyingKey>,
+        token: &str,
+        now_secs: i64,
+    ) -> Result<Verified, Reason> {
         let mut parts = token.split('.');
         let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -281,7 +319,6 @@ impl JwtAuth {
             .get("kid")
             .and_then(Value::as_str)
             .ok_or(Reason::UnknownKid)?;
-        let keys = self.current_keys();
         let key = keys.get(kid).ok_or(Reason::UnknownKid)?;
         if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
             return Err(Reason::AlgMismatch);
@@ -398,7 +435,7 @@ pub fn signing_key(seed: &[u8; 32]) -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(seed)
 }
 
-/// 公開鍵を設定に書く形 (32 バイトの base64url、パディング無し) にする。
+/// 公開鍵を JWK の `x` の形 (32 バイトの base64url、パディング無し) にする。
 pub fn public_key_text(key: &VerifyingKey) -> String {
     B64.encode(key.to_bytes())
 }
@@ -783,14 +820,5 @@ pub(crate) mod tests {
             "unchanged mtime does not reload"
         );
         assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));
-    }
-
-    #[test]
-    fn public_keys_are_read_from_base64url() {
-        let key = signing_key(1).verifying_key();
-        let written = B64.encode(key.to_bytes());
-        assert_eq!(parse_public_key(&written), Ok(key));
-        assert!(parse_public_key("AAAA").is_err());
-        assert!(parse_public_key(&format!("{written}=")).is_err());
     }
 }
