@@ -105,10 +105,13 @@ llm-gateway daemon reload --all
 
 ## 未確定
 
-- **走行状態の引き継ぎ規則**: 設定に紐づく走行状態 (会話と経路の結びつき (affinity) は経路名に、使い切り繰り上げ (spend_down) と借り上限 (pace_cap) が見る枠の観測は経路ごとの状態に紐づく) を、読み直しの前後でどう渡すか。仮置きは「同名は引き継ぐ、消えた名前は捨てる」。同名でも中身 (credential や provider) が変わった経路の状態を引き継いでよいかは、実物を見て決める
 - **`daemon status` に設定の差を出すか**: 置いてある設定 (`on_disk`) と走っている設定 (`running`) の食い違いを、DR-0028 決定 9 の版の並べ方と同じ形で出すか。後続で決める
-- **既存の `Request::Reload` との語の衝突**: 監督者の言葉には既に `Request::Reload` (引数なし、「登録簿を読み直して望みとの差を埋める」、`crates/gateway-core/src/daemon/protocol.rs:28`、`crates/gateway-core/src/daemon/supervisor.rs:259`) がある。CLI からは送られていない (`daemon reload` は今 `there is no` で断られ、そのことを試験が固定している。`crates/llm-gateway-cli/src/daemon.rs:382`)。本 DR の `Request::Reload(Which)` と同じ名前になるので、どちらかの名前を変える必要がある。どちらをどう呼ぶかは実装時に決める
-- **起動時に写し取った値の扱い**: 下の「影響」の表で「写し」とした値 (discovery の間隔、webhook の送り先、upstream status の設定、keepalive の上限、中継の秘密の置き場) を、読み直しで作り直す側に入れるか、決定 4 の「変えられない欄」に足すか
+
+## 実装時の判断 (統括 2026-09-30)
+
+- **走行状態の引き継ぎ規則**: 経路の状態 (affinity / spend_down / pace_cap の観測) は「経路名 + その経路が指す credential と provider」が前後で同一の時だけ引き継ぐ。名前が消えた経路の状態は捨てる。同名でも credential か provider が変わった経路は新規扱い (観測は枠に紐づくもので、枠が変われば意味を失う)
+- **`Request::Reload` の語**: 既存の引数なし `Request::Reload` (登録簿の読み直し) は `Request::Reload(Which)` に畳む。監督者は reload を受けたら先に登録簿を読み直し、それから指された unit の設定を読み直させる。「reload = ディスク上の変更を拾う」という利用者の語で 1 つにし、別の語を増やさない
+- **起動時に写し取った値**: 第一段では全部「変えられない欄」(決定 4) に入れて、変わっていたら `restart_required` で断る (discovery の間隔、webhook、upstream status の設定、keepalive の上限、passthrough の設定)。読み直しで作り直す側へ移すのは、必要になった欄から後続で
 
 ## 影響
 
@@ -119,7 +122,7 @@ llm-gateway daemon reload --all
 | 箇所 | 持ち方 | 差し替え |
 |---|---|---|
 | `Gateway.config` (`crates/llm-gateway/src/gateway.rs:38`, 格納は `:147`) | `Config` を値で持つ (`config.clone()`) | 耐えない。`Gateway` は `Arc<Gateway>` として axum の State と裏の仕事に配られている (`crates/llm-gateway-cli/src/daemon/run.rs:75-76`, `:118-122`, `:140-145`) ので、`Gateway` ごと作り直すと走行状態も作り直しになる。差し替え可能な持ち方 (`ArcSwap<Config>` 等) に変える必要がある |
-| `Router.config` と `Router.presets` (`crates/llm-gateway/src/router.rs:257`, `:260`, 構築は `:287-305`) | `Config` を値で持ち、経路ごとの `Preset` (経路の状態 `RouteState` を持つ、`crates/llm-gateway/src/provider.rs:210-221`) を設定から組み立てる | 耐えない。`presets` は「経路の状態を持つので作り直さない」と明記された構造 (`router.rs:258-259`)。設定を差し替えると presets の組み直しと状態の引き継ぎ (未確定の節) が同時に要る。**最大の難所** |
+| `Router.config` と `Router.presets` (`crates/llm-gateway/src/router.rs:257`, `:260`, 構築は `:287-305`) | `Config` を値で持ち、経路ごとの `Preset` (経路の状態 `RouteState` を持つ、`crates/llm-gateway/src/provider.rs:210-221`) を設定から組み立てる | 耐えない。`presets` は「経路の状態を持つので作り直さない」と明記された構造 (`router.rs:258-259`)。設定を差し替えると presets の組み直しと状態の引き継ぎ (実装時の判断の節) が同時に要る。**最大の難所** |
 | `Router.affinity` (`router.rs:276`) | 値は `Binding { route: Arc<Route> }` (`router.rs:281-284`) で、`Route` は `Arc<Preset>` を抱える (`router.rs:40-42`) | 旧 presets を指したまま残る。引き継ぐなら経路名で新しい `Preset` へ付け替える必要がある |
 | `Gateway` の間隔 `refresh_interval` / `watch_interval` (`gateway.rs:42-44`, 写しは `:139-140`) | 起動時に `Duration` へ写す。`keep_models_fresh` がこれで回る (`gateway.rs:354`) | 写し。回っている仕事は値を読み直さない |
 | `Stats` / `QuotaStore` (`gateway.rs:143-146`, `:151-154`) | stats の置き場と `listen` (書き手の名前) を起動時に渡す | 決定 4 の「変えられない欄」(stats の dir、listen) だけに依存するので、断る規則で守られる |
@@ -142,8 +145,8 @@ llm-gateway daemon reload --all
 
 | 段 | 中身 | 完了条件 |
 |---|---|---|
-| 1 | 設定を差し替え可能な持ち方にする (`Gateway` / `Router` の `Config` を 1 か所から引く形へ)。起動時の写しを「作り直す」か「変えられない欄」かに仕分ける (未確定の節) | 試験で、差し替え前に掴んだリクエストが旧設定で完走し、差し替え後のリクエストが新設定を見る |
-| 2 | 走行状態の引き継ぎ (presets の組み直し、affinity の付け替え)。規則は未確定の節を裁定してから | 試験で、同名経路の締め出し・枠の観測・結びつきが差し替えを跨いで残り、消えた経路の状態が捨てられる |
+| 1 | 設定を差し替え可能な持ち方にする (`Gateway` / `Router` の `Config` を 1 か所から引く形へ)。起動時の写しを「作り直す」か「変えられない欄」かに仕分ける (実装時の判断の節: 第一段は全部「変えられない欄」) | 試験で、差し替え前に掴んだリクエストが旧設定で完走し、差し替え後のリクエストが新設定を見る |
+| 2 | 走行状態の引き継ぎ (presets の組み直し、affinity の付け替え)。規則は実装時の判断の節 | 試験で、同名経路の締め出し・枠の観測・結びつきが差し替えを跨いで残り、消えた経路の状態が捨てられる |
 | 3 | 子の制御 socket (`daemon/control/<unit>.sock`)。`Config::load` → 決定 4 の比較 → 差し替え、結果を `{unit, ok, error}` で返す | 試験で、検証に落ちる設定・変えられない欄を変えた設定のどちらも旧設定のまま `ok: false` が返る |
 | 4 | 監督者の `Request::Reload(Which)` (既存の `Request::Reload` との名前の整理を含む) と CLI の `daemon reload`。`--help`・実装・zsh completion を揃える (cli-design-preferences) | `daemon reload --all` が全台の結果を並べ、1 台の失敗で exit 非 0、残りの台は読み直されている |
 | 5 | MANUAL に契機の表 (決定 6) | MANUAL から credential / keys_file / config の反映手段が 1 表で引ける |
