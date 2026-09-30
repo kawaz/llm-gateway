@@ -1001,6 +1001,10 @@ impl Router {
     ) {
         // 読み直しは結びつきの錠を握ったまま差し替えるので、錠の内側で
         // 比べれば差し替えの途中を見ない。
+        //
+        // 開始 account も錠の内側で「無ければ入れる、あれば比べる」。初回が
+        // 並行して別 account で通っても、先に覚えた方が開始 account になり、
+        // 後の方は跨ぎとして印が立つ (DR-0033 §2)。
         let mut affinity = self.affinity.lock().await;
         if !Arc::ptr_eq(ns.active(), &self.active()) {
             return;
@@ -2994,6 +2998,42 @@ spend_down_within = "25%"
         // 開始 account に戻っても、開始 account も印も変わらない。
         passed(&r, "s", SONNET, "a1").await;
         assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
+    }
+
+    /// 初回が並行して別 account で通ったら、先に覚えた方が開始 account に
+    /// なり、後の方は跨ぎとして扱う (first-writer-wins)。
+    #[tokio::test]
+    async fn concurrent_first_requests_keep_the_first_remembered_account() {
+        let r = locking().await;
+        // 2 本とも開始 account が決まる前に経路を選んだ。
+        let first = r
+            .routes_for(&ns(&r), NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        let second = r
+            .routes_for(&ns(&r), NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        assert_eq!(lock_of(&r, "s", SONNET).await, None);
+        let pick = |routes: &[Arc<Route>], name: &str| {
+            Arc::clone(routes.iter().find(|r| r.name() == name).unwrap())
+        };
+
+        r.remember(&ns(&r), &session("s"), SONNET, &pick(&first, "b1"))
+            .await;
+        r.remember(&ns(&r), &session("s"), SONNET, &pick(&second, "a1"))
+            .await;
+
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("b", true));
+        let order = r
+            .routes_for(&ns(&r), NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&order)[0],
+            "b1",
+            "the first remembered account stays in front (and is what `stay` keeps)"
+        );
     }
 
     #[tokio::test]

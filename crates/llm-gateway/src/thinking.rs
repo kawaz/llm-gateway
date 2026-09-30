@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 /// 本文の thinking を text に置き換える。
 ///
 /// - `thinking` → `{"type":"text","text":<本文>}`。本文は改行を半角空白 1 個に
-///   畳み、末尾の空白を落としたもの。見出しや接頭辞は付けない (付けると
+///   畳み、末尾の半角空白を落としたもの。見出しや接頭辞は付けない (付けると
 ///   `reasoning_extraction` の refusal になる実測がある)。署名は捨てる
 /// - `redacted_thinking` と、本文が空の `thinking` → 落とす (運ぶ本文が無い)
 /// - 位置は元の block のまま。元の block の `cache_control` は置き換えた text へ移す
@@ -43,7 +43,8 @@ fn replace(block: Value) -> Option<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .replace('\n', " ");
-            let folded = folded.trim_end();
+            // 落とすのは半角空白だけ。他の空白 (タブ等) は本文として残す。
+            let folded = folded.trim_end_matches(' ');
             if folded.is_empty() {
                 return None;
             }
@@ -87,6 +88,23 @@ mod tests {
             ])
         );
         assert_eq!(got["messages"][0], json!({"role": "user", "content": "hi"}));
+    }
+
+    #[test]
+    fn only_trailing_ascii_spaces_are_trimmed() {
+        let got = converted(json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "a\t\n \n", "signature": "s"},
+                {"type": "thinking", "thinking": "b\u{3000}\n", "signature": "s"},
+            ]},
+        ]}));
+        assert_eq!(
+            got["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "a\t"},
+                {"type": "text", "text": "b\u{3000}"},
+            ])
+        );
     }
 
     #[test]

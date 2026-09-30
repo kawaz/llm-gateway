@@ -41,6 +41,7 @@ account_bound_thinking = ["claude-sonnet-5-5", "claude-fable-5-*"]
 対象は決定 1 に当たるモデルの session だけ。それ以外の session の affinity は今のまま「優先」。
 
 - **開始 account** = その `(namespace, session, model)` で最初に 2xx を返した経路の account。affinity を覚える契機 (DR-0009、2xx のみ) と同じ
+- 並行した初回は、先に記録された 2xx の account が開始 account になり、他方は跨ぎとして扱う (first-writer-wins。初回を直列化して送信を待たせることはしない)
 - **account の同一性は credential 名で表す**。同じ credential を指す経路は同じ account、別の credential は別 account。linked account は無い前提で、同一視の設定は持たない。credential を持たない経路 (relay) は経路名を account 名として扱う (中の account を gateway は知らない)
 - ロック中の session の候補は、開始 account の経路だけに絞る。affinity は「先頭へ寄せる」から「開始 account 以外を外す」になる。spend_down の昇格 (DR-0018) もロックを越えない
 - 開始 account の経路が全部使えないとき (枠切れ・締め出し・pace_cap・5xx) の振る舞いは設定 `on_account_switch` で選ぶ。置き場は決定 1 の `account_bound_thinking` と同じ最上位 (global)
@@ -64,7 +65,7 @@ on_account_switch = "stay"  # "stay" | "drop_thinking" | "thinking_as_text"
 
 変換は送る直前の本文に対して行う:
 
-- `thinking` block → `{"type": "text", "text": <本文>}`。本文は thinking 本文の改行 (`\n`) を全部半角空白 1 個に置き換え、末尾の空白をトリムしたもの。prefix や装飾は付けない。署名は捨てる
+- `thinking` block → `{"type": "text", "text": <本文>}`。本文は thinking 本文の改行 (`\n`) を全部半角空白 1 個に置き換え、末尾の半角空白をトリムしたもの (トリムは半角空白のみ。タブ等の他の空白は残す)。prefix や装飾は付けない。署名は捨てる
 - `redacted_thinking` block と、本文が空の `thinking` block → 落とす (運ぶ本文が無い)
 - 元にするのはクライアントが送ってきた本文そのまま。`thinking_display = "summarized"` (DR-0016) の namespace なら要約が入り、`omitted` なら空なので落ちる
 - 位置は元の block と同じ。他の block (text / tool_use / tool_result) には触らない
