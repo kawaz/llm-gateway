@@ -2491,22 +2491,41 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     /// 試験では relay 型を使う。upstream に一覧を聞きに行かず、設定に
     /// 書いたモデルをそのまま扱うので、偽の upstream 1 つで完結する。
     /// 認証情報が要る経路を試すときだけ `claude_oauth` を使う。
-    async fn gateway(config_toml: &str) -> Gateway<StaticStore> {
+    /// 試験用の gateway と、束縛を設定した試験のロックの置き場 (落とすと消える)。
+    struct Rig {
+        gateway: Gateway<StaticStore>,
+        _locks: Option<tempfile::TempDir>,
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = Gateway<StaticStore>;
+
+        fn deref(&self) -> &Gateway<StaticStore> {
+            &self.gateway
+        }
+    }
+
+    async fn gateway(config_toml: &str) -> Rig {
         gateway_with(config_toml, StaticStore::new()).await
     }
 
-    async fn gateway_with(config_toml: &str, store: StaticStore) -> Gateway<StaticStore> {
+    async fn gateway_with(config_toml: &str, store: StaticStore) -> Rig {
         let mut config: Config = toml::from_str(config_toml).unwrap();
         // 束縛を設定した試験は session のロックを書く。試験どうしで同じ session
         // を見ないよう、書き先を試験ごとに分ける (他の試験は読み直しで
         // `[stats]` を比べるので触らない)。
-        if config.stats.dir.is_none() && config_toml.contains("account_bound_thinking") {
-            config.stats.dir = Some(tempfile::tempdir().unwrap().keep());
+        let locks = (config.stats.dir.is_none() && config_toml.contains("account_bound_thinking"))
+            .then(|| tempfile::tempdir().unwrap());
+        if let Some(locks) = &locks {
+            config.stats.dir = Some(locks.path().to_owned());
         }
         config.validate().unwrap();
         let gw = Gateway::new(&config, store).unwrap();
         gw.refresh_models().await;
-        gw
+        Rig {
+            gateway: gw,
+            _locks: locks,
+        }
     }
 
     /// 名前で経路の preset を引く。状態 (締め出し・枠) を持っている実体。

@@ -1359,17 +1359,35 @@ spend_down_within = "25%"
 
     const NOW: i64 = 1_800_000_000;
 
-    fn build(config: Config) -> Router {
-        // 試験ごとにロックの置き場を分ける (同じ session 名を使い回すため)。
-        Router::new(
-            config,
-            Arc::new(Events::new()),
-            AccountLocks::open(tempfile::tempdir().unwrap().keep()),
-        )
+    /// 試験用の router と、そのロックの置き場。置き場は試験ごとに分け
+    /// (同じ session 名を使い回すため)、落とすと消える。
+    struct Rig {
+        router: Router,
+        _locks: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = Router;
+
+        fn deref(&self) -> &Router {
+            &self.router
+        }
+    }
+
+    fn build(config: Config) -> Rig {
+        let locks = tempfile::tempdir().unwrap();
+        Rig {
+            router: Router::new(
+                config,
+                Arc::new(Events::new()),
+                AccountLocks::open(locks.path()),
+            ),
+            _locks: locks,
+        }
     }
 
     /// discovery 済みの状態を作る。
-    async fn router() -> Router {
+    async fn router() -> Rig {
         let config: Config = toml::from_str(CONFIG).unwrap();
         config.validate().unwrap();
         let r = build(config);
@@ -2769,7 +2787,7 @@ routes = ["a", "b"]
     const SONNET: &str = "claude-sonnet-5";
 
     /// 3 経路すべてに締め出し・枠の観測・会話の結びつきを持たせた router。
-    async fn observed_before_reload() -> Router {
+    async fn observed_before_reload() -> Rig {
         let config: Config = toml::from_str(BEFORE_RELOAD).unwrap();
         config.validate().unwrap();
         let r = build(config);
@@ -2949,7 +2967,7 @@ spend_down_within = "25%"
 
     const OPUS: &str = "claude-opus-5";
 
-    async fn locking_with(config_toml: &str) -> Router {
+    async fn locking_with(config_toml: &str) -> Rig {
         let config: Config = toml::from_str(config_toml).unwrap();
         config.validate().unwrap();
         let r = build(config);
@@ -2959,7 +2977,7 @@ spend_down_within = "25%"
         r
     }
 
-    async fn locking() -> Router {
+    async fn locking() -> Rig {
         locking_with(LOCKING).await
     }
 
