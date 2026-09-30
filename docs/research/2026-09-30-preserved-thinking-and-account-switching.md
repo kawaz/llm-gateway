@@ -27,7 +27,23 @@
 
 **観測できた範囲:** 同一 account のこの tool loop では置換・削除とも HTTP 400 にならなかった。ただし turn2-b は `refusal`、対照と削除は `max_tokens` で、正常な回答の継続は確認できていない。`refusal` の要因が履歴改変にあるかどうかも未確認。初回の簡単な tool 指示では thinking なしの `tool_use` のみが返ったため、その試行からは turn 2 を投げず、thinking が得られた試行を対象にした。
 
-**account B は未測。** 統括が `ns-lab` を別 account の route に切り替えた後、`/tmp/pt-toolloop-turn1.json` 内の `common`・`first`・`content` を使って同じ tool_result を構築し、turn2-a（無改変）と turn2-b（thinking→text）を B に送る。HTTP status、error 全文、`input_transformations`、`stop_reason`、応答 block type を比較する。B における thinking drop と置換の扱いの差は、この測定まで断定しない。
+account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した同じ turn 1 の履歴と tool_result で再送した。各リクエストの HTTP status は 200、`error` は null。イベントの route 照合は未実施であり、この route 名は切替担当者の申告に基づく。無改変時に `end_user_binding_mismatch` の drop が記録され、切替の実効性とも整合する。
+
+| ケース | HTTP status | error / transformations と応答状態 |
+|---|---|---|
+| B-unaltered: thinking 無改変 | 200 | `input_transformations: [{"type":"thinking_dropped","path":"messages.1.content.0","reason":"end_user_binding_mismatch"}]`、`stop_reason: max_tokens`、thinking のみ |
+| B-replaced: thinking→`THINKING:\n`＋本文の text | 200 | `input_transformations: []`、`stop_reason: refusal`、thinking のみ。`stop_details.category: reasoning_extraction` |
+| B-deleted: thinking 削除 | 200 | `input_transformations: []`、`stop_reason: max_tokens`、thinking のみ |
+
+置換の追加試行（いずれも B、`max_tokens: 2048`、各 HTTP 200、`input_transformations: []`、error null）:
+
+| text block の内容 | 試行数 | `stop_reason` | 応答に text があるか |
+|---|---:|---|---|
+| `THINKING:\n`＋thinking 本文 | 3 | 3 回とも `refusal` (`reasoning_extraction`) | 3 回ともなし |
+| thinking 本文だけ | 1 | `max_tokens` | なし |
+| `(previous reasoning)\n`＋thinking 本文 | 1 | `refusal` (`reasoning_extraction`) | なし |
+
+`THINKING:` の綴りだけに固有の現象ではなく、reasoning を表す別の見出しでも refusal が再現した。一方、見出しのない本文だけでは `max_tokens` になった。どのケースも完了した回答の text がなく、本文だけの試行も正常完了と同一視できない。各応答は `/tmp/pt-toolloop-B-*-response.json` に保存した。account A の `THINKING:` 置換も `stop_details.category: reasoning_extraction` だった。したがって HTTP 400 にならないことと、継続可能な応答が得られることは区別する。拒否の規則や別の入力への一般化はこの観測だけから確定しない。
 
 ## Gateway 照合（文書＋実装）
 
