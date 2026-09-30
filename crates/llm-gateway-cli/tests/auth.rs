@@ -14,12 +14,13 @@ fn run(args: &[&str], stdin: &str) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // 引数の検査で先に終わる子は stdin を読まずに閉じるので、書き込みの EPIPE は
+    // 失敗ではない (Linux では pipe が即座に閉じる)。
+    match child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the child's stdin: {e}"),
+    }
     child.wait_with_output().unwrap()
 }
 
