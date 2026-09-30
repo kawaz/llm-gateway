@@ -26,7 +26,7 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 止まる前に session のロックの書き込みを待つ上限。書き込みは小さな JSON
 /// 1 つなので普段はすぐ済み、置き場が詰まった時だけ効く。
-const ACCOUNT_LOCK_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+const ACCOUNT_LOCK_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn foreground(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
     let Some(name) = args.first() else {
