@@ -47,13 +47,16 @@ account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した�
 
 ### 置換の形（account B）
 
-同じ turn 1 の署名付き履歴を account B に送り、thinking block の置換形だけを変えた。`max_tokens: 4096`、各ケース 1 回（本文だけは 3 回）。`get_time` の tool_result は `2026-09-30T00:00:00Z`。各リクエストは HTTP 200、`input_transformations: []`（無改変のみ `thinking_dropped`）、error null。下表の先頭 60 文字は応答の最初の text block の値。
+同じ turn 1 の署名付き履歴を account B に送り、thinking block の置換形を変えた。`max_tokens: 4096`、各ケース 1 回（本文だけと改行を半角空白にした本文だけは各 3 回）。`get_time` の tool_result は `2026-09-30T00:00:00Z`。各リクエストは HTTP 200、`input_transformations: []`（無改変のみ `thinking_dropped`）、error null。下表の先頭 60 文字は応答の最初の text block の値。
 
 | ケース | HTTP | `stop_reason` / `stop_details` | `input_transformations` | text block と先頭 60 文字 | `usage.input_tokens` |
 |---|---:|---|---|---|---:|
 | 本文だけ #1 | 200 | `end_turn` / null | `[]` | あり: `It's **Wednesday, September 30, 2026, 00:00:00 UTC** (ISO 86` | 727 |
 | 本文だけ #2 | 200 | `end_turn` / null | `[]` | あり: <code>It's **Wednesday, September 30, 2026, 00:00 UTC** (`2026-09-</code> | 727 |
 | 本文だけ #3 | 200 | `end_turn` / null | `[]` | あり: `The current time is **Wednesday, September 30, 2026, 00:00:0` | 727 |
+| 改行を半角空白に置換した本文だけ #1 | 200 | `end_turn` / null | `[]` | あり: <code>The current time from `get_time` is:\n\n**Wednesday, September</code> | 727 |
+| 改行を半角空白に置換した本文だけ #2 | 200 | `end_turn` / null | `[]` | あり: <code>The current time from `get_time` is:\n\n**Wednesday, September</code> | 727 |
+| 改行を半角空白に置換した本文だけ #3 | 200 | `end_turn` / null | `[]` | あり: <code>The current time from `get_time` is **Wednesday, September 3</code> | 727 |
 | `🧠 `＋本文 | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 731 |
 | `💬 `＋本文 | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 730 |
 | `(`＋本文＋`)` | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 729 |
