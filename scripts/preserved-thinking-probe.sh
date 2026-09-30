@@ -46,6 +46,8 @@ response=$(mktemp)
 trap 'rm -f "$response"' EXIT
 printf 'Probe mode: %s; beta: %s; edited prefix: %s\n' "$(if [[ -n $turn1_out ]]; then printf turn1; else printf turn2; fi)" "$beta" "$edit_prefix"
 headers=(-H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -H "User-Agent: claude-cli/$version" -H 'x-app: cli')
+# jwt の ns には PT_TOKEN (llm-gateway auth sign の出力) を Bearer で渡す
+[[ -n ${PT_TOKEN:-} ]] && headers+=(-H "Authorization: Bearer $PT_TOKEN")
 beta_flags='oauth-2025-04-20,claude-code-20250219'
 if [[ $beta == true ]]; then beta_flags+=',thinking-binding-controls-2026-08-01'; fi
 headers+=(-H "anthropic-beta: $beta_flags")

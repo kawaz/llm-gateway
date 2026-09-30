@@ -87,3 +87,14 @@ account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した�
 | gateway 内 route 切替 | affinity が同 route を優先、denial / pace_cap / 5xx 時に別 route へ移る | **実装と既存 unit test で確認、API 実機未検証** | router.rs:582-659、DR-0009、DR-0018、DR-0019。 |
 
 **未検証と次の測定:** `scripts/preserved-thinking-probe.sh http://127.0.0.1:11301 ns-personal claude-sonnet-5-5 --beta --turn1-out /tmp/pt-content.json` で署名付き content を保存し、同じ引数の `--turn2-in /tmp/pt-content.json` で再送する。`--beta` を外して両ターンを再実行し、先行 user 本文変更は beta 有の turn 2 に `--edit-prefix` を付ける。素の request は OAuth 経路で HTTP 429 `Error` となるため（`docs/issue/2026-09-03-oauth-requires-claude-code-shape.md`）、probe は Claude Code 形の system・metadata・headers を付けて測定した。credential の値は読まない。reload 実装後、unstable のみの `[ns.personal]` の `[[ns.personal.routing]]` に `models = ["claude-sonnet-5-5"]` と `routes = ["<対象 route 名>"]` を既存の `models = ["*"]` より前に置き、承認済みの各 route に切り替えて 2 turn を実行する。route 定義は既存の `[routes.<対象 route 名>]` を使用し、同一 key、別 key 同 account、別非 linked account、linked account を個別に確認する。固定後は SSE `/llm-gateway/events` の `request` / `response` の `credential` と daemon log unstable の `route` で turn ごとの実経路を突き合わせる。実運用 config の編集・reload は別途承認を得てから行う。route 名だけでは account 同一性や linked 判定を推定しない。Google Cloud / Bedrock / OAuth の未測定結果も一般化しない。認証情報探索は権限制御で拒否されたため別経路で回避しない。使用後の署名付き content は外部共有しない。自己検証用ファイルは利用者が適切に管理する。
+
+## gateway 実装 (DR-0033、v0.62.0) の実機 (2026-09-30 13:10 JST、unstable `ns-lab`)
+
+`account_bound_thinking` 既定、`on_account_switch` を unstable の global に書いて `daemon reload` で切替。turn1 は `claude-kawazzz` 固定の lab で取り、lab の routing を `claude-emrd` に reload してから同じ session (同じ `metadata.user_id`) で turn2。
+
+| `on_account_switch` | turn2 の結果 | 根拠 |
+|---|---|---|
+| `thinking_as_text` | 200、`end_turn`、text 応答あり、`input_transformations: []`、`input_tokens` 486 (turn1 の `thinking_tokens` 110 が text として載っている。drop 時の 401〜409 より多く、同一 account の 494〜520 に近い)。events の `request` に `thinking_as_text: true` | gateway が跨ぎを検知して変換した |
+| `stay` | 404 `no route for model … can carry a messages request` | lab では開始 account の経路を routing から**消して**いるので「全部断った」ではなく「経路が無い」。DR-0033 の 429 + retry-after は「開始 account の経路が denial で全滅」の場合で、それは unit test (`stay_answers_the_denial_of_the_starting_account_without_switching`) で確認。実機で枠切れを起こすのは費用の面で未実施 |
+
+`drop_thinking` (既定) は本文不変で API が落とす経路 (上の「置換の形」節の無改変行と同じ) なので再測していない。設定は測定後に既定へ戻し、lab の routing も `claude-kawazzz` に戻した。probe script は `PT_TOKEN` (jwt の ns 用 Bearer) を受けるようにした。
