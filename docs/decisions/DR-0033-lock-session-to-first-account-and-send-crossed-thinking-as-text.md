@@ -133,6 +133,10 @@ keepalive は最後に転送した本文を控えて送り直す。控えるの�
 
 - **置換の形が別の会話・別モデルでも refusal にならないこと**: 実測は Sonnet 5.5 の 1 つの tool ループだけ。段 5 で会話を変えて確かめる
 
+### 既知の端: 変換で content が空になる assistant turn
+
+`thinking` / `redacted_thinking` だけで text も tool_use も持たない assistant turn は、変換後に content が `[]` になる (実運用の assistant turn は text か tool_use で終わるので、ほぼ起きない)。起きた場合、API はその 1 本を 400 で断りうる。
+
 ### ロックが外れる場面
 
 ロックは affinity と同じ寿命なので、1 時間黙っていた session と、読み直しで Binding を捨てた session は次のリクエストで開始 account を決め直す。そこで別 account に移れば、以前の thinking は今までどおり黙って落ちる。寿命を affinity と揃えたのは裁定どおりで、これを塞ぐかは本 DR の外 (塞ぐなら寿命を分けるか、履歴に署名付き thinking がある session を「開始済み」とみなす判定が要る)。
