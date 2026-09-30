@@ -1,6 +1,6 @@
 # DR-0034: session の開始 account と「跨いだ」印を Store 層に永続化し、restart と unit 間で共有する
 
-- Status: Accepted (kawaz 裁定 2026-09-30)。未実装
+- Status: Accepted (kawaz 裁定 2026-09-30)。実装済
 - Date: 2026-09-30
 
 ## 文脈

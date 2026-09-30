@@ -80,6 +80,8 @@ on_account_switch = "stay"  # "stay" | "drop_thinking" | "thinking_as_text"
 
 ### 4. 状態は affinity と同じ場所・同じ寿命で持つ
 
+寿命と置き場、unit 間の共有、読み直しでの扱いは [DR-0034](DR-0034-persist-session-account-lock-in-store.md) が置き換える (ロックは affinity と別の表として `[stats] dir` に永続化し、`seen` から 24 時間)。
+
 affinity の値 (`Binding`) に「開始 account」と「跨いだか」を足す。鍵は affinity と同じ `(namespace, session, model)`。
 
 - 寿命は affinity と同じ (最後に通ってから 1 時間、`AFFINITY_TTL`)

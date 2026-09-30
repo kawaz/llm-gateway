@@ -160,7 +160,7 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
 
 #### account を跨ぐ session の thinking (`account_bound_thinking` / `on_account_switch`)
 
-thinking の署名が生成した account でしか効かないモデル (既定は `claude-sonnet-5-5`) では、会話が別 account の経路へ移ると、履歴の thinking を API が黙って捨てる (200 のまま)。これを防ぐため、そのモデルの会話 (namespace × 会話 × モデル) は最初に 2xx を返した経路の account (= credential。credential を持たない経路は経路名) に結ばれ、以後はその account の経路を先に全部試す。使い切りの繰り上げ (`spend_down_within`) もこれを越えない。開始 account の経路が全部使えないときの振る舞いは `on_account_switch` で選ぶ (DR-0033)。
+thinking の署名が生成した account でしか効かないモデル (既定は `claude-sonnet-5-5`) では、会話が別 account の経路へ移ると、履歴の thinking を API が黙って捨てる (200 のまま)。これを防ぐため、そのモデルの会話 (namespace × 会話 × モデル) は最初に 2xx を返した経路の account (= credential。credential を持たない経路は経路名) に結ばれ、以後はその account の経路を先に全部試す。使い切りの繰り上げ (`spend_down_within`) もこれを越えない。開始 account の経路が全部使えないときの振る舞いは `on_account_switch` で選ぶ (DR-0033)。 開始 account と跨いだ印は `[stats] dir` の `account-lock/locks.json` に保存され、同じ置き場を見る unit (stable / unstable) で共有し、restart でも残る。最後に通ってから 24 時間で忘れる (DR-0034)。
 
 ```toml
 # 設定ファイルの最上位 (どの [表] よりも前) に書く
