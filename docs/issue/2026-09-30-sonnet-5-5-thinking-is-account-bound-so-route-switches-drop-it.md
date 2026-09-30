@@ -59,12 +59,12 @@ gateway は DR-0009 の fail over (401/403/429/529/5xx) と pace_cap / denial �
 失われたことを記録するだけの案 (観測・検知のみ、単純に剥がす等) は推論を救えないので却下。次の 3 点セットで行く。
 
 - (a) **session ごとに開始 account をロックする**。affinity を「優先」でなく「固定」にする。ロックした account の枠切れ時の扱い (待つ / 切替) は issue `low-priority-slow-requests-should-wait-not-switch` の裁定と合流する
-- (b) **やむなく切替える時は cache 破壊前提で thinking を text に変換する**。切替点 (session の message index) を記録し、それより前の thinking block を通常の text block に書き換える。先頭に `THINKING:\n` を付けて webui で区別できるようにする。変換は決定的で、切替後に新 account が生成した block は素通しする
-- (c) **持ち越せるのは client が持つ本文だけ**。`thinking_display = "summarized"` の ns では要約しか渡らない。`redacted_thinking` は変換不能
+- (b) **account が切り替わった session は、以後の全リクエストで履歴中の thinking block を全部 assistant の通常 text block に置き換える**。thinking としては捨てて独り言として残す。先頭に `THINKING:\n` を付けて webui で区別できるようにする。署名も束縛も無くなる。切替点の index 記録は不要で、session 単位のモード切替とする。変換は決定的で、cache は破壊前提。切替後に新 account が生成した thinking も同様に text になる (その session はもう account を跨いだので preserved thinking の恩恵は諦める)
+- (c) **変換するのは client が送ってきた本文そのまま**。`thinking_display = "summarized"` の ns なら要約が残る。`redacted_thinking` は本文が無いので落とす
 
 ## 裁定点
 
-- thinking_display を full に戻すか、要約持ち越しで割り切るか
+- (a) の「開始 account ロック中に枠が切れたら待つか切替えるか」のみ。issue `low-priority-slow-requests-should-wait-not-switch` と一緒に裁定する
 
 DR 起草は裁定後。
 
