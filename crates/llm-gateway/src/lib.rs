@@ -4,6 +4,7 @@
 //! upstream と認証情報を選び、最小限の加工をして転送する。
 //!
 //! 構成は DR-0002 / DR-0014 を参照:
+//! - [`account_lock`] session の開始 account と跨いだ印を unit 間で共有する (DR-0034)
 //! - [`router`] モデル名 + session キー → 経路の優先順位。経路が使えるかは経路に聞く
 //! - [`provider`] provider preset の契約 (Auth / Wire / Metering / 任意 capability) と経路の状態
 //! - [`preset`] その契約の provider ごとの実装。方言と認証を組み合わせて束ねる
@@ -19,6 +20,7 @@
 //! - [`metering`] トークン集計の正規形と、単価を引き当てる契約
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
 
+pub mod account_lock;
 pub mod cache;
 pub mod config;
 pub mod credential;
