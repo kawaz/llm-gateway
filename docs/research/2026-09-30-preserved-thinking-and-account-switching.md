@@ -15,6 +15,20 @@
 - [controls / enforcement](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking#preserved-thinking-controls): `anthropic-beta: thinking-binding-controls-2026-08-01` を送ると `input_transformations`（stream では `message_start`）に `thinking_dropped` と `reason: organization_binding_mismatch | model_binding_mismatch | prefix_binding_mismatch` が現れる。Claude API と Google Cloud における account mismatch の報告が明記され、ヘッダがなければ silent drop。`thinking.block_binding.prefix_mismatch_behavior` は `error` / `drop_block` で、ヘッダなしの指定は 400。2026-08-31 00:00 UTC 以後作成の account は prefix 検査が既定で強制（失敗時は 400 または指定による drop）、古い account はフィールドを指定したとき強制。Sonnet 5.5 では `block_binding` を付けられるのは adaptive thinking のみで、`between_tools` 併用は 400。
 - [Thinking](https://platform.claude.com/docs/en/build-with-claude/thinking)・[Steering thinking / pricing](https://platform.claude.com/docs/en/build-with-claude/thinking-steering-and-cost#pricing): モデルが推論した token は表示有無によらず output 課金。保持されて入力へ残る過去 turn の thinking は input 課金、drop された block は input 課金されないが推論再生成により後続 token が増える可能性はある。[Extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking) によれば Sonnet 5.5 / Opus 5.5 / Fable 5.1 の `enabled` + `budget_tokens` は 400 で adaptive を使う。thinking 設定・top-level effort の変更は prompt cache を無効化し得る。`cache_control` marker は署名 prefix に影響せず、両者の条件は同一ではない。
 
+## tool ループ中の置換（2026-09-30、unstable `ns-lab`）
+
+`claude-sonnet-5-5` / adaptive thinking、Claude Code 形の system・metadata・headers、`thinking-binding-controls-2026-08-01` を使用。`ns-lab` は account A の `claude-emrd` に固定。turn 1 で `get_time` の tool_use を要求し、`thinking`、`text`、`tool_use` の順の署名付き content を得た。この content を `/tmp/pt-toolloop-turn1.json` に保存した。次の user message には `tool_result` を入れ、同じ account に以下の 3 通りを送信した。
+
+| ケース | HTTP status | error / transformations と応答状態 |
+|---|---|---|
+| turn2-a: turn 1 の assistant content をそのまま再送 | 200 | `input_transformations: []`、`stop_reason: max_tokens`、応答は thinking block のみ |
+| turn2-b: thinking block を `THINKING:\n` とその本文を持つ text block に置換 | 200 | `input_transformations: []`、`stop_reason: refusal`、応答は thinking block のみ |
+| turn2-c: thinking block を削除 | 200 | `input_transformations: []`、`stop_reason: max_tokens`、応答は thinking block のみ |
+
+**観測できた範囲:** 同一 account のこの tool loop では置換・削除とも HTTP 400 にならなかった。ただし turn2-b は `refusal`、対照と削除は `max_tokens` で、正常な回答の継続は確認できていない。`refusal` の要因が履歴改変にあるかどうかも未確認。初回の簡単な tool 指示では thinking なしの `tool_use` のみが返ったため、その試行からは turn 2 を投げず、thinking が得られた試行を対象にした。
+
+**account B は未測。** 統括が `ns-lab` を別 account の route に切り替えた後、`/tmp/pt-toolloop-turn1.json` 内の `common`・`first`・`content` を使って同じ tool_result を構築し、turn2-a（無改変）と turn2-b（thinking→text）を B に送る。HTTP status、error 全文、`input_transformations`、`stop_reason`、応答 block type を比較する。B における thinking drop と置換の扱いの差は、この測定まで断定しない。
+
 ## Gateway 照合（文書＋実装）
 
 `docs/DESIGN-ja.md` は現行 tree に存在せず、コード地図は `docs/design/architecture-overview.md` を確認。`docs/decisions/INDEX.md` の DR-0009・0016・0018・0019・0024 を照合した。`crates/llm-gateway/src/session.rs:55-88` は metadata・header・冒頭本文から session key を導出。`crates/llm-gateway/src/router.rs:582-600` は spend_down 昇格後に affinity を先頭へ動かすが、`:605-659` は denial / pace_cap 経路を除外し、後続候補を維持する。affinity は `(namespace, session, model)` で route を記憶する (`router.rs:276`)。DR-0009 は 401/403/429/529 や 5xx を契機に別 credential / upstream へ切替し、2xx に限り affinity を更新する。新しい route が違う account なら Sonnet 5.5 の thinking は消える。成功レスポンスだけでは検知できない。
