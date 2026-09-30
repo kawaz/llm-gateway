@@ -3,6 +3,7 @@
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
 | 2026-09-30 | design | open | [daemon-reload-through-the-supervisor-and-per-unit-control-socket](./2026-09-30-daemon-reload-through-the-supervisor-and-per-unit-control-socket.md) | daemon reload — 設定の reload を restart 無しで行う (監督者経由 + unit ごとの制御 socket) |
+| 2026-09-30 | design | open | [persist-session-account-lock-across-restart-and-units](./2026-09-30-persist-session-account-lock-across-restart-and-units.md) | session の開始 account と「跨いだ」印 (AccountLock) を永続化して restart と unit 間で共有する |
 | 2026-09-30 | design | open | [sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](./2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md) | Sonnet 5.5 の thinking は account 束縛なので route 切替で黙って消える。切替に慎重になるオプションの検討 |
 | 2026-09-25 | design | open | [low-priority-slow-requests-should-wait-not-switch](./2026-09-25-low-priority-slow-requests-should-wait-not-switch.md) | Claude Code の /low-priority (anthropic-usage-limit: slow) の 429/529 を DR-0009 の断りとして扱わず透過する |
 | 2026-09-24 | bug | open | [keepalive-restore-test-double-send-in-ci](./2026-09-24-keepalive-restore-test-double-send-in-ci.md) | keepalive の復元テストが CI で 1 回だけ 2 回送出 (`2 != 1`) した真因が未特定 |
