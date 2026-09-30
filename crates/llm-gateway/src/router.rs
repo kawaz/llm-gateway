@@ -18,6 +18,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
+use crate::account_lock::AccountLocks;
 use crate::config::{self, Config, Namespace, RouteSpec};
 use crate::credential::time::now_unix;
 use crate::credential::{CredentialId, CredentialPersistence, CredentialStore};
@@ -399,6 +400,11 @@ pub struct Router {
     /// **provider 間で選ぶための状態**なので、経路の側ではなく core が持つ
     /// (DR-0014 §3 の横断機構)。
     affinity: Mutex<HashMap<(String, SessionKey, String), Binding>>,
+    /// thinking が account に束縛されるモデルの session の開始 account と印
+    /// (DR-0034)。affinity とは別に持つ: 経路名の優先は失っても設定順に落ちる
+    /// だけだが、ロックを失うと跨いだ thinking が黙って落ちる。兄弟の unit と
+    /// ファイルで共有し、寿命も affinity より長い。
+    locks: Arc<AccountLocks>,
     /// 起きたことを見ている人へ流す口。全 provider ぶんで 1 本。
     events: Arc<Events>,
 }
@@ -408,11 +414,6 @@ struct Binding {
     /// 掴み続ける。
     route: String,
     seen: Instant,
-    /// 最初に 2xx を返した経路の account ([`Route::account`])。以後変えない
-    /// (DR-0033 §4)。
-    account: String,
-    /// 開始 account 以外の account で通ったことがあるか。一度立てたら消さない。
-    crossed: bool,
 }
 
 /// thinking が account に束縛されるモデルの session が、どの account に
@@ -423,6 +424,11 @@ pub struct AccountLock {
     pub account: String,
     /// 開始 account 以外へ移ったことがあるか。
     pub crossed: bool,
+}
+
+/// ロックの表の鍵。affinity と同じ (namespace 名, session, モデル)。
+fn lock_key(ns: &str, session: &SessionKey, model: &str) -> crate::account_lock::Key {
+    (ns.to_owned(), session.as_str().to_owned(), model.to_owned())
 }
 
 /// 1 本を送るとき、その session の thinking をどう運ぶか (DR-0033 §2・§3)。
@@ -456,11 +462,12 @@ impl AccountLock {
 }
 
 impl Router {
-    pub fn new(config: Config, events: Arc<Events>) -> Self {
+    pub fn new(config: Config, events: Arc<Events>, locks: AccountLocks) -> Self {
         Self {
             active: std::sync::RwLock::new(Arc::new(Active::new(config))),
             catalog: RwLock::new(Catalog::default()),
             affinity: Mutex::new(HashMap::new()),
+            locks: Arc::new(locks),
             events,
         }
     }
@@ -503,6 +510,8 @@ impl Router {
             *active = Arc::new(next);
             carried
         };
+        // ロックの表には触らない。ロックは経路でなく account に結ばれていて、
+        // 経路表を差し替えても意味が変わらない (DR-0034 決定 5)。
         affinity.retain(|_, bound| carried.contains(&bound.route));
         drop(affinity);
         self.catalog
@@ -828,24 +837,29 @@ impl Router {
         affinity.retain(|_, b| now.duration_since(b.seen) < AFFINITY_TTL);
 
         let key = (ns_name.to_owned(), session.clone(), model.to_owned());
-        let Some(bound) = affinity.get(&key) else {
-            return Ok(routes);
-        };
-        if let Some(at) = routes.iter().position(|r| r.name() == bound.route) {
+        if let Some(bound) = affinity.get(&key)
+            && let Some(at) = routes.iter().position(|r| r.name() == bound.route)
+        {
             // 抜いて先頭へ差し込む。入れ替えると、先頭にいた経路が抜けた穴へ
             // 飛んで残りの優先順が入れ替わる (前回通った経路の後ろは、設定に
             // 書いた順のままであってほしい)。
             let bound = routes.remove(at);
             routes.insert(0, bound);
         }
+        drop(affinity);
         // thinking が account に束縛されるモデルでは、開始 account の経路を
         // 全部先に試す (DR-0033 §2)。繰り上げ・前回の経路より後で効かせるので、
         // どちらもロックを越えない。他 account の経路を外すかどうかは
-        // `on_account_switch` 次第で、それは送る側が決める。
-        if ns.active().config.thinking_is_account_bound(model) {
+        // `on_account_switch` 次第で、それは送る側が決める。ロックは affinity
+        // が寿命切れでも効く (DR-0034)。
+        if ns.active().config.thinking_is_account_bound(model)
+            && let Some(lock) = self
+                .locks
+                .get(&lock_key(ns_name, session, model), now_unix())
+        {
             let (mut locked, others): (Vec<_>, Vec<_>) = routes
                 .into_iter()
-                .partition(|route| route.account() == bound.account);
+                .partition(|route| route.account() == lock.account);
             locked.extend(others);
             routes = locked;
         }
@@ -1001,33 +1015,28 @@ impl Router {
     ) {
         // 読み直しは結びつきの錠を握ったまま差し替えるので、錠の内側で
         // 比べれば差し替えの途中を見ない。
-        //
-        // 開始 account も錠の内側で「無ければ入れる、あれば比べる」。初回が
-        // 並行して別 account で通っても、先に覚えた方が開始 account になり、
-        // 後の方は跨ぎとして印が立つ (DR-0033 §2)。
         let mut affinity = self.affinity.lock().await;
         if !Arc::ptr_eq(ns.active(), &self.active()) {
             return;
         }
-        let now = Instant::now();
         let key = (ns.name().to_owned(), session.clone(), model.to_owned());
-        match affinity.get_mut(&key) {
-            Some(bound) if now.duration_since(bound.seen) < AFFINITY_TTL => {
-                bound.route = route.name().to_owned();
-                bound.seen = now;
-                bound.crossed |= route.account() != bound.account;
-            }
-            _ => {
-                affinity.insert(
-                    key,
-                    Binding {
-                        route: route.name().to_owned(),
-                        seen: now,
-                        account: route.account().to_owned(),
-                        crossed: false,
-                    },
-                );
-            }
+        affinity.insert(
+            key,
+            Binding {
+                route: route.name().to_owned(),
+                seen: Instant::now(),
+            },
+        );
+        drop(affinity);
+        // 開始 account は「無ければ入れる、あれば比べる」。初回が並行して別
+        // account で通っても、先に覚えた方が開始 account になり、後の方は
+        // 跨ぎとして印が立つ (DR-0033 §2、unit を跨いでも同じ、DR-0034 決定 2)。
+        if ns.active().config.thinking_is_account_bound(model) {
+            self.locks.remember(
+                lock_key(ns.name(), session, model),
+                route.account(),
+                now_unix(),
+            );
         }
     }
 
@@ -1044,12 +1053,8 @@ impl Router {
         if !ns.active().config.thinking_is_account_bound(model) {
             return None;
         }
-        let affinity = self.affinity.lock().await;
-        let bound = affinity.get(&(ns.name().to_owned(), session.clone(), model.to_owned()))?;
-        (Instant::now().duration_since(bound.seen) < AFFINITY_TTL).then(|| AccountLock {
-            account: bound.account.clone(),
-            crossed: bound.crossed,
-        })
+        self.locks
+            .get(&lock_key(ns.name(), session, model), now_unix())
     }
 
     /// discovery が済んだ状態を作る。
@@ -1355,7 +1360,12 @@ spend_down_within = "25%"
     const NOW: i64 = 1_800_000_000;
 
     fn build(config: Config) -> Router {
-        Router::new(config, Arc::new(Events::new()))
+        // 試験ごとにロックの置き場を分ける (同じ session 名を使い回すため)。
+        Router::new(
+            config,
+            Arc::new(Events::new()),
+            AccountLocks::open(tempfile::tempdir().unwrap().keep()),
+        )
     }
 
     /// discovery 済みの状態を作る。
@@ -3050,12 +3060,14 @@ spend_down_within = "25%"
         assert_eq!(lock_of(&r, "s", OPUS).await, None);
     }
 
+    /// 読み直しはロックの表に触らない。ロックは経路でなく account に結ばれて
+    /// いる (DR-0034 決定 5)。
     #[tokio::test]
-    async fn a_reload_keeps_the_lock_bound_to_an_unchanged_route() {
+    async fn a_reload_leaves_the_locks_alone() {
         let r = locking().await;
         passed(&r, "kept", SONNET, "a1").await;
         passed(&r, "kept", SONNET, "b1").await;
-        passed(&r, "dropped", SONNET, "a2").await;
+        passed(&r, "moved", SONNET, "a2").await;
 
         // a2 だけ credential を変える。
         reload_with(
@@ -3069,10 +3081,69 @@ spend_down_within = "25%"
 
         assert_eq!(lock_of(&r, "kept", SONNET).await, locked("a", true));
         assert_eq!(
-            lock_of(&r, "dropped", SONNET).await,
-            None,
-            "the route changed its credential; the session starts over"
+            lock_of(&r, "moved", SONNET).await,
+            locked("a", false),
+            "the session stays on account `a`, whichever routes now reach it"
         );
+        let order = r
+            .routes_for(&ns(&r), NS, SONNET, &session("moved"))
+            .await
+            .unwrap();
+        // a2 は一覧を聞き直すまで候補に出ない。
+        assert_eq!(names(&order), ["a1", "b1", "relay"]);
+    }
+
+    /// affinity (経路名の優先) が切れても、ロックと印は効き続ける (DR-0034)。
+    #[tokio::test]
+    async fn the_lock_outlives_the_affinity() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "a2").await;
+        passed(&r, "s", SONNET, "b1").await;
+        // 1 時間の沈黙で affinity が寿命切れになったのと同じ。
+        r.affinity.lock().await.clear();
+
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
+        let order = r
+            .routes_for(&ns(&r), NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        assert_eq!(names(&order), ["a1", "a2", "b1", "relay"]);
+    }
+
+    /// 同じ置き場で作り直した router (restart 相当) と、同じ置き場を見る別の
+    /// router (兄弟の unit 相当) が、開始 account と印を引き継ぐ (DR-0034)。
+    #[tokio::test]
+    async fn the_lock_survives_a_restart_and_is_shared_with_the_sibling_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = |dir: &std::path::Path| {
+            let config: Config = toml::from_str(LOCKING).unwrap();
+            let r = Router::new(config, Arc::new(Events::new()), AccountLocks::open(dir));
+            async move {
+                let both: &[(&str, &str)] = &[(SONNET, SONNET), (OPUS, OPUS)];
+                r.set_catalog(&[("a1", both), ("a2", both), ("b1", both), ("relay", both)])
+                    .await;
+                r
+            }
+        };
+        let stable = unit(dir.path()).await;
+        let unstable = unit(dir.path()).await;
+
+        passed(&stable, "s", SONNET, "a1").await;
+        stable.locks.settled().await;
+        // 兄弟は開始 account を知ったうえで、別 account へ跨いだ。
+        assert_eq!(lock_of(&unstable, "s", SONNET).await, locked("a", false));
+        passed(&unstable, "s", SONNET, "b1").await;
+        unstable.locks.settled().await;
+        assert_eq!(lock_of(&stable, "s", SONNET).await, locked("a", true));
+
+        drop(stable);
+        let restarted = unit(dir.path()).await;
+        assert_eq!(lock_of(&restarted, "s", SONNET).await, locked("a", true));
+        let order = restarted
+            .routes_for(&ns(&restarted), NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        assert_eq!(names(&order), ["a1", "a2", "b1", "relay"]);
     }
 
     #[tokio::test]

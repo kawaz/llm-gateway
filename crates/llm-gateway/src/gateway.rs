@@ -15,6 +15,7 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::account_lock::AccountLocks;
 use crate::cache::{self, keepalive};
 use crate::config::{CacheRule, CacheStrategy, Config, OnAccountSwitch};
 use crate::credential::oauth::{self, WebAuthorization};
@@ -167,7 +168,12 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
         let tap = Arc::new(Tap::new());
-        let router = Arc::new(Router::new(config.clone(), Arc::clone(&events)));
+        let router = Arc::new(Router::new(
+            config.clone(),
+            Arc::clone(&events),
+            // 兄弟の unit と共有する走行状態なので keepalive と同じ置き場 (DR-0034)。
+            AccountLocks::open(config.stats.resolve_dir()),
+        ));
         // 控えは待ち受けごとに分けない。兄弟は同じ置き場を共有し、系列の
         // `.lock` を掴んだ 1 台だけが撫でる (DR-0027 決定 3)。
         let keepalive = Arc::new(keepalive::Keepalive::new(
@@ -2490,7 +2496,13 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     }
 
     async fn gateway_with(config_toml: &str, store: StaticStore) -> Gateway<StaticStore> {
-        let config: Config = toml::from_str(config_toml).unwrap();
+        let mut config: Config = toml::from_str(config_toml).unwrap();
+        // 束縛を設定した試験は session のロックを書く。試験どうしで同じ session
+        // を見ないよう、書き先を試験ごとに分ける (他の試験は読み直しで
+        // `[stats]` を比べるので触らない)。
+        if config.stats.dir.is_none() && config_toml.contains("account_bound_thinking") {
+            config.stats.dir = Some(tempfile::tempdir().unwrap().keep());
+        }
         config.validate().unwrap();
         let gw = Gateway::new(&config, store).unwrap();
         gw.refresh_models().await;
