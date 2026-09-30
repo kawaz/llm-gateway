@@ -98,3 +98,7 @@ account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した�
 | `stay` | 404 `no route for model … can carry a messages request` | lab では開始 account の経路を routing から**消して**いるので「全部断った」ではなく「経路が無い」。DR-0033 の 429 + retry-after は「開始 account の経路が denial で全滅」の場合で、それは unit test (`stay_answers_the_denial_of_the_starting_account_without_switching`) で確認。実機で枠切れを起こすのは費用の面で未実施 |
 
 `drop_thinking` (既定) は本文不変で API が落とす経路 (上の「置換の形」節の無改変行と同じ) なので再測していない。設定は測定後に既定へ戻し、lab の routing も `claude-kawazzz` に戻した。probe script は `PT_TOKEN` (jwt の ns 用 Bearer) を受けるようにした。
+
+## ロックの永続化 (DR-0034、v0.63.1) の実機 (2026-09-30 19:20 JST、unstable `ns-lab`)
+
+turn1 を `claude-kawazzz` 固定の lab で取ると `~/.local/state/llm-gateway/stats/account-lock/locks.json` に `{ns: lab, model: claude-sonnet-5-5, account: claude-kawazzz, crossed: false}` が書かれた。unstable を **restart** し、lab の routing を `claude-emrd` に reload してから同 session で turn2: 200 / `end_turn` / `input_tokens` 495 (thinking が text として載っている) / events に `thinking_as_text: true`、ファイルは `crossed: true` に更新。restart を跨いでロックが復元され、跨ぎが検知された。stable と unstable の相互は lab が unstable にしか無いので未測 (統合テスト `the_lock_survives_a_restart_and_is_shared_with_the_sibling_unit` で担保)。
