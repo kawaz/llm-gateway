@@ -1,6 +1,6 @@
 # DR-0033: session を開始 account にロックし、account を跨いだ session は以後 thinking を text として送る
 
-- Status: Accepted (kawaz 裁定 2026-09-30)。未実装
+- Status: Accepted (kawaz 裁定 2026-09-30)。改定 2026-09-30 (置換の形と enum)。未実装
 - Date: 2026-09-30
 
 ## 文脈
@@ -18,6 +18,8 @@ account 束縛に外れた block は、API が黙って捨てたうえで 200 �
 gateway は DR-0009 の fail over (401/403/429/529/5xx)、pace_cap (DR-0019)、締め出し (denial) で別 credential に移る。affinity は「前回通った経路を先頭へ寄せる」優先であって固定ではなく、経路名を覚えるだけで account の同一性を知らない。よって Sonnet 5.5 の会話は、経路が変わった瞬間に推論の連続性を失い、クライアントにも gateway にも何も見えない。
 
 実測 (`docs/research/2026-09-30-preserved-thinking-and-account-switching.md`): account A で生成した turn 1 を account B へ再送すると、beta `thinking-binding-controls-2026-08-01` の有無によらず 200 で、`input_transformations` は beta 有でも `[]` だった。drop は `usage.input_tokens` が同一 account の対照より turn 1 の `thinking_tokens` 分だけ少ないことでしか見えない。同一 account で先行本文を改変した場合は `prefix_binding_mismatch` が報告されるので、header 自体は効いている。**header で account 不一致を観測する方式は成立せず、gateway が自前で判断する必要がある。**
+
+一方、tool ループ中の同じ実測 (同 research doc の「tool ループ中の置換」節) では、account B へ無改変で再送した時に `input_transformations` へ `{"type":"thinking_dropped","reason":"end_user_binding_mismatch"}` が出た。資料に載る `organization_binding_mismatch` とは別の値で、text-only 履歴の再送では `[]` だった。この報告が出る条件は確定していないので、判断の根拠には使わない。
 
 ## 決定
 
@@ -41,20 +43,41 @@ account_bound_thinking = ["claude-sonnet-5-5", "claude-fable-5-*"]
 - **開始 account** = その `(namespace, session, model)` で最初に 2xx を返した経路の account。affinity を覚える契機 (DR-0009、2xx のみ) と同じ
 - **account の同一性は credential 名で表す**。同じ credential を指す経路は同じ account、別の credential は別 account。linked account は無い前提で、同一視の設定は持たない。credential を持たない経路 (relay) は経路名を account 名として扱う (中の account を gateway は知らない)
 - ロック中の session の候補は、開始 account の経路だけに絞る。affinity は「先頭へ寄せる」から「開始 account 以外を外す」になる。spend_down の昇格 (DR-0018) もロックを越えない
-- 開始 account の経路が全部使えないとき (枠切れ・締め出し・pace_cap・5xx) にどうするかは未確定 (未確定の節)。**裁定までは今の DR-0009 のまま別 account へ切り替え**、その session は決定 3 のモードに入る
+- 開始 account の経路が全部使えないとき (枠切れ・締め出し・pace_cap・5xx) の振る舞いは設定 `on_account_switch` で選ぶ。置き場は決定 1 の `account_bound_thinking` と同じ最上位 (global)
 
-### 3. account を跨いだ session は、以後の全リクエストで thinking を assistant の text として送る
+```toml
+# 書かなければ "drop_thinking"
+on_account_switch = "stay"  # "stay" | "drop_thinking" | "thinking_as_text"
+```
+
+| 値 | 振る舞い |
+|---|---|
+| `stay` | 切り替えない。ロック側の締め出しとして 429 + `retry-after` を返す (全経路が締め出された時の既存の応答と同じ形) |
+| `drop_thinking` (既定) | DR-0009 のまま別 account へ切り替え、API が束縛外の thinking を黙って捨てるのを受け入れる。gateway は events に記録する (決定 5) |
+| `thinking_as_text` | 別 account へ切り替え、その session は決定 3 の置換を以後の全リクエストに当てる |
+
+既定を `drop_thinking` にするのは今の挙動と同じで、本文を変えない側だから。`stay` は `docs/issue/2026-09-25-low-priority-slow-requests-should-wait-not-switch.md` の「待つ」に相当する。
+
+### 3. `thinking_as_text` で account を跨いだ session は、以後の全リクエストで thinking を assistant の text として送る
 
 「跨いだ」= 開始 account 以外の account へ送る時点。その 1 本から後は、送り先が開始 account に戻っても続ける (session 単位のモードで、切替点の index は持たない)。
 
 変換は送る直前の本文に対して行う:
 
-- `thinking` block → `{"type": "text", "text": "THINKING:\n" + <block の thinking 本文>}`。署名は捨てる。先頭の `THINKING:\n` は webui 等の下流で独り言と本文を見分けるため
-- `redacted_thinking` block → 落とす (運ぶ本文が無い)
-- 置き換えるのはクライアントが送ってきた本文そのまま。`thinking_display = "summarized"` (DR-0016) の namespace なら要約が、`omitted` なら空文字が入る
+- `thinking` block → `{"type": "text", "text": <本文>}`。本文は thinking 本文の改行 (`\n`) を全部半角空白 1 個に置き換え、末尾の空白をトリムしたもの。prefix や装飾は付けない。署名は捨てる
+- `redacted_thinking` block と、本文が空の `thinking` block → 落とす (運ぶ本文が無い)
+- 元にするのはクライアントが送ってきた本文そのまま。`thinking_display = "summarized"` (DR-0016) の namespace なら要約が入り、`omitted` なら空なので落ちる
 - 位置は元の block と同じ。他の block (text / tool_use / tool_result) には触らない
 - 決定的に変換する (同じ入力から同じ本文)。それでも初回の変換で prefix が変わるので、その session の prompt cache は 1 度壊れる。前提として受け入れる
 - 跨いだ後に新しい account が生成した thinking も、次のリクエストでは同じく text になる。その session は preserved thinking の恩恵を諦め、推論は「読める独り言」として残る
+
+この形の根拠は実測 (`docs/research/2026-09-30-preserved-thinking-and-account-switching.md` の「tool ループ中の置換」「置換の形 (account B)」節):
+
+- 本文だけ (3/3) と改行を半角空白にした本文だけ (3/3) は `end_turn` で text の応答が返った
+- 見出し (`THINKING:\n` 3/3、`(previous reasoning)\n`)、`🧠` / `💬` の接頭辞、括弧囲み、user turn の text への移動は、すべて `stop_reason: refusal` / `stop_details.category: reasoning_extraction` になった
+- tool ループの途中 (直前の assistant turn が `tool_use` を持つ) で置換しても 400 にならなかった
+
+改行を畳むので置換後は 1 行の text になり、webui 等の下流では「改行の無い長い段落」として変換済みの thinking を見分けられる。
 
 ### 4. 状態は affinity と同じ場所・同じ寿命で持つ
 
@@ -64,20 +87,20 @@ affinity の値 (`Binding`) に「開始 account」と「跨いだか」を足�
 - `Binding.route` (前回通った経路) は今どおり更新し、開始 account は最初に決めたまま変えない。跨いだ印は一度立てたら消さない
 - 読み直し (DR-0032) の引き継ぎも affinity と同じ規則: 「経路名 + credential + provider」が前後で同一の経路に結ばれた Binding だけ残す
 
-### 5. 変換した 1 本は events の `request` に `thinking_as_text: true` で出す
+### 5. 跨いだ 1 本は events の `request` に印を出す
 
-変換しなかった 1 本では欄ごと出さない (`skipped` / `cache_ttl_secs` と同じ流儀)。stats (DR-0011 / DR-0029) には軸を足さない: 変換は session の状態であってトークンの行き先ではなく、どの session が何本変換されたかは events で追える。
+- `thinking_as_text` で変換した 1 本は `thinking_as_text: true`
+- `drop_thinking` で開始 account 以外へ送った 1 本は `thinking_dropped_by_switch: true` (履歴の thinking が API に捨てられる見込みの印。実際に捨てられたかは gateway には見えない)
 
-## 未確定
-
-- **ロック中の開始 account の経路が全部使えない時に、待つか別 account へ切り替えるか**。これは `docs/issue/2026-09-25-low-priority-slow-requests-should-wait-not-switch.md` の問い (slow 付き request の 429 / 529 を断りとせず待つか、DR-0009 どおり切り替えるか) と同じ形で、同じ裁定になる。裁定までは決定 2 の末尾のとおり切り替え、決定 3 で推論を text として残す
+当てはまらない 1 本では欄ごと出さない (`skipped` / `cache_ttl_secs` と同じ流儀)。stats (DR-0011 / DR-0029) には軸を足さない: 変換は session の状態であってトークンの行き先ではなく、どの session が何本変換されたかは events で追える。
 
 ## 却下した案
 
 - **切替時に drop を観測・記録するだけ**: 推論は救えない。しかも実測で header は account 不一致を報告しないので、観測そのものが成立しない
 - **`input_tokens` の差で事後に検知する**: 同じく推論を救えず、対照 (同一 account で同じ本文を送った値) が手元に無いので差を取れない
 - **切替点より前の thinking だけ text にする**: account A → B → A と戻ると、B が生成した block が A で黙って落ちる。防ぐには block ごとに生成 account を覚える segment 管理が要り、状態が session 単位から block 単位に膨らむ
-- **thinking を単純に剥がして切り替える**: 推論の痕跡が消える。text に置けば署名と束縛は無くなっても内容はモデルに届く
+- **thinking を単純に剥がして切り替える**: 推論の痕跡が消える。text に置けば署名と束縛は無くなっても内容はモデルに届く (剥がす挙動が欲しい運用は `drop_thinking` で API の drop に任せれば足りる)
+- **ラベル付き置換** (`THINKING:\n` 等の見出し・絵文字・括弧を付ける、user turn へ移す): 実測で全部 `reasoning_extraction` の refusal になる
 
 ## 影響
 
@@ -108,8 +131,7 @@ keepalive は最後に転送した本文を控えて送り直す。控えるの�
 
 ### 実機で確かめてから入れること
 
-- **tool 使用の途中での変換**: thinking を有効にした tool 使用ループでは、直前の assistant turn の thinking block をそのまま返すことが要求される (返さないと 400 になりうる)。ループの途中で跨いだ場合に text への置換が 400 にならないかを実機で確かめる。400 になるなら、置換を最後の assistant turn より前に限るかどうかを別途決める (本 DR の裁定の外)
-- **`omitted` の namespace で空の thinking が `THINKING:\n` だけの text になること**: API が受け付けること、下流の表示で邪魔にならないこと
+- **置換の形が別の会話・別モデルでも refusal にならないこと**: 実測は Sonnet 5.5 の 1 つの tool ループだけ。段 5 で会話を変えて確かめる
 
 ### ロックが外れる場面
 
@@ -121,14 +143,14 @@ keepalive は最後に転送した本文を控えて送り直す。控えるの�
 |---|---|---|
 | 1 | 設定 `account_bound_thinking` (決定 1)。パターン照合、既定値、`check` の検証 | 試験で、書かない設定は `claude-sonnet-5-5` だけに当たり、書いた配列が既定を置き換え、`[]` はどれにも当たらない |
 | 2 | `Binding` に開始 account と跨いだ印 (決定 4)。覚える契機と読み直しの引き継ぎ | 試験で、2xx の初回が開始 account になり、別 credential の経路で送ると印が立ち、同じ credential を指す別名の経路では立たず、読み直しで同一経路の Binding が残る |
-| 3 | 変換 (決定 3) を送る直前に当てる。events の `thinking_as_text` (決定 5) | 試験で、跨いだ session の本文の thinking が `THINKING:\n` 付き text に、redacted_thinking が消え、跨いでいない session と束縛外モデルの本文はバイト一致のまま |
-| 4 | ロック (決定 2)。束縛モデルの候補を開始 account に絞り、全滅時は未確定の裁定まで今の切替に落とす | 試験で、ロック中の session が spend_down の昇格でも他 account へ行かず、開始 account が全部断った時だけ切り替わって段 3 の変換が効く |
-| 5 | 実機: account A で turn 1、B へ切替えた turn 2 で `input_tokens` が変換後の text 分だけ載ることと、tool 使用ループ途中の置換が通ること | `docs/research/2026-09-30-preserved-thinking-and-account-switching.md` のマトリクスに行が足される |
+| 3 | 設定 `on_account_switch`、変換 (決定 3) を送る直前に当てる。events の `thinking_as_text` / `thinking_dropped_by_switch` (決定 5) | 試験で、跨いだ session の本文の thinking が改行を空白に畳んだ本文だけの text に、redacted_thinking と空の thinking が消え、跨いでいない session と束縛外モデルの本文はバイト一致のまま |
+| 4 | ロック (決定 2)。束縛モデルの候補を開始 account に絞り、全滅時は `on_account_switch` に従う | 試験で、ロック中の session が spend_down の昇格でも他 account へ行かず、開始 account が全部断った時に `stay` は 429 + `retry-after`、`drop_thinking` は切り替えて本文不変、`thinking_as_text` は切り替えて段 3 の変換が効く |
+| 5 | 実機: account A で turn 1、B へ切替えた turn 2 で `input_tokens` が変換後の text 分だけ載ることと、別の会話でも置換形が refusal にならないこと | `docs/research/2026-09-30-preserved-thinking-and-account-switching.md` のマトリクスに行が足される |
 
 ## 関連
 
 - docs/issue/2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md (本 DR の元)
-- docs/issue/2026-09-25-low-priority-slow-requests-should-wait-not-switch.md (未確定の合流先)
+- docs/issue/2026-09-25-low-priority-slow-requests-should-wait-not-switch.md (`stay` が同 issue の「待つ」に相当)
 - docs/research/2026-09-30-preserved-thinking-and-account-switching.md (一次資料と実測)
 - DR-0009 (fail over の契機と affinity の鍵)
 - DR-0016 (`thinking_display`。変換で残る本文が要約か空かを決める)
