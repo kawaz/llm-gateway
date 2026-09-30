@@ -76,7 +76,7 @@ DR-0033 は thinking が account に束縛されるモデルの session を開�
 - **affinity ごと永続化する**: 経路名の優先は prompt cache の都合で、1 時間で捨ててよい状態。永続化すると request ごとに経路名の更新を書くことになり、書き込みの頻度が 2xx ごとに跳ね上がる。reload の引き継ぎ規則 (経路が変わったら捨てる) もファイル側に持ち込むことになる
 - **`AFFINITY_TTL` を延ばすだけ / ロックの寿命だけメモリで延ばす**: 1 時間の沈黙は塞げるが、restart と unit の移動は塞げない
 - **Caddy 等の前段の sticky で session を 1 unit に寄せる**: unit の移動は減るが restart は塞げず、session key (本文や header から gateway が導く、`session.rs`) を前段が知らない。session の状態は gateway の責務
-- **unit (writer) ごとのファイルに書いて読む時に merge する (DR-0031 (3) の形)**: `crossed` の OR と `seen` の最大は merge で作れるが、開始 account の first-writer-wins は「どちらが先か」を writer 間で決める時刻の比較になり、時計と書き込み遅延に依る。flock の内側で「無ければ入れる」なら判定が 1 箇所で済む
+- **unit (writer) ごとのファイルに書いて読む時に merge する (DR-0031 (3) の形)**: `crossed` の OR と `seen` の最大は merge で作れるが、読むたびに全 writer のファイルを開いて merge することになり、判定の場所が読み手の数だけ増える。1 ファイルを flock の内側で更新すれば判定は 1 箇所で済み、`decided_at` の比較もそこだけで閉じる
 
 ## 未確定
 
