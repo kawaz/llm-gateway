@@ -795,6 +795,23 @@ impl Router {
             .await
     }
 
+    /// [`Self::routes_for`] を、呼び出し側が読んだロックで並べる。
+    ///
+    /// 送る側はロックを 1 度だけ読み、変換の判断 (`on_account_switch`) と
+    /// 候補の並べ替えの両方に同じ値を使う。別々に読むと、間に兄弟の unit が
+    /// 書いた時に 2 つが食い違う。
+    pub async fn routes_for_locked(
+        &self,
+        ns: &NamespaceView,
+        ns_name: &str,
+        model: &str,
+        session: &SessionKey,
+        lock: Option<&AccountLock>,
+    ) -> Result<Vec<Arc<Route>>> {
+        self.ordered_at(ns, ns_name, model, session, now_unix(), lock)
+            .await
+    }
+
     async fn routes_for_at(
         &self,
         ns: &NamespaceView,
@@ -802,6 +819,20 @@ impl Router {
         model: &str,
         session: &SessionKey,
         now: i64,
+    ) -> Result<Vec<Arc<Route>>> {
+        let lock = self.account_lock(ns, session, model).await;
+        self.ordered_at(ns, ns_name, model, session, now, lock.as_ref())
+            .await
+    }
+
+    async fn ordered_at(
+        &self,
+        ns: &NamespaceView,
+        ns_name: &str,
+        model: &str,
+        session: &SessionKey,
+        now: i64,
+        lock: Option<&AccountLock>,
     ) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
         let visible = catalog.visible(ns, ns.config());
@@ -852,11 +883,7 @@ impl Router {
         // どちらもロックを越えない。他 account の経路を外すかどうかは
         // `on_account_switch` 次第で、それは送る側が決める。ロックは affinity
         // が寿命切れでも効く (DR-0034)。
-        if ns.active().config.thinking_is_account_bound(model)
-            && let Some(lock) = self
-                .locks
-                .get(&lock_key(ns_name, session, model), now_unix_ms())
-        {
+        if let Some(lock) = lock {
             let (mut locked, others): (Vec<_>, Vec<_>) = routes
                 .into_iter()
                 .partition(|route| route.account() == lock.account);
@@ -1013,6 +1040,18 @@ impl Router {
         model: &str,
         route: &Arc<Route>,
     ) {
+        // 開始 account は「無ければ入れる、あれば比べる」。初回が並行して別
+        // account で通っても、先に覚えた方が開始 account になり、後の方は
+        // 跨ぎとして印が立つ (DR-0033 §2、unit を跨いでも同じ、DR-0034 決定 2)。
+        // ロックは経路でなく account に結ばれていて設定の差し替えに依らない
+        // ので、読み直しを跨いだ 1 本でも覚える (下の affinity の除外より先)。
+        if ns.active().config.thinking_is_account_bound(model) {
+            self.locks.remember(
+                lock_key(ns.name(), session, model),
+                route.account(),
+                now_unix_ms(),
+            );
+        }
         // 読み直しは結びつきの錠を握ったまま差し替えるので、錠の内側で
         // 比べれば差し替えの途中を見ない。
         let mut affinity = self.affinity.lock().await;
@@ -1027,17 +1066,6 @@ impl Router {
                 seen: Instant::now(),
             },
         );
-        drop(affinity);
-        // 開始 account は「無ければ入れる、あれば比べる」。初回が並行して別
-        // account で通っても、先に覚えた方が開始 account になり、後の方は
-        // 跨ぎとして印が立つ (DR-0033 §2、unit を跨いでも同じ、DR-0034 決定 2)。
-        if ns.active().config.thinking_is_account_bound(model) {
-            self.locks.remember(
-                lock_key(ns.name(), session, model),
-                route.account(),
-                now_unix_ms(),
-            );
-        }
     }
 
     /// この session が結ばれている account (DR-0033 §2)。
@@ -1055,6 +1083,12 @@ impl Router {
         }
         self.locks
             .get(&lock_key(ns.name(), session, model), now_unix_ms())
+    }
+
+    /// 裏に渡したロックの書き込みを、`limit` まで待って書き切る。止まる前に
+    /// 呼ぶ (待たずに止まると、決まった開始 account や印を失う)。
+    pub async fn drain_locks(&self, limit: Duration) {
+        self.locks.drain(limit).await;
     }
 
     /// discovery が済んだ状態を作る。
@@ -3109,6 +3143,36 @@ spend_down_within = "25%"
             .unwrap();
         // a2 は一覧を聞き直すまで候補に出ない。
         assert_eq!(names(&order), ["a1", "b1", "relay"]);
+    }
+
+    /// 読み直しの前に始まった 1 本の 2xx も、ロックには覚える。ロックは
+    /// account に結ばれていて、設定の差し替えに依らない。
+    #[tokio::test]
+    async fn a_success_that_straddles_a_reload_still_locks() {
+        let r = locking().await;
+        let before = ns(&r);
+        let routes = r
+            .routes_for(&before, NS, SONNET, &session("s"))
+            .await
+            .unwrap();
+        let a1 = Arc::clone(routes.iter().find(|r| r.name() == "a1").unwrap());
+        reload_with(&r, LOCKING).await;
+
+        r.remember(&before, &session("s"), SONNET, &a1).await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+    }
+
+    /// 送る側が読んだロックで並べる (表を読み直さない)。
+    #[tokio::test]
+    async fn the_order_follows_the_lock_the_caller_read() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "a1").await;
+        let read = locked("b", false).unwrap();
+        let order = r
+            .routes_for_locked(&ns(&r), NS, SONNET, &session("s"), Some(&read))
+            .await
+            .unwrap();
+        assert_eq!(names(&order), ["b1", "a1", "a2", "relay"]);
     }
 
     /// affinity (経路名の優先) が切れても、ロックと印は効き続ける (DR-0034)。

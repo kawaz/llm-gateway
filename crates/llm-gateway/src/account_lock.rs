@@ -105,7 +105,8 @@ struct Memo {
 impl Memo {
     /// 控えをファイルの中身に置き換える。ファイルが正で、残すのはまだ
     /// 書いていない手元の分だけ (書いた後にファイルから消えた鍵は、別の
-    /// 書き手が刈ったもの)。同じ鍵に手元の言い分があれば当てる。
+    /// 書き手が刈ったもの)。同じ鍵に手元の言い分があれば当て、まだ書いて
+    /// いないという印も引き継ぐ (次の 2xx で書き直すため)。
     fn replace_with(&mut self, map: Map, now: i64) {
         let mut previous = std::mem::take(&mut self.entries);
         for (_, mut from_file) in map {
@@ -113,9 +114,9 @@ impl Memo {
                 continue;
             }
             let key = from_file.key();
-            let mut written = from_file.seen;
+            let mut written = Some(from_file.seen);
             if let Some(mine) = previous.remove(&key) {
-                written = mine.written.map_or(written, |w| w.max(written));
+                written = mine.written.map(|w| w.max(from_file.seen));
                 if mine.record.alive(now) {
                     from_file.absorb(&mine.record);
                 }
@@ -124,7 +125,7 @@ impl Memo {
                 key,
                 Entry {
                     record: from_file,
-                    written: Some(written),
+                    written,
                 },
             );
         }
@@ -140,8 +141,7 @@ impl Memo {
 enum Job {
     Write(Record),
     /// ここまでの書き込みが済んだら知らせる。
-    #[cfg(test)]
-    Settle(tokio::sync::oneshot::Sender<()>),
+    Drain(tokio::sync::oneshot::Sender<()>),
 }
 
 /// ロックの表。メモリの控えと、兄弟の unit と共有するファイル。
@@ -152,6 +152,9 @@ pub struct AccountLocks {
     /// 裏の書き手への口。最初の書き込みで書き手を起こす (作る時点では
     /// runtime の内側とは限らない)。
     writer: OnceLock<mpsc::UnboundedSender<Job>>,
+    /// ファイルへ書いた回数。試験で書き込みの合流を確かめるためだけに数える。
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 impl AccountLocks {
@@ -164,6 +167,8 @@ impl AccountLocks {
             lock_path: dir.join("locks.json.lock"),
             memo: std::sync::Mutex::new(Memo::default()),
             writer: OnceLock::new(),
+            #[cfg(test)]
+            saves: std::sync::atomic::AtomicUsize::new(0),
         };
         locks.refresh(&mut locks.memo(), crate::credential::time::now_unix_ms());
         locks
@@ -195,30 +200,41 @@ impl AccountLocks {
         }
     }
 
-    /// 書き手へ渡す。書き手は unit に 1 本で、受け取った順に 1 件ずつ書く —
-    /// 書き込みごとに並行させると flock を取る順が渡した順と入れ替わる。
+    /// 書き手へ渡す。書き手は unit に 1 本で、受け取った順に書く — 書き込み
+    /// ごとに並行させると flock を取る順が渡した順と入れ替わる。
+    ///
+    /// 溜まっていた分はまとめて 1 度の flock で当てて 1 度書く。1 件ごとに
+    /// map 全体を書き直すと、一度に多くの session が始まった時に書き込みが
+    /// その数だけ並ぶ。
     fn send(self: &Arc<Self>, job: Job) {
         let writer = self.writer.get_or_init(|| {
             let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
             // 書き手は表を弱く持つ。表が落ちれば口も閉じて書き手も終わる。
             let this: Weak<Self> = Arc::downgrade(self);
             tokio::spawn(async move {
-                while let Some(job) = rx.recv().await {
-                    match job {
-                        Job::Write(change) => {
-                            let Some(locks) = this.upgrade() else { break };
-                            let written = tokio::task::spawn_blocking(move || {
-                                locks.write(&change, crate::credential::time::now_unix_ms());
-                            })
-                            .await;
-                            if let Err(e) = written {
-                                tracing::warn!(%e, "the session account lock writer failed");
-                            }
+                while let Some(first) = rx.recv().await {
+                    let mut changes = Vec::new();
+                    let mut drained = Vec::new();
+                    let mut next = Some(first);
+                    while let Some(job) = next {
+                        match job {
+                            Job::Write(change) => changes.push(change),
+                            Job::Drain(done) => drained.push(done),
                         }
-                        #[cfg(test)]
-                        Job::Settle(done) => {
-                            let _ = done.send(());
+                        next = rx.try_recv().ok();
+                    }
+                    if !changes.is_empty() {
+                        let Some(locks) = this.upgrade() else { break };
+                        let written = tokio::task::spawn_blocking(move || {
+                            locks.write(&changes, crate::credential::time::now_unix_ms());
+                        })
+                        .await;
+                        if let Err(e) = written {
+                            tracing::warn!(%e, "the session account lock writer failed");
                         }
+                    }
+                    for done in drained {
+                        let _ = done.send(());
                     }
                 }
             });
@@ -226,6 +242,20 @@ impl AccountLocks {
         });
         // 書き手が終わっているのは表が落ちる時だけで、書く先も無い。
         let _ = writer.send(job);
+    }
+
+    /// ここまでに渡した書き込みが済むまで、`limit` を上限に待つ。止まる前に
+    /// 呼ぶ。間に合わなければ警告を残して諦める (次の起動で書き直す手段は
+    /// 無いが、止まる側を待たせ続けるほどではない)。
+    pub async fn drain(self: &Arc<Self>, limit: std::time::Duration) {
+        if self.writer.get().is_none() {
+            return;
+        }
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.send(Job::Drain(done));
+        if tokio::time::timeout(limit, wait).await.is_err() {
+            tracing::warn!(path = %self.path.display(), "gave up waiting for the session account locks to be saved");
+        }
     }
 
     /// 控えを更新し、ファイルへ書くべき変化なら書く中身を返す。
@@ -267,10 +297,17 @@ impl AccountLocks {
         }
     }
 
-    /// 版が動いていればファイルを読み直して控えを置き換える。
+    /// 版が動いていればファイルを読み直して控えを置き換える。ファイルが
+    /// 消えていれば中身は空として置き換える (まだ書いていない手元の分だけ
+    /// 残り、次の書き込みでファイルを作り直す)。
     fn refresh(&self, memo: &mut Memo, now: i64) {
         let version = self.version();
-        if version.is_none() || version == memo.version {
+        if version == memo.version {
+            return;
+        }
+        if version.is_none() {
+            memo.replace_with(Map::new(), now);
+            memo.version = None;
             return;
         }
         if let Some(map) = self.read() {
@@ -315,13 +352,13 @@ impl AccountLocks {
     ///
     /// 鍵が無い (または寿命切れ) なら入れる。あれば [`Record::absorb`] で
     /// 当てる。掴んでいる区間は読み直しから rename までだけ。
-    fn write(&self, change: &Record, now: i64) {
-        if let Err(e) = self.write_locked(change, now) {
+    fn write(&self, changes: &[Record], now: i64) {
+        if let Err(e) = self.write_locked(changes, now) {
             tracing::warn!(path = %self.path.display(), %e, "cannot save the session account lock");
         }
     }
 
-    fn write_locked(&self, change: &Record, now: i64) -> std::io::Result<()> {
+    fn write_locked(&self, changes: &[Record], now: i64) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -331,18 +368,30 @@ impl AccountLocks {
             .read()
             .ok_or_else(|| std::io::Error::other("the current locks are unreadable"))?;
         map.retain(|_, record| record.alive(now));
-        let slot = map_key(&change.key());
-        match map.get_mut(&slot) {
-            Some(existing) => existing.absorb(change),
-            None => {
-                map.insert(slot, change.clone());
+        for change in changes {
+            let slot = map_key(&change.key());
+            match map.get_mut(&slot) {
+                Some(existing) => existing.absorb(change),
+                None => {
+                    map.insert(slot, change.clone());
+                }
             }
         }
         write_atomically(&self.path, &map)?;
+        #[cfg(test)]
+        self.saves
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let version = self.version();
         let mut memo = self.memo();
         memo.replace_with(map, now);
         memo.version = version;
+        // 書いた分は書けた印を付ける。手元でその後に進んだ分 (`seen`) は
+        // 印の値より新しいので、間引きの判定で次に書かれる。
+        for change in changes {
+            if let Some(entry) = memo.entries.get_mut(&change.key()) {
+                entry.written = Some(entry.written.map_or(change.seen, |w| w.max(change.seen)));
+            }
+        }
         Ok(())
     }
 
@@ -366,9 +415,7 @@ impl AccountLocks {
     /// ここまでに渡した書き込みが全部終わるまで待つ。
     #[cfg(test)]
     pub async fn settled(self: &Arc<Self>) {
-        let (done, wait) = tokio::sync::oneshot::channel();
-        self.send(Job::Settle(done));
-        wait.await.unwrap();
+        self.drain(std::time::Duration::from_secs(60)).await;
     }
 }
 
@@ -393,7 +440,7 @@ mod tests {
     fn pass(locks: &AccountLocks, s: &str, account: &str, now: i64) -> bool {
         match locks.note(key(s), account, now) {
             Some(change) => {
-                locks.write(&change, now);
+                locks.write(std::slice::from_ref(&change), now);
                 true
             }
             None => false,
@@ -436,8 +483,8 @@ mod tests {
         let first = stable.note(key("s"), "a", T0).unwrap();
         let second = unstable.note(key("s"), "b", T0 + 1).unwrap();
 
-        unstable.write(&second, T0 + 1);
-        stable.write(&first, T0 + 1);
+        unstable.write(std::slice::from_ref(&second), T0 + 1);
+        stable.write(std::slice::from_ref(&first), T0 + 1);
 
         assert_eq!(stable.get(&key("s"), T0 + 1), lock("a", true));
         assert_eq!(unstable.get(&key("s"), T0 + 1), lock("a", true));
@@ -596,5 +643,66 @@ mod tests {
             std::fs::read(dir.path().join("account-lock/locks.json")).unwrap(),
             b"{broken"
         );
+    }
+
+    /// 止まる前の drain で、渡しただけの書き込みもファイルに載る。
+    #[tokio::test]
+    async fn a_drain_writes_what_was_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = Arc::new(AccountLocks::open(dir.path()));
+        locks.remember(key("s1"), "a", T0);
+        locks.remember(key("s2"), "b", T0);
+        locks.drain(std::time::Duration::from_secs(5)).await;
+
+        let disk = on_disk(dir.path());
+        assert!(disk.contains_key(&map_key(&key("s1"))));
+        assert!(disk.contains_key(&map_key(&key("s2"))));
+    }
+
+    /// 溜まった書き込みは 1 度の flock でまとめて書く。
+    #[tokio::test]
+    async fn queued_writes_are_merged_into_one_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = Arc::new(AccountLocks::open(dir.path()));
+        for i in 0..10 {
+            locks.remember(key(&format!("s{i}")), "a", T0 + i);
+        }
+        locks.settled().await;
+
+        assert_eq!(on_disk(dir.path()).len(), 10);
+        let saves = locks.saves.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((1..=2).contains(&saves), "saved {saves} times");
+    }
+
+    /// 読み直しで、まだ書いていない手元の分はその印ごと残り、次の 2xx で書く。
+    #[test]
+    fn an_unwritten_lock_stays_pending_across_a_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = AccountLocks::open(dir.path());
+        let sibling = AccountLocks::open(dir.path());
+        // 手元で決まったが、まだ書いていない。
+        mine.note(key("s"), "a", T0).unwrap();
+        // その間に兄弟が同じ session を後から決めて書いた。
+        pass(&sibling, "s", "b", T0 + 1);
+
+        assert_eq!(mine.get(&key("s"), T0 + 2), lock("a", true));
+        assert!(
+            pass(&mine, "s", "a", T0 + 3),
+            "the pending decision is retried on the next success"
+        );
+        assert_eq!(sibling.get(&key("s"), T0 + 4), lock("a", true));
+    }
+
+    /// ファイルが消えたら、読み直しでロックも消える (次の書き込みで作り直す)。
+    #[test]
+    fn a_removed_file_forgets_the_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = AccountLocks::open(dir.path());
+        pass(&locks, "s", "a", T0);
+        std::fs::remove_file(dir.path().join("account-lock/locks.json")).unwrap();
+
+        assert_eq!(locks.get(&key("s"), T0), None);
+        assert!(pass(&locks, "s", "b", T0 + 1));
+        assert_eq!(on_disk(dir.path())[&map_key(&key("s"))].account, "b");
     }
 }

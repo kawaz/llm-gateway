@@ -365,6 +365,12 @@ impl<P: CredentialPersistence> Gateway<P> {
         }
     }
 
+    /// 裏に渡した session のロックの書き込みを、`limit` まで待って書き切る
+    /// (DR-0034)。止まる前に呼ぶ。
+    pub async fn drain_account_locks(&self, limit: std::time::Duration) {
+        self.router.drain_locks(limit).await;
+    }
+
     /// 変わった分をディスクへ落とす。
     ///
     /// 落とし損なっても止めない — 次の周回で書き直される。
@@ -617,7 +623,13 @@ impl<P: CredentialPersistence> Gateway<P> {
         };
         let mut routes = self
             .router
-            .routes_for(ns, ns_name, &model, &session)
+            .routes_for_locked(
+                ns,
+                ns_name,
+                &model,
+                &session,
+                call.lock.as_ref().map(|(lock, _)| lock),
+            )
             .await?;
         // この形を運べない経路は、ここで落とす。運べるかどうかは方言を知って
         // いる経路が答える (DR-0025) ので、core は provider の名前を知らないまま
