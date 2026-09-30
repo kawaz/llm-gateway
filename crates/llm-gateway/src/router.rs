@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use crate::account_lock::AccountLocks;
 use crate::config::{self, Config, Namespace, RouteSpec};
-use crate::credential::time::now_unix;
+use crate::credential::time::{now_unix, now_unix_ms};
 use crate::credential::{CredentialId, CredentialPersistence, CredentialStore};
 use crate::denial::{Availability, Denial, PROBE_INTERVAL, Reason, Scope};
 use crate::discovery::{self, Model};
@@ -855,7 +855,7 @@ impl Router {
         if ns.active().config.thinking_is_account_bound(model)
             && let Some(lock) = self
                 .locks
-                .get(&lock_key(ns_name, session, model), now_unix())
+                .get(&lock_key(ns_name, session, model), now_unix_ms())
         {
             let (mut locked, others): (Vec<_>, Vec<_>) = routes
                 .into_iter()
@@ -1035,7 +1035,7 @@ impl Router {
             self.locks.remember(
                 lock_key(ns.name(), session, model),
                 route.account(),
-                now_unix(),
+                now_unix_ms(),
             );
         }
     }
@@ -1054,7 +1054,7 @@ impl Router {
             return None;
         }
         self.locks
-            .get(&lock_key(ns.name(), session, model), now_unix())
+            .get(&lock_key(ns.name(), session, model), now_unix_ms())
     }
 
     /// discovery が済んだ状態を作る。

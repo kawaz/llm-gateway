@@ -37,8 +37,9 @@ DR-0033 は thinking が account に束縛されるモデルの session を開�
 - 形式は **1 ファイル 1 map** (JSON オブジェクト、鍵ごとに 1 レコード)。書き込みは既存の `write_atomically` (一時ファイル + fsync + rename) で丸ごと差し替える。jsonl の追記は採らない: 同じ鍵の更新が行として溜まり、読むたびに畳む処理と追記ファイルの切り詰めが要る。1 map なら読み手は mtime を 1 回見れば足りる (決定 4)
 - 書き換えは DR-0010 と同じ形: `.lock` を flock で掴む → 最新を読み直す → 自分の変更を当てる → 書く → 手放す。`.lock` は消さない (本体は rename で inode が変わるので、本体ではなく脇のファイルを掴む)
 - 読み直した上での当て方 (両 unit の書き込みが交差しても意味が崩れない規則):
-  - 鍵が無い、または寿命切れ → 自分の account を開始 account として入れる (first-writer-wins。flock の内側なので、別 unit が先に入れていればそちらが勝つ)
-  - 鍵がある → `account` は変えない。`crossed` は OR、`seen` は大きい方
+  - 鍵が無い、または寿命切れ → 自分の account を開始 account として入れる
+  - 鍵がある → 開始 account は **先に決まった方** (レコードの `decided_at` = 開始 account が決まった時刻が早い方) が勝つ (first-writer-wins を「先に書いた方」でなく「先に決まった方」と定義する。unit の内でも間でも、決まった順と flock を取る順は入れ替わりうるため。unit の内の書き込みは 1 本の書き手が FIFO で流す)
+  - 鍵がある → `crossed` は OR (開始 account が食い違っていれば遅く決めた側は跨いだことになるので真)、`seen` は大きい方
 - 両 unit が同じファイルを見るので、restart と unit の移動を跨いでロックと印が残る
 
 ### 3. 寿命は `seen` から 24 時間。刈り込みは書き込みのついでに行う
@@ -49,7 +50,7 @@ DR-0033 は thinking が account に束縛されるモデルの session を開�
 
 ### 4. 読みはメモリの控え + mtime、書きは状態が変わった 2xx だけ
 
-- **読み** (リクエストごと、`account_lock`): メモリに控えた map を引く。控えにはファイルの版 (mtime のナノ秒、DR-0010) を添え、引く前に版を見て変わっていれば読み直す。credential の `FileStore::version` と同じ型で、1 本あたりの仕事は `stat` 1 回
+- **読み** (リクエストごと、`account_lock`): メモリに控えた map を引く。控えにはファイルの版 (mtime のナノ秒・inode・長さ。DR-0010 の mtime に、同じナノ秒内の差し替えを見分ける inode を足す) を添え、引く前に版を見て変わっていれば読み直す。credential の `FileStore::version` と同じ考え方で、1 本あたりの仕事は `stat` 1 回
 - **書き** (2xx で `remember` が呼ばれた時): 次のどれかに当たる時だけ書く
   - 開始 account が決まった (鍵が無い / 寿命切れ)
   - `crossed` が偽から真になった

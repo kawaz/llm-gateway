@@ -5,35 +5,37 @@
 //! restart と兄弟の unit を跨いで覚えておくため、`[stats] dir` の下の
 //! `account-lock/locks.json` に 1 つの map として持ち、両 unit で共有する。
 //!
-//! - 読みはメモリの控えを引く。引く前にファイルの版 (mtime のナノ秒) を見て、
-//!   動いていれば読み直す
-//! - 書きは状態が変わった時だけ ([`AccountLocks::remember`])。脇の `.lock` を
-//!   flock で掴み、最新を読み直して当ててから丸ごと差し替える
+//! - 読みはメモリの控えを引く。引く前にファイルの版 (mtime・inode・長さ) を
+//!   見て、動いていれば読み直す
+//! - 書きは状態が変わった時だけ ([`AccountLocks::remember`])。unit ごとに 1 本の
+//!   書き手が順に、脇の `.lock` を flock で掴み、最新を読み直して当ててから
+//!   丸ごと差し替える
 //! - 読み書きの失敗は警告を残して進む。ロックは推論の連続性を守る仕組みで、
 //!   置き場の障害で転送を止めるほど重くない
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::persist::write_atomically;
 use crate::router::AccountLock;
 
-/// 最後に通ってから、ロックを覚えておく時間 (秒)。
-pub const LOCK_TTL_SECS: i64 = 24 * 3600;
+/// 最後に通ってから、ロックを覚えておく時間 (ミリ秒)。
+pub const LOCK_TTL_MS: i64 = 24 * 3600 * 1000;
 
-/// `seen` だけが進んだ時に、ファイルへ書き直す間隔 (秒)。
+/// `seen` だけが進んだ時に、ファイルへ書き直す間隔 (ミリ秒)。
 ///
 /// `seen` の更新を 2xx ごとに書くと、書き込みがリクエスト数に比例する。
 /// 寿命 24 時間に対して 5 分の誤差なら困らない。
-const SEEN_STRIDE_SECS: i64 = 300;
+const SEEN_STRIDE_MS: i64 = 300 * 1000;
 
 /// ロックの鍵。affinity と同じ `(namespace 名, session key, モデル)`。
 pub type Key = (String, String, String);
 
-/// ファイルの 1 レコード。
+/// ファイルの 1 レコード。時刻は Unix ミリ秒。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     ns: String,
@@ -41,7 +43,9 @@ struct Record {
     model: String,
     account: String,
     crossed: bool,
-    /// 最後にこの session が 2xx で通った時刻 (Unix 秒)。
+    /// 開始 account が決まった時刻。2 つの言い分が食い違ったら早い方が勝つ。
+    decided_at: i64,
+    /// 最後にこの session が 2xx で通った時刻。寿命の起点。
     seen: i64,
 }
 
@@ -51,16 +55,23 @@ impl Record {
     }
 
     fn alive(&self, now: i64) -> bool {
-        now - self.seen < LOCK_TTL_SECS
+        now - self.seen < LOCK_TTL_MS
     }
 
-    /// 同じ鍵の別の言い分を当てる。`account` は先にあった方 (= self) が勝ち、
-    /// `crossed` は OR、`seen` は大きい方。
+    /// 同じ鍵の別の言い分を当てる。`account` は先に決まった方 (同時なら
+    /// self) が勝ち、`crossed` は OR、`seen` は大きい方 (DR-0034 決定 2)。
     ///
-    /// 相手の開始 account がこちらと違えば、相手はこちらの開始 account 以外へ
-    /// 送ったことになるので、それも跨ぎとして数える。
+    /// 書き込みの順 (flock を取った順) で決めないのは、同じ unit の中でも
+    /// unit の間でも、決まった順と書かれる順が入れ替わりうるため。
+    ///
+    /// 2 つの開始 account が違えば、遅く決めた側は勝った方の開始 account
+    /// 以外へ送ったことになるので、それも跨ぎとして数える。
     fn absorb(&mut self, other: &Record) {
         self.crossed |= other.crossed || other.account != self.account;
+        if other.decided_at < self.decided_at {
+            self.account.clone_from(&other.account);
+            self.decided_at = other.decided_at;
+        }
         self.seen = self.seen.max(other.seen);
     }
 }
@@ -73,6 +84,10 @@ fn map_key(key: &Key) -> String {
     serde_json::to_string(&[&key.0, &key.1, &key.2]).unwrap_or_default()
 }
 
+/// ファイルの版。rename のたびに inode が変わるので、同じ mtime (ナノ秒) の
+/// 内に 2 度差し替わっても見分けられる。
+type Version = (u128, u64, u64);
+
 /// メモリの控え 1 件。
 struct Entry {
     record: Record,
@@ -83,39 +98,50 @@ struct Entry {
 #[derive(Default)]
 struct Memo {
     /// 控えが写しているファイルの版。
-    version: Option<u64>,
+    version: Option<Version>,
     entries: HashMap<Key, Entry>,
 }
 
 impl Memo {
-    /// ファイルの中身を控えに当てる。account はファイルが正 (別 unit が先に
-    /// 入れていればそちら)、印と `seen` は合わせる。
-    fn absorb_file(&mut self, map: Map, now: i64) {
+    /// 控えをファイルの中身に置き換える。ファイルが正で、残すのはまだ
+    /// 書いていない手元の分だけ (書いた後にファイルから消えた鍵は、別の
+    /// 書き手が刈ったもの)。同じ鍵に手元の言い分があれば当てる。
+    fn replace_with(&mut self, map: Map, now: i64) {
+        let mut previous = std::mem::take(&mut self.entries);
         for (_, mut from_file) in map {
             if !from_file.alive(now) {
                 continue;
             }
             let key = from_file.key();
-            let mine = self.entries.get(&key);
-            let written = mine
-                .and_then(|e| e.written)
-                .map_or(from_file.seen, |w| w.max(from_file.seen));
-            if let Some(mine) = mine
-                && mine.record.alive(now)
-            {
-                from_file.absorb(&mine.record);
+            let mut written = from_file.seen;
+            if let Some(mine) = previous.remove(&key) {
+                written = mine.written.map_or(written, |w| w.max(written));
+                if mine.record.alive(now) {
+                    from_file.absorb(&mine.record);
+                }
             }
-            let written = Some(written);
             self.entries.insert(
                 key,
                 Entry {
                     record: from_file,
-                    written,
+                    written: Some(written),
                 },
             );
         }
-        self.entries.retain(|_, e| e.record.alive(now));
+        self.entries.extend(
+            previous
+                .into_iter()
+                .filter(|(_, e)| e.written.is_none() && e.record.alive(now)),
+        );
     }
+}
+
+/// 書き手への 1 件。
+enum Job {
+    Write(Record),
+    /// ここまでの書き込みが済んだら知らせる。
+    #[cfg(test)]
+    Settle(tokio::sync::oneshot::Sender<()>),
 }
 
 /// ロックの表。メモリの控えと、兄弟の unit と共有するファイル。
@@ -123,8 +149,9 @@ pub struct AccountLocks {
     path: PathBuf,
     lock_path: PathBuf,
     memo: std::sync::Mutex<Memo>,
-    /// 裏で走っている書き込み。試験で書き終わりを待つためだけに持つ。
-    writes: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// 裏の書き手への口。最初の書き込みで書き手を起こす (作る時点では
+    /// runtime の内側とは限らない)。
+    writer: OnceLock<mpsc::UnboundedSender<Job>>,
 }
 
 impl AccountLocks {
@@ -136,9 +163,9 @@ impl AccountLocks {
             path: dir.join("locks.json"),
             lock_path: dir.join("locks.json.lock"),
             memo: std::sync::Mutex::new(Memo::default()),
-            writes: std::sync::Mutex::new(Vec::new()),
+            writer: OnceLock::new(),
         };
-        locks.refresh(&mut locks.memo(), crate::credential::time::now_unix());
+        locks.refresh(&mut locks.memo(), crate::credential::time::now_unix_ms());
         locks
     }
 
@@ -159,26 +186,52 @@ impl AccountLocks {
         })
     }
 
-    /// `account` で 2xx が返ったことを覚える。控えはその場で更新し、状態が
-    /// 変わっていればファイルへの書き込みを裏で出す (送信を待たせない)。
+    /// `account` で 2xx が返ったことを覚える (`now` は Unix ミリ秒)。控えは
+    /// その場で更新し、状態が変わっていればファイルへの書き込みを裏の書き手
+    /// へ渡す (送信を待たせない)。
     pub fn remember(self: &Arc<Self>, key: Key, account: &str, now: i64) {
-        let Some(change) = self.note(key, account, now) else {
-            return;
-        };
-        let this = Arc::clone(self);
-        let handle = tokio::task::spawn_blocking(move || this.write(&change, now));
-        let mut writes = self
-            .writes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writes.retain(|h| !h.is_finished());
-        writes.push(handle);
+        if let Some(change) = self.note(key, account, now) {
+            self.send(Job::Write(change));
+        }
+    }
+
+    /// 書き手へ渡す。書き手は unit に 1 本で、受け取った順に 1 件ずつ書く —
+    /// 書き込みごとに並行させると flock を取る順が渡した順と入れ替わる。
+    fn send(self: &Arc<Self>, job: Job) {
+        let writer = self.writer.get_or_init(|| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+            // 書き手は表を弱く持つ。表が落ちれば口も閉じて書き手も終わる。
+            let this: Weak<Self> = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    match job {
+                        Job::Write(change) => {
+                            let Some(locks) = this.upgrade() else { break };
+                            let written = tokio::task::spawn_blocking(move || {
+                                locks.write(&change, crate::credential::time::now_unix_ms());
+                            })
+                            .await;
+                            if let Err(e) = written {
+                                tracing::warn!(%e, "the session account lock writer failed");
+                            }
+                        }
+                        #[cfg(test)]
+                        Job::Settle(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            });
+            tx
+        });
+        // 書き手が終わっているのは表が落ちる時だけで、書く先も無い。
+        let _ = writer.send(job);
     }
 
     /// 控えを更新し、ファイルへ書くべき変化なら書く中身を返す。
     ///
     /// 書くのは、開始 account が決まった時 / 印が立った時 / `seen` が前に
-    /// 書いた値から [`SEEN_STRIDE_SECS`] 以上進んだ時だけ (DR-0034 決定 4)。
+    /// 書いた値から [`SEEN_STRIDE_MS`] 以上進んだ時だけ (DR-0034 決定 4)。
     fn note(&self, key: Key, account: &str, now: i64) -> Option<Record> {
         let mut memo = self.memo();
         self.refresh(&mut memo, now);
@@ -189,7 +242,7 @@ impl AccountLocks {
                 entry.record.seen = entry.record.seen.max(now);
                 let stale = entry
                     .written
-                    .is_none_or(|written| now - written >= SEEN_STRIDE_SECS);
+                    .is_none_or(|written| now - written >= SEEN_STRIDE_MS);
                 (entry.record.crossed != was_crossed || stale).then(|| entry.record.clone())
             }
             _ => {
@@ -199,6 +252,7 @@ impl AccountLocks {
                     model: key.2.clone(),
                     account: account.to_owned(),
                     crossed: false,
+                    decided_at: now,
                     seen: now,
                 };
                 memo.entries.insert(
@@ -213,24 +267,29 @@ impl AccountLocks {
         }
     }
 
-    /// 版が動いていればファイルを読み直して控えに当てる。
+    /// 版が動いていればファイルを読み直して控えを置き換える。
     fn refresh(&self, memo: &mut Memo, now: i64) {
         let version = self.version();
         if version.is_none() || version == memo.version {
             return;
         }
         if let Some(map) = self.read() {
-            memo.absorb_file(map, now);
+            memo.replace_with(map, now);
             memo.version = version;
         }
     }
 
-    /// 更新時刻を版として使う。書き換えは rename なので、中身が入れ替われば
-    /// 必ず動く (DR-0010)。
-    fn version(&self) -> Option<u64> {
-        let modified = std::fs::metadata(&self.path).ok()?.modified().ok()?;
-        let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-        Some(since_epoch.as_nanos() as u64)
+    /// 更新時刻 (ナノ秒)・inode・長さを版として使う。書き換えは rename なので、
+    /// 中身が入れ替われば inode が必ず変わる (DR-0010 の mtime に inode を足す)。
+    fn version(&self) -> Option<Version> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(&self.path).ok()?;
+        let since_epoch = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((since_epoch.as_nanos(), meta.ino(), meta.len()))
     }
 
     /// ファイルの中身。無ければ空、読めなければ `None` (控えのまま進む)。
@@ -254,9 +313,8 @@ impl AccountLocks {
 
     /// 脇の `.lock` を掴み、最新を読み直して当て、寿命切れを刈って書く。
     ///
-    /// 鍵が無い (または寿命切れ) なら自分の account を開始 account として
-    /// 入れる。あれば account は変えず、印は OR、`seen` は大きい方
-    /// (DR-0034 決定 2)。掴んでいる区間は読み直しから rename までだけ。
+    /// 鍵が無い (または寿命切れ) なら入れる。あれば [`Record::absorb`] で
+    /// 当てる。掴んでいる区間は読み直しから rename までだけ。
     fn write(&self, change: &Record, now: i64) {
         if let Err(e) = self.write_locked(change, now) {
             tracing::warn!(path = %self.path.display(), %e, "cannot save the session account lock");
@@ -283,7 +341,7 @@ impl AccountLocks {
         write_atomically(&self.path, &map)?;
         let version = self.version();
         let mut memo = self.memo();
-        memo.absorb_file(map, now);
+        memo.replace_with(map, now);
         memo.version = version;
         Ok(())
     }
@@ -305,18 +363,12 @@ impl AccountLocks {
         }
     }
 
-    /// 裏で出した書き込みが全部終わるまで待つ。
+    /// ここまでに渡した書き込みが全部終わるまで待つ。
     #[cfg(test)]
-    pub async fn settled(&self) {
-        let writes: Vec<_> = std::mem::take(
-            &mut *self
-                .writes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        for handle in writes {
-            handle.await.unwrap();
-        }
+    pub async fn settled(self: &Arc<Self>) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.send(Job::Settle(done));
+        wait.await.unwrap();
     }
 }
 
@@ -324,7 +376,7 @@ impl AccountLocks {
 mod tests {
     use super::*;
 
-    const T0: i64 = 1_800_000_000;
+    const T0: i64 = 1_800_000_000_000;
 
     fn key(s: &str) -> Key {
         ("default".into(), s.into(), "m".into())
@@ -374,20 +426,90 @@ mod tests {
         );
     }
 
-    /// 並行した初回: 控えは互いに知らず、flock の内側で先に書いた方が勝つ。
+    /// 並行した初回: 控えは互いに知らず、flock を取る順が決まった順と逆でも、
+    /// 先に決まった方の account が開始 account になる。
     #[test]
-    fn the_first_writer_wins_between_units() {
+    fn the_earlier_decision_wins_whatever_order_it_is_written_in() {
         let dir = tempfile::tempdir().unwrap();
         let stable = AccountLocks::open(dir.path());
         let unstable = AccountLocks::open(dir.path());
         let first = stable.note(key("s"), "a", T0).unwrap();
-        let second = unstable.note(key("s"), "b", T0).unwrap();
+        let second = unstable.note(key("s"), "b", T0 + 1).unwrap();
 
-        unstable.write(&second, T0);
-        stable.write(&first, T0);
+        unstable.write(&second, T0 + 1);
+        stable.write(&first, T0 + 1);
 
-        assert_eq!(stable.get(&key("s"), T0), lock("b", true));
-        assert_eq!(unstable.get(&key("s"), T0), lock("b", true));
+        assert_eq!(stable.get(&key("s"), T0 + 1), lock("a", true));
+        assert_eq!(unstable.get(&key("s"), T0 + 1), lock("a", true));
+    }
+
+    /// 同じ unit の書き込みは渡した順に 1 本ずつ流れる。
+    #[tokio::test]
+    async fn one_unit_writes_in_the_order_it_decided() {
+        let dir = tempfile::tempdir().unwrap();
+        let locks = Arc::new(AccountLocks::open(dir.path()));
+        for i in 0..20 {
+            locks.remember(key(&format!("s{i}")), "a", T0 + i);
+        }
+        locks.remember(key("s0"), "b", T0 + 100);
+        locks.settled().await;
+
+        let disk = on_disk(dir.path());
+        assert_eq!(disk.len(), 20);
+        let record = &disk[&map_key(&key("s0"))];
+        assert_eq!((record.account.as_str(), record.crossed), ("a", true));
+    }
+
+    /// 同じ mtime のまま差し替わっても (rename で inode が変わるので) 読み直す。
+    #[test]
+    fn a_replacement_within_the_same_mtime_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-lock/locks.json");
+        let pin = |path: &Path| {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+            )
+            .unwrap();
+        };
+        let writer = AccountLocks::open(dir.path());
+        pass(&writer, "s1", "a", T0);
+        pin(&path);
+        let reader = AccountLocks::open(dir.path());
+        assert_eq!(reader.get(&key("s1"), T0), lock("a", false));
+
+        // 同じ長さ・同じ mtime の中身へ差し替える。
+        let mut map = on_disk(dir.path());
+        let mut record = map.remove(&map_key(&key("s1"))).unwrap();
+        record.session = "s2".into();
+        map.insert(map_key(&key("s2")), record);
+        write_atomically(&path, &map).unwrap();
+        pin(&path);
+
+        assert_eq!(reader.get(&key("s2"), T0), lock("a", false));
+        assert_eq!(reader.get(&key("s1"), T0), None, "the file is the truth");
+    }
+
+    /// 読み直しは控えをファイルの中身に置き換える。書いた後にファイルから
+    /// 消えた鍵 (別の書き手が刈った) は落とし、まだ書いていない鍵は残す。
+    #[test]
+    fn a_refresh_drops_keys_gone_from_the_file_but_keeps_unwritten_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-lock/locks.json");
+        let locks = AccountLocks::open(dir.path());
+        pass(&locks, "gone", "a", T0);
+        pass(&locks, "kept", "a", T0);
+        // 控えにだけあって、まだ書いていない鍵。
+        locks.note(key("pending"), "a", T0).unwrap();
+
+        // 別の書き手が "gone" を刈った。
+        let mut map = on_disk(dir.path());
+        map.remove(&map_key(&key("gone")));
+        write_atomically(&path, &map).unwrap();
+
+        assert_eq!(locks.get(&key("gone"), T0), None);
+        assert_eq!(locks.get(&key("kept"), T0), lock("a", false));
+        assert_eq!(locks.get(&key("pending"), T0), lock("a", false));
     }
 
     /// 寿命切れは読み手に見えず、次の書き込みで消える。
@@ -396,7 +518,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let locks = AccountLocks::open(dir.path());
         pass(&locks, "old", "a", T0);
-        let later = T0 + LOCK_TTL_SECS;
+        let later = T0 + LOCK_TTL_MS;
 
         let fresh = AccountLocks::open(dir.path());
         assert_eq!(fresh.get(&key("old"), later), None);
@@ -418,8 +540,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let locks = AccountLocks::open(dir.path());
         pass(&locks, "s", "a", T0);
-        pass(&locks, "s", "b", T0 + LOCK_TTL_SECS);
-        assert_eq!(locks.get(&key("s"), T0 + LOCK_TTL_SECS), lock("b", false));
+        pass(&locks, "s", "b", T0 + LOCK_TTL_MS);
+        assert_eq!(locks.get(&key("s"), T0 + LOCK_TTL_MS), lock("b", false));
     }
 
     /// `seen` だけが進んだ時は 5 分ごとにしか書かない。印が立てばすぐ書く。
@@ -431,15 +553,15 @@ mod tests {
             pass(&locks, "s", "a", T0),
             "the starting account is written"
         );
-        assert!(!pass(&locks, "s", "a", T0 + SEEN_STRIDE_SECS - 1));
+        assert!(!pass(&locks, "s", "a", T0 + SEEN_STRIDE_MS - 1));
         assert_eq!(on_disk(dir.path())[&map_key(&key("s"))].seen, T0);
 
-        assert!(pass(&locks, "s", "a", T0 + SEEN_STRIDE_SECS));
+        assert!(pass(&locks, "s", "a", T0 + SEEN_STRIDE_MS));
         assert!(
-            pass(&locks, "s", "b", T0 + SEEN_STRIDE_SECS + 1),
+            pass(&locks, "s", "b", T0 + SEEN_STRIDE_MS + 1),
             "crossing is written"
         );
-        assert!(!pass(&locks, "s", "b", T0 + SEEN_STRIDE_SECS + 2));
+        assert!(!pass(&locks, "s", "b", T0 + SEEN_STRIDE_MS + 2));
     }
 
     /// 書けなかった開始 account は、次の 2xx で書き直す。
