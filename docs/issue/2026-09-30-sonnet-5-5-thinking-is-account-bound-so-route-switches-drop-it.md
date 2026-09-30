@@ -52,6 +52,25 @@ kawaz 裁定待ち: どの候補で行くか、実機検証を許可する accou
 
 裁定点: (1')/(2')/(3') の組み合わせ、route → account 対応を設定で表す形。
 
+## 適用範囲の前提 (2026-09-30 一次資料再確認)
+
+束縛の種類とモデルごとの現状:
+
+| 束縛 | Sonnet 5.5 | Fable 5.1 | Opus 5.5 |
+|---|---|---|---|
+| account 束縛 | あり | なし | なし |
+| prefix 束縛 | あり | あり | あり |
+| model 束縛 | あり | あり | あり |
+
+- account 束縛は現時点で Sonnet 5.5 だけ。prefix 束縛と model 束縛は全モデル・全 account で効く
+- ただし資料は「newer Claude models の性質」「later checks add values」と書いており、他モデルに広がらない保証は無い
+- Fable の routing は Bedrock を fail over 先に含み、Bedrock は別 account 扱い。Fable に広がると、統括セッションの長い thinking 連鎖が fail over の瞬間に黙って消える (致命的、kawaz 指摘)
+- 実測どおり beta header は account 不一致を報告しないので、gateway が自前で判断する必要がある
+
+設計方針: 対策をモデル固有にしない。**モデルごとの束縛ポリシーを設定で持ち、既定リストは今は `claude-sonnet-5-5` だけ**にする。他モデルに広がったら設定 1 行で追加できる形にする。
+
+裁定点の更新: (1'') 束縛モデルの会話は同一 account に pin し、枠切れ時だけ利用者に選ばせる、を opt-in でなく既定に近づけるか。
+
 ## 受け入れ条件
 
 - [ ] 候補 (1)〜(4) のどれで行くか裁定される
