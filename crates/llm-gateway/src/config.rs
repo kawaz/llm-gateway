@@ -133,6 +133,19 @@ pub struct Config {
     #[serde(default)]
     pub ratelimit: RateLimitStore,
 
+    /// thinking の署名が生成した account にしか効かないモデル (DR-0033 §1)。
+    ///
+    /// upstream の性質で namespace ごとには変わらないので、最上位に 1 つ置く。
+    /// 要素は routing / cache の `models` と同じパターンで、解決後のモデル名と
+    /// 照合する。書けば既定を置き換え (DR-0013 の配列の規則)、`[]` で無効。
+    #[serde(default = "default_account_bound_thinking")]
+    pub account_bound_thinking: Vec<String>,
+
+    /// 束縛モデルの session が開始 account の経路を全部断られたときの振る舞い
+    /// (DR-0033 §2)。
+    #[serde(default)]
+    pub on_account_switch: OnAccountSwitch,
+
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
     /// 何を隠すか・どう振り分けるか・短い名前をどうするかは、使う人ごとに
@@ -370,6 +383,23 @@ impl From<Namespace> for NamespaceRepr {
             thinking_display: n.thinking_display,
         }
     }
+}
+
+fn default_account_bound_thinking() -> Vec<String> {
+    vec!["claude-sonnet-5-5".to_owned()]
+}
+
+/// 開始 account の経路が全部使えないときに、別 account へ移るか (DR-0033 §2)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnAccountSwitch {
+    /// 移らない。全経路が締め出された時と同じ 429 + `retry-after` を返す。
+    Stay,
+    /// 移る。本文はそのままで、履歴の thinking は API が捨てるのに任せる。
+    #[default]
+    DropThinking,
+    /// 移る。その session は以後 thinking を assistant の text にして送る。
+    ThinkingAsText,
 }
 
 /// Messages API の思考表示方法。
@@ -1529,6 +1559,11 @@ fn validate_route(name: &str, route: &RouteSpec, config: &Config) -> Result<()> 
 }
 
 impl Config {
+    /// このモデル (解決後の名前) の thinking が account に束縛されるか (DR-0033 §1)。
+    pub fn thinking_is_account_bound(&self, model: &str) -> bool {
+        crate::pattern::matches_any(&self.account_bound_thinking, model)
+    }
+
     /// 読み込む。設定に矛盾があればここで弾く。
     pub fn load(path: &Path) -> Result<Self> {
         // 土台 (`extends`) があれば先に畳む (DR-0013)。
@@ -1548,6 +1583,12 @@ impl Config {
     /// 起動時に落としておかないと、その規則を最初に踏んだ人が
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
+        if self.account_bound_thinking.iter().any(String::is_empty) {
+            return Err(Error::Config(
+                "account_bound_thinking has an empty pattern; remove it or write a model name"
+                    .to_owned(),
+            ));
+        }
         let (_, refused) = self.webhook.destinations();
         if let Some(reason) = refused.first() {
             return Err(Error::Config(format!("webhook destination {reason}")));
@@ -2094,6 +2135,46 @@ routes = ["cpa"]
 [ns.default.aliases]
 o = "claude-opus-*"
 "#;
+
+    #[test]
+    fn account_bound_thinking_defaults_to_sonnet_5_5_only() {
+        let c = parse("").unwrap();
+        assert!(c.thinking_is_account_bound("claude-sonnet-5-5"));
+        assert!(!c.thinking_is_account_bound("claude-fable-5-1"));
+        assert!(!c.thinking_is_account_bound("claude-opus-5-5"));
+        assert_eq!(c.on_account_switch, OnAccountSwitch::DropThinking);
+    }
+
+    #[test]
+    fn account_bound_thinking_written_replaces_the_default() {
+        let c = parse(r#"account_bound_thinking = ["claude-fable-5-*"]"#).unwrap();
+        assert!(c.thinking_is_account_bound("claude-fable-5-1"));
+        assert!(!c.thinking_is_account_bound("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn account_bound_thinking_empty_matches_nothing() {
+        let c = parse("account_bound_thinking = []").unwrap();
+        assert!(!c.thinking_is_account_bound("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn account_bound_thinking_rejects_an_empty_pattern() {
+        assert!(parse(r#"account_bound_thinking = [""]"#).is_err());
+    }
+
+    #[test]
+    fn on_account_switch_reads_all_three_values() {
+        for (raw, want) in [
+            ("stay", OnAccountSwitch::Stay),
+            ("drop_thinking", OnAccountSwitch::DropThinking),
+            ("thinking_as_text", OnAccountSwitch::ThinkingAsText),
+        ] {
+            let c = parse(&format!("on_account_switch = \"{raw}\"")).unwrap();
+            assert_eq!(c.on_account_switch, want);
+        }
+        assert!(parse(r#"on_account_switch = "switch""#).is_err());
+    }
 
     fn parse(s: &str) -> Result<Config> {
         let c: Config = toml::from_str(s).map_err(|e| Error::Config(e.to_string()))?;
