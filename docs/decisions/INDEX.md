@@ -47,3 +47,4 @@ Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは�
 | [DR-0031](DR-0031-store-layer.md) | 🟡 部分実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |
 | [DR-0032](DR-0032-daemon-reload.md) | ✅ 実装済 | 設定の読み直しを `daemon reload` で明示的に行う (CLI → 監督者 → unit ごとの制御 socket、`check` と同じ経路で検証して通った時だけ差し替え、変えられない欄の変更は restart を求めて断る) |
 | [DR-0033](DR-0033-lock-session-to-first-account-and-send-crossed-thinking-as-text.md) | ✅ 実装済 | thinking が account に束縛されるモデル (設定、既定は Sonnet 5.5) の session を開始 account にロックし、開始 account が全滅した時の振る舞いを `on_account_switch` (`stay` / `drop_thinking` / `thinking_as_text`) で選ぶ。`thinking_as_text` で跨いだ session は以後 thinking を改行を保った本文だけの text として送る |
+| [DR-0034](DR-0034-persist-session-account-lock-in-store.md) | ⬜ 未実装 | DR-0033 の開始 account と「跨いだ」印を `[stats] dir` の共有ファイル (flock、1 ファイル 1 map) に永続化し、restart と unit 間で共有する (寿命は `seen` から 24h、書くのは状態が変わった 2xx だけ、affinity は永続化しない) |
