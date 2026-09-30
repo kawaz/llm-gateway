@@ -293,6 +293,17 @@ static TABLE: &[Row] = &[
         ],
         OPENAI_REFINEMENTS,
     ),
+    // gpt-6.1-sol は 2026-09-30 確認 (changelog 2026-09-29 公開)。cache read が gpt-6-sol の半額。
+    row(
+        &["gpt-6.1-sol", "gpt-6.1-sol-*"],
+        &[
+            (INPUT, 2.0),
+            (OUTPUT, 10.0),
+            (CACHE_WRITE, 2.5),
+            (CACHE_READ, 0.1),
+        ],
+        OPENAI_REFINEMENTS,
+    ),
     // gpt-6 の sol / luna は 2026-09-23 確認 (同じ Standard 表)。導入価格の断りは無い。
     row(
         &["gpt-6-sol", "gpt-6-sol-*"],
@@ -503,6 +514,10 @@ mod tests {
         assert_eq!(rate("claude-fable-5-1", &TokenKind::output()), Some(50.0));
         assert_eq!(rate("gpt-5.6-luna", &TokenKind::output()), Some(1.2));
         assert_eq!(rate("gpt-6-sol", &TokenKind::output()), Some(10.0));
+        assert_eq!(
+            rate("gpt-6.1-sol", &TokenKind::input_cache_read()),
+            Some(0.1)
+        );
         assert_eq!(rate("gpt-6-luna", &TokenKind::input()), Some(0.1));
     }
 
