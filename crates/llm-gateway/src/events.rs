@@ -114,6 +114,15 @@ pub struct Event {
     /// 分岐時間に収まる本数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_breakeven_count: Option<u32>,
+    /// account を跨いだ session の thinking を text にして送った (DR-0033 §5)。
+    /// 当てはまらない 1 本では欄ごと出さない。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thinking_as_text: bool,
+    /// 開始 account 以外へ本文のまま送った (DR-0033 §5)。履歴の thinking が
+    /// API に捨てられる見込みの印で、実際に捨てられたかは見えない。当てはまらない
+    /// 1 本では欄ごと出さない。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thinking_dropped_by_switch: bool,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -192,6 +201,9 @@ impl Event {
             cache_until_count: origin.chain.map(|chain| chain.until_count),
             cache_breakeven_until: origin.breakeven.map(|breakeven| breakeven.until_ms),
             cache_breakeven_count: origin.breakeven.map(|breakeven| breakeven.count),
+            // 送る経路が決まって初めて分かる。立てるのは送る側。
+            thinking_as_text: false,
+            thinking_dropped_by_switch: false,
         }
     }
 }

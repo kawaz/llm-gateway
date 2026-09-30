@@ -41,6 +41,7 @@ pub mod stats;
 pub mod status;
 mod statuspage_v2;
 pub mod tap;
+pub mod thinking;
 pub mod webhook;
 
 pub use config::Config;

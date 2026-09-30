@@ -16,7 +16,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::cache::{self, keepalive};
-use crate::config::{CacheRule, CacheStrategy, Config};
+use crate::config::{CacheRule, CacheStrategy, Config, OnAccountSwitch};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms, to_unix_secs};
 use crate::credential::{Credential, CredentialId, CredentialPersistence, CredentialStore, Kind};
@@ -28,7 +28,7 @@ use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
 use crate::quota::{self, QuotaLimit, QuotaStore};
-use crate::router::{NamespaceView, Route, Router, Selection};
+use crate::router::{AccountLock, Crossing, NamespaceView, Route, Router, Selection};
 use crate::session;
 use crate::stats::{self, Stats};
 use crate::tap::Tap;
@@ -587,6 +587,14 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
+        // thinking が account に束縛されるモデルの session は、開始 account に
+        // 結ぶ (DR-0033 §2)。`stay` なら他の account の経路は候補から外す —
+        // 開始 account が全部断れば、全経路が締め出された時と同じ 429 になる。
+        let lock = self
+            .router
+            .account_lock(ns, &session, &model)
+            .await
+            .map(|lock| (lock, ns.active().config().on_account_switch));
         let call = Call {
             principal: principal.and_then(|p| p.subject.as_deref().zip(p.kid.as_deref())),
             ns: ns_name,
@@ -599,6 +607,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             cache: ns.cache_for(&model),
             series,
             shape,
+            lock,
         };
         let mut routes = self
             .router
@@ -610,6 +619,9 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 無い」ではなく「この形では運べない」— 別の受け口なら通るので、
         // 区別が付かないと直しようがない。
         routes.retain(|route| route.preset.wire().accepts(shape));
+        if let Some((lock, OnAccountSwitch::Stay)) = &call.lock {
+            routes.retain(|route| route.account() == lock.account);
+        }
         if routes.is_empty() {
             return Err(Error::UnsupportedRequestShape {
                 model,
@@ -1224,6 +1236,13 @@ impl<P: CredentialPersistence> Gateway<P> {
         // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
         let (origin, strategy) = call.cache_view();
+        // account を跨いだ session の thinking は text にする (DR-0033 §3)。
+        // cache 戦略より前に当てる — 整える `cache_control` は変換後の本文の上に
+        // 置く。控え (keepalive) も変換後の本文を持つ。
+        let crossing = call.crossing(route);
+        if crossing == Crossing::ThinkingAsText {
+            crate::thinking::as_text(&mut body);
+        }
         // この 1 本の時刻は**ここで 1 回だけ**読む。知らせの `ts` にも、
         // 連鎖の起点にも同じ値を使う。
         let sent_at_ms = now_unix_ms();
@@ -1306,7 +1325,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         // status で絞らない。ただし断られた 1 本には延ばす cache が無いので、
         // 寿命は約束しない (控えを置かないのと対称、DR-0027 決定 8)。
         let promised = resp.response.status / 100 == 2;
-        self.events.publish(events::Event::with_skipped(
+        let mut event = events::Event::with_skipped(
             sent_at_ms,
             &events::Origin {
                 origin: origin.as_str(),
@@ -1318,7 +1337,10 @@ impl<P: CredentialPersistence> Gateway<P> {
             },
             resp.response.status,
             skipped.to_vec(),
-        ));
+        );
+        event.thinking_as_text = crossing == Crossing::ThinkingAsText;
+        event.thinking_dropped_by_switch = crossing == Crossing::ThinkingDropped;
+        self.events.publish(event);
         // 応答が閉じたときの知らせは、素性がここで揃う。終わり方が分かるのは
         // 本文を流し切ったところ ([`crate::exchange`]) なので、下書きだけを
         // 作って持たせる。会話でない口 (`count_tokens`) には作らない。
@@ -1738,9 +1760,22 @@ struct Call<'a> {
     series: Option<keepalive::Series>,
     /// クライアントから受けた本文の形 (DR-0025)。
     shape: RequestShape,
+    /// この session が結ばれている account と、そこを離れるときの振る舞い
+    /// (DR-0033)。thinking が account に束縛されないモデルと、開始 account が
+    /// まだ決まっていない session では `None`。
+    lock: Option<(AccountLock, OnAccountSwitch)>,
 }
 
 impl<'a> Call<'a> {
+    /// この経路へ送る 1 本が、session の thinking をどう運ぶか (DR-0033)。
+    fn crossing(&self, route: &Route) -> Crossing {
+        self.lock
+            .as_ref()
+            .map_or(Crossing::Unchanged, |(lock, policy)| {
+                lock.crossing(route, *policy)
+            })
+    }
+
     /// 知らせに載せる素性。答えた経路の名前だけが呼び出しごとに変わる。
     fn origin(&'a self, credential: &'a str) -> events::Origin<'a> {
         events::Origin {
@@ -7987,5 +8022,215 @@ models = ["n"]
 
         assert!(outcome.warnings[0].contains("did not arrive in time"));
         assert!(gw.namespace(NS).unwrap().config().routes.contains_key("a"));
+    }
+
+    // ---------- account への束縛 (DR-0033) ----------
+
+    /// 2 つの relay 経路 (= 別 account) と、束縛と切り替えの設定。
+    fn bound_config(first: &str, second: &str, bound: &str, policy: &str) -> String {
+        format!(
+            "account_bound_thinking = {bound}\non_account_switch = \"{policy}\"\n{}",
+            two_credentials(first, second)
+        )
+    }
+
+    /// 履歴に thinking を持つ会話の 1 本。
+    fn thinking_request() -> Value {
+        json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "step one\nstep two\n", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "text", "text": "done"},
+                ]},
+                {"role": "user", "content": "next"},
+            ],
+            "metadata": {"user_id": r#"{"session_id":"s1"}"#},
+        })
+    }
+
+    /// 変換後に届くはずの履歴。
+    fn thinking_as_text_messages() -> Value {
+        json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "step one step two"},
+                {"type": "text", "text": "done"},
+            ]},
+            {"role": "user", "content": "next"},
+        ])
+    }
+
+    async fn forward_thinking<P: CredentialPersistence>(gw: &Gateway<P>) -> Forwarded {
+        gw.forward(
+            &ns(gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            thinking_request(),
+            vec![],
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 今までに流れた転送の知らせ (経路名と 2 つの印)。
+    fn crossing_marks(watching: &mut events::Watching) -> Vec<(String, bool, bool)> {
+        let mut marks = Vec::new();
+        while let Ok(notice) = watching.try_recv() {
+            if let Some(event) = notice.request() {
+                let json = serde_json::to_value(event).unwrap();
+                // 立っていない印は欄ごと出ない。
+                for field in ["thinking_as_text", "thinking_dropped_by_switch"] {
+                    assert_ne!(json.get(field), Some(&json!(false)), "{json}");
+                }
+                marks.push((
+                    event.credential.clone(),
+                    event.thinking_as_text,
+                    event.thinking_dropped_by_switch,
+                ));
+            }
+        }
+        marks
+    }
+
+    /// 1 本目は a、2 本目は a が 500 で b、3 本目は a が戻る。
+    async fn a_fails_once() -> FakeUpstream {
+        FakeUpstream::start(|n, _| {
+            let status = if n == 2 { 500 } else { 200 };
+            (status, body_for(status))
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn thinking_as_text_converts_every_request_after_the_crossing() {
+        let a = a_fails_once().await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&bound_config(
+            &a.url,
+            &b.url,
+            r#"["m"]"#,
+            "thinking_as_text",
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        for _ in 0..3 {
+            assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        }
+
+        let a_sent = a.requests();
+        assert_eq!(
+            sent_body(&a_sent[0]),
+            thinking_request(),
+            "before the crossing the body goes as-is"
+        );
+        assert_eq!(
+            sent_body(&a_sent[1]),
+            thinking_request(),
+            "the starting account is tried first, unconverted"
+        );
+        assert_eq!(
+            sent_body(&b.requests()[0])["messages"],
+            thinking_as_text_messages()
+        );
+        assert_eq!(
+            sent_body(&a_sent[2])["messages"],
+            thinking_as_text_messages(),
+            "back on the starting account the session keeps converting"
+        );
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), false, false),
+                ("b".to_owned(), true, false),
+                ("a".to_owned(), true, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_thinking_switches_with_the_body_unchanged() {
+        let a = a_fails_once().await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&bound_config(&a.url, &b.url, r#"["m"]"#, "drop_thinking")).await;
+        let mut watching = gw.events().subscribe();
+
+        for _ in 0..3 {
+            assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        }
+
+        let body = |raw: &str| raw.split_once("\r\n\r\n").unwrap().1.to_owned();
+        let a_sent = a.requests();
+        assert_eq!(body(&b.requests()[0]), body(&a_sent[0]), "byte for byte");
+        assert_eq!(body(&a_sent[2]), body(&a_sent[0]));
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), false, false),
+                ("b".to_owned(), false, true),
+                ("a".to_owned(), false, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stay_answers_the_denial_of_the_starting_account_without_switching() {
+        let a = FakeUpstream::start_with_headers(&[("retry-after", "30")], |n, _| {
+            let status = if n == 1 { 200 } else { 429 };
+            (status, body_for(status))
+        })
+        .await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&bound_config(&a.url, &b.url, r#"["m"]"#, "stay")).await;
+
+        assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        let refused = forward_thinking(&gw).await;
+        assert_eq!(refused.response.status, 429);
+        assert_eq!(refused.response.headers.get("retry-after"), Some("30"));
+
+        // 締め出された後は a にも当てず、全経路が締め出された時と同じ 429 を組む。
+        let held = forward_thinking(&gw).await;
+        assert_eq!(held.response.status, 429);
+        assert!(held.response.headers.get("retry-after").is_some());
+        assert_eq!(held.route, "router");
+        assert_eq!((a.hits(), b.hits()), (2, 0), "never switched to b");
+    }
+
+    #[tokio::test]
+    async fn a_model_without_the_binding_keeps_its_body_and_switches_freely() {
+        let a = a_fails_once().await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&bound_config(&a.url, &b.url, "[]", "thinking_as_text")).await;
+        let mut watching = gw.events().subscribe();
+
+        for _ in 0..3 {
+            assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        }
+
+        let body = |raw: &str| raw.split_once("\r\n\r\n").unwrap().1.to_owned();
+        let a_sent = a.requests();
+        let b_sent = b.requests();
+        assert_eq!(body(&b_sent[0]), body(&a_sent[0]), "byte for byte");
+        assert_eq!(
+            (a.hits(), b.hits()),
+            (2, 2),
+            "unlocked, the session stays where it last passed"
+        );
+        assert_eq!(body(&b_sent[1]), body(&a_sent[0]));
+        assert!(
+            crossing_marks(&mut watching)
+                .iter()
+                .all(|(_, as_text, dropped)| !as_text && !dropped)
+        );
     }
 }

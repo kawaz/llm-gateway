@@ -425,6 +425,36 @@ pub struct AccountLock {
     pub crossed: bool,
 }
 
+/// 1 本を送るとき、その session の thinking をどう運ぶか (DR-0033 §2・§3)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Crossing {
+    /// 本文をそのまま送る。開始 account へ送る、または束縛の無い 1 本。
+    Unchanged,
+    /// 開始 account 以外へ本文のまま送る。履歴の thinking は API が捨てる見込み。
+    ThinkingDropped,
+    /// thinking を text にして送る。
+    ThinkingAsText,
+}
+
+impl AccountLock {
+    /// この経路へ送る 1 本の扱い。
+    ///
+    /// `thinking_as_text` で一度跨いだ session は、開始 account へ戻っても
+    /// 変換を続ける (切替点を持たない、DR-0033 §3)。
+    pub fn crossing(&self, route: &Route, policy: config::OnAccountSwitch) -> Crossing {
+        let elsewhere = route.account() != self.account;
+        match policy {
+            config::OnAccountSwitch::Stay => Crossing::Unchanged,
+            config::OnAccountSwitch::DropThinking if elsewhere => Crossing::ThinkingDropped,
+            config::OnAccountSwitch::DropThinking => Crossing::Unchanged,
+            config::OnAccountSwitch::ThinkingAsText if elsewhere || self.crossed => {
+                Crossing::ThinkingAsText
+            }
+            config::OnAccountSwitch::ThinkingAsText => Crossing::Unchanged,
+        }
+    }
+}
+
 impl Router {
     pub fn new(config: Config, events: Arc<Events>) -> Self {
         Self {
