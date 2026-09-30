@@ -45,6 +45,24 @@ account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した�
 
 `THINKING:` の綴りだけに固有の現象ではなく、reasoning を表す別の見出しでも refusal が再現した。一方、見出しのない本文だけでは `max_tokens` になった。どのケースも完了した回答の text がなく、本文だけの試行も正常完了と同一視できない。各応答は `/tmp/pt-toolloop-B-*-response.json` に保存した。account A の `THINKING:` 置換も `stop_details.category: reasoning_extraction` だった。したがって HTTP 400 にならないことと、継続可能な応答が得られることは区別する。拒否の規則や別の入力への一般化はこの観測だけから確定しない。
 
+### 置換の形（account B）
+
+同じ turn 1 の署名付き履歴を account B に送り、thinking block の置換形だけを変えた。`max_tokens: 4096`、各ケース 1 回（本文だけは 3 回）。`get_time` の tool_result は `2026-09-30T00:00:00Z`。各リクエストは HTTP 200、`input_transformations: []`（無改変のみ `thinking_dropped`）、error null。下表の先頭 60 文字は応答の最初の text block の値。
+
+| ケース | HTTP | `stop_reason` / `stop_details` | `input_transformations` | text block と先頭 60 文字 | `usage.input_tokens` |
+|---|---:|---|---|---|---:|
+| 本文だけ #1 | 200 | `end_turn` / null | `[]` | あり: `It's **Wednesday, September 30, 2026, 00:00:00 UTC** (ISO 86` | 727 |
+| 本文だけ #2 | 200 | `end_turn` / null | `[]` | あり: <code>It's **Wednesday, September 30, 2026, 00:00 UTC** (`2026-09-</code> | 727 |
+| 本文だけ #3 | 200 | `end_turn` / null | `[]` | あり: `The current time is **Wednesday, September 30, 2026, 00:00:0` | 727 |
+| `🧠 `＋本文 | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 731 |
+| `💬 `＋本文 | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 730 |
+| `(`＋本文＋`)` | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 729 |
+| thinking 削除、tool_result 後の user text に `前の推論:\n`＋本文 | 200 | `refusal` / `reasoning_extraction` | `[]` | なし | 736 |
+| thinking 削除 | 200 | `end_turn` / null | `[]` | あり: <code>The current time from `get_time` is:\n\n**Wednesday, September</code> | 646 |
+| 無改変 | 200 | `end_turn` / null | `[{"type":"thinking_dropped","path":"messages.1.content.0","reason":"end_user_binding_mismatch"}]` | あり: `The current time is **Wednesday, September 30, 2026, 00:00 U` | 646 |
+
+この条件では本文だけの 3 回は拒否されず回答が完了した。短い接頭辞・括弧・user text への移動はすべて `reasoning_extraction` で拒否された。直前の `max_tokens: 2048` の本文だけ 1 回との差はあり、置換形だけによる効果とは断定できない。応答は `/tmp/pt-replace-forms-*-response.json` に保存した。
+
 ## Gateway 照合（文書＋実装）
 
 `docs/DESIGN-ja.md` は現行 tree に存在せず、コード地図は `docs/design/architecture-overview.md` を確認。`docs/decisions/INDEX.md` の DR-0009・0016・0018・0019・0024 を照合した。`crates/llm-gateway/src/session.rs:55-88` は metadata・header・冒頭本文から session key を導出。`crates/llm-gateway/src/router.rs:582-600` は spend_down 昇格後に affinity を先頭へ動かすが、`:605-659` は denial / pace_cap 経路を除外し、後続候補を維持する。affinity は `(namespace, session, model)` で route を記憶する (`router.rs:276`)。DR-0009 は 401/403/429/529 や 5xx を契機に別 credential / upstream へ切替し、2xx に限り affinity を更新する。新しい route が違う account なら Sonnet 5.5 の thinking は消える。成功レスポンスだけでは検知できない。
