@@ -11,8 +11,8 @@ use serde_json::{Map, Value};
 
 /// 本文の thinking を text に置き換える。
 ///
-/// - `thinking` → `{"type":"text","text":<本文>}`。本文は改行を半角空白 1 個に
-///   畳み、末尾の半角空白を落としたもの。見出しや接頭辞は付けない (付けると
+/// - `thinking` → `{"type":"text","text":<本文>}`。本文は元の本文から末尾の
+///   改行と半角空白だけを落としたもの (内部の改行はそのまま)。見出しや接頭辞は付けない (付けると
 ///   `reasoning_extraction` の refusal になる実測がある)。署名は捨てる
 /// - `redacted_thinking` と、本文が空の `thinking` → 落とす (運ぶ本文が無い)
 /// - 位置は元の block のまま。元の block の `cache_control` は置き換えた text へ移す
@@ -38,19 +38,19 @@ fn replace(block: Value) -> Option<Value> {
     match block.get("type").and_then(Value::as_str) {
         Some("redacted_thinking") => None,
         Some("thinking") => {
-            let folded = block
+            // 落とすのは末尾の改行と半角空白だけ。内部の改行 (段落の区切り) と
+            // 他の空白 (タブ等) は本文として残す。
+            let body = block
                 .get("thinking")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .replace('\n', " ");
-            // 落とすのは半角空白だけ。他の空白 (タブ等) は本文として残す。
-            let folded = folded.trim_end_matches(' ');
-            if folded.is_empty() {
+                .trim_end_matches(['\n', ' ']);
+            if body.is_empty() {
                 return None;
             }
             let mut text = Map::new();
             text.insert("type".to_owned(), Value::from("text"));
-            text.insert("text".to_owned(), Value::from(folded));
+            text.insert("text".to_owned(), Value::from(body));
             if let Some(cache_control) = block.get("cache_control") {
                 text.insert("cache_control".to_owned(), cache_control.clone());
             }
@@ -72,18 +72,18 @@ mod tests {
     }
 
     #[test]
-    fn thinking_becomes_text_with_newlines_folded_and_the_end_trimmed() {
+    fn thinking_becomes_text_keeping_its_newlines_with_the_end_trimmed() {
         let got = converted(json!({"messages": [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [
-                {"type": "thinking", "thinking": "first\nsecond\n\nthird\n  ", "signature": "sig"},
+                {"type": "thinking", "thinking": "first\nsecond\n\nthird\n \n  ", "signature": "sig"},
                 {"type": "text", "text": "answer\nkept"},
             ]},
         ]}));
         assert_eq!(
             got["messages"][1]["content"],
             json!([
-                {"type": "text", "text": "first second  third"},
+                {"type": "text", "text": "first\nsecond\n\nthird"},
                 {"type": "text", "text": "answer\nkept"},
             ])
         );
@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn only_trailing_ascii_spaces_are_trimmed() {
+    fn only_trailing_newlines_and_ascii_spaces_are_trimmed() {
         let got = converted(json!({"messages": [
             {"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "a\t\n \n", "signature": "s"},

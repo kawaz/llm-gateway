@@ -172,7 +172,7 @@ on_account_switch = "drop_thinking"             # 既定
 |---|---|
 | `stay` | 他の account へ移らない。全経路が締め出された時と同じ 429 + `retry-after` を返す |
 | `drop_thinking` | 他の account へ移り、本文はそのまま送る (履歴の thinking は API に捨てられる) |
-| `thinking_as_text` | 他の account へ移り、その会話は以後すべての 1 本で、履歴の `thinking` を assistant の `text` にして送る (改行を半角空白に畳んだ本文だけ。`redacted_thinking` と空の thinking は落とす)。変換した時点でその会話の prompt cache は 1 度作り直しになる |
+| `thinking_as_text` | 他の account へ移り、その会話は以後すべての 1 本で、履歴の `thinking` を assistant の `text` にして送る (本文だけ。改行は残し、末尾の改行と半角空白だけを落とす。`redacted_thinking` と空の thinking は落とす)。変換した時点でその会話の prompt cache は 1 度作り直しになる |
 
 結びつきの寿命は経路の結びつき (affinity) と同じで、最後に通ってから 1 時間。設定の読み直しで経路の credential が変わった会話は、次の 1 本で開始 account を決め直す。
 

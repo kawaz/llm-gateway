@@ -8057,7 +8057,7 @@ models = ["n"]
         json!([
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [
-                {"type": "text", "text": "step one step two"},
+                {"type": "text", "text": "step one\nstep two"},
                 {"type": "text", "text": "done"},
             ]},
             {"role": "user", "content": "next"},

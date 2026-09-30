@@ -172,7 +172,7 @@ on_account_switch = "drop_thinking"             # default
 |---|---|
 | `stay` | Does not move to another account. Returns the same 429 + `retry-after` as when every route is denied |
 | `drop_thinking` | Moves to another account and sends the body unchanged (the API drops the history's thinking) |
-| `thinking_as_text` | Moves to another account, and from then on every request of that conversation sends the history's `thinking` as an assistant `text` (the body alone, with newlines folded into single spaces; `redacted_thinking` and empty thinking are dropped). The conversation's prompt cache is rebuilt once at the first conversion |
+| `thinking_as_text` | Moves to another account, and from then on every request of that conversation sends the history's `thinking` as an assistant `text` (the body alone, keeping its newlines and dropping only trailing newlines and spaces; `redacted_thinking` and empty thinking are dropped). The conversation's prompt cache is rebuilt once at the first conversion |
 
 The binding lives as long as the route affinity: one hour since the last request. A conversation whose route changed its credential on a configuration reload decides its starting account again on its next request.
 

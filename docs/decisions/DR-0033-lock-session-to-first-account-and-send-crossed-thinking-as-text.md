@@ -65,7 +65,7 @@ on_account_switch = "stay"  # "stay" | "drop_thinking" | "thinking_as_text"
 
 変換は送る直前の本文に対して行う:
 
-- `thinking` block → `{"type": "text", "text": <本文>}`。本文は thinking 本文の改行 (`\n`) を全部半角空白 1 個に置き換え、末尾の半角空白をトリムしたもの (トリムは半角空白のみ。タブ等の他の空白は残す)。prefix や装飾は付けない。署名は捨てる
+- `thinking` block → `{"type": "text", "text": <本文>}`。本文は thinking 本文から末尾の改行 (`\n`) と半角空白だけを除いたもの。内部の改行 (`\n` / `\n\n`) はバイトのまま残す (下流の webui が `\n\n` 区切りで翻訳を並列化する)。タブ等の他の空白も残す。prefix や装飾は付けない。署名は捨てる
 - `redacted_thinking` block と、本文が空の `thinking` block → 落とす (運ぶ本文が無い)
 - 元にするのはクライアントが送ってきた本文そのまま。`thinking_display = "summarized"` (DR-0016) の namespace なら要約が入り、`omitted` なら空なので落ちる
 - 位置は元の block と同じ。他の block (text / tool_use / tool_result) には触らない
@@ -77,8 +77,6 @@ on_account_switch = "stay"  # "stay" | "drop_thinking" | "thinking_as_text"
 - 本文だけ (3/3) と改行を半角空白にした本文だけ (3/3) は `end_turn` で text の応答が返った
 - 見出し (`THINKING:\n` 3/3、`(previous reasoning)\n`)、`🧠` / `💬` の接頭辞、括弧囲み、user turn の text への移動は、すべて `stop_reason: refusal` / `stop_details.category: reasoning_extraction` になった
 - tool ループの途中 (直前の assistant turn が `tool_use` を持つ) で置換しても 400 にならなかった
-
-改行を畳むので置換後は 1 行の text になり、webui 等の下流では「改行の無い長い段落」として変換済みの thinking を見分けられる。
 
 ### 4. 状態は affinity と同じ場所・同じ寿命で持つ
 
@@ -148,7 +146,7 @@ keepalive は最後に転送した本文を控えて送り直す。控えるの�
 |---|---|---|
 | 1 | 設定 `account_bound_thinking` (決定 1)。パターン照合、既定値、`check` の検証 | 試験で、書かない設定は `claude-sonnet-5-5` だけに当たり、書いた配列が既定を置き換え、`[]` はどれにも当たらない |
 | 2 | `Binding` に開始 account と跨いだ印 (決定 4)。覚える契機と読み直しの引き継ぎ | 試験で、2xx の初回が開始 account になり、別 credential の経路で送ると印が立ち、同じ credential を指す別名の経路では立たず、読み直しで同一経路の Binding が残る |
-| 3 | 設定 `on_account_switch`、変換 (決定 3) を送る直前に当てる。events の `thinking_as_text` / `thinking_dropped_by_switch` (決定 5) | 試験で、跨いだ session の本文の thinking が改行を空白に畳んだ本文だけの text に、redacted_thinking と空の thinking が消え、跨いでいない session と束縛外モデルの本文はバイト一致のまま |
+| 3 | 設定 `on_account_switch`、変換 (決定 3) を送る直前に当てる。events の `thinking_as_text` / `thinking_dropped_by_switch` (決定 5) | 試験で、跨いだ session の本文の thinking が改行を保った本文だけの text に、redacted_thinking と空の thinking が消え、跨いでいない session と束縛外モデルの本文はバイト一致のまま |
 | 4 | ロック (決定 2)。束縛モデルの候補を開始 account に絞り、全滅時は `on_account_switch` に従う | 試験で、ロック中の session が spend_down の昇格でも他 account へ行かず、開始 account が全部断った時に `stay` は 429 + `retry-after`、`drop_thinking` は切り替えて本文不変、`thinking_as_text` は切り替えて段 3 の変換が効く |
 | 5 | 実機: account A で turn 1、B へ切替えた turn 2 で `input_tokens` が変換後の text 分だけ載ることと、別の会話でも置換形が refusal にならないこと | `docs/research/2026-09-30-preserved-thinking-and-account-switching.md` のマトリクスに行が足される |
 
