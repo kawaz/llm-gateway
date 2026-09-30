@@ -68,6 +68,16 @@ impl Route {
         self.preset.name()
     }
 
+    /// この経路が送る先の account (DR-0033 §2)。
+    ///
+    /// 同じ credential を指す経路は同じ account。credential を持たない経路
+    /// (relay) は中の account を知らないので、経路名を account 名とする。
+    pub fn account(&self) -> &str {
+        self.credential
+            .as_ref()
+            .map_or_else(|| self.name(), CredentialId::as_str)
+    }
+
     /// 按分線を超えて使ったか。超えていれば、次に予算が増えるまでの控え。
     ///
     /// 見るのは**周期が一番長い窓**だけ (DR-0018 §2 と同じ理由 — 数時間で
@@ -398,6 +408,21 @@ struct Binding {
     /// 掴み続ける。
     route: String,
     seen: Instant,
+    /// 最初に 2xx を返した経路の account ([`Route::account`])。以後変えない
+    /// (DR-0033 §4)。
+    account: String,
+    /// 開始 account 以外の account で通ったことがあるか。一度立てたら消さない。
+    crossed: bool,
+}
+
+/// thinking が account に束縛されるモデルの session が、どの account に
+/// 結ばれているか (DR-0033 §2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountLock {
+    /// 開始 account。
+    pub account: String,
+    /// 開始 account 以外へ移ったことがあるか。
+    pub crossed: bool,
 }
 
 impl Router {
@@ -773,14 +798,26 @@ impl Router {
         affinity.retain(|_, b| now.duration_since(b.seen) < AFFINITY_TTL);
 
         let key = (ns_name.to_owned(), session.clone(), model.to_owned());
-        if let Some(bound) = affinity.get(&key)
-            && let Some(at) = routes.iter().position(|r| r.name() == bound.route)
-        {
+        let Some(bound) = affinity.get(&key) else {
+            return Ok(routes);
+        };
+        if let Some(at) = routes.iter().position(|r| r.name() == bound.route) {
             // 抜いて先頭へ差し込む。入れ替えると、先頭にいた経路が抜けた穴へ
             // 飛んで残りの優先順が入れ替わる (前回通った経路の後ろは、設定に
             // 書いた順のままであってほしい)。
             let bound = routes.remove(at);
             routes.insert(0, bound);
+        }
+        // thinking が account に束縛されるモデルでは、開始 account の経路を
+        // 全部先に試す (DR-0033 §2)。繰り上げ・前回の経路より後で効かせるので、
+        // どちらもロックを越えない。他 account の経路を外すかどうかは
+        // `on_account_switch` 次第で、それは送る側が決める。
+        if ns.active().config.thinking_is_account_bound(model) {
+            let (mut locked, others): (Vec<_>, Vec<_>) = routes
+                .into_iter()
+                .partition(|route| route.account() == bound.account);
+            locked.extend(others);
+            routes = locked;
         }
         Ok(routes)
     }
@@ -938,13 +975,47 @@ impl Router {
         if !Arc::ptr_eq(ns.active(), &self.active()) {
             return;
         }
-        affinity.insert(
-            (ns.name().to_owned(), session.clone(), model.to_owned()),
-            Binding {
-                route: route.name().to_owned(),
-                seen: Instant::now(),
-            },
-        );
+        let now = Instant::now();
+        let key = (ns.name().to_owned(), session.clone(), model.to_owned());
+        match affinity.get_mut(&key) {
+            Some(bound) if now.duration_since(bound.seen) < AFFINITY_TTL => {
+                bound.route = route.name().to_owned();
+                bound.seen = now;
+                bound.crossed |= route.account() != bound.account;
+            }
+            _ => {
+                affinity.insert(
+                    key,
+                    Binding {
+                        route: route.name().to_owned(),
+                        seen: now,
+                        account: route.account().to_owned(),
+                        crossed: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// この session が結ばれている account (DR-0033 §2)。
+    ///
+    /// thinking が account に束縛されないモデルと、まだ 2xx を得ていない
+    /// (= 開始 account が決まっていない) session では `None`。
+    pub async fn account_lock(
+        &self,
+        ns: &NamespaceView,
+        session: &SessionKey,
+        model: &str,
+    ) -> Option<AccountLock> {
+        if !ns.active().config.thinking_is_account_bound(model) {
+            return None;
+        }
+        let affinity = self.affinity.lock().await;
+        let bound = affinity.get(&(ns.name().to_owned(), session.clone(), model.to_owned()))?;
+        (Instant::now().duration_since(bound.seen) < AFFINITY_TTL).then(|| AccountLock {
+            account: bound.account.clone(),
+            crossed: bound.crossed,
+        })
     }
 
     /// discovery が済んだ状態を作る。
@@ -2791,5 +2862,208 @@ routes = ["a", "b"]
             before.preset("b").unwrap().availability(SONNET, NOW),
             Availability::Denied { .. }
         ));
+    }
+
+    // ---------- account への束縛 (DR-0033) ----------
+
+    const LOCKING: &str = r#"
+account_bound_thinking = ["claude-sonnet-5"]
+
+[credentials.a]
+type = "claude_oauth"
+
+[credentials.b]
+type = "claude_oauth"
+
+[routes.a1]
+provider = "anthropic"
+credential = "a"
+
+# a1 と同じ credential を別の接続先で指す経路。
+[routes.a2]
+provider = "anthropic"
+credential = "a"
+url = "https://a2.invalid"
+
+[routes.b1]
+provider = "anthropic"
+credential = "b"
+
+[routes.relay]
+provider = "anthropic"
+url = "http://127.0.0.1:8320"
+
+[[ns.default.routing]]
+models = ["claude-sonnet-5", "claude-opus-5"]
+routes = ["b1", "a1", "a2", "relay"]
+
+[[ns.spend.routing]]
+models = ["claude-sonnet-5", "claude-opus-5"]
+routes = ["a1", "a2", "b1"]
+spend_down_within = "25%"
+"#;
+
+    const OPUS: &str = "claude-opus-5";
+
+    async fn locking_with(config_toml: &str) -> Router {
+        let config: Config = toml::from_str(config_toml).unwrap();
+        config.validate().unwrap();
+        let r = build(config);
+        let both: &[(&str, &str)] = &[(SONNET, SONNET), (OPUS, OPUS)];
+        r.set_catalog(&[("a1", both), ("a2", both), ("b1", both), ("relay", both)])
+            .await;
+        r
+    }
+
+    async fn locking() -> Router {
+        locking_with(LOCKING).await
+    }
+
+    /// その経路で 2xx が返ったことにする。
+    async fn passed(r: &Router, s: &str, model: &str, route: &str) {
+        let routes = r.routes_for(&ns(r), NS, model, &session(s)).await.unwrap();
+        let route = routes.iter().find(|r| r.name() == route).unwrap();
+        r.remember(&ns(r), &session(s), model, route).await;
+    }
+
+    async fn lock_of(r: &Router, s: &str, model: &str) -> Option<AccountLock> {
+        r.account_lock(&ns(r), &session(s), model).await
+    }
+
+    fn locked(account: &str, crossed: bool) -> Option<AccountLock> {
+        Some(AccountLock {
+            account: account.to_owned(),
+            crossed,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_first_success_decides_the_starting_account() {
+        let r = locking().await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, None, "nothing passed yet");
+
+        passed(&r, "s", SONNET, "a2").await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+    }
+
+    #[tokio::test]
+    async fn another_route_on_the_same_credential_does_not_cross() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "a1").await;
+        passed(&r, "s", SONNET, "a2").await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+    }
+
+    #[tokio::test]
+    async fn another_credential_crosses_and_the_mark_stays() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "a1").await;
+        passed(&r, "s", SONNET, "b1").await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
+
+        // 開始 account に戻っても、開始 account も印も変わらない。
+        passed(&r, "s", SONNET, "a1").await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
+    }
+
+    #[tokio::test]
+    async fn a_relay_route_is_its_own_account() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "relay").await;
+        assert_eq!(lock_of(&r, "s", SONNET).await, locked("relay", false));
+    }
+
+    #[tokio::test]
+    async fn a_model_without_account_bound_thinking_is_not_locked() {
+        let r = locking().await;
+        passed(&r, "s", OPUS, "a1").await;
+        assert_eq!(lock_of(&r, "s", OPUS).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_reload_keeps_the_lock_bound_to_an_unchanged_route() {
+        let r = locking().await;
+        passed(&r, "kept", SONNET, "a1").await;
+        passed(&r, "kept", SONNET, "b1").await;
+        passed(&r, "dropped", SONNET, "a2").await;
+
+        // a2 だけ credential を変える。
+        reload_with(
+            &r,
+            &LOCKING.replace(
+                "credential = \"a\"\nurl = \"https://a2.invalid\"",
+                "credential = \"b\"\nurl = \"https://a2.invalid\"",
+            ),
+        )
+        .await;
+
+        assert_eq!(lock_of(&r, "kept", SONNET).await, locked("a", true));
+        assert_eq!(
+            lock_of(&r, "dropped", SONNET).await,
+            None,
+            "the route changed its credential; the session starts over"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_locked_session_tries_every_route_of_its_account_first() {
+        let r = locking().await;
+        passed(&r, "s", SONNET, "a2").await;
+        passed(&r, "s", OPUS, "a2").await;
+
+        let order = |model| {
+            let r = &r;
+            async move {
+                names(
+                    &r.routes_for(&ns(r), NS, model, &session("s"))
+                        .await
+                        .unwrap(),
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(order(SONNET).await, ["a2", "a1", "b1", "relay"]);
+        assert_eq!(
+            order(OPUS).await,
+            ["a2", "b1", "a1", "relay"],
+            "a model without the binding keeps the plain affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_spend_down_promotion_does_not_break_the_lock() {
+        let r = locking().await;
+        for model in [SONNET, OPUS] {
+            let routes = r
+                .routes_for_at(&spend_ns(&r), SPEND_NS, model, &session("s"), NOW)
+                .await
+                .unwrap();
+            r.remember(&spend_ns(&r), &session("s"), model, &routes[0])
+                .await;
+            assert_eq!(routes[0].name(), "a1");
+        }
+        observe_window(&r, "b1", Some(WEEK), Some(NOW + 60));
+
+        let order = |model| {
+            let r = &r;
+            async move {
+                names(
+                    &r.routes_for_at(&spend_ns(r), SPEND_NS, model, &session("s"), NOW)
+                        .await
+                        .unwrap(),
+                )
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(order(SONNET).await, ["a1", "a2", "b1"]);
+        assert_eq!(
+            order(OPUS).await,
+            ["a1", "b1", "a2"],
+            "without the binding the promotion still moves b1 up"
+        );
     }
 }
