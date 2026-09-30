@@ -29,28 +29,13 @@ Sonnet 5.5 の thinking は account 束縛なので route 切替で黙って消�
 
 gateway は DR-0009 の fail over (401/403/429/529/5xx) と pace_cap / denial で別 credential に移り、affinity は route 名単位で account の同一性を知らない。そのため Sonnet 5.5 の会話は切替後に推論の連続性を黙って失う。
 
-候補:
-
-1. 同一 account 優先 + 切替時に beta header を付けて drop を観測し、stats / events に出す (推奨、可用性維持)
-2. 同一 account への hard pin (枠不足で会話停止)
-3. thinking を剥がして切替
-4. 切替を拒否して client に返す
-
-前提として route → account の対応 (linked account 含む) を設定で表せる必要がある。実機の 2-turn マトリクス (同 key / 別 key 同 account / 別 account / linked、beta 有無) は未検証。
-
-kawaz 裁定待ち: どの候補で行くか、実機検証を許可する account 2 つ。
+前提として route → account の対応 (linked account 含む) を設定で表せる必要がある。
 
 ## 実測 2026-09-30 (research doc 参照)
 
 別 account (`claude-emrd` で生成 → `claude-kawazzz`) への再送は 200 で thinking が黙って落ちる。`input_tokens` が同一 account の対照より thinking_tokens 分少ない。beta `thinking-binding-controls-2026-08-01` を付けても `input_transformations` は `[]` で、理由は報告されない。同一 account の履歴改変では `prefix_binding_mismatch` が出るので header 自体は効いている。
 
-よって候補 (1) の「header で drop を観測」は成立しない。候補を見直す:
-
-- (1') 同一 account 優先 + 切替時に thinking を含む会話は切替を拒否する (client に 429/503 と retry-after を返す)
-- (2') 切替時に thinking block を gateway が剥がして送る (どのみち落ちるので明示的に落として挙動を読めるようにする、events に記録)
-- (3') `input_tokens` の期待値との差で事後検知して events に `thinking_dropped_suspected` を出す (検知のみ)
-
-裁定点: (1')/(2')/(3') の組み合わせ、route → account 対応を設定で表す形。
+よって beta header で drop を観測する方式は成立しない。gateway が自前で判断する。
 
 ## 適用範囲の前提 (2026-09-30 一次資料再確認)
 
@@ -69,12 +54,25 @@ kawaz 裁定待ち: どの候補で行くか、実機検証を許可する accou
 
 設計方針: 対策をモデル固有にしない。**モデルごとの束縛ポリシーを設定で持ち、既定リストは今は `claude-sonnet-5-5` だけ**にする。他モデルに広がったら設定 1 行で追加できる形にする。
 
-裁定点の更新: (1'') 束縛モデルの会話は同一 account に pin し、枠切れ時だけ利用者に選ばせる、を opt-in でなく既定に近づけるか。
+## 採る方向 (kawaz 裁定 2026-09-30)
+
+失われたことを記録するだけの案 (観測・検知のみ、単純に剥がす等) は推論を救えないので却下。次の 3 点セットで行く。
+
+- (a) **session ごとに開始 account をロックする**。affinity を「優先」でなく「固定」にする。ロックした account の枠切れ時の扱い (待つ / 切替) は issue `low-priority-slow-requests-should-wait-not-switch` の裁定と合流する
+- (b) **やむなく切替える時は cache 破壊前提で thinking を text に変換する**。切替点 (session の message index) を記録し、それより前の thinking block を通常の text block に書き換える。先頭に `THINKING:\n` を付けて webui で区別できるようにする。変換は決定的で、切替後に新 account が生成した block は素通しする
+- (c) **持ち越せるのは client が持つ本文だけ**。`thinking_display = "summarized"` の ns では要約しか渡らない。`redacted_thinking` は変換不能
+
+## 裁定点
+
+- thinking_display を full に戻すか、要約持ち越しで割り切るか
+
+DR 起草は裁定後。
 
 ## 受け入れ条件
 
-- [ ] 候補 (1)〜(4) のどれで行くか裁定される
+- [ ] 上記裁定点が裁定され、DR が起草される
 - [ ] 実機 2-turn マトリクスの検証結果が docs/research に記録される
+- [ ] session の開始 account ロックと、切替時の thinking → text 変換が実装される
 - [ ] route → account (linked 含む) の対応を設定で表せる
 
 ## TODO
