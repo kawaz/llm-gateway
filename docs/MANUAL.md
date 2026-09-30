@@ -158,6 +158,24 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
   -d '{"model":"opus","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
+#### Thinking in a session that crosses accounts (`account_bound_thinking` / `on_account_switch`)
+
+For models whose thinking signatures only work on the account that generated them (by default `claude-sonnet-5-5`), a conversation that moves to a route on another account has its history's thinking silently dropped by the API (still a 200). To prevent this, a conversation on such a model (namespace × conversation × model) is bound to the account of the route that first returned a 2xx (= its credential; a route without a credential counts as its route name), and every route of that account is tried first from then on. The spend-down promotion (`spend_down_within`) does not cross this either. What happens when every route of the starting account is unavailable is chosen with `on_account_switch` (DR-0033).
+
+```toml
+# Write these at the top level of the file (before any [table])
+account_bound_thinking = ["claude-sonnet-5-5"]  # default; writing it replaces the default, [] disables. Same patterns as routing models
+on_account_switch = "drop_thinking"             # default
+```
+
+| `on_account_switch` | When every route of the starting account is unavailable |
+|---|---|
+| `stay` | Does not move to another account. Returns the same 429 + `retry-after` as when every route is denied |
+| `drop_thinking` | Moves to another account and sends the body unchanged (the API drops the history's thinking) |
+| `thinking_as_text` | Moves to another account, and from then on every request of that conversation sends the history's `thinking` as an assistant `text` (the body alone, with newlines folded into single spaces; `redacted_thinking` and empty thinking are dropped). The conversation's prompt cache is rebuilt once at the first conversion |
+
+The binding lives as long as the route affinity: one hour since the last request. A conversation whose route changed its credential on a configuration reload decides its starting account again on its next request.
+
 The upstream response is returned as-is (`{"type":"message","content":[...]}`). When the gateway itself refuses, it answers with JSON in the Anthropic error shape.
 
 ```json
@@ -485,7 +503,7 @@ data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":
 
 In a namespace that authenticates with `jwt`, `request`, `response` and `passthrough` events also carry `subject` (the token's `sub`) and `kid` right after `boot`, for example `{"ts":…,"seq":42,"boot":…,"subject":"kawaz-mbp","kid":"claude-mbp-2026-09","session_id":"s-1",…}`. In other namespaces the two fields are absent. A request refused by namespace authentication produces no event.
 
-`prefix` is an 8-digit hash of the first block of the system prompt, marking which conversation series a request belongs to; when it cannot be derived, the field is omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in the Responses shape is `codex`, and the gateway's own resend is `keepalive`). It is read from the shape the request came in, not from the route it goes to: a Messages request sent to an openai route still reads as `main` / `sub`. `cache_ttl_secs` is **how long the prefix this request leaves behind lives**, in seconds: it follows the strategy that was applied, and for an untouched body it reads the `cache_control` that was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300). `cache_expires_at` is that moment. A request that leaves no breakpoint omits both, and so does an attempt the upstream refused (non-2xx): it placed no cache, so it promises no lifetime and carries none of the `cache_*` fields below either. If routes were skipped during route selection, `skipped` lists each credential and the reason.
+`prefix` is an 8-digit hash of the first block of the system prompt, marking which conversation series a request belongs to; when it cannot be derived, the field is omitted. `origin` says who asked (`main` / `sub` / `oneshot` / `unknown`; a request received in the Responses shape is `codex`, and the gateway's own resend is `keepalive`). It is read from the shape the request came in, not from the route it goes to: a Messages request sent to an openai route still reads as `main` / `sub`. `cache_ttl_secs` is **how long the prefix this request leaves behind lives**, in seconds: it follows the strategy that was applied, and for an untouched body it reads the `cache_control` that was sent (3600 when any breakpoint carries `ttl:"1h"`, otherwise 300). `cache_expires_at` is that moment. A request that leaves no breakpoint omits both, and so does an attempt the upstream refused (non-2xx): it placed no cache, so it promises no lifetime and carries none of the `cache_*` fields below either. If routes were skipped during route selection, `skipped` lists each credential and the reason. `thinking_as_text` is `true` on a request that sent a cross-account conversation's thinking as text, and `thinking_dropped_by_switch` is `true` on a request that `drop_thinking` sent unchanged to an account other than the starting one (the history's thinking is expected to be dropped by the API); otherwise the fields are omitted (see [Thinking in a session that crosses accounts](#thinking-in-a-session-that-crosses-accounts-account_bound_thinking--on_account_switch)).
 
 A request the `keepalive` strategy will keep also carries the shape of its resend chain (all omitted for a request that will not be kept). What is kept is written only after the response finishes, but **these fields are there from the very first request** — the projection follows from the values at send time alone. When a request turns out to have landed on no cache, the `cache_expired` that follows withdraws the promise it made:
 

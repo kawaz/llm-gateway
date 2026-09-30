@@ -46,4 +46,4 @@ Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは�
 | [DR-0030](DR-0030-general-purpose-auth-gateway.md) | 🟡 部分実装 | 汎用の認証 gateway を crate として下に敷き、LLM をその上の 1 利用者にする (任意 API への認証差し替えパススルー、自主レート制限、ns の allowlist と JWT 認証) |
 | [DR-0031](DR-0031-store-layer.md) | 🟡 部分実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |
 | [DR-0032](DR-0032-daemon-reload.md) | ✅ 実装済 | 設定の読み直しを `daemon reload` で明示的に行う (CLI → 監督者 → unit ごとの制御 socket、`check` と同じ経路で検証して通った時だけ差し替え、変えられない欄の変更は restart を求めて断る) |
-| [DR-0033](DR-0033-lock-session-to-first-account-and-send-crossed-thinking-as-text.md) | ⬜ 未実装 | thinking が account に束縛されるモデル (設定、既定は Sonnet 5.5) の session を開始 account にロックし、account を跨いだ session は以後 thinking を `THINKING:\n` 付きの text として送る |
+| [DR-0033](DR-0033-lock-session-to-first-account-and-send-crossed-thinking-as-text.md) | 🟡 部分実装 | thinking が account に束縛されるモデル (設定、既定は Sonnet 5.5) の session を開始 account にロックし、開始 account が全滅した時の振る舞いを `on_account_switch` (`stay` / `drop_thinking` / `thinking_as_text`) で選ぶ。`thinking_as_text` で跨いだ session は以後 thinking を改行を畳んだ本文だけの text として送る (段 5 の実機確認待ち) |

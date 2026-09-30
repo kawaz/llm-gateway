@@ -1,6 +1,6 @@
 # DR-0033: session を開始 account にロックし、account を跨いだ session は以後 thinking を text として送る
 
-- Status: Accepted (kawaz 裁定 2026-09-30)。改定 2026-09-30 (置換の形と enum)。未実装
+- Status: Accepted (kawaz 裁定 2026-09-30)。改定 2026-09-30 (置換の形と enum)。部分実装 (段 1〜4 実装済、段 5 の実機確認待ち)
 - Date: 2026-09-30
 
 ## 文脈

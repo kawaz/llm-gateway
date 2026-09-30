@@ -158,6 +158,24 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
   -d '{"model":"opus","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
+#### account を跨ぐ session の thinking (`account_bound_thinking` / `on_account_switch`)
+
+thinking の署名が生成した account でしか効かないモデル (既定は `claude-sonnet-5-5`) では、会話が別 account の経路へ移ると、履歴の thinking を API が黙って捨てる (200 のまま)。これを防ぐため、そのモデルの会話 (namespace × 会話 × モデル) は最初に 2xx を返した経路の account (= credential。credential を持たない経路は経路名) に結ばれ、以後はその account の経路を先に全部試す。使い切りの繰り上げ (`spend_down_within`) もこれを越えない。開始 account の経路が全部使えないときの振る舞いは `on_account_switch` で選ぶ (DR-0033)。
+
+```toml
+# 設定ファイルの最上位 (どの [表] よりも前) に書く
+account_bound_thinking = ["claude-sonnet-5-5"]  # 既定。書けば置き換え、[] で無効。routing の models と同じパターン
+on_account_switch = "drop_thinking"             # 既定
+```
+
+| `on_account_switch` | 開始 account の経路が全部使えないとき |
+|---|---|
+| `stay` | 他の account へ移らない。全経路が締め出された時と同じ 429 + `retry-after` を返す |
+| `drop_thinking` | 他の account へ移り、本文はそのまま送る (履歴の thinking は API に捨てられる) |
+| `thinking_as_text` | 他の account へ移り、その会話は以後すべての 1 本で、履歴の `thinking` を assistant の `text` にして送る (改行を半角空白に畳んだ本文だけ。`redacted_thinking` と空の thinking は落とす)。変換した時点でその会話の prompt cache は 1 度作り直しになる |
+
+結びつきの寿命は経路の結びつき (affinity) と同じで、最後に通ってから 1 時間。設定の読み直しで経路の credential が変わった会話は、次の 1 本で開始 account を決め直す。
+
 応答は upstream のものをそのまま返す (`{"type":"message","content":[...]}`)。gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を返す。
 
 ```json
@@ -487,7 +505,7 @@ data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":
 
 `jwt` で認証する namespace では、`request` / `response` / `passthrough` の知らせの `boot` の直後に `subject` (token の `sub`) と `kid` も載る (例: `{"ts":…,"seq":42,"boot":…,"subject":"kawaz-mbp","kid":"claude-mbp-2026-09","session_id":"s-1",…}`)。それ以外の namespace では 2 欄とも出ない。namespace の認証で断った要求は知らせに出さない。
 
-`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。受けた形から読むので送り先の経路には依らず、Messages 形式を openai 経路へ送っても `main` / `sub` になる。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。
+`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。受けた形から読むので送り先の経路には依らず、Messages 形式を openai 経路へ送っても `main` / `sub` になる。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。`thinking_as_text` は account を跨いだ会話の thinking を text にして送った 1 本に、`thinking_dropped_by_switch` は `drop_thinking` で開始 account 以外へ本文のまま送った 1 本 (履歴の thinking が API に捨てられる見込み) に `true` で付き、当てはまらない 1 本では欄ごと出ない ([account を跨ぐ session の thinking](#account-を跨ぐ-session-の-thinking-account_bound_thinking--on_account_switch))。
 
 `keepalive` 戦略で繋ぐ 1 本には、送り直しの連鎖の姿が付く (繋ぐ対象でなければ欄ごと出ない)。控えが置かれるのは応答を読み切った後だが、この欄は**その 1 本目から**出る — 見立ては送る時点の値だけで決まるため。cache に乗らずに終わった 1 本では、直後の `cache_expired` がその約束を取り消す:
 
