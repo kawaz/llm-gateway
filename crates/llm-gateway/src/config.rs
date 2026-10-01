@@ -1945,6 +1945,13 @@ impl Namespace {
         }
     }
 
+    /// このモデルの振り分け規則に書いた経路。規則が当たらなければ空。
+    pub(crate) fn routing_entries_for(&self, model: &str) -> Vec<&str> {
+        self.rule_for(model)
+            .map(|rule| rule.routes.iter().flat_map(RouteGroup::routes).collect())
+            .unwrap_or_default()
+    }
+
     /// このモデルに当たる振り分け規則。当たらなければ無い。
     fn rule_for(&self, model: &str) -> Option<&RoutingRule> {
         self.routing

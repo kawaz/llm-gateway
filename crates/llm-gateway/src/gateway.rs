@@ -675,7 +675,15 @@ impl<P: CredentialPersistence> Gateway<P> {
             &call.origin(crate::stats::NO_CREDENTIAL),
         ) {
             Selection::Ready { routes, skipped } => (routes, skipped),
-            Selection::AllDenied { response, .. } => {
+            Selection::AllDenied { response, until } => {
+                let missing = self.missing_routes(ns, &model).await;
+                warn!(
+                    model = %model,
+                    routes = routes.len(),
+                    %missing,
+                    seconds = until - now,
+                    "every route is denied; returning the time it reopens"
+                );
                 // 行き場を失った今が、状態を確かめる価値の最も高い瞬間。
                 // 次の周期を待たずに聞きに行く。
                 for route in &routes {
@@ -846,10 +854,12 @@ impl<P: CredentialPersistence> Gateway<P> {
                 Some(error) => client_error_response(resp, error)?,
                 None => resp,
             };
+            let missing = self.missing_routes(ns, &model).await;
             warn!(
                 model = %model,
                 status = resp.status,
                 routes = routes.len(),
+                %missing,
                 "exhausted all routes; returning the last denial as-is"
             );
             return Ok(Forwarded {
@@ -868,6 +878,27 @@ impl<P: CredentialPersistence> Gateway<P> {
         }
 
         Err(Error::AllUpstreamsFailed { model, attempts })
+    }
+
+    /// 全滅のログに添える、振り分け規則に書いてあるのに一覧に載っていない経路。
+    ///
+    /// 一覧から外れる典型は credential の更新が断られた経路 (一覧を取れない
+    /// まま再起動すると空になる) なので、記録されている認証の状態を添える。
+    /// 全滅したときだけ組む — 通るリクエストのたびに一覧を引き直す必要は無い。
+    async fn missing_routes(&self, ns: &NamespaceView, model: &str) -> String {
+        let mut described = Vec::new();
+        for (name, credential) in self.router.missing_from_catalog(ns, model).await {
+            let auth = match &credential {
+                Some(id) => self
+                    .credentials
+                    .auth_state(id)
+                    .await
+                    .map(|auth| auth.status),
+                None => None,
+            };
+            described.push((name, auth));
+        }
+        crate::router::describe_missing(&described)
     }
 
     /// 1 経路を試す。切り替える価値のある失敗なら理由を返す。

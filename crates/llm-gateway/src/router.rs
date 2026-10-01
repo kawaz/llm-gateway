@@ -28,6 +28,7 @@ use crate::egress::{Headers, Response};
 use crate::events::{self, Events};
 use crate::preset;
 use crate::provider::Preset;
+use crate::quota::AuthStatus;
 use crate::session::SessionKey;
 use crate::{Error, Result};
 
@@ -780,6 +781,38 @@ impl Router {
             .collect()
     }
 
+    /// このモデルの振り分け規則に書いてあるのに、一覧に載っていない経路と
+    /// その credential。書いた順、重複は除く。
+    ///
+    /// 一覧に無い経路は候補を組む段で黙って外れる ([`Self::routes_for`])。
+    /// 全滅のログに名前を添えて、試されなかった経路を追えるようにする。
+    /// 規則の当たらないモデル (namespace の経路を全部試す) は、扱わない経路が
+    /// 居て当然なので数えない。namespace の絞り込みで外れたものも数えない —
+    /// それは一覧の欠けではなく設定の選択。
+    pub async fn missing_from_catalog(
+        &self,
+        ns: &NamespaceView,
+        model: &str,
+    ) -> Vec<(String, Option<CredentialId>)> {
+        let catalog = self.catalog.read().await;
+        let mut missing: Vec<(String, Option<CredentialId>)> = Vec::new();
+        for name in ns.routing_entries_for(model) {
+            if catalog.upstream_name(name, model).is_some()
+                || missing.iter().any(|(seen, _)| seen == name)
+            {
+                continue;
+            }
+            let credential = ns
+                .config()
+                .routes
+                .get(name)
+                .and_then(|route| route.credential.as_deref())
+                .map(CredentialId::new);
+            missing.push((name.to_owned(), credential));
+        }
+        missing
+    }
+
     /// この会話でこのモデルを使うときの経路を、試す順に返す。
     ///
     /// `ns_name` は前回通った経路を引くための鍵。`ns` から名前は取れないので
@@ -951,13 +984,9 @@ impl Router {
         }
 
         // どれも塞がっているなら、最初に開くのがいつかがクライアントの知りたいこと。
+        // ログは呼び出し側が出す — 添える「一覧に無い経路」の credential の
+        // 状態は、認証情報の置き場を持つ側にしか読めない。
         let until = opens_at.into_iter().min().unwrap_or(now);
-        warn!(
-            model = %model,
-            routes = routes.len(),
-            seconds = until - now,
-            "every route is denied; returning the time it reopens"
-        );
         self.events
             .publish(events::Event::with_skipped(now, origin, 429, skipped));
         Selection::AllDenied {
@@ -1167,6 +1196,31 @@ fn build_route(
             .filter(|upstream| *upstream != model)
             .map(str::to_owned),
     }))
+}
+
+/// 全滅のログに添える、一覧に載っていない経路の欄。
+///
+/// `[a, b (credential unavailable: relogin_required)]` の形。理由を添えるのは
+/// credential の更新が失敗したと記録のある経路だけで、記録が無ければ名前
+/// だけにする — 外れた理由を推し量って書くと、外れていたときに読み手を
+/// 誤った対処へ送る。無くても `[]` を出す (見ていることが分かるように)。
+pub fn describe_missing(missing: &[(String, Option<AuthStatus>)]) -> String {
+    let entries: Vec<String> = missing
+        .iter()
+        .map(|(name, auth)| {
+            let failed = match auth {
+                None | Some(AuthStatus::Ok) => None,
+                Some(AuthStatus::ReloginRequired) => Some("relogin_required"),
+                Some(AuthStatus::Degraded) => Some("degraded"),
+                Some(AuthStatus::OrgNotAllowed) => Some("org_not_allowed"),
+            };
+            match failed {
+                Some(status) => format!("{name} (credential unavailable: {status})"),
+                None => name.clone(),
+            }
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
 }
 
 /// どの経路も断られているときに返す応答。
@@ -2744,6 +2798,65 @@ exclude = ["route-hidden-*"]
             r.routes_for(&ns(&r), NS, "claude-opus-5", &session("s"))
                 .await
                 .is_err()
+        );
+    }
+
+    /// 振り分け規則に書いたのに一覧から外れた経路を、書いた順に credential と
+    /// 一緒に挙げる。規則の当たらないモデルでは数えない。
+    #[tokio::test]
+    async fn names_the_written_routes_missing_from_the_catalog() {
+        let r = router().await;
+        // oauth-a の一覧が取れなかった (credential の更新が断られた等) 状態。
+        r.set_catalog(&[
+            (
+                "bedrock",
+                &[("claude-sonnet-5", "anthropic.claude-sonnet-5")],
+            ),
+            ("oauth-a", &[]),
+            ("oauth-b", &[("claude-sonnet-5", "claude-sonnet-5")]),
+            ("cpa", &[("gpt-5.6-sol", "gpt-5.6-sol")]),
+        ])
+        .await;
+
+        assert_eq!(
+            r.missing_from_catalog(&ns(&r), "claude-sonnet-5").await,
+            vec![("oauth-a".to_owned(), Some(CredentialId::new("oauth-a")))]
+        );
+        assert_eq!(
+            r.missing_from_catalog(&ns(&r), "claude-fable-5").await,
+            vec![
+                ("bedrock".to_owned(), Some(CredentialId::new("bedrock"))),
+                ("oauth-a".to_owned(), Some(CredentialId::new("oauth-a"))),
+            ],
+            "every member of an equal group is named, in the written order"
+        );
+        assert!(
+            r.missing_from_catalog(&ns(&r), "gpt-5.6-sol")
+                .await
+                .is_empty(),
+            "nothing is missing when every written route lists the model"
+        );
+        assert!(
+            r.missing_from_catalog(&ns(&r), "claude-opus-5")
+                .await
+                .is_empty(),
+            "a model no rule matches tries every route, so none is missing"
+        );
+    }
+
+    /// 欄は名前の並びで、credential の更新が失敗した記録がある経路にだけ
+    /// 理由を添える。無くても空の並びを出す。
+    #[test]
+    fn describes_the_missing_routes_for_the_log() {
+        assert_eq!(describe_missing(&[]), "[]");
+        assert_eq!(
+            describe_missing(&[
+                ("a".to_owned(), Some(AuthStatus::ReloginRequired)),
+                ("b".to_owned(), None),
+                ("c".to_owned(), Some(AuthStatus::Ok)),
+                ("d".to_owned(), Some(AuthStatus::Degraded)),
+            ]),
+            "[a (credential unavailable: relogin_required), b, c, d (credential unavailable: degraded)]"
         );
     }
 
