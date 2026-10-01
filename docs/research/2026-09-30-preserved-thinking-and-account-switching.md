@@ -102,3 +102,22 @@ account B (`claude-kawazzz`) に `ns-lab` を切り替えた後、保存した�
 ## ロックの永続化 (DR-0034、v0.63.1) の実機 (2026-09-30 19:20 JST、unstable `ns-lab`)
 
 turn1 を `claude-kawazzz` 固定の lab で取ると `~/.local/state/llm-gateway/stats/account-lock/locks.json` に `{ns: lab, model: claude-sonnet-5-5, account: claude-kawazzz, crossed: false}` が書かれた。unstable を **restart** し、lab の routing を `claude-emrd` に reload してから同 session で turn2: 200 / `end_turn` / `input_tokens` 495 (thinking が text として載っている) / events に `thinking_as_text: true`、ファイルは `crossed: true` に更新。restart を跨いでロックが復元され、跨ぎが検知された。stable と unstable の相互は lab が unstable にしか無いので未測 (統合テスト `the_lock_survives_a_restart_and_is_shared_with_the_sibling_unit` で担保)。
+
+## fable の account 跨ぎと fable→opus のモデル跨ぎ (2026-10-01 18:00 JST、gateway 0.64.1、unstable `ns-lab`)
+
+turn1 は `claude-fable-5-1` を `claude-kawazzz` 固定の lab で 1 回取り、その content (署名付き thinking 1 個 + text) を全ケースで使い回した。lab は `thinking_display = "summarized"` なので thinking 本文は要約 428 文字、turn1 の `thinking_tokens` は 408。`effort: high` では fable が 2 回とも thinking を出さなかった (text のみ、署名なし) ため、turn1・turn2 とも `effort: max` で測った (effort は prefix 検査の対象外)。全リクエストに `thinking-binding-controls-2026-08-01`。fable / opus は `account_bound_thinking` に入っていないので gateway は変換していない (events の `thinking_as_text` は全件なし)。route は SSE events の `credential` で各リクエストを照合した。A2 だけ lab の routing を `claude-zunsystem` に reload して送り、測定後 `claude-kawazzz` に戻した。
+
+| ケース | turn2 の model / route | 送った thinking | HTTP | `stop_reason` / `stop_details` | `input_transformations` | text 応答 | `input_tokens` |
+|---|---|---|---:|---|---|---|---:|
+| A1 (対照) | fable / `claude-kawazzz` | 無改変 | 200 | `end_turn` / null | `[]` | あり (`246 + 642 = 888`) | 1021 |
+| A2 | fable / `claude-zunsystem` | 無改変 | 200 | `end_turn` / null | `[]` | あり (`888`) | 1021 |
+| A3 (対照) | fable / `claude-zunsystem` | 削除 | 200 | `end_turn` / null | `[]` | あり (`888`) | 611 |
+| B1 | opus 5.5 / `claude-kawazzz` | 無改変 | 200 | `end_turn` / null | `[{"type":"thinking_dropped","path":"messages.1.content.0","reason":"model_binding_mismatch"}]` | あり (`888`) | 611 |
+| B2 | opus 5.5 / `claude-kawazzz` | 本文 (末尾の改行と半角空白を除去) の text block に置換 | 200 | `end_turn` / null | `[]` | あり (`888`) | 759 |
+| B3 (対照) | opus 5.5 / `claude-kawazzz` | 削除 | 200 | `end_turn` / null | `[]` | あり (`888`) | 611 |
+
+drop の判定: thinking を削除した対照は fable (A3) / opus (B3) とも 611 で、残した A1 は 1021。差 410 は turn1 の `thinking_tokens` 408 にほぼ一致する (署名が運ぶ推論全体が input として数えられ、要約本文の長さではない)。A2 は A1 と同じ 1021、B1 は削除と同じ 611。B2 は 611 + 148 で、要約本文だけが text として載り、元の推論 (410) は載らない。
+
+**結論:** A — fable 5.1 の thinking は `claude-kawazzz` → `claude-zunsystem` で落ちなかった (`input_tokens` が同一 account と同値、報告なし)。ただし 2 account が linked でないことは未確認 (`claude-zunsystem` に sonnet 5.5 の route が無く、account 束縛される Sonnet で非 linked を確かめられない)。B — fable → opus 5.5 では thinking が黙って落ち、beta header 有りで `model_binding_mismatch` が報告された (Sonnet の account 跨ぎで `[]` だったのと違い、こちらは報告される)。text 化すると要約本文 (148 token) が入力に載り、`reasoning_extraction` の refusal は出ず `end_turn` で回答した。持ち越せるのは要約本文までで、turn2 の正答は削除 (B3) でも同じだったため、推論の持ち越しが回答に効いたかはこの問題では区別できない。
+
+probe に `--turn2-thinking keep|text|drop` (turn2 で thinking block をそのまま / text 化 / 削除して送る) と `--effort` を足し、出力に `stop_details` と先頭 text を加えた。turn2 の model は turn2 呼び出しの MODEL 引数で turn1 と変えられる。
