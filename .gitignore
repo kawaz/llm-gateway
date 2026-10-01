@@ -1,2 +1,5 @@
 /target
 *.local.code-workspace
+
+# auto mode classifier 向けの個人設定 (正本は privacy リポ、symlink)
+.claude/rules/*.local.md
