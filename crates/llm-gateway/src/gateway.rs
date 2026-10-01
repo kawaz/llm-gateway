@@ -15,9 +15,8 @@ use futures_util::StreamExt as _;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use crate::account_lock::AccountLocks;
 use crate::cache::{self, keepalive};
-use crate::config::{CacheRule, CacheStrategy, Config, OnAccountSwitch};
+use crate::config::{CacheRule, CacheStrategy, Config};
 use crate::credential::oauth::{self, WebAuthorization};
 use crate::credential::time::{now_unix, now_unix_ms, to_unix_secs};
 use crate::credential::{Credential, CredentialId, CredentialPersistence, CredentialStore, Kind};
@@ -29,10 +28,11 @@ use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
 use crate::quota::{self, QuotaLimit, QuotaStore};
-use crate::router::{AccountLock, Crossing, NamespaceView, Route, Router, Selection};
+use crate::router::{Crossing, NamespaceView, Route, Router, Selection, ThinkingSession};
 use crate::session;
 use crate::stats::{self, Stats};
 use crate::tap::Tap;
+use crate::thinking_sources::ThinkingSources;
 use crate::{Error, Result};
 
 pub struct Gateway<P: CredentialPersistence> {
@@ -171,8 +171,8 @@ impl<P: CredentialPersistence> Gateway<P> {
         let router = Arc::new(Router::new(
             config.clone(),
             Arc::clone(&events),
-            // 兄弟の unit と共有する走行状態なので keepalive と同じ置き場 (DR-0034)。
-            AccountLocks::open(config.stats.resolve_dir()),
+            // 兄弟の unit と共有する走行状態なので keepalive と同じ置き場 (DR-0035 §6)。
+            ThinkingSources::open(config.stats.resolve_dir()),
         ));
         // 控えは待ち受けごとに分けない。兄弟は同じ置き場を共有し、系列の
         // `.lock` を掴んだ 1 台だけが撫でる (DR-0027 決定 3)。
@@ -365,10 +365,10 @@ impl<P: CredentialPersistence> Gateway<P> {
         }
     }
 
-    /// 裏に渡した session のロックの書き込みを、`limit` まで待って書き切る
-    /// (DR-0034)。止まる前に呼ぶ。
-    pub async fn drain_account_locks(&self, limit: std::time::Duration) {
-        self.router.drain_locks(limit).await;
+    /// 裏に渡した session の thinking の出所の書き込みを、`limit` まで待って
+    /// 書き切る (DR-0035 §6)。止まる前に呼ぶ。
+    pub async fn drain_thinking_sources(&self, limit: std::time::Duration) {
+        self.router.drain_sources(limit).await;
     }
 
     /// 変わった分をディスクへ落とす。
@@ -599,14 +599,10 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         // 知らせに載せる素性。会話の id はクライアントが名乗ったものを使う
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
-        // thinking が account に束縛されるモデルの session は、開始 account に
-        // 結ぶ (DR-0033 §2)。`stay` なら他の account の経路は候補から外す —
-        // 開始 account が全部断れば、全経路が締め出された時と同じ 429 になる。
-        let lock = self
-            .router
-            .account_lock(ns, &session, &model)
-            .await
-            .map(|lock| (lock, ns.active().config().on_account_switch));
+        // thinking を運ぶ 1 本だけが session の出所で判定・並べ替えされる
+        // (DR-0035 §3)。運ばない脇の呼び出しを混ぜると本流が毎回跨いで見える。
+        let thinking = crate::thinking::carries_thinking(&body)
+            .then(|| self.router.thinking_session(ns, &session, &model));
         let call = Call {
             principal: principal.and_then(|p| p.subject.as_deref().zip(p.kid.as_deref())),
             ns: ns_name,
@@ -619,17 +615,11 @@ impl<P: CredentialPersistence> Gateway<P> {
             cache: ns.cache_for(&model),
             series,
             shape,
-            lock,
+            thinking,
         };
         let mut routes = self
             .router
-            .routes_for_locked(
-                ns,
-                ns_name,
-                &model,
-                &session,
-                call.lock.as_ref().map(|(lock, _)| lock),
-            )
+            .routes_for_thinking(ns, ns_name, &model, &session, call.thinking.as_ref())
             .await?;
         // この形を運べない経路は、ここで落とす。運べるかどうかは方言を知って
         // いる経路が答える (DR-0025) ので、core は provider の名前を知らないまま
@@ -637,8 +627,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 無い」ではなく「この形では運べない」— 別の受け口なら通るので、
         // 区別が付かないと直しようがない。
         routes.retain(|route| route.preset.wire().accepts(shape));
-        if let Some((lock, OnAccountSwitch::Stay)) = &call.lock {
-            routes.retain(|route| route.account() == lock.account);
+        // `stay` なら account 束縛の model の session を開始 account に留める
+        // (DR-0035 §4)。開始 account が全部断れば、全経路が締め出された時と同じ
+        // 429 になる。
+        if let Some(start) = call.thinking.as_ref().and_then(ThinkingSession::stays_on) {
+            routes.retain(|route| route.account() == start);
         }
         if routes.is_empty() {
             return Err(Error::UnsupportedRequestShape {
@@ -732,6 +725,9 @@ impl<P: CredentialPersistence> Gateway<P> {
                     // 次の転送も同じところから始めることになる。
                     if resp.status / 100 == 2 {
                         self.router.remember(ns, &session, &model, route).await;
+                        if call.thinking.is_some() {
+                            self.router.remember_source(&session, &model, route);
+                        }
                         // 通ったなら締め出しの根拠は消えている。
                         route.preset.allow(&model);
                     }
@@ -1285,7 +1281,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         // prompt cache の扱いは経路ごとに決める (DR-0024)。見るのは解決後の
         // モデル名と呼び出し元で、どちらもこの 1 本の間は変わらない。
         let (origin, strategy) = call.cache_view();
-        // account を跨いだ session の thinking は text にする (DR-0033 §3)。
+        // 跨いだ session の thinking は text にする (DR-0035 §5)。
         // cache 戦略より前に当てる — 整える `cache_control` は変換後の本文の上に
         // 置く。控え (keepalive) も変換後の本文を持つ。
         let crossing = call.crossing(route);
@@ -1809,20 +1805,17 @@ struct Call<'a> {
     series: Option<keepalive::Series>,
     /// クライアントから受けた本文の形 (DR-0025)。
     shape: RequestShape,
-    /// この session が結ばれている account と、そこを離れるときの振る舞い
-    /// (DR-0033)。thinking が account に束縛されないモデルと、開始 account が
-    /// まだ決まっていない session では `None`。
-    lock: Option<(AccountLock, OnAccountSwitch)>,
+    /// thinking を運ぶ 1 本なら、session の出所と跨ぐときの振る舞い (DR-0035 §3)。
+    /// 運ばない 1 本は `None` で、跨ぎの判定も候補の絞りもしない。
+    thinking: Option<ThinkingSession>,
 }
 
 impl<'a> Call<'a> {
-    /// この経路へ送る 1 本が、session の thinking をどう運ぶか (DR-0033)。
+    /// この経路へ送る 1 本が、session の thinking をどう運ぶか (DR-0035 §4)。
     fn crossing(&self, route: &Route) -> Crossing {
-        self.lock
+        self.thinking
             .as_ref()
-            .map_or(Crossing::Unchanged, |(lock, policy)| {
-                lock.crossing(route, *policy)
-            })
+            .map_or(Crossing::Unchanged, |thinking| thinking.crossing(route))
     }
 
     /// 知らせに載せる素性。答えた経路の名前だけが呼び出しごとに変わる。
@@ -2534,7 +2527,7 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
     /// 試験では relay 型を使う。upstream に一覧を聞きに行かず、設定に
     /// 書いたモデルをそのまま扱うので、偽の upstream 1 つで完結する。
     /// 認証情報が要る経路を試すときだけ `claude_oauth` を使う。
-    /// 試験用の gateway と、束縛を設定した試験のロックの置き場 (落とすと消える)。
+    /// 試験用の gateway と、跨ぎを設定した試験の出所の置き場 (落とすと消える)。
     struct Rig {
         gateway: Gateway<StaticStore>,
         _locks: Option<tempfile::TempDir>,
@@ -2554,10 +2547,10 @@ content-length: {}\r\n{extra}connection: close\r\n\r\n{body}",
 
     async fn gateway_with(config_toml: &str, store: StaticStore) -> Rig {
         let mut config: Config = toml::from_str(config_toml).unwrap();
-        // 束縛を設定した試験は session のロックを書く。試験どうしで同じ session
-        // を見ないよう、書き先を試験ごとに分ける (他の試験は読み直しで
-        // `[stats]` を比べるので触らない)。
-        let locks = (config.stats.dir.is_none() && config_toml.contains("account_bound_thinking"))
+        // 跨ぎを設定した試験は thinking を運ぶ本文を送り、session の出所を書く。
+        // 試験どうしで同じ session を見ないよう、書き先を試験ごとに分ける (他の
+        // 試験は読み直しで `[stats]` を比べるので触らない)。
+        let locks = (config.stats.dir.is_none() && config_toml.contains("on_thinking_crossing"))
             .then(|| tempfile::tempdir().unwrap());
         if let Some(locks) = &locks {
             config.stats.dir = Some(locks.path().to_owned());
@@ -8098,20 +8091,31 @@ models = ["n"]
         assert!(gw.namespace(NS).unwrap().config().routes.contains_key("a"));
     }
 
-    // ---------- account への束縛 (DR-0033) ----------
+    // ---------- thinking の跨ぎ (DR-0035) ----------
 
-    /// 2 つの relay 経路 (= 別 account) と、束縛と切り替えの設定。
+    /// 2 つの relay 経路 (= 別 account) と、束縛と跨ぎの設定 (方針は既定の namespace に書く)。
     fn bound_config(first: &str, second: &str, bound: &str, policy: &str) -> String {
         format!(
-            "account_bound_thinking = {bound}\non_account_switch = \"{policy}\"\n{}",
+            "account_bound_thinking = {bound}\n\n[ns.default]\non_thinking_crossing = \"{policy}\"\n{}",
             two_credentials(first, second)
         )
     }
 
+    /// [`bound_config`] の、両経路が `m` と `n` の 2 つのモデルを扱う形。
+    fn two_models_config(first: &str, second: &str, bound: &str, policy: &str) -> String {
+        bound_config(first, second, bound, policy)
+            .replace("models = [\"m\"]", "models = [\"m\", \"n\"]")
+    }
+
     /// 履歴に thinking を持つ会話の 1 本。
     fn thinking_request() -> Value {
+        thinking_request_for("m")
+    }
+
+    /// [`thinking_request`] のモデル違い。
+    fn thinking_request_for(model: &str) -> Value {
         json!({
-            "model": "m",
+            "model": model,
             "max_tokens": 8,
             "messages": [
                 {"role": "user", "content": "hi"},
@@ -8138,16 +8142,39 @@ models = ["n"]
         ])
     }
 
+    /// 同じ session id で別のモデルを呼ぶ、thinking を運ばない脇の 1 本 (権限判定など)。
+    fn side_request(model: &str) -> Value {
+        json!({
+            "model": model,
+            "max_tokens": 8,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "is this allowed?"}],
+            "metadata": {"user_id": r#"{"session_id":"s1"}"#},
+        })
+    }
+
     async fn forward_thinking<P: CredentialPersistence>(gw: &Gateway<P>) -> Forwarded {
+        forward_body(gw, thinking_request()).await
+    }
+
+    async fn forward_body<P: CredentialPersistence>(gw: &Gateway<P>, body: Value) -> Forwarded {
+        forward_in(gw, NS, body).await
+    }
+
+    async fn forward_in<P: CredentialPersistence>(
+        gw: &Gateway<P>,
+        ns_name: &str,
+        body: Value,
+    ) -> Forwarded {
         gw.forward(
-            &ns(gw),
-            NS,
+            &gw.namespace(ns_name).unwrap(),
+            ns_name,
             Ingress {
                 path: "/v1/messages",
                 query: None,
                 shape: RequestShape::Messages,
             },
-            thinking_request(),
+            body,
             vec![],
         )
         .await
@@ -8246,13 +8273,176 @@ models = ["n"]
         let a_sent = a.requests();
         assert_eq!(body(&b.requests()[0]), body(&a_sent[0]), "byte for byte");
         assert_eq!(body(&a_sent[2]), body(&a_sent[0]));
+        // 開始 account へ戻っても、b で生まれた thinking は a では読めない。
         assert_eq!(
             crossing_marks(&mut watching),
             [
                 ("a".to_owned(), false, false),
                 ("a".to_owned(), false, false),
                 ("b".to_owned(), false, true),
+                ("a".to_owned(), false, true),
+            ]
+        );
+    }
+
+    /// 同じ account のまま model だけ変えても跨ぎ。どの policy でも判定し、
+    /// `thinking_as_text` は元の model へ戻っても変換を続ける。
+    #[tokio::test]
+    async fn a_model_crossing_on_the_same_account_is_a_crossing_under_every_policy() {
+        for (policy, as_text, dropped) in [
+            ("stay", false, true),
+            ("drop_thinking", false, true),
+            ("thinking_as_text", true, false),
+        ] {
+            let a = FakeUpstream::always(200).await;
+            let b = FakeUpstream::always(200).await;
+            let gw = gateway(&two_models_config(&a.url, &b.url, "[]", policy)).await;
+            let mut watching = gw.events().subscribe();
+
+            for model in ["m", "n", "m"] {
+                let sent = forward_body(&gw, thinking_request_for(model)).await;
+                assert_eq!(sent.response.status, 200, "{policy}");
+            }
+
+            assert_eq!(b.hits(), 0, "{policy}: every request stays on account a");
+            assert_eq!(
+                crossing_marks(&mut watching),
+                [
+                    ("a".to_owned(), false, false),
+                    ("a".to_owned(), as_text, dropped),
+                    ("a".to_owned(), as_text, dropped),
+                ],
+                "{policy}"
+            );
+            let a_sent = a.requests();
+            assert_eq!(sent_body(&a_sent[0]), thinking_request_for("m"), "{policy}");
+            for later in &a_sent[1..] {
+                let messages = &sent_body(later)["messages"];
+                if as_text {
+                    assert_eq!(messages, &thinking_as_text_messages(), "{policy}");
+                } else {
+                    assert_eq!(messages, &thinking_request()["messages"], "{policy}");
+                }
+            }
+        }
+    }
+
+    /// 2 つの namespace が同じ session の出所を共有し、跨ぎはそれぞれの方針で
+    /// 扱う。方針を書かない namespace は最上位 (ここでは未記入) から `drop_thinking`。
+    #[tokio::test]
+    async fn namespaces_share_the_sources_and_judge_by_their_own_policy() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let config = format!(
+            "account_bound_thinking = []\n\n[ns.text]\non_thinking_crossing = \"thinking_as_text\"\n\n[[ns.text.routing]]\nmodels = [\"m\"]\nroutes = [\"a\", \"b\"]\n{}",
+            two_credentials(&a.url, &b.url)
+        )
+        .replace("models = [\"m\"]", "models = [\"m\", \"n\"]");
+        let gw = gateway(&config).await;
+        let mut watching = gw.events().subscribe();
+
+        for (ns_name, model) in [(NS, "m"), ("text", "n"), (NS, "n")] {
+            let sent = forward_in(&gw, ns_name, thinking_request_for(model)).await;
+            assert_eq!(sent.response.status, 200, "{ns_name} {model}");
+        }
+
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
                 ("a".to_owned(), false, false),
+                ("a".to_owned(), true, false),
+                ("a".to_owned(), false, true),
+            ],
+            "the default namespace sees the crossing recorded through `text`"
+        );
+        let a_sent = a.requests();
+        assert_eq!(
+            sent_body(&a_sent[1])["messages"],
+            thinking_as_text_messages()
+        );
+        assert_eq!(
+            sent_body(&a_sent[2]),
+            thinking_request_for("n"),
+            "drop_thinking keeps the body"
+        );
+    }
+
+    /// thinking を運ばない脇の呼び出しは、別 model でも出所に入らない。本流は
+    /// 跨いだ扱いにならず、本文もそのまま。
+    #[tokio::test]
+    async fn a_side_call_without_thinking_does_not_cross_the_main_flow() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_models_config(
+            &a.url,
+            &b.url,
+            r#"["m", "n"]"#,
+            "thinking_as_text",
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        assert_eq!(
+            forward_body(&gw, side_request("n")).await.response.status,
+            200
+        );
+        assert_eq!(forward_thinking(&gw).await.response.status, 200);
+
+        let a_sent = a.requests();
+        assert_eq!(
+            sent_body(&a_sent[1]),
+            side_request("n"),
+            "the side call goes as-is"
+        );
+        assert_eq!(
+            sent_body(&a_sent[2]),
+            thinking_request(),
+            "the main flow has not crossed"
+        );
+        assert!(
+            crossing_marks(&mut watching)
+                .iter()
+                .all(|(_, as_text, dropped)| !as_text && !dropped)
+        );
+        let session = crate::session::derive(&thinking_request(), &[]);
+        assert_eq!(
+            gw.router
+                .thinking_session(&ns(&gw), &session, "n")
+                .starting_account(),
+            None,
+            "nothing was remembered for the side call's model"
+        );
+    }
+
+    /// `stay` は model の跨ぎでは候補を絞らない (それは client が選ぶ)。
+    /// 開始 account に留めるのは、同じ model の出所がある時だけ。
+    #[tokio::test]
+    async fn stay_does_not_narrow_on_a_model_crossing() {
+        let a = FakeUpstream::start_with_headers(&[("retry-after", "30")], |n, _| {
+            let status = if n == 1 { 200 } else { 429 };
+            (status, body_for(status))
+        })
+        .await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_models_config(&a.url, &b.url, r#"["m", "n"]"#, "stay")).await;
+        let mut watching = gw.events().subscribe();
+
+        assert_eq!(forward_thinking(&gw).await.response.status, 200);
+        let crossed = forward_body(&gw, thinking_request_for("n")).await;
+
+        assert_eq!(crossed.response.status, 200);
+        assert_eq!(
+            (a.hits(), b.hits()),
+            (2, 1),
+            "n has no starting account yet"
+        );
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), false, true),
+                ("b".to_owned(), false, true),
             ]
         );
     }

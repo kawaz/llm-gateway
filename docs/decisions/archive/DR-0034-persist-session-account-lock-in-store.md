@@ -1,6 +1,6 @@
 # DR-0034: session の開始 account と「跨いだ」印を Store 層に永続化し、restart と unit 間で共有する
 
-- Status: Accepted (kawaz 裁定 2026-09-30)。実装済
+- Status: Superseded by [DR-0035](../DR-0035-judge-thinking-crossing-by-session-sources.md) (2026-10-01)。それまでは Accepted (kawaz 裁定 2026-09-30)、実装済
 - Date: 2026-09-30
 
 ## 文脈
@@ -121,7 +121,7 @@ DR-0033 は thinking が account に束縛されるモデルの session を開�
 - docs/issue/2026-09-30-persist-session-account-lock-across-restart-and-units.md (本 DR の元)
 - docs/issue/2026-09-15-store-layer-for-replaceable-persistence.md (Store 層の品目として)
 - [DR-0033](DR-0033-lock-session-to-first-account-and-send-crossed-thinking-as-text.md) (ロックの意味。§4 の寿命と読み直しの規則を本 DR が置き換える)
-- [DR-0010](DR-0010-credential-cross-process-lock.md) (`.lock` の flock と mtime の版)
-- [DR-0027](DR-0027-keepalive-by-replay.md) (兄弟の unit が `[stats] dir` を共有する先例)
-- [DR-0031](DR-0031-store-layer.md) (Store 層の意味論。載せる trait は未確定)
-- [DR-0032](DR-0032-daemon-reload.md) (reload の走行状態の引き継ぎ)
+- [DR-0010](../DR-0010-credential-cross-process-lock.md) (`.lock` の flock と mtime の版)
+- [DR-0027](../DR-0027-keepalive-by-replay.md) (兄弟の unit が `[stats] dir` を共有する先例)
+- [DR-0031](../DR-0031-store-layer.md) (Store 層の意味論。載せる trait は未確定)
+- [DR-0032](../DR-0032-daemon-reload.md) (reload の走行状態の引き継ぎ)

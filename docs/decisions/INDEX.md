@@ -1,6 +1,6 @@
 # Decision Records 一覧
 
-Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは今立っている DR だけ。
+Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは今立っている DR だけで、置き換えられた DR は [archive/INDEX.md](archive/INDEX.md) にある。
 
 状態は絵文字とラベルだけ。日付・Phase・裁定の内訳は各 DR 本文に書く。
 
@@ -46,5 +46,4 @@ Status は各 DR ファイルの `Status:` 行が正本。ここに載るのは�
 | [DR-0030](DR-0030-general-purpose-auth-gateway.md) | 🟡 部分実装 | 汎用の認証 gateway を crate として下に敷き、LLM をその上の 1 利用者にする (任意 API への認証差し替えパススルー、自主レート制限、ns の allowlist と JWT 認証) |
 | [DR-0031](DR-0031-store-layer.md) | 🟡 部分実装 | 永続化の器を一貫性の意味論 (単一 writer の更新 / リース / 合算可能なカウンタ / LWW スナップショット) で 4 つの trait に切り、file backend をその 1 実装にする |
 | [DR-0032](DR-0032-daemon-reload.md) | ✅ 実装済 | 設定の読み直しを `daemon reload` で明示的に行う (CLI → 監督者 → unit ごとの制御 socket、`check` と同じ経路で検証して通った時だけ差し替え、変えられない欄の変更は restart を求めて断る) |
-| [DR-0033](DR-0033-lock-session-to-first-account-and-send-crossed-thinking-as-text.md) | ✅ 実装済 | thinking が account に束縛されるモデル (設定、既定は Sonnet 5.5) の session を開始 account にロックし、開始 account が全滅した時の振る舞いを `on_account_switch` (`stay` / `drop_thinking` / `thinking_as_text`) で選ぶ。`thinking_as_text` で跨いだ session は以後 thinking を改行を保った本文だけの text として送る |
-| [DR-0034](DR-0034-persist-session-account-lock-in-store.md) | ✅ 実装済 | DR-0033 の開始 account と「跨いだ」印を `[stats] dir` の共有ファイル (flock、1 ファイル 1 map) に永続化し、restart と unit 間で共有する (寿命は `seen` から 24h、書くのは状態が変わった 2xx だけ、affinity は永続化しない) |
+| [DR-0035](DR-0035-judge-thinking-crossing-by-session-sources.md) | ✅ 実装済 | thinking の跨ぎ (生成と別のモデル、account 束縛モデル (設定、既定は Sonnet 5.5) なら別の account) を session の出所 tuple (session, account, model) で判定し、`on_thinking_crossing` (`stay` / `drop_thinking` / `thinking_as_text`、namespace ごと、最上位は既定) で振る舞いを選ぶ。対象は履歴に thinking を持つ 1 本だけ。出所は `[stats] dir` の共有ファイルに永続化し (寿命は `seen` から 24h)、`thinking_as_text` で跨いだ session は以後 thinking を改行を保った本文だけの text として送る |

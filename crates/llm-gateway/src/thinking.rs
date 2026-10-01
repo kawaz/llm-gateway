@@ -1,13 +1,39 @@
-//! account を跨いだ session の thinking を、assistant の text にして送る (DR-0033 §3)。
+//! session の thinking の扱い (DR-0035 §3・§5)。
 //!
-//! 署名がもう効かないと分かっている session にだけ当てる。跨いだ後の署名は
-//! account 束縛でどのみち捨てられるので、本文を変えても prefix 束縛で失うものは
-//! 無い (DR-0024 の「本文を変えない」との線引きは DR-0033 の影響節)。
+//! - [`carries_thinking`] その 1 本の履歴が thinking を運ぶか。跨ぎの記録・判定の対象を決める
+//! - [`as_text`] 跨いだ session の thinking を assistant の text にして送る
+//!
+//! text 化は署名がもう効かないと分かっている session にだけ当てる。跨いだ後の
+//! 署名は model / account の束縛でどのみち捨てられるので、本文を変えても prefix
+//! 束縛で失うものは無い (DR-0024 の「本文を変えない」との線引きは DR-0035 §5)。
 //!
 //! 判断は純粋関数で、状態を持たない。同じ本文からは同じ本文を作る — 変わると
 //! 送るたびに prompt cache が壊れる。
 
 use serde_json::{Map, Value};
+
+/// この 1 本が thinking を運ぶか (DR-0035 §3)。assistant の content に
+/// `thinking` / `redacted_thinking` block がある時だけ。
+///
+/// `thinking` param は見ない: thinking を切った model へ移っても、履歴の thinking
+/// は跨ぎとして扱う (text 化すれば文脈に載る)。同じ session id で別 model が走る
+/// 脇の呼び出し (権限判定・要約) は履歴に thinking を持たないので、本流の出所に
+/// 混ざらない。見るのは正規形 (Messages 形式) だけで、他の形の本文は運ばない扱い。
+pub fn carries_thinking(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )
+        })
+}
 
 /// 本文の thinking を text に置き換える。
 ///
@@ -155,6 +181,66 @@ mod tests {
         let once = serde_json::to_vec(&converted(body.clone())).unwrap();
         let twice = serde_json::to_vec(&converted(body)).unwrap();
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn the_thinking_param_alone_does_not_carry() {
+        for thinking in [
+            json!({"type": "adaptive"}),
+            json!({"type": "enabled", "budget_tokens": 1024}),
+            json!({"type": "disabled"}),
+        ] {
+            let body = json!({"model": "m", "thinking": thinking, "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+                {"role": "user", "content": "next"},
+            ]});
+            assert!(!carries_thinking(&body), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_body_without_history_does_not_carry() {
+        assert!(!carries_thinking(
+            &json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        ));
+        assert!(!carries_thinking(&json!({"model": "m", "messages": []})));
+    }
+
+    #[test]
+    fn thinking_blocks_in_the_history_carry_with_or_without_the_param() {
+        for block in [
+            json!({"type": "thinking", "thinking": "", "signature": "s"}),
+            json!({"type": "redacted_thinking", "data": "opaque"}),
+        ] {
+            for param in [
+                None,
+                Some(json!({"type": "disabled"})),
+                Some(json!({"type": "adaptive"})),
+            ] {
+                let mut body = json!({"model": "m", "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": [block.clone(), {"type": "text", "text": "x"}]},
+                ]});
+                if let Some(param) = param {
+                    body["thinking"] = param;
+                }
+                assert!(carries_thinking(&body), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_assistant_blocks_of_the_messages_shape_count() {
+        let user_side = json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "thinking", "thinking": "x", "signature": "s"}]},
+            {"role": "assistant", "content": "plain"},
+        ]});
+        assert!(!carries_thinking(&user_side));
+        let other_shape = json!({"model": "m", "input": [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]},
+        ]});
+        assert!(!carries_thinking(&other_shape));
     }
 
     #[test]

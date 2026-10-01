@@ -18,7 +18,6 @@ use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::account_lock::AccountLocks;
 use crate::config::{self, Config, Namespace, RouteSpec};
 use crate::credential::time::{now_unix, now_unix_ms};
 use crate::credential::{CredentialId, CredentialPersistence, CredentialStore};
@@ -30,6 +29,7 @@ use crate::preset;
 use crate::provider::Preset;
 use crate::quota::AuthStatus;
 use crate::session::SessionKey;
+use crate::thinking_sources::{SessionSources, ThinkingSources};
 use crate::{Error, Result};
 
 /// 会話と経路の結びつきを保つ時間。
@@ -70,7 +70,7 @@ impl Route {
         self.preset.name()
     }
 
-    /// この経路が送る先の account (DR-0033 §2)。
+    /// この経路が送る先の account (DR-0035 §1)。
     ///
     /// 同じ credential を指す経路は同じ account。credential を持たない経路
     /// (relay) は中の account を知らないので、経路名を account 名とする。
@@ -365,6 +365,14 @@ impl NamespaceView {
     pub fn config(&self) -> &Config {
         &self.active.config
     }
+
+    /// この namespace の `on_thinking_crossing` (DR-0035 §4)。namespace の値 →
+    /// 最上位の値 → `drop_thinking` の順。
+    pub fn on_thinking_crossing(&self) -> config::OnThinkingCrossing {
+        let own: &Namespace = self;
+        own.on_thinking_crossing
+            .unwrap_or(self.config().on_thinking_crossing)
+    }
 }
 
 impl std::ops::Deref for NamespaceView {
@@ -401,11 +409,10 @@ pub struct Router {
     /// **provider 間で選ぶための状態**なので、経路の側ではなく core が持つ
     /// (DR-0014 §3 の横断機構)。
     affinity: Mutex<HashMap<(String, SessionKey, String), Binding>>,
-    /// thinking が account に束縛されるモデルの session の開始 account と印
-    /// (DR-0034)。affinity とは別に持つ: 経路名の優先は失っても設定順に落ちる
-    /// だけだが、ロックを失うと跨いだ thinking が黙って落ちる。兄弟の unit と
-    /// ファイルで共有し、寿命も affinity より長い。
-    locks: Arc<AccountLocks>,
+    /// session の thinking の出所 (DR-0035 §2)。affinity とは別に持つ: 経路名の
+    /// 優先は失っても設定順に落ちるだけだが、出所を失うと跨いだ thinking が
+    /// 黙って落ちる。兄弟の unit とファイルで共有し、寿命も affinity より長い。
+    sources: Arc<ThinkingSources>,
     /// 起きたことを見ている人へ流す口。全 provider ぶんで 1 本。
     events: Arc<Events>,
 }
@@ -417,58 +424,87 @@ struct Binding {
     seen: Instant,
 }
 
-/// thinking が account に束縛されるモデルの session が、どの account に
-/// 結ばれているか (DR-0033 §2)。
+/// thinking を運ぶ 1 本から見た、その session (DR-0035 §1・§4)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountLock {
-    /// 開始 account。
-    pub account: String,
-    /// 開始 account 以外へ移ったことがあるか。
-    pub crossed: bool,
+pub struct ThinkingSession {
+    /// 送るモデル (解決後の名前)。
+    model: String,
+    /// そのモデルの thinking が account にも束縛されるか。
+    account_bound: bool,
+    policy: config::OnThinkingCrossing,
+    sources: SessionSources,
 }
 
-/// ロックの表の鍵。affinity と同じ (namespace 名, session, モデル)。
-fn lock_key(ns: &str, session: &SessionKey, model: &str) -> crate::account_lock::Key {
-    (ns.to_owned(), session.as_str().to_owned(), model.to_owned())
-}
-
-/// 1 本を送るとき、その session の thinking をどう運ぶか (DR-0033 §2・§3)。
+/// 1 本を送るとき、その session の thinking をどう運ぶか (DR-0035 §4)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Crossing {
-    /// 本文をそのまま送る。開始 account へ送る、または束縛の無い 1 本。
+    /// 本文をそのまま送る。跨いでいない、または thinking を運ばない 1 本。
     Unchanged,
-    /// 開始 account 以外へ本文のまま送る。履歴の thinking は API が捨てる見込み。
+    /// 跨いだ先へ本文のまま送る。読めない thinking は API が捨てる見込み。
     ThinkingDropped,
     /// thinking を text にして送る。
     ThinkingAsText,
 }
 
-impl AccountLock {
+impl ThinkingSession {
+    fn new(
+        model: &str,
+        account_bound: bool,
+        policy: config::OnThinkingCrossing,
+        sources: SessionSources,
+    ) -> Self {
+        Self {
+            model: model.to_owned(),
+            account_bound,
+            policy,
+            sources,
+        }
+    }
+
+    /// 開始 account。account 束縛のモデルで、同じモデルの出所がある時だけ。
+    pub fn starting_account(&self) -> Option<&str> {
+        if !self.account_bound {
+            return None;
+        }
+        self.sources.starting_account(&self.model)
+    }
+
+    /// `stay` で候補を絞る先の account。model の跨ぎは client が選ぶもので
+    /// gateway には止められないので、絞るのは account の跨ぎだけ。
+    pub fn stays_on(&self) -> Option<&str> {
+        if self.policy != config::OnThinkingCrossing::Stay {
+            return None;
+        }
+        self.starting_account()
+    }
+
     /// この経路へ送る 1 本の扱い。
     ///
-    /// `thinking_as_text` で一度跨いだ session は、開始 account へ戻っても
-    /// 変換を続ける (切替点を持たない、DR-0033 §3)。
-    pub fn crossing(&self, route: &Route, policy: config::OnAccountSwitch) -> Crossing {
-        let elsewhere = route.account() != self.account;
-        match policy {
-            config::OnAccountSwitch::Stay => Crossing::Unchanged,
-            config::OnAccountSwitch::DropThinking if elsewhere => Crossing::ThinkingDropped,
-            config::OnAccountSwitch::DropThinking => Crossing::Unchanged,
-            config::OnAccountSwitch::ThinkingAsText if elsewhere || self.crossed => {
-                Crossing::ThinkingAsText
+    /// 跨いだ出所は session が生きている限り集合に残るので、`thinking_as_text`
+    /// で一度跨いだ session は開始側へ戻っても変換を続ける (切替点を持たない)。
+    pub fn crossing(&self, route: &Route) -> Crossing {
+        if !self
+            .sources
+            .crossed(&self.model, route.account(), self.account_bound)
+        {
+            return Crossing::Unchanged;
+        }
+        match self.policy {
+            config::OnThinkingCrossing::Stay | config::OnThinkingCrossing::DropThinking => {
+                Crossing::ThinkingDropped
             }
-            config::OnAccountSwitch::ThinkingAsText => Crossing::Unchanged,
+            config::OnThinkingCrossing::ThinkingAsText => Crossing::ThinkingAsText,
         }
     }
 }
 
 impl Router {
-    pub fn new(config: Config, events: Arc<Events>, locks: AccountLocks) -> Self {
+    pub fn new(config: Config, events: Arc<Events>, sources: ThinkingSources) -> Self {
         Self {
             active: std::sync::RwLock::new(Arc::new(Active::new(config))),
             catalog: RwLock::new(Catalog::default()),
             affinity: Mutex::new(HashMap::new()),
-            locks: Arc::new(locks),
+            sources: Arc::new(sources),
             events,
         }
     }
@@ -511,8 +547,8 @@ impl Router {
             *active = Arc::new(next);
             carried
         };
-        // ロックの表には触らない。ロックは経路でなく account に結ばれていて、
-        // 経路表を差し替えても意味が変わらない (DR-0034 決定 5)。
+        // 出所の表には触らない。出所は経路でなく (account, model) で、経路表を
+        // 差し替えても意味が変わらない (DR-0035 §6)。
         affinity.retain(|_, bound| carried.contains(&bound.route));
         drop(affinity);
         self.catalog
@@ -813,7 +849,8 @@ impl Router {
         missing
     }
 
-    /// この会話でこのモデルを使うときの経路を、試す順に返す。
+    /// この会話でこのモデルを使うときの経路を、試す順に返す。session の
+    /// thinking の出所では並べない ([`Self::routes_for_thinking`] が並べる)。
     ///
     /// `ns_name` は前回通った経路を引くための鍵。`ns` から名前は取れないので
     /// 呼び出し側から渡す。
@@ -828,20 +865,21 @@ impl Router {
             .await
     }
 
-    /// [`Self::routes_for`] を、呼び出し側が読んだロックで並べる。
+    /// [`Self::routes_for`] を、thinking を運ぶ 1 本なら呼び出し側が読んだ
+    /// session の出所で並べる。
     ///
-    /// 送る側はロックを 1 度だけ読み、変換の判断 (`on_account_switch`) と
+    /// 送る側は出所を 1 度だけ読み、変換の判断 (`on_thinking_crossing`) と
     /// 候補の並べ替えの両方に同じ値を使う。別々に読むと、間に兄弟の unit が
     /// 書いた時に 2 つが食い違う。
-    pub async fn routes_for_locked(
+    pub async fn routes_for_thinking(
         &self,
         ns: &NamespaceView,
         ns_name: &str,
         model: &str,
         session: &SessionKey,
-        lock: Option<&AccountLock>,
+        thinking: Option<&ThinkingSession>,
     ) -> Result<Vec<Arc<Route>>> {
-        self.ordered_at(ns, ns_name, model, session, now_unix(), lock)
+        self.ordered_at(ns, ns_name, model, session, now_unix(), thinking)
             .await
     }
 
@@ -853,8 +891,7 @@ impl Router {
         session: &SessionKey,
         now: i64,
     ) -> Result<Vec<Arc<Route>>> {
-        let lock = self.account_lock(ns, session, model).await;
-        self.ordered_at(ns, ns_name, model, session, now, lock.as_ref())
+        self.ordered_at(ns, ns_name, model, session, now, None)
             .await
     }
 
@@ -865,7 +902,7 @@ impl Router {
         model: &str,
         session: &SessionKey,
         now: i64,
-        lock: Option<&AccountLock>,
+        thinking: Option<&ThinkingSession>,
     ) -> Result<Vec<Arc<Route>>> {
         let catalog = self.catalog.read().await;
         let visible = catalog.visible(ns, ns.config());
@@ -912,16 +949,16 @@ impl Router {
         }
         drop(affinity);
         // thinking が account に束縛されるモデルでは、開始 account の経路を
-        // 全部先に試す (DR-0033 §2)。繰り上げ・前回の経路より後で効かせるので、
-        // どちらもロックを越えない。他 account の経路を外すかどうかは
-        // `on_account_switch` 次第で、それは送る側が決める。ロックは affinity
-        // が寿命切れでも効く (DR-0034)。
-        if let Some(lock) = lock {
-            let (mut locked, others): (Vec<_>, Vec<_>) = routes
+        // 全部先に試す (DR-0035 §4)。繰り上げ・前回の経路より後で効かせるので、
+        // どちらも開始 account を越えない。他 account の経路を外すかどうかは
+        // `on_thinking_crossing` 次第で、それは送る側が決める。出所は affinity
+        // が寿命切れでも効く。
+        if let Some(start) = thinking.and_then(ThinkingSession::starting_account) {
+            let (mut first, others): (Vec<_>, Vec<_>) = routes
                 .into_iter()
-                .partition(|route| route.account() == lock.account);
-            locked.extend(others);
-            routes = locked;
+                .partition(|route| route.account() == start);
+            first.extend(others);
+            routes = first;
         }
         Ok(routes)
     }
@@ -1069,18 +1106,6 @@ impl Router {
         model: &str,
         route: &Arc<Route>,
     ) {
-        // 開始 account は「無ければ入れる、あれば比べる」。初回が並行して別
-        // account で通っても、先に覚えた方が開始 account になり、後の方は
-        // 跨ぎとして印が立つ (DR-0033 §2、unit を跨いでも同じ、DR-0034 決定 2)。
-        // ロックは経路でなく account に結ばれていて設定の差し替えに依らない
-        // ので、読み直しを跨いだ 1 本でも覚える (下の affinity の除外より先)。
-        if ns.active().config.thinking_is_account_bound(model) {
-            self.locks.remember(
-                lock_key(ns.name(), session, model),
-                route.account(),
-                now_unix_ms(),
-            );
-        }
         // 読み直しは結びつきの錠を握ったまま差し替えるので、錠の内側で
         // 比べれば差し替えの途中を見ない。
         let mut affinity = self.affinity.lock().await;
@@ -1097,27 +1122,36 @@ impl Router {
         );
     }
 
-    /// この session が結ばれている account (DR-0033 §2)。
+    /// thinking を運ぶ 1 本が 2xx で通った (account, model) を、session の出所に
+    /// 覚える (DR-0035 §2・§6)。
     ///
-    /// thinking が account に束縛されないモデルと、まだ 2xx を得ていない
-    /// (= 開始 account が決まっていない) session では `None`。
-    pub async fn account_lock(
+    /// 出所は経路でなく (account, model) で設定の差し替えに依らないので、
+    /// 読み直しを跨いだ 1 本でも覚える ([`Self::remember`] の affinity と違う)。
+    /// ns も鍵に含めない: thinking の束縛は upstream の性質で namespace に依らない。
+    pub fn remember_source(&self, session: &SessionKey, model: &str, route: &Route) {
+        self.sources
+            .remember(session.as_str(), route.account(), model, now_unix_ms());
+    }
+
+    /// thinking を運ぶ 1 本から見た、この session (DR-0035 §1・§4)。
+    pub fn thinking_session(
         &self,
         ns: &NamespaceView,
         session: &SessionKey,
         model: &str,
-    ) -> Option<AccountLock> {
-        if !ns.active().config.thinking_is_account_bound(model) {
-            return None;
-        }
-        self.locks
-            .get(&lock_key(ns.name(), session, model), now_unix_ms())
+    ) -> ThinkingSession {
+        ThinkingSession::new(
+            model,
+            ns.config().thinking_is_account_bound(model),
+            ns.on_thinking_crossing(),
+            self.sources.get(session.as_str(), now_unix_ms()),
+        )
     }
 
-    /// 裏に渡したロックの書き込みを、`limit` まで待って書き切る。止まる前に
-    /// 呼ぶ (待たずに止まると、決まった開始 account や印を失う)。
-    pub async fn drain_locks(&self, limit: Duration) {
-        self.locks.drain(limit).await;
+    /// 裏に渡した出所の書き込みを、`limit` まで待って書き切る。止まる前に
+    /// 呼ぶ (待たずに止まると、覚えた出所を失う)。
+    pub async fn drain_sources(&self, limit: Duration) {
+        self.sources.drain(limit).await;
     }
 
     /// discovery が済んだ状態を作る。
@@ -1447,11 +1481,11 @@ spend_down_within = "25%"
 
     const NOW: i64 = 1_800_000_000;
 
-    /// 試験用の router と、そのロックの置き場。置き場は試験ごとに分け
+    /// 試験用の router と、その thinking の出所の置き場。置き場は試験ごとに分け
     /// (同じ session 名を使い回すため)、落とすと消える。
     struct Rig {
         router: Router,
-        _locks: tempfile::TempDir,
+        _sources: tempfile::TempDir,
     }
 
     impl std::ops::Deref for Rig {
@@ -1463,14 +1497,14 @@ spend_down_within = "25%"
     }
 
     fn build(config: Config) -> Rig {
-        let locks = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
         Rig {
             router: Router::new(
                 config,
                 Arc::new(Events::new()),
-                AccountLocks::open(locks.path()),
+                ThinkingSources::open(sources.path()),
             ),
-            _locks: locks,
+            _sources: sources,
         }
     }
 
@@ -3073,9 +3107,9 @@ routes = ["a", "b"]
         ));
     }
 
-    // ---------- account への束縛 (DR-0033) ----------
+    // ---------- thinking の跨ぎ (DR-0035) ----------
 
-    const LOCKING: &str = r#"
+    const BINDING: &str = r#"
 account_bound_thinking = ["claude-sonnet-5"]
 
 [credentials.a]
@@ -3114,122 +3148,238 @@ spend_down_within = "25%"
 
     const OPUS: &str = "claude-opus-5";
 
-    async fn locking_with(config_toml: &str) -> Rig {
-        let config: Config = toml::from_str(config_toml).unwrap();
-        config.validate().unwrap();
-        let r = build(config);
+    async fn set_both_models(r: &Router) {
         let both: &[(&str, &str)] = &[(SONNET, SONNET), (OPUS, OPUS)];
         r.set_catalog(&[("a1", both), ("a2", both), ("b1", both), ("relay", both)])
             .await;
+    }
+
+    async fn binding_with(config_toml: &str) -> Rig {
+        let config: Config = toml::from_str(config_toml).unwrap();
+        config.validate().unwrap();
+        let r = build(config);
+        set_both_models(&r).await;
         r
     }
 
-    async fn locking() -> Rig {
-        locking_with(LOCKING).await
+    async fn binding() -> Rig {
+        binding_with(BINDING).await
     }
 
-    /// その経路で 2xx が返ったことにする。
+    fn pick(routes: &[Arc<Route>], name: &str) -> Arc<Route> {
+        Arc::clone(routes.iter().find(|r| r.name() == name).unwrap())
+    }
+
+    async fn route_of(r: &Router, model: &str, name: &str) -> Arc<Route> {
+        let routes = r
+            .routes_for(&ns(r), NS, model, &session("any"))
+            .await
+            .unwrap();
+        pick(&routes, name)
+    }
+
+    /// thinking を運ぶ 1 本が、その経路で 2xx を得たことにする。
     async fn passed(r: &Router, s: &str, model: &str, route: &str) {
         let routes = r.routes_for(&ns(r), NS, model, &session(s)).await.unwrap();
-        let route = routes.iter().find(|r| r.name() == route).unwrap();
-        r.remember(&ns(r), &session(s), model, route).await;
+        let route = pick(&routes, route);
+        r.remember(&ns(r), &session(s), model, &route).await;
+        r.remember_source(&session(s), model, &route);
     }
 
-    async fn lock_of(r: &Router, s: &str, model: &str) -> Option<AccountLock> {
-        r.account_lock(&ns(r), &session(s), model).await
+    fn thinking_of(r: &Router, s: &str, model: &str) -> ThinkingSession {
+        r.thinking_session(&ns(r), &session(s), model)
     }
 
-    fn locked(account: &str, crossed: bool) -> Option<AccountLock> {
-        Some(AccountLock {
-            account: account.to_owned(),
-            crossed,
-        })
+    fn start_of(r: &Router, s: &str, model: &str) -> Option<String> {
+        thinking_of(r, s, model)
+            .starting_account()
+            .map(str::to_owned)
+    }
+
+    /// thinking を運ぶ 1 本の試す順。
+    async fn thinking_order(r: &Router, s: &str, model: &str) -> Vec<String> {
+        let thinking = thinking_of(r, s, model);
+        names(
+            &r.routes_for_thinking(&ns(r), NS, model, &session(s), Some(&thinking))
+                .await
+                .unwrap(),
+        )
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn sources(list: &[(&str, &str)]) -> SessionSources {
+        list.iter()
+            .enumerate()
+            .map(|(i, (account, model))| crate::thinking_sources::Source {
+                account: (*account).to_owned(),
+                model: (*model).to_owned(),
+                decided_at: i64::try_from(i).unwrap(),
+            })
+            .collect()
     }
 
     #[tokio::test]
     async fn the_first_success_decides_the_starting_account() {
-        let r = locking().await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, None, "nothing passed yet");
+        let r = binding().await;
+        assert_eq!(start_of(&r, "s", SONNET), None, "nothing passed yet");
 
         passed(&r, "s", SONNET, "a2").await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+        assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("a"));
     }
 
     #[tokio::test]
     async fn another_route_on_the_same_credential_does_not_cross() {
-        let r = locking().await;
+        let r = binding().await;
         passed(&r, "s", SONNET, "a1").await;
         passed(&r, "s", SONNET, "a2").await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+        let thinking = thinking_of(&r, "s", SONNET);
+        assert_eq!(thinking.starting_account(), Some("a"));
+        assert_eq!(
+            thinking.crossing(&*route_of(&r, SONNET, "a1").await),
+            Crossing::Unchanged
+        );
+        assert_eq!(
+            thinking.crossing(&*route_of(&r, SONNET, "b1").await),
+            Crossing::ThinkingDropped
+        );
     }
 
+    /// 別 account へ跨いだ session は、開始 account へ戻っても跨いだまま
+    /// (b で生まれた thinking は a では読めない)。開始 account は変わらない。
     #[tokio::test]
-    async fn another_credential_crosses_and_the_mark_stays() {
-        let r = locking().await;
+    async fn another_credential_crosses_and_stays_crossed() {
+        let r = binding().await;
         passed(&r, "s", SONNET, "a1").await;
         passed(&r, "s", SONNET, "b1").await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
-
-        // 開始 account に戻っても、開始 account も印も変わらない。
         passed(&r, "s", SONNET, "a1").await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
+
+        let thinking = thinking_of(&r, "s", SONNET);
+        assert_eq!(thinking.starting_account(), Some("a"));
+        assert_eq!(
+            thinking.crossing(&*route_of(&r, SONNET, "a1").await),
+            Crossing::ThinkingDropped
+        );
     }
 
-    /// 初回が並行して別 account で通ったら、先に覚えた方が開始 account に
-    /// なり、後の方は跨ぎとして扱う (first-writer-wins)。
+    /// 初回が並行して別 account で通ったら、先に決まった方が開始 account。
+    /// 覚えた順 (書き込みの順) には依らない。
     #[tokio::test]
-    async fn concurrent_first_requests_keep_the_first_remembered_account() {
-        let r = locking().await;
-        // 2 本とも開始 account が決まる前に経路を選んだ。
-        let first = r
-            .routes_for(&ns(&r), NS, SONNET, &session("s"))
-            .await
-            .unwrap();
-        let second = r
-            .routes_for(&ns(&r), NS, SONNET, &session("s"))
-            .await
-            .unwrap();
-        assert_eq!(lock_of(&r, "s", SONNET).await, None);
-        let pick = |routes: &[Arc<Route>], name: &str| {
-            Arc::clone(routes.iter().find(|r| r.name() == name).unwrap())
-        };
+    async fn the_earliest_decided_account_starts_whatever_order_it_is_remembered_in() {
+        let r = binding().await;
+        let (s, now) = (session("s"), now_unix_ms());
+        r.sources.remember(s.as_str(), "a", SONNET, now);
+        r.sources.remember(s.as_str(), "b", SONNET, now - 1);
+        r.sources.settled().await;
 
-        r.remember(&ns(&r), &session("s"), SONNET, &pick(&first, "b1"))
-            .await;
-        r.remember(&ns(&r), &session("s"), SONNET, &pick(&second, "a1"))
-            .await;
-
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("b", true));
-        let order = r
-            .routes_for(&ns(&r), NS, SONNET, &session("s"))
-            .await
-            .unwrap();
+        assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("b"));
         assert_eq!(
-            names(&order)[0],
+            thinking_order(&r, "s", SONNET).await[0],
             "b1",
-            "the first remembered account stays in front (and is what `stay` keeps)"
+            "the starting account stays in front (and is what `stay` keeps)"
         );
     }
 
     #[tokio::test]
     async fn a_relay_route_is_its_own_account() {
-        let r = locking().await;
+        let r = binding().await;
         passed(&r, "s", SONNET, "relay").await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("relay", false));
+        assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("relay"));
     }
 
+    /// account に束縛されないモデルも出所には入る (model の束縛は全モデル)。
+    /// 開始 account は持たない。
     #[tokio::test]
-    async fn a_model_without_account_bound_thinking_is_not_locked() {
-        let r = locking().await;
+    async fn a_model_without_account_bound_thinking_is_remembered_but_not_pinned() {
+        let r = binding().await;
         passed(&r, "s", OPUS, "a1").await;
-        assert_eq!(lock_of(&r, "s", OPUS).await, None);
+        assert_eq!(start_of(&r, "s", OPUS), None);
+        assert_eq!(
+            thinking_of(&r, "s", OPUS).crossing(&*route_of(&r, OPUS, "b1").await),
+            Crossing::Unchanged,
+            "another account is no crossing for an unbound model"
+        );
+        assert_eq!(
+            thinking_of(&r, "s", SONNET).crossing(&*route_of(&r, SONNET, "a1").await),
+            Crossing::ThinkingDropped,
+            "another model is"
+        );
     }
 
-    /// 読み直しはロックの表に触らない。ロックは経路でなく account に結ばれて
-    /// いる (DR-0034 決定 5)。
     #[tokio::test]
-    async fn a_reload_leaves_the_locks_alone() {
-        let r = locking().await;
+    async fn the_crossing_follows_the_policy() {
+        let a1 = {
+            let r = binding().await;
+            route_of(&r, SONNET, "a1").await
+        };
+        let crossed = sources(&[("a", OPUS)]);
+        for (policy, want) in [
+            (config::OnThinkingCrossing::Stay, Crossing::ThinkingDropped),
+            (
+                config::OnThinkingCrossing::DropThinking,
+                Crossing::ThinkingDropped,
+            ),
+            (
+                config::OnThinkingCrossing::ThinkingAsText,
+                Crossing::ThinkingAsText,
+            ),
+        ] {
+            let thinking = ThinkingSession::new(SONNET, true, policy, crossed.clone());
+            assert_eq!(thinking.crossing(&a1), want, "{policy:?}");
+            let fresh = ThinkingSession::new(SONNET, true, policy, SessionSources::default());
+            assert_eq!(fresh.crossing(&a1), Crossing::Unchanged, "{policy:?}");
+        }
+    }
+
+    /// 方針は namespace の値 → 最上位の値 → `drop_thinking` の順に決まる。
+    #[test]
+    fn the_crossing_policy_resolves_namespace_then_top_level_then_drop_thinking() {
+        use config::OnThinkingCrossing::{DropThinking, Stay, ThinkingAsText};
+        let policy = |toml_text: &str| {
+            let config: Config = toml::from_str(toml_text).unwrap();
+            build(config).namespace("x").unwrap().on_thinking_crossing()
+        };
+        assert_eq!(policy("[ns.x]\n"), DropThinking, "neither is written");
+        assert_eq!(
+            policy("on_thinking_crossing = \"stay\"\n[ns.x]\n"),
+            Stay,
+            "only the top level is written"
+        );
+        assert_eq!(
+            policy(
+                "on_thinking_crossing = \"stay\"\n[ns.x]\non_thinking_crossing = \"thinking_as_text\"\n"
+            ),
+            ThinkingAsText,
+            "the namespace wins"
+        );
+        assert_eq!(
+            policy("[ns.x]\non_thinking_crossing = \"stay\"\n"),
+            Stay,
+            "the namespace alone"
+        );
+    }
+
+    /// `stay` が留めるのは account 束縛のモデルの、同じモデルの出所がある時だけ。
+    #[test]
+    fn stay_keeps_only_a_bound_model_with_its_own_source() {
+        use config::OnThinkingCrossing::{DropThinking, Stay};
+        let same = sources(&[("a", SONNET)]);
+        let other_model = sources(&[("a", OPUS)]);
+        let session = |bound, policy, sources: &SessionSources| {
+            ThinkingSession::new(SONNET, bound, policy, sources.clone())
+        };
+        assert_eq!(session(true, Stay, &same).stays_on(), Some("a"));
+        assert_eq!(session(true, Stay, &other_model).stays_on(), None);
+        assert_eq!(session(false, Stay, &same).stays_on(), None);
+        assert_eq!(session(true, DropThinking, &same).stays_on(), None);
+    }
+
+    /// 読み直しは出所の表に触らない。出所は経路でなく account に結ばれて
+    /// いる (DR-0035 §6)。
+    #[tokio::test]
+    async fn a_reload_leaves_the_sources_alone() {
+        let r = binding().await;
         passed(&r, "kept", SONNET, "a1").await;
         passed(&r, "kept", SONNET, "b1").await;
         passed(&r, "moved", SONNET, "a2").await;
@@ -3237,86 +3387,106 @@ spend_down_within = "25%"
         // a2 だけ credential を変える。
         reload_with(
             &r,
-            &LOCKING.replace(
+            &BINDING.replace(
                 "credential = \"a\"\nurl = \"https://a2.invalid\"",
                 "credential = \"b\"\nurl = \"https://a2.invalid\"",
             ),
         )
         .await;
 
-        assert_eq!(lock_of(&r, "kept", SONNET).await, locked("a", true));
+        assert_eq!(start_of(&r, "kept", SONNET).as_deref(), Some("a"));
         assert_eq!(
-            lock_of(&r, "moved", SONNET).await,
-            locked("a", false),
+            start_of(&r, "moved", SONNET).as_deref(),
+            Some("a"),
             "the session stays on account `a`, whichever routes now reach it"
         );
-        let order = r
-            .routes_for(&ns(&r), NS, SONNET, &session("moved"))
-            .await
-            .unwrap();
         // a2 は一覧を聞き直すまで候補に出ない。
-        assert_eq!(names(&order), ["a1", "b1", "relay"]);
+        assert_eq!(
+            thinking_order(&r, "moved", SONNET).await,
+            ["a1", "b1", "relay"]
+        );
     }
 
-    /// 読み直しの前に始まった 1 本の 2xx も、ロックには覚える。ロックは
-    /// account に結ばれていて、設定の差し替えに依らない。
+    /// 読み直しの前に始まった 1 本の 2xx も、出所には覚える。出所は account に
+    /// 結ばれていて、設定の差し替えに依らない。
     #[tokio::test]
-    async fn a_success_that_straddles_a_reload_still_locks() {
-        let r = locking().await;
+    async fn a_success_that_straddles_a_reload_is_still_remembered() {
+        let r = binding().await;
         let before = ns(&r);
         let routes = r
             .routes_for(&before, NS, SONNET, &session("s"))
             .await
             .unwrap();
-        let a1 = Arc::clone(routes.iter().find(|r| r.name() == "a1").unwrap());
-        reload_with(&r, LOCKING).await;
+        let a1 = pick(&routes, "a1");
+        reload_with(&r, BINDING).await;
 
         r.remember(&before, &session("s"), SONNET, &a1).await;
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", false));
+        r.remember_source(&session("s"), SONNET, &a1);
+        assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("a"));
     }
 
-    /// 送る側が読んだロックで並べる (表を読み直さない)。
+    /// 送る側が読んだ出所で並べる (表を読み直さない)。
     #[tokio::test]
-    async fn the_order_follows_the_lock_the_caller_read() {
-        let r = locking().await;
+    async fn the_order_follows_the_sources_the_caller_read() {
+        let r = binding().await;
         passed(&r, "s", SONNET, "a1").await;
-        let read = locked("b", false).unwrap();
+        let read = ThinkingSession::new(
+            SONNET,
+            true,
+            config::OnThinkingCrossing::DropThinking,
+            sources(&[("b", SONNET)]),
+        );
         let order = r
-            .routes_for_locked(&ns(&r), NS, SONNET, &session("s"), Some(&read))
+            .routes_for_thinking(&ns(&r), NS, SONNET, &session("s"), Some(&read))
             .await
             .unwrap();
         assert_eq!(names(&order), ["b1", "a1", "a2", "relay"]);
     }
 
-    /// affinity (経路名の優先) が切れても、ロックと印は効き続ける (DR-0034)。
+    /// thinking を運ばない 1 本は出所で並べず、affinity だけで並ぶ。
     #[tokio::test]
-    async fn the_lock_outlives_the_affinity() {
-        let r = locking().await;
+    async fn a_request_without_thinking_is_ordered_by_the_affinity_alone() {
+        let r = binding().await;
+        passed(&r, "s", SONNET, "a2").await;
+        passed(&r, "s", SONNET, "b1").await;
+
+        let plain = r
+            .routes_for_thinking(&ns(&r), NS, SONNET, &session("s"), None)
+            .await
+            .unwrap();
+        assert_eq!(names(&plain), ["b1", "a1", "a2", "relay"]);
+        assert_eq!(
+            thinking_order(&r, "s", SONNET).await,
+            ["a1", "a2", "b1", "relay"]
+        );
+    }
+
+    /// affinity (経路名の優先) が切れても、出所は効き続ける。
+    #[tokio::test]
+    async fn the_sources_outlive_the_affinity() {
+        let r = binding().await;
         passed(&r, "s", SONNET, "a2").await;
         passed(&r, "s", SONNET, "b1").await;
         // 1 時間の沈黙で affinity が寿命切れになったのと同じ。
         r.affinity.lock().await.clear();
 
-        assert_eq!(lock_of(&r, "s", SONNET).await, locked("a", true));
-        let order = r
-            .routes_for(&ns(&r), NS, SONNET, &session("s"))
-            .await
-            .unwrap();
-        assert_eq!(names(&order), ["a1", "a2", "b1", "relay"]);
+        assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("a"));
+        assert_eq!(
+            thinking_order(&r, "s", SONNET).await,
+            ["a1", "a2", "b1", "relay"]
+        );
     }
 
     /// 同じ置き場で作り直した router (restart 相当) と、同じ置き場を見る別の
-    /// router (兄弟の unit 相当) が、開始 account と印を引き継ぐ (DR-0034)。
+    /// router (兄弟の unit 相当) が、出所を引き継ぐ (DR-0035 §6)。
     #[tokio::test]
-    async fn the_lock_survives_a_restart_and_is_shared_with_the_sibling_unit() {
+    async fn the_sources_survive_a_restart_and_are_shared_with_the_sibling_unit() {
         let dir = tempfile::tempdir().unwrap();
         let unit = |dir: &std::path::Path| {
-            let config: Config = toml::from_str(LOCKING).unwrap();
-            let r = Router::new(config, Arc::new(Events::new()), AccountLocks::open(dir));
+            let config: Config = toml::from_str(BINDING).unwrap();
+            let r = Router::new(config, Arc::new(Events::new()), ThinkingSources::open(dir));
             async move {
-                let both: &[(&str, &str)] = &[(SONNET, SONNET), (OPUS, OPUS)];
-                r.set_catalog(&[("a1", both), ("a2", both), ("b1", both), ("relay", both)])
-                    .await;
+                set_both_models(&r).await;
                 r
             }
         };
@@ -3324,53 +3494,49 @@ spend_down_within = "25%"
         let unstable = unit(dir.path()).await;
 
         passed(&stable, "s", SONNET, "a1").await;
-        stable.locks.settled().await;
+        stable.sources.settled().await;
         // 兄弟は開始 account を知ったうえで、別 account へ跨いだ。
-        assert_eq!(lock_of(&unstable, "s", SONNET).await, locked("a", false));
+        assert_eq!(start_of(&unstable, "s", SONNET).as_deref(), Some("a"));
         passed(&unstable, "s", SONNET, "b1").await;
-        unstable.locks.settled().await;
-        assert_eq!(lock_of(&stable, "s", SONNET).await, locked("a", true));
+        unstable.sources.settled().await;
+        let a1 = route_of(&stable, SONNET, "a1").await;
+        assert_eq!(
+            thinking_of(&stable, "s", SONNET).crossing(&a1),
+            Crossing::ThinkingDropped,
+            "the sibling's crossing is seen"
+        );
 
         drop(stable);
         let restarted = unit(dir.path()).await;
-        assert_eq!(lock_of(&restarted, "s", SONNET).await, locked("a", true));
-        let order = restarted
-            .routes_for(&ns(&restarted), NS, SONNET, &session("s"))
-            .await
-            .unwrap();
-        assert_eq!(names(&order), ["a1", "a2", "b1", "relay"]);
-    }
-
-    #[tokio::test]
-    async fn a_locked_session_tries_every_route_of_its_account_first() {
-        let r = locking().await;
-        passed(&r, "s", SONNET, "a2").await;
-        passed(&r, "s", OPUS, "a2").await;
-
-        let order = |model| {
-            let r = &r;
-            async move {
-                names(
-                    &r.routes_for(&ns(r), NS, model, &session("s"))
-                        .await
-                        .unwrap(),
-                )
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-            }
-        };
-        assert_eq!(order(SONNET).await, ["a2", "a1", "b1", "relay"]);
+        let thinking = thinking_of(&restarted, "s", SONNET);
+        assert_eq!(thinking.starting_account(), Some("a"));
+        assert_eq!(thinking.crossing(&a1), Crossing::ThinkingDropped);
         assert_eq!(
-            order(OPUS).await,
-            ["a2", "b1", "a1", "relay"],
-            "a model without the binding keeps the plain affinity"
+            thinking_order(&restarted, "s", SONNET).await,
+            ["a1", "a2", "b1", "relay"]
         );
     }
 
     #[tokio::test]
-    async fn the_spend_down_promotion_does_not_break_the_lock() {
-        let r = locking().await;
+    async fn a_session_with_a_starting_account_tries_every_route_of_it_first() {
+        let r = binding().await;
+        passed(&r, "s", SONNET, "a2").await;
+        passed(&r, "s", OPUS, "a2").await;
+
+        assert_eq!(
+            thinking_order(&r, "s", SONNET).await,
+            ["a2", "a1", "b1", "relay"]
+        );
+        assert_eq!(
+            thinking_order(&r, "s", OPUS).await,
+            ["a2", "b1", "a1", "relay"],
+            "a model without the account binding keeps the plain affinity"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_spend_down_promotion_does_not_break_the_starting_account() {
+        let r = binding().await;
         for model in [SONNET, OPUS] {
             let routes = r
                 .routes_for_at(&spend_ns(&r), SPEND_NS, model, &session("s"), NOW)
@@ -3378,6 +3544,7 @@ spend_down_within = "25%"
                 .unwrap();
             r.remember(&spend_ns(&r), &session("s"), model, &routes[0])
                 .await;
+            r.remember_source(&session("s"), model, &routes[0]);
             assert_eq!(routes[0].name(), "a1");
         }
         observe_window(&r, "b1", Some(WEEK), Some(NOW + 60));
@@ -3385,10 +3552,18 @@ spend_down_within = "25%"
         let order = |model| {
             let r = &r;
             async move {
+                let thinking = r.thinking_session(&spend_ns(r), &session("s"), model);
                 names(
-                    &r.routes_for_at(&spend_ns(r), SPEND_NS, model, &session("s"), NOW)
-                        .await
-                        .unwrap(),
+                    &r.ordered_at(
+                        &spend_ns(r),
+                        SPEND_NS,
+                        model,
+                        &session("s"),
+                        NOW,
+                        Some(&thinking),
+                    )
+                    .await
+                    .unwrap(),
                 )
                 .into_iter()
                 .map(str::to_owned)
@@ -3399,7 +3574,7 @@ spend_down_within = "25%"
         assert_eq!(
             order(OPUS).await,
             ["a1", "b1", "a2"],
-            "without the binding the promotion still moves b1 up"
+            "without the account binding the promotion still moves b1 up"
         );
     }
 }

@@ -133,7 +133,9 @@ pub struct Config {
     #[serde(default)]
     pub ratelimit: RateLimitStore,
 
-    /// thinking の署名が生成した account にしか効かないモデル (DR-0033 §1)。
+    /// thinking の署名が生成した account にしか効かないモデル (DR-0035 §1)。
+    /// model の束縛 (生成した model でしか読めない) は全モデルに効くので、ここに
+    /// 書くのは account の束縛だけ。
     ///
     /// upstream の性質で namespace ごとには変わらないので、最上位に 1 つ置く。
     /// 要素は routing / cache の `models` と同じパターンで、解決後のモデル名と
@@ -141,10 +143,10 @@ pub struct Config {
     #[serde(default = "default_account_bound_thinking")]
     pub account_bound_thinking: Vec<String>,
 
-    /// 束縛モデルの session が開始 account の経路を全部断られたときの振る舞い
-    /// (DR-0033 §2)。
+    /// thinking が跨ぐときの振る舞いの、各 namespace の既定 (DR-0035 §4)。
+    /// namespace が自分で書けばそちらが勝つ。
     #[serde(default)]
-    pub on_account_switch: OnAccountSwitch,
+    pub on_thinking_crossing: OnThinkingCrossing,
 
     /// 名前空間。`/ns-<名前>/v1/messages` で使い分ける。
     ///
@@ -207,6 +209,12 @@ pub struct Namespace {
 
     /// Messages API の思考表示方法を強制する。
     pub thinking_display: Option<ThinkingDisplay>,
+
+    /// thinking を運ぶ 1 本が、履歴の thinking を読めない先 (別 model、account
+    /// 束縛の model なら別 account) へ跨ぐときの振る舞い (DR-0035 §4)。
+    /// 推論の連続性と可用性のどちらを取るかは使う側の方針なので namespace に
+    /// 置く。書かなければ最上位の値。
+    pub on_thinking_crossing: Option<OnThinkingCrossing>,
 }
 
 /// 認証の方式名 (`auth = "..."`)。
@@ -291,6 +299,8 @@ pub struct NamespaceRepr {
     routes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking_display: Option<ThinkingDisplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_thinking_crossing: Option<OnThinkingCrossing>,
 }
 
 impl TryFrom<NamespaceRepr> for Namespace {
@@ -330,6 +340,7 @@ impl TryFrom<NamespaceRepr> for Namespace {
             allow: r.allow,
             routes: r.routes,
             thinking_display: r.thinking_display,
+            on_thinking_crossing: r.on_thinking_crossing,
         })
     }
 }
@@ -381,6 +392,7 @@ impl From<Namespace> for NamespaceRepr {
             allow: n.allow,
             routes: n.routes,
             thinking_display: n.thinking_display,
+            on_thinking_crossing: n.on_thinking_crossing,
         }
     }
 }
@@ -389,16 +401,18 @@ fn default_account_bound_thinking() -> Vec<String> {
     vec!["claude-sonnet-5-5".to_owned()]
 }
 
-/// 開始 account の経路が全部使えないときに、別 account へ移るか (DR-0033 §2)。
+/// thinking が跨ぐときの振る舞い (DR-0035 §4)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OnAccountSwitch {
-    /// 移らない。全経路が締め出された時と同じ 429 + `retry-after` を返す。
+pub enum OnThinkingCrossing {
+    /// account 束縛の model では開始 account から移らず、全経路が締め出された時と
+    /// 同じ 429 + `retry-after` を返す。model の跨ぎは client が選ぶので止めず、
+    /// 本文はそのまま送る。
     Stay,
-    /// 移る。本文はそのままで、履歴の thinking は API が捨てるのに任せる。
+    /// 跨いでも本文はそのままで、履歴の thinking は API が捨てるのに任せる。
     #[default]
     DropThinking,
-    /// 移る。その session は以後 thinking を assistant の text にして送る。
+    /// 跨いだ session は以後 thinking を assistant の text にして送る。
     ThinkingAsText,
 }
 
@@ -1559,7 +1573,7 @@ fn validate_route(name: &str, route: &RouteSpec, config: &Config) -> Result<()> 
 }
 
 impl Config {
-    /// このモデル (解決後の名前) の thinking が account に束縛されるか (DR-0033 §1)。
+    /// このモデル (解決後の名前) の thinking が account に束縛されるか (DR-0035 §1)。
     pub fn thinking_is_account_bound(&self, model: &str) -> bool {
         crate::pattern::matches_any(&self.account_bound_thinking, model)
     }
@@ -2149,7 +2163,7 @@ o = "claude-opus-*"
         assert!(c.thinking_is_account_bound("claude-sonnet-5-5"));
         assert!(!c.thinking_is_account_bound("claude-fable-5-1"));
         assert!(!c.thinking_is_account_bound("claude-opus-5-5"));
-        assert_eq!(c.on_account_switch, OnAccountSwitch::DropThinking);
+        assert_eq!(c.on_thinking_crossing, OnThinkingCrossing::DropThinking);
     }
 
     #[test]
@@ -2171,16 +2185,36 @@ o = "claude-opus-*"
     }
 
     #[test]
-    fn on_account_switch_reads_all_three_values() {
+    fn on_thinking_crossing_reads_all_three_values() {
         for (raw, want) in [
-            ("stay", OnAccountSwitch::Stay),
-            ("drop_thinking", OnAccountSwitch::DropThinking),
-            ("thinking_as_text", OnAccountSwitch::ThinkingAsText),
+            ("stay", OnThinkingCrossing::Stay),
+            ("drop_thinking", OnThinkingCrossing::DropThinking),
+            ("thinking_as_text", OnThinkingCrossing::ThinkingAsText),
         ] {
-            let c = parse(&format!("on_account_switch = \"{raw}\"")).unwrap();
-            assert_eq!(c.on_account_switch, want);
+            let c = parse(&format!("on_thinking_crossing = \"{raw}\"")).unwrap();
+            assert_eq!(c.on_thinking_crossing, want);
         }
-        assert!(parse(r#"on_account_switch = "switch""#).is_err());
+        assert!(parse(r#"on_thinking_crossing = "switch""#).is_err());
+    }
+
+    #[test]
+    fn a_namespace_reads_its_own_crossing_policy_or_leaves_it_unset() {
+        let c = parse("[ns.default]\n[ns.text]\non_thinking_crossing = \"thinking_as_text\"\n")
+            .unwrap();
+        assert_eq!(c.namespace("default").unwrap().on_thinking_crossing, None);
+        assert_eq!(
+            c.namespace("text").unwrap().on_thinking_crossing,
+            Some(OnThinkingCrossing::ThinkingAsText)
+        );
+        assert!(parse("[ns.default]\non_thinking_crossing = \"switch\"\n").is_err());
+    }
+
+    #[test]
+    fn the_account_only_name_of_the_crossing_setting_is_rejected() {
+        let err = parse(r#"on_account_switch = "stay""#).unwrap_err();
+        assert!(err.to_string().contains("on_account_switch"), "{err}");
+        let err = parse("[ns.default]\non_account_switch = \"stay\"\n").unwrap_err();
+        assert!(err.to_string().contains("on_account_switch"), "{err}");
     }
 
     fn parse(s: &str) -> Result<Config> {

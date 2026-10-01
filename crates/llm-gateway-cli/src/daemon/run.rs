@@ -24,9 +24,9 @@ const SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// 最後の保存までを子自身の終了処理として完遂する。
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 止まる前に session のロックの書き込みを待つ上限。書き込みは小さな JSON
-/// 1 つなので普段はすぐ済み、置き場が詰まった時だけ効く。
-const ACCOUNT_LOCK_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+/// 止まる前に session の thinking の出所の書き込みを待つ上限。書き込みは小さな
+/// JSON 1 つなので普段はすぐ済み、置き場が詰まった時だけ効く。
+const THINKING_SOURCES_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn foreground(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
     let Some(name) = args.first() else {
@@ -204,9 +204,9 @@ remove disabled from [server], or register another configuration",
         // 止まる前に落とす。定期の周回を待たずに書くので、終了の合図で
         // 直前の分を失わない。
         gateway.save().await;
-        // 裏に渡した session のロックを書き切る。上限は止まる側を待たせすぎ
-        // ないため (DR-0034)。
-        gateway.drain_account_locks(ACCOUNT_LOCK_DRAIN).await;
+        // 裏に渡した session の thinking の出所を書き切る。上限は止まる側を
+        // 待たせすぎないため (DR-0035 §6)。
+        gateway.drain_thinking_sources(THINKING_SOURCES_DRAIN).await;
         result?;
 
         Ok(ExitCode::SUCCESS)
