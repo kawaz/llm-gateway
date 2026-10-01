@@ -594,7 +594,7 @@ open http://127.0.0.1:8402/llm-gateway/login
 
 ### `GET /llm-gateway/login/{name}/start`
 
-state と PKCE verifier を作ってメモリに保持し、credential 専用の HTML ページを返す。ページには credential 名、別タブで開く Anthropic の認可リンク、短い手順、コード貼り付けフォームがある。認可後に Anthropic console が表示する `code#state` をコピーし、元のページへ戻って貼り付けて保存する。
+state と PKCE verifier を作ってメモリに保持し、credential 専用の HTML ページを返す。ページには credential 名、別タブで開く Anthropic の認可リンク (同じ URL を読み取り専用の欄と Copy ボタンでも出す。別のブラウザプロファイルへ貼る用)、短い手順、コード貼り付けフォームがある。認可後に Anthropic console が表示する `code#state` をコピーし、元のページへ戻って貼り付けて保存する。
 
 設定に無い名前は 404、`claude_oauth` 以外の credential は 400 を返す。
 

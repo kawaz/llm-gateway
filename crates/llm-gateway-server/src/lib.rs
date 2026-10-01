@@ -76,7 +76,19 @@ fn html_page(title: &str, body: &str) -> Response {
 body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:40rem;padding:0 1rem;\
 background:Canvas;color:CanvasText}\
 input,button{font:inherit}\
-.authorize{display:inline-block;padding:.8rem 1.2rem;border-radius:.4rem;background:LinkText;color:Canvas;text-decoration:none;font-weight:700}</style>";
+.authorize{display:inline-block;padding:.8rem 1.2rem;border-radius:.4rem;background:LinkText;color:Canvas;text-decoration:none;font-weight:700}\
+.copy-row{display:flex;gap:.5rem}\
+.copy-row input{flex:1;min-width:0}\
+input[type=text]{box-sizing:border-box;padding:.6rem .75rem;font-size:1.05rem;\
+border:2px solid color-mix(in srgb,CanvasText 55%,Canvas);border-radius:.4rem;\
+background:color-mix(in srgb,CanvasText 14%,Canvas);color:CanvasText;\
+&:focus-visible{outline:3px solid color-mix(in srgb,LinkText 60%,transparent);outline-offset:1px;border-color:LinkText}}\
+.code-field{display:grid;gap:.4rem;margin-bottom:1rem;font-weight:600;\
+input{font-family:ui-monospace,monospace;font-size:1.15rem;font-weight:400;width:100%;padding:.8rem .9rem;\
+border-color:color-mix(in srgb,CanvasText 75%,Canvas);&::placeholder{color:color-mix(in srgb,CanvasText 50%,Canvas)}}}\
+button{padding:.6rem 1rem;border:2px solid color-mix(in srgb,CanvasText 45%,Canvas);border-radius:.4rem;\
+background:color-mix(in srgb,CanvasText 10%,Canvas);color:CanvasText;cursor:pointer;\
+&:focus-visible{outline:3px solid color-mix(in srgb,LinkText 60%,transparent);outline-offset:1px}}</style>";
     let html = format!(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">{STYLE}<title>{}</title><body><main><h1>{}</h1>{}</main></body></html>",
         html_escape(title),
@@ -111,6 +123,14 @@ async fn login_index<P: CredentialPersistence + 'static>(
     html_page("llm-gateway login", &rows)
 }
 
+/// 認可 URL の input を全選択し、copy ボタンで clipboard へ書く。結果は数秒だけボタンの文言に出す。
+const COPY_SCRIPT: &str = "const url=document.getElementById('authorize-url'),button=document.getElementById('copy-url');\
+url.addEventListener('click',()=>url.select());\
+button.addEventListener('click',async()=>{\
+let label='Copied';\
+try{await navigator.clipboard.writeText(url.value)}catch{url.select();label='Copy failed'}\
+button.textContent=label;setTimeout(()=>button.textContent='Copy',2500)});";
+
 async fn login_start<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(name): AxumPath<String>,
@@ -138,11 +158,14 @@ async fn login_start<P: CredentialPersistence + 'static>(
                 Ok(_) => {
                     let title = format!("Authorize {name}");
                     let path_name = path_segment(&name);
+                    let escaped_url = html_escape(&authorize_url);
                     let body = format!(
-                        "<p><a class=\"authorize\" href=\"{}\" target=\"_blank\" rel=\"noopener\">Open authorization</a></p>\
+                        "<p><a class=\"authorize\" href=\"{escaped_url}\" target=\"_blank\" rel=\"noopener\">Open authorization</a></p>\
+                         <p>Wrong browser profile for this account? Copy the URL and open it in the right one.</p>\
+                         <div class=\"copy-row\"><input type=\"text\" id=\"authorize-url\" readonly aria-label=\"Authorization URL\" value=\"{escaped_url}\"><button type=\"button\" id=\"copy-url\">Copy</button></div>\
                          <ol><li>Approve access in the new tab.</li><li>Copy the code shown in the console.</li><li>Paste it below.</li><li>Select Save.</li></ol>\
-                         <form method=\"post\" action=\"/llm-gateway/login/{path_name}\"><label>Authorization code <input name=\"code\" required autocomplete=\"off\"></label> <button type=\"submit\">Save</button></form>",
-                        html_escape(&authorize_url),
+                         <form method=\"post\" action=\"/llm-gateway/login/{path_name}\"><label class=\"code-field\">Authorization code <input type=\"text\" name=\"code\" required autocomplete=\"off\" spellcheck=\"false\" placeholder=\"code#state\"></label><button type=\"submit\">Save</button></form>\
+                         <script>{COPY_SCRIPT}</script>",
                     );
                     html_page(&title, &body)
                 }
@@ -3985,6 +4008,22 @@ type = "claude_oauth"
             "{body}"
         );
         assert_eq!(body.matches("<form").count(), 1, "{body}");
+        // 別プロファイルへ貼れるよう、同じ URL を readonly の input と copy ボタンでも出す。
+        assert!(
+            body.contains("<input type=\"text\" id=\"authorize-url\" readonly"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<button type=\"button\" id=\"copy-url\">Copy</button>"),
+            "{body}"
+        );
+        assert!(body.contains("navigator.clipboard.writeText"), "{body}");
+        assert_eq!(
+            body.matches("value=\"https://claude.ai/oauth/authorize?")
+                .count(),
+            1,
+            "{body}"
+        );
     }
 
     /// 貼り付け経路は state を単回消費し、交換・確認・保存後に対象名を返す。

@@ -592,7 +592,7 @@ open http://127.0.0.1:8402/llm-gateway/login
 
 ### `GET /llm-gateway/login/{name}/start`
 
-Creates a state and a PKCE verifier, holds them in memory, and returns an HTML page for that credential. The page shows the credential name, an Anthropic authorization link that opens in a new tab, short instructions, and the code-paste form. After approval, copy the `code#state` shown by the Anthropic console, return to the original page, paste it, and save.
+Creates a state and a PKCE verifier, holds them in memory, and returns an HTML page for that credential. The page shows the credential name, an Anthropic authorization link that opens in a new tab (the same URL also sits in a read-only field with a Copy button, for pasting into another browser profile), short instructions, and the code-paste form. After approval, copy the `code#state` shown by the Anthropic console, return to the original page, paste it, and save.
 
 An unconfigured name returns 404, and a credential that is not `claude_oauth` returns 400.
 
