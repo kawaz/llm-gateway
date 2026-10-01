@@ -40,6 +40,8 @@ The `ns-` prefix exists so a namespace name can be told apart from the API path 
 
 Authentication is per namespace. Only a namespace with `auth_token` under `[ns.<name>]` inspects the `Authorization` header; a mismatch returns 401 (`authentication_error`). A namespace without `auth_token` passes traffic through unchecked — the boundary is expected to be drawn in front (tailnet / Caddy).
 
+`GET` / `HEAD` on `/ns-<ns>/api/hello` returns 200 (no body) without authentication in every namespace, whatever its auth scheme, and is not forwarded upstream: Claude Code sends it to `ANTHROPIC_BASE_URL` without a token as a connectivity check. A namespace that is not configured still returns 404, as on any other path.
+
 ### `jwt` namespaces
 
 A namespace can instead accept Ed25519-signed JWTs (DR-0030 §6). The token is sent as `Authorization: Bearer <jwt>`, the same way as a fixed token, so a client such as Claude Code puts it in `ANTHROPIC_AUTH_TOKEN`.

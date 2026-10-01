@@ -40,6 +40,8 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 
 認証は namespace ごと。`[ns.<name>]` に `auth_token` を書いた namespace だけが `Authorization` ヘッダを検査し、合わなければ 401 (`authentication_error`) を返す。`auth_token` を書かない namespace は検査せずに通す — 手前 (tailnet / Caddy) で境界を引く運用を前提にしているため。
 
+`GET` / `HEAD` の `/ns-<ns>/api/hello` は、Claude Code が `ANTHROPIC_BASE_URL` に token を付けずに送る疎通確認のため、どの認証方式の namespace でも認証なしで 200 (本文なし) を返し、upstream には流さない。設定に無い namespace は他のパスと同じく 404。
+
 ### `jwt` の namespace
 
 固定 token の代わりに、Ed25519 で署名した JWT を受ける namespace も作れる (DR-0030 §6)。送り方は固定 token と同じ `Authorization: Bearer <jwt>` なので、Claude Code なら `ANTHROPIC_AUTH_TOKEN` に入れる。

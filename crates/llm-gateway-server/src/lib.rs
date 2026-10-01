@@ -61,6 +61,9 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
+        // Claude Code の疎通確認。答えるのは GET / HEAD だけで、他の動詞は
+        // 同じ形の中継 (行き先 `api` の `/hello`) へそのまま回す。
+        .route("/{ns}/api/hello", get(client_probe).fallback(passthrough))
         // 登録した行き先への無変換の中継 (DR-0030 §2)。上の固定の段 (`v1`) が
         // 先に当たるので、`v1` / `llm-gateway` / `llm` は行き先の名前にできない。
         .route("/{ns}/{upstream}/{*rest}", any(passthrough))
@@ -260,6 +263,29 @@ fn login_error(error: Error) -> Response {
 /// こちらが避難することになる。
 async fn healthz() -> Response {
     (StatusCode::OK, "ok").into_response()
+}
+
+/// クライアントの疎通確認 (`/ns-<ns>/api/hello`) に、認証なしで 200 を返す。
+///
+/// Claude Code は `ANTHROPIC_BASE_URL` に対して `HEAD {base}/api/hello` を
+/// Authorization 無しで数秒おきに送り、結果は捨てる。namespace の認証に回すと、
+/// `jwt` の namespace では token の拒否が WARN で積もるだけになる。届いたことを
+/// 返せば足りるので、upstream にも流さない。HEAD は `get` が受けて本文を落とす。
+///
+/// 答えるのは設定にある namespace だけで、無い名前は他の口と同じく 404。
+/// healthz と違って namespace の下に置くのは、クライアントが base URL の下へ
+/// 送ってくるから。
+async fn client_probe<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    AxumPath(ns): AxumPath<String>,
+) -> Response {
+    let Some(ns_name) = ns.strip_prefix("ns-") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if gateway.namespace(ns_name).is_none() {
+        return unknown_namespace(ns_name, &gateway.namespace_names());
+    }
+    StatusCode::OK.into_response()
 }
 
 /// この**プロセスが載せている**版を返す。
@@ -5122,6 +5148,60 @@ nothing = ["GET /x"]
                 kid: Some("mbp-2026-09".into()),
             })
         );
+    }
+
+    /// Claude Code の疎通確認 (`/api/hello` の GET / HEAD) は token 無しで 200。
+    /// 他の口と他の動詞は従来どおり認証を求め、無い namespace は 404。
+    #[tokio::test]
+    async fn the_client_probe_needs_no_token() {
+        let (_ring, config) = config();
+        let base = serve(&config).await;
+        let client = reqwest::Client::new();
+
+        let head = client
+            .head(format!("{base}/ns-claude/api/hello"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200);
+        let get = client
+            .get(format!("{base}/ns-claude/api/hello"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 200);
+        assert!(get.bytes().await.unwrap().is_empty());
+
+        let messages = client
+            .post(format!("{base}/ns-claude/v1/messages"))
+            .json(&json!({"model": "claude-opus-5", "max_tokens": 1, "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(messages.status(), 401);
+        let models = client
+            .get(format!("{base}/ns-claude/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(models.status(), 401);
+        let other_verb = client
+            .post(format!("{base}/ns-claude/api/hello"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            other_verb.status(),
+            401,
+            "other verbs go to the relay, which checks the token"
+        );
+
+        let unknown = client
+            .head(format!("{base}/ns-nope/api/hello"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 404);
     }
 
     /// jwt で通った相手は、転送の知らせに `subject` / `kid` として載る。
