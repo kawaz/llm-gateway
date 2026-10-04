@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-10-04 | task | open | [launchd-label-naming-convention](./2026-10-04-launchd-label-naming-convention.md) | launchd label を規約 (com.github.kawaz.<repo>) に揃える (`jp.kawaz.llm-gateway.supervise` → `com.github.kawaz.llm-gateway.supervise`) |
 | 2026-10-04 | design | open | [service-reregister-env-drift-not-detected](./2026-10-04-service-reregister-env-drift-not-detected.md) | service register は XDG を plist に固定しているが、re-register で値が変わっても止まらず、client 側の検知も無い (hyoui からのフラグ) |
 | 2026-09-30 | design | open | [daemon-reload-through-the-supervisor-and-per-unit-control-socket](./2026-09-30-daemon-reload-through-the-supervisor-and-per-unit-control-socket.md) | daemon reload — 設定の reload を restart 無しで行う (監督者経由 + unit ごとの制御 socket) |
 | 2026-09-30 | design | open | [persist-session-account-lock-across-restart-and-units](./2026-09-30-persist-session-account-lock-across-restart-and-units.md) | session の開始 account と「跨いだ」印 (AccountLock) を永続化して restart と unit 間で共有する |
