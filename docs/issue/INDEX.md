@@ -2,6 +2,7 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
+| 2026-10-04 | design | open | [service-reregister-env-drift-not-detected](./2026-10-04-service-reregister-env-drift-not-detected.md) | service register は XDG を plist に固定しているが、re-register で値が変わっても止まらず、client 側の検知も無い (hyoui からのフラグ) |
 | 2026-09-30 | design | open | [daemon-reload-through-the-supervisor-and-per-unit-control-socket](./2026-09-30-daemon-reload-through-the-supervisor-and-per-unit-control-socket.md) | daemon reload — 設定の reload を restart 無しで行う (監督者経由 + unit ごとの制御 socket) |
 | 2026-09-30 | design | open | [persist-session-account-lock-across-restart-and-units](./2026-09-30-persist-session-account-lock-across-restart-and-units.md) | session の開始 account と「跨いだ」印 (AccountLock) を永続化して restart と unit 間で共有する |
 | 2026-09-30 | design | open | [sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](./2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md) | Sonnet 5.5 の thinking は account 束縛なので route 切替で黙って消える。切替に慎重になるオプションの検討 |
