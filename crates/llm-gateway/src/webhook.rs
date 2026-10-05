@@ -233,6 +233,7 @@ fn read_token(path: &Path) -> std::result::Result<String, String> {
 mod tests {
     use super::*;
     use crate::events::{Event, Events, Notice, Origin};
+    use crate::test_log::logs_of;
     use std::sync::{Arc, Mutex};
 
     const NOW: i64 = 1_800_000_000;
@@ -660,44 +661,6 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         assert_eq!(read_token(&with_token(&dir, TOKEN)).unwrap(), TOKEN);
         assert!(read_token(&dir.path().join("ない")).is_err());
-    }
-
-    /// `run` の間に出た記録を集める。受け取り先はこのスレッドにだけ差し込む。
-    fn logs_of<F: std::future::Future<Output = ()>>(run: impl FnOnce() -> F) -> String {
-        #[derive(Clone, Default)]
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Buffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buffer = Buffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run());
-        });
-        let text = buffer.0.lock().unwrap().clone();
-        String::from_utf8_lossy(&text).into_owned()
     }
 
     /// 受け口を複数書いたら、同じ知らせが全部へ届く。

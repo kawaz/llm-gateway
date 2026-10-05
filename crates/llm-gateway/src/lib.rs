@@ -50,6 +50,8 @@ pub use config::Config;
 pub use gateway::Gateway;
 
 mod error;
+#[cfg(test)]
+mod test_log;
 pub(crate) use gateway_core::persist;
 
 pub use error::{Error, Result};

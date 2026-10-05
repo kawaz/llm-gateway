@@ -440,57 +440,8 @@ mod tests {
     use crate::Error;
     use crate::metering::{TokenKind, TokenUsage};
     use crate::stats::ByDate;
+    use crate::test_log::logs_of;
     use futures_util::StreamExt as _;
-    use std::sync::Mutex;
-
-    /// ログを溜める書き出し先。
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Buffer {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// `run` の間に出たログを集める。
-    ///
-    /// 受け取り先はこのスレッドにだけ差し込む (他の試験と混ざらない)。
-    /// 中で待つものがあるので、同じスレッドで回るランタイムを渡す。
-    /// 時計を使えるようにしてあるのは、無音を作る試験があるため。
-    fn logs_of<F: Future<Output = ()>>(run: impl FnOnce() -> F) -> String {
-        let buffer = Buffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .with_ansi(false)
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap()
-                .block_on(run());
-        });
-        buffer.text()
-    }
 
     fn body(chunks: Vec<Result<Bytes>>) -> BodyStream {
         futures_util::stream::iter(chunks).boxed()
