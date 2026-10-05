@@ -1,6 +1,6 @@
 ---
 title: launchd label を規約 (com.github.kawaz.<repo>) に揃える (jp.kawaz.llm-gateway.supervise → com.github.kawaz.llm-gateway.supervise)
-status: open
+status: resolved
 category: task
 created: 2026-10-04T17:30:00+09:00
 last_read: 2026-10-04T17:30:00+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-05T17:24:21+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0028","runbook/2026-09-09-migrate-launchd-to-service","done:稼働機を 2026-10-05 に新 label へ移行済み (supervisor/stable/unstable 0.66.0 running、healthz 200)"]
 blocked_by:
 ---
 
