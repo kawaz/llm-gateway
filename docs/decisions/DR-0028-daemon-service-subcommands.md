@@ -124,7 +124,7 @@ llm-gateway service status     {registered,running,pid,service:{loaded,running,p
 llm-gateway service log [--follow]
 ```
 
-`register` が OS に載せるのは `llm-gateway daemon supervise` **1 つ**。macOS は `~/Library/LaunchAgents/<label>.plist`、Linux は systemd の user unit。label は `jp.kawaz.llm-gateway` 系にして、既存の `com.kawaz.llm-gateway-{stable,unstable}` と衝突させない (移行の途中で両方が載っても、片方だけを外せる)。
+`register` が OS に載せるのは `llm-gateway daemon supervise` **1 つ**。macOS は `~/Library/LaunchAgents/<label>.plist`、Linux は systemd の user unit。label は `com.github.kawaz.llm-gateway.supervise` (逆引き DNS は所有を確かめた名前空間だけを使い、先頭にリポ名を置く。kawaz 製ツール共通の規約) で、既存の `com.kawaz.llm-gateway-{stable,unstable}` と衝突させない (移行の途中で両方が載っても、片方だけを外せる)。
 
 既存 2 plist は runbook の手順で `launchctl bootout` してからファイルを消す。
 

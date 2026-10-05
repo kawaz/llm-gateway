@@ -739,7 +739,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
-                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                "launchctl bootout gui/501/com.github.kawaz.llm-gateway.supervise".to_owned(),
                 format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
             ]
         );
@@ -760,7 +760,7 @@ mod tests {
         // 見に行っただけで、降ろしも載せもしていない。
         assert_eq!(
             runner.calls(),
-            vec!["launchctl print gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec!["launchctl print gui/501/com.github.kawaz.llm-gateway.supervise"]
         );
     }
 
@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
-                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                "launchctl bootout gui/501/com.github.kawaz.llm-gateway.supervise".to_owned(),
                 format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
             ]
         );
@@ -802,8 +802,8 @@ mod tests {
         assert_eq!(
             runner.calls(),
             vec![
-                "launchctl print gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
-                "launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise".to_owned(),
+                "launchctl print gui/501/com.github.kawaz.llm-gateway.supervise".to_owned(),
+                "launchctl bootout gui/501/com.github.kawaz.llm-gateway.supervise".to_owned(),
                 format!("launchctl bootstrap gui/501 {}", plan.unit_path.display()),
             ]
         );
@@ -850,7 +850,7 @@ mod tests {
         unregister(&plan, &runner).unwrap();
         assert_eq!(
             runner.calls(),
-            vec!["launchctl bootout gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec!["launchctl bootout gui/501/com.github.kawaz.llm-gateway.supervise"]
         );
         assert!(!plan.unit_path.exists());
     }
@@ -893,7 +893,7 @@ mod tests {
         start(&plan, &runner).unwrap();
         assert_eq!(
             runner.calls(),
-            vec!["launchctl kickstart gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec!["launchctl kickstart gui/501/com.github.kawaz.llm-gateway.supervise"]
         );
     }
 
@@ -933,7 +933,7 @@ mod tests {
         stop(&plan, &runner, &dir.path().join("supervisor.sock")).unwrap();
         assert_eq!(
             runner.calls(),
-            vec!["launchctl kill SIGTERM gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec!["launchctl kill SIGTERM gui/501/com.github.kawaz.llm-gateway.supervise"]
         );
     }
 
@@ -968,7 +968,7 @@ mod tests {
         status(&plan, &runner, Some(json!({"units": [{"unit": "stable"}]}))).unwrap();
         assert_eq!(
             runner.calls(),
-            vec!["launchctl print gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec!["launchctl print gui/501/com.github.kawaz.llm-gateway.supervise"]
         );
     }
 
@@ -977,7 +977,7 @@ mod tests {
     fn what_launchctl_says_becomes_the_service_part() {
         let out = Output {
             code: 0,
-            stdout: "gui/501/jp.kawaz.llm-gateway.supervise = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n\n\tresource coalition = {\n\t\tstate = active\n\t}\n\n\tjetsam coalition = {\n\t\tstate = active\n\t}\n}\n"
+            stdout: "gui/501/com.github.kawaz.llm-gateway.supervise = {\n\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n\n\tresource coalition = {\n\t\tstate = active\n\t}\n\n\tjetsam coalition = {\n\t\tstate = active\n\t}\n}\n"
                 .to_owned(),
             stderr: String::new(),
         };

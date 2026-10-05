@@ -18,8 +18,9 @@ pub enum Kind {
     Systemd,
 }
 
-/// 登録先の名前。既存の `com.kawaz.llm-gateway-{stable,unstable}` と衝突させない。
-pub const LABEL: &str = "jp.kawaz.llm-gateway.supervise";
+/// 登録先の名前。逆引き DNS は所有を確かめた名前空間 (`com.github.kawaz`) だけを使い、
+/// 先頭にリポ名を置く。既存の `com.kawaz.llm-gateway-{stable,unstable}` とも衝突しない。
+pub const LABEL: &str = "com.github.kawaz.llm-gateway.supervise";
 
 /// systemd 側の unit 名。
 pub const UNIT_NAME: &str = "llm-gateway-supervise.service";
@@ -332,16 +333,16 @@ mod tests {
         );
     }
 
-    /// 既存の 2 台 (`com.kawaz.llm-gateway-*`) と別の名で載る。移行の途中で
-    /// 両方が載っても、片方だけを外せる。
+    /// 所有している名前空間 `com.github.kawaz.<repo>` の下に載り、既存の 2 台
+    /// (`com.kawaz.llm-gateway-*`) とも別の名になる。両方が載っても片方だけを外せる。
     #[test]
-    fn the_label_does_not_collide_with_the_two_that_are_already_loaded() {
+    fn the_label_lives_under_the_owned_namespace_and_does_not_collide() {
         let plan = plan(Kind::Launchd, &env());
-        assert_eq!(plan.label, "jp.kawaz.llm-gateway.supervise");
+        assert_eq!(plan.label, "com.github.kawaz.llm-gateway.supervise");
         assert!(!plan.label.starts_with("com.kawaz.llm-gateway-"));
         assert!(
             plan.unit_path
-                .ends_with("jp.kawaz.llm-gateway.supervise.plist")
+                .ends_with("com.github.kawaz.llm-gateway.supervise.plist")
         );
     }
 
@@ -378,7 +379,7 @@ mod tests {
             vec![
                 "launchctl",
                 "bootout",
-                "gui/501/jp.kawaz.llm-gateway.supervise"
+                "gui/501/com.github.kawaz.llm-gateway.supervise"
             ]
         );
         assert_eq!(
@@ -387,12 +388,16 @@ mod tests {
                 "launchctl",
                 "bootstrap",
                 "gui/501",
-                "/home/u/LaunchAgents/jp.kawaz.llm-gateway.supervise.plist"
+                "/home/u/LaunchAgents/com.github.kawaz.llm-gateway.supervise.plist"
             ]
         );
         assert_eq!(
             plan.stop[0].args,
-            vec!["kill", "SIGTERM", "gui/501/jp.kawaz.llm-gateway.supervise"]
+            vec![
+                "kill",
+                "SIGTERM",
+                "gui/501/com.github.kawaz.llm-gateway.supervise"
+            ]
         );
     }
 

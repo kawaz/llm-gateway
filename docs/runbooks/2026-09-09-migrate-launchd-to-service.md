@@ -11,7 +11,7 @@ launchd に直接載っている 2 つの plist を降ろし、`llm-gateway serv
 
 どちらの plist も `<binary> serve --config <path>` を `RunAtLoad` + `KeepAlive` で走らせている。Caddy は 11301 を優先し、落ちていれば 11302 に回す。
 
-移った後は、OS に載るのは `jp.kawaz.llm-gateway.supervise` (= `llm-gateway daemon supervise`) だけになり、2 台は登録簿 (`~/.local/state/llm-gateway/daemon/units/*.toml`) の中身になる。
+移った後は、OS に載るのは `com.github.kawaz.llm-gateway.supervise` (= `llm-gateway daemon supervise`) だけになり、2 台は登録簿 (`~/.local/state/llm-gateway/daemon/units/*.toml`) の中身になる。
 
 ## 移る前に
 
@@ -116,6 +116,17 @@ rm ~/.config/llm-gateway/config.toml   # 待ち受けないダミー (DR-0028 �
 `config.toml` は `usage` / `stats` / `upstream status` が `--config` 無しで宛先を作るために置いてあったもの。今はこれらが登録簿から宛先を引くので要らない。消した後に `llm-gateway usage --unit unstable` が答えることを確かめる。
 
 dotfiles 側で config の変更 (a) と `config.toml` の削除をコミットする。
+
+## label `jp.kawaz.llm-gateway.supervise` で載っている機械を移す
+
+label を変えた版の `service unregister` / `register` は新しい label しか知らないので、旧 label は手で降ろす。監督者が降りる間は stable / unstable の子も畳まれる (数秒〜model 一覧の取得まで止まる)。
+
+```bash
+launchctl bootout gui/$(id -u)/jp.kawaz.llm-gateway.supervise
+rm ~/Library/LaunchAgents/jp.kawaz.llm-gateway.supervise.plist
+llm-gateway service register            # 新しい版の binary で。com.github.kawaz.llm-gateway.supervise で載る
+llm-gateway daemon status --all         # 2 台が running: true に戻るのを見る
+```
 
 ## ログの回転を仕込む (macOS)
 
