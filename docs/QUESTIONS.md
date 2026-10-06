@@ -20,13 +20,6 @@
 
 open issue の消化 (2026-10-06) で、着手前に方針の一言が要るもの。推しは各項目の先頭。
 
-### IS-Q6 Sonnet 5.5 の issue に残る「linked account の対応を設定で表す」
-
-[sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](issue/2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md)。本体は DR-0035 で実装済み。受け入れ条件のこの 1 項目だけ機構が無い。
-
-- [x] a (推し): 不要として close。DR-0035 は account をそのまま束縛の単位にしていて、linked の対応表を要する場面が出ていない
-- [ ] b: 後続 issue に切り出して close
-
 ### IS-Q8 OAuth probe の issue は前提が崩れていた。どう畳むか
 
 [oauth-requires-claude-code-shape](issue/2026-09-03-oauth-requires-claude-code-shape.md)。IS-Q5a で着手する前に現状を確かめた (読み取りのみ、上流へは送っていない):
