@@ -1,6 +1,6 @@
 # DR-0035: thinking の跨ぎ (account / model) を session の出所 tuple で判定し、跨いだ session は thinking を text として送る
 
-- Status: Accepted (kawaz 裁定 2026-10-01)。実装済
+- Status: Accepted (kawaz 裁定 2026-10-01、出所の単位を session から連なり (session + subagent の agent id) に改定 2026-10-06、改定は kawaz の裁定待ち)。実装済
 - Date: 2026-10-01
 
 ## 文脈
@@ -57,34 +57,40 @@ account_bound_thinking = ["claude-sonnet-5-5", "claude-fable-5-*"]
 - **model の同一性**は、gateway が解決したモデル名の文字列そのまま (経路ごとの upstream 名への書き換えの前)。date 接尾辞の除去や family への正規化はしない。どのモデルの組が互いの block を読めるかの表は公開されておらず (資料が名指しするのは「Sonnet 5.5 の block を読むのは Sonnet 5.5 だけ」)、バージョン違いで落ちるかも分かっていないので、推測の規則を足さない
 - **account の同一性**は credential 名。同じ credential を指す経路は同じ account、別の credential は別 account。credential を持たない経路 (relay) は経路名を account 名として扱う (中の account を gateway は知らない)。linked account は無い前提で、同一視の設定は持たない
 
-経路 R へモデル M を送る時、session の出所 (決定 2) に次を満たす tuple `t` が 1 つでもあれば、その 1 本は **跨いでいる**。
+経路 R へモデル M を送る時、その 1 本が属する連なりの出所 (決定 2) に次を満たす tuple `t` が 1 つでもあれば、その 1 本は **跨いでいる**。
 
 ```
 t.model != M  ||  (M が account 束縛  &&  t.account != R の account)
 ```
 
-出所は一度入ったら寿命まで消えないので、跨いだ session は以後ずっと跨いだまま (送り先が開始 account や元のモデルに戻っても、別の出所の thinking が履歴に残っている)。切替点の index は持たない。
+出所は一度入ったら寿命まで消えないので、跨いだ連なりは以後ずっと跨いだまま (送り先が開始 account や元のモデルに戻っても、別の出所の thinking が履歴に残っている)。切替点の index は持たない。
 
 ### 2. 出所 tuple
 
-session ごとに、履歴に thinking を持つ 1 本 (決定 3) が 2xx で通った `(account, model)` の集合を持つ。
+thinking の **連なり** ごとに、履歴に thinking を持つ 1 本 (決定 3) が 2xx で通った `(account, model)` の集合を持つ。
+
+連なりは `(session, agent)`。agent は Claude Code が subagent の 1 本に付ける `x-claude-code-agent-id` で、main の 1 本には付かない ([公式](https://code.claude.com/docs/en/llm-gateway-protocol#request-headers))。subagent は main と同じ `x-claude-code-session-id` / `metadata.user_id` の session_id を名乗るので、session だけでは main と区別できない。
+
+- 1 つの連なりの 1 本が履歴に持つ thinking は、同じ連なりの前の応答が生成したものだけ。subagent の履歴は main と別で、subagent の結果は main の履歴に tool_result の text として戻る (thinking は載らない)。session で束ねると、別のモデルで走る subagent の出所が main を跨ぎ扱いにし、`thinking_as_text` の namespace では main の全リクエストの thinking が text になる (実測: 2026-10-06 時点の `sources.json` で、複数モデルを持つ 7 session の別モデルの tuple 10 件はすべて、同じモデルの subagent の transcript が始まった 7〜89 秒後に決まっていた)
+- agent id は subagent を起こすたびに新しく振られ、ネストした agent も自分の id を持つ。親の id (`x-claude-code-parent-agent-id`) は鍵にしない
+- agent を名乗らない 1 本は main の連なり (agent = なし) に入る。main 直下の補助の呼び出し (要約・classifier 等) もここに入り、履歴に thinking を持って別のモデルへ送られれば決定 3 の限界どおり main を跨ぎ扱いにする。Claude Code がこれらを見分けて送る `x-claude-code-request-class` は、gateway (custom base URL) 宛てには既定で送られない (`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` が要る) ので、判定の根拠にしない
 
 | 欄 | 中身 |
 |---|---|
-| `session` / `account` / `model` | 鍵。session は session key (`session.rs` が metadata / header / 本文冒頭から導く)、account は決定 1 の credential 名、model は解決後のモデル名 |
+| `session` / `agent` / `account` / `model` | 鍵。session は session key (`session.rs` が metadata / header / 本文冒頭から導く)、agent は subagent の agent id (main は欄ごと無い)、account は決定 1 の credential 名、model は解決後のモデル名 |
 | `decided_at` | この tuple が初めて 2xx で通った時刻 |
-| `seen` | この session が最後に 2xx で通った時刻。寿命の起点 |
+| `seen` | この連なりが最後に 2xx で通った時刻。寿命の起点 |
 
 - 鍵に namespace を含めない。束縛は upstream の性質で namespace に依らないので、同じ session key が別の namespace を通っても 1 つの出所を共有する (跨いだ時の方針はその時の namespace のもの。決定 4)
 - 「跨いだ」のような派生フラグは持たない。跨ぎは集合から導く (決定 1)
 - **開始 account** = 同じモデルの tuple のうち `decided_at` が最小のものの account。account 束縛モデルの候補の並べ替え (決定 4) に使う。`decided_at` が同じなら account 名の小さい方 (どの unit でも同じ答えになるように)
 - 同じ鍵について 2 つの言い分 (2 unit、またはメモリとファイル) があれば、`decided_at` は小さい方、`seen` は大きい方を取る。鍵に account を含むので、同じ session・同じモデルに別 account の 2xx が並行して届いても tuple が 2 つ並ぶだけで、開始 account は `decided_at` で決まり、遅い側は自動的に跨ぎになる (取り合いの規則が要らない)
-- `seen` は session 単位で進める。session のどの tuple が通っても、その session の全 tuple の `seen` を進める
-- 寿命は最後の `seen` から 24 時間。session の tuple は揃って寿命切れになる
+- `seen` は連なり単位で進める。連なりのどの tuple が通っても、その連なりの全 tuple の `seen` を進める。同じ session の別の連なり (main と subagent) の `seen` は進めない (終わった subagent の出所を main の活動で書き直し続けることになる)
+- 寿命は最後の `seen` から 24 時間。連なりの tuple は揃って寿命切れになる
 
 ### 3. 履歴に thinking を持つ要求だけが対象
 
-同じ session id で別モデルが走る脇の呼び出し (権限判定の classifier・要約) を出所に混ぜると、本流が毎回「別モデルの出所がある」=「跨いだ」と判定され、`thinking_as_text` の session は本流の thinking まで text になる。affinity のようにモデルを session の鍵に含めれば脇の呼び出しは分かれるが、それではモデルの跨ぎが見えない (モデルの跨ぎを見るには出所を session で束ねる必要がある)。
+同じ session id で別モデルが走る脇の呼び出し (権限判定の classifier・要約) を出所に混ぜると、本流が毎回「別モデルの出所がある」=「跨いだ」と判定され、`thinking_as_text` の session は本流の thinking まで text になる。affinity のようにモデルを session の鍵に含めれば脇の呼び出しは分かれるが、それではモデルの跨ぎが見えない (モデルの跨ぎを見るには出所を連なり (決定 2) で束ねる必要がある)。subagent は連なりが別なので、ここの脇の呼び出しには当たらない。
 
 そこで、出所への記録・跨ぎの判定・候補の絞り込み (決定 4) は **履歴に thinking を持つ 1 本**だけに当てる。
 
@@ -94,7 +100,7 @@ session ごとに、履歴に thinking を持つ 1 本 (決定 3) が 2xx で通
 
 限界:
 
-- 会話の履歴ごと別モデルへ送る脇の呼び出し (fork 等) は、履歴に thinking があれば対象になり、出所に別モデルの tuple を足す (以後は本流も跨いだと判定される)
+- 会話の履歴ごと別モデルへ送る、agent を名乗らない脇の呼び出しは、履歴に thinking があれば対象になり、main の連なりの出所に別モデルの tuple を足す (以後は本流も跨いだと判定される)
 
 ### 4. `on_thinking_crossing`
 
@@ -153,11 +159,11 @@ on_thinking_crossing = "thinking_as_text"  # この namespace だけ上書き
 出所は `[stats] dir` の共有ファイルに置き、restart と unit (stable / unstable) を跨いで共有する。
 
 - 置き場は `[stats] dir` 配下の `thinking-sources/` に `sources.json` と `sources.json.lock`。`[stats] dir` は keepalive の控え (DR-0027) と同じく兄弟の unit が共有する走行状態の置き場で、既定は `$XDG_STATE_HOME/llm-gateway/stats`。`[store] dir` は credential の置き場で、credential 以外を混ぜない
-- 形式は **1 ファイル 1 map** (JSON オブジェクト、鍵ごとに 1 レコード `{session, account, model, decided_at, seen}`)。書き込みは `write_atomically` (一時ファイル + fsync + rename) で丸ごと差し替える。jsonl の追記は採らない (同じ鍵の更新が行として溜まり、読むたびに畳む処理と切り詰めが要る)
+- 形式は **1 ファイル 1 map** (JSON オブジェクト、鍵ごとに 1 レコード `{session, agent?, account, model, decided_at, seen}`)。map の鍵は `[session, account, model]` の JSON 文字列で、subagent は 4 要素目に agent を足す。`agent` の欄を持たないレコードは main の連なりとして読む (main のレコードは agent を持たない時と同じ形)書き込みは `write_atomically` (一時ファイル + fsync + rename) で丸ごと差し替える。jsonl の追記は採らない (同じ鍵の更新が行として溜まり、読むたびに畳む処理と切り詰めが要る)
 - 書き換えは DR-0010 と同じ形: `.lock` を flock で掴む → 最新を読み直す → 自分の変更を当てる (決定 2 の `decided_at` min / `seen` max) → 書く → 手放す。`.lock` は消さない (本体は rename で inode が変わるので、脇のファイルを掴む)。flock を持つ区間に送信や upstream の待ちを含めない
 - 両 unit は同一ホストの時計を使う前提で、`decided_at` の比較は unit 間の時計ずれを考えない
 - **読み** (リクエストごと): メモリの控えを引く。控えにはファイルの版 (mtime のナノ秒・inode・長さ) を添え、引く前に版を見て変わっていれば読み直す。1 本あたりの仕事は `stat` 1 回
-- **書き** (履歴に thinking を持つ 1 本の 2xx): 新しい tuple が入った時と、session の `seen` が前に書いた値から 5 分以上進んだ時だけ書く (寿命 24 時間に対して最大 5 分の誤差)。書き込みは session 数に比例し、リクエスト数には比例しない
+- **書き** (履歴に thinking を持つ 1 本の 2xx): 新しい tuple が入った時と、連なりの `seen` が前に書いた値から 5 分以上進んだ時だけ書く (寿命 24 時間に対して最大 5 分の誤差)。書き込みは連なりの数に比例し、リクエスト数には比例しない
 - メモリの控えはその場で更新し、ファイルへの書き込みは unit ごとに 1 本の書き手が blocking の仕事として裏で順に流す。同じ unit の次の 1 本はメモリの控えを見るので、書き込みの完了を待たない
 - 失敗は best-effort: 読めなければメモリの控えのまま進み、書けなければ警告を残して進む (次に書く条件に当たった 2xx で書き直す)。出所は推論の連続性を守る仕組みで、置き場の障害で転送を止めるほど重くない
 - 刈り込みは書き込む側が flock の内側で行う (寿命切れのレコードを落としてから書く)。担当 unit は決めない。起動時は読み取りだけで刈らず、寿命切れは読み手が無いものとして扱う
@@ -199,8 +205,9 @@ on_thinking_crossing = "thinking_as_text"  # この namespace だけ上書き
 
 | 箇所 | この DR で要ること |
 |---|---|
-| `thinking_sources` モジュール (`account_lock` を置き換える) | 出所の表: 3 値の鍵、`decided_at` / `seen` の当て方、版の照合つきの控え、flock の内側での書き換えと刈り込み、裏の書き手 (決定 2・6) |
+| `thinking_sources` モジュール (`account_lock` を置き換える) | 出所の表: 連なり `(session, agent)` と `(account, model)` の鍵、`decided_at` / `seen` の当て方、版の照合つきの控え、flock の内側での書き換えと刈り込み、裏の書き手 (決定 2・6) |
 | `Router` の出所の口 | 出所を引く口と、履歴に thinking を持つ 1 本の 2xx で記録する口。候補の並べ替えで account 束縛モデルの開始 account の経路を先頭へまとめ、`stay` では他を外す (決定 4)。reload は出所の表に触らない。affinity は `(namespace, session, model)` のメモリのまま |
+| `session.rs` | `x-claude-code-agent-id` を読む (決定 2 の連なり) |
 | `gateway.rs` の `Call` と送る直前の本文 | 送る経路ごとに跨ぎを判定し (出所 + 送り先の account + モデル、方針は今の 1 本が通る namespace の `on_thinking_crossing`)、`thinking_as_text` なら変換、`stay` / `drop_thinking` なら印。変換は経路ごとのモデル名の書き換えと cache 戦略の前 (決定 5) |
 | `thinking::carries_thinking` | 決定 3 の「履歴に thinking を持つ 1 本」の判定 (assistant の content の block だけを見る) |
 | 設定 | `on_thinking_crossing` は namespace と最上位 (各 namespace の既定) に置き、ns → 最上位 → `drop_thinking` の順に解決する (決定 4 の設定エラーを含む)。`account_bound_thinking` は最上位のまま据え置き。`check` で同じ検証 |
@@ -222,7 +229,9 @@ keepalive は最後に転送した本文を控えて送り直す。控えるの�
 
 - **変換で content が空になる assistant turn**: `thinking` / `redacted_thinking` だけで text も tool_use も持たない assistant turn は、変換後に content が `[]` になる (実運用の assistant turn は text か tool_use で終わるので、ほぼ起きない)。起きた場合、API はその 1 本を 400 で断りうる
 - **24 時間より長く黙った session**: 寿命は session の最後の 2xx から 24 時間で、それより長く黙った session は出所を忘れる。次の 1 本で出所を作り直すので、そこで別 account / 別モデルに移れば、以前の thinking は黙って落ちる
-- **履歴ごと別モデルへ送る脇の呼び出し** (fork 等): 決定 3 の限界。履歴に thinking があれば出所に別モデルの tuple を足し、本流を跨ぎ扱いにする
+- **履歴ごと別モデルへ送る脇の呼び出し**: 決定 3 の限界。agent を名乗らない呼び出しは main の連なりに入るので、履歴に thinking があれば出所に別モデルの tuple を足し、本流を跨ぎ扱いにする
+- **親の履歴を引き継ぐ subagent (fork)**: agent id を名乗るので自分の連なりで始まり、最初の 1 本は出所が空で跨がない。親が別のモデル (や別の account) で生成した thinking を運んでいれば、それは黙って落ちる。fork と新しく起きた subagent は本文の形でも header (既定) でも見分けられず、親の出所を引き継ぐと新しく起きた subagent が毎回跨ぎ扱いになる (main で起きていた誤判定が subagent 側に移るだけ) ので引き継がない。2026-10-06 時点の実測で親の履歴を持っていた subagent (`forked-skill`) は見当たらなかった (forked-skill の transcript は親の履歴を持たずに始まる)
+- **agent を持たずに記録された subagent の tuple**: agent の欄を書かない版の unit が記録した subagent の tuple は、main の連なりとして読まれる。その session は寿命 (最後の 2xx から 24 時間) が切れるまで main も跨いだまま。そうした版の unit は同じファイルを書き換える時に `agent` の欄を落とすので、同じ置き場を見る unit (stable / unstable) の版が揃うまで同じ誤判定が起きうる
 - **本文冒頭のハッシュに落ちる session key**: metadata / header で会話を名乗らないクライアントは、system と最初の user 本文のハッシュが session key になる。冒頭が同じ別の会話は出所を共有し、モデルが違えば互いを跨ぎ扱いにする
 - **credential 名を設定で付け替えた時**: 旧名の tuple は新しい設定のどの経路とも一致しないので、account 束縛モデルの次の 1 本は跨ぎ扱いになる。実害は「跨いだ扱いが 1 度増える」だけと見て、特別な扱いは置かない
 

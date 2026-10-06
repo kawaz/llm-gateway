@@ -424,7 +424,8 @@ struct Binding {
     seen: Instant,
 }
 
-/// thinking を運ぶ 1 本から見た、その session (DR-0035 §1・§4)。
+/// thinking を運ぶ 1 本から見た、その連なり (session と、subagent ならその
+/// agent) (DR-0035 §1・§4)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingSession {
     /// 送るモデル (解決後の名前)。
@@ -1122,29 +1123,42 @@ impl Router {
         );
     }
 
-    /// thinking を運ぶ 1 本が 2xx で通った (account, model) を、session の出所に
-    /// 覚える (DR-0035 §2・§6)。
+    /// thinking を運ぶ 1 本が 2xx で通った (account, model) を、その連なり
+    /// (`session` と、subagent なら `agent`) の出所に覚える (DR-0035 §2・§6)。
     ///
     /// 出所は経路でなく (account, model) で設定の差し替えに依らないので、
     /// 読み直しを跨いだ 1 本でも覚える ([`Self::remember`] の affinity と違う)。
     /// ns も鍵に含めない: thinking の束縛は upstream の性質で namespace に依らない。
-    pub fn remember_source(&self, session: &SessionKey, model: &str, route: &Route) {
-        self.sources
-            .remember(session.as_str(), route.account(), model, now_unix_ms());
+    pub fn remember_source(
+        &self,
+        session: &SessionKey,
+        agent: Option<&str>,
+        model: &str,
+        route: &Route,
+    ) {
+        self.sources.remember(
+            session.as_str(),
+            agent,
+            route.account(),
+            model,
+            now_unix_ms(),
+        );
     }
 
-    /// thinking を運ぶ 1 本から見た、この session (DR-0035 §1・§4)。
+    /// thinking を運ぶ 1 本から見た、その連なり (DR-0035 §1・§4)。`agent` は
+    /// subagent の id で、main は `None`。
     pub fn thinking_session(
         &self,
         ns: &NamespaceView,
         session: &SessionKey,
+        agent: Option<&str>,
         model: &str,
     ) -> ThinkingSession {
         ThinkingSession::new(
             model,
             ns.config().thinking_is_account_bound(model),
             ns.on_thinking_crossing(),
-            self.sources.get(session.as_str(), now_unix_ms()),
+            self.sources.get(session.as_str(), agent, now_unix_ms()),
         )
     }
 
@@ -3183,11 +3197,11 @@ spend_down_within = "25%"
         let routes = r.routes_for(&ns(r), NS, model, &session(s)).await.unwrap();
         let route = pick(&routes, route);
         r.remember(&ns(r), &session(s), model, &route).await;
-        r.remember_source(&session(s), model, &route);
+        r.remember_source(&session(s), None, model, &route);
     }
 
     fn thinking_of(r: &Router, s: &str, model: &str) -> ThinkingSession {
-        r.thinking_session(&ns(r), &session(s), model)
+        r.thinking_session(&ns(r), &session(s), None, model)
     }
 
     fn start_of(r: &Router, s: &str, model: &str) -> Option<String> {
@@ -3269,8 +3283,8 @@ spend_down_within = "25%"
     async fn the_earliest_decided_account_starts_whatever_order_it_is_remembered_in() {
         let r = binding().await;
         let (s, now) = (session("s"), now_unix_ms());
-        r.sources.remember(s.as_str(), "a", SONNET, now);
-        r.sources.remember(s.as_str(), "b", SONNET, now - 1);
+        r.sources.remember(s.as_str(), None, "a", SONNET, now);
+        r.sources.remember(s.as_str(), None, "b", SONNET, now - 1);
         r.sources.settled().await;
 
         assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("b"));
@@ -3421,7 +3435,7 @@ spend_down_within = "25%"
         reload_with(&r, BINDING).await;
 
         r.remember(&before, &session("s"), SONNET, &a1).await;
-        r.remember_source(&session("s"), SONNET, &a1);
+        r.remember_source(&session("s"), None, SONNET, &a1);
         assert_eq!(start_of(&r, "s", SONNET).as_deref(), Some("a"));
     }
 
@@ -3544,7 +3558,7 @@ spend_down_within = "25%"
                 .unwrap();
             r.remember(&spend_ns(&r), &session("s"), model, &routes[0])
                 .await;
-            r.remember_source(&session("s"), model, &routes[0]);
+            r.remember_source(&session("s"), None, model, &routes[0]);
             assert_eq!(routes[0].name(), "a1");
         }
         observe_window(&r, "b1", Some(WEEK), Some(NOW + 60));
@@ -3552,7 +3566,7 @@ spend_down_within = "25%"
         let order = |model| {
             let r = &r;
             async move {
-                let thinking = r.thinking_session(&spend_ns(r), &session("s"), model);
+                let thinking = r.thinking_session(&spend_ns(r), &session("s"), None, model);
                 names(
                     &r.ordered_at(
                         &spend_ns(r),

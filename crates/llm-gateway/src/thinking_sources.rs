@@ -1,8 +1,12 @@
-//! session の thinking の出所 (account, model) の置き場 (DR-0035 §2・§6)。
+//! thinking の連なりごとの出所 (account, model) の置き場 (DR-0035 §2・§6)。
 //!
 //! thinking は生成した model でしか読めず、model によっては生成した account
-//! でしか読めない。跨いだ履歴の thinking は黙って落ちるので、session ごとに
+//! でしか読めない。跨いだ履歴の thinking は黙って落ちるので、連なりごとに
 //! 「2xx で通った (account, model)」を覚えておき、送る 1 本が跨ぐかを判定する。
+//!
+//! 連なりは session と、subagent ならその agent の id で分ける ([`Lineage`])。
+//! subagent は main と同じ session を名乗るが、履歴は main と別に持つので、
+//! 別のモデルで走る subagent の出所が main を跨ぎ扱いにしてはいけない。
 //! restart と兄弟の unit を跨いで覚えておくため、`[stats] dir` の下の
 //! `thinking-sources/sources.json` に 1 つの map として持ち、両 unit で共有する。
 //!
@@ -32,24 +36,40 @@ pub const SOURCE_TTL_MS: i64 = 24 * 3600 * 1000;
 /// 寿命 24 時間に対して 5 分の誤差なら困らない。
 const SEEN_STRIDE_MS: i64 = 300 * 1000;
 
-/// session の中で出所を見分ける鍵。`(account, model)`。
+/// 連なりの中で出所を見分ける鍵。`(account, model)`。
 type Tuple = (String, String);
+
+/// thinking の連なり。`(session, agent)` で、main (agent を名乗らない 1 本) は
+/// agent が `None`。
+///
+/// 1 つの連なりの 1 本は、同じ連なりの前の応答だけを履歴に持つ。subagent の
+/// 履歴は main と別で、main の履歴に subagent の thinking は載らない
+/// (subagent の結果は tool_result の text として戻る)。
+type Lineage = (String, Option<String>);
 
 /// ファイルの 1 レコード = 出所 1 つ。時刻は Unix ミリ秒。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     session: String,
+    /// subagent の連なりならその agent の id。main は欄ごと出さない (main の
+    /// レコードの形と鍵は agent を持たない時と同じ)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     account: String,
     model: String,
     /// この出所が最初に決まった時刻。開始 account を決める。
     decided_at: i64,
-    /// 最後にこの session が 2xx で通った時刻。寿命の起点。
+    /// 最後にこの連なりが 2xx で通った時刻。寿命の起点。
     seen: i64,
 }
 
 impl Record {
     fn tuple(&self) -> Tuple {
         (self.account.clone(), self.model.clone())
+    }
+
+    fn lineage(&self) -> Lineage {
+        (self.session.clone(), self.agent.clone())
     }
 
     fn alive(&self, now: i64) -> bool {
@@ -63,10 +83,13 @@ impl Record {
         self.seen = self.seen.max(other.seen);
     }
 
-    /// ファイルの map の鍵。`[session, account, model]` の JSON で、区切り文字の
-    /// 衝突が起きない。
+    /// ファイルの map の鍵。`[session, account, model]` (subagent は
+    /// `[session, account, model, agent]`) の JSON で、区切り文字の衝突が起きない。
+    /// main の鍵は agent を持たない時と同じ形で、要素の数で subagent と分かれる。
     fn map_key(&self) -> String {
-        serde_json::to_string(&[&self.session, &self.account, &self.model]).unwrap_or_default()
+        let mut key = vec![&self.session, &self.account, &self.model];
+        key.extend(&self.agent);
+        serde_json::to_string(&key).unwrap_or_default()
     }
 }
 
@@ -85,7 +108,7 @@ pub struct Source {
     pub decided_at: i64,
 }
 
-/// session の thinking の出所の集合 (DR-0035 §2)。
+/// 1 つの連なりの thinking の出所の集合 (DR-0035 §2)。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSources(Vec<Source>);
 
@@ -136,14 +159,14 @@ struct Entry {
 struct Memo {
     /// 控えが写しているファイルの版。
     version: Option<Version>,
-    /// session で引く。リクエストごとの lookup を全件走査にしないため。
-    sessions: HashMap<String, HashMap<Tuple, Entry>>,
+    /// 連なりで引く。リクエストごとの lookup を全件走査にしないため。
+    lineages: HashMap<Lineage, HashMap<Tuple, Entry>>,
 }
 
 impl Memo {
     fn put(&mut self, record: Record, written: Option<i64>) {
-        self.sessions
-            .entry(record.session.clone())
+        self.lineages
+            .entry(record.lineage())
             .or_default()
             .insert(record.tuple(), Entry { record, written });
     }
@@ -153,14 +176,14 @@ impl Memo {
     /// 書き手が刈ったもの)。同じ鍵に手元の言い分があれば当て、まだ書いて
     /// いないという印も引き継ぐ (次の 2xx で書き直すため)。
     fn replace_with(&mut self, map: Map, now: i64) {
-        let mut previous = std::mem::take(&mut self.sessions);
+        let mut previous = std::mem::take(&mut self.lineages);
         for (_, mut from_file) in map {
             if !from_file.alive(now) {
                 continue;
             }
             let mut written = Some(from_file.seen);
             let mine = previous
-                .get_mut(&from_file.session)
+                .get_mut(&from_file.lineage())
                 .and_then(|tuples| tuples.remove(&from_file.tuple()));
             if let Some(mine) = mine {
                 written = mine.written.map(|w| w.max(from_file.seen));
@@ -221,12 +244,13 @@ impl ThinkingSources {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// この session の出所。寿命切れは含めない。
-    pub fn get(&self, session: &str, now: i64) -> SessionSources {
+    /// この連なり (`session` と、subagent ならその `agent`) の出所。寿命切れは
+    /// 含めない。
+    pub fn get(&self, session: &str, agent: Option<&str>, now: i64) -> SessionSources {
         let mut memo = self.memo();
         self.refresh(&mut memo, now);
-        memo.sessions
-            .get(session)
+        memo.lineages
+            .get(&(session.to_owned(), agent.map(str::to_owned)))
             .into_iter()
             .flat_map(HashMap::values)
             .filter(|entry| entry.record.alive(now))
@@ -238,11 +262,18 @@ impl ThinkingSources {
             .collect()
     }
 
-    /// `session` が `account` の `model` で 2xx を得たことを覚える (`now` は
-    /// Unix ミリ秒)。控えはその場で更新し、書くべき変化ならファイルへの書き込みを
-    /// 裏の書き手へ渡す (送信を待たせない)。
-    pub fn remember(self: &Arc<Self>, session: &str, account: &str, model: &str, now: i64) {
-        if let Some(changes) = self.note(session, account, model, now) {
+    /// 連なり (`session` と、subagent ならその `agent`) が `account` の `model` で
+    /// 2xx を得たことを覚える (`now` は Unix ミリ秒)。控えはその場で更新し、
+    /// 書くべき変化ならファイルへの書き込みを裏の書き手へ渡す (送信を待たせない)。
+    pub fn remember(
+        self: &Arc<Self>,
+        session: &str,
+        agent: Option<&str>,
+        account: &str,
+        model: &str,
+        now: i64,
+    ) {
+        if let Some(changes) = self.note(session, agent, account, model, now) {
             self.send(Job::Write(changes));
         }
     }
@@ -305,23 +336,35 @@ impl ThinkingSources {
         }
     }
 
-    /// 控えを更新し、ファイルへ書くべき変化なら書く中身 (その session の出所
+    /// 控えを更新し、ファイルへ書くべき変化なら書く中身 (その連なりの出所
     /// 全部) を返す。
     ///
-    /// `seen` は session 単位で進める: どの出所で通っても全部の寿命を延ばす
-    /// (跨ぎの記憶が session の活動中に先に切れないため、DR-0035 §2)。書くのは
-    /// 新しい出所が入った時か、`seen` が前に書いた値から [`SEEN_STRIDE_MS`]
-    /// 以上進んだ時だけ。
-    fn note(&self, session: &str, account: &str, model: &str, now: i64) -> Option<Vec<Record>> {
+    /// `seen` は連なり単位で進める: どの出所で通っても全部の寿命を延ばす
+    /// (跨ぎの記憶が連なりの活動中に先に切れないため、DR-0035 §2)。別の
+    /// 連なり (main と subagent) の寿命は延ばさない — 終わった subagent の
+    /// 出所を main の活動で書き直し続けることになる。書くのは新しい出所が
+    /// 入った時か、`seen` が前に書いた値から [`SEEN_STRIDE_MS`] 以上進んだ時だけ。
+    fn note(
+        &self,
+        session: &str,
+        agent: Option<&str>,
+        account: &str,
+        model: &str,
+        now: i64,
+    ) -> Option<Vec<Record>> {
         let mut memo = self.memo();
         self.refresh(&mut memo, now);
-        let tuples = memo.sessions.entry(session.to_owned()).or_default();
+        let tuples = memo
+            .lineages
+            .entry((session.to_owned(), agent.map(str::to_owned)))
+            .or_default();
         tuples.retain(|_, entry| entry.record.alive(now));
         tuples
             .entry((account.to_owned(), model.to_owned()))
             .or_insert_with(|| Entry {
                 record: Record {
                     session: session.to_owned(),
+                    agent: agent.map(str::to_owned),
                     account: account.to_owned(),
                     model: model.to_owned(),
                     decided_at: now,
@@ -431,8 +474,8 @@ impl ThinkingSources {
         // 印の値より新しいので、間引きの判定で次に書かれる。
         for change in changes {
             let entry = memo
-                .sessions
-                .get_mut(&change.session)
+                .lineages
+                .get_mut(&change.lineage())
                 .and_then(|tuples| tuples.get_mut(&change.tuple()));
             if let Some(entry) = entry {
                 entry.written = Some(entry.written.map_or(change.seen, |w| w.max(change.seen)));
@@ -485,9 +528,20 @@ mod tests {
             .collect()
     }
 
-    /// 書き込みを同期で当てる (裏の仕事を介さない)。
+    /// 書き込みを同期で当てる (裏の仕事を介さない)。main の連なり。
     fn pass(table: &ThinkingSources, s: &str, account: &str, model: &str, now: i64) -> bool {
-        match table.note(s, account, model, now) {
+        pass_in(table, (s, None), account, model, now)
+    }
+
+    /// [`pass`] の、連なりを `(session, agent)` で選ぶ形。
+    fn pass_in(
+        table: &ThinkingSources,
+        (s, agent): (&str, Option<&str>),
+        account: &str,
+        model: &str,
+        now: i64,
+    ) -> bool {
+        match table.note(s, agent, account, model, now) {
             Some(changes) => {
                 table.write(&changes, now);
                 true
@@ -540,11 +594,11 @@ mod tests {
         pass(&table, "s", "a", "n", T0 + 2);
 
         assert_eq!(
-            table.get("s", T0 + 3),
+            table.get("s", None, T0 + 3),
             sources(&[("a", "m", T0), ("b", "m", T0 + 1), ("a", "n", T0 + 2)])
         );
         assert_eq!(on_disk(dir.path()).len(), 3);
-        assert!(table.get("other", T0 + 3).is_empty());
+        assert!(table.get("other", None, T0 + 3).is_empty());
     }
 
     /// 2 つの unit が同じ置き場を見て、同じ鍵の言い分は `decided_at` = min、
@@ -554,16 +608,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stable = ThinkingSources::open(dir.path());
         let unstable = ThinkingSources::open(dir.path());
-        let early = stable.note("s", "a", "m", T0).unwrap();
-        let late = unstable.note("s", "a", "m", T0 + 5).unwrap();
+        let early = stable.note("s", None, "a", "m", T0).unwrap();
+        let late = unstable.note("s", None, "a", "m", T0 + 5).unwrap();
 
         unstable.write(&late, T0 + 5);
         stable.write(&early, T0 + 5);
 
         let record = &on_disk(dir.path())[&disk_key("s", "a", "m")];
         assert_eq!((record.decided_at, record.seen), (T0, T0 + 5));
-        assert_eq!(stable.get("s", T0 + 6), sources(&[("a", "m", T0)]));
-        assert_eq!(unstable.get("s", T0 + 6), sources(&[("a", "m", T0)]));
+        assert_eq!(stable.get("s", None, T0 + 6), sources(&[("a", "m", T0)]));
+        assert_eq!(unstable.get("s", None, T0 + 6), sources(&[("a", "m", T0)]));
     }
 
     /// 2 つの unit が別 account で通れば、両方の出所が残る。開始 account は
@@ -573,14 +627,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let stable = ThinkingSources::open(dir.path());
         let unstable = ThinkingSources::open(dir.path());
-        let first = stable.note("s", "a", "m", T0).unwrap();
-        let second = unstable.note("s", "b", "m", T0 + 1).unwrap();
+        let first = stable.note("s", None, "a", "m", T0).unwrap();
+        let second = unstable.note("s", None, "b", "m", T0 + 1).unwrap();
 
         unstable.write(&second, T0 + 1);
         stable.write(&first, T0 + 1);
 
         for table in [&stable, &unstable] {
-            let got = table.get("s", T0 + 2);
+            let got = table.get("s", None, T0 + 2);
             assert_eq!(got, sources(&[("a", "m", T0), ("b", "m", T0 + 1)]));
             assert_eq!(got.starting_account("m"), Some("a"));
         }
@@ -611,6 +665,83 @@ mod tests {
         assert!(!SessionSources::default().crossed("m", "b", true));
     }
 
+    /// subagent の連なりは main と別。同じ session でも出所を混ぜない。
+    #[test]
+    fn a_subagent_is_its_own_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = ThinkingSources::open(dir.path());
+        pass(&table, "s", "a", "opus", T0);
+        pass_in(&table, ("s", Some("x")), "a", "sonnet", T0 + 1);
+        pass_in(&table, ("s", Some("y")), "b", "haiku", T0 + 2);
+
+        assert_eq!(table.get("s", None, T0 + 3), sources(&[("a", "opus", T0)]));
+        assert_eq!(
+            table.get("s", Some("x"), T0 + 3),
+            sources(&[("a", "sonnet", T0 + 1)])
+        );
+        assert_eq!(
+            table.get("s", Some("y"), T0 + 3),
+            sources(&[("b", "haiku", T0 + 2)])
+        );
+        assert!(table.get("s", Some("z"), T0 + 3).is_empty());
+
+        let reopened = ThinkingSources::open(dir.path());
+        assert_eq!(
+            reopened.get("s", Some("x"), T0 + 3),
+            sources(&[("a", "sonnet", T0 + 1)]),
+            "the agent survives the file"
+        );
+        assert_eq!(
+            reopened.get("s", None, T0 + 3),
+            sources(&[("a", "opus", T0)])
+        );
+    }
+
+    /// main のレコードは agent の欄を持たず、鍵も 3 要素のまま。subagent は
+    /// `agent` の欄と 4 要素目の鍵を持つ。agent の欄が無いレコードは main として読む。
+    #[test]
+    fn the_agent_is_written_only_for_a_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = ThinkingSources::open(dir.path());
+        pass(&table, "s", "a", "m", T0);
+        pass_in(&table, ("s", Some("x")), "a", "n", T0);
+        let raw: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("thinking-sources/sources.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw,
+            serde_json::json!({
+                (disk_key("s", "a", "m")): {
+                    "session": "s", "account": "a", "model": "m",
+                    "decided_at": T0, "seen": T0,
+                },
+                (serde_json::to_string(&["s", "a", "n", "x"]).unwrap()): {
+                    "session": "s", "agent": "x", "account": "a", "model": "n",
+                    "decided_at": T0, "seen": T0,
+                },
+            })
+        );
+    }
+
+    /// 連なりの活動は、同じ session の別の連なりの寿命を延ばさない。
+    #[test]
+    fn activity_of_one_lineage_does_not_extend_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = ThinkingSources::open(dir.path());
+        pass_in(&table, ("s", Some("x")), "a", "n", T0);
+        pass(&table, "s", "a", "m", T0 + SOURCE_TTL_MS - 1);
+
+        assert!(
+            table.get("s", Some("x"), T0 + SOURCE_TTL_MS).is_empty(),
+            "the finished subagent expires on its own clock"
+        );
+        assert_eq!(
+            table.get("s", None, T0 + SOURCE_TTL_MS),
+            sources(&[("a", "m", T0 + SOURCE_TTL_MS - 1)])
+        );
+    }
+
     /// session のどれかの出所で通れば、その session の全部の `seen` が進む。
     #[test]
     fn activity_on_one_tuple_extends_the_whole_session() {
@@ -622,7 +753,7 @@ mod tests {
         assert!(pass(&table, "s", "a", "n", later - 2));
 
         assert_eq!(
-            table.get("s", later),
+            table.get("s", None, later),
             sources(&[("a", "m", T0), ("a", "n", T0 + SOURCE_TTL_MS / 2)]),
             "the first tuple outlives its own last success"
         );
@@ -647,7 +778,7 @@ mod tests {
         pass(&writer, "s1", "a", "m", T0);
         pin(&path);
         let reader = ThinkingSources::open(dir.path());
-        assert_eq!(reader.get("s1", T0), sources(&[("a", "m", T0)]));
+        assert_eq!(reader.get("s1", None, T0), sources(&[("a", "m", T0)]));
 
         // 同じ長さ・同じ mtime の中身へ差し替える。
         let mut map = on_disk(dir.path());
@@ -657,8 +788,11 @@ mod tests {
         write_atomically(&path, &map).unwrap();
         pin(&path);
 
-        assert_eq!(reader.get("s2", T0), sources(&[("a", "m", T0)]));
-        assert!(reader.get("s1", T0).is_empty(), "the file is the truth");
+        assert_eq!(reader.get("s2", None, T0), sources(&[("a", "m", T0)]));
+        assert!(
+            reader.get("s1", None, T0).is_empty(),
+            "the file is the truth"
+        );
     }
 
     /// 読み直しは控えをファイルの中身に置き換える。書いた後にファイルから
@@ -671,16 +805,16 @@ mod tests {
         pass(&table, "gone", "a", "m", T0);
         pass(&table, "kept", "a", "m", T0);
         // 控えにだけあって、まだ書いていない鍵。
-        table.note("pending", "a", "m", T0).unwrap();
+        table.note("pending", None, "a", "m", T0).unwrap();
 
         // 別の書き手が "gone" を刈った。
         let mut map = on_disk(dir.path());
         map.remove(&disk_key("gone", "a", "m"));
         write_atomically(&path, &map).unwrap();
 
-        assert!(table.get("gone", T0).is_empty());
-        assert_eq!(table.get("kept", T0), sources(&[("a", "m", T0)]));
-        assert_eq!(table.get("pending", T0), sources(&[("a", "m", T0)]));
+        assert!(table.get("gone", None, T0).is_empty());
+        assert_eq!(table.get("kept", None, T0), sources(&[("a", "m", T0)]));
+        assert_eq!(table.get("pending", None, T0), sources(&[("a", "m", T0)]));
     }
 
     /// 寿命切れは読み手に見えず、次の書き込みで消える。
@@ -692,8 +826,8 @@ mod tests {
         let later = T0 + SOURCE_TTL_MS;
 
         let fresh = ThinkingSources::open(dir.path());
-        assert!(fresh.get("old", later).is_empty());
-        assert!(table.get("old", later).is_empty());
+        assert!(fresh.get("old", None, later).is_empty());
+        assert!(table.get("old", None, later).is_empty());
         assert!(
             on_disk(dir.path()).contains_key(&disk_key("old", "a", "m")),
             "reading does not prune"
@@ -712,7 +846,7 @@ mod tests {
         let table = ThinkingSources::open(dir.path());
         pass(&table, "s", "a", "m", T0);
         pass(&table, "s", "b", "m", T0 + SOURCE_TTL_MS);
-        let got = table.get("s", T0 + SOURCE_TTL_MS);
+        let got = table.get("s", None, T0 + SOURCE_TTL_MS);
         assert_eq!(got, sources(&[("b", "m", T0 + SOURCE_TTL_MS)]));
         assert_eq!(got.starting_account("m"), Some("b"));
     }
@@ -747,7 +881,7 @@ mod tests {
         let table = ThinkingSources::open(dir.path());
         assert!(pass(&table, "s", "a", "m", T0));
         assert_eq!(
-            table.get("s", T0),
+            table.get("s", None, T0),
             sources(&[("a", "m", T0)]),
             "the memo still holds it"
         );
@@ -765,7 +899,7 @@ mod tests {
         std::fs::write(dir.path().join("thinking-sources/sources.json"), b"{broken").unwrap();
         let table = ThinkingSources::open(dir.path());
         pass(&table, "s", "a", "m", T0);
-        assert_eq!(table.get("s", T0), sources(&[("a", "m", T0)]));
+        assert_eq!(table.get("s", None, T0), sources(&[("a", "m", T0)]));
         assert_eq!(
             std::fs::read(dir.path().join("thinking-sources/sources.json")).unwrap(),
             b"{broken"
@@ -778,9 +912,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table = Arc::new(ThinkingSources::open(dir.path()));
         for i in 0..20 {
-            table.remember(&format!("s{i}"), "a", "m", T0 + i);
+            table.remember(&format!("s{i}"), None, "a", "m", T0 + i);
         }
-        table.remember("s0", "b", "m", T0 + 100);
+        table.remember("s0", None, "b", "m", T0 + 100);
         table.settled().await;
 
         let disk = on_disk(dir.path());
@@ -794,8 +928,8 @@ mod tests {
     async fn a_drain_writes_what_was_queued() {
         let dir = tempfile::tempdir().unwrap();
         let table = Arc::new(ThinkingSources::open(dir.path()));
-        table.remember("s1", "a", "m", T0);
-        table.remember("s2", "b", "m", T0);
+        table.remember("s1", None, "a", "m", T0);
+        table.remember("s2", None, "b", "m", T0);
         table.drain(std::time::Duration::from_secs(5)).await;
 
         let disk = on_disk(dir.path());
@@ -809,7 +943,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let table = Arc::new(ThinkingSources::open(dir.path()));
         for i in 0..10 {
-            table.remember(&format!("s{i}"), "a", "m", T0 + i);
+            table.remember(&format!("s{i}"), None, "a", "m", T0 + i);
         }
         table.settled().await;
 
@@ -825,19 +959,19 @@ mod tests {
         let mine = ThinkingSources::open(dir.path());
         let sibling = ThinkingSources::open(dir.path());
         // 手元で決まったが、まだ書いていない。
-        mine.note("s", "a", "m", T0).unwrap();
+        mine.note("s", None, "a", "m", T0).unwrap();
         // その間に兄弟が同じ session を別 account で書いた。
         pass(&sibling, "s", "b", "m", T0 + 1);
 
         assert_eq!(
-            mine.get("s", T0 + 2),
+            mine.get("s", None, T0 + 2),
             sources(&[("a", "m", T0), ("b", "m", T0 + 1)])
         );
         assert!(
             pass(&mine, "s", "a", "m", T0 + 3),
             "the pending tuple is retried on the next success"
         );
-        let got = sibling.get("s", T0 + 4);
+        let got = sibling.get("s", None, T0 + 4);
         assert_eq!(got, sources(&[("a", "m", T0), ("b", "m", T0 + 1)]));
         assert_eq!(got.starting_account("m"), Some("a"));
     }
@@ -850,9 +984,9 @@ mod tests {
         pass(&table, "s", "a", "m", T0);
         std::fs::remove_file(dir.path().join("thinking-sources/sources.json")).unwrap();
 
-        assert!(table.get("s", T0).is_empty());
+        assert!(table.get("s", None, T0).is_empty());
         assert!(pass(&table, "s", "b", "m", T0 + 1));
-        assert_eq!(table.get("s", T0 + 1), sources(&[("b", "m", T0 + 1)]));
+        assert_eq!(table.get("s", None, T0 + 1), sources(&[("b", "m", T0 + 1)]));
         assert_eq!(on_disk(dir.path()).len(), 1);
     }
 
@@ -867,7 +1001,7 @@ mod tests {
 
         let reopened = ThinkingSources::open(dir.path());
         assert_eq!(
-            reopened.get("s", T0 + 2),
+            reopened.get("s", None, T0 + 2),
             sources(&[("a", "m", T0), ("b", "n", T0 + 1)])
         );
     }

@@ -588,6 +588,11 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         let session = session::derive(&body, &headers);
         let declared = session::declared_id(&headers);
+        // thinking の連なりは session と、subagent ならその agent で分ける
+        // (DR-0035 §2)。subagent は main と同じ session を名乗るが、履歴は別に
+        // 持つ — session だけで束ねると、別のモデルで走る subagent が main を
+        // 跨ぎ扱いにする。agent を名乗らない 1 本は main の連なりに入る。
+        let agent = session::agent_id(&headers);
         let prefix = events::prefix(&body);
         let series = declared
             .clone()
@@ -601,8 +606,10 @@ impl<P: CredentialPersistence> Gateway<P> {
         // (こちらが本文から作る affinity の鍵とは別物、DR-0012)。
         // thinking を運ぶ 1 本だけが session の出所で判定・並べ替えされる
         // (DR-0035 §3)。運ばない脇の呼び出しを混ぜると本流が毎回跨いで見える。
-        let thinking = crate::thinking::carries_thinking(&body)
-            .then(|| self.router.thinking_session(ns, &session, &model));
+        let thinking = crate::thinking::carries_thinking(&body).then(|| {
+            self.router
+                .thinking_session(ns, &session, agent.as_deref(), &model)
+        });
         let call = Call {
             principal: principal.and_then(|p| p.subject.as_deref().zip(p.kid.as_deref())),
             ns: ns_name,
@@ -726,7 +733,8 @@ impl<P: CredentialPersistence> Gateway<P> {
                     if resp.status / 100 == 2 {
                         self.router.remember(ns, &session, &model, route).await;
                         if call.thinking.is_some() {
-                            self.router.remember_source(&session, &model, route);
+                            self.router
+                                .remember_source(&session, agent.as_deref(), &model, route);
                         }
                         // 通ったなら締め出しの根拠は消えている。
                         route.preset.allow(&model);
@@ -8166,6 +8174,15 @@ models = ["n"]
         ns_name: &str,
         body: Value,
     ) -> Forwarded {
+        forward_with(gw, ns_name, body, vec![]).await
+    }
+
+    async fn forward_with<P: CredentialPersistence>(
+        gw: &Gateway<P>,
+        ns_name: &str,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Forwarded {
         gw.forward(
             &gw.namespace(ns_name).unwrap(),
             ns_name,
@@ -8175,10 +8192,34 @@ models = ["n"]
                 shape: RequestShape::Messages,
             },
             body,
-            vec![],
+            headers,
         )
         .await
         .unwrap()
+    }
+
+    /// Claude Code の 1 本が名乗るヘッダ。subagent は session に agent の id を足す。
+    fn claude_code_headers(agent: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![(crate::session::SESSION_HEADER.to_owned(), "s1".to_owned())];
+        if let Some(agent) = agent {
+            headers.push((crate::session::AGENT_HEADER.to_owned(), agent.to_owned()));
+        }
+        headers
+    }
+
+    /// 連なり (agent) を名乗って、履歴に thinking を持つ 1 本を送る。
+    async fn forward_as_agent<P: CredentialPersistence>(
+        gw: &Gateway<P>,
+        agent: Option<&str>,
+        model: &str,
+    ) -> Forwarded {
+        forward_with(
+            gw,
+            NS,
+            thinking_request_for(model),
+            claude_code_headers(agent),
+        )
+        .await
     }
 
     /// 今までに流れた転送の知らせ (経路名と 2 つの印)。
@@ -8408,10 +8449,140 @@ models = ["n"]
         let session = crate::session::derive(&thinking_request(), &[]);
         assert_eq!(
             gw.router
-                .thinking_session(&ns(&gw), &session, "n")
+                .thinking_session(&ns(&gw), &session, None, "n")
                 .starting_account(),
             None,
             "nothing was remembered for the side call's model"
+        );
+    }
+
+    /// 同じ session の subagent が別のモデルで走っても、main は (main 自身が
+    /// 跨いでいなければ) 跨いだ扱いにならず、本文もそのまま。subagent も自分の
+    /// 連なりの中で同じモデルを続ける限り跨がない。
+    #[tokio::test]
+    async fn a_subagent_on_another_model_does_not_cross_the_main_flow() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_models_config(
+            &a.url,
+            &b.url,
+            r#"["m", "n"]"#,
+            "thinking_as_text",
+        ))
+        .await;
+        let mut watching = gw.events().subscribe();
+
+        for (agent, model) in [(None, "m"), (Some("x"), "n"), (Some("x"), "n"), (None, "m")] {
+            let sent = forward_as_agent(&gw, agent, model).await;
+            assert_eq!(sent.response.status, 200, "{agent:?} {model}");
+        }
+
+        let a_sent = a.requests();
+        assert_eq!(
+            sent_body(&a_sent[3]),
+            thinking_request_for("m"),
+            "the main flow goes as-is after the subagent ran on n"
+        );
+        assert_eq!(sent_body(&a_sent[2]), thinking_request_for("n"));
+        assert!(
+            crossing_marks(&mut watching)
+                .iter()
+                .all(|(_, as_text, dropped)| !as_text && !dropped)
+        );
+        let session = crate::session::derive(&thinking_request(), &[]);
+        let start = |agent, model| {
+            gw.router
+                .thinking_session(&ns(&gw), &session, agent, model)
+                .starting_account()
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            start(None, "n"),
+            None,
+            "nothing of the subagent's model was remembered for the main flow"
+        );
+        assert_eq!(start(Some("x"), "n").as_deref(), Some("a"));
+        assert_eq!(start(None, "m").as_deref(), Some("a"));
+    }
+
+    /// subagent が自分の連なりの中でモデルを替えれば、その subagent は跨いで
+    /// 変換される。main と、別の (ネストした) subagent は巻き込まれない。
+    #[tokio::test]
+    async fn a_subagent_that_crosses_itself_is_converted_alone() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_models_config(&a.url, &b.url, "[]", "thinking_as_text")).await;
+        let mut watching = gw.events().subscribe();
+
+        let nested = {
+            let mut headers = claude_code_headers(Some("y"));
+            headers.push(("x-claude-code-parent-agent-id".to_owned(), "x".to_owned()));
+            headers
+        };
+        assert_eq!(forward_as_agent(&gw, None, "m").await.response.status, 200);
+        assert_eq!(
+            forward_as_agent(&gw, Some("x"), "n").await.response.status,
+            200
+        );
+        assert_eq!(
+            forward_as_agent(&gw, Some("x"), "m").await.response.status,
+            200
+        );
+        let sent = forward_with(&gw, NS, thinking_request_for("n"), nested).await;
+        assert_eq!(sent.response.status, 200);
+        assert_eq!(forward_as_agent(&gw, None, "m").await.response.status, 200);
+
+        let a_sent = a.requests();
+        assert_eq!(
+            sent_body(&a_sent[2])["messages"],
+            thinking_as_text_messages(),
+            "the subagent crossed from n to m"
+        );
+        assert_eq!(
+            sent_body(&a_sent[3]),
+            thinking_request_for("n"),
+            "the nested subagent has its own lineage"
+        );
+        assert_eq!(sent_body(&a_sent[4]), thinking_request_for("m"));
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), true, false),
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), false, false),
+            ]
+        );
+    }
+
+    /// agent を名乗らない 1 本 (main 直下の補助の呼び出し等) は main の連なりに
+    /// 入る。履歴に thinking を持って別のモデルへ送れば、main と一緒に跨ぐ。
+    #[tokio::test]
+    async fn a_request_without_an_agent_id_joins_the_main_lineage() {
+        let a = FakeUpstream::always(200).await;
+        let b = FakeUpstream::always(200).await;
+        let gw = gateway(&two_models_config(&a.url, &b.url, "[]", "thinking_as_text")).await;
+        let mut watching = gw.events().subscribe();
+
+        assert_eq!(forward_as_agent(&gw, None, "m").await.response.status, 200);
+        // ヘッダを何も持たない 1 本も、本文の session が同じなら main と同じ連なり。
+        assert_eq!(
+            forward_body(&gw, thinking_request_for("n"))
+                .await
+                .response
+                .status,
+            200
+        );
+        assert_eq!(forward_as_agent(&gw, None, "m").await.response.status, 200);
+
+        assert_eq!(
+            crossing_marks(&mut watching),
+            [
+                ("a".to_owned(), false, false),
+                ("a".to_owned(), true, false),
+                ("a".to_owned(), true, false),
+            ]
         );
     }
 

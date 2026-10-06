@@ -36,6 +36,19 @@ pub fn declared_id(headers: &[(String, String)]) -> Option<String> {
     header(headers, SESSION_HEADER).map(str::to_owned)
 }
 
+/// Claude Code が subagent の 1 本に付ける、その agent の id のヘッダ。
+///
+/// subagent は main と同じ [`SESSION_HEADER`] を名乗り、違うのはこれだけ
+/// (main の 1 本には付かない)。ネストした agent も自分の id を載せるので、
+/// 親の id (`x-claude-code-parent-agent-id`) を見なくても agent ごとに分かれる。
+/// id は subagent を起こすたびに新しく振られる。
+pub const AGENT_HEADER: &str = "x-claude-code-agent-id";
+
+/// その 1 本を出した subagent の id。main (と、agent を名乗らない相手) は `None`。
+pub fn agent_id(headers: &[(String, String)]) -> Option<String> {
+    header(headers, AGENT_HEADER).map(str::to_owned)
+}
+
 /// session affinity のキー。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionKey(String);
@@ -312,5 +325,25 @@ mod tests {
             declared_id(&headers(&[(SESSION_HEADER, " s-1 ")])),
             Some("s-1".to_owned())
         );
+    }
+
+    /// subagent は会話の id に加えて自分の id を名乗る。親の id は agent を
+    /// 分ける鍵にしない (ネストした agent も自分の id を持つ)。main は名乗らない。
+    #[test]
+    fn the_agent_id_is_read_and_the_parent_is_not_taken_for_it() {
+        assert_eq!(
+            agent_id(&headers(&[
+                (SESSION_HEADER, "s-1"),
+                ("X-Claude-Code-Agent-Id", " a-2 "),
+                ("x-claude-code-parent-agent-id", "a-1"),
+            ])),
+            Some("a-2".to_owned())
+        );
+        assert_eq!(agent_id(&headers(&[(SESSION_HEADER, "s-1")])), None);
+        assert_eq!(
+            agent_id(&headers(&[("x-claude-code-parent-agent-id", "a-1")])),
+            None
+        );
+        assert_eq!(agent_id(&headers(&[(AGENT_HEADER, " ")])), None);
     }
 }

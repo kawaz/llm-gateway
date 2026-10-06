@@ -162,8 +162,9 @@ curl -sS http://127.0.0.1:8402/ns-personal/v1/messages \
 
 #### account / model を跨ぐ session の thinking (`account_bound_thinking` / `on_thinking_crossing`)
 
-履歴に載って戻ってきた thinking は、生成したのと同じモデルでしか読めず、モデルによっては生成した account でしか読めない (既定は `claude-sonnet-5-5`)。読めない thinking は API が黙って捨てる (200 のまま)。gateway は会話 (session) ごとに、履歴に thinking を持つ 1 本がどの account とモデルで通ったか (出所) を覚え、送る 1 本の送り先が出所と食い違えば「跨いだ」とみなす。食い違いは、出所に別のモデルがあるか、account に束縛されるモデルで出所に別の account があること。跨いだ 1 本の扱いは namespace ごとに `on_thinking_crossing` で選ぶ (DR-0035)。
+履歴に載って戻ってきた thinking は、生成したのと同じモデルでしか読めず、モデルによっては生成した account でしか読めない (既定は `claude-sonnet-5-5`)。読めない thinking は API が黙って捨てる (200 のまま)。gateway は thinking の連なりごとに、履歴に thinking を持つ 1 本がどの account とモデルで通ったか (出所) を覚え、送る 1 本の送り先が出所と食い違えば「跨いだ」とみなす。食い違いは、出所に別のモデルがあるか、account に束縛されるモデルで出所に別の account があること。跨いだ 1 本の扱いは namespace ごとに `on_thinking_crossing` で選ぶ (DR-0035)。
 
+- 連なりは会話 (session) と、subagent ならその agent (`x-claude-code-agent-id`) で分かれる。subagent は main と同じ会話を名乗るが履歴は別に持つので、別のモデルで走る subagent が main を跨ぎ扱いにすることは無い。agent を名乗らない 1 本は main の連なりに入る
 - 対象は履歴 (assistant の content) に `thinking` / `redacted_thinking` がある 1 本だけ。リクエストの `thinking` の設定は見ないので、thinking を無効にしたモデルへ切り替えても履歴の thinking は跨ぎとして扱う。同じ会話で走る脇の呼び出し (権限判定や要約) は履歴を持たないので出所に数えない
 - account の同一性は credential で見る (credential を持たない経路は経路名)。モデルの同一性は解決後のモデル名そのまま
 - account に束縛されるモデルの会話は、そのモデルで最初に 2xx を返した account (開始 account) の経路を先に全部試す。使い切りの繰り上げ (`spend_down_within`) もこれを越えない
@@ -185,7 +186,7 @@ on_thinking_crossing = "thinking_as_text"       # この namespace だけ上書�
 | `drop_thinking` | 開始 account の経路が全部使えなければ他の account へ移る。跨いでも本文はそのまま送る (履歴の thinking は API に捨てられる) |
 | `thinking_as_text` | 開始 account の経路が全部使えなければ他の account へ移る。跨いだ会話は以後すべての 1 本で、履歴の `thinking` を assistant の `text` にして送る (本文だけ。改行は残し、末尾の改行と半角空白だけを落とす。`redacted_thinking` と空の thinking は落とす)。変換した時点でその会話の prompt cache は 1 度作り直しになる |
 
-出所は `[stats] dir` の `thinking-sources/sources.json` に保存され、同じ置き場を見る unit (stable / unstable) で共有し、restart や設定の読み直しでも残る。会話が最後に 2xx で通ってから 24 時間で忘れる。
+出所は `[stats] dir` の `thinking-sources/sources.json` に保存され、同じ置き場を見る unit (stable / unstable) で共有し、restart や設定の読み直しでも残る。連なりが最後に 2xx で通ってから 24 時間で忘れる。
 
 応答は upstream のものをそのまま返す (`{"type":"message","content":[...]}`)。gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を返す。
 
