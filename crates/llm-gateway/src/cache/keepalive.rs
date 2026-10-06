@@ -228,6 +228,13 @@ pub struct Keepalive {
     sender: Mutex<Weak<dyn Sender>>,
     /// 系列ごとの次の予定。落ちれば予定も止まる。
     timers: Mutex<HashMap<Series, Timer>>,
+    /// 発火の判断を終えた回数 (送らなかった判断も数える)。
+    ///
+    /// 「送られなかった」の試験は、判断に**到達した上で**送らなかったのか、
+    /// 予定の task がそもそも走っていないのかを見分けられない。送出の数は
+    /// [`Sender`] の側にしか無いので、判断の数はここで別に数える。
+    #[cfg(test)]
+    judged: tokio::sync::watch::Sender<usize>,
 }
 
 /// 予定の実体。畳まれたら止まる。
@@ -304,6 +311,8 @@ impl Keepalive {
             reach,
             sender: Mutex::new(Weak::<NoSender>::new()),
             timers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            judged: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -448,8 +457,17 @@ impl Keepalive {
         self.timers.lock().unwrap().insert(series, timer);
     }
 
-    /// 1 本送り直す。
+    /// 予定の時刻が来た系列を判断し、送るなら送る。
+    ///
+    /// 判断の中身は [`Self::judge`]。ここは終わった回数を数えるだけ (試験用)。
     async fn fire(self: &Arc<Self>, series: Series, expected_ms: i64) {
+        self.judge(series, expected_ms).await;
+        #[cfg(test)]
+        self.judged.send_modify(|count| *count += 1);
+    }
+
+    /// 1 本送り直す、または送らない理由を決める。
+    async fn judge(self: &Arc<Self>, series: Series, expected_ms: i64) {
         // 撫でるのは 1 台だけ。兄弟が掴んでいるなら、その系列はそちらが
         // 繋いでいる — こちらは予定を置き直して次に備える。
         let Some(_claim) = self.store.claim(&series) else {
@@ -616,6 +634,30 @@ impl Keepalive {
             &series.prefix,
             of,
         ));
+    }
+
+    /// 判断を `nth` 回終えるまで待つ。
+    ///
+    /// 待ち方は [`FakeUpstream::until_sent`] と同じ (知らせを待ち、上限は止めた
+    /// 時計の上で効く)。「何も送られない」の試験は、これで判断が走ったことを
+    /// 確かめてから送出の無さを言う。
+    #[cfg(test)]
+    async fn until_judged(&self, nth: usize) {
+        let mut watching = self.judged.subscribe();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            watching
+                .wait_for(|count| *count >= nth)
+                .await
+                .expect("the keepalive is still there");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("judgment #{nth} never happened"));
+    }
+
+    /// ここまでに判断を終えた回数。
+    #[cfg(test)]
+    fn judged(&self) -> usize {
+        *self.judged.borrow()
     }
 
     /// 予定を持っている系列の数。
@@ -857,7 +899,14 @@ mod tests {
             tokio::time::advance(REFRESH_AFTER - Duration::from_secs(60)).await;
             tokio::task::yield_now().await;
         }
+        assert_eq!(keepalive.judged(), 0, "no schedule ever came due");
         assert!(upstream.sent().is_empty(), "the replay never came due");
+
+        // 対照: 先送りが止まれば、同じ仕掛けが判断に至って送る。これが無いと、
+        // 予定の task が走らない壊れ方でもこの試験は通ってしまう。
+        tokio::time::advance(REFRESH_AFTER).await;
+        keepalive.until_judged(1).await;
+        upstream.until_sent(1).await;
     }
 
     /// 繋いだ 1 本は、次の 55 分へまた繋がる。起点は動かさない。
@@ -1078,7 +1127,7 @@ mod tests {
 
         keepalive.armed_by_request(sent(now_unix_ms()));
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        keepalive.until_judged(1).await;
 
         assert!(upstream.sent().is_empty(), "nothing went out");
         assert_eq!(keepalive.armed(), 1, "the series is still watched");
@@ -1139,7 +1188,7 @@ mod tests {
         keepalive.store.save(&kept);
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        keepalive.until_judged(1).await;
 
         assert!(upstream.sent().is_empty(), "the horizon was over");
         assert_eq!(
@@ -1162,7 +1211,7 @@ mod tests {
         let _held = sibling.claim(&series()).expect("the sibling took it");
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
+        keepalive.until_judged(1).await;
 
         assert!(upstream.sent().is_empty(), "the sibling is doing it");
         assert_eq!(keepalive.armed(), 1, "the series is still watched");
@@ -1182,7 +1231,13 @@ mod tests {
         assert_eq!(keepalive.armed(), 0, "nothing is watched");
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
+        assert_eq!(keepalive.judged(), 0, "there was no schedule to judge");
         assert!(upstream.sent().is_empty());
+
+        // 対照: 普通の大きさの 1 本なら、同じ仕掛けで送られる。
+        keepalive.armed_by_request(sent(now_unix_ms()));
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        upstream.until_sent(1).await;
     }
 
     /// 止めた会話の控えは消える。解くのは実リクエスト 1 本。
@@ -1199,14 +1254,18 @@ mod tests {
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
+        assert_eq!(keepalive.judged(), 0, "a paused conversation is not judged");
         assert!(
             upstream.sent().is_empty(),
             "a paused conversation stays quiet"
         );
 
-        // 実リクエストが 1 本来れば、そのまま張り直る。
+        // 実リクエストが 1 本来れば、そのまま張り直る。送られるところまで
+        // 見るのは、止めた側の静けさが「予定が走らない」ためでないことの対照。
         keepalive.armed_by_request(sent(now_unix_ms()));
         assert_eq!(keepalive.armed(), 1);
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        upstream.until_sent(1).await;
     }
 
     /// 落ちている間の控えを読み戻して、予定を張り直す。
