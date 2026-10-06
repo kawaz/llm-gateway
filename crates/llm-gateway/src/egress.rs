@@ -169,6 +169,12 @@ pub struct UpstreamRequest {
 pub struct EncodedRequest {
     pub upstream: UpstreamRequest,
     pub response: ResponseMode,
+    /// 正規形の最上位の欄のうち、この経路が上流へ渡せずに落としたものの名前。
+    /// 素通しする経路では空。
+    ///
+    /// 落としたことを警告・知らせに出すのは core (どの会話・どの agent の 1 本か
+    /// を知っているのは core で、Wire は知らない)。
+    pub dropped: Vec<String>,
 }
 
 /// upstream 応答をクライアント向けの正規形へ整える方法。
@@ -184,6 +190,8 @@ pub enum ResponseMode {
 pub struct SentResponse {
     pub response: Response,
     pub mode: ResponseMode,
+    /// 送る時に落とした欄 ([`EncodedRequest::dropped`])。
+    pub dropped: Vec<String>,
 }
 
 /// upstream からの応答。本文はまだ読んでいない。
@@ -221,12 +229,17 @@ pub async fn send(
     let EncodedRequest {
         mut upstream,
         response: mode,
+        dropped,
     } = preset.wire().encode(request)?;
     preset.auth().authorize(credential, &mut upstream)?;
     // 受けた形も渡す。上流の応答をクライアントの方言へ通訳するかどうかは
     // 「何で受けたか」で決まり、送る内容 ([`UpstreamRequest`]) からは読めない。
     let response = preset.wire().send(http, upstream, shape).await?;
-    Ok(SentResponse { response, mode })
+    Ok(SentResponse {
+        response,
+        mode,
+        dropped,
+    })
 }
 
 pub async fn finish_response(sent: SentResponse) -> Result<Response> {
@@ -407,13 +420,17 @@ impl MessageCollector {
         Ok(())
     }
 
+    /// `message_delta` の `delta` を message へ写す。
+    ///
+    /// 欄は選ばずに全部写す。`delta` は「message の最上位の欄の最終値」で、
+    /// 知っている欄 (`stop_reason` / `stop_sequence`) だけを写すと、上流が後から
+    /// 足した欄 (`safeguard_results` / `context_management` 等) が非ストリームの
+    /// 応答からだけ黙って消える。
     fn apply_message_delta(&mut self, event: &Value) {
         let message = self.message_mut();
         if let Some(delta) = event.get("delta").and_then(Value::as_object) {
-            for key in ["stop_reason", "stop_sequence"] {
-                if let Some(value) = delta.get(key) {
-                    message.insert(key.to_owned(), value.clone());
-                }
+            for (key, value) in delta {
+                message.insert(key.clone(), value.clone());
             }
         }
         if let Some(usage) = event.get("usage") {
@@ -690,6 +707,29 @@ mod tests {
         );
         assert_eq!(body["stop_reason"], "tool_use");
         assert_eq!(body["usage"], json!({"input_tokens":10,"output_tokens":7}));
+    }
+
+    /// `message_delta` の `delta` は知らない欄も message に写す (非ストリームの
+    /// 応答だけ欄が消えることが無い)。
+    #[tokio::test]
+    async fn collects_every_message_delta_field() {
+        let response = adapted(
+            ResponseMode::CollectMessagesSse,
+            vec![
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"safeguard_results\":[{\"type\":\"dangerous_tool_use\",\"status\":{\"type\":\"available\",\"tool_uses\":{}}}],\"context_management\":{\"applied_edits\":[]}},\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            ],
+        )
+        .await;
+
+        let body: Value =
+            serde_json::from_slice(&collect_body(response.body).await.unwrap()).unwrap();
+        assert_eq!(body["stop_reason"], "end_turn");
+        assert_eq!(
+            body["safeguard_results"],
+            json!([{"type":"dangerous_tool_use","status":{"type":"available","tool_uses":{}}}])
+        );
+        assert_eq!(body["context_management"], json!({"applied_edits":[]}));
+        assert_eq!(body["usage"], json!({"input_tokens":3,"output_tokens":1}));
     }
 
     /// streaming 中の正規形 error は、成功 message と混ぜず同じ error JSON 形で返す。

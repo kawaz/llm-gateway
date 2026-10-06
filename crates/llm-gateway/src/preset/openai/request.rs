@@ -4,7 +4,37 @@ use serde_json::{Map, Value, json};
 
 use crate::{Error, Result};
 
-pub fn convert(body: Value) -> Result<Value> {
+/// 変換の結果。
+#[derive(Debug)]
+pub struct Converted {
+    /// Responses API の request。
+    pub body: Value,
+    /// 写せずに落とした最上位の欄の名前 (正規形での名前、入っていた順)。
+    pub dropped: Vec<String>,
+}
+
+/// 正規形の最上位の欄のうち、変換が読むもの。これ以外は上流に届かない。
+///
+/// `stream` は Wire が応答の返し方を決めるのに読む (上流へは常に `true`)。
+/// `output_config` は `effort` だけを写す (残りの中身は落ちるが、欄としては読む)。
+///
+/// Design rationale: 落とす欄を名指しの一覧で持つと、クライアントが新しく
+/// 送り始めた欄 (`safeguards` / `context_management` 等) が警告も無く消える。
+/// 読む側を一覧にし、それ以外は全部「落とした」として呼び出し側へ返す。
+const READ: &[&str] = &[
+    "model",
+    "system",
+    "messages",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "output_config",
+    "temperature",
+    "top_p",
+    "stream",
+];
+
+pub fn convert(body: Value) -> Result<Converted> {
     let input = body
         .as_object()
         .ok_or_else(|| invalid("request body must be a JSON object"))?;
@@ -55,22 +85,18 @@ pub fn convert(body: Value) -> Result<Value> {
             output.insert(key.to_owned(), value.clone());
         }
     }
-    for key in [
-        "max_tokens",
-        "stop_sequences",
-        "top_k",
-        "metadata",
-        "service_tier",
-    ] {
-        if input.contains_key(key) {
-            tracing::warn!(
-                parameter = key,
-                "dropping parameter not supported by the Codex backend"
-            );
-        }
-    }
+    // 警告は落とした欄を受け取った側が出す。どの会話・どの agent の 1 本かを
+    // 知っているのはそちら。
+    let dropped = input
+        .keys()
+        .filter(|key| !READ.contains(&key.as_str()))
+        .cloned()
+        .collect();
 
-    Ok(Value::Object(output))
+    Ok(Converted {
+        body: Value::Object(output),
+        dropped,
+    })
 }
 
 fn system_text(value: &Value) -> Result<String> {
@@ -386,7 +412,8 @@ mod tests {
                 {"role":"user","content":"go on"}
             ]
         }))
-        .unwrap();
+        .unwrap()
+        .body;
 
         let input = converted["input"].as_array().unwrap();
         assert_eq!(input[1]["role"], "system");
@@ -415,7 +442,7 @@ mod tests {
             "temperature":0.2,
             "top_p":0.9,
             "max_tokens":100
-        })).unwrap();
+        })).unwrap().body;
 
         assert_eq!(converted["instructions"], "one\n\ntwo");
         assert_eq!(converted["store"], false);
@@ -465,7 +492,8 @@ mod tests {
             {"type":"image","source":{"type":"url","url":"https://example.com/a.png"}},
             {"type":"text","text":"after"}
         ]}]}]}))
-        .unwrap();
+        .unwrap()
+        .body;
         assert_eq!(
             body["input"][0],
             json!({"type":"function_call_output","call_id":"call-1","output":[
@@ -484,7 +512,8 @@ mod tests {
         "type":"tool_result","tool_use_id":"call-1","content":[
             {"type":"text","text":"a"},{"type":"text","text":"b"}
         ]}]}]}))
-        .unwrap();
+        .unwrap()
+        .body;
         assert_eq!(body["input"][0]["output"], json!("a\nb"));
     }
 
@@ -568,7 +597,34 @@ mod tests {
             "output_config": {"effort": "xhigh"},
             "messages": [{"role":"user","content":"hi"}],
         }))
-        .unwrap();
+        .unwrap()
+        .body;
         assert_eq!(converted["reasoning"]["effort"], "xhigh");
+    }
+
+    /// 読まない最上位の欄は全部、落とした欄として返す。名指しの一覧に無い
+    /// 欄 (`safeguards` / `context_management`) も漏らさない。読む欄は返さない。
+    #[test]
+    fn every_unread_top_level_field_is_reported_as_dropped() {
+        let converted = convert(json!({
+            "model": "m",
+            "max_tokens": 64,
+            "stream": true,
+            "system": "s",
+            "messages": [{"role":"user","content":"hi"}],
+            "metadata": {"user_id": "u"},
+            "safeguards": [{"type": "dangerous_tool_use"}],
+            "context_management": {"edits": []},
+            "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+        }))
+        .unwrap();
+        assert_eq!(
+            converted.dropped,
+            ["max_tokens", "metadata", "safeguards", "context_management"]
+        );
+        assert!(converted.body.get("safeguards").is_none());
+
+        let plain = convert(json!({"model": "m", "messages": []})).unwrap();
+        assert!(plain.dropped.is_empty());
     }
 }

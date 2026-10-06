@@ -91,6 +91,8 @@ impl Wire for AnthropicWire {
                 body,
             },
             response: ResponseMode::Passthrough,
+            // 本文は丸ごと素通しで、落とす欄は無い。
+            dropped: Vec::new(),
         })
     }
 

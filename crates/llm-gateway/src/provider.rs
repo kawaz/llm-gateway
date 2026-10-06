@@ -481,6 +481,7 @@ mod tests {
                     body: bytes::Bytes::from(serde_json::to_vec(&request.body)?),
                 },
                 response: crate::egress::ResponseMode::Passthrough,
+                dropped: Vec::new(),
             })
         }
 

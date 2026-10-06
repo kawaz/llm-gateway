@@ -246,6 +246,7 @@ mod tests {
             &Origin {
                 principal: None,
                 session_id: Some("s-1"),
+                agent_id: None,
                 prefix: Some("2cf24dba"),
                 ns: "personal",
                 model: "m",
@@ -267,6 +268,7 @@ mod tests {
             &Origin {
                 principal: None,
                 session_id: Some("s-1"),
+                agent_id: None,
                 prefix: None,
                 ns: "personal",
                 model: "m",

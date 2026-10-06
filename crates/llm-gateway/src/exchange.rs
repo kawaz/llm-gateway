@@ -1098,6 +1098,7 @@ mod tests {
         events::Origin {
             principal: None,
             session_id: Some("s-1"),
+            agent_id: None,
             prefix: Some("2cf24dba"),
             ns: "personal",
             model: "claude-opus-5",

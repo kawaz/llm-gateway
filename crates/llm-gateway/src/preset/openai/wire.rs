@@ -62,16 +62,17 @@ impl Wire for OpenAiWire {
         // Responses 形式で受けたなら、本文は上流の方言そのもの。`stream` や
         // `store` の決め方もクライアントの言い分に従う (DR-0025) — こちらで
         // 直すと、送った側が組み立てた会話の続き方と食い違う。
-        let (body, response) = match request.shape {
-            RequestShape::Responses => (request.body, ResponseMode::Passthrough),
-            RequestShape::Messages => (
-                request::convert(request.body)?,
-                if client_streams {
+        let (body, response, dropped) = match request.shape {
+            RequestShape::Responses => (request.body, ResponseMode::Passthrough, Vec::new()),
+            RequestShape::Messages => {
+                let converted = request::convert(request.body)?;
+                let response = if client_streams {
                     ResponseMode::Passthrough
                 } else {
                     ResponseMode::CollectMessagesSse
-                },
-            ),
+                };
+                (converted.body, response, converted.dropped)
+            }
         };
         let body = Bytes::from(serde_json::to_vec(&body)?);
         Ok(EncodedRequest {
@@ -81,6 +82,7 @@ impl Wire for OpenAiWire {
                 body,
             },
             response,
+            dropped,
         })
     }
 

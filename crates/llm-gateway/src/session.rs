@@ -49,6 +49,15 @@ pub fn agent_id(headers: &[(String, String)]) -> Option<String> {
     header(headers, AGENT_HEADER).map(str::to_owned)
 }
 
+/// Claude Code が auto mode の判定を server に頼む、request の最上位の欄。
+///
+/// 応答の `message_delta` に `safeguard_results` が返る前提の往復で、経路がこの
+/// 欄を上流へ渡せないと結果も返らない。Claude Code (2.1.290 で実測) は結果の無い
+/// 完了応答を「この環境は review しない」と受け取り、プロセスが終わるまで main も
+/// subagent もこの欄を送らなくなる (docs/findings/2026-09-24-auto-mode-classifier-notice.md)。
+/// 落とした 1 本の影響がその 1 本で終わらないので、落とした欄の中から名指しする。
+pub const SERVER_REVIEW_FIELD: &str = "safeguards";
+
 /// session affinity のキー。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionKey(String);

@@ -1584,6 +1584,7 @@ spend_down_within = "25%"
         events::Origin {
             principal: None,
             session_id: None,
+            agent_id: None,
             prefix: None,
             ns: NS,
             model,

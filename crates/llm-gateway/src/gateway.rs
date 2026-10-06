@@ -615,6 +615,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             ns: ns_name,
             model: &model,
             session_id: declared,
+            agent_id: agent.as_deref(),
             prefix,
             path,
             query,
@@ -1000,18 +1001,21 @@ impl<P: CredentialPersistence> Gateway<P> {
         model: &str,
         sent: SentResponse,
     ) -> std::result::Result<Response, Switch> {
-        let mode = sent.mode;
+        // 落とした欄は送った直後 ([`Self::send`]) に読み終えている。仕上げには要らない。
+        let SentResponse { response, mode, .. } = sent;
         match route
             .preset
-            .admit(sent.response, model, now_unix())
+            .admit(response, model, now_unix())
             .await
             .map_err(|e| Switch::to_next(e.to_string()))?
         {
-            Admission::Admitted(response) => {
-                egress::finish_response(SentResponse { response, mode })
-                    .await
-                    .map_err(|e| Switch::to_next(e.to_string()))
-            }
+            Admission::Admitted(response) => egress::finish_response(SentResponse {
+                response,
+                mode,
+                dropped: Vec::new(),
+            })
+            .await
+            .map_err(|e| Switch::to_next(e.to_string())),
             Admission::Rejected {
                 response,
                 reason,
@@ -1026,9 +1030,13 @@ impl<P: CredentialPersistence> Gateway<P> {
                         .observe_failure(route.name(), "busy", None)
                         .await;
                 }
-                let response = egress::finish_response(SentResponse { response, mode })
-                    .await
-                    .map_err(|e| Switch::to_next(e.to_string()))?;
+                let response = egress::finish_response(SentResponse {
+                    response,
+                    mode,
+                    dropped: Vec::new(),
+                })
+                .await
+                .map_err(|e| Switch::to_next(e.to_string()))?;
                 Err(Switch {
                     reason,
                     denial: Some(response),
@@ -1241,6 +1249,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             &events::Origin {
                 principal: None,
                 session_id: Some(&kept.session_id),
+                // gateway 自身の送り直しで、どの agent も出していない。
+                agent_id: None,
                 prefix: Some(&kept.prefix),
                 ns: &kept.ns,
                 model: &kept.model,
@@ -1355,6 +1365,37 @@ impl<P: CredentialPersistence> Gateway<P> {
             }
         };
 
+        // 経路が上流へ渡せなかった欄を、どの会話・どの agent の 1 本かと一緒に
+        // 残す。落としたのは方言の都合で、知っているのは Wire だが、素性を
+        // 知っているのはここ (DR-0014 の境界)。
+        // 落とした欄のうち server review を頼む欄だけは名指しする。落とした 1 本の
+        // 影響がその 1 本で終わらない ([`session::SERVER_REVIEW_FIELD`])。
+        // 結果を作って返すことはしない — 作れば安全判定の偽装になる。
+        let safeguards_dropped = resp
+            .dropped
+            .iter()
+            .any(|field| field == session::SERVER_REVIEW_FIELD);
+        if safeguards_dropped {
+            warn!(
+                model = %call.model,
+                route = route.name(),
+                session = call.session_id.as_deref().unwrap_or("-"),
+                agent = call.agent_id.unwrap_or("-"),
+                dropped = ?resp.dropped,
+                "dropping `safeguards`: this route cannot carry auto mode server review, \
+                 and the client may stop asking for it until it restarts"
+            );
+        } else if !resp.dropped.is_empty() {
+            warn!(
+                model = %call.model,
+                route = route.name(),
+                session = call.session_id.as_deref().unwrap_or("-"),
+                agent = call.agent_id.unwrap_or("-"),
+                dropped = ?resp.dropped,
+                "dropping request fields this route cannot carry upstream"
+            );
+        }
+
         // 便乗して枠を拾う (DR-0007)。読むのはヘッダだけなので、本文はこの後も
         // そのまま流れる。上限に当たった応答こそ見たいので、status では絞らない。
         let now_ms = now_unix_ms();
@@ -1393,6 +1434,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         );
         event.thinking_as_text = crossing == Crossing::ThinkingAsText;
         event.thinking_dropped_by_switch = crossing == Crossing::ThinkingDropped;
+        event.safeguards_dropped = safeguards_dropped;
         self.events.publish(event);
         // 応答が閉じたときの知らせは、素性がここで揃う。終わり方が分かるのは
         // 本文を流し切ったところ ([`crate::exchange`]) なので、下書きだけを
@@ -1800,6 +1842,8 @@ struct Call<'a> {
     model: &'a str,
     /// クライアントが名乗った会話の id。名乗らない相手もいる。
     session_id: Option<String>,
+    /// その会話の中で、この 1 本を出した subagent の id。main は `None`。
+    agent_id: Option<&'a str>,
     /// 会話系列の識別子。経路を試すたびに作り直さないよう、1 回で取る。
     prefix: Option<String>,
     path: &'a str,
@@ -1831,6 +1875,7 @@ impl<'a> Call<'a> {
         events::Origin {
             principal: self.principal,
             session_id: self.session_id.as_deref(),
+            agent_id: self.agent_id,
             prefix: self.prefix.as_deref(),
             ns: self.ns,
             model: self.model,
@@ -7485,6 +7530,169 @@ routes = ["codex"]
             let event = announced(watching.recv().await.unwrap());
             assert_eq!(event.origin, expected);
         }
+    }
+
+    /// `safeguards` を運べない openai 経路では、落としたことが会話・agent・モデル・
+    /// 経路の分かる警告と、知らせの `safeguards_dropped` に出る。結果は作らない。
+    /// 素通しの anthropic 経路へ同じ本文を送っても、どちらも出ない。
+    #[test]
+    fn a_route_that_drops_safeguards_says_so_in_the_log_and_the_event() {
+        let mut events = Vec::new();
+        let logs = crate::test_log::logs_of(|| async {
+            let codex = responses_upstream().await;
+            let anthropic = FakeUpstream::always(200).await;
+            let gw = gateway_with(
+                &r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "CODEX/backend-api/codex"
+models = ["gpt-6-sol"]
+
+[routes.relay]
+provider = "anthropic"
+url = "RELAY"
+models = ["m"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["gpt-6-sol"]
+routes = ["codex"]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["relay"]
+"#
+                .replace("CODEX", &codex.url)
+                .replace("RELAY", &anthropic.url),
+                StaticStore::holding(valid_codex_credential()),
+            )
+            .await;
+            let mut watching = gw.events().subscribe();
+
+            for model in ["gpt-6-sol", "m"] {
+                let (mut body, mut headers) = conversation(json!({}));
+                body["model"] = json!(model);
+                body["tools"] = json!([{"name": "Bash", "input_schema": {"type": "object"}}]);
+                body["safeguards"] = json!([{"type": "dangerous_tool_use"}]);
+                headers.push((session::AGENT_HEADER.to_owned(), "agent-7".to_owned()));
+                let forwarded = forward_with(&gw, NS, body, headers).await;
+                assert_eq!(forwarded.response.status, 200, "{model}");
+                events.push(announced(watching.recv().await.unwrap()));
+            }
+
+            // 一覧の問い合わせ (discovery) も同じ相手に届くので、転送だけを拾う。
+            let posted = |upstream: &FakeUpstream| {
+                upstream
+                    .requests()
+                    .into_iter()
+                    .find(|req| req.starts_with("POST "))
+                    .expect("the forwarded request")
+            };
+            assert!(
+                sent_body(&posted(&codex)).get("safeguards").is_none(),
+                "the Responses API has no such field"
+            );
+            assert_eq!(
+                sent_body(&posted(&anthropic))["safeguards"],
+                json!([{"type": "dangerous_tool_use"}]),
+                "the passthrough route carries it"
+            );
+        });
+
+        let (dropped, carried) = (&events[0], &events[1]);
+        assert_eq!(dropped.credential, "codex");
+        assert!(dropped.safeguards_dropped);
+        assert_eq!(dropped.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(carried.credential, "relay");
+        assert!(!carried.safeguards_dropped);
+        assert_eq!(carried.agent_id.as_deref(), Some("agent-7"));
+        let carried_json = serde_json::to_value(carried).unwrap();
+        assert!(
+            carried_json.get("safeguards_dropped").is_none(),
+            "{carried_json}"
+        );
+        let dropped_json = serde_json::to_value(dropped).unwrap();
+        assert_eq!(dropped_json["safeguards_dropped"], json!(true));
+        assert_eq!(dropped_json["agent_id"], json!("agent-7"));
+
+        let warned: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains("dropping `safeguards`"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{logs}");
+        for part in [
+            "WARN",
+            "model=gpt-6-sol",
+            "route=\"codex\"",
+            "session=\"s-1\"",
+            "agent=\"agent-7\"",
+            "\"safeguards\"",
+        ] {
+            assert!(warned[0].contains(part), "{part}: {}", warned[0]);
+        }
+        assert!(
+            !logs.contains("dropping request fields"),
+            "one line per request, the safeguards one: {logs}"
+        );
+    }
+
+    /// 他の欄だけを落とした 1 本は、落とした欄の一覧で 1 行警告する。印は付けない。
+    #[test]
+    fn other_dropped_fields_are_warned_once_without_the_safeguards_mark() {
+        let mut events = Vec::new();
+        let logs = crate::test_log::logs_of(|| async {
+            let codex = responses_upstream().await;
+            let gw = gateway_with(
+                &r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "CODEX/backend-api/codex"
+models = ["gpt-6-sol"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["gpt-6-sol"]
+routes = ["codex"]
+"#
+                .replace("CODEX", &codex.url),
+                StaticStore::holding(valid_codex_credential()),
+            )
+            .await;
+            let mut watching = gw.events().subscribe();
+            let (mut body, headers) = conversation(json!({}));
+            body["model"] = json!("gpt-6-sol");
+            body["tools"] = json!([{"name": "Bash", "input_schema": {"type": "object"}}]);
+            body["context_management"] = json!({"edits": []});
+            assert_eq!(
+                forward_with(&gw, NS, body, headers).await.response.status,
+                200
+            );
+            events.push(announced(watching.recv().await.unwrap()));
+        });
+
+        assert!(!events[0].safeguards_dropped);
+        assert_eq!(events[0].agent_id, None, "main names no agent");
+        let warned: Vec<&str> = logs
+            .lines()
+            .filter(|line| line.contains("dropping request fields"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{logs}");
+        for part in [
+            "\"max_tokens\"",
+            "\"metadata\"",
+            "\"context_management\"",
+            "agent=\"-\"",
+        ] {
+            assert!(warned[0].contains(part), "{part}: {}", warned[0]);
+        }
+        assert!(!logs.contains("safeguards"), "{logs}");
     }
 
     /// codex backend が返した記述を、namespace が見せるモデルだけに絞って渡す。

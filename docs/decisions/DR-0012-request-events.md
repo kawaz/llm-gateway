@@ -70,6 +70,7 @@ data: {"ts":1785600000000,"seq":42,"boot":1785590000000,"session_id":"s-1","ns":
 - `boot` — **どの起動の番号か** (その gateway が起動した時刻、Unix ミリ秒)。再起動で `seq` は 1 に戻るので、`boot` が変わったら番号の振り直しと読む。`/llm-gateway/self` の `boot` と同じ値
 - `subject` / `kid` — ns 認証 `jwt` で通った相手 (token の `sub`) と、確かめた鍵 (`kid`)。`jwt` 方式の ns でだけ出し、token 方式・無検査の ns では欄ごと出ない。応答の知らせ (`response`) と中継の知らせ (`passthrough`) にも同じ値を載せる。認証に失敗した要求は知らせに出さない (未認証の相手の入力で流量が増える口を作らない)
 - `session_id` — リクエストヘッダ `X-Claude-Code-Session-Id` の値 (大文字小文字は問わない)。名乗らないクライアント (curl 等) では `null`。欄自体は必ず出す — 欠けさせると、読む側が形を 2 通り扱うことになる
+- `agent_id` — リクエストヘッダ `x-claude-code-agent-id` の値。Claude Code の subagent は main と同じ `session_id` を名乗り、どの agent の 1 本かはこれでしか分からない。main の 1 本と名乗らないクライアントでは欄ごと出さない。`response` にも同じ値を載せる
 - `ns` / `model` / `credential` — どの面の・どのモデルが・どの経路に当たったか。`model` は解決後の実名 (`opus` のような短い名前はここでは解決済み)
 - `status` — upstream が返した状態
 - `prefix` — **会話系列の識別子** (下記)。分からなければ欄ごと出さない
@@ -113,7 +114,7 @@ data: {"type":"response","ts":1785600012000,"seq":43,"boot":1785590000000,
 - `ts` — **この知らせの時刻** = 本文が閉じた、または切れた瞬間
 - `seq` / `boot` — `request` と同じ規則 (1 つの列で数える)
 - `request_ts` — 対応する `request` の `ts`。同じ会話で何本も走るので、素性が同じでも 1 対 1 に結べるようにする
-- `session_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status` — 対応する `request` と同じ値。見る側に 2 通の突き合わせを強いない
+- `session_id` / `agent_id` / `prefix` / `ns` / `model` / `credential` / `origin` / `status` — 対応する `request` と同じ値。見る側に 2 通の突き合わせを強いない
 - `stop_reason` — upstream が言った終わり方を**そのまま写す**。こちらで語彙の一覧を持つと、増えた語を落とす。載っていなければ欄ごと出さない (途中で切れた場合がこれ)
 - `aborted` — 本文が最後まで流れなかったか。**常に出す** — 欄が消えると「切れていない」と区別が付かない
 - `cache` — この 1 本で prompt cache が実際にどう働いたか。**常に出す** (下記)

@@ -53,6 +53,10 @@ pub struct Event {
     pub kid: Option<String>,
     /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
     pub session_id: Option<String>,
+    /// その会話の中で、この 1 本を出した subagent の id ([`crate::session::agent_id`])。
+    /// main の 1 本と、名乗らないクライアントでは欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// どの namespace 宛か。
     pub ns: String,
     /// 解決後の実モデル名 (`opus` のような短い名前はここでは解決済み)。
@@ -123,6 +127,11 @@ pub struct Event {
     /// 1 本では欄ごと出さない。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thinking_dropped_by_switch: bool,
+    /// クライアントが送った server review を頼む欄
+    /// ([`crate::session::SERVER_REVIEW_FIELD`]) を、答えた経路が上流へ渡せなかった。
+    /// 応答にも review の結果は載らない。当てはまらない 1 本では欄ごと出さない。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub safeguards_dropped: bool,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -138,6 +147,8 @@ pub struct Origin<'a> {
     pub principal: Option<(&'a str, &'a str)>,
     /// クライアントが名乗った会話の id。
     pub session_id: Option<&'a str>,
+    /// その会話の中で、この 1 本を出した subagent の id。main は `None`。
+    pub agent_id: Option<&'a str>,
     /// 会話系列の識別子。
     pub prefix: Option<&'a str>,
     pub ns: &'a str,
@@ -176,6 +187,7 @@ impl Event {
             subject: origin.principal.map(|(s, _)| s.to_owned()),
             kid: origin.principal.map(|(_, k)| k.to_owned()),
             session_id: origin.session_id.map(str::to_owned),
+            agent_id: origin.agent_id.map(str::to_owned),
             ns: origin.ns.to_owned(),
             model: origin.model.to_owned(),
             credential: origin.credential.to_owned(),
@@ -204,6 +216,7 @@ impl Event {
             // 送る経路が決まって初めて分かる。立てるのは送る側。
             thinking_as_text: false,
             thinking_dropped_by_switch: false,
+            safeguards_dropped: false,
         }
     }
 }
@@ -311,6 +324,9 @@ pub struct Response {
     pub request_ts: i64,
     /// どの会話か。ヘッダを付けてこないクライアントでは `null`。
     pub session_id: Option<String>,
+    /// この 1 本を出した subagent の id ([`Event::agent_id`])。main では欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// この会話系列の識別子 ([`prefix`])。取れなければ欄ごと出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
@@ -358,6 +374,7 @@ impl Response {
             kid: origin.principal.map(|(_, k)| k.to_owned()),
             request_ts,
             session_id: origin.session_id.map(str::to_owned),
+            agent_id: origin.agent_id.map(str::to_owned),
             prefix: origin.prefix.map(str::to_owned),
             ns: origin.ns.to_owned(),
             model: origin.model.to_owned(),
@@ -636,6 +653,7 @@ mod tests {
         Origin {
             principal: None,
             session_id: None,
+            agent_id: None,
             prefix: None,
             ns: "personal",
             model: "m",
@@ -786,6 +804,7 @@ mod tests {
             NOW,
             &Origin {
                 session_id: Some("s-1"),
+                agent_id: None,
                 model: "claude-fable-5",
                 ..from("claude-kawazzz")
             },
@@ -903,6 +922,7 @@ mod tests {
             NOW,
             &Origin {
                 session_id: Some("s-1"),
+                agent_id: None,
                 ..from("a")
             },
             200,
@@ -1084,6 +1104,7 @@ mod tests {
             NOW,
             &Origin {
                 session_id: Some("s-1"),
+                agent_id: None,
                 prefix: Some("2cf24dba"),
                 model: "claude-opus-5",
                 origin: "main",
@@ -1135,6 +1156,7 @@ mod tests {
             NOW + 55 * MINUTE,
             &Origin {
                 session_id: Some("s-1"),
+                agent_id: None,
                 prefix: Some("2cf24dba"),
                 model: "claude-opus-5",
                 origin: "main",
@@ -1285,6 +1307,7 @@ mod tests {
             NOW,
             &Origin {
                 session_id: Some("s-1"),
+                agent_id: None,
                 prefix: Some("2cf24dba"),
                 model: "claude-opus-5",
                 origin: "main",
