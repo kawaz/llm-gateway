@@ -1,6 +1,6 @@
 ---
 title: 監督者クラッシュ後に子プロセスが残り新監督者とポート衝突する
-status: open
+status: resolved
 category: bug
 created: 2026-09-10T15:19:14+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:51:15+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented:988d714 (Linux/systemd 未実機)","runbook/supervisor-orphan-children"]
 blocked_by:
 origin: 自リポ TODO
 ---
