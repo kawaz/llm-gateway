@@ -128,6 +128,13 @@ llm-gateway service register            # 新しい版の binary で。com.githu
 llm-gateway daemon status --all         # 2 台が running: true に戻るのを見る
 ```
 
+## re-register が `environment_drift` で止まった時
+
+`service register` は、置いてある unit に固定した `XDG_CONFIG_HOME` / `XDG_STATE_HOME` が今のシェルの導出と違うと、差分を出して止まる (監督者が見る置き場が黙って変わるのを防ぐため)。手で書いた unit や、XDG を固定していなかった頃の unit を置き換える時もここで止まる。
+
+- 置き場を移すつもりなら `llm-gateway service register --force`
+- 移すつもりが無いなら、unit を登録した時と同じ環境のシェルから打ち直す。差分は出力の `drift` (`key` / `from` / `to`) で見る
+
 ## ログの回転を仕込む (macOS)
 
 監督者は `~/.local/state/llm-gateway/logs/<unit>.log` へ追記するだけで、回転は持たない (DR-0028 決定 10)。macOS では newsyslog に任せる。
