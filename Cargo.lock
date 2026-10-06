@@ -976,6 +976,7 @@ name = "llm-gateway-cli"
 version = "0.67.0"
 dependencies = [
  "axum",
+ "base64",
  "gateway-core",
  "llm-gateway",
  "llm-gateway-server",

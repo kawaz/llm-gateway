@@ -165,21 +165,41 @@ llm-gateway auth — make keys and tokens for namespaces that use auth = \"jwt\"
 usage:
   llm-gateway auth <command> [options]
 
-everything is written to stdout and nothing is saved. the key ring (the file
-keys_file points at) holds one JWK per line, private keys included; append to
-it yourself with >>, and keep it readable only by you (chmod 600). jwks and
-sign read the key ring from --key <file>, or from stdin with --key - (the
-default).
+token is for clients that ask for a token each time they need one, such as
+Claude Code's apiKeyHelper. it reads the configuration and signs with the
+namespace's newest automatic key, which each running unit makes and replaces by
+itself (key_rotation). it writes nothing.
+
+  llm-gateway auth token --config ~/.config/llm-gateway/config.toml --ns claude --sub kawaz-mbp
+
+keygen / jwks / sign are for keys you make yourself. they print to stdout and
+save nothing. the key ring (the file keys_file points at) holds one JWK per
+line, private keys included; append to it yourself with >>, and keep it
+readable only by you (chmod 600). jwks and sign read the key ring from
+--key <file>, or from stdin with --key - (the default).
 
   llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl
   llm-gateway auth sign --key ~/.config/llm-gateway/keys/claude.jwks.jsonl \\
     --kid claude-mbp-2026-09 --sub kawaz-mbp --ttl 180d
 
 commands:
+  token             print a short-lived JWT for a namespace, signed with its
+                    newest automatic key (reads the configuration)
   keygen            make an Ed25519 key pair and print it as one JWK line
                     (private key included)
   jwks              print the key ring's public keys as a JSON Web Key Set
   sign              print a JWT signed with a private key from the key ring
+
+token options:
+  --config <path>   configuration file to read
+                    (default: $XDG_CONFIG_HOME/llm-gateway/config.toml)
+  --ns <name>       namespace the token is for (required; it must use auth = \"jwt\")
+  --sub <subject>   who the token is for (required; shows up as subject in events)
+  --ttl <duration>  how long it lives, like 1h / 30m (default: 1h; at most what
+                    the key allows, which is min(key_rotation, max_ttl) for an
+                    automatic key and max_ttl for a key of keys_file)
+  --kid <kid>       a key of keys_file to sign with while the namespace has no
+                    automatic key (not used once there is one)
 
 keygen options:
   --kid <kid>       key id (default: today's date and 4 random hex digits)

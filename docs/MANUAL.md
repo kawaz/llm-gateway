@@ -53,6 +53,7 @@ keys_file = "~/.config/llm-gateway/keys/claude.jwks.jsonl"   # required; the key
 max_ttl = "400d"          # required; a token living longer than this (exp - now, and exp - iat when iat is present) is refused
 iss = "llm-gateway-cli"   # optional; when written, the token's iss must match
 aud = "ns-claude"         # optional; when written, the token's aud (a string or an array) must contain it
+key_rotation = "7d"       # optional; how often the gateway replaces the automatic key (default 7d, at least 1h)
 ```
 
 The key ring `claude.jwks.jsonl` holds one JWK per line, each line exactly what `llm-gateway auth keygen` prints (private key included; make the file mode 600). During a rotation the old and new lines sit side by side:
@@ -62,12 +63,24 @@ The key ring `claude.jwks.jsonl` holds one JWK per line, each line exactly what 
 {"kty":"OKP","crv":"Ed25519","kid":"claude-mbp-2027-03","d":"…","x":"…"}
 ```
 
-- `auth` names the method: omit it and `auth_token` decides (`token` when present, unchecked when absent), or write `auth = "token"` / `auth = "jwt"`. Fields of the other method (`auth_token` with `jwt`, `keys_file` / `max_ttl` / `iss` / `aud` without it) are refused when the configuration is read
+- `auth` names the method: omit it and `auth_token` decides (`token` when present, unchecked when absent), or write `auth = "token"` / `auth = "jwt"`. Fields of the other method (`auth_token` with `jwt`, `keys_file` / `max_ttl` / `iss` / `aud` / `key_rotation` without it) are refused when the configuration is read. The name of a `jwt` namespace names the file of its automatic keys, so it may contain only letters, digits, `.`, `_` and `-`, and must not start with `.`
 - `keys_file` expands `~` and environment variables like the other path fields. The file is the source of truth: add a key by appending a line, revoke one by deleting its line. Every line needs a `kid`; a non-Ed25519 line or a duplicate kid is a read error
 - A token passes when its header names a `kid` in the key ring, its `alg` is `EdDSA` (the algorithm comes from the key's `kty` / `crv`; the header's `alg` is only compared), it carries no `crit`, the signature verifies, `exp` and `sub` are present, and the times hold within 60 seconds of skew (`exp` not passed, `iat` / `nbf` not in the future, the lifetime within `max_ttl`)
 - Every failure returns the same 401 with `WWW-Authenticate: Bearer error="invalid_token"`; which check failed is only written to the log
 - A file that `extends` another and writes `keys_file` replaces the key ring as a whole (keys are not merged one by one). The valid keys are exactly the contents of the one file the namespace's `keys_file` points to
 - **Changes to the key ring take effect without a restart.** The gateway reads the key ring at startup and, on every verification, checks the mtime of `keys_file` and rereads it when it changed. Delete a line and that kid's tokens are refused from the next request on. A key ring that cannot be read at startup (missing, permissions, a bad line) stops the gateway from starting; a failed reread while running logs a warning and keeps verifying with the previous key ring. Delete lines by writing a temporary file and replacing the key ring with `mv` (add lines by appending with `>>`). Reading a half-appended or empty key ring counts as a failed reread and keeps the previous key ring
+
+#### Automatic keys (`key_rotation`)
+
+In a `jwt` namespace, every unit's daemon also makes and replaces **automatic keys**, apart from `keys_file` (DR-0037). A client that asks for a token every time, such as Claude Code's `apiKeyHelper`, gets a short-lived token signed with them from `llm-gateway auth token`.
+
+- They live in `<[stats] dir>/jwt-keys/<ns>.jwks.jsonl` (by default `~/.local/state/llm-gateway/stats/jwt-keys/`; the directory is 700 and the file 600). One JWK per line: a `keys_file` line plus `"auto":true`, `"created"` (when it was made, Unix seconds) and `"max_token_ttl"` (the longest lifetime of a token signed with it, in seconds)
+- Verification looks at both `keys_file` and the automatic keys (a kid is looked up in `keys_file` first). The automatic file is also restatted on every verification and reread when its mtime changed; while it does not exist it counts as empty. A file that cannot be read does not stop the unit from starting (it logs a warning and rereads the file once it changes)
+- At startup, and whenever the newest automatic key is `key_rotation` old or there is none, the unit appends a new key. Its kid is `<ns>-<date>-<4 hex digits>` (for example `lab-2026-10-06-3fa9`) and its `max_token_ttl` is the smaller of `key_rotation` and `max_ttl`
+- An old automatic key is deleted once its successor has existed for the old key's `max_token_ttl` plus 1 hour (by writing a temporary file and renaming it). Only lines carrying the mark are deleted; `keys_file` is never touched
+- The time of the next step is computed from when the keys were made, and a timer is set for it (each sleep lasts at most 1 hour, so that the wall clock corrects for macOS's monotonic clock stopping during sleep). `daemon reload` also makes it check every namespace again
+- Units sharing a `[stats] dir` (such as stable and unstable) coordinate on the same file with a flock on `.lock`; whichever goes first, exactly one key is added
+- Versions that do not read the automatic keys (0.67.0 and earlier) refuse their tokens with `unknown_kid`. Switch clients to `auth token` only after every unit they may reach runs a newer version. A configuration that writes `key_rotation` cannot be read by older versions either
 
 ## Prompt cache strategy (`[[ns.<name>.cache]]`)
 
@@ -643,6 +656,7 @@ A running unit rereads each input on a different trigger. What to do after chang
 | --- | --- | --- |
 | Credentials (`<store>/<name>.json`) | The mtime is watched periodically and the file reread when it changed (`[discovery] watch_secs`) | Nothing |
 | Key ring (`keys_file`) | Every JWT verification stats it and rereads it when the mtime changed | Nothing (effective from the next request) |
+| Automatic keys (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) | The same; the gateway itself writes them | Do not edit them by hand |
 | Configuration file (including its `extends` bases) | Only when told to by `daemon reload` | `llm-gateway daemon reload <unit>\|--all` |
 
 The configuration file alone is not watched: watching would pick up a half-saved file, or a moment where an `extends` base is rewritten but the file deriving from it is not yet. Say it is finished with `daemon reload`. Some fields are taken when the unit starts and cannot change on a reload; changing them needs a restart (see `daemon reload`).
@@ -715,7 +729,24 @@ Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `bin
 
 ### `auth` — keys and tokens for `jwt` namespaces
 
-Everything is printed to stdout; nothing is saved. Appending to the key ring (`keys_file`) is up to you, with `>>`. The key ring is read from a file (`--key <file>`) or from stdin (`--key -`, the default).
+Everything is printed to stdout; nothing is saved. `token` reads the configuration and signs with the automatic key the gateway replaces. `keygen` / `jwks` / `sign` are tools for keys you make yourself and do not read the configuration. Appending to the key ring (`keys_file`) is up to you, with `>>`. The key ring is read from a file (`--key <file>`) or from stdin (`--key -`, the default).
+
+```bash
+llm-gateway auth token --config ~/.config/llm-gateway/config.toml --ns claude --sub kawaz-mbp   # a one-hour JWT on one line, signed with the automatic key
+```
+
+- `token [--config <path>] --ns <ns> --sub <subject> [--ttl <duration>] [--kid <kid>]`: prints one JWT signed with the namespace's newest automatic key. On failure it exits non-zero and prints nothing to stdout. It writes nothing (only the daemon makes keys). `--ttl` defaults to 1 hour and is refused beyond the key's `max_token_ttl` or `max_ttl`. The namespace's `iss` / `aud`, when written, are put in the token. While there is no automatic key yet (no unit has started, or the file cannot be read) it signs with the `keys_file` key named by `--kid` (capped by `max_ttl`), and without `--kid` it refuses. Once there is an automatic key, `--kid` is not used. `--config` defaults to `$XDG_CONFIG_HOME/llm-gateway/config.toml`
+
+As Claude Code's `apiKeyHelper` (`settings.json`):
+
+```json
+{
+  "apiKeyHelper": "llm-gateway auth token --config ~/.config/llm-gateway/config.toml --ns claude --sub kawaz-mbp",
+  "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:11300/ns-claude", "ANTHROPIC_AUTH_TOKEN": ""}
+}
+```
+
+Claude Code calls the helper again once the JWT is past `exp - 30s`, so it never sends an expired token. `ANTHROPIC_AUTH_TOKEN` takes precedence over the helper and also works from the parent process's environment, so override it with an empty string (`docs/findings/2026-10-06-api-key-helper.md`).
 
 ```bash
 llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl   # append one line to the key ring

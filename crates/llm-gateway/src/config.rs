@@ -248,7 +248,7 @@ pub fn parse_duration_secs(raw: &str) -> std::result::Result<i64, String> {
 }
 
 /// 秒を読み戻せる長さの書き方にする (割り切れる最大の単位)。
-fn format_duration_secs(secs: i64) -> String {
+pub fn format_duration_secs(secs: i64) -> String {
     for (unit, scale) in [("d", 86_400), ("h", 3600), ("m", 60)] {
         if secs % scale == 0 {
             return format!("{}{unit}", secs / scale);
@@ -293,6 +293,9 @@ pub struct NamespaceRepr {
     /// `jwt` 方式で、書いたら含まれることを要求する `aud`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     aud: Option<String>,
+    /// `jwt` 方式で、gateway が自動の鍵を入れ替える周期 (DR-0037 §10)。省けば 7 日。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_rotation: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     allow: BTreeMap<String, Vec<gateway_core::upstream::Allow>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -310,18 +313,25 @@ impl TryFrom<NamespaceRepr> for Namespace {
         if r.keys.is_some() {
             return Err("`keys` is replaced by `keys_file`; move the keys into a jsonl file (see docs/runbooks/ns-auth-jwt-rotation.md)".to_owned());
         }
-        let jwt_fields =
-            r.keys_file.is_some() || r.max_ttl.is_some() || r.iss.is_some() || r.aud.is_some();
+        let jwt_fields = r.keys_file.is_some()
+            || r.max_ttl.is_some()
+            || r.iss.is_some()
+            || r.aud.is_some()
+            || r.key_rotation.is_some();
         let auth = match (r.auth, r.auth_token) {
             (Some(AuthKind::Jwt), Some(_)) => {
                 return Err("auth = \"jwt\" does not use `auth_token`; remove it".to_owned());
             }
-            (Some(AuthKind::Jwt), None) => {
-                NsAuth::Jwt(jwt_auth(r.keys_file, r.max_ttl, r.iss, r.aud)?)
-            }
+            (Some(AuthKind::Jwt), None) => NsAuth::Jwt(jwt_auth(
+                r.keys_file,
+                r.max_ttl,
+                r.iss,
+                r.aud,
+                r.key_rotation,
+            )?),
             (_, _) if jwt_fields => {
                 return Err(
-                    "`keys_file` / `max_ttl` / `iss` / `aud` belong to auth = \"jwt\"; add it or remove them"
+                    "`keys_file` / `max_ttl` / `iss` / `aud` / `key_rotation` belong to auth = \"jwt\"; add it or remove them"
                         .to_owned(),
                 );
             }
@@ -351,28 +361,48 @@ fn jwt_auth(
     max_ttl: Option<String>,
     iss: Option<String>,
     aud: Option<String>,
+    key_rotation: Option<String>,
 ) -> std::result::Result<gateway_core::ns::jwt::JwtAuth, String> {
+    use gateway_core::ns::jwt;
     let path = keys_file.ok_or(
         "auth = \"jwt\" needs `keys_file` (one JWK per line, as `llm-gateway auth keygen` writes)",
     )?;
     let max_ttl = max_ttl.ok_or("auth = \"jwt\" needs `max_ttl` (for example `180d`)")?;
-    gateway_core::ns::jwt::JwtAuth::from_file(
+    let key_rotation_secs = match key_rotation {
+        None => jwt::DEFAULT_KEY_ROTATION_SECS,
+        Some(raw) => {
+            let secs = parse_duration_secs(&raw).map_err(|e| format!("key_rotation: {e}"))?;
+            if secs < jwt::MIN_KEY_ROTATION_SECS {
+                return Err(format!(
+                    "key_rotation `{raw}` is shorter than 1h; write 1h or longer"
+                ));
+            }
+            secs
+        }
+    };
+    let mut auth = jwt::JwtAuth::from_file(
         path,
         parse_duration_secs(&max_ttl).map_err(|e| format!("max_ttl: {e}"))?,
         iss,
         aud,
-    )
+    )?;
+    auth.key_rotation_secs = key_rotation_secs;
+    Ok(auth)
 }
 
 impl From<Namespace> for NamespaceRepr {
     fn from(n: Namespace) -> Self {
-        let (mut keys_file, mut max_ttl, mut iss, mut aud) = (None, None, None, None);
+        let (mut keys_file, mut max_ttl, mut iss, mut aud, mut key_rotation) =
+            (None, None, None, None, None);
         let (auth, auth_token) = match n.auth {
             NsAuth::Open => (None, None),
             NsAuth::Token(token) => (None, Some(token)),
             NsAuth::Jwt(jwt) => {
                 keys_file = jwt.ring.path().map(Path::to_path_buf);
                 max_ttl = Some(format_duration_secs(jwt.max_ttl_secs));
+                key_rotation = (jwt.key_rotation_secs
+                    != gateway_core::ns::jwt::DEFAULT_KEY_ROTATION_SECS)
+                    .then(|| format_duration_secs(jwt.key_rotation_secs));
                 (iss, aud) = (jwt.iss, jwt.aud);
                 (Some(AuthKind::Jwt), None)
             }
@@ -389,6 +419,7 @@ impl From<Namespace> for NamespaceRepr {
             max_ttl,
             iss,
             aud,
+            key_rotation,
             allow: n.allow,
             routes: n.routes,
             thinking_display: n.thinking_display,
@@ -1589,7 +1620,41 @@ impl Config {
             ))
         })?;
         config.validate()?;
+        let mut config = config;
+        config.bind_auto_key_rings();
         Ok(config)
+    }
+
+    /// この namespace の自動の鍵のファイル (DR-0037 §12)。
+    ///
+    /// daemon の入れ替え・検証・`auth token` の 3 者がここから同じ置き場を引く。
+    /// 兄弟の unit と共有する走行状態なので `[stats] dir` の下に置く。
+    pub fn auto_keys_path(&self, ns: &str) -> PathBuf {
+        self.stats
+            .resolve_dir()
+            .join("jwt-keys")
+            .join(format!("{ns}.jwks.jsonl"))
+    }
+
+    /// `jwt` の namespace に、自動の鍵束を検証元として結びつける (DR-0037 §16)。
+    ///
+    /// 置き場は `[stats] dir` (最上位) と ns の名前で決まり、ns の欄を読む時点では
+    /// 分からないので、設定を読み終えてから結ぶ。ファイルが無くてもよい。
+    pub fn bind_auto_key_rings(&mut self) {
+        let paths: Vec<(String, PathBuf)> = self
+            .namespaces
+            .keys()
+            .map(|name| (name.clone(), self.auto_keys_path(name)))
+            .collect();
+        for (name, path) in paths {
+            if let Some(Namespace {
+                auth: NsAuth::Jwt(jwt),
+                ..
+            }) = self.namespaces.get_mut(&name)
+            {
+                jwt.auto_ring = Some(gateway_core::ns::jwt::KeyRing::from_optional_file(path));
+            }
+        }
     }
 
     /// 参照先が揃っているかを確かめる。
@@ -1661,6 +1726,16 @@ impl Config {
     }
 
     fn validate_namespace(&self, ns_name: &str, ns: &Namespace) -> Result<()> {
+        // 自動の鍵のファイル名になる (DR-0037 §12)。
+        let file_safe = !ns_name.starts_with('.')
+            && ns_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if matches!(ns.auth, NsAuth::Jwt(_)) && !file_safe {
+            return Err(Error::Config(format!(
+                "namespace `{ns_name}` uses auth = \"jwt\", so its name may contain only letters, digits, `.`, `_` and `-`, and must not start with `.` (it names the file of its automatic keys)"
+            )));
+        }
         for upstream in ns.allow.keys() {
             if !self.upstreams.contains_key(upstream) {
                 tracing::warn!(
@@ -2362,6 +2437,126 @@ o = "claude-opus-*"
             err.contains(&format!("{home}/llm-gateway-test-no-such-ring.jsonl")),
             "{err}"
         );
+    }
+
+    /// `key_rotation` は `jwt` の欄。既定 7 日、1 時間より短いと断る。既定と違う時だけ
+    /// 書き戻す。
+    #[test]
+    fn key_rotation_is_a_jwt_field_with_a_floor() {
+        use gateway_core::ns::jwt;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("keys.jsonl");
+        std::fs::write(
+            &ring,
+            jwt::private_jwk("k1", &jwt::signing_key(&[1; 32])).to_string(),
+        )
+        .unwrap();
+        let ns = |extra: &str| {
+            toml::from_str::<Config>(&format!(
+                "[ns.a]\nauth = \"jwt\"\nkeys_file = \"{}\"\nmax_ttl = \"400d\"\n{extra}",
+                ring.display()
+            ))
+        };
+        let rotation = |config: &Config| match &config.namespaces["a"].auth {
+            NsAuth::Jwt(auth) => auth.key_rotation_secs,
+            _ => panic!("jwt expected"),
+        };
+        let plain = ns("").unwrap();
+        assert_eq!(rotation(&plain), jwt::DEFAULT_KEY_ROTATION_SECS);
+        assert!(!toml::to_string(&plain).unwrap().contains("key_rotation"));
+        let two_days = ns("key_rotation = \"2d\"\n").unwrap();
+        assert_eq!(rotation(&two_days), 2 * 86_400);
+        assert!(
+            toml::to_string(&two_days)
+                .unwrap()
+                .contains("key_rotation = \"2d\"")
+        );
+        assert!(ns("key_rotation = \"1h\"\n").is_ok());
+        let err = ns("key_rotation = \"59m\"\n").unwrap_err().to_string();
+        assert!(err.contains("1h"), "{err}");
+        let err = toml::from_str::<Config>("[ns.a]\nkey_rotation = \"1d\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("belong to"), "{err}");
+    }
+
+    /// `jwt` の ns の名前は自動の鍵のファイル名になるので、使える文字を限る。
+    #[test]
+    fn a_jwt_namespace_name_must_be_usable_as_a_file_name() {
+        use gateway_core::ns::jwt;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("keys.jsonl");
+        std::fs::write(
+            &ring,
+            jwt::private_jwk("k1", &jwt::signing_key(&[1; 32])).to_string(),
+        )
+        .unwrap();
+        let config = |name: &str, auth: bool| {
+            let body = if auth {
+                format!(
+                    "auth = \"jwt\"\nkeys_file = \"{}\"\nmax_ttl = \"1d\"\n",
+                    ring.display()
+                )
+            } else {
+                String::new()
+            };
+            toml::from_str::<Config>(&format!("[ns.\"{name}\"]\n{body}")).unwrap()
+        };
+        assert!(config("lab-1.x_y", true).validate().is_ok());
+        for bad in ["a/b", "..", ".hidden", "a b"] {
+            let err = config(bad, true).validate().unwrap_err().to_string();
+            assert!(err.contains("file"), "{bad}: {err}");
+            assert!(config(bad, false).validate().is_ok(), "{bad} without jwt");
+        }
+    }
+
+    /// 読み込むと、`jwt` の ns に `[stats] dir` の下の自動の鍵束が結びつき、その鍵の
+    /// token も通る。
+    #[test]
+    fn loading_binds_the_automatic_key_ring() {
+        use gateway_core::ns::jwt;
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("keys.jsonl");
+        std::fs::write(
+            &ring,
+            jwt::private_jwk("k1", &jwt::signing_key(&[1; 32])).to_string(),
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[stats]\ndir = \"{}\"\n[ns.lab]\nauth = \"jwt\"\nkeys_file = \"{}\"\nmax_ttl = \"1d\"\n",
+                dir.path().join("stats").display(),
+                ring.display()
+            ),
+        )
+        .unwrap();
+        let automatic = dir.path().join("stats/jwt-keys/lab.jwks.jsonl");
+        std::fs::create_dir_all(automatic.parent().unwrap()).unwrap();
+        std::fs::write(
+            &automatic,
+            jwt::private_jwk("lab-auto", &jwt::signing_key(&[2; 32])).to_string(),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.auto_keys_path("lab"), automatic);
+        let now = crate::credential::time::now_unix();
+        let token = jwt::sign(
+            &jwt::signing_key(&[2; 32]),
+            "lab-auto",
+            &serde_json::json!({"sub": "s", "exp": now + 60}),
+        );
+        assert!(matches!(
+            config.namespaces["lab"].auth.verify("lab", Some(&token)),
+            Authorization::Accepted(_)
+        ));
+        // 読み込みを通らない設定 (試験の toml 直読み) には結びつかない。
+        let raw: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(!matches!(
+            raw.namespaces["lab"].auth.verify("lab", Some(&token)),
+            Authorization::Accepted(_)
+        ));
     }
 
     #[test]

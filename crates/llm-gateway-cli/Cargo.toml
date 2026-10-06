@@ -36,3 +36,5 @@ gateway-core = { path = "../gateway-core" }
 tempfile = { workspace = true }
 # `auth jwks` の出力 (TOML の断片) を読んで確かめる。
 toml = { workspace = true }
+# `auth token` の出力のヘッダと claims (署名部を除く) を読んで確かめる。
+base64 = { workspace = true }

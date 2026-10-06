@@ -1,14 +1,18 @@
-//! ns 認証 `jwt` の鍵と token を手元で作る (DR-0030 §6)。
+//! ns 認証 `jwt` の鍵と token を手元で作る (DR-0030 §6、DR-0037)。
 //!
 //! どれも標準出力に出すだけで、何も保存しない。鍵束 (`keys_file`、1 行 1 JWK) への
 //! 追記は利用者が `>>` で行う。CLI が秘密をどこかに置くと、鍵束の窓口がファイルと
 //! CLI の 2 つに割れる (DR-0030 §5)。
+//!
+//! `token` だけが設定を読み、gateway が入れ替える自動の鍵で発行する (DR-0037 §2)。
+//! 発行は読むだけで、鍵のファイルを書くのは daemon の入れ替えだけ。
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use llm_gateway::config::jwt;
+use llm_gateway::config::{NsAuth, jwt};
 use serde_json::{Value, json};
 
 use crate::failure::Failure;
@@ -22,6 +26,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     }
     let rest = &args[1..];
     let out = match args[0].as_str() {
+        "token" => token(&parse(rest, &["config", "ns", "sub", "kid", "ttl"], &[])?)?,
         "keygen" => keygen(&parse(rest, &["kid"], &[])?)?,
         "jwks" => jwks(&parse(rest, &["key", "kid"], &[])?)?,
         "sign" => sign(&parse(
@@ -86,6 +91,103 @@ fn parse(args: &[String], one: &[&str], many: &[&str]) -> Result<Parsed, Failure
         }
     }
     Ok(parsed)
+}
+
+/// `auth token` の TTL の既定 (DR-0037 §2)。
+///
+/// Claude Code は JWT の `exp - 30s` で helper を呼び直すので期限切れの token は
+/// 送られず、裏の呼び直しが失敗し続けても約 55 分は古い token で動く。
+const DEFAULT_TOKEN_TTL_SECS: i64 = 3600;
+
+/// 設定の ns の鍵で token を発行し、1 行で出す (DR-0037 §2・§14)。読むだけで、
+/// 何も書かない。
+///
+/// 鍵は最新の自動の鍵。無ければ (読めなければ) `--kid` の手の鍵。TTL は鍵の上限
+/// (自動の鍵は行に刻んだ `max_token_ttl`、手の鍵は無し) と `max_ttl` を超えられない。
+fn token(parsed: &Parsed) -> Result<String, Failure> {
+    let ns_name = parsed.need("ns")?;
+    let subject = parsed.need("sub")?;
+    if !jwt::subject_is_acceptable(subject) {
+        return Err(Failure::from(format!(
+            "--sub must be 1 to {} bytes without control characters",
+            jwt::MAX_SUBJECT_LEN
+        )));
+    }
+    let ttl = match parsed.get("ttl") {
+        Some(raw) => llm_gateway::config::parse_duration_secs(raw)
+            .map_err(|e| Failure::from(format!("--ttl: {e}")))?,
+        None => DEFAULT_TOKEN_TTL_SECS,
+    };
+    let path = parsed
+        .get("config")
+        .map_or_else(llm_gateway::Config::default_path, PathBuf::from);
+    let config = crate::load(&path)?;
+    let Some(ns) = config.namespace(ns_name) else {
+        return Err(Failure::from(format!(
+            "{} has no namespace `{ns_name}`; namespaces: {}",
+            path.display(),
+            config.namespace_names().join(", ")
+        )));
+    };
+    let NsAuth::Jwt(auth) = &ns.auth else {
+        return Err(Failure::from(format!(
+            "namespace `{ns_name}` does not use auth = \"jwt\"; there is no key to sign with"
+        )));
+    };
+    let auto_path = config.auto_keys_path(ns_name);
+    let automatic = match jwt::auto::newest(&auto_path) {
+        Ok(found) => found,
+        // 読めない自動の鍵は無いものとして `--kid` に落とす。`--kid` も無ければ理由を言う。
+        Err(e) if parsed.get("kid").is_none() => {
+            return Err(Failure::from(format!(
+                "cannot read the automatic keys: {e}; fix or remove the broken line, or give --kid <kid> to sign with a key of keys_file"
+            )));
+        }
+        Err(_) => None,
+    };
+    let (kid, key, cap) = match (automatic, parsed.get("kid")) {
+        (Some(found), _) => (
+            found.kid,
+            found.key,
+            found.mark.max_token_ttl.min(auth.max_ttl_secs),
+        ),
+        (None, Some(kid)) => {
+            let ring_path = auth
+                .ring
+                .path()
+                .ok_or_else(|| Failure::from("the namespace has no keys_file"))?;
+            let text = std::fs::read_to_string(ring_path).map_err(|e| {
+                Failure::from(format!("could not read {}: {e}", ring_path.display()))
+            })?;
+            let ring = jwt::read_key_ring(&text)
+                .map_err(|e| Failure::from(format!("{}: {e}", ring_path.display())))?;
+            let (kid, key) = pick(ring, Some(kid))?;
+            (kid, key, auth.max_ttl_secs)
+        }
+        (None, None) => {
+            return Err(Failure::from(format!(
+                "namespace `{ns_name}` has no automatic key yet ({} does not hold one); start a unit that reads this configuration so it makes one, or give --kid <kid> to sign with a key of keys_file",
+                auto_path.display()
+            )));
+        }
+    };
+    if ttl > cap {
+        return Err(Failure::from(format!(
+            "--ttl {} is longer than the key `{kid}` allows ({}); give a shorter --ttl",
+            llm_gateway::config::format_duration_secs(ttl),
+            llm_gateway::config::format_duration_secs(cap)
+        )));
+    }
+    let now = llm_gateway::credential::time::now_unix();
+    let mut claims = json!({"sub": subject, "iat": now, "exp": now + ttl});
+    // ns が要求する iss / aud を載せ、そのまま検証を通る token にする。
+    if let Some(iss) = &auth.iss {
+        claims["iss"] = json!(iss);
+    }
+    if let Some(aud) = &auth.aud {
+        claims["aud"] = json!(aud);
+    }
+    Ok(format!("{}\n", jwt::sign(&key, &kid, &claims)))
 }
 
 /// 新しい鍵ペアを作り、秘密鍵の JWK を 1 行で出す。

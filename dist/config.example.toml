@@ -220,18 +220,18 @@ haiku = "claude-haiku-*"
 # routes = ["claude-work"]
 
 # 固定 token の代わりに、Ed25519 で署名した JWT で通す namespace (DR-0030 §6)。
-# 鍵と token は `llm-gateway auth keygen` / `auth jwks` / `auth sign` で手元で作る
-# (手順は docs/runbooks/ns-auth-jwt-rotation.md)。鍵の追加・削除は restart で反映。
+# 手の鍵と token は `llm-gateway auth keygen` / `auth jwks` / `auth sign` で手元で作る
+# (手順は docs/runbooks/ns-auth-jwt-rotation.md)。鍵束の追加・削除は restart 無しで反映。
+# gateway は別に自動の鍵を `[stats] dir` の jwt-keys/ に作って入れ替え (DR-0037)、
+# `llm-gateway auth token --ns claude --sub <誰>` がその鍵で短寿命の token を出す。
 #
 # [ns.claude]
 # auth = "jwt"
+# keys_file = "~/.config/llm-gateway/keys/claude.jwks.jsonl"   # 1 行 1 JWK (auth keygen の出力)
 # max_ttl = "400d"                       # これより長い寿命の token は断る
+# # key_rotation = "7d"                  # 自動の鍵を入れ替える周期 (既定 7d)
 # # iss = "llm-gateway-cli"              # 書いたら一致を要求
 # # aud = "ns-claude"                    # 書いたら含まれることを要求
-#
-# [ns.claude.keys.claude-mbp-2026-09]    # 表のキーが kid (機械ごとに 1 本)
-# alg = "EdDSA"
-# public = "<auth jwks --ns claude の出力の public>"
 
 # 登録した上流へ無変換で中継する (DR-0030 §2)。URL は /ns-<ns>/<名前>/<rest>。
 # 認証だけを登録済みの秘密に差し替え、本文・ヘッダ・応答は変えない。

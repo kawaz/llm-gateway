@@ -260,3 +260,308 @@ keys_file = "{}"
         .unwrap();
     assert_eq!(without.status(), 401);
 }
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `auth token` の試験の置き場: 手の鍵束 (kid `by-hand`) と、それを指す設定。
+/// `[stats] dir` も試験の置き場に向ける (自動の鍵はその下)。
+struct Face {
+    dir: tempfile::TempDir,
+    config: std::path::PathBuf,
+}
+
+impl Face {
+    fn new(extra: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("lab.jwks.jsonl");
+        std::fs::write(&ring, stdout(&["auth", "keygen", "--kid", "by-hand"], "")).unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[stats]
+dir = "{}"
+
+[routes.a]
+provider = "anthropic"
+url = "http://127.0.0.1:9"
+models = ["claude-opus-5"]
+
+[ns.lab]
+auth = "jwt"
+keys_file = "{}"
+max_ttl = "400d"
+{extra}
+
+[ns.open]
+"#,
+                dir.path().join("stats").display(),
+                ring.display()
+            ),
+        )
+        .unwrap();
+        Self { dir, config }
+    }
+
+    fn config(&self) -> &str {
+        self.config.to_str().unwrap()
+    }
+
+    fn auto_path(&self) -> std::path::PathBuf {
+        self.dir.path().join("stats/jwt-keys/lab.jwks.jsonl")
+    }
+
+    /// daemon の入れ替えと同じ口で、自動の鍵を 1 本作る。
+    fn rotate(&self) -> String {
+        let config = llm_gateway::Config::load(&self.config).unwrap();
+        let mut due = std::collections::HashMap::new();
+        let jobs = llm_gateway::key_rotation::jobs(&config);
+        llm_gateway::key_rotation::step(&jobs, &mut due, now(), &mut |b: &mut [u8]| {
+            b.iter_mut().enumerate().for_each(|(i, x)| *x = i as u8 + 3)
+        });
+        jwt::auto::newest(&self.auto_path()).unwrap().unwrap().kid
+    }
+
+    fn token(&self, extra: &[&str]) -> std::process::Output {
+        let mut args = vec!["auth", "token", "--config", self.config(), "--ns", "lab"];
+        args.extend_from_slice(extra);
+        run(&args, "")
+    }
+
+    /// 置き場の中身 (名前・長さ・mtime) の控え。書いていないことを比べる。
+    fn snapshot(&self) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime)> {
+        fn walk(
+            dir: &std::path::Path,
+            out: &mut Vec<(std::path::PathBuf, u64, std::time::SystemTime)>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk(&entry.path(), out);
+                } else {
+                    out.push((entry.path(), meta.len(), meta.modified().unwrap()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.dir.path(), &mut out);
+        out.sort();
+        out
+    }
+}
+
+/// claims (署名部を除く payload) とヘッダを読む。
+fn parts(token: &str) -> (serde_json::Value, serde_json::Value) {
+    use base64::Engine as _;
+    let decode = |part: &str| -> serde_json::Value {
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(part)
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let mut it = token.trim().split('.');
+    (decode(it.next().unwrap()), decode(it.next().unwrap()))
+}
+
+/// 最新の自動の鍵で署名した 1 行を出し、何も書かない。設定の iss / aud を載せ、
+/// TTL の既定は 1 時間。検証は手の鍵束と自動の鍵束の両方を見る。
+#[test]
+fn token_signs_with_the_newest_automatic_key_and_writes_nothing() {
+    let face = Face::new("iss = \"gw\"\naud = \"ns-lab\"");
+    let kid = face.rotate();
+    assert!(kid.starts_with("lab-"), "{kid}");
+    let before = face.snapshot();
+    let out = face.token(&["--sub", "helper-test", "--kid", "by-hand"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty());
+    let token = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(token.lines().count(), 1);
+    assert_eq!(face.snapshot(), before, "issuing writes nothing");
+
+    let (header, claims) = parts(&token);
+    assert_eq!(
+        header["kid"],
+        kid.as_str(),
+        "the automatic key wins over --kid"
+    );
+    assert_eq!(claims["sub"], "helper-test");
+    assert_eq!(claims["iss"], "gw");
+    assert_eq!(claims["aud"], "ns-lab");
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        3600
+    );
+
+    let config = llm_gateway::Config::load(&face.config).unwrap();
+    let ns = config.namespace("lab").unwrap();
+    let verified = ns.auth.verify("lab", Some(token.trim()));
+    assert!(
+        matches!(verified, llm_gateway::config::Authorization::Accepted(ref p) if p.kid.as_deref() == Some(kid.as_str())),
+        "{verified:?}"
+    );
+}
+
+/// 自動の鍵が無ければ `--kid` の手の鍵に落ちる。`--kid` も無ければ非 0 で、
+/// stdout には何も出さない。どちらも鍵を作らない。
+#[test]
+fn token_falls_back_to_kid_or_refuses_without_an_automatic_key() {
+    let face = Face::new("");
+    let refused = face.token(&["--sub", "helper-test"]);
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("no automatic key") && err.contains("--kid"),
+        "{err}"
+    );
+    assert!(!face.auto_path().exists());
+    assert!(
+        !face.auto_path().parent().unwrap().exists(),
+        "makes no directory either"
+    );
+
+    let out = face.token(&["--sub", "helper-test", "--kid", "by-hand"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let token = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(parts(&token).0["kid"], "by-hand");
+    assert!(!face.auto_path().exists());
+
+    // 自動の鍵のファイルが壊れていても `--kid` に落ちる。`--kid` が無ければ理由を言う。
+    std::fs::create_dir_all(face.auto_path().parent().unwrap()).unwrap();
+    std::fs::write(face.auto_path(), "{\"kty\":").unwrap();
+    assert!(
+        face.token(&["--sub", "s", "--kid", "by-hand"])
+            .status
+            .success()
+    );
+    let broken = face.token(&["--sub", "s"]);
+    assert!(!broken.status.success() && broken.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&broken.stderr).contains("automatic keys"));
+}
+
+/// 自動の鍵の TTL は鍵に刻んだ上限 (周期と max_ttl の小さい方) まで、手の鍵は
+/// max_ttl まで。超えたら非 0 で stdout は空。
+#[test]
+fn token_refuses_a_ttl_over_the_cap() {
+    let face = Face::new("key_rotation = \"2d\"");
+    face.rotate();
+    for (ttl, ok) in [("2d", true), ("49h", false), ("400d", false)] {
+        let out = face.token(&["--sub", "s", "--ttl", ttl]);
+        assert_eq!(out.status.success(), ok, "{ttl}");
+        if !ok {
+            assert!(out.stdout.is_empty(), "{ttl}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("2d"), "{ttl}");
+        }
+    }
+    let manual = Face::new("");
+    for (ttl, ok) in [("400d", true), ("401d", false)] {
+        let out = manual.token(&["--sub", "s", "--kid", "by-hand", "--ttl", ttl]);
+        assert_eq!(out.status.success(), ok, "{ttl}");
+    }
+}
+
+/// 鍵を持たない ns・無い ns・検証を通らない sub は断る。
+#[test]
+fn token_needs_a_jwt_namespace_and_a_valid_subject() {
+    let face = Face::new("");
+    face.rotate();
+    for (args, why) in [
+        (
+            vec![
+                "auth",
+                "token",
+                "--config",
+                face.config(),
+                "--ns",
+                "open",
+                "--sub",
+                "s",
+            ],
+            "does not use",
+        ),
+        (
+            vec![
+                "auth",
+                "token",
+                "--config",
+                face.config(),
+                "--ns",
+                "nope",
+                "--sub",
+                "s",
+            ],
+            "lab, open",
+        ),
+        (
+            vec!["auth", "token", "--config", face.config(), "--ns", "lab"],
+            "--sub",
+        ),
+        (
+            vec![
+                "auth",
+                "token",
+                "--config",
+                face.config(),
+                "--ns",
+                "lab",
+                "--sub",
+                "",
+            ],
+            "--sub",
+        ),
+    ] {
+        let out = run(&args, "");
+        assert!(!out.status.success(), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(why), "{args:?}: {err}");
+    }
+}
+
+/// 入れ替えた自動の鍵で `auth token` が出した token を、同じ設定を読んだ gateway が通す。
+#[tokio::test]
+async fn an_auth_token_from_a_rotated_key_opens_the_namespace() {
+    let face = Face::new("");
+    face.rotate();
+    let token = String::from_utf8(face.token(&["--sub", "e2e"]).stdout).unwrap();
+
+    let config = llm_gateway::Config::load(&face.config).unwrap();
+    let store = llm_gateway::credential::file::FileStore::open(face.dir.path().join("credentials"))
+        .unwrap();
+    let gateway = std::sync::Arc::new(llm_gateway::Gateway::new(&config, store).unwrap());
+    gateway.refresh_models().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = llm_gateway_server::router(gateway);
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let status = reqwest::Client::new()
+        .get(format!("http://{addr}/ns-lab/v1/models"))
+        .bearer_auth(token.trim())
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+}

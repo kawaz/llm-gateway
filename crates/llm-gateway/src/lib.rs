@@ -30,6 +30,7 @@ pub mod egress;
 pub mod events;
 pub mod exchange;
 pub mod gateway;
+pub mod key_rotation;
 pub mod metering;
 pub mod passthrough;
 pub use gateway_core::pattern;

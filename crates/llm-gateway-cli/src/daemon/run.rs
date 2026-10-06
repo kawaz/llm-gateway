@@ -130,6 +130,7 @@ remove disabled from [server], or register another configuration",
             .await;
         gateway.start_status();
         gateway.start_keepalive();
+        gateway.start_key_rotation();
 
         tracing::info!(
             unit,

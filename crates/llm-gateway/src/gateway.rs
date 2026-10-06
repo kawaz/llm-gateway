@@ -59,6 +59,8 @@ pub struct Gateway<P: CredentialPersistence> {
     passthrough: crate::passthrough::Passthrough,
     status: crate::status::Manager,
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
+    /// 自動の鍵を入れ替える仕事を起こす口 (DR-0037 §13)。設定の読み直しで鳴らす。
+    key_rotation: Arc<tokio::sync::Notify>,
 }
 
 /// 設定として通るが、書き落としの疑いがある箇所を挙げる。
@@ -206,6 +208,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             passthrough: crate::passthrough::Passthrough::new(config)?,
             status: crate::status::Manager::new(config),
             web_logins: Mutex::new(HashMap::new()),
+            key_rotation: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -496,6 +499,8 @@ impl<P: CredentialPersistence> Gateway<P> {
         warn_about_gaps(&config);
         self.router.reload(config).await;
         info!("reloaded the configuration");
+        // `jwt` になった ns の鍵をすぐ作り、周期の変更をすぐ効かせる (DR-0037 §13)。
+        self.key_rotation.notify_one();
         let warnings = self
             .router
             .refresh_until(
@@ -1494,6 +1499,15 @@ impl<P: CredentialPersistence> Gateway<P> {
     pub fn pause_keepalive(&self, session_id: &str) {
         info!(session = session_id, "pausing the cache keepalive");
         self.keepalive.pause(session_id);
+    }
+
+    /// ns 認証 `jwt` の自動の鍵の入れ替えを始める (DR-0037 §3)。最初の 1 回は
+    /// すぐ走り、全 ns を確かめる。
+    pub fn start_key_rotation(&self) {
+        tokio::spawn(crate::key_rotation::run(
+            Arc::clone(&self.router),
+            Arc::clone(&self.key_rotation),
+        ));
     }
 
     /// upstream service 状態の収集を開始する。

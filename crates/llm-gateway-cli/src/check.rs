@@ -157,6 +157,25 @@ fn namespace_summary_lines(config: &Config) -> Vec<String> {
                 lines.push(format!("  {:<11}keys_file {}", "", path.display()));
             }
             lines.push(format!("  {:<11}kids {}", "", jwt.ring.kids().join(", ")));
+            // gateway が入れ替える鍵の置き場と周期 (DR-0037)。
+            lines.push(format!(
+                "  {:<11}automatic keys {} (every {})",
+                "",
+                config.auto_keys_path(name).display(),
+                llm_gateway::config::format_duration_secs(jwt.key_rotation_secs)
+            ));
+            let automatic = jwt
+                .auto_ring
+                .as_ref()
+                .map(|ring| ring.kids())
+                .unwrap_or_default();
+            if !automatic.is_empty() {
+                lines.push(format!(
+                    "  {:<11}automatic kids {}",
+                    "",
+                    automatic.join(", ")
+                ));
+            }
         }
     }
     lines
@@ -279,11 +298,13 @@ main = "keepalive"
         std::fs::write(
             &path,
             format!(
-                "[ns.claude]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"{}\"\n",
+                "[stats]\ndir = \"{}\"\n[ns.claude]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"{}\"\n",
+                dir.path().display(),
                 ring.display()
             ),
         )
         .unwrap();
+        let automatic = dir.path().join("jwt-keys/claude.jwks.jsonl");
         let lines = namespace_summary_lines(&load(&path).unwrap());
         assert_eq!(
             lines,
@@ -291,7 +312,22 @@ main = "keepalive"
                 "  claude     0 routing, 0 aliases, 0 cache".to_owned(),
                 format!("             keys_file {}", ring.display()),
                 "             kids mbp, mini".to_owned(),
+                format!(
+                    "             automatic keys {} (every 7d)",
+                    automatic.display()
+                ),
             ]
+        );
+        std::fs::create_dir_all(automatic.parent().unwrap()).unwrap();
+        std::fs::write(
+            &automatic,
+            format!("{}\n", jwk("claude-2026-10-06-0a0b", 3)),
+        )
+        .unwrap();
+        let lines = namespace_summary_lines(&load(&path).unwrap());
+        assert_eq!(
+            lines.last().unwrap(),
+            "             automatic kids claude-2026-10-06-0a0b"
         );
         let secret = jwk("mbp", 1)["d"].as_str().unwrap().to_owned();
         assert!(!lines.concat().contains(&secret));

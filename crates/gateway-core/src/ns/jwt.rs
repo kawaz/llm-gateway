@@ -8,6 +8,8 @@
 //! 失敗の理由 ([`Reason`]) は呼び出し側のログのためだけに返す。応答で区別すると、
 //! kid の有無や期限切れを外から探らせることになる。
 
+pub mod auto;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -26,7 +28,20 @@ use serde_json::Value;
 pub const SKEW_SECS: i64 = 60;
 
 /// `sub` の長さの上限 (バイト)。知らせのキーになるので長さを抑える。
-const MAX_SUBJECT_LEN: usize = 128;
+pub const MAX_SUBJECT_LEN: usize = 128;
+
+/// 自動の鍵を入れ替える周期の既定 (秒、DR-0037 §10)。
+pub const DEFAULT_KEY_ROTATION_SECS: i64 = 7 * 86_400;
+
+/// 入れ替えの周期の下限 (秒、DR-0037 §10)。
+pub const MIN_KEY_ROTATION_SECS: i64 = 3600;
+
+/// `sub` が検証を通る形か (空でない、長さの上限以下、制御文字なし)。
+pub fn subject_is_acceptable(subject: &str) -> bool {
+    !subject.is_empty()
+        && subject.len() <= MAX_SUBJECT_LEN
+        && !subject.chars().any(char::is_control)
+}
 
 /// 通さなかった理由。応答には出さない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +137,10 @@ pub struct KeyRing(Arc<Inner>);
 struct Inner {
     /// 鍵束の置き場。[`KeyRing::from_keys`] で作ったものは `None` (読み直さない)。
     path: Option<PathBuf>,
+    /// ファイルが無くてよいか ([`KeyRing::from_optional_file`])。無い間は空の束。
+    optional: bool,
     /// 最後に見た mtime (読み直しに失敗した時も記録する) と、最後に読めた kid → 公開鍵。
+    /// 無くてよいファイルが無い間、mtime は `None`。
     state: RwLock<(Option<u64>, Table)>,
 }
 
@@ -132,14 +150,40 @@ impl KeyRing {
         let (mtime, keys) = load(&path)?;
         Ok(Self(Arc::new(Inner {
             path: Some(path),
+            optional: false,
             state: RwLock::new((Some(mtime), Arc::new(keys))),
         })))
+    }
+
+    /// 無くてもよい鍵束ファイル (自動の鍵、DR-0037 §16)。無ければ空の束で始め、
+    /// 現れたら読む。
+    ///
+    /// 読めない時も作れる (空の束で始め、警告を残し、書き換わったら読み直す)。
+    /// gateway が自分で書くファイルの不具合で、手の鍵の ns まで起動できなく
+    /// しない。
+    pub fn from_optional_file(path: PathBuf) -> Self {
+        let state = match fs::metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, BTreeMap::new()),
+            _ => match load(&path) {
+                Ok((mtime, keys)) => (Some(mtime), keys),
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "cannot read the automatic key ring; starting without its keys");
+                    (mtime_of(&path).ok(), BTreeMap::new())
+                }
+            },
+        };
+        Self(Arc::new(Inner {
+            path: Some(path),
+            optional: true,
+            state: RwLock::new((state.0, Arc::new(state.1))),
+        }))
     }
 
     /// 与えた表をそのまま持つ (読み直さない)。
     pub fn from_keys(keys: BTreeMap<String, VerifyingKey>) -> Self {
         Self(Arc::new(Inner {
             path: None,
+            optional: false,
             state: RwLock::new((None, Arc::new(keys))),
         }))
     }
@@ -165,6 +209,9 @@ impl KeyRing {
         };
         let mtime = match mtime_of(path) {
             Ok(mtime) => mtime,
+            Err(error) if self.0.optional && error.kind() == std::io::ErrorKind::NotFound => {
+                return self.gone(path);
+            }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "cannot stat key ring; keeping previous keys");
                 return self.snapshot();
@@ -193,6 +240,23 @@ impl KeyRing {
             Err(error) => {
                 tracing::warn!(path = %path.display(), error = %unreadable(path, error), "cannot reload key ring; keeping previous keys")
             }
+        }
+        Arc::clone(&state.1)
+    }
+
+    /// 無くてよいファイルが無い。まだ現れていないなら空の束のまま黙って返す。
+    /// あったものが消えたなら、前の束を保って 1 度だけ言う (mtime を `None` に戻し、
+    /// 現れ直せば読み直す)。
+    fn gone(&self, path: &Path) -> Table {
+        {
+            let state = self.0.state.read().unwrap_or_else(|e| e.into_inner());
+            if state.0.is_none() {
+                return Arc::clone(&state.1);
+            }
+        }
+        let mut state = self.0.state.write().unwrap_or_else(|e| e.into_inner());
+        if state.0.take().is_some() {
+            tracing::warn!(path = %path.display(), "the key ring disappeared; keeping previous keys");
         }
         Arc::clone(&state.1)
     }
@@ -253,8 +317,13 @@ fn read_keys(path: &Path) -> Result<BTreeMap<String, VerifyingKey>, String> {
 /// その時点の表に対して行う。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtAuth {
-    /// kid → 公開鍵。今の方式 (alg) は EdDSA だけ。
+    /// kid → 公開鍵 (手の鍵、`keys_file`)。今の方式 (alg) は EdDSA だけ。
     pub ring: KeyRing,
+    /// gateway が入れ替える自動の鍵 (DR-0037 §16)。kid は手の鍵束に無ければここから引く。
+    /// 置き場は設定を読み込む側が結びつける。
+    pub auto_ring: Option<KeyRing>,
+    /// 自動の鍵を入れ替える周期 (秒、DR-0037 §10)。
+    pub key_rotation_secs: i64,
     /// 受ける寿命の上限 (秒)。`exp - now` (と `iat` があれば `exp - iat`) で測る。
     pub max_ttl_secs: i64,
     /// 書いたら `iss` の一致を要求する。
@@ -272,6 +341,8 @@ impl JwtAuth {
     ) -> Result<Self, String> {
         Ok(Self {
             ring: KeyRing::from_file(path)?,
+            auto_ring: None,
+            key_rotation_secs: DEFAULT_KEY_ROTATION_SECS,
             max_ttl_secs,
             iss,
             aud,
@@ -286,6 +357,8 @@ impl JwtAuth {
     ) -> Self {
         Self {
             ring: KeyRing::from_keys(keys),
+            auto_ring: None,
+            key_rotation_secs: DEFAULT_KEY_ROTATION_SECS,
             max_ttl_secs,
             iss,
             aud,
@@ -299,13 +372,23 @@ impl JwtAuth {
     /// 順序: 形 → ヘッダ (kid / alg / crit) → 署名 → claim。claim は署名が通って
     /// から読む (誰が書いたか分からない値を解釈しない)。
     pub fn verify(&self, token: &str, now_secs: i64) -> Result<Verified, Reason> {
-        self.verify_with(&self.ring.current(), token, now_secs)
+        let manual = self.ring.current();
+        let auto = self.auto_ring.as_ref().map(KeyRing::current);
+        // 手の鍵を先に引く。自動の kid は作る時に手の kid と重ならないよう選ぶので、
+        // 重なるのは人が自動の鍵束に手で書いた時だけ (DR-0037 §16)。
+        let find = |kid: &str| {
+            manual
+                .get(kid)
+                .or_else(|| auto.as_deref().and_then(|keys| keys.get(kid)))
+                .copied()
+        };
+        self.verify_with(&find, token, now_secs)
     }
 
-    /// 与えた表で検査する。鍵束の読み直しとは切り離してある。
+    /// 与えた引き方で検査する。鍵束の読み直しとは切り離してある。
     fn verify_with(
         &self,
-        keys: &BTreeMap<String, VerifyingKey>,
+        find: &dyn Fn(&str) -> Option<VerifyingKey>,
         token: &str,
         now_secs: i64,
     ) -> Result<Verified, Reason> {
@@ -321,7 +404,7 @@ impl JwtAuth {
             .get("kid")
             .and_then(Value::as_str)
             .ok_or(Reason::UnknownKid)?;
-        let key = keys.get(kid).ok_or(Reason::UnknownKid)?;
+        let key = find(kid).ok_or(Reason::UnknownKid)?;
         if header.get("alg").and_then(Value::as_str) != Some("EdDSA") {
             return Err(Reason::AlgMismatch);
         }
@@ -380,10 +463,7 @@ impl JwtAuth {
             .get("sub")
             .and_then(Value::as_str)
             .ok_or(Reason::Malformed)?;
-        if subject.is_empty()
-            || subject.len() > MAX_SUBJECT_LEN
-            || subject.chars().any(char::is_control)
-        {
+        if !subject_is_acceptable(subject) {
             return Err(Reason::Claims);
         }
         if let Some(iss) = &self.iss
@@ -832,6 +912,97 @@ pub(crate) mod tests {
             ["b"],
             "the clone sees the reload without reading"
         );
+    }
+
+    /// 手の鍵束と自動の鍵束の両方の kid を通す。自動の鍵束はファイルが無くてよく、
+    /// 現れたら読む。kid が両方にあれば手の鍵で確かめる。
+    #[test]
+    fn verification_looks_at_both_the_manual_and_the_automatic_ring() {
+        use std::fs::{self, File, FileTimes};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let manual = dir.path().join("manual.jsonl");
+        let automatic = dir.path().join("auto/lab.jwks.jsonl");
+        let write_at = |path: &Path, text: &str, seconds: u64| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        };
+        write_at(
+            &manual,
+            &private_jwk("hand", &signing_key(1)).to_string(),
+            100,
+        );
+        let mut auth = JwtAuth::from_file(manual.clone(), 86_400, None, None).unwrap();
+        auth.auto_ring = Some(KeyRing::from_optional_file(automatic.clone()));
+        let by_hand = super::sign(&signing_key(1), "hand", &claims());
+        let by_gateway = super::sign(&signing_key(2), "lab-1", &claims());
+        assert!(auth.verify(&by_hand, NOW).is_ok());
+        assert_eq!(
+            auth.verify(&by_gateway, NOW),
+            Err(Reason::UnknownKid),
+            "no automatic ring yet"
+        );
+
+        write_at(
+            &automatic,
+            &private_jwk("lab-1", &signing_key(2)).to_string(),
+            200,
+        );
+        assert!(auth.verify(&by_gateway, NOW).is_ok(), "it appeared");
+        assert!(auth.verify(&by_hand, NOW).is_ok());
+
+        // 同じ kid が両方にあれば手の鍵。自動の側の鍵で署名したものは通らない。
+        let clash = format!(
+            "{}\n{}\n",
+            private_jwk("lab-1", &signing_key(2)),
+            private_jwk("hand", &signing_key(3))
+        );
+        write_at(&automatic, &clash, 201);
+        let forged = super::sign(&signing_key(3), "hand", &claims());
+        assert_eq!(auth.verify(&forged, NOW), Err(Reason::BadSignature));
+
+        // 消えても前の束を保つ。現れ直せば読み直す。
+        fs::remove_file(&automatic).unwrap();
+        assert!(
+            auth.verify(&by_gateway, NOW).is_ok(),
+            "kept after it vanished"
+        );
+        write_at(
+            &automatic,
+            &private_jwk("lab-2", &signing_key(4)).to_string(),
+            300,
+        );
+        assert_eq!(auth.verify(&by_gateway, NOW), Err(Reason::UnknownKid));
+        let next = super::sign(&signing_key(4), "lab-2", &claims());
+        assert!(auth.verify(&next, NOW).is_ok());
+
+        // 空や壊れた自動の鍵束は採らない。
+        write_at(&automatic, "", 301);
+        assert!(
+            auth.verify(&next, NOW).is_ok(),
+            "an empty ring keeps the last one"
+        );
+    }
+
+    /// 自動の鍵束は、無くても壊れていても作れる (空の束で始める)。あれば読む。
+    #[test]
+    fn an_optional_ring_starts_even_when_it_is_missing_or_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.jwks.jsonl");
+        assert!(KeyRing::from_optional_file(path.clone()).kids().is_empty());
+        std::fs::write(&path, private_jwk("a", &signing_key(1)).to_string()).unwrap();
+        assert_eq!(KeyRing::from_optional_file(path.clone()).kids(), ["a"]);
+        std::fs::write(&path, "nope").unwrap();
+        assert!(KeyRing::from_optional_file(path).kids().is_empty());
     }
 
     #[test]

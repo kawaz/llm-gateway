@@ -1,12 +1,15 @@
 # Runbook: ns 認証 `jwt` の鍵の鋳造・ローテ・失効
 
-- Last Updated: 2026-09-29
+- Last Updated: 2026-10-06
 
 ## 適用ケース
 
 - Claude Code などのクライアントに、`auth = "jwt"` の namespace を使わせ始める時 (初回の鋳造)
 - 鍵の周期 (既定 180 日) が来た時 (ローテ)
 - 秘密鍵か token が漏れた、または漏れた疑いがある時 (失効)
+- Claude Code の `apiKeyHelper` を `auth token` (gateway が入れ替える自動の鍵、DR-0037) に切り替える時
+
+この runbook の鋳造・ローテ・失効は `keys_file` の**手の鍵**の手順。自動の鍵は各 unit の daemon が `key_rotation` (既定 7 日) ごとに作って入れ替えるので、人の手順は要らない (MANUAL の「自動の鍵」)。
 
 ## 前提
 
@@ -78,11 +81,29 @@ token の ttl は鍵の周期 + 猶予にしておく。
    grep -v '"kid":"claude-mbp-2026-09"' "$ring" > "$ring.tmp" && chmod 600 "$ring.tmp" && mv "$ring.tmp" "$ring"
    ```
 
+### helper を `auth token` に切り替える
+
+前提: クライアントが届きうる全 unit (Caddy の fail over 先を含む) が、自動の鍵を読む版 (0.67.0 より新しい版) であること。古い版は自動の鍵の token を `unknown_kid` で断る。
+
+1. **自動の鍵ができているのを確かめる。** unit を新しい版で起動 (または restart) すると作られる
+   ```bash
+   llm-gateway check --config <設定ファイル>
+   ```
+   期待結果: ns の行に `automatic keys <置き場> (every 7d)` と `automatic kids <ns>-<日付>-<4 桁>` が出る
+2. **発行を試す。** token の値は画面に出さず、長さと終了コードだけ見る
+   ```bash
+   llm-gateway auth token --config <設定ファイル> --ns claude --sub kawaz-mbp | wc -c
+   ```
+3. **`settings.json` を書き換える。** `apiKeyHelper` に上のコマンドを置き、`env.ANTHROPIC_AUTH_TOKEN` は空文字で上書きする (親プロセスの env に残った旧 token が helper より優先されるため)。`--kid <手の kid>` を足しておくと、自動の鍵が読めない間はその鍵に落ちる
+4. **走行中のセッションは起動時の token を持ち続ける**ので、全セッションの再起動を待つ。`/llm-gateway/events` の `kid` が自動の kid (`<ns>-<日付>-…`) に変わるのを見る
+5. **旧 helper 用の手の kid の行を消す。** その kid が events に来なくなり、その kid で鋳造した token の `exp` (helper なら最長 `--ttl`) を過ぎてから、ローテの手順 4 と同じく一時ファイル + `mv` で消す
+
 ### 漏洩時
 
 1. **漏れた kid の行を鍵束から即座に削除する** (ローテの手順 4 と同じく、一時ファイルに書いて `mv` で置き換える)。次のリクエストから、その kid で鋳造した token は全て通らなくなる。別の kid で鋳造した機械は影響を受けない
 2. 必要なら、その機械のために新しい kid で初回の手順 1〜3 をやり直す (鍵束への追記と token の貼り替え。restart は要らない)
 3. 鍵束ファイル自体が漏れた疑いがある時は全行が漏洩扱い。新しい kid の行を追記して全機械の token を鋳造し直し、古い行を全て削除する
+4. 自動の鍵のファイル (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) が漏れた疑いがある時は、全 unit を止めてからファイルを消し、unit を起動し直す (起動時に新しい自動の鍵が作られる)。`auth token` を使うクライアントは次の呼び直しで新しい鍵の token を受け取る。止めずに消すと、走っている unit は前の束を保ったまま検証を続ける
 
 ## 失敗時の切り分け
 
