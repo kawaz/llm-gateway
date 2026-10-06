@@ -130,6 +130,10 @@ type Table = Arc<BTreeMap<String, VerifyingKey>>;
 /// いれば読み直す。読み直しに失敗したら前の束を保つ (書きかけのファイルで全鍵を
 /// 失わない)。1 行でも不正なら束全体を採らない。
 ///
+/// mtime を記録するのは、読めて、かつ読む前後の stat が同じ mtime だった時だけ。
+/// 読めなかった時は記録せず次の検証で読み直す (警告は mtime ごとに 1 度)。追記の
+/// 途中を読んだ後、同じ mtime のまま書き上がった中身を取りこぼさないため。
+///
 /// clone は中身を共有する。設定を clone して持つ複数の部品が、それぞれ別に読み直さない。
 #[derive(Clone)]
 pub struct KeyRing(Arc<Inner>);
@@ -139,9 +143,27 @@ struct Inner {
     path: Option<PathBuf>,
     /// ファイルが無くてよいか ([`KeyRing::from_optional_file`])。無い間は空の束。
     optional: bool,
-    /// 最後に見た mtime (読み直しに失敗した時も記録する) と、最後に読めた kid → 公開鍵。
-    /// 無くてよいファイルが無い間、mtime は `None`。
-    state: RwLock<(Option<u64>, Table)>,
+    state: RwLock<State>,
+}
+
+struct State {
+    /// 今の表を読んだ時の mtime。読み直さずに済む印で、読めて前後の stat が揃った時
+    /// だけ記録する。無くてよいファイルが無い間・まだ読めていない間は `None`。
+    read_at: Option<u64>,
+    /// 最後に読めた kid → 公開鍵。
+    table: Table,
+    /// 最後に読めなかった警告を出した mtime。同じ mtime の間は警告を繰り返さない。
+    warned_at: Option<u64>,
+}
+
+impl State {
+    fn new(read_at: Option<u64>, table: BTreeMap<String, VerifyingKey>) -> RwLock<Self> {
+        RwLock::new(Self {
+            read_at,
+            table: Arc::new(table),
+            warned_at: None,
+        })
+    }
 }
 
 impl KeyRing {
@@ -151,31 +173,35 @@ impl KeyRing {
         Ok(Self(Arc::new(Inner {
             path: Some(path),
             optional: false,
-            state: RwLock::new((Some(mtime), Arc::new(keys))),
+            state: State::new(mtime, keys),
         })))
     }
 
     /// 無くてもよい鍵束ファイル (自動の鍵、DR-0037 §16)。無ければ空の束で始め、
     /// 現れたら読む。
     ///
-    /// 読めない時も作れる (空の束で始め、警告を残し、書き換わったら読み直す)。
+    /// 読めない時も作れる (空の束で始め、警告を残し、次の検証からまた読む)。
     /// gateway が自分で書くファイルの不具合で、手の鍵の ns まで起動できなく
     /// しない。
     pub fn from_optional_file(path: PathBuf) -> Self {
-        let state = match fs::metadata(&path) {
+        let mut warned_at = None;
+        let (read_at, keys) = match fs::metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, BTreeMap::new()),
             _ => match load(&path) {
-                Ok((mtime, keys)) => (Some(mtime), keys),
+                Ok((mtime, keys)) => (mtime, keys),
                 Err(error) => {
                     tracing::warn!(path = %path.display(), %error, "cannot read the automatic key ring; starting without its keys");
-                    (mtime_of(&path).ok(), BTreeMap::new())
+                    warned_at = mtime_of(&path).ok();
+                    (None, BTreeMap::new())
                 }
             },
         };
+        let state = State::new(read_at, keys);
+        state.write().unwrap_or_else(|e| e.into_inner()).warned_at = warned_at;
         Self(Arc::new(Inner {
             path: Some(path),
             optional: true,
-            state: RwLock::new((state.0, Arc::new(state.1))),
+            state,
         }))
     }
 
@@ -184,7 +210,7 @@ impl KeyRing {
         Self(Arc::new(Inner {
             path: None,
             optional: false,
-            state: RwLock::new((None, Arc::new(keys))),
+            state: State::new(None, keys),
         }))
     }
 
@@ -199,7 +225,7 @@ impl KeyRing {
     }
 
     fn snapshot(&self) -> Table {
-        Arc::clone(&self.0.state.read().unwrap_or_else(|e| e.into_inner()).1)
+        Arc::clone(&self.0.state.read().unwrap_or_else(|e| e.into_inner()).table)
     }
 
     /// 今の束。ファイルの mtime が記録と違えば読み直してから返す。
@@ -219,29 +245,39 @@ impl KeyRing {
         };
         {
             let state = self.0.state.read().unwrap_or_else(|e| e.into_inner());
-            if state.0 == Some(mtime) {
-                return Arc::clone(&state.1);
+            if state.read_at == Some(mtime) {
+                return Arc::clone(&state.table);
             }
         }
-        // 書きロックの下で stat し直し、記録する mtime と読む中身を同じ stat に揃える。
-        // 同時に変化を見た他のリクエストは、ここで記録済みの mtime を見て読み直さない。
+        // 書きロックの下で読み直す。同時に変化を見た他のリクエストは、ここで記録済みの
+        // mtime を見て読み直さない。
         let mut state = self.0.state.write().unwrap_or_else(|e| e.into_inner());
         match mtime_of(path) {
-            Ok(mtime) if state.0 == Some(mtime) => {}
-            // 失敗しても見た mtime は記録する (表は前の束のまま)。同じ mtime の間は
-            // 読み直しも警告も繰り返さず、書き換わって mtime が変われば読み直す。
-            Ok(mtime) => match read_keys(path) {
-                Ok(keys) => *state = (Some(mtime), Arc::new(keys)),
+            Ok(mtime) if state.read_at == Some(mtime) => {}
+            Ok(before) => match read_keys(path) {
+                Ok(keys) => {
+                    state.table = Arc::new(keys);
+                    // 読む間に書き換わっていたら記録しない (読んだ中身がどちらの版か
+                    // 分からない)。次の検証で読み直す。
+                    state.read_at = match mtime_of(path) {
+                        Ok(after) if after == before => Some(before),
+                        _ => None,
+                    };
+                }
+                // 失敗した mtime は記録しない (表は前の束のまま)。次の検証でまた読み、
+                // 同じ mtime のまま書き上がった中身を拾う。警告は mtime ごとに 1 度。
                 Err(error) => {
-                    state.0 = Some(mtime);
-                    tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
+                    if state.warned_at != Some(before) {
+                        state.warned_at = Some(before);
+                        tracing::warn!(path = %path.display(), %error, "cannot reload key ring; keeping previous keys")
+                    }
                 }
             },
             Err(error) => {
                 tracing::warn!(path = %path.display(), error = %unreadable(path, error), "cannot reload key ring; keeping previous keys")
             }
         }
-        Arc::clone(&state.1)
+        Arc::clone(&state.table)
     }
 
     /// 無くてよいファイルが無い。まだ現れていないなら空の束のまま黙って返す。
@@ -250,15 +286,15 @@ impl KeyRing {
     fn gone(&self, path: &Path) -> Table {
         {
             let state = self.0.state.read().unwrap_or_else(|e| e.into_inner());
-            if state.0.is_none() {
-                return Arc::clone(&state.1);
+            if state.read_at.is_none() {
+                return Arc::clone(&state.table);
             }
         }
         let mut state = self.0.state.write().unwrap_or_else(|e| e.into_inner());
-        if state.0.take().is_some() {
+        if state.read_at.take().is_some() {
             tracing::warn!(path = %path.display(), "the key ring disappeared; keeping previous keys");
         }
-        Arc::clone(&state.1)
+        Arc::clone(&state.table)
     }
 }
 
@@ -295,11 +331,13 @@ fn unreadable(path: &Path, e: std::io::Error) -> String {
     )
 }
 
-/// mtime を取ってから中身を読む。間に書き換えがあっても、記録する mtime が古い側に
-/// なるだけで、次の [`KeyRing::current`] で読み直される。
-fn load(path: &Path) -> Result<(u64, BTreeMap<String, VerifyingKey>), String> {
-    let mtime = mtime_of(path).map_err(|e| unreadable(path, e))?;
-    Ok((mtime, read_keys(path)?))
+/// 読む前後で stat し、mtime が揃った時だけ返す (揃わなければ `None` で、次の
+/// [`KeyRing::current`] で読み直される)。
+fn load(path: &Path) -> Result<(Option<u64>, BTreeMap<String, VerifyingKey>), String> {
+    let before = mtime_of(path).map_err(|e| unreadable(path, e))?;
+    let keys = read_keys(path)?;
+    let after = mtime_of(path).ok();
+    Ok(((after == Some(before)).then_some(before), keys))
 }
 
 fn read_keys(path: &Path) -> Result<BTreeMap<String, VerifyingKey>, String> {
@@ -1013,6 +1051,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// 読めなかった時の mtime は固定しない。追記の途中を読んで失敗した後、同じ mtime の
+    /// まま書き上がった中身も次の検証で拾う (固定すると次の書き換えまで新しい kid を
+    /// 断り続ける)。
+    #[test]
+    fn a_failed_read_does_not_pin_the_mtime() {
+        use std::fs::{self, File, FileTimes};
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ring.jsonl");
+        let write_at = |text: &str, seconds: u64| {
+            fs::write(&path, text).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        };
+        let first = private_jwk("a", &signing_key(1)).to_string();
+        let second = private_jwk("b", &signing_key(2)).to_string();
+        let b = super::sign(&signing_key(2), "b", &claims());
+        write_at(&format!("{first}\n"), 100);
+        let auth = JwtAuth::from_file(path.clone(), 86_400, None, None).unwrap();
+        let half = &second[..second.len() / 2];
+        write_at(&format!("{first}\n{half}"), 101);
+        assert_eq!(
+            auth.verify(&b, NOW),
+            Err(Reason::UnknownKid),
+            "half-appended"
+        );
+        write_at(&format!("{first}\n{second}\n"), 101);
+        assert!(
+            auth.verify(&b, NOW).is_ok(),
+            "the finished append at the same mtime"
+        );
+        // 揃った後は同じ mtime の間は読み直さない。
+        write_at(&first, 101);
+        assert!(
+            auth.verify(&b, NOW).is_ok(),
+            "unchanged mtime does not reload"
+        );
+    }
+
     #[test]
     fn key_ring_reloads_on_mtime_change_and_keeps_last_valid_ring() {
         use std::fs::{self, File, FileTimes};
@@ -1044,11 +1128,13 @@ pub(crate) mod tests {
         write_at("not JSON", 102);
         assert!(auth.verify(&a, NOW).is_ok());
         assert!(auth.verify(&b, NOW).is_ok());
-        // 失敗した mtime のままなら読み直さない (中身を正しくしても mtime が同じなら拾わない)。
+        // 失敗した mtime は固定しない。同じ mtime のまま中身を正しくすれば拾う
+        // (DR-0037 §16、詳しくは a_failed_read_does_not_pin_the_mtime)。
         write_at(&second, 102);
-        assert!(
-            auth.verify(&a, NOW).is_ok(),
-            "a failed mtime is not retried"
+        assert_eq!(
+            auth.verify(&a, NOW),
+            Err(Reason::UnknownKid),
+            "a failed mtime is retried"
         );
         write_at(&second, 103);
         assert_eq!(auth.verify(&a, NOW), Err(Reason::UnknownKid));

@@ -74,6 +74,9 @@ pub fn step(
                 if let Some(kid) = &outcome.created {
                     tracing::info!(ns = %job.ns, kid = %kid, path = %job.path.display(), "created an automatic key");
                 }
+                if !outcome.incomplete.is_empty() {
+                    tracing::warn!(ns = %job.ns, kids = %outcome.incomplete.join(", "), path = %job.path.display(), "these lines say auto but lack created / max_token_ttl; they are kept and never used for signing");
+                }
                 if !outcome.deleted.is_empty() {
                     tracing::info!(ns = %job.ns, kids = %outcome.deleted.join(", "), "deleted old automatic keys");
                 }
@@ -101,6 +104,23 @@ pub fn wait(due: &HashMap<String, i64>, now: i64) -> Option<Duration> {
     Some(Duration::from_secs(secs.unsigned_abs()))
 }
 
+/// 1 回の入れ替えの結果を次の時刻の表にする。仕事が落ちた (panic 等) 時は、全 ns を
+/// cooltime 後に試し直す表にする (空の表にすると、読み直しまで二度と起きない)。
+pub fn settle(
+    finished: Result<HashMap<String, i64>, tokio::task::JoinError>,
+    names: &[String],
+    now: i64,
+) -> HashMap<String, i64> {
+    match finished {
+        Ok(due) => due,
+        Err(error) => {
+            tracing::warn!(%error, "the automatic key rotation stopped unexpectedly; trying again later");
+            let retry = now.saturating_add(auto::COOLTIME_SECS);
+            names.iter().map(|ns| (ns.clone(), retry)).collect()
+        }
+    }
+}
+
 /// 入れ替えの仕事を回し続ける。`wake` で起こされたら (設定の読み直し)、全 ns を
 /// その場で確かめ直す。
 pub async fn run(router: Arc<Router>, wake: Arc<Notify>) {
@@ -108,18 +128,13 @@ pub async fn run(router: Arc<Router>, wake: Arc<Notify>) {
     loop {
         let jobs = jobs(router.active().config());
         let now = crate::credential::time::now_unix();
-        due = match tokio::task::spawn_blocking(move || {
+        let names: Vec<String> = jobs.iter().map(|job| job.ns.clone()).collect();
+        let finished = tokio::task::spawn_blocking(move || {
             step(&jobs, &mut due, now, &mut |buf: &mut [u8]| rand::fill(buf));
             due
         })
-        .await
-        {
-            Ok(due) => due,
-            Err(error) => {
-                tracing::warn!(%error, "the automatic key rotation stopped unexpectedly; trying again later");
-                HashMap::new()
-            }
-        };
+        .await;
+        due = settle(finished, &names, now);
         let sleeping = async {
             match wait(&due, crate::credential::time::now_unix()) {
                 Some(duration) => tokio::time::sleep(duration).await,
@@ -231,6 +246,24 @@ mod tests {
         assert_eq!(due.get("lab"), Some(&(NOW + auto::COOLTIME_SECS)));
         assert!(!due.contains_key("gone"));
         assert_eq!(std::fs::read_to_string(&jobs[0].path).unwrap(), "broken");
+    }
+
+    /// 仕事が落ちても、全 ns を cooltime 後に試し直す。
+    #[tokio::test]
+    async fn a_crashed_pass_retries_every_namespace_after_the_cooltime() {
+        let crashed =
+            tokio::task::spawn_blocking(|| -> HashMap<String, i64> { panic!("boom") }).await;
+        let names = vec!["lab".to_owned(), "personal".to_owned()];
+        let due = settle(crashed, &names, NOW);
+        let retry = NOW + auto::COOLTIME_SECS;
+        assert_eq!(
+            due,
+            HashMap::from([("lab".to_owned(), retry), ("personal".to_owned(), retry)])
+        );
+        assert_eq!(
+            wait(&due, NOW),
+            Some(Duration::from_secs(auto::COOLTIME_SECS as u64))
+        );
     }
 
     /// 寝る長さは次の時刻までで、cooltime を超えない。過ぎていても 1 秒は空ける。

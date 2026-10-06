@@ -438,17 +438,28 @@ fn token_falls_back_to_kid_or_refuses_without_an_automatic_key() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(
+        out.stderr.is_empty(),
+        "no automatic key yet is not worth a warning"
+    );
     let token = String::from_utf8(out.stdout).unwrap();
     assert_eq!(parts(&token).0["kid"], "by-hand");
     assert!(!face.auto_path().exists());
 
-    // 自動の鍵のファイルが壊れていても `--kid` に落ちる。`--kid` が無ければ理由を言う。
+    // 自動の鍵のファイルが壊れていても `--kid` に落ちる。その時だけ stderr に 1 行
+    // 言う (stdout は token だけ)。`--kid` が無ければ理由を言って断る。
     std::fs::create_dir_all(face.auto_path().parent().unwrap()).unwrap();
     std::fs::write(face.auto_path(), "{\"kty\":").unwrap();
+    let fallen = face.token(&["--sub", "s", "--kid", "by-hand"]);
+    assert!(fallen.status.success());
+    let token = String::from_utf8(fallen.stdout).unwrap();
+    assert_eq!(token.lines().count(), 1);
+    assert_eq!(parts(&token).0["kid"], "by-hand");
+    let warning = String::from_utf8_lossy(&fallen.stderr);
+    assert_eq!(warning.lines().count(), 1, "{warning}");
     assert!(
-        face.token(&["--sub", "s", "--kid", "by-hand"])
-            .status
-            .success()
+        warning.contains("automatic keys") && warning.contains("by-hand"),
+        "{warning}"
     );
     let broken = face.token(&["--sub", "s"]);
     assert!(!broken.status.success() && broken.stdout.is_empty());

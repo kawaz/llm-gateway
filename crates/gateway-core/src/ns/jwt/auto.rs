@@ -53,8 +53,13 @@ struct Line {
     kid: String,
     key: SigningKey,
     mark: Option<Mark>,
+    /// `auto` を名乗るが印の欄が揃っていない (DR-0037 §5)。印の無い行と同じく扱う。
+    incomplete: bool,
 }
 
+/// 印は 3 欄 (`"auto": true`、整数の `created`、正の整数の `max_token_ttl`) が揃って
+/// 初めて印 (DR-0037 §5)。1 つでも欠ければ印の無い行と同じく扱う: 消さない
+/// (この鍵の token の寿命が分からない) し、署名にも使わない。
 fn mark_of(jwk: &Value) -> Option<Mark> {
     if jwk.get("auto").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -92,6 +97,7 @@ fn parse(text: &str) -> Result<Vec<Line>, String> {
             kid,
             key,
             mark: mark_of(&jwk),
+            incomplete: jwk.get("auto").is_some() && mark_of(&jwk).is_none(),
         });
     }
     Ok(lines)
@@ -138,6 +144,17 @@ pub fn newest(path: &Path) -> Result<Option<AutoKey>, String> {
         key: line.key.clone(),
         mark,
     }))
+}
+
+/// 鍵のファイルにある kid (確かめる側のため)。ファイルが無ければ `None`、読めなければ
+/// エラー (秘密鍵の中身は含めない)。読むだけで、何も書かない。
+pub fn kids(path: &Path) -> Result<Option<Vec<String>>, String> {
+    let Some(text) = read(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        parse(&text)?.into_iter().map(|line| line.kid).collect(),
+    ))
 }
 
 /// 1 回の入れ替えでやること。
@@ -212,6 +229,8 @@ pub struct Outcome {
     pub created: Option<String>,
     pub deleted: Vec<String>,
     pub next_at: i64,
+    /// `auto` を名乗るが印の欄が揃っていない行の kid。残してあるので知らせる。
+    pub incomplete: Vec<String>,
 }
 
 /// 脇の `.lock` の置き場。
@@ -298,6 +317,11 @@ pub fn rotate(
         created: created.map(|(kid, _)| kid),
         deleted: plan.delete,
         next_at: plan.next_at,
+        incomplete: lines
+            .iter()
+            .filter(|line| line.incomplete)
+            .map(|line| line.kid.clone())
+            .collect(),
     })
 }
 
@@ -355,6 +379,16 @@ fn temporary_prefix(path: &Path) -> String {
     )
 }
 
+/// `<名前>.tmp.<pid>.<連番>` の形か。前方一致だけだと、名前が入れ子になった別の ns
+/// (`lab.jwks.jsonl.tmp.1` という ns の `lab.jwks.jsonl.tmp.1.jwks.jsonl`) を消しうる。
+fn is_temporary(name: &str, prefix: &str) -> bool {
+    let Some(rest) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    matches!(rest.split_once('.'), Some((pid, seq)) if digits(pid) && digits(seq))
+}
+
 /// 落ちた書き手が残した一時ファイルを消す。一時ファイルは flock の内側でしか
 /// 作らないので、掴んでいる間に見えるものは全部残骸。
 fn sweep_temporaries(path: &Path) {
@@ -363,7 +397,7 @@ fn sweep_temporaries(path: &Path) {
     };
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with(&prefix) {
+        if is_temporary(&name.to_string_lossy(), &prefix) {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => {
                     tracing::info!(path = %entry.path().display(), "cleaned up a stray key ring write")
@@ -540,6 +574,20 @@ mod tests {
             NOW + WEEK,
             "b goes at now + its cap + cooltime, after the next rotation"
         );
+    }
+
+    /// 時計が戻って最新の鍵の `created` が未来でも、若いとみなして作らない。次の時刻は
+    /// `created + every` (時計が追いつくまで待つ)。
+    #[test]
+    fn a_newest_key_from_the_future_counts_as_young() {
+        let keys = [
+            ("old", mark(NOW - WEEK, WEEK)),
+            ("ahead", mark(NOW + DAY, WEEK)),
+        ];
+        let p = plan(&keys, NOW, WEEK);
+        assert!(!p.create);
+        assert!(p.delete.is_empty(), "old's successor is in the future too");
+        assert_eq!(p.next_at, NOW + DAY + WEEK);
     }
 
     #[test]
@@ -719,12 +767,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lab.jwks.jsonl");
         let reserved = BTreeSet::new();
-        let broken = format!("{}\n{{\"kty\":", manual_line("by-hand", 9));
+        // 2 行目は秘密鍵 (`d`) を持つが、`x` が別の鍵の JWK。エラーに `d` の値を出さない。
+        let mut mixed: Value = serde_json::from_str(&manual_line("mixed", 8)).unwrap();
+        let secret = mixed["d"].as_str().unwrap().to_owned();
+        mixed["x"] = Value::String(super::super::public_key_text(
+            &super::super::signing_key(&[9; 32]).verifying_key(),
+        ));
+        let broken = format!("{}\n{mixed}\n", manual_line("by-hand", 9));
         std::fs::write(&path, &broken).unwrap();
         let error = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap_err();
         assert!(error.contains("line 2"), "{error}");
-        assert!(!error.contains("\"d\""), "{error}");
+        assert!(
+            !error.contains(&secret),
+            "the private key leaked into: {error}"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let error = newest(&path).unwrap_err();
+        assert!(
+            !error.contains(&secret),
+            "the private key leaked into: {error}"
+        );
     }
 
     /// 作る kid は手の鍵束の kid と重ならない。
@@ -753,6 +815,42 @@ mod tests {
         rotate(&rotation(&path, &BTreeSet::new()), NOW, &mut counter()).unwrap();
         assert!(!leftover.exists());
         assert!(other.exists(), "another ns's file is not ours to sweep");
+    }
+
+    /// 一時ファイルの形 (`<名前>.tmp.<pid>.<連番>`) まで合うものだけを消す。名前が
+    /// 入れ子になった別の ns のファイルは消さない。
+    #[test]
+    fn sweeping_spares_a_nested_namespace_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.jwks.jsonl");
+        let nested = dir.path().join("lab.jwks.jsonl.tmp.1.jwks.jsonl");
+        let nested_lock = dir.path().join("lab.jwks.jsonl.tmp.1.jwks.jsonl.lock");
+        let leftover = dir.path().join("lab.jwks.jsonl.tmp.123.4");
+        for p in [&nested, &nested_lock, &leftover] {
+            std::fs::write(p, "x").unwrap();
+        }
+        rotate(&rotation(&path, &BTreeSet::new()), NOW, &mut counter()).unwrap();
+        assert!(nested.exists() && nested_lock.exists());
+        assert!(!leftover.exists());
+    }
+
+    /// 印は 3 欄 (`auto: true`・`created`・`max_token_ttl`) が揃って初めて印。欠けた行は
+    /// 印の無い行と同じく消さず署名にも使わず、入れ替えの結果に挙げて知らせる。
+    #[test]
+    fn a_partial_mark_is_kept_unused_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.jwks.jsonl");
+        let mut partial: Value = serde_json::from_str(&manual_line("half", 5)).unwrap();
+        partial["auto"] = Value::Bool(true);
+        partial["created"] = (NOW - 100 * DAY).into();
+        std::fs::write(&path, format!("{partial}\n")).unwrap();
+        assert!(newest(&path).unwrap().is_none(), "not used for signing");
+        let reserved = BTreeSet::new();
+        let first = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap();
+        assert_eq!(first.incomplete, vec!["half".to_owned()]);
+        let later = rotate(&rotation(&path, &reserved), NOW + 3 * WEEK, &mut counter()).unwrap();
+        assert_eq!(later.incomplete, vec!["half".to_owned()]);
+        assert!(kids(&path).contains(&"half".to_owned()), "never deleted");
     }
 
     #[test]

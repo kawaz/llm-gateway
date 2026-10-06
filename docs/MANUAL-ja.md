@@ -68,14 +68,16 @@ key_rotation = "7d"       # 任意。gateway が自動の鍵を入れ替える�
 - 通るのは、ヘッダの `kid` が鍵束にあり、`alg` が `EdDSA` (検証の方式は鍵の `kty` / `crv` から決め、ヘッダの `alg` は照合するだけ)、`crit` が無く、署名が合い、`exp` と `sub` があり、時刻が 60 秒の揺れの内で合う (`exp` を過ぎていない、`iat` / `nbf` が先の時刻でない、寿命が `max_ttl` 以内) token
 - 通らなかった時は理由に関わらず同じ 401 と `WWW-Authenticate: Bearer error="invalid_token"` を返す。どの検査で落ちたかはログにだけ残す
 - `extends` した派生のファイルで `keys_file` を書くと、鍵束はファイルごと差し替わる (鍵単位のマージはしない)。有効な鍵は、その ns の `keys_file` が指す 1 ファイルの中身だけで決まる
-- **鍵束の変更は restart 無しで反映される**。gateway は起動時に鍵束を読み、検証のたびに `keys_file` の mtime を見て、変わっていれば読み直す。行を消せば次のリクエストからその kid の token は通らない。起動時に鍵束が読めない (無い・権限・不正な行) と起動を止める。稼働中の読み直しに失敗したら警告をログに出し、前の鍵束で検証を続ける。行の削除は一時ファイルに書いて `mv` で置き換える (追加は `>>` の追記)。追記の途中や空の鍵束を拾っても、読み直しの失敗として前の鍵束を保つ
+- **鍵束の変更は restart 無しで反映される**。gateway は起動時に鍵束を読み、検証のたびに `keys_file` の mtime を見て、変わっていれば読み直す。行を消せば次のリクエストからその kid の token は通らない。起動時に鍵束が読めない (無い・権限・不正な行) と起動を止める。稼働中の読み直しに失敗したら警告をログに出し (mtime ごとに 1 度)、前の鍵束で検証を続け、次の検証でまた読む (読めて、かつ読む間に mtime が動かなかった時だけ読めたものとして扱う)。行の削除は一時ファイルに書いて `mv` で置き換える (追加は `>>` の追記)。追記の途中や空の鍵束を拾っても、読み直しの失敗として前の鍵束を保つ
 
 #### 自動の鍵 (`key_rotation`)
 
 `jwt` の namespace では、各 unit の daemon が `keys_file` とは別に**自動の鍵**を作って入れ替える (DR-0037)。Claude Code の `apiKeyHelper` のように毎回 token を取りに来るクライアントは、`llm-gateway auth token` でこの鍵の短寿命の token を受け取る。
 
 - 置き場は `<[stats] dir>/jwt-keys/<ns>.jwks.jsonl` (既定 `~/.local/state/llm-gateway/stats/jwt-keys/`、ディレクトリ 700・ファイル 600)。1 行 1 JWK で、`keys_file` の行に `"auto":true`・`"created"` (作成時刻、Unix 秒)・`"max_token_ttl"` (この鍵で発行できる token の寿命の上限、秒) を足した形
-- 検証は `keys_file` と自動の鍵のファイルの両方を見る (kid は `keys_file` から先に引く)。自動の鍵のファイルも検証のたびに mtime を見て読み直し、無い間は空として扱う。読めなくても起動は止めない (警告を出し、書き換わったら読み直す)
+- 検証は `keys_file` と自動の鍵のファイルの両方を見る (kid は `keys_file` から先に引く)。自動の鍵のファイルも検証のたびに mtime を見て読み直し、無い間は空として扱う。読めなくても起動は止めない (警告を出し、次の検証でまた読む)。`llm-gateway check` は、自動の鍵のファイルがまだ無い (`none yet`) のか読めない (`cannot read (<理由>)`) のかを言い分け、設定に `jwt` の namespace として無い名前の自動の鍵のファイルを警告に挙げる (秘密鍵が残っていて、同じ名前の namespace を書くとまた効く。全 unit からその namespace が消えたら消す)
+- `[stats] dir` を書かないと、置き場は設定を読むプロセスの `XDG_STATE_HOME` で決まり、unit と helper の env が違うと別のファイルを見る。`[stats] dir` を明示するか、Claude Code と同じ env で `check` を通して `automatic keys` の置き場を突き合わせる
+- `max_token_ttl` を守らせるのは `auth token` だけ。`auth sign --key <自動の鍵のファイル>` で長い token を鋳造すると、`exp` に関わらず gateway がその鍵を消した時点 (後継 + `max_token_ttl` + 1 時間) で効かなくなる。自動の鍵は `auth token` で使う
 - 起動時に確かめ、最新の自動の鍵が無いか `key_rotation` 以上古ければ新しい鍵を追記する。kid は `<ns>-<日付>-<16 進 4 桁>` (例 `lab-2026-10-06-3fa9`)。新しい鍵の `max_token_ttl` は `key_rotation` と `max_ttl` の小さい方
 - 古い自動の鍵は、後継ができてから「その鍵の `max_token_ttl` + 1 時間」で消す (一時ファイル + rename)。消すのは印のある行だけで、`keys_file` には触らない
 - 次にやることの時刻は鍵の作成時刻から計算してタイマーを張る (寝るのは 1 回 1 時間まで。macOS のスリープで単調時計が止まる分を壁時計で補う)。`daemon reload` でも全 namespace を確かめ直す

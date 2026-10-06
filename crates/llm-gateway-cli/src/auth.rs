@@ -143,7 +143,15 @@ fn token(parsed: &Parsed) -> Result<String, Failure> {
                 "cannot read the automatic keys: {e}; fix or remove the broken line, or give --kid <kid> to sign with a key of keys_file"
             )));
         }
-        Err(_) => None,
+        // 壊れた鍵束で無音のまま手の鍵に落ちると、入れ替えが止まっていることに気づけない。
+        // stdout は token だけに保ち、stderr に 1 行だけ言う。
+        Err(e) => {
+            eprintln!(
+                "llm-gateway auth token: warning: cannot read the automatic keys ({e}); signing with --kid {}",
+                parsed.get("kid").unwrap_or_default()
+            );
+            None
+        }
     };
     let (kid, key, cap) = match (automatic, parsed.get("kid")) {
         (Some(found), _) => (

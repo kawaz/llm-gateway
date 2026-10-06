@@ -89,7 +89,9 @@ token の ttl は鍵の周期 + 猶予にしておく。
    ```bash
    llm-gateway check --config <設定ファイル>
    ```
-   期待結果: ns の行に `automatic keys <置き場> (every 7d)` と `automatic kids <ns>-<日付>-<4 桁>` が出る
+   期待結果: ns の行に `automatic keys <置き場> (every 7d)` と `automatic kids <ns>-<日付>-<4 桁>` が出る。`(every 7d, none yet; …)` ならまだ作られていない (新しい版の unit が起動していない)。`automatic keys <置き場>: cannot read (<理由>)` なら壊れていて入れ替えも止まっているので、理由の行を一時ファイル + `mv` で消す。
+
+   置き場は設定の `[stats] dir` で決まり、書いていなければ設定を読むプロセスの `XDG_STATE_HOME` で決まる。`[stats] dir` を明示するか、`check` を Claude Code と同じ env で通し、unit のログ (`created an automatic key ... path=`) の置き場と同じかを確かめる
 2. **発行を試す。** token の値は画面に出さず、長さと終了コードだけ見る
    ```bash
    llm-gateway auth token --config <設定ファイル> --ns claude --sub kawaz-mbp | wc -c
@@ -103,7 +105,8 @@ token の ttl は鍵の周期 + 猶予にしておく。
 1. **漏れた kid の行を鍵束から即座に削除する** (ローテの手順 4 と同じく、一時ファイルに書いて `mv` で置き換える)。次のリクエストから、その kid で鋳造した token は全て通らなくなる。別の kid で鋳造した機械は影響を受けない
 2. 必要なら、その機械のために新しい kid で初回の手順 1〜3 をやり直す (鍵束への追記と token の貼り替え。restart は要らない)
 3. 鍵束ファイル自体が漏れた疑いがある時は全行が漏洩扱い。新しい kid の行を追記して全機械の token を鋳造し直し、古い行を全て削除する
-4. 自動の鍵のファイル (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) が漏れた疑いがある時は、全 unit を止めてからファイルを消し、unit を起動し直す (起動時に新しい自動の鍵が作られる)。`auth token` を使うクライアントは次の呼び直しで新しい鍵の token を受け取る。止めずに消すと、走っている unit は前の束を保ったまま検証を続ける
+4. **ns を消した・改名した時は、state の自動の鍵のファイル (`<[stats] dir>/jwt-keys/<旧 ns>.jwks.jsonl` と `.lock`) も消す。** daemon は消さず、同じ名前の `jwt` の ns を書き直すとその鍵がまた効く。全 unit の設定からその ns が消えたことを確かめてから消す (`check` が `warning: these automatic keys belong to no jwt namespace of this configuration` に挙げる)
+5. 自動の鍵のファイル (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) が漏れた疑いがある時は、全 unit を止めてからファイルを消し、unit を起動し直す (起動時に新しい自動の鍵が作られる)。`auth token` を使うクライアントは次の呼び直しで新しい鍵の token を受け取る。止めずに消すと、走っている unit は前の束を保ったまま検証を続ける
 
 ## 失敗時の切り分け
 

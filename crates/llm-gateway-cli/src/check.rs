@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use llm_gateway::Config;
-use llm_gateway::config::NsAuth;
+use llm_gateway::config::{NsAuth, jwt};
 use llm_gateway::credential::file::FileStore;
 use llm_gateway::credential::{CredentialId, Persistence};
 
@@ -64,6 +64,20 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
     {
         println!("\nwarning: the binary written in [server] binary_path is not there:");
         println!("  {}", binary.display());
+    }
+
+    let orphans = orphaned_automatic_keys(&config);
+    if !orphans.is_empty() {
+        println!(
+            "\nwarning: these automatic keys belong to no jwt namespace of this configuration:"
+        );
+        for path in &orphans {
+            println!("  {}", path.display());
+        }
+        println!(
+            "  they hold private keys, and a jwt namespace of the same name would accept them again;"
+        );
+        println!("  delete them (and their .lock) once the namespace is gone for every unit");
     }
 
     let unrouted = config.namespaces_without_routing();
@@ -138,6 +152,32 @@ pub fn run(config_path: &Path) -> Result<ExitCode, Failure> {
     Ok(ExitCode::FAILURE)
 }
 
+/// 設定に `jwt` の namespace として無い名前の自動の鍵のファイル (DR-0037 §12)。
+///
+/// ns を消した・改名した後も秘密鍵は state に残り、同じ名前の ns を書くとその鍵が
+/// また効く。daemon には消させず (別の設定の unit が使っているかもしれない)、人に
+/// 知らせる。
+fn orphaned_automatic_keys(config: &Config) -> Vec<std::path::PathBuf> {
+    let Some(dir) = config.auto_keys_path("_").parent().map(Path::to_path_buf) else {
+        return Vec::new();
+    };
+    let mut orphans: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let ns = name.strip_suffix(".jwks.jsonl")?;
+            let wanted = config
+                .namespace(ns)
+                .is_some_and(|n| matches!(n.auth, NsAuth::Jwt(_)));
+            (!wanted).then(|| entry.path())
+        })
+        .collect();
+    orphans.sort();
+    orphans
+}
+
 /// namespace ごとの要約行。
 ///
 /// 名前を並べるだけでは、節が丸ごと消えていても「居る」ようにしか見えない。
@@ -157,24 +197,29 @@ fn namespace_summary_lines(config: &Config) -> Vec<String> {
                 lines.push(format!("  {:<11}keys_file {}", "", path.display()));
             }
             lines.push(format!("  {:<11}kids {}", "", jwt.ring.kids().join(", ")));
-            // gateway が入れ替える鍵の置き場と周期 (DR-0037)。
-            lines.push(format!(
-                "  {:<11}automatic keys {} (every {})",
-                "",
-                config.auto_keys_path(name).display(),
-                llm_gateway::config::format_duration_secs(jwt.key_rotation_secs)
-            ));
-            let automatic = jwt
-                .auto_ring
-                .as_ref()
-                .map(|ring| ring.kids())
-                .unwrap_or_default();
-            if !automatic.is_empty() {
-                lines.push(format!(
-                    "  {:<11}automatic kids {}",
+            // gateway が入れ替える鍵の置き場と周期 (DR-0037)。daemon の外では警告が
+            // 見えないので、まだ無いのか読めないのかをここで言い分ける。
+            let auto_path = config.auto_keys_path(name);
+            let every = llm_gateway::config::format_duration_secs(jwt.key_rotation_secs);
+            match jwt::auto::kids(&auto_path) {
+                Ok(Some(kids)) if !kids.is_empty() => {
+                    lines.push(format!(
+                        "  {:<11}automatic keys {} (every {every})",
+                        "",
+                        auto_path.display()
+                    ));
+                    lines.push(format!("  {:<11}automatic kids {}", "", kids.join(", ")));
+                }
+                Ok(_) => lines.push(format!(
+                    "  {:<11}automatic keys {} (every {every}, none yet; a running unit makes one)",
                     "",
-                    automatic.join(", ")
-                ));
+                    auto_path.display()
+                )),
+                Err(e) => lines.push(format!(
+                    "  {:<11}automatic keys {}: cannot read ({e})",
+                    "",
+                    auto_path.display()
+                )),
             }
         }
     }
@@ -313,7 +358,7 @@ main = "keepalive"
                 format!("             keys_file {}", ring.display()),
                 "             kids mbp, mini".to_owned(),
                 format!(
-                    "             automatic keys {} (every 7d)",
+                    "             automatic keys {} (every 7d, none yet; a running unit makes one)",
                     automatic.display()
                 ),
             ]
@@ -331,6 +376,70 @@ main = "keepalive"
         );
         let secret = jwk("mbp", 1)["d"].as_str().unwrap().to_owned();
         assert!(!lines.concat().contains(&secret));
+
+        // 壊れた自動の鍵束は「まだ無い」と区別して、読めない理由を出す (秘密は出さない)。
+        let mut mixed = jwk("claude-2026-10-06-0c0d", 4);
+        let hidden = mixed["d"].as_str().unwrap().to_owned();
+        mixed["x"] = jwk("other", 5)["x"].clone();
+        std::fs::write(&automatic, format!("{mixed}\n")).unwrap();
+        let lines = namespace_summary_lines(&load(&path).unwrap());
+        let last = lines.last().unwrap();
+        assert!(
+            last.starts_with(&format!(
+                "             automatic keys {}: cannot read (line 1",
+                automatic.display()
+            )),
+            "{last}"
+        );
+        assert!(!lines.concat().contains(&hidden), "{last}");
+    }
+
+    /// 設定に `jwt` の namespace として無い名前の自動の鍵のファイルを挙げる (ns を消した・
+    /// 改名した後に秘密鍵が残っている)。
+    #[test]
+    fn automatic_keys_of_namespaces_not_in_the_configuration_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = dir.path().join("lab.jwks.jsonl");
+        std::fs::write(
+            &ring,
+            llm_gateway::config::jwt::private_jwk(
+                "k",
+                &llm_gateway::config::jwt::signing_key(&[1; 32]),
+            )
+            .to_string(),
+        )
+        .unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[stats]\ndir = \"{}\"\n[ns.lab]\nauth = \"jwt\"\nmax_ttl = \"1d\"\nkeys_file = \"{}\"\n[ns.open]\n",
+                dir.path().join("stats").display(),
+                ring.display()
+            ),
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert!(
+            orphaned_automatic_keys(&config).is_empty(),
+            "no directory yet"
+        );
+        let keys = dir.path().join("stats/jwt-keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        for name in [
+            "lab.jwks.jsonl",
+            "lab.jwks.jsonl.lock",
+            "gone.jwks.jsonl",
+            "gone.jwks.jsonl.lock",
+            "open.jwks.jsonl",
+            "lab.jwks.jsonl.tmp.1.2",
+        ] {
+            std::fs::write(keys.join(name), "").unwrap();
+        }
+        assert_eq!(
+            orphaned_automatic_keys(&config),
+            vec![keys.join("gone.jwks.jsonl"), keys.join("open.jwks.jsonl")]
+        );
     }
 
     /// 待ち受け行は、無効かどうかで書き分ける。住所そのものは伏せない。
