@@ -1,6 +1,6 @@
 ---
 title: Claude Code の /low-priority (anthropic-usage-limit: slow) の 429 slot_busy / 529 を DR-0009 の断りとして扱わず透過する
-status: open
+status: resolved
 category: design
 created: 2026-09-25T08:04:43+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T14:12:53+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0036","implemented","done:a8e2e43 で実装 (kawaz 裁定 2026-10-06)。slow 付きは 429/529 で経路を替えず印も付けず透過、全経路が印で塞がっても上流に当てる、pace_cap 対象外、401/403/5xx は従来どおり。slot_busy 以外の slow status と slow ヘッダ無し 429 も透過。MANUAL 日英に節追加。未確認: 実 request 観測と課金"]
 blocked_by:
 origin: 自リポ TODO
 ---
