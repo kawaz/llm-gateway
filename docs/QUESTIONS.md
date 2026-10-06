@@ -27,19 +27,11 @@ open issue の消化 (2026-10-06) で、着手前に方針の一言が要るも�
 - [ ] a (推し): 値が変わる時は差分を出して止め、`--force` で通す。reference `cli-daemon-subcommands` の「意図しない置き換えは止める」に沿う。daemon 側の検知 (名乗る場所と導出の比較) は別 PR
 - [ ] b: 黙って書き換える現状のまま、warning だけ出す
 
-### IS-Q5 サブスク OAuth の probe を Claude Code の形に揃える範囲
-
-[oauth-requires-claude-code-shape](issue/2026-09-03-oauth-requires-claude-code-shape.md)。usage の probe (`preset/anthropic/quota_api.rs`) は User-Agent / x-app / `metadata.user_id` 等が無く、上流が「Claude Code の形でない」と弾く形のまま。
-
-- [ ] a (推し): probe を Claude Code の形に揃えるだけ先にやる。「429 `Error` を即 4xx 扱い」は DR-0009 の例外になるので、弾かれる実害を確かめてから別に決める
-- [ ] b: 両方まとめてやる
-- [ ] c: 実害 (probe が弾かれているか) を確かめてから決める
-
 ### IS-Q6 Sonnet 5.5 の issue に残る「linked account の対応を設定で表す」
 
 [sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](issue/2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md)。本体は DR-0035 で実装済み。受け入れ条件のこの 1 項目だけ機構が無い。
 
-- [ ] a (推し): 不要として close。DR-0035 は account をそのまま束縛の単位にしていて、linked の対応表を要する場面が出ていない
+- [x] a (推し): 不要として close。DR-0035 は account をそのまま束縛の単位にしていて、linked の対応表を要する場面が出ていない
 - [ ] b: 後続 issue に切り出して close
 
 ### IS-Q7 DR-0035 の改定: thinking の出所を session でなく「連なり (session + subagent の agent id)」で持つ
