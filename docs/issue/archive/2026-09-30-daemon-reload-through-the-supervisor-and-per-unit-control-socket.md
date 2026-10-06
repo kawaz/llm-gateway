@@ -1,6 +1,6 @@
 ---
 title: daemon reload — 設定の reload を restart 無しで行う (監督者経由 + unit ごとの制御 socket)
-status: open
+status: resolved
 category: design
 created: 2026-09-30T07:54:16+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:00:41+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0032","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---
