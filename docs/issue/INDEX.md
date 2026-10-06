@@ -5,7 +5,6 @@
 | 2026-10-04 | design | open | [service-reregister-env-drift-not-detected](./2026-10-04-service-reregister-env-drift-not-detected.md) | service register は XDG を plist に固定しているが、re-register で値が変わっても止まらず、client 側の検知も無い (hyoui からのフラグ) |
 | 2026-09-30 | design | open | [sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](./2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md) | Sonnet 5.5 の thinking は account 束縛なので route 切替で黙って消える。切替に慎重になるオプションの検討 |
 | 2026-09-25 | design | open | [low-priority-slow-requests-should-wait-not-switch](./2026-09-25-low-priority-slow-requests-should-wait-not-switch.md) | Claude Code の /low-priority (anthropic-usage-limit: slow) の 429/529 を DR-0009 の断りとして扱わず透過する |
-| 2026-09-24 | bug | open | [keepalive-restore-test-double-send-in-ci](./2026-09-24-keepalive-restore-test-double-send-in-ci.md) | keepalive の復元テストが CI で 1 回だけ 2 回送出 (`2 != 1`) した真因が未特定 |
 | 2026-09-17 | design | open | [plan-command-routing-and-quota-forecast](./2026-09-17-plan-command-routing-and-quota-forecast.md) | plan command で routing 解決 + quota forecast を pull 型で出す |
 | 2026-09-15 | design | open | [store-layer-for-replaceable-persistence](./2026-09-15-store-layer-for-replaceable-persistence.md) | 永続化の器を Store 層として責務で切り、file backend を差し替え可能にする |
 | 2026-09-10 | request | open | [supervisor-log-reopen-on-rotation](./2026-09-10-supervisor-log-reopen-on-rotation.md) | 監督者のログ fd をログローテーション後に開き直す |

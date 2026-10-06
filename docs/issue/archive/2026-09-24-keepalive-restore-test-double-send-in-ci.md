@@ -1,6 +1,6 @@
 ---
 title: keepalive の復元テストが CI で 1 回だけ 2 回送出 (`2 != 1`) した真因が未特定
-status: open
+status: resolved
 category: bug
 created: 2026-09-24T00:40:50+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:30:17+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","commit/d491d14"]
 blocked_by:
 origin: 自リポ TODO
 ---
