@@ -624,6 +624,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             series,
             shape,
             thinking,
+            low_priority: session::low_priority(&headers),
         };
         let mut routes = self
             .router
@@ -664,8 +665,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         // 上限を書いた経路の枠が読めていないなら、**判定の前に**聞いておく
         // (DR-0019 §6)。読めないままだとその経路は通らず、通らなければ応答
         // ヘッダも読めない (= 一度も貸せないまま閉じ続ける)。枠照会は
-        // トークンを消費しないので、ここで待つ価値がある。
-        self.fill_quota_for_capped(&routes, now).await;
+        // トークンを消費しないので、ここで待つ価値がある。低優先度の 1 本は
+        // 上限に掛けない (DR-0036) ので、判定のために待つ理由も無い。
+        if !call.low_priority {
+            self.fill_quota_for_capped(&routes, now).await;
+        }
 
         // 断られている経路は飛ばす。全滅なら router が 429 を組んで返す
         // (「候補が空」は経路を選ぶ側の判断、DR-0014 §8)。
@@ -674,6 +678,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             &model,
             now,
             &call.origin(crate::stats::NO_CREDENTIAL),
+            call.low_priority,
         ) {
             Selection::Ready { routes, skipped } => (routes, skipped),
             Selection::AllDenied { response, until } => {
@@ -737,14 +742,22 @@ impl<P: CredentialPersistence> Gateway<P> {
                             self.router
                                 .remember_source(&session, agent.as_deref(), &model, route);
                         }
-                        // 通ったなら締め出しの根拠は消えている。
-                        route.preset.allow(&model);
+                        // 通ったなら締め出しの根拠は消えている。ただし低優先度で
+                        // 通っても、通常の優先度の上限が開いた証拠にはならない
+                        // (上限に当たった後も通るのが低優先度枠)。印は通常の
+                        // 優先度の観測だけで付け外しする (DR-0036)。
+                        if !call.low_priority {
+                            route.preset.allow(&model);
+                        }
                     }
                     // 採用した応答は upstream に届いた証拠なので、成功でなくても
                     // 到達できたこと自体は数える (DR-0021 §2)。数えないのは
                     // upstream 障害を疑う 5xx で、そちらは 529 と transport error
                     // だけを failing として別に記録する。credential や枠の断り
-                    // (401 / 403 / 429) はこの分岐まで来ない。
+                    // (401 / 403 / 429) はこの分岐まで来ない。低優先度で透過した
+                    // 429 / 529 は来る。429 は届いた証拠として数え、529 は failing
+                    // にしない — 低優先度枠の混み具合で、上流の障害とは限らない
+                    // (DR-0036)。
                     if resp.status < 500 {
                         self.status.observe_success(route.name()).await;
                     }
@@ -953,10 +966,10 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         // 交渉するものを載せていないなら、失敗の原因は他にある。
         if resp.status != 400 || sent.is_empty() {
-            return Ok(Attempt::of(resp, completion)?);
+            return Ok(Attempt::of(resp, completion, call.low_priority)?);
         }
         let Some(negotiation) = negotiation else {
-            return Ok(Attempt::of(resp, completion)?);
+            return Ok(Attempt::of(resp, completion, call.low_priority)?);
         };
 
         let (resp, raw) = egress::buffer(resp)
@@ -964,7 +977,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             .map_err(|e| Switch::to_next(e.to_string()))?;
         let raw = String::from_utf8_lossy(&raw);
         let Some(blamed) = negotiation.blame(&raw, &sent) else {
-            return Ok(Attempt::of(resp, completion)?);
+            return Ok(Attempt::of(resp, completion, call.low_priority)?);
         };
 
         warn!(
@@ -992,7 +1005,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         let resp = self
             .admit(route, call.model, sent_response.response)
             .await?;
-        Ok(Attempt::of(resp, sent_response.completion)?)
+        Ok(Attempt::of(
+            resp,
+            sent_response.completion,
+            call.low_priority,
+        )?)
     }
 
     async fn admit(
@@ -1435,6 +1452,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         event.thinking_as_text = crossing == Crossing::ThinkingAsText;
         event.thinking_dropped_by_switch = crossing == Crossing::ThinkingDropped;
         event.safeguards_dropped = safeguards_dropped;
+        event.low_priority = call.low_priority;
         self.events.publish(event);
         // 応答が閉じたときの知らせは、素性がここで揃う。終わり方が分かるのは
         // 本文を流し切ったところ ([`crate::exchange`]) なので、下書きだけを
@@ -1860,6 +1878,11 @@ struct Call<'a> {
     /// thinking を運ぶ 1 本なら、session の出所と跨ぐときの振る舞い (DR-0035 §3)。
     /// 運ばない 1 本は `None` で、跨ぎの判定も候補の絞りもしない。
     thinking: Option<ThinkingSession>,
+    /// クライアントが低優先度で送り、混雑・上限の断りを自分で待つ 1 本か
+    /// (DR-0036)。見分け方はクライアント方言の知識なので入口 ([`session`]) が
+    /// 読む。立っていれば、429 / 529 で経路を替えず、印も付けず、消費の上限
+    /// (DR-0019) にも掛けない。
+    low_priority: bool,
 }
 
 impl<'a> Call<'a> {
@@ -1992,8 +2015,9 @@ impl Attempt {
     fn of(
         response: Response,
         completion: Option<exchange::Completion>,
+        low_priority: bool,
     ) -> std::result::Result<Self, Switch> {
-        accept_or_switch(response).map(|response| Self {
+        accept_or_switch(response, low_priority).map(|response| Self {
             response,
             completion,
         })
@@ -2196,10 +2220,16 @@ impl From<Switch> for Failure {
 }
 
 /// この応答をクライアントへ返すか、別の経路を試すか。
-fn accept_or_switch(resp: Response) -> std::result::Result<Response, Switch> {
+///
+/// `low_priority` は、クライアントが断りを自分で待つと言っている 1 本
+/// ([`is_wait_answer`])。
+fn accept_or_switch(resp: Response, low_priority: bool) -> std::result::Result<Response, Switch> {
     let reason = format!("upstream returned {}", resp.status);
     if should_try_next(resp.status) {
         return Err(Switch::to_next(reason));
+    }
+    if low_priority && is_wait_answer(resp.status) {
+        return Ok(resp);
     }
     if is_route_denial(resp.status) {
         return Err(Switch {
@@ -2236,6 +2266,20 @@ fn should_try_next(status: u16) -> bool {
 /// 応答は捨てずに持ち回る。全部断られたときは、これをそのまま返す。
 fn is_route_denial(status: u16) -> bool {
     matches!(status, 401 | 403 | 429 | 529)
+}
+
+/// 低優先度で送った 1 本なら、経路を替えずにそのまま返す断りか (DR-0036)。
+///
+/// 低優先度枠の上流は、混んでいる・枠を待てば通る 1 本を 429 / 529 で返し、
+/// 待つ長さと理由を応答ヘッダに載せる。クライアントはそれを読んで自分で待ち、
+/// 同じ 1 本を送り直す。ここで別の経路へ回すと、待てば通った 1 本で別の
+/// アカウントの枠を使い、印を付けた後の 1 本はこちらが組む 429 (待つための
+/// ヘッダが無い) に化ける。
+///
+/// 待っても直らない断り (401 / 403) と経路断 (5xx) は含めない。そちらは
+/// 優先度に依らず、別の経路へ回す価値がある (DR-0009)。
+fn is_wait_answer(status: u16) -> bool {
+    matches!(status, 429 | 529)
 }
 
 struct WebLoginSession {
@@ -3753,6 +3797,235 @@ routes = ["a", "b"]
             "tells when the earliest one reopens"
         );
         assert_eq!((far.hits(), near.hits()), (0, 0), "hits neither");
+    }
+
+    /// クライアントが低優先度で送ると名乗るヘッダ (DR-0036)。
+    fn low_priority() -> Vec<(String, String)> {
+        vec![(
+            crate::session::LOW_PRIORITY_HEADER.to_owned(),
+            "slow".to_owned(),
+        )]
+    }
+
+    /// 低優先度枠の上流が「待てば通る」と答えるときのヘッダ。
+    const SLOT_BUSY: &[(&str, &str)] = &[
+        ("anthropic-ratelimit-unified-slow-status", "slot_busy"),
+        ("anthropic-ratelimit-unified-slow-retry-after", "20"),
+    ];
+
+    async fn forward_headers(
+        gw: &Gateway<StaticStore>,
+        headers: Vec<(String, String)>,
+    ) -> Forwarded {
+        gw.forward(
+            &ns(gw),
+            NS,
+            Ingress {
+                path: "/v1/messages",
+                query: None,
+                shape: RequestShape::Messages,
+            },
+            request(),
+            headers,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// 低優先度の 429 (`slot_busy`) / 529 は、経路を替えず印も付けずに、
+    /// 上流のヘッダごとそのまま返す (DR-0036)。替えると、待てば通った 1 本で
+    /// 別のアカウントの枠を使う。
+    #[tokio::test]
+    async fn a_low_priority_wait_answer_is_passed_through_without_switching() {
+        for status in [429, 529] {
+            let busy =
+                FakeUpstream::start_with_headers(SLOT_BUSY, move |_, _| (status, body_for(status)))
+                    .await;
+            let spare = FakeUpstream::always(200).await;
+            let gw = gateway(&two_credentials(&busy.url, &spare.url)).await;
+
+            let resp = forward_headers(&gw, low_priority()).await;
+
+            assert_eq!(resp.response.status, status);
+            assert_eq!(resp.route, "a");
+            assert_eq!(
+                resp.response
+                    .headers
+                    .get("anthropic-ratelimit-unified-slow-status"),
+                Some("slot_busy"),
+                "{status}: the client reads this to wait: {:?}",
+                resp.response.headers
+            );
+            assert_eq!(
+                resp.response
+                    .headers
+                    .get("anthropic-ratelimit-unified-slow-retry-after"),
+                Some("20")
+            );
+            assert_eq!(spare.hits(), 0, "{status}: another account is not used");
+            assert_eq!(
+                preset_of(&gw, "a").availability(MODEL, now_unix()),
+                Availability::Ready,
+                "{status}: no cooldown is placed"
+            );
+            assert!(
+                busy.requests()[0]
+                    .to_ascii_lowercase()
+                    .contains("anthropic-usage-limit: slow"),
+                "the header itself still reaches the upstream"
+            );
+        }
+    }
+
+    /// 名乗らない 1 本は従来どおり: 同じ 429 / 529 で次の経路へ回り、印が付く。
+    #[tokio::test]
+    async fn a_normal_request_still_switches_on_the_same_answer() {
+        for status in [429, 529] {
+            let busy =
+                FakeUpstream::start_with_headers(SLOT_BUSY, move |_, _| (status, body_for(status)))
+                    .await;
+            let spare = FakeUpstream::always(200).await;
+            let gw = gateway(&two_credentials(&busy.url, &spare.url)).await;
+
+            let resp = forward_headers(&gw, vec![]).await;
+
+            assert_eq!((resp.response.status, resp.route.as_str()), (200, "b"));
+            assert!(
+                matches!(
+                    preset_of(&gw, "a").availability(MODEL, now_unix()),
+                    Availability::Denied { .. }
+                ),
+                "{status}: the refusing route is held"
+            );
+        }
+    }
+
+    /// 全経路が印で塞がっていても、低優先度の 1 本はこちらで 429 を組まずに
+    /// 上流へ当てる。こちらの 429 には待つためのヘッダが無い (DR-0036)。
+    /// 印は通常の優先度の記録なので、通っても消さない。
+    #[tokio::test]
+    async fn a_low_priority_request_reaches_the_upstream_past_every_cooldown() {
+        let first = FakeUpstream::start_with_headers(SLOT_BUSY, |_, _| (429, body_for(429))).await;
+        let second = FakeUpstream::always(200).await;
+        let gw = gateway(&two_credentials(&first.url, &second.url)).await;
+        let now = now_unix();
+        for route in ["a", "b"] {
+            preset_of(&gw, route).deny(window_closed(now + 1000), now);
+        }
+
+        let mut watching = gw.events().subscribe();
+        let resp = forward_headers(&gw, low_priority()).await;
+
+        assert_eq!(resp.response.status, 429);
+        assert_eq!(resp.route, "a", "the upstream answered, not the router");
+        assert_eq!(
+            resp.response
+                .headers
+                .get("anthropic-ratelimit-unified-slow-status"),
+            Some("slot_busy")
+        );
+        assert_eq!((first.hits(), second.hits()), (1, 0), "tried in order");
+        let event = announced(watching.recv().await.unwrap());
+        assert_eq!((event.credential.as_str(), event.status), ("a", 429));
+        assert!(event.low_priority);
+        assert!(event.skipped.is_empty(), "the tried route is not skipped");
+
+        // 低優先度で通っても、通常の優先度の上限が開いた証拠にはならない。
+        let passed = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&passed.url)).await;
+        preset_of(&gw, "a").deny(window_closed(now + 1000), now);
+        let resp = forward_headers(&gw, low_priority()).await;
+        assert_eq!(resp.response.status, 200);
+        assert!(
+            matches!(
+                preset_of(&gw, "a").availability(MODEL, now_unix()),
+                Availability::Denied { .. }
+            ),
+            "the mark stays for normal-priority requests"
+        );
+    }
+
+    /// 低優先度でも、待っても直らない断り (401) と経路断 (5xx) は次へ回す
+    /// (DR-0009 のまま)。
+    #[tokio::test]
+    async fn a_low_priority_request_still_switches_on_auth_failure_and_outage() {
+        for status in [401, 503] {
+            let broken = FakeUpstream::always(status).await;
+            let spare = FakeUpstream::always(200).await;
+            let gw = gateway(&two_credentials(&broken.url, &spare.url)).await;
+
+            let resp = forward_headers(&gw, low_priority()).await;
+
+            assert_eq!(
+                (resp.response.status, resp.route.as_str()),
+                (200, "b"),
+                "{status} moves on"
+            );
+        }
+    }
+
+    /// 低優先度の 1 本は消費の上限 (DR-0019) に掛けない。本人が先の枠を
+    /// 前借りすると選んでいる。名乗らない 1 本は従来どおり上限で外れる。
+    #[tokio::test]
+    async fn a_low_priority_request_is_not_held_by_the_pace_cap() {
+        let capped = FakeUpstream::always(200).await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[routes.b]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = [{{ route = "a", pace_cap = {{ ratio = "100%", step = "1d" }} }}, "b"]
+"#,
+            capped.url, spare.url
+        ))
+        .await;
+        // 週の窓が開いたばかりで、もう使い切っている。予算は 0。
+        const WEEK: u64 = 7 * 24 * 60 * 60;
+        let now_ms = crate::credential::time::now_unix_ms();
+        let window = quota::Window {
+            utilization: Some(1.0),
+            ..quota::Window::default()
+        }
+        .with_reset(Some(now_ms + WEEK as i64 * 1000))
+        .with_window_seconds(Some(WEEK));
+        preset_of(&gw, "a")
+            .restore_quota(quota::Snapshot::new(now_ms, None, Some(window), None).unwrap());
+
+        // 低優先度を先に送る。通った経路は会話に結びつく (affinity) ので、
+        // 後に送ると先の 1 本が通った経路から始まる。
+        assert_eq!(forward_headers(&gw, low_priority()).await.route, "a");
+        assert_eq!(
+            forward_headers(&gw, vec![]).await.route,
+            "b",
+            "a normal request is held even on the route the conversation used"
+        );
+        assert_eq!((capped.hits(), spare.hits()), (1, 1));
+    }
+
+    /// 低優先度の印は知らせの `request` に出る。名乗らない 1 本では欄ごと出ない。
+    #[tokio::test]
+    async fn the_low_priority_mark_is_announced() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway(&one_credential(&up.url)).await;
+
+        let mut watching = gw.events().subscribe();
+        forward_headers(&gw, low_priority()).await;
+        forward_headers(&gw, vec![]).await;
+
+        let slow = serde_json::to_value(announced(watching.recv().await.unwrap())).unwrap();
+        let normal = serde_json::to_value(announced(watching.recv().await.unwrap())).unwrap();
+        assert_eq!(slow["low_priority"], json!(true));
+        assert!(normal.get("low_priority").is_none(), "{normal}");
     }
 
     /// 待っても直らない断り (401 / 403) では締め出さない。

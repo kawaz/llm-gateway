@@ -977,18 +977,40 @@ impl Router {
     /// その答えも選ぶ側が出す (DR-0014 §8)。見ている人にも 1 件流す — upstream
     /// を叩いていないだけで、クライアントには断りが返っている。`origin` の
     /// `credential` は呼び出し側が決める (この応答を出したのはどの経路でもない)。
+    ///
+    /// `low_priority` はクライアントが低優先度で送り、断りを自分で待つ 1 本
+    /// (DR-0036)。消費の上限には掛けない — 本人が先の枠を前借りすると選んで
+    /// いる。上限・混雑の印は通常の優先度で受けた断りの記録なので、使える経路が
+    /// ある間は通常どおり外すが、**全部が印で塞がっていても 429 を組まず**、
+    /// 印の付いた経路を設定順のまま渡す。こちらが組んだ 429 には、クライアントが
+    /// 待つのに読む上流のヘッダが載らない。組織ごとの断りだけは優先度に依らない
+    /// ので外す。
     pub fn select(
         &self,
         routes: &[Arc<Route>],
         model: &str,
         now: i64,
         origin: &events::Origin<'_>,
+        low_priority: bool,
     ) -> Selection {
         let mut ready = Vec::new();
         let mut skipped = Vec::new();
         let mut opens_at = Vec::new();
+        // 低優先度の 1 本が、使える経路が無いときに当てる先。
+        let mut waiting = Vec::new();
         for route in routes {
-            if let Some(held) = route.paced_out(now) {
+            if low_priority {
+                // 印の中で一番遅く開くものしか availability は答えないので、
+                // 組織ごとの断りは別に聞く (上限の印の陰に隠れうる)。
+                if let Some(until) = route.preset.org_not_allowed(now) {
+                    skipped.push(events::Skipped {
+                        credential: route.name().to_owned(),
+                        reason: Reason::OrgNotAllowed,
+                    });
+                    opens_at.push(until);
+                    continue;
+                }
+            } else if let Some(held) = route.paced_out(now) {
                 info!(
                     route = route.name(),
                     model = %model,
@@ -1011,12 +1033,23 @@ impl Router {
                         reason,
                     });
                     opens_at.push(until);
+                    if low_priority {
+                        waiting.push(Arc::clone(route));
+                    }
                 }
             }
         }
         if !ready.is_empty() {
             return Selection::Ready {
                 routes: ready,
+                skipped,
+            };
+        }
+        if !waiting.is_empty() {
+            // 当てる経路を「外した」とは載せない。外したのは組織ごとの断りだけ。
+            skipped.retain(|skip| skip.reason == Reason::OrgNotAllowed);
+            return Selection::Ready {
+                routes: waiting,
                 skipped,
             };
         }
@@ -1942,7 +1975,13 @@ exclude = ["route-hidden-*"]
             )
             .await
             .unwrap();
-        match r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5")) {
+        match r.select(
+            &routes,
+            "claude-sonnet-5",
+            NOW,
+            &origin("claude-sonnet-5"),
+            false,
+        ) {
             Selection::Ready { routes, .. } => routes.iter().map(|r| r.name().to_owned()).collect(),
             Selection::AllDenied { .. } => Vec::new(),
         }
@@ -1978,7 +2017,13 @@ exclude = ["route-hidden-*"]
         let Selection::Ready {
             routes: ready,
             skipped,
-        } = r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
+        } = r.select(
+            &routes,
+            "claude-sonnet-5",
+            NOW,
+            &origin("claude-sonnet-5"),
+            false,
+        )
         else {
             panic!("the uncapped route remains available");
         };
@@ -2037,7 +2082,7 @@ exclude = ["route-hidden-*"]
         let Selection::Ready {
             routes: ready,
             skipped,
-        } = r.select(&routes, "claude-sonnet-5", NOW, &origin("m"))
+        } = r.select(&routes, "claude-sonnet-5", NOW, &origin("m"), false)
         else {
             panic!("nothing is denied without a cap");
         };
@@ -2107,9 +2152,13 @@ exclude = ["route-hidden-*"]
             .await
             .unwrap();
         assert_eq!(names(&routes), vec!["oauth-a"], "no fallback exists");
-        let Selection::AllDenied { until, .. } =
-            r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
-        else {
+        let Selection::AllDenied { until, .. } = r.select(
+            &routes,
+            "claude-sonnet-5",
+            NOW,
+            &origin("claude-sonnet-5"),
+            false,
+        ) else {
             panic!("the only route is over its pace");
         };
         assert_eq!(until, NOW + DAY, "reopens when the next step arrives");
@@ -2146,9 +2195,13 @@ exclude = ["route-hidden-*"]
             .routes_for_at(ns, GROUP_NS, "claude-sonnet-5", &session("s1"), NOW)
             .await
             .unwrap();
-        let Selection::Ready { routes: ready, .. } =
-            r.select(&routes, "claude-sonnet-5", NOW, &origin("claude-sonnet-5"))
-        else {
+        let Selection::Ready { routes: ready, .. } = r.select(
+            &routes,
+            "claude-sonnet-5",
+            NOW,
+            &origin("claude-sonnet-5"),
+            false,
+        ) else {
             panic!("the uncapped routes are still available");
         };
         assert_eq!(
@@ -2396,7 +2449,13 @@ exclude = ["route-hidden-*"]
         let Selection::Ready {
             routes: ready,
             skipped,
-        } = r.select(&routes, "claude-fable-5", NOW, &origin("claude-fable-5"))
+        } = r.select(
+            &routes,
+            "claude-fable-5",
+            NOW,
+            &origin("claude-fable-5"),
+            false,
+        )
         else {
             panic!("one should remain");
         };
@@ -2428,7 +2487,7 @@ exclude = ["route-hidden-*"]
         }
 
         let Selection::AllDenied { response, until } =
-            r.select(&routes, model, NOW, &origin(model))
+            r.select(&routes, model, NOW, &origin(model), false)
         else {
             panic!("should be all denied");
         };
@@ -2456,6 +2515,169 @@ exclude = ["route-hidden-*"]
         );
     }
 
+    /// 低優先度の 1 本は、全部が印で塞がっていても 429 を組まずに設定順で
+    /// 当てる (DR-0036)。上流の断りには、クライアントが待つのに読むヘッダが載る。
+    #[tokio::test]
+    async fn a_low_priority_request_is_not_answered_by_the_router() {
+        let r = router().await;
+        let model = "claude-fable-5";
+        let routes = r
+            .routes_for(&ns(&r), NS, model, &session("s1"))
+            .await
+            .unwrap();
+        for route in &routes {
+            route
+                .preset
+                .reject(429, &Headers::default(), None, model, NOW)
+                .expect("429 is denied");
+        }
+
+        let mut watching = r.events().subscribe();
+        let Selection::Ready {
+            routes: waiting,
+            skipped,
+        } = r.select(&routes, model, NOW, &origin(model), true)
+        else {
+            panic!("a low-priority request still reaches the upstream");
+        };
+        assert_eq!(names(&waiting), names(&routes), "in the configured order");
+        assert!(skipped.is_empty(), "the routes it tries are not skipped");
+        assert!(
+            watching.try_recv().is_err(),
+            "no self-made denial is announced"
+        );
+    }
+
+    /// 使える経路があれば、低優先度でも印の付いた経路は外す。通常の 1 本より
+    /// 悪い先へは送らない。
+    #[tokio::test]
+    async fn a_low_priority_request_prefers_an_open_route() {
+        let r = router().await;
+        let routes = r
+            .routes_for(&ns(&r), NS, "claude-fable-5", &session("s1"))
+            .await
+            .unwrap();
+        routes[0]
+            .preset
+            .reject(429, &Headers::default(), None, "claude-fable-5", NOW);
+
+        let Selection::Ready {
+            routes: ready,
+            skipped,
+        } = r.select(
+            &routes,
+            "claude-fable-5",
+            NOW,
+            &origin("claude-fable-5"),
+            true,
+        )
+        else {
+            panic!("one should remain");
+        };
+        assert_eq!(names(&ready), vec!["oauth-a"]);
+        assert_eq!(
+            skipped,
+            vec![events::Skipped {
+                credential: "bedrock".to_owned(),
+                reason: Reason::Busy,
+            }]
+        );
+    }
+
+    /// 組織ごとの断りは優先度に依らないので、低優先度でも外す。上限の印の
+    /// 陰に隠れていても見落とさない。
+    #[tokio::test]
+    async fn a_low_priority_request_still_skips_an_org_refusal() {
+        let r = router().await;
+        let model = "claude-fable-5";
+        let routes = r
+            .routes_for(&ns(&r), NS, model, &session("s1"))
+            .await
+            .unwrap();
+        let org = Denial {
+            until: NOW + 3600,
+            reason: Reason::OrgNotAllowed,
+            scope: Scope::Everything,
+        };
+        let limited = |until| Denial {
+            until,
+            reason: Reason::Limited,
+            scope: Scope::Everything,
+        };
+        // 1 本目: 組織ごとの断りより遅く開く、モデル群の枠の印が重なっている
+        // (範囲が違うので両方残る)。availability は遅い方しか答えない。
+        routes[0].preset.deny(org.clone(), NOW);
+        routes[0].preset.deny(
+            Denial {
+                until: NOW + 7200,
+                reason: Reason::Limited,
+                scope: Scope::Models("claude-fable-*".to_owned()),
+            },
+            NOW,
+        );
+        assert!(matches!(
+            routes[0].preset.availability(model, NOW),
+            Availability::Denied {
+                reason: Reason::Limited,
+                ..
+            }
+        ));
+        routes[1].preset.deny(limited(NOW + 600), NOW);
+
+        let Selection::Ready {
+            routes: waiting,
+            skipped,
+        } = r.select(&routes, model, NOW, &origin(model), true)
+        else {
+            panic!("the limited route is still tried");
+        };
+        assert_eq!(names(&waiting), vec![routes[1].name().to_owned()]);
+        assert_eq!(
+            skipped,
+            vec![events::Skipped {
+                credential: routes[0].name().to_owned(),
+                reason: Reason::OrgNotAllowed,
+            }]
+        );
+
+        // 全部が組織ごとに断られていれば、低優先度でも 429 になる。
+        routes[1].preset.deny(org, NOW);
+        assert!(matches!(
+            r.select(&routes, model, NOW, &origin(model), true),
+            Selection::AllDenied { .. }
+        ));
+    }
+
+    /// 低優先度の 1 本は消費の上限 (DR-0019) に掛けない。本人が先の枠を
+    /// 前借りすると選んでいる。
+    #[tokio::test]
+    async fn a_low_priority_request_is_not_paced() {
+        let r = router().await;
+        observe_usage(&r, "oauth-a", 3 * DAY, 1.0);
+        const ONLY_NS: &str = "paced-only";
+        let ns = &r.namespace(ONLY_NS).expect("declared in CONFIG");
+        let routes = r
+            .routes_for_at(ns, ONLY_NS, "claude-sonnet-5", &session("s1"), NOW)
+            .await
+            .unwrap();
+
+        let Selection::Ready {
+            routes: ready,
+            skipped,
+        } = r.select(
+            &routes,
+            "claude-sonnet-5",
+            NOW,
+            &origin("claude-sonnet-5"),
+            true,
+        )
+        else {
+            panic!("the pace cap does not hold a low-priority request");
+        };
+        assert_eq!(names(&ready), vec!["oauth-a"]);
+        assert!(skipped.is_empty());
+    }
+
     /// 自前で返した 429 も、見ている人には 1 件流れる。
     ///
     /// upstream を叩いていないだけで、クライアントには断りが返っている。
@@ -2475,7 +2697,7 @@ exclude = ["route-hidden-*"]
         }
 
         let mut watching = r.events().subscribe();
-        r.select(&routes, model, NOW, &origin(model));
+        r.select(&routes, model, NOW, &origin(model), false);
 
         let event = announced(watching.recv().await.unwrap());
         assert_eq!(event.status, 429);

@@ -132,6 +132,11 @@ pub struct Event {
     /// 応答にも review の結果は載らない。当てはまらない 1 本では欄ごと出さない。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub safeguards_dropped: bool,
+    /// クライアントが低優先度で送った 1 本 (DR-0036)。429 / 529 でも経路を
+    /// 替えずに返すので、断りが並んでも経路が尽きたとは限らない。当てはまらない
+    /// 1 本では欄ごと出さない。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub low_priority: bool,
 }
 
 /// 知らせに載せる、この呼び出しの素性。
@@ -217,6 +222,7 @@ impl Event {
             thinking_as_text: false,
             thinking_dropped_by_switch: false,
             safeguards_dropped: false,
+            low_priority: false,
         }
     }
 }

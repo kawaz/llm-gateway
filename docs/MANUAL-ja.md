@@ -188,6 +188,20 @@ on_thinking_crossing = "thinking_as_text"       # この namespace だけ上書�
 
 出所は `[stats] dir` の `thinking-sources/sources.json` に保存され、同じ置き場を見る unit (stable / unstable) で共有し、restart や設定の読み直しでも残る。連なりが最後に 2xx で通ってから 24 時間で忘れる。
 
+#### Claude Code の `/low-priority` (`anthropic-usage-limit: slow`)
+
+Claude Code の `/low-priority` は、通常の枠 (5h) の壁に当たった後も低優先度で作業を続ける機能で、週の枠を使う。有効にすると request に `anthropic-usage-limit: slow` が付き、上流は混んでいる 1 本を 429 (`slot_busy`) / 529 で返して、待つ長さを応答ヘッダ `anthropic-ratelimit-unified-slow-*` に載せる。Claude Code はそれを読んで自分で待ち、送り直す。
+
+gateway はこのヘッダを付けた 1 本を、通常の 1 本と次の点で違えて扱う (DR-0036)。設定は要らない。
+
+- **429 / 529 では次の経路へ回さず、その応答をヘッダごと返す**。別の credential へ回すと、待てば通った 1 本で別の subscription の枠を使う。`slot_busy` 以外の低優先度の状態 (`weekly_limit` / `budget_exhausted` / `ineligible` / `off`) も同じく返し、Claude Code が中断して知らせる。続けるなら `/low-priority` を外して通常の優先度で送り直す (通常の 1 本は従来どおり次の経路へ回る)
+- **断った経路を締め出さない**。2xx が返っても、通常の 1 本の締め出しは外さない (低優先度で通ることは、通常の枠が開いたことを意味しない)
+- **締め出しで全経路が塞がっていても、gateway 自身の 429 を返さず**、設定の順に上流へ当てる。gateway が組む 429 には、Claude Code が待つのに読むヘッダが無い。使える経路があるうちは、通常の 1 本と同じ経路を選ぶ
+- **`pace_cap` で外さない**。本人が週の枠の前借りを選んで送っている
+- 401 / 403 / 5xx と、組織ごと OAuth を断られた経路 (`org_not_allowed`) は通常の 1 本と同じ
+
+転送の知らせ ([`GET /llm-gateway/events`](#get-llm-gatewayevents)) の `request` には `low_priority: true` が付く。gateway 越しに `/low-priority` が効いているかはこれで確かめられる。
+
 応答は upstream のものをそのまま返す (`{"type":"message","content":[...]}`)。gateway 側で断る場合は Anthropic のエラー形式に揃えた JSON を返す。
 
 ```json
@@ -519,7 +533,7 @@ data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"s-1","ns":
 
 Claude Code の subagent が出した 1 本には、`session_id` の直後に `agent_id` (リクエストヘッダ `x-claude-code-agent-id` の値) が載る。subagent は main と同じ `session_id` を名乗るので、同じ会話のどの agent の 1 本かはこの欄で分かれる。main の 1 本と名乗らないクライアントでは欄ごと出ない。`response` の知らせにも同じ値が載る。
 
-`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。受けた形から読むので送り先の経路には依らず、Messages 形式を openai 経路へ送っても `main` / `sub` になる。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。`thinking_as_text` は account / model を跨いだ会話の thinking を text にして送った 1 本に、`thinking_dropped_by_switch` は `stay` / `drop_thinking` で跨いだ会話を本文のまま送った 1 本 (履歴の thinking が API に捨てられる見込み) に `true` で付き、当てはまらない 1 本では欄ごと出ない ([account / model を跨ぐ session の thinking](#account--model-を跨ぐ-session-の-thinking-account_bound_thinking--on_thinking_crossing))。`safeguards_dropped` は、クライアントが送った `safeguards` (Claude Code が auto mode の判定を server に頼む欄) を答えた経路が上流へ渡せなかった 1 本 (openai 経路) に `true` で付き、当てはまらない 1 本では欄ごと出ない。その応答には判定の結果 (`safeguard_results`) が載らず、Claude Code はそれを受けてプロセスが終わるまで main も subagent も server に判定を頼まなくなる (`/status` の Auto mode server が Disabled になる)。gateway は結果を作らない (作れば安全判定の偽装になる)。同じ 1 本で、落とした欄の一覧と会話・agent・モデル・経路を載せた警告がログに出る。
+`prefix` は system prompt の先頭ブロックのハッシュ (8 桁) で、同じ会話系列かを見分ける印。取れなければ欄ごと出ない。`origin` はその 1 本を出した側 (`main` / `sub` / `oneshot` / `unknown`、Responses 形式で受けた 1 本は `codex`、gateway 自身の送り直しは `keepalive`)。受けた形から読むので送り先の経路には依らず、Messages 形式を openai 経路へ送っても `main` / `sub` になる。`cache_ttl_secs` は**この 1 本が残すプレフィックスの寿命** (秒) で、効かせた戦略から決まり、本文に触らない場合は送った `cache_control` を読む (`ttl:"1h"` があれば 3600、無ければ 300)。`cache_expires_at` はその時刻。ブレークポイントの無い 1 本では 2 つとも欄ごと出ない。upstream に断られた試行 (2xx 以外) も cache を置いていないので寿命を約束せず、2 つとも以下の `cache_*` も出ない。経路選定で外した経路がある場合は `skipped` に credential と理由が並ぶ。`thinking_as_text` は account / model を跨いだ会話の thinking を text にして送った 1 本に、`thinking_dropped_by_switch` は `stay` / `drop_thinking` で跨いだ会話を本文のまま送った 1 本 (履歴の thinking が API に捨てられる見込み) に `true` で付き、当てはまらない 1 本では欄ごと出ない ([account / model を跨ぐ session の thinking](#account--model-を跨ぐ-session-の-thinking-account_bound_thinking--on_thinking_crossing))。`safeguards_dropped` は、クライアントが送った `safeguards` (Claude Code が auto mode の判定を server に頼む欄) を答えた経路が上流へ渡せなかった 1 本 (openai 経路) に `true` で付き、当てはまらない 1 本では欄ごと出ない。その応答には判定の結果 (`safeguard_results`) が載らず、Claude Code はそれを受けてプロセスが終わるまで main も subagent も server に判定を頼まなくなる (`/status` の Auto mode server が Disabled になる)。gateway は結果を作らない (作れば安全判定の偽装になる)。同じ 1 本で、落とした欄の一覧と会話・agent・モデル・経路を載せた警告がログに出る。`low_priority` はクライアントが低優先度で送った 1 本 (Claude Code の `/low-priority`) に `true` で付き、当てはまらない 1 本では欄ごと出ない。この 1 本は 429 / 529 でも次の経路へ回らないので、断りが並んでも経路が尽きたとは限らない ([Claude Code の `/low-priority`](#claude-code-の-low-priority-anthropic-usage-limit-slow))。
 
 `keepalive` 戦略で繋ぐ 1 本には、送り直しの連鎖の姿が付く (繋ぐ対象でなければ欄ごと出ない)。控えが置かれるのは応答を読み切った後だが、この欄は**その 1 本目から**出る — 見立ては送る時点の値だけで決まるため。cache に乗らずに終わった 1 本では、直後の `cache_expired` がその約束を取り消す:
 

@@ -179,3 +179,4 @@
 - [DR-0007](./DR-0007-usage-visibility.md) — 上限のヘッダを通りすがりに読む仕組み。締め出す期限はここで読んだ窓の状態とリセット時刻から決める。応答に載る窓は 5h / 7d の 2 つで、モデル別の窓は載らない (上の実測)。モデル別の制限は「頼んだモデルが 429 で返る」形でしか観測できないので、範囲の判定もそこから起こしている
 - [DR-0006](./DR-0006-namespace-routing.md) — namespace の単位。affinity を namespace で分けるのはこの単位に揃えるため
 - [DR-0008](./DR-0008-user-facing-language.md) — 新規の error message は英語
+- [DR-0036](./DR-0036-low-priority-requests-wait-instead-of-switching.md) — 本 DR の例外。クライアントが低優先度で送った 1 本は、429 / 529 で経路を替えず印も付けずに透過し、全経路が印で塞がっていても router の 429 を組まない

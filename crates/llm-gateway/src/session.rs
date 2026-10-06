@@ -49,6 +49,21 @@ pub fn agent_id(headers: &[(String, String)]) -> Option<String> {
     header(headers, AGENT_HEADER).map(str::to_owned)
 }
 
+/// Claude Code の `/low-priority` が request に付けるヘッダと、その値。
+///
+/// 付けた 1 本は subscription の低優先度枠で送られ、上流は「待てば通る」429
+/// (`slot_busy`) / 529 を返す。Claude Code は応答の
+/// `anthropic-ratelimit-unified-slow-*` を読んで自分で待ち、同じ request を送り
+/// 直す (v2.1.282 の binary で確認)。値は `slow` だけを見る。
+pub const LOW_PRIORITY_HEADER: &str = "anthropic-usage-limit";
+const LOW_PRIORITY_VALUE: &str = "slow";
+
+/// クライアントがこの 1 本を低優先度で送り、混雑や上限の断りを自分で待つと
+/// 言っているか (DR-0036)。
+pub fn low_priority(headers: &[(String, String)]) -> bool {
+    header(headers, LOW_PRIORITY_HEADER).is_some_and(|v| v.eq_ignore_ascii_case(LOW_PRIORITY_VALUE))
+}
+
 /// Claude Code が auto mode の判定を server に頼む、request の最上位の欄。
 ///
 /// 応答の `message_delta` に `safeguard_results` が返る前提の往復で、経路がこの
@@ -354,5 +369,21 @@ mod tests {
             None
         );
         assert_eq!(agent_id(&headers(&[(AGENT_HEADER, " ")])), None);
+    }
+
+    /// 低優先度の名乗りは名前も値も大文字小文字を問わず読む。`slow` 以外の値と
+    /// 名乗らない 1 本は通常の優先度。
+    #[test]
+    fn low_priority_is_read_from_the_usage_limit_header() {
+        for (name, value) in [
+            ("anthropic-usage-limit", "slow"),
+            ("Anthropic-Usage-Limit", " SLOW "),
+        ] {
+            assert!(low_priority(&headers(&[(name, value)])), "{name}: {value}");
+        }
+        assert!(!low_priority(&[]));
+        assert!(!low_priority(&headers(&[(LOW_PRIORITY_HEADER, "fast")])));
+        assert!(!low_priority(&headers(&[(LOW_PRIORITY_HEADER, " ")])));
+        assert!(!low_priority(&headers(&[("x-usage-limit", "slow")])));
     }
 }

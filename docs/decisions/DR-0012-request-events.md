@@ -75,6 +75,7 @@ data: {"ts":1785600000000,"seq":42,"boot":1785590000000,"session_id":"s-1","ns":
 - `status` — upstream が返した状態
 - `prefix` — **会話系列の識別子** (下記)。分からなければ欄ごと出さない
 - `origin` — この 1 本を出した側 (`main` / `sub` / `oneshot` / `keepalive` / `unknown`)。gateway 自身の送り直し (DR-0027) は `keepalive` で出る。見分け方は DR-0024。Responses 形式で受けた 1 本は、出した側を読む手掛かりが本文に無いので受けた形をそのまま素性にして `codex` (DR-0025)。欄自体は必ず出す
+- `low_priority` — クライアントが低優先度で送った 1 本 (Claude Code の `/low-priority`) で `true`。429 / 529 でも経路を替えずに返すので (DR-0036)、断りが並んでも経路が尽きたとは限らない。当てはまらない 1 本では欄ごと出さない
 - `cache_ttl_secs` — **この 1 本が残すプレフィックスの寿命** (秒)。効かせた戦略 (DR-0024) で決まり、本文に触らない場合は送った `cache_control` を読む (`ttl: "1h"` がひとつでもあれば 3600、`ttl` の無いブレークポイントだけなら 300)。ブレークポイントが無ければ欄ごと出さない
 - `cache_expires_at` — `ts` + `cache_ttl_secs`。残りを数える側で足し算をさせない。寿命が分からなければ欄ごと出さない
 - 寿命の欄 (`cache_ttl_secs` / `cache_expires_at` / `cache_notice` と以下の連鎖の `cache_*`) は **2xx の試行だけ**が持つ。断られた試行には延ばす cache が無く、控えも置かれない (DR-0027 決定 8) ので、何も約束しない
