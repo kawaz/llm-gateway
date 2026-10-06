@@ -126,7 +126,7 @@ impl Route {
         self.pace_cap.is_some() && self.pace_state(now).is_none()
     }
 
-    /// 使い切りの繰り上げ窓に入っているか。入っていれば、そのリセット時刻
+    /// 使い切りの繰り上げ窓に入っているか。入っていれば、そのリセット時刻 (Unix 秒)
     /// (DR-0018 §3)。
     ///
     /// 判定に使うのは上限と同じ最長周期窓。リセット時刻か窓長が読めない
@@ -136,7 +136,7 @@ impl Route {
         let snapshot = self.preset.quota()?;
         let window = snapshot.longest_window()?;
         let length = window.window_seconds?;
-        let reset = window.reset.filter(|reset| *reset > now)?;
+        let reset = window.reset_secs().filter(|reset| *reset > now)?;
         (reset - now <= within.seconds_in(length)).then_some(reset)
     }
 
@@ -145,7 +145,7 @@ impl Route {
         let snapshot = self.preset.quota()?;
         let window = snapshot.longest_window()?;
         let window_seconds = window.window_seconds?;
-        let reset = window.reset.filter(|reset| *reset > now)?;
+        let reset = window.reset_secs().filter(|reset| *reset > now)?;
         Some(PaceState {
             window_seconds,
             window_started_at: reset - window_seconds as i64,
@@ -1252,7 +1252,7 @@ fn reset_order_key(active: &Active, route: &str, now: i64) -> (bool, i64) {
         .preset(route)
         .and_then(|preset| preset.quota())
         .and_then(|snapshot| snapshot.seven_day)
-        .and_then(|window| window.reset)
+        .and_then(|window| window.reset_secs())
         .filter(|reset| *reset > now)
         .map_or((true, 0), |reset| (false, reset))
 }
@@ -1528,6 +1528,14 @@ spend_down_within = "25%"
 
     const NOW: i64 = 1_800_000_000;
 
+    /// 秒の時刻を、スナップショットが運ぶ単位 (Unix ミリ秒) へ直す。
+    ///
+    /// 試験は時刻を秒で書く (`NOW` と足し引きしやすい) が、窓に入れるのは
+    /// 実物と同じミリ秒。ここを秒のまま入れると、単位の取り違えを見逃す。
+    fn ms(unix: i64) -> i64 {
+        crate::credential::time::to_unix_ms(unix)
+    }
+
     /// 試験用の router と、その thinking の出所の置き場。置き場は試験ごとに分け
     /// (同じ session 名を使い回すため)、落とすと消える。
     struct Rig {
@@ -1706,9 +1714,9 @@ exclude = ["route-hidden-*"]
 
     fn observe_seven_day_reset(r: &Router, route: &str, reset: i64) {
         let snapshot = crate::quota::Snapshot::new(
-            NOW,
+            ms(NOW),
             None,
-            Some(crate::quota::Window::default().with_reset(Some(reset))),
+            Some(crate::quota::Window::default().with_reset(Some(ms(reset)))),
             None,
         )
         .unwrap();
@@ -1793,9 +1801,9 @@ exclude = ["route-hidden-*"]
     /// 周期と reset を申告した窓を 1 つ持たせる。
     fn observe_window(r: &Router, route: &str, window_seconds: Option<u64>, reset: Option<i64>) {
         let window = crate::quota::Window::default()
-            .with_reset(reset)
+            .with_reset(reset.map(ms))
             .with_window_seconds(window_seconds);
-        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        let snapshot = crate::quota::Snapshot::new(ms(NOW), None, Some(window), None).unwrap();
         r.active().preset(route).unwrap().restore_quota(snapshot);
     }
 
@@ -1857,16 +1865,16 @@ exclude = ["route-hidden-*"]
     async fn spend_down_looks_only_at_the_longest_window() {
         let r = router().await;
         let snapshot = crate::quota::Snapshot::new(
-            NOW,
+            ms(NOW),
             // 5h 窓はもうすぐ回るが、これは数時間で戻るので蒸発の損が無い。
             Some(
                 crate::quota::Window::default()
-                    .with_reset(Some(NOW + 60))
+                    .with_reset(Some(ms(NOW + 60)))
                     .with_window_seconds(Some(5 * 60 * 60)),
             ),
             Some(
                 crate::quota::Window::default()
-                    .with_reset(Some(NOW + QUARTER_OF_A_WEEK + 1))
+                    .with_reset(Some(ms(NOW + QUARTER_OF_A_WEEK + 1)))
                     .with_window_seconds(Some(WEEK)),
             ),
             None,
@@ -1957,9 +1965,9 @@ exclude = ["route-hidden-*"]
             utilization: Some(utilization),
             ..crate::quota::Window::default()
         }
-        .with_reset(Some(NOW + WEEK as i64 - elapsed))
+        .with_reset(Some(ms(NOW + WEEK as i64 - elapsed)))
         .with_window_seconds(Some(WEEK));
-        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        let snapshot = crate::quota::Snapshot::new(ms(NOW), None, Some(window), None).unwrap();
         r.active().preset(route).unwrap().restore_quota(snapshot);
     }
 
@@ -2128,8 +2136,8 @@ exclude = ["route-hidden-*"]
             utilization: Some(0.1),
             ..crate::quota::Window::default()
         }
-        .with_reset(Some(NOW + WEEK as i64));
-        let snapshot = crate::quota::Snapshot::new(NOW, None, Some(window), None).unwrap();
+        .with_reset(Some(ms(NOW + WEEK as i64)));
+        let snapshot = crate::quota::Snapshot::new(ms(NOW), None, Some(window), None).unwrap();
         r.active()
             .preset("oauth-a")
             .unwrap()

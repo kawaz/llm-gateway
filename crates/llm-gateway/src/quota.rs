@@ -103,6 +103,15 @@ impl Window {
         self
     }
 
+    /// リセット時刻を Unix 秒で読む。
+    ///
+    /// 窓はミリ秒で持つが、経路の判定 (使い切りの繰り上げ・消費の上限・
+    /// 締め出しの期限) は秒で数える。秒の `now` と比べる側は必ずここを通し、
+    /// `reset` を直に引き算しない — 桁が 1000 倍ずれても型では止まらない。
+    pub fn reset_secs(&self) -> Option<i64> {
+        self.reset.map(crate::credential::time::to_unix_secs)
+    }
+
     /// この窓が回る周期を入れる。
     pub fn with_window_seconds(mut self, seconds: Option<u64>) -> Self {
         self.window_seconds = seconds;
@@ -586,6 +595,14 @@ mod tests {
             None
         );
         assert_eq!(Snapshot::from_limits(&[], NOW), None);
+    }
+
+    /// 秒で数える側へ渡すリセット時刻は、ミリ秒を秒へ落としたもの。
+    #[test]
+    fn the_reset_is_read_in_seconds_for_second_based_callers() {
+        let window = Window::default().with_reset(Some(1_791_277_200_999));
+        assert_eq!(window.reset_secs(), Some(1_791_277_200));
+        assert_eq!(Window::default().reset_secs(), None);
     }
 
     /// 判定に使えるのは、周期・リセット・使用率が揃った窓だけ。
