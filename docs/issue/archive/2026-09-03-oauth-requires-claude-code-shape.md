@@ -1,6 +1,6 @@
 ---
 title: サブスク OAuth 経路は Claude Code 形の request のみ通す (429 "Error" の真因)
-status: open
+status: resolved
 category: tech-memo
 created: 2026-09-03T12:10:29+09:00
 last_read: 2026-09-30T08:38:11+09:00
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T14:13:14+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:問題は起きていないと確認済み (7/28 以降 形を理由とした 429 は 0 件、usage 取得 293 回成功)。kawaz 裁定 2026-10-06 IS-Q8。実害が出たら起票し直す"]
 blocked_by:
 origin: 自リポ TODO
 ---
