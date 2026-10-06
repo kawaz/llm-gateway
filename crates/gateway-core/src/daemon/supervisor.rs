@@ -854,11 +854,13 @@ impl Supervisor {
                     if !names.contains(&line.unit) {
                         continue;
                     }
-                    if read
-                        .get(&line.unit)
-                        .is_some_and(|read| line.offset <= *read)
-                    {
-                        continue;
+                    // 重なりは読み始めの間だけ。読んだ長さを越える行が来たら、
+                    // 以降は全部新しい。回転でオフセットが戻っても捨てない。
+                    if let Some(upto) = read.get(&line.unit).copied() {
+                        if line.offset <= upto {
+                            continue;
+                        }
+                        read.remove(&line.unit);
                     }
                     let value = serde_json::json!({"unit": line.unit, "line": line.line});
                     if write_line(&mut writing, &value).await.is_err() {
@@ -982,19 +984,12 @@ async fn pump(
     err: Option<tokio::process::ChildStderr>,
     lines: broadcast::Sender<LogLine>,
 ) {
-    use tokio::fs::OpenOptions;
     use tokio::sync::mpsc;
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await;
-    let Ok(mut file) = file else {
-        tracing::error!(unit, path = %path.display(), "could not write the log");
+    let Some(mut sink) = LogSink::open(path).await else {
+        tracing::error!(unit, "could not write the log");
         return;
     };
-    let mut offset = file.metadata().await.map(|m| m.len()).unwrap_or_default();
 
     let (sender, mut written) = mpsc::channel::<String>(256);
     if let Some(out) = out {
@@ -1009,16 +1004,93 @@ async fn pump(
     while let Some(line) = written.recv().await {
         let mut text = line.clone();
         text.push('\n');
-        if file.write_all(text.as_bytes()).await.is_err() {
+        let Some(offset) = sink.append(&unit, text.as_bytes()).await else {
             return;
-        }
-        offset += text.len() as u64;
+        };
         // 誰も追従していなければ配り先が無い。それは失敗ではない。
         let _ = lines.send(LogLine {
             unit: unit.clone(),
             line,
             offset,
         });
+    }
+}
+
+/// 1 つの unit のログファイル。書く直前に、握っている fd がまだ `path` の
+/// ファイルかを確かめ、入れ替わっていたら開き直す。
+///
+/// newsyslog / logrotate は rename で回転させる。fd を握ったままだと回転した
+/// 側へ書き続け、新しいファイルは空のままになる。確かめる契機は「書く直前」
+/// だけにする。時間で見に行くループは持たず、書かれない間は何も走らない。
+/// 1 行ごとの `stat` は書き込み 1 回に比べて安い。
+///
+/// Design rationale: SIGHUP で開き直す方式を採らないのは、newsyslog の `N`
+/// フラグ (合図を送らない) のままでも、logrotate の設定を問わず効かせるため。
+/// 受け口を持つと回転側の設定が gateway の都合に縛られる。
+struct LogSink {
+    path: PathBuf,
+    file: tokio::fs::File,
+    /// 開き直しに失敗している間 true。失敗の報告を 1 回に留める。
+    failing: bool,
+}
+
+impl LogSink {
+    async fn open(path: PathBuf) -> Option<Self> {
+        let file = Self::open_file(&path).await.ok()?;
+        Some(Self {
+            path,
+            file,
+            failing: false,
+        })
+    }
+
+    async fn open_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await
+    }
+
+    /// 握っている fd と `path` が同じファイルか。
+    async fn is_current(&self) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let held = self.file.metadata().await?;
+        let at_path = tokio::fs::metadata(&self.path).await?;
+        Ok(held.dev() == at_path.dev() && held.ino() == at_path.ino())
+    }
+
+    /// 追記して、書き終えた時点のファイルの長さを返す。書けなければ `None`。
+    ///
+    /// 開き直せなくても (権限・ディレクトリ消失) 握っている fd へ書いて子の
+    /// 出力を失わず、監督者も落とさない。次の行でまた試す。copytruncate は
+    /// inode が変わらないが、追記モードなので書き位置は末尾に追従する。長さは
+    /// 書いた後に fd から読むので、切り詰めがあっても実際の長さと合う。
+    async fn append(&mut self, unit: &str, bytes: &[u8]) -> Option<u64> {
+        // `Ok(false)` は入れ替わり。`Err` は path が無い (回転しただけで新しい
+        // ファイルがまだ無い) か stat できない。どちらも開き直しを試す。
+        if !matches!(self.is_current().await, Ok(true)) {
+            match Self::open_file(&self.path).await {
+                Ok(file) => {
+                    self.file = file;
+                    self.failing = false;
+                }
+                Err(e) => {
+                    if !self.failing {
+                        tracing::error!(
+                            unit,
+                            path = %self.path.display(),
+                            "could not reopen the log, keep writing to the old file: {e}"
+                        );
+                    }
+                    self.failing = true;
+                }
+            }
+        }
+        self.file.write_all(bytes).await.ok()?;
+        self.file.flush().await.ok()?;
+        self.file.metadata().await.ok().map(|m| m.len())
     }
 }
 
@@ -1590,6 +1662,91 @@ mod tests {
         assert_eq!(value["error"]["kind"], serde_json::json!("bad_request"));
 
         accepting.abort();
+    }
+
+    /// rename で回転させたら、次の行から新しいファイルへ書く。
+    #[tokio::test]
+    async fn a_rotated_log_is_written_to_the_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("u.log");
+        let mut sink = LogSink::open(path.clone()).await.unwrap();
+        assert_eq!(sink.append("u", b"one\n").await, Some(4));
+
+        std::fs::rename(&path, dir.join("u.log.0")).unwrap();
+        // 新しいファイルがまだ無い間も、開き直して作る。
+        assert_eq!(sink.append("u", b"two\n").await, Some(4));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "two\n");
+
+        // 回転の後に newsyslog が空のファイルを作っておく形。
+        std::fs::rename(&path, dir.join("u.log.1")).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(sink.append("u", b"three\n").await, Some(6));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("u.log.0")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("u.log.1")).unwrap(),
+            "two\n"
+        );
+    }
+
+    /// 開き直せなくても落ちず、握っている fd へ書き続け、戻れば移る。
+    #[tokio::test]
+    async fn a_log_that_cannot_be_reopened_keeps_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let logs = dir.join("logs");
+        std::fs::create_dir(&logs).unwrap();
+        let path = logs.join("u.log");
+        let mut sink = LogSink::open(path.clone()).await.unwrap();
+        sink.append("u", b"one\n").await.unwrap();
+
+        // ディレクトリごと退けて、同名の通れない物を置く。
+        let moved = dir.join("logs.moved");
+        std::fs::rename(&logs, &moved).unwrap();
+        assert_eq!(sink.append("u", b"two\n").await, Some(8));
+        assert!(sink.failing);
+        assert_eq!(
+            std::fs::read_to_string(moved.join("u.log")).unwrap(),
+            "one\ntwo\n"
+        );
+
+        // 権限で開けない場合。
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::File::create(path.clone()).is_err() {
+            assert_eq!(sink.append("u", b"three\n").await, Some(14));
+        }
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // 戻ったら新しいファイルへ移る。
+        assert_eq!(sink.append("u", b"four\n").await, Some(5));
+        assert!(!sink.failing);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "four\n");
+    }
+
+    /// copytruncate は inode が同じまま切り詰められる。追記モードなので壊れない。
+    #[tokio::test]
+    async fn a_truncated_log_is_appended_from_the_new_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("u.log");
+        let mut sink = LogSink::open(path.clone()).await.unwrap();
+        sink.append("u", b"one\ntwo\n").await.unwrap();
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(sink.append("u", b"three\n").await, Some(6));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
     }
 
     /// 追従は、既に書かれた分を出してから、続きを流す。

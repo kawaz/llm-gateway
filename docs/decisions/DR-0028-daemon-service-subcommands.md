@@ -161,7 +161,9 @@ llm-gateway version
 
 **回転は gateway が持たない。** OS の仕組み (macOS は newsyslog、Linux は logrotate) に任せ、gateway 側は追記しかしない。自前で持つと、大きさの上限・世代数・圧縮の有無という運用ごとに違う判断を gateway が代わりに決めることになり、しかも OS の仕組みと二重になる。
 
-ただし監督者は追記の fd を子が終わるまで握り続ける。rename で回転させる方式 (newsyslog / logrotate の既定) では、回転した後も監督者は元の inode に書き続け、新しいファイルは `llm-gateway daemon restart` で子が入れ替わるまで空のままになる。回転の設定は `N` (シグナルを送らない) で置き、実際に切り替わるのは次の入れ替えの時、と読む。具体的な newsyslog の書き方は runbook `docs/runbooks/2026-09-09-migrate-launchd-to-service.md` に置く。
+監督者は 1 行書く直前ごとに、握っている fd と `logs/<unit>.log` が同じファイル (dev / inode) かを確かめ、入れ替わっていれば開き直して新しいファイルへ書く。rename で回転させる方式 (newsyslog / logrotate の既定) が、`daemon restart` を待たずに効く。確かめる契機は書く直前だけで、時間で見に行くループは持たない。SIGHUP のような合図を受ける口を持たない理由は、回転側の設定 (newsyslog の `N` フラグ、logrotate の `postrotate`) を gateway の都合に縛らず、どの回転の仕組みでも同じに効かせるため。copytruncate は inode が変わらず、追記モードで開いているので書き位置は切り詰め後の末尾に追従する。
+
+開き直せない時 (権限・ディレクトリの消失) は、握っている fd へ書き続けて子の出力を失わず、監督者も落とさない。次の行でまた試し、戻れば移る。失敗の報告は途切れるまで 1 回だけ。`daemon log --follow` に配る `offset` は書いた後のファイルの長さなので、回転で小さく戻る。追従は読み始めの重なりを捨てるためだけに `offset` を使い、重なりを抜けた後は比べない。具体的な newsyslog の書き方は runbook `docs/runbooks/2026-09-09-migrate-launchd-to-service.md` に置く。
 
 ### 11. 監督者が落ちても子は残る。次の監督者は拾わずに起こし直す
 
