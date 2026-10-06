@@ -1,6 +1,6 @@
 ---
 title: daemon restart --all の順序と停止猶予を設定可能にする
-status: open
+status: resolved
 category: request
 created: 2026-09-09T16:32:04+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:52:05+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["done:順序(priority)と停止猶予(stop_grace_secs)は実装しない (kawaz 裁定 2026-10-06 IS-Q3a)","implemented:v0.44.4 の SHUTDOWN_GRACE 5s で SSE 購読を切る修正で SIGKILL 解消","done:graceful shutdown 確認項目は完了済み"]
 blocked_by:
 origin: 自リポ TODO
 ---
