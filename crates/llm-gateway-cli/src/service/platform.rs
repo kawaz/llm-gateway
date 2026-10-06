@@ -25,6 +25,12 @@ pub const LABEL: &str = "com.github.kawaz.llm-gateway.supervise";
 /// systemd 側の unit 名。
 pub const UNIT_NAME: &str = "llm-gateway-supervise.service";
 
+/// 場所の導出に効くので unit に固定する環境変数。
+///
+/// 固定する側 (`service::env`) と、置いてある unit との食い違いを見る側
+/// ([`drift`]) が同じ一覧を読む。別々に持つと、固定したのに比べない変数が出る。
+pub const PINNED_ENV: [&str; 2] = ["XDG_STATE_HOME", "XDG_CONFIG_HOME"];
+
 /// 叩く命令 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -77,6 +83,8 @@ pub struct Plan {
     pub exe: PathBuf,
     /// 監督者が書く先 (OS がここへ流す)。
     pub log: PathBuf,
+    /// unit に固定する環境変数 (置いてある登録との食い違いを見るのに使う)。
+    pub environment: Vec<(String, String)>,
     /// unit ファイルを置き換える前に叩くもの (best-effort、載っていなければ断られる)。
     pub before_write: Vec<Step>,
     /// unit ファイルを書いた後に叩くもの。
@@ -115,6 +123,7 @@ fn launchd(env: &Env) -> Plan {
         label: LABEL.to_owned(),
         log: env.log.clone(),
         exe: env.exe.clone(),
+        environment: env.environment.clone(),
         unit_text: plist(env),
         // 同じ label が載ったままだと bootstrap が断る。手書きの plist が
         // 載っている場合も含めて、置き換えるときは先に降ろす。
@@ -199,6 +208,72 @@ pub fn executable_of(kind: Kind, unit_text: &str) -> Option<PathBuf> {
     }
 }
 
+/// 置いてある unit ファイルに固定されている環境変数を読む。
+///
+/// 書く側 ([`plan`]) の逆。読めない中身 (手書きの unit など) は空になる。
+/// 「固定していない」と同じ扱いで、比べる側が差として見せる。
+pub fn environment_of(kind: Kind, unit_text: &str) -> Vec<(String, String)> {
+    match kind {
+        Kind::Launchd => {
+            let Some(rest) = unit_text.split("<key>EnvironmentVariables</key>").nth(1) else {
+                return Vec::new();
+            };
+            let dict = rest.split("</dict>").next().unwrap_or_default();
+            dict.split("<key>")
+                .skip(1)
+                .filter_map(|entry| {
+                    let (key, after) = entry.split_once("</key>")?;
+                    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+                    Some((unescape(key.trim()), unescape(value)))
+                })
+                .collect()
+        }
+        Kind::Systemd => unit_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("Environment="))
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect(),
+    }
+}
+
+/// 固定する変数 1 つの食い違い。`None` は「固定していない (= 値が無い)」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub key: &'static str,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+impl Drift {
+    pub fn to_json(&self) -> Value {
+        json!({"key": self.key, "from": self.from, "to": self.to})
+    }
+
+    /// 人が読む 1 行。値が無い側は `(unset)`。
+    pub fn describe(&self) -> String {
+        let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "(unset)".to_owned());
+        format!("{}: {} -> {}", self.key, show(&self.from), show(&self.to))
+    }
+}
+
+/// 置いてある登録に固定された値と、今の導出結果の食い違い。
+///
+/// 見るのは [`PINNED_ENV`] だけ。binary のパスなど他の差は置き換えで直す
+/// ものなので、ここには入れない。
+pub fn drift(written: &[(String, String)], now: &[(String, String)]) -> Vec<Drift> {
+    let find = |list: &[(String, String)], key: &str| {
+        list.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
+    PINNED_ENV
+        .iter()
+        .filter_map(|key| {
+            let (from, to) = (find(written, key), find(now, key));
+            (from != to).then_some(Drift { key, from, to })
+        })
+        .collect()
+}
+
 /// plist は XML なので、パスに `&` や `<` が居ると壊れる。
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -221,6 +296,7 @@ fn systemd(env: &Env) -> Plan {
         label: UNIT_NAME.to_owned(),
         log: env.log.clone(),
         exe: env.exe.clone(),
+        environment: env.environment.clone(),
         unit_text: service_unit(env),
         // systemd は書き換えたファイルを読み直せば済む。降ろす必要はない。
         before_write: Vec::new(),
@@ -458,6 +534,47 @@ mod tests {
         // 読めない中身は「分からない」。手書きの plist が置いてあることもある。
         assert_eq!(executable_of(Kind::Launchd, "<plist/>"), None);
         assert_eq!(executable_of(Kind::Systemd, "[Service]\n"), None);
+    }
+
+    /// 書いた環境変数は、unit ファイルから同じ形で読み戻せる。
+    #[test]
+    fn the_pinned_environment_can_be_read_back_out_of_the_unit_file() {
+        let mut env = env();
+        env.environment
+            .push(("XDG_CONFIG_HOME".to_owned(), "/home/a&b/config".to_owned()));
+        for kind in [Kind::Launchd, Kind::Systemd] {
+            assert_eq!(
+                environment_of(kind, &plan(kind, &env).unit_text),
+                env.environment,
+                "{kind:?}"
+            );
+        }
+        // 固定していない / 読めない中身は空。
+        assert!(environment_of(Kind::Launchd, "<plist/>").is_empty());
+        assert!(environment_of(Kind::Systemd, "[Service]\n").is_empty());
+    }
+
+    /// 食い違うのは固定対象の変数だけ。値が無い側も差になる。
+    #[test]
+    fn drift_is_only_about_the_pinned_variables() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let written = vec![pair("XDG_STATE_HOME", "/a"), pair("OTHER", "x")];
+        let now = vec![pair("XDG_STATE_HOME", "/a"), pair("OTHER", "y")];
+        assert!(drift(&written, &now).is_empty());
+
+        let now = vec![pair("XDG_STATE_HOME", "/b"), pair("XDG_CONFIG_HOME", "/c")];
+        let found = drift(&written, &now);
+        assert_eq!(
+            found.iter().map(Drift::describe).collect::<Vec<_>>(),
+            vec![
+                "XDG_STATE_HOME: /a -> /b".to_owned(),
+                "XDG_CONFIG_HOME: (unset) -> /c".to_owned()
+            ]
+        );
+        assert_eq!(
+            found[0].to_json(),
+            json!({"key": "XDG_STATE_HOME", "from": "/a", "to": "/b"})
+        );
     }
 
     #[test]

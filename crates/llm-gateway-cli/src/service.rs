@@ -73,7 +73,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     let rest = &args[1..];
     match args[0].as_str() {
         "register" => {
-            let (dry_run, executable) = register_options(rest)?;
+            let (dry_run, force, executable) = register_options(rest)?;
             let resolved = executable::resolve(&current_exe()?, executable.as_deref())?;
             if let Some(warning) = &resolved.warning {
                 eprintln!("llm-gateway service register: warning: {warning}");
@@ -81,7 +81,7 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
             register(
                 &here(&resolved)?,
                 &System,
-                dry_run,
+                Options { dry_run, force },
                 resolved.warning.as_deref(),
             )
         }
@@ -143,7 +143,7 @@ fn env(exe: PathBuf) -> Result<Env, Failure> {
     // 別の状態ディレクトリを見たまま上がる。PATH は渡さない — 走らせる binary は
     // 登録簿が絶対パスで持っており、探す必要がないので。
     let mut environment = Vec::new();
-    for key in ["XDG_STATE_HOME", "XDG_CONFIG_HOME"] {
+    for key in platform::PINNED_ENV {
         if let Some(value) = std::env::var_os(key)
             && let Some(value) = value.to_str()
         {
@@ -178,6 +178,15 @@ fn log_path() -> PathBuf {
     protocol::log_dir().join("supervise.log")
 }
 
+/// `register` の旗。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// 書く中身と叩く並びを出すだけで何も触らない。
+    pub dry_run: bool,
+    /// 固定してある場所が今の導出結果と違っても、止まらずに置き換える。
+    pub force: bool,
+}
+
 /// OS に載せる。何度やっても同じ姿に落ち着く。
 ///
 /// 描いた unit ファイルが既にそのまま置いてあって、OS 側にも載っているなら
@@ -185,15 +194,33 @@ fn log_path() -> PathBuf {
 /// 置き換えて載せ直す (`changed: true`)。「既に登録されている」を理由に断ると、
 /// 中身を直したいときに人が `unregister` を挟むことになる。
 ///
+/// 置いてある unit に固定された XDG の値が今の導出結果と違うときは、差を示して
+/// 止まる (`environment_drift`)。違う shell から register し直しただけで、
+/// 監督者が別の状態ディレクトリを見て上がるのを防ぐ。意図した移動なら `--force`。
+/// 止めるのは XDG の差だけで、binary のパスなど他の差は従来どおり置き換える。
+///
 /// `--dry-run` は、書く中身と叩く並びを出すだけで何も触らない。本番の手前で
 /// 「何が起きるか」を全部見られるようにしてある (移行の runbook がこれを使う)。
 pub fn register(
     plan: &Plan,
     runner: &dyn Runner,
-    dry_run: bool,
+    options: Options,
     warning: Option<&str>,
 ) -> Result<ExitCode, Failure> {
-    if dry_run {
+    let written = std::fs::read_to_string(&plan.unit_path).ok();
+    // 置いてあるものが無ければ、比べる相手が居ない (初回の登録)。
+    let drift = written
+        .as_deref()
+        .map(|text| {
+            platform::drift(
+                &platform::environment_of(plan.kind, text),
+                &plan.environment,
+            )
+        })
+        .unwrap_or_default();
+    let drift_json: Vec<_> = drift.iter().map(platform::Drift::to_json).collect();
+
+    if options.dry_run {
         let commands: Vec<_> = plan
             .before_write
             .iter()
@@ -208,6 +235,7 @@ pub fn register(
                 "path": plan.unit_path.display().to_string(),
                 "executable": plan.exe.display().to_string(),
                 "warning": warning,
+                "drift": drift_json,
                 "contents": plan.unit_text,
                 "commands": commands,
             })
@@ -215,10 +243,29 @@ pub fn register(
         return Ok(ExitCode::SUCCESS);
     }
 
+    if !drift.is_empty() && !options.force {
+        let lines: Vec<_> = drift.iter().map(platform::Drift::describe).collect();
+        return Err(Failure::new(
+            "environment_drift",
+            format!(
+                "`{}` pins different locations than this shell resolves ({}): {}",
+                plan.label,
+                plan.unit_path.display(),
+                lines.join("; ")
+            ),
+        )
+        .with("drift", drift_json)
+        .with(
+            "hint",
+            "if the move is intended, run `llm-gateway service register --force`; \
+             otherwise run it from the shell that registered the unit",
+        ));
+    }
+
     // 既にこの姿で載っているなら、触らない。載せ直すと監督者が畳まれて
     // 子が全部落ちるので、「変わっていない」ことを確かめる値打ちがある。
-    let written = std::fs::read_to_string(&plan.unit_path).unwrap_or_default();
-    if written == plan.unit_text && loaded(plan, runner) {
+    // 差があれば文面も違うので、ここには来ない。
+    if written.as_deref().unwrap_or_default() == plan.unit_text && loaded(plan, runner) {
         println!(
             "{}",
             json!({
@@ -264,6 +311,7 @@ pub fn register(
             "path": plan.unit_path.display().to_string(),
             "executable": plan.exe.display().to_string(),
             "warning": warning,
+            "drift": drift_json,
         })
     );
     Ok(ExitCode::SUCCESS)
@@ -586,21 +634,23 @@ fn flag(args: &[String], name: &str) -> Result<bool, Failure> {
     Ok(found)
 }
 
-/// `register` が受けるもの: `--dry-run` と `--executable <path>`。
-fn register_options(args: &[String]) -> Result<(bool, Option<String>), Failure> {
+/// `register` が受けるもの: `--dry-run` / `--force` / `--executable <path>`。
+fn register_options(args: &[String]) -> Result<(bool, bool, Option<String>), Failure> {
     let mut dry_run = false;
+    let mut force = false;
     let mut executable = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match split(arg) {
             Some(("dry-run", None)) => dry_run = true,
+            Some(("force", None)) => force = true,
             Some(("executable", inline)) => {
                 executable = Some(crate::options::take_value("executable", inline, &mut it)?);
             }
             _ => return Err(Failure::from(format!("could not understand `{arg}`"))),
         }
     }
-    Ok((dry_run, executable))
+    Ok((dry_run, force, executable))
 }
 
 fn no_options(args: &[String]) -> Result<(), Failure> {
@@ -732,7 +782,7 @@ mod tests {
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(&plan, &runner, false, None).unwrap();
+        register(&plan, &runner, Options::default(), None).unwrap();
 
         let written = std::fs::read_to_string(&plan.unit_path).unwrap();
         assert_eq!(written, plan.unit_text);
@@ -755,7 +805,7 @@ mod tests {
         std::fs::write(&plan.unit_path, &plan.unit_text).unwrap();
 
         let runner = loaded_recorder();
-        register(&plan, &runner, false, None).unwrap();
+        register(&plan, &runner, Options::default(), None).unwrap();
 
         // 見に行っただけで、降ろしも載せもしていない。
         assert_eq!(
@@ -770,10 +820,16 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
         std::fs::create_dir_all(plan.unit_path.parent().unwrap()).unwrap();
-        std::fs::write(&plan.unit_path, "<plist>the one from before</plist>").unwrap();
+        // XDG の固定は同じで、binary だけが違う前回の登録。
+        std::fs::write(
+            &plan.unit_path,
+            plan.unit_text
+                .replace("/opt/homebrew/bin/llm-gateway", "/old/llm-gateway"),
+        )
+        .unwrap();
 
         let runner = loaded_recorder();
-        register(&plan, &runner, false, None).unwrap();
+        register(&plan, &runner, Options::default(), None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&plan.unit_path).unwrap(),
@@ -798,7 +854,7 @@ mod tests {
 
         // `launchctl print` だけが断る = ファイルはあるが載っていない。
         let runner = NotLoaded::default();
-        register(&plan, &runner, false, None).unwrap();
+        register(&plan, &runner, Options::default(), None).unwrap();
         assert_eq!(
             runner.calls(),
             vec![
@@ -809,6 +865,133 @@ mod tests {
         );
     }
 
+    /// 別の場所を指す shell から register し直すと、固定してあった場所が
+    /// 黙って変わる。差を示して止まり、unit にも OS にも触らない。
+    #[test]
+    fn a_moved_xdg_location_stops_the_register_and_shows_the_difference() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let before = plan_in(dir.path());
+        std::fs::create_dir_all(before.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&before.unit_path, &before.unit_text).unwrap();
+
+        let mut moved = plan_in(dir.path());
+        moved.environment = vec![
+            ("XDG_STATE_HOME".to_owned(), "/elsewhere/state".to_owned()),
+            ("XDG_CONFIG_HOME".to_owned(), "/elsewhere/config".to_owned()),
+        ];
+        let runner = loaded_recorder();
+        let e = register(&moved, &runner, Options::default(), None).unwrap_err();
+
+        assert_eq!(e.kind(), "environment_drift");
+        let shown = e.to_json();
+        let drift = serde_json::from_str::<Value>(&shown).unwrap()["error"]["drift"].clone();
+        assert_eq!(
+            drift,
+            json!([
+                {"key": "XDG_STATE_HOME", "from": dir.path().display().to_string(), "to": "/elsewhere/state"},
+                {"key": "XDG_CONFIG_HOME", "from": null, "to": "/elsewhere/config"},
+            ])
+        );
+        assert!(e.message().contains("-> /elsewhere/state"), "{e:?}");
+        assert!(
+            e.message().contains("(unset) -> /elsewhere/config"),
+            "{e:?}"
+        );
+        assert!(shown.contains("--force"), "{shown}");
+        assert!(
+            runner.calls().is_empty(),
+            "touched the system: {:?}",
+            runner.calls()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&before.unit_path).unwrap(),
+            before.unit_text
+        );
+    }
+
+    /// `--force` なら、差があっても置き換える。
+    #[test]
+    fn force_swaps_the_unit_even_when_the_location_moved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let before = plan_in(dir.path());
+        std::fs::create_dir_all(before.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&before.unit_path, &before.unit_text).unwrap();
+
+        let mut moved = plan_in(dir.path());
+        moved.environment = vec![("XDG_STATE_HOME".to_owned(), "/elsewhere/state".to_owned())];
+        moved.unit_text = platform::plan(
+            Kind::Launchd,
+            &Env {
+                exe: moved.exe.clone(),
+                unit_dir: dir.path().join("LaunchAgents"),
+                log: moved.log.clone(),
+                uid: 501,
+                environment: moved.environment.clone(),
+            },
+        )
+        .unit_text;
+        let runner = loaded_recorder();
+        register(
+            &moved,
+            &runner,
+            Options {
+                force: true,
+                ..Options::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&moved.unit_path).unwrap();
+        assert_eq!(written, moved.unit_text);
+        assert!(written.contains("/elsewhere/state"));
+        assert_eq!(runner.calls().len(), 2, "{:?}", runner.calls());
+    }
+
+    /// 止めるのは XDG の差だけ。binary のパスが変わっただけなら従来どおり置き換える。
+    #[test]
+    fn a_changed_binary_with_the_same_location_is_still_swapped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let before = plan_in(dir.path());
+        std::fs::create_dir_all(before.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &before.unit_path,
+            before
+                .unit_text
+                .replace("/opt/homebrew/bin/llm-gateway", "/old/llm-gateway"),
+        )
+        .unwrap();
+
+        let runner = loaded_recorder();
+        register(&before, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&before.unit_path).unwrap(),
+            before.unit_text
+        );
+    }
+
+    /// `--dry-run` は止まらず、差を `drift` に載せて見せる。
+    #[test]
+    fn a_dry_run_reports_the_drift_without_stopping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let before = plan_in(dir.path());
+        std::fs::create_dir_all(before.unit_path.parent().unwrap()).unwrap();
+        std::fs::write(&before.unit_path, &before.unit_text).unwrap();
+        let mut moved = plan_in(dir.path());
+        moved.environment = vec![("XDG_STATE_HOME".to_owned(), "/elsewhere/state".to_owned())];
+
+        let runner = Recorder::default();
+        let dry = Options {
+            dry_run: true,
+            ..Options::default()
+        };
+        assert_eq!(
+            register(&moved, &runner, dry, None).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert!(runner.calls().is_empty());
+    }
+
     /// `--dry-run` は何も触らない。移行の前に「何が起きるか」だけを見る。
     #[test]
     fn a_dry_run_touches_nothing() {
@@ -816,7 +999,16 @@ mod tests {
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(&plan, &runner, true, Some("a dev build")).unwrap();
+        register(
+            &plan,
+            &runner,
+            Options {
+                dry_run: true,
+                ..Options::default()
+            },
+            Some("a dev build"),
+        )
+        .unwrap();
 
         assert!(!plan.unit_path.exists());
         assert!(runner.calls().is_empty());
@@ -828,7 +1020,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
 
-        let e = register(&plan, &Refuses, false, None).unwrap_err();
+        let e = register(&plan, &Refuses, Options::default(), None).unwrap_err();
         assert_eq!(e.kind(), "command_failed");
         assert!(e.message().contains("Bootstrap failed"), "{e:?}");
         assert!(!plan.unit_path.exists());
@@ -840,7 +1032,7 @@ mod tests {
     fn unregistering_tells_the_system_before_removing_the_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
 
         let refused = unregister(&plan, &Refuses).unwrap_err();
         assert_eq!(refused.kind(), "command_failed");
@@ -887,7 +1079,7 @@ mod tests {
     fn starting_kickstarts_the_registered_label() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
 
         let runner = Recorder::default();
         start(&plan, &runner).unwrap();
@@ -905,7 +1097,7 @@ mod tests {
     fn stopping_waits_on_the_socket_it_was_given() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
 
         // 掴ませてから離す監督者役。
         let socket = dir.path().join("supervisor.sock");
@@ -927,7 +1119,7 @@ mod tests {
     fn stopping_something_that_holds_nothing_returns_at_once() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
 
         let runner = Recorder::default();
         stop(&plan, &runner, &dir.path().join("supervisor.sock")).unwrap();
@@ -958,7 +1150,7 @@ mod tests {
     fn the_status_separates_registration_from_running_from_units() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
 
         let runner = Recorder::saying(Output {
             code: 0,
@@ -1030,7 +1222,7 @@ mod tests {
     fn the_log_directory_is_made_before_the_service_is_loaded() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), false, None).unwrap();
+        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
         assert!(dir.path().join("logs").is_dir());
     }
 
@@ -1064,7 +1256,7 @@ mod tests {
     /// `register` は焼き込む実行ファイルを指させる。
     #[test]
     fn register_takes_a_dry_run_and_an_executable() {
-        assert_eq!(register_options(&[]).unwrap(), (false, None));
+        assert_eq!(register_options(&[]).unwrap(), (false, false, None));
         assert_eq!(
             register_options(&args(&[
                 "--dry-run",
@@ -1072,11 +1264,19 @@ mod tests {
                 "/opt/homebrew/bin/llm-gateway"
             ]))
             .unwrap(),
-            (true, Some("/opt/homebrew/bin/llm-gateway".to_owned()))
+            (
+                true,
+                false,
+                Some("/opt/homebrew/bin/llm-gateway".to_owned())
+            )
         );
         assert_eq!(
             register_options(&args(&["--executable=/usr/local/bin/llm-gateway"])).unwrap(),
-            (false, Some("/usr/local/bin/llm-gateway".to_owned()))
+            (false, false, Some("/usr/local/bin/llm-gateway".to_owned()))
+        );
+        assert_eq!(
+            register_options(&args(&["--force"])).unwrap(),
+            (false, true, None)
         );
         assert!(register_options(&args(&["--follow"])).is_err());
         assert!(register_options(&args(&["--executable"])).is_err());
@@ -1095,6 +1295,7 @@ mod tests {
         // 旗も同じ (打てるのに書いていない、を作らない)。
         assert!(help::SERVICE.contains("--dry-run"), "{}", help::SERVICE);
         assert!(help::SERVICE.contains("--executable"), "{}", help::SERVICE);
+        assert!(help::SERVICE.contains("--force"), "{}", help::SERVICE);
         assert!(help::SERVICE.contains("--follow"), "{}", help::SERVICE);
 
         let e = dispatch(&args(&["reload"])).unwrap_err();

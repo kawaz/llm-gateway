@@ -745,6 +745,8 @@ What is registered is the supervisor (`daemon supervise`) alone. Which units it 
 
 `register` settles on the same shape however many times it is run: it does nothing when the same unit is already loaded (`changed: false`), and swaps the unit in place when it differs (`changed: true`). The binary it bakes in is the stable place on PATH that points at this same binary (`/opt/homebrew/bin/llm-gateway` and the like); with no such place it bakes in the running binary and adds a `warning` (`--executable <path>` names one).
 
+`register` also stops when the unit it would replace pins a different `XDG_STATE_HOME` / `XDG_CONFIG_HOME` than this shell resolves (the supervisor would otherwise come up looking at other directories, and nothing would say so). It exits non-zero with `error.kind` `environment_drift`, a `drift` list of `{key, from, to}` (`null` means unset) and the same difference in `message`; `--force` swaps anyway. Only these two variables stop it: a different binary path is still swapped silently. `--dry-run` never stops and shows the same list as `drift`.
+
 The migration steps are in the [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md).
 
 Options:
@@ -757,6 +759,7 @@ Options:
 | `--all` | `daemon` start/stop/restart/status/log | Everything that is registered |
 | `--follow` | `daemon log` / `service log` | Keep printing as more is written |
 | `--dry-run` | `service register` | Print what would happen instead of registering |
+| `--force` | `service register` | Swap the unit in even when the pinned `XDG_STATE_HOME` / `XDG_CONFIG_HOME` differ from what this shell resolves |
 | `--executable <path>` | `service register` | The binary to bake in (default: the stable path on PATH pointing at this same binary) |
 | `--refresh` | `usage` / `upstream status` | Read again before showing (with `usage` this consumes a little) |
 | `--days <N>` | `stats` | The last N days (default: 7, `0` for everything) |

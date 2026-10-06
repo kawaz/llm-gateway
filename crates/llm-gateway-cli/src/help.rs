@@ -122,12 +122,16 @@ commands:
 
 register options:
   --dry-run         print the unit file and the commands instead of running them
+  --force           swap the unit in even when XDG_STATE_HOME / XDG_CONFIG_HOME
+                    differ from the ones the registered unit pins
   --executable <path>
                     the binary to bake in (default: the stable path on PATH that
                     points at this same binary, or this binary itself)
 
 register is idempotent: it does nothing when the same unit is already loaded, and
-swaps the unit in place when it differs.
+swaps the unit in place when it differs. the one difference it refuses to swap
+silently is a moved XDG_STATE_HOME / XDG_CONFIG_HOME (the supervisor would come up
+looking at other directories): it prints old -> new and stops, and --force goes on.
 
 log options:
   --follow          keep printing as more is written

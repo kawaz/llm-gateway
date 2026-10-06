@@ -747,6 +747,8 @@ OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を�
 
 `register` は何度実行しても同じ姿に落ち着く。同じ unit が既に載っていれば何もせず (`changed: false`)、違えば降ろして置き換えて載せ直す (`changed: true`)。焼き込む binary は今の自分と同じものを指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway` 等) を選び、そこが無ければ今の自分を焼いて `warning` を添える (`--executable <path>` で明示もできる)。
 
+`register` は、置き換える先の unit に固定された `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が今の shell の導出結果と違うときも止まる (止めないと、監督者が別のディレクトリを見て上がり、そのことを誰も言わない)。exit は非 0、`error.kind` は `environment_drift`、`drift` に `{key, from, to}` の並び (`null` = 値が無い)、`message` にも同じ差分を入れる。`--force` で通す。止めるのはこの 2 変数の差だけで、binary のパスの差は従来どおり黙って置き換える。`--dry-run` は止まらず、同じ並びを `drift` に出す。
+
 移行手順は [runbook](./runbooks/2026-09-09-migrate-launchd-to-service.md) にある。
 
 オプション:
@@ -759,6 +761,7 @@ OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を�
 | `--all` | `daemon` の上げ下げ・状態・ログ | 登録されている全部 |
 | `--follow` | `daemon log` / `service log` | 書かれ続けるものを追う |
 | `--dry-run` | `service register` | 何が起きるかを出すだけで登録しない |
+| `--force` | `service register` | 固定してある `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が今の shell の導出結果と違っても置き換える |
 | `--executable <path>` | `service register` | 焼き込む実行ファイル (既定: 同じ binary を指す PATH 上の安定な場所) |
 | `--refresh` | `usage` / `upstream status` | 読み直してから表示する (`usage` では少し消費する) |
 | `--days <N>` | `stats` | 直近 N 日 (既定: 7、`0` で全期間) |
