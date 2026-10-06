@@ -575,7 +575,22 @@ impl Keepalive {
                 } else {
                     next.count += 1;
                 }
-                next.fires_at_ms = sent_at_ms + refresh_ms();
+                // 次の予定は、いま消費した予定 (`expected_ms`) から少なくとも
+                // 1 間隔先に置く。同じ予定を持つ兄弟は、起きたときに控えが
+                // `expected_ms` より先を指しているのを見て下がる
+                // ([`Self::plan`])。その「先」を壁時計の進みに任せると、
+                // 予定から送り終えるまでに壁時計が進まなかった (または戻った)
+                // ときに控えが `expected_ms` に留まり、兄弟が同じ予定を
+                // もう 1 本送る。下がる幅も「控えの差」なので、ここが 1 間隔
+                // 先なら兄弟の次の予定もこちらの次の予定と揃う。
+                //
+                // Design rationale: 次の予定を単純に「送った時刻 + 55 分」と
+                // しないのは、二重送出の抑止を壁時計の単調性に頼らないため。
+                // 普段は送った時刻が予定以上なので値は変わらない。壁時計が
+                // 予定より遅れていたときだけ予定の格子側に寄せ、その分
+                // 期限 (`expires_at_ms`、送った時刻から数える) との余裕が
+                // 減る — 二重に払うより、その 1 本が間に合わない側を取る。
+                next.fires_at_ms = sent_at_ms.max(expected_ms) + refresh_ms();
                 next.expires_at_ms = sent_at_ms + (LIFETIME - MARGIN).as_millis() as i64;
                 let fires_at_ms = next.fires_at_ms;
                 if !self.store.save(&next) {
@@ -1290,6 +1305,46 @@ mod tests {
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         upstream.until_sent(1).await;
         assert_eq!(upstream.sent().len(), 1, "it replayed on the old schedule");
+    }
+
+    /// 兄弟が同じ予定を持っていても、1 つの予定には 1 本しか送らない。
+    ///
+    /// 両方が同じ系列の予定を持つのは普通の姿 (片方が控えを置き、もう片方が
+    /// 起動時に読み戻す)。止めた時計の下では 55 分進めても壁時計は数ミリ秒
+    /// しか動かない — 送った後の控えが「消費した予定より先」を指すかを壁時計
+    /// の進みに任せると、後から起きた側は同じ予定を送る。進んだ数ミリ秒だけ
+    /// 下がって送るか (この試験が踏む形)、1 ミリ秒も進まずにそのまま送るか
+    /// (`docs/issue/2026-09-24-keepalive-restore-test-double-send-in-ci.md`
+    /// の CI で、残っていた古い予定と読み戻した予定が踏んだ形) の違いだけ。
+    #[tokio::test(start_paused = true)]
+    async fn siblings_holding_the_same_schedule_send_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
+        let first = keepalive(dir.path(), &upstream, true);
+        first.armed_by_request(sent(now_unix_ms()));
+        let second = keepalive(dir.path(), &upstream, true);
+        second.restore();
+        assert_eq!(second.armed(), 1, "both siblings hold the series");
+
+        for round in 1..=2 {
+            tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+            first.until_judged(round).await;
+            second.until_judged(round).await;
+            // 次の予定より十分手前まで、何も走らない時間を置く。止めた時計は
+            // 暇になると次の期限へ飛ぶので、この間に期限の来る予定があれば
+            // ここで必ず走る。
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            assert_eq!(
+                upstream.sent().len(),
+                round,
+                "one replay per schedule (round {round})"
+            );
+            assert_eq!(
+                (first.judged(), second.judged()),
+                (round, round),
+                "each sibling judged each schedule once (round {round})"
+            );
+        }
     }
 
     /// 読み戻しのついでに、古びた退避も切り詰める。
