@@ -18,23 +18,7 @@
 
 ## 裁定待ち
 
-open issue の消化 (2026-10-06) で、着手前に方針の一言が要るもの。推しは各項目の先頭。
-
-### IS-Q8 OAuth probe の issue は前提が崩れていた。どう畳むか
-
-[oauth-requires-claude-code-shape](issue/2026-09-03-oauth-requires-claude-code-shape.md)。IS-Q5a で着手する前に現状を確かめた (読み取りのみ、上流へは送っていない):
-
-- ログ (unstable 7/28〜、stable) に、形を理由に弾かれた 429 (本文が素の `"Error"`) は 0 件。probe の失敗 24 件は refresh token 切れ・組織の OAuth 不許可 (403)・接続失敗・本物の rate limit (429 `would exceed your account's rate limit`) だけ
-- usage は別経路の fetch (`/api/oauth/usage`) で 293 回取れており、実トラフィックの応答ヘッダでも更新されている
-- 9/03 に見た「小さい probe だけ 429」は手で作った合成リクエストでの観測で、gateway の probe が弾かれた記録は無い
-- Claude Code の形 (User-Agent / x-app / 請求ヘッダ / `metadata.user_id`) は本文の調査から変わっていない (2.1.289〜2.1.291 の控えで確認)
-- 気づき: クライアントは `anthropic-beta` に `oauth-2025-04-20` を入れておらず、gateway も足していないのに実トラフィックは 200 で通っている。`quota_api.rs` の「載せないとサブスクの認証が通らない」というコメントの前提が怪しい (未検証)
-
-着手前に書いていた probe の差分は戻した (未コミットだった)。
-
-- [ ] a (推し): 「gateway の probe では観測されていない」として close する。実害が出たら、本文の調査とこの節の観測を起点に起票し直す。beta のコメントの真偽は、次に `quota_api.rs` を触る時に確かめる
-- [ ] b: open のまま残し、probe の成功もログに出すようにして観測を続ける
-- [ ] c: 上流に probe を 1 本送って (credential を使う外向きの送信)、今の形と oauth beta の要否を実機で確かめてから決める
+（現在なし）
 
 ## 確認待ち
 
