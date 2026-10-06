@@ -143,12 +143,12 @@ auto mode の session で OpenAI 経路 (gpt / codex 系) の subagent を使う
 
 ### gateway 側の対処
 
-OpenAI preset が `safeguards` を捨てたことを warn と events に出す (v0.67.0 予定、実装中)。
+OpenAI preset が `safeguards` を捨てた 1 本は、gateway のログに `dropping \`safeguards\`: this route cannot carry auto mode server review, ...` の warn (session / agent / model / route 付き) を出し、request イベントに `safeguards_dropped: true` を立てる。request / response イベントには subagent の `agent_id` も載る。応答に `safeguard_results` を作って入れることはしない。
 
 ### 次回の即断のための見方
 
 - transcript: assistant エントリの `serverClassifierRequest` が消えた時点と、直前の `message.id`=`msg_openai` の有無
-- gateway: 同じ session で `safeguards` を送ったのに `safeguard_results` の無い完了応答が出た時刻と agent-id
+- gateway: events で同じ `session_id` の `safeguards_dropped: true` を探し、その `ts` と `agent_id` を見る。それがラッチの瞬間
 
 ### 未確認
 

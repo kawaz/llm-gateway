@@ -159,7 +159,7 @@ on_thinking_crossing = "thinking_as_text"  # この namespace だけ上書き
 出所は `[stats] dir` の共有ファイルに置き、restart と unit (stable / unstable) を跨いで共有する。
 
 - 置き場は `[stats] dir` 配下の `thinking-sources/` に `sources.json` と `sources.json.lock`。`[stats] dir` は keepalive の控え (DR-0027) と同じく兄弟の unit が共有する走行状態の置き場で、既定は `$XDG_STATE_HOME/llm-gateway/stats`。`[store] dir` は credential の置き場で、credential 以外を混ぜない
-- 形式は **1 ファイル 1 map** (JSON オブジェクト、鍵ごとに 1 レコード `{session, agent?, account, model, decided_at, seen}`)。map の鍵は `[session, account, model]` の JSON 文字列で、subagent は 4 要素目に agent を足す。`agent` の欄を持たないレコードは main の連なりとして読む (main のレコードは agent を持たない時と同じ形)書き込みは `write_atomically` (一時ファイル + fsync + rename) で丸ごと差し替える。jsonl の追記は採らない (同じ鍵の更新が行として溜まり、読むたびに畳む処理と切り詰めが要る)
+- 形式は **1 ファイル 1 map** (JSON オブジェクト、鍵ごとに 1 レコード `{session, agent?, account, model, decided_at, seen}`)。map の鍵は `[session, account, model]` の JSON 文字列で、subagent は 4 要素目に agent を足す。`agent` の欄を持たないレコードは main の連なりとして読む (main のレコードは agent を持たない時と同じ形)。書き込みは `write_atomically` (一時ファイル + fsync + rename) で丸ごと差し替える。jsonl の追記は採らない (同じ鍵の更新が行として溜まり、読むたびに畳む処理と切り詰めが要る)
 - 書き換えは DR-0010 と同じ形: `.lock` を flock で掴む → 最新を読み直す → 自分の変更を当てる (決定 2 の `decided_at` min / `seen` max) → 書く → 手放す。`.lock` は消さない (本体は rename で inode が変わるので、脇のファイルを掴む)。flock を持つ区間に送信や upstream の待ちを含めない
 - 両 unit は同一ホストの時計を使う前提で、`decided_at` の比較は unit 間の時計ずれを考えない
 - **読み** (リクエストごと): メモリの控えを引く。控えにはファイルの版 (mtime のナノ秒・inode・長さ) を添え、引く前に版を見て変わっていれば読み直す。1 本あたりの仕事は `stat` 1 回

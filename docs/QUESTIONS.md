@@ -66,6 +66,14 @@ open issue の消化 (2026-10-06) で、着手前に方針の一言が要るも�
 - [ ] a (推し): 不要として close。DR-0035 は account をそのまま束縛の単位にしていて、linked の対応表を要する場面が出ていない
 - [ ] b: 後続 issue に切り出して close
 
+### IS-Q7 DR-0035 の改定: thinking の出所を session でなく「連なり (session + subagent の agent id)」で持つ
+
+[DR-0035](decisions/DR-0035-judge-thinking-crossing-by-session-sources.md) 決定 2。subagent は main と同じ session を名乗るので、別モデルの subagent が main を「跨いだ」扱いにし、`thinking_as_text` の ns では main の thinking が毎回 text になっていた (実測)。実装済み (70be6bc) で、DR の Status は「改定は kawaz の裁定待ち」。
+
+- [ ] a (推し): 改定を承認。subagent の履歴は main と別で、結果は tool_result の text として戻るので、thinking の連なりは agent ごとに分かれるのが実態どおり。agent id を名乗らない 1 本は main に入れる
+- [ ] b: 承認するが、親の履歴を引き継ぐ fork の subagent で親の thinking が黙って落ちる端 (DR の「既知の端」) を先に潰す方法を検討する
+- [ ] c: 差し戻す
+
 ## 確認待ち
 
 （現在なし）
