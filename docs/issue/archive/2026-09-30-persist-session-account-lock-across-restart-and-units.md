@@ -1,6 +1,6 @@
 ---
 title: session の開始 account と「跨いだ」印 (AccountLock) を永続化して restart と unit 間で共有する
-status: open
+status: resolved
 category: design
 created: 2026-09-30T18:19:57+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:23:28+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0035","implemented","done:出所 tuple を連なり単位 (session + subagent agent id) に改定、裁定は QUESTIONS IS-Q7","done:backend 差し替え可能な Store 層は store-layer-for-replaceable-persistence の残課題"]
 blocked_by:
 origin: 自リポ TODO (kawaz 着手裁定 2026-09-30)
 ---
