@@ -1,4 +1,4 @@
-# auto mode の classifier 課金不適格通知は gateway による欄落としが原因ではない
+# auto mode の server review は既定 off と OpenAI 経路の subagent で外れる (Anthropic 経路の欄落としは無い)
 
 - Date: 2026-09-24
 
@@ -33,7 +33,7 @@ y to continue · n to cancel
 
 - gateway が classifier 関連の欄・ヘッダ・beta を落としている証拠は無い。通知の原因は gateway 側の実装ではなく、この credential (subscription OAuth) で Claude Code が `safeguards` を送っていない、または上流 rollout が未対応である可能性が高い (未確認)
 - 通知が邪魔な場合の回避策は `CLAUDE_CODE_AUTO_MODE_SERVER=0` (ただし classifier 課金免除は諦めることになる)
-- gateway 側の変更は不要。上流の rollout 状況が進んだ時点で再確認する
+- Anthropic 経路 (Messages の素通し) に gateway 側の変更は不要。session の途中で Disabled に落ちる件は OpenAI 経路の subagent が真因 (2026-10-06 節)
 
 ## 検証の詳細
 
@@ -88,4 +88,69 @@ unstable 経路の実 request には `safeguards` があり、実 response に�
 | `CLAUDE_CODE_AUTO_MODE_SERVER=1 claude` | auto | **Enabled** |
 | `CLAUDE_CODE_AUTO_MODE_SERVER=1 claude` | auto 以外 | Disabled (server review は auto モードだけが頼むので仕様どおり) |
 
-結論: 版差でもモデル差でも gateway の互換性でもなく、**この環境では既定で server review を頼んでいない**。env を明示すれば gateway 越しに Enabled になる。恒久対処は各面の `settings.json` の `env` に `CLAUDE_CODE_AUTO_MODE_SERVER=1` を足すこと (通知は fallback した session にしか出ないので消える)。既定で off になる条件 (`oee(e)` の `!QJ()&&!hRe()&&!(Ie()==="firstParty"&&SRe())` のどれか。gateway 経由だと managed settings / feature flag が fetch されない点が候補) は未確認。
+結論: 版差でもモデル差でも gateway の互換性でもなく、**この環境では既定で server review を頼んでいない**。env を明示すれば gateway 越しに Enabled になる。恒久対処は各面の `settings.json` の `env` に `CLAUDE_CODE_AUTO_MODE_SERVER=1` を足すこと (通知は fallback した session にしか出ない。起動時 Enabled でも途中で落ちる場合は 2026-10-06 節)。既定で off になる条件 (`oee(e)` の `!QJ()&&!hRe()&&!(Ie()==="firstParty"&&SRe())` のどれか。gateway 経由だと managed settings / feature flag が fetch されない点が候補) は未確認。
+
+## 2026-10-06: session の途中で落ちる真因
+
+### 現象
+
+`CLAUDE_CODE_AUTO_MODE_SERVER=1` で起動して `/status` が Enabled でも、session の途中で Disabled に落ち、課金不適格の通知が出る。
+
+### 真因
+
+gpt-6-sol 等の subagent が gateway の OpenAI preset を通ると、応答に `safeguard_results` が付かない。Claude Code 2.1.290 は third-party 経路で `safeguard_results` の無い完了応答 (`message_stop` 時点で結果未確定) を `server_no_result` と判定し、1 本でプロセス単位のラッチ (`host.requestLatches.markThirdPartyServerClassifierRefused()`) を立てる。ログ文言は次のとおり。
+
+```text
+[server-classifier] the platform gave no classification for this request (...); treating that as this deployment's answer: auto mode classifies locally for the rest of this session and stops sending the classifier context
+```
+
+ラッチ後は main も他の subagent も `safeguards` を送らない (`anthropic-beta` の `dangerous-tool-use-*` は付いたまま)。ラッチは永続化されず、プロセス再起動で戻る。
+
+### gateway 側の経路
+
+- `crates/llm-gateway/src/preset/openai/request.rs` 7-74 の allowlist 変換が `safeguards` を warn 無しで捨てる
+- `preset/openai/response.rs` 221-246 が `stop_reason` / `stop_sequence` / `usage` だけの `message_delta` に続けて `message_stop` を出す
+- Anthropic 経路は素通しで問題ない
+
+### 時系列の裏取り
+
+transcript の assistant エントリの `serverClassifierRequest` が消えた時点で突き合わせた (時刻 UTC)。
+
+| session | 観測 |
+|---|---|
+| hyoui 14603db6 | 02:50:16 に `reviewer-sol-high` (gpt-6-sol) を起動。初回応答 (`message.id`=`msg_openai`) の後、subagent 2 本目 02:50:29 から消え、main も 02:50:42 から消えた |
+| ccmsg bf6689f9 | 00:30:41 の `worker-sol-high` 初回の後、main は 00:31:56 から消えた |
+| a6c95e87 | 10/03 に gpt-6-sol subagent の直後に 2 回消え、2 回ともプロセス再起動で戻った |
+| 5a3754c0 / f5ad8853 / 14e5d996 / 40b50b47 / 70e2c3df | gpt 応答が 0 件。全部 `safeguards` が残っている |
+
+### unstable での再現
+
+- sonnet 単独 5 本は `safeguards` あり / `available`
+- sonnet の main から `reviewer-sol-high` を起動すると、gpt の 1 本目は `safeguards` ありで応答に結果なし。gpt の 2 本目から `safeguards` なしになり、その後の sonnet main も `safeguards` なし
+- `--model gpt-6-sol` を main で使った場合は最初から `safeguards` を送らずラッチもしない (subagent のときだけ 1 本目に送る理由は未追跡)
+
+### thinking_as_text は原因ではない
+
+変換を受けた session でもラッチ前は毎回 `serverClassifierRequest` が付いていた。CC は `safeguard_results` を応答だけから読む。
+
+### gateway では直せないもの
+
+ラッチが 1 本で、subagent 込みのプロセス全体に効くのは CC の仕様。gateway が `safeguard_results` を合成するのは安全判定の偽装になるのでしない (`unsupported` もラッチ、`unavailable` は deny 連鎖の恐れ)。
+
+### 運用上の回避策
+
+auto mode の session で OpenAI 経路 (gpt / codex 系) の subagent を使うとラッチする前提で使う。戻すにはプロセスを再起動する (`--resume` で可)。
+
+### gateway 側の対処
+
+OpenAI preset が `safeguards` を捨てたことを warn と events に出す (v0.67.0 予定、実装中)。
+
+### 次回の即断のための見方
+
+- transcript: assistant エントリの `serverClassifierRequest` が消えた時点と、直前の `message.id`=`msg_openai` の有無
+- gateway: 同じ session で `safeguards` を送ったのに `safeguard_results` の無い完了応答が出た時刻と agent-id
+
+### 未確認
+
+- gpt-6-sol を main で使うと `safeguards` を送らず、subagent だと送る理由
+- `unavailable` を返した場合の実挙動
