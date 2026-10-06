@@ -1,6 +1,6 @@
 ---
 title: keepalive-absence-tests-can-pass-vacuously
-status: open
+status: resolved
 category: task
 created: 2026-09-14T17:02:46+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:09:08+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","commit/c65e02f"]
 blocked_by:
 origin: worker replay-stage-b の報告
 ---
