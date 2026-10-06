@@ -112,6 +112,33 @@ pub struct UnitStatus {
     /// 最後に終わったときの様子。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<String>,
+    /// 台の待ち受けポートを今だれが握っているか (DR-0028 決定 11)。
+    ///
+    /// 待ち受け先が読めない台には聞きに行かないので欄ごと出さない。この欄を
+    /// 持たない監督者の答えも読めるよう、無くてもよい。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<PortHolder>,
+}
+
+/// 台の待ち受けポートの様子。
+///
+/// 監督者が落ちて残った子がポートを握っていると、新しい子は待ち受けられずに
+/// 落ち続ける。その時 `running: false` と `restarts` の増加だけでは「なぜ上がら
+/// ないか」が分からないので、ポートを握っている者が自分の子かどうかを並べる。
+/// 握っている者を引き取ったり畳んだりはしない (決定 11)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PortHolder {
+    /// 設定に書かれた待ち受け先。
+    pub listen: String,
+    /// 誰かがそこで待ち受けているか (繋いでみて決める)。
+    pub held: bool,
+    /// 待ち受けで握っているプロセスの pid。誰も握っていなければ空。握っているが
+    /// 誰かを引けない (`lsof` が無い等) なら `null`。
+    pub pids: Option<Vec<u32>>,
+    /// 握っているのが監督者の今の子ではないか。子が居ないのに塞がっていれば
+    /// `true`、握っている pid が分かって今の子が含まれていなければ `true`。
+    /// 空いていれば `false`。子が居て pid が分からなければ `null` (比べられない)。
+    pub foreign: Option<bool>,
 }
 
 /// 1 台が数えた知らせの配り損ね (DR-0012)。

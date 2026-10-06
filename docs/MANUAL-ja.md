@@ -667,11 +667,13 @@ llm-gateway <command> [options]
 | `daemon remove <unit>` | 登録簿から外す |
 | `daemon list` | 登録されている台を並べる |
 | `daemon start\|stop\|restart <unit>\|--all` | 監督者に頼んで上げ下げする |
-| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | 台の様子 (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit` / `port`) |
 | `daemon reload <unit>\|--all` | 台に設定ファイルを読み直させる (restart 無し) |
 | `daemon log [<unit>]\|--all` | 台が書いたものを出す (`--follow` で追う) |
 
 `start` / `stop` / `restart` / `status` / `reload` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
+
+`port` は台の待ち受けポートを誰が握っているか: `{listen, held, pids, foreign}`。`held` はそこで誰かが待ち受けているか、`pids` は握っているプロセス (`lsof` で引く。引けなければ `null`、誰も握っていなければ空)、`foreign` は握っているのが監督者の今の子でなければ `true` (子が居て握っている者を引けなければ `null`)。SIGKILL で落ちた監督者の子は、ポートを握ったまま残る。次の監督者はそれを引き取りも畳みもしないので、新しい子は待ち受けられずに落ち続け、`last_exit` に握っている者が載る。畳むのは人で、手順は [runbook](./runbooks/supervisor-orphan-children.md) にある。待ち受け先を読めない台には `port` が付かない。
 
 #### `daemon reload <unit>|--all`
 

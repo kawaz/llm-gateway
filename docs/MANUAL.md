@@ -665,11 +665,13 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 | `daemon remove <unit>` | Drop a unit from the registry |
 | `daemon list` | List the registered units |
 | `daemon start\|stop\|restart <unit>\|--all` | Ask the supervisor to move them |
-| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit`) |
+| `daemon status [<unit>]\|--all` | How they are doing (`running` / `pid` / `version` / `events.dropped` / `restarts` / `last_exit` / `port`) |
 | `daemon reload <unit>\|--all` | Have the units reread their configuration file (no restart) |
 | `daemon log [<unit>]\|--all` | Show what they wrote (`--follow` to keep reading) |
 
 `start` / `stop` / `restart` / `status` / `reload` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.
+
+`port` says who holds the unit's listen port: `{listen, held, pids, foreign}`. `held` is whether something is listening there, `pids` the processes holding it (looked up with `lsof`; `null` when they cannot be named, empty when nobody holds it), and `foreign` is `true` when the holder is not the supervisor's current child (`null` when a child is running but the holder cannot be named). A supervisor that died by SIGKILL leaves its children behind, still holding their ports; the next supervisor does not adopt or kill them, so the new child keeps failing to listen, and `last_exit` names the holder. Folding them is a manual step: see the [runbook](./runbooks/supervisor-orphan-children.md). Units whose listen address cannot be read carry no `port`.
 
 #### `daemon reload <unit>|--all`
 

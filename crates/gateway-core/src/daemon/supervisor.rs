@@ -21,6 +21,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, broadcast};
 
+use crate::daemon::port;
 use crate::daemon::protocol::{
     self, ControlRequest, LogLine, Reloaded, Request, UnitStatus, Which,
 };
@@ -546,21 +547,39 @@ impl Supervisor {
                     tracing::info!(unit = %name, pid, "started");
 
                     // 起きたと分かったら、次に落ちたときの待ち時間を戻す。
+                    //
+                    // healthz に答えたのが今の子とは限らない。監督者が落ちて残った
+                    // 子がポートを握っていると、それが答えて間隔が毎回戻り、新しい
+                    // 子は 1 秒おきに落ち続ける (DR-0028 決定 11)。答えた後に握って
+                    // いる者を見て、よそ者と分かった時は戻さない。誰か分からない
+                    // (`lsof` が無い等) 時は、これまでどおり答えたことを信じる。
                     if let Some(listen) = self.listen_of(&name) {
                         let me = Arc::clone(&self);
                         let named = name.clone();
                         tokio::spawn(async move {
-                            if healthy(&listen, me.probe.health_path, HEALTH_WAIT).await {
+                            if healthy(&listen, me.probe.health_path, HEALTH_WAIT).await
+                                && port::inspect(&listen, Some(pid)).await.foreign != Some(true)
+                            {
                                 me.reset_backoff(&named).await;
                             }
                         });
                     }
 
                     let status = child.wait().await;
-                    let ended = match &status {
+                    let mut ended = match &status {
                         Ok(status) => status.to_string(),
                         Err(e) => format!("could not wait for it: {e}"),
                     };
+                    // 頼まれずに落ちたのなら、待ち受けポートが塞がれていないか
+                    // 見る。監督者が落ちて残った子が握っていると、新しい子は
+                    // 待ち受けられずに落ち、backoff を繰り返す (DR-0028 決定 11)。
+                    // 終了コードだけではそれが読めないので、理由に添える。
+                    if self.still_tended(&name, epoch).await
+                        && let Some(listen) = self.listen_of(&name)
+                        && let Some(blocked) = port::blocked_by(&port::inspect(&listen, None).await)
+                    {
+                        ended = format!("{ended}; {blocked}");
+                    }
                     tracing::warn!(unit = %name, status = %ended, "stopped");
 
                     // 見送ったことは、世話を降ろされていても書く。ここで
@@ -722,6 +741,15 @@ impl Supervisor {
         }
     }
 
+    /// その世話係がまだ世話を任されているか (意図した上げ下げで札が進んで
+    /// いなければ、子は頼まれずに落ちた)。
+    async fn still_tended(&self, name: &str, epoch: u64) -> bool {
+        let watched = self.watched.lock().await;
+        watched
+            .get(name)
+            .is_some_and(|state| state.epoch == epoch && state.tending)
+    }
+
     async fn reset_backoff(&self, name: &str) {
         let mut watched = self.watched.lock().await;
         if let Some(state) = watched.get_mut(name) {
@@ -765,6 +793,7 @@ impl Supervisor {
                         events: None,
                         restarts: state.map_or(0, |s| s.restarts),
                         last_exit: state.and_then(|s| s.last_exit.clone()),
+                        port: None,
                     }
                 })
                 .collect()
@@ -772,10 +801,18 @@ impl Supervisor {
 
         // 版と配り損ねは走っている本人にしか言えないので、聞きに行く。錠は
         // 放してから聞く (返事を待つ間、上げ下げが止まってしまう)。
-        for row in rows.iter_mut().filter(|row| row.running) {
+        //
+        // 待ち受けポートを誰が握っているかは、止まっている台についても見る。
+        // 監督者が落ちて残った子は、止めてある台のポートも握り続けている
+        // (DR-0028 決定 11)。
+        for row in rows.iter_mut() {
             let Some(listen) = self.listen_of(&row.unit) else {
                 continue;
             };
+            row.port = Some(port::inspect(&listen, row.pid).await);
+            if !row.running {
+                continue;
+            }
             if let Some(answer) = ask_self(&listen, &self.probe).await {
                 row.version = answer.version;
                 row.events = answer.events;
@@ -1030,7 +1067,7 @@ async fn healthy(listen: &str, path: &str, limit: Duration) -> bool {
 /// 待ち受けの書き方を、叩ける住所に読み替える。
 ///
 /// `0.0.0.0` は「どこからでも受ける」であって、繋ぎに行く先ではない。
-fn reachable_authority(listen: &str) -> String {
+pub(super) fn reachable_authority(listen: &str) -> String {
     match listen.rsplit_once(':') {
         Some((host, port)) => {
             let host = match host.trim_matches(['[', ']']) {
@@ -1799,6 +1836,140 @@ mod tests {
         assert_eq!(status.version, None);
 
         world.supervisor.shutdown().await;
+    }
+
+    /// 待ち受けポートを自分の子でない誰かが握っていると、子が落ちた理由に
+    /// それが載り、`status` の行も「よそ者が握っている」と言う (DR-0028 決定 11)。
+    ///
+    /// 監督者が落ちて残った子の代わりに、試験自身がポートを握る。
+    #[tokio::test]
+    async fn a_port_held_by_someone_else_is_named_as_the_reason() {
+        let world = world();
+        // 本物の `daemon run` は待ち受けられずに 1 で終わる。その形だけを真似る。
+        let binary = fake_binary(&world.root, "blocked", "exit 1");
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = squatter.local_addr().unwrap().to_string();
+        std::fs::write(
+            world.root.join("stable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+        world.register("stable", &binary, true);
+
+        world.supervisor.reload().await;
+        let status = world
+            .until("stable", |s| {
+                s.last_exit
+                    .as_deref()
+                    .is_some_and(|e| e.contains("is held by"))
+            })
+            .await;
+        let last_exit = status.last_exit.unwrap();
+        assert!(last_exit.contains(&listen), "{last_exit}");
+        assert!(last_exit.contains("lsof -nP -iTCP:"), "{last_exit}");
+
+        let port = status.port.expect("the port is looked at");
+        assert_eq!(port.listen, listen);
+        assert!(port.held);
+        assert_eq!(port.foreign, Some(true), "{port:?}");
+        // 握っている pid が引ければ、試験自身 (= 監督者の子ではない) が挙がる。
+        if let Some(pids) = &port.pids {
+            assert!(pids.contains(&std::process::id()), "{port:?}");
+            assert!(
+                last_exit.contains(&std::process::id().to_string()),
+                "{last_exit}"
+            );
+        }
+
+        // 空いた待ち受け先なら塞がっていない。今閉じたポートを見直すと揺れる
+        // (`port` の試験の注記) ので、誰も待ち受けない番号に書き換えて見る。
+        world.supervisor.stop("stable").await.unwrap();
+        drop(squatter);
+        std::fs::write(
+            world.root.join("stable.toml"),
+            "[server]\nlisten = \"127.0.0.1:1\"\n",
+        )
+        .unwrap();
+        let port = world.status("stable").await.port.unwrap();
+        assert!(!port.held, "{port:?}");
+        assert_eq!(port.pids, Some(vec![]));
+        assert_eq!(port.foreign, Some(false));
+    }
+
+    /// ポートを握るよそ者が healthz に答えても、落ち続ける子の間隔は戻さない。
+    ///
+    /// 戻すと、残った子が答えるたびに間隔が 1 秒に戻り、新しい子は 1 秒おきに
+    /// 起きては落ち続ける (実機 2026-10-06 で 20 秒に 23 回)。
+    #[tokio::test]
+    async fn a_squatter_answering_healthz_does_not_reset_the_backoff() {
+        // 誰が握っているかを引けない環境では、答えたことを信じて戻す (従来どおり)
+        // ので、この試験の言い分は成り立たない。
+        if port::holders(1).await.is_none() {
+            eprintln!("skipped: lsof is not available, so the holder cannot be told apart");
+            return;
+        }
+        let world = world();
+        let binary = fake_binary(&world.root, "blocked", "exit 1");
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = squatter.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let app =
+                axum::Router::new().route("/unit/healthz", axum::routing::get(|| async { "ok" }));
+            let _ = axum::serve(squatter, app).await;
+        });
+        std::fs::write(
+            world.root.join("stable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+        world.register("stable", &binary, true);
+
+        world.supervisor.reload().await;
+        world.until("stable", |s| s.restarts >= 2).await;
+        // 1 秒、2 秒と待って 2 回起こし直した。次は 4 秒待つはず。
+        let backoff = world.supervisor.watched.lock().await["stable"].backoff;
+        assert_eq!(backoff, BACKOFF_FIRST * 4);
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// 子が居てもポートを握っているのが別人なら、`lsof` で引けた限りでそう言う。
+    /// 引けなければ比べられないので `null`。
+    #[tokio::test]
+    async fn a_running_child_that_does_not_hold_its_port_is_told_apart() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        let squatter = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = squatter.local_addr().unwrap().to_string();
+        std::fs::write(
+            world.root.join("stable.toml"),
+            format!("[server]\nlisten = \"{listen}\"\n"),
+        )
+        .unwrap();
+        world.register("stable", &binary, true);
+
+        world.supervisor.reload().await;
+        let status = world.until("stable", |s| s.running).await;
+        let port = status.port.expect("the port is looked at");
+        assert!(port.held);
+        match &port.pids {
+            Some(pids) => {
+                assert!(!pids.contains(&status.pid.unwrap()), "{port:?}");
+                assert_eq!(port.foreign, Some(true));
+            }
+            None => assert_eq!(port.foreign, None),
+        }
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// 待ち受け先が読めない台には、ポートを見に行かない。
+    #[tokio::test]
+    async fn a_unit_without_a_listen_address_has_no_port_row() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("quiet", &binary, false);
+        assert_eq!(world.status("quiet").await.port, None);
     }
 
     /// healthz が返るまでが「起きた」。返らなければ待ちきって諦める。

@@ -6,9 +6,12 @@
 //! - [`registry`] どの設定を 1 台として走らせるかの登録簿
 //! - [`supervisor`] 登録された台を抱えて生かし続ける監督者
 //! - [`protocol`] 監督者に頼むときの言葉
+//! - [`port`] 台の待ち受けポートを今だれが握っているか
 //! - [`control`] 走っている台が監督者から設定の読み直しを受ける口
 
 pub mod control;
+
+pub use gateway_core::daemon::port;
 
 pub mod protocol {
     pub use gateway_core::daemon::protocol::*;

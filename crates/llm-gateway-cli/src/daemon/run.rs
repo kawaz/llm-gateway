@@ -82,7 +82,19 @@ remove disabled from [server], or register another configuration",
         let listener = tokio::net::TcpListener::bind(&config.server.listen)
             .await
             .map_err(|e| {
-                Failure::from(format!("could not listen on {}: {e}", config.server.listen))
+                // 塞がっているなら、握っている者の探し方まで言う。監督者が落ちて
+                // 残った子が握っていることがあり (DR-0028 決定 11)、監督者は
+                // それを引き取らないので、畳むのは人。
+                let hint = match (e.kind(), llm_gateway::daemon::port::port_of(&config.server.listen)) {
+                    (std::io::ErrorKind::AddrInUse, Some(port)) => format!(
+                        "; another process holds it (find it with `lsof -nP -iTCP:{port} -sTCP:LISTEN`)"
+                    ),
+                    _ => String::new(),
+                };
+                Failure::from(format!(
+                    "could not listen on {}: {e}{hint}",
+                    config.server.listen
+                ))
             })?;
 
         // 監督者から設定の読み直しを受ける口 (DR-0032 決定 2)。開けなくても
