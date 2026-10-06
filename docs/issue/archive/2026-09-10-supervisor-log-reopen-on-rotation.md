@@ -1,6 +1,6 @@
 ---
 title: 監督者のログ fd をログローテーション後に開き直す
-status: open
+status: resolved
 category: request
 created: 2026-09-10T15:19:11+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T14:01:05+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","dr/DR-0028","runbook/2026-09-09-migrate-launchd-to-service","done:cd1bb02 で LogSink を実装、実機は rename/空ファイル作成/truncate の模擬回転で確認、newsyslog/logrotate 自体は未実行"]
 blocked_by:
 origin: 自リポ TODO
 ---
