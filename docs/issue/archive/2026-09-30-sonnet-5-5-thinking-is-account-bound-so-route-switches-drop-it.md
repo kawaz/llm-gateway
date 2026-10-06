@@ -1,6 +1,6 @@
 ---
 title: Sonnet 5.5 の thinking は account 束縛なので route 切替で黙って消える
-status: open
+status: resolved
 category: design
 created: 2026-09-30T07:42:25+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-10-06T13:57:46+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0035","implemented","IS-Q6a: linked account 対応表は不要 (kawaz 裁定 2026-10-06)"]
 blocked_by:
 origin: 自リポ TODO
 ---
