@@ -20,27 +20,12 @@
 
 open issue の消化 (2026-10-06) で、着手前に方針の一言が要るもの。推しは各項目の先頭。
 
-### IS-Q1 service re-register で XDG の値が変わった時の扱い
-
-[service-reregister-env-drift-not-detected](issue/2026-10-04-service-reregister-env-drift-not-detected.md)。`service register` は XDG を plist に固定するが、re-register で値が変わっても黙って書き換わる。
-
-- [ ] a (推し): 値が変わる時は差分を出して止め、`--force` で通す。reference `cli-daemon-subcommands` の「意図しない置き換えは止める」に沿う。daemon 側の検知 (名乗る場所と導出の比較) は別 PR
-- [ ] b: 黙って書き換える現状のまま、warning だけ出す
-
 ### IS-Q6 Sonnet 5.5 の issue に残る「linked account の対応を設定で表す」
 
 [sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it](issue/2026-09-30-sonnet-5-5-thinking-is-account-bound-so-route-switches-drop-it.md)。本体は DR-0035 で実装済み。受け入れ条件のこの 1 項目だけ機構が無い。
 
 - [x] a (推し): 不要として close。DR-0035 は account をそのまま束縛の単位にしていて、linked の対応表を要する場面が出ていない
 - [ ] b: 後続 issue に切り出して close
-
-### IS-Q7 DR-0035 の改定: thinking の出所を session でなく「連なり (session + subagent の agent id)」で持つ
-
-[DR-0035](decisions/DR-0035-judge-thinking-crossing-by-session-sources.md) 決定 2。subagent は main と同じ session を名乗るので、別モデルの subagent が main を「跨いだ」扱いにし、`thinking_as_text` の ns では main の thinking が毎回 text になっていた (実測)。実装済み (70be6bc) で、DR の Status は「改定は kawaz の裁定待ち」。
-
-- [ ] a (推し): 改定を承認。subagent の履歴は main と別で、結果は tool_result の text として戻るので、thinking の連なりは agent ごとに分かれるのが実態どおり。agent id を名乗らない 1 本は main に入れる
-- [ ] b: 承認するが、親の履歴を引き継ぐ fork の subagent で親の thinking が黙って落ちる端 (DR の「既知の端」) を先に潰す方法を検討する
-- [ ] c: 差し戻す
 
 ## 確認待ち
 

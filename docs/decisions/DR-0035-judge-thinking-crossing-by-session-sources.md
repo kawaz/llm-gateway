@@ -1,6 +1,6 @@
 # DR-0035: thinking の跨ぎ (account / model) を session の出所 tuple で判定し、跨いだ session は thinking を text として送る
 
-- Status: Accepted (kawaz 裁定 2026-10-01、出所の単位を session から連なり (session + subagent の agent id) に改定 2026-10-06、改定は kawaz の裁定待ち)。実装済
+- Status: Accepted (kawaz 裁定 2026-10-01、出所の単位を session から連なり (session + subagent の agent id) に改定、kawaz 裁定 2026-10-06)。実装済
 - Date: 2026-10-01
 
 ## 文脈
