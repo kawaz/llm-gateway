@@ -1,13 +1,13 @@
 # Runbook: ns 認証 `jwt` の鍵の鋳造・ローテ・失効
 
-- Last Updated: 2026-10-06
+- Last Updated: 2026-10-13
 
 ## 適用ケース
 
 - Claude Code などのクライアントに、`auth = "jwt"` の namespace を使わせ始める時 (初回の鋳造)
 - 鍵の周期 (既定 180 日) が来た時 (ローテ)
 - 秘密鍵か token が漏れた、または漏れた疑いがある時 (失効)
-- Claude Code の `apiKeyHelper` を `auth token` (gateway が入れ替える自動の鍵、DR-0037) に切り替える時
+- Claude Code の `apiKeyHelper` や codex CLI の `auth.command` を `auth token` (gateway が入れ替える自動の鍵、DR-0037) に切り替える時
 
 この runbook の鋳造・ローテ・失効は `keys_file` の**手の鍵**の手順。自動の鍵は各 unit の daemon が `key_rotation` (既定 7 日) ごとに作って入れ替えるので、人の手順は要らない (MANUAL の「自動の鍵」)。
 
@@ -47,7 +47,7 @@
    ```
    期待結果: 1 行の JWT。`--sub` は機械ごとに分けると、知らせ (`/llm-gateway/events` の `subject` / `kid`) で見分けられる。`--ttl` は `max_ttl` 以下
 
-3. **クライアントに持たせる。** Claude Code なら `settings.json` の `env.ANTHROPIC_AUTH_TOKEN` に入れ、`ANTHROPIC_BASE_URL` を `…/ns-claude` にする
+3. **クライアントに持たせる。** Claude Code なら `settings.json` の `env.ANTHROPIC_AUTH_TOKEN` に入れ、`ANTHROPIC_BASE_URL` を `…/ns-claude` にする。codex CLI なら `[model_providers.<id>]` の `http_headers = { Authorization = "Bearer <JWT>" }` に入れ、`base_url` を `…/ns-claude/v1` にする
 
 4. **設定に `keys_file` を書いて読み直させる。** 鍵束と違って設定は見張られないので、書き終えたら `daemon reload` で伝える
    ```toml
@@ -96,7 +96,9 @@ token の ttl は鍵の周期 + 猶予にしておく。
    ```bash
    llm-gateway auth token --config <設定ファイル> --ns claude --sub kawaz-mbp | wc -c
    ```
-3. **`settings.json` を書き換える。** `apiKeyHelper` に上のコマンドを置き、`env.ANTHROPIC_AUTH_TOKEN` は空文字で上書きする (親プロセスの env に残った旧 token が helper より優先されるため)。`--kid <手の kid>` を足しておくと、自動の鍵が読めない間はその鍵に落ちる
+3. **クライアントの設定を書き換える。** `--kid <手の kid>` を足しておくと、自動の鍵が読めない間はその鍵に落ちる
+   - Claude Code: `settings.json` の `apiKeyHelper` に上のコマンドを置き、`env.ANTHROPIC_AUTH_TOKEN` は空文字で上書きする (親プロセスの env に残った旧 token が helper より優先されるため)
+   - codex CLI: `$CODEX_HOME/config.toml` の `[model_providers.<id>]` から `http_headers` の `Authorization` (と `env_key`) の行を消し、`[model_providers.<id>.auth]` の `command = "llm-gateway"`、`args` に上のコマンドの引数を並べて置く (MANUAL の「codex CLI の設定」)。`args` はシェルを通らないので `--config` は `~` を使わず絶対パスで書く
 4. **走行中のセッションは起動時の token を持ち続ける**ので、全セッションの再起動を待つ。`/llm-gateway/events` の `kid` が自動の kid (`<ns>-<日付>-…`) に変わるのを見る
 5. **旧 helper 用の手の kid の行を消す。** その kid が events に来なくなり、その kid で鋳造した token の `exp` (helper なら最長 `--ttl`) を過ぎてから、ローテの手順 4 と同じく一時ファイル + `mv` で消す
 

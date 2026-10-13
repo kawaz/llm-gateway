@@ -248,7 +248,7 @@ Responses API を話すクライアント (codex CLI) の受け口 (DR-0025)。�
 
 #### codex CLI の設定
 
-`~/.codex/config.toml` (または `CODEX_HOME/config.toml`) にカスタム provider を書いて向ける。`env_key` の中身は gateway が捨てるので、**namespace に `auth_token` を書いていなければ何でもよい** (書いてあるならその token を入れる)。
+`~/.codex/config.toml` (または `CODEX_HOME/config.toml`) にカスタム provider を書いて向ける。`model_provider` / `model_providers` はプロジェクトの `.codex/config.toml` では効かないので、このユーザ単位のファイルに書く。`env_key` の中身は gateway が捨てるので、**namespace に `auth_token` を書いていなければ何でもよい** (書いてあるならその token を入れる)。
 
 ```toml
 model = "gpt-5.6-sol"
@@ -261,11 +261,32 @@ env_key = "LLM_GATEWAY_API_KEY"
 wire_api = "responses"
 ```
 
-provider の名前に `openai` のような組み込み ID は使えない (codex CLI が予約している)。
+provider の名前に `openai` / `ollama` / `lmstudio` は使えない (codex CLI が予約している)。
 
 ```bash
 LLM_GATEWAY_API_KEY=dummy codex exec -m gpt-5.6-sol --skip-git-repo-check 'hi'
 ```
+
+namespace が `jwt` なら、`env_key` の代わりに `[model_providers.<id>.auth]` の `command` で `llm-gateway auth token` を呼ばせる ([`auth`](#auth--jwt-の-namespace-の鍵と-token))。codex CLI はコマンドが標準出力に出した 1 行を `Authorization: Bearer` で送り、`refresh_interval_ms` (既定 5 分) ごとに呼び直す。Claude Code の `apiKeyHelper` と同じく、短寿命の token を取りに来る形になる。
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "llm-gateway"
+
+[model_providers.llm-gateway]
+name = "llm-gateway"
+base_url = "http://127.0.0.1:8402/ns-personal/v1"
+wire_api = "responses"
+
+[model_providers.llm-gateway.auth]
+command = "llm-gateway"
+args = ["auth", "token", "--ns", "personal", "--sub", "kawaz-mbp-codex"]
+```
+
+- `auth` の表は `env_key` / `experimental_bearer_token` / `requires_openai_auth` と同時に書けない
+- `command` は `PATH` から探されるが、`args` はシェルを通らないので `~` は展開されない。既定 (`$XDG_CONFIG_HOME/llm-gateway/config.toml`) 以外の設定を読ませる時は `"--config", "<絶対パス>"` を足す
+- token の寿命 (`--ttl`、既定 1 時間) は `refresh_interval_ms` より長くする。短いと、次の呼び直しまでに切れた token を送って 401 になる
+- コマンドは `timeout_ms` (既定 5 秒) の内に終わる必要がある。`auth token` は手元のファイルを読んで署名するだけなので、daemon への問い合わせで待つことはない
 
 codex CLI は `Session-Id` ヘッダを送るので、会話と経路の貼り付け (affinity) は Messages 経由と同じように効く。
 
@@ -751,6 +772,8 @@ Claude Code の `apiKeyHelper` に置く例 (`settings.json`):
 ```
 
 Claude Code は JWT の `exp - 30s` を過ぎると helper を呼び直すので、期限切れの token は送られない。`ANTHROPIC_AUTH_TOKEN` は helper より優先され親プロセスの env からも効くので、空文字で上書きしておく (`docs/findings/2026-10-06-api-key-helper.md`)。
+
+codex CLI では `[model_providers.<id>.auth]` の `command` / `args` に同じコマンドを置く ([codex CLI の設定](#codex-cli-の設定))。
 
 ```bash
 llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl   # 鍵束に 1 行追記

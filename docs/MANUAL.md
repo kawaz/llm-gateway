@@ -248,7 +248,7 @@ The entry point for clients that speak the Responses API (the codex CLI, DR-0025
 
 #### Pointing the codex CLI at the gateway
 
-Add a custom provider to `~/.codex/config.toml` (or `CODEX_HOME/config.toml`). The gateway discards whatever `env_key` resolves to, so **any value works unless the namespace sets `auth_token`** (in which case use that token).
+Add a custom provider to `~/.codex/config.toml` (or `CODEX_HOME/config.toml`). `model_provider` / `model_providers` have no effect in a project's `.codex/config.toml`, so write them in this per-user file. The gateway discards whatever `env_key` resolves to, so **any value works unless the namespace sets `auth_token`** (in which case use that token).
 
 ```toml
 model = "gpt-5.6-sol"
@@ -261,11 +261,32 @@ env_key = "LLM_GATEWAY_API_KEY"
 wire_api = "responses"
 ```
 
-The provider id cannot be one of the codex CLI's built-in ids such as `openai`.
+The provider id cannot be `openai`, `ollama` or `lmstudio` (the codex CLI reserves them).
 
 ```bash
 LLM_GATEWAY_API_KEY=dummy codex exec -m gpt-5.6-sol --skip-git-repo-check 'hi'
 ```
+
+For a `jwt` namespace, have `[model_providers.<id>.auth]` run `llm-gateway auth token` as its `command` instead of using `env_key` ([`auth`](#auth--keys-and-tokens-for-jwt-namespaces)). The codex CLI sends the one line the command prints to stdout as `Authorization: Bearer` and runs it again every `refresh_interval_ms` (5 minutes by default) — the same fetch-a-short-lived-token shape as Claude Code's `apiKeyHelper`.
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "llm-gateway"
+
+[model_providers.llm-gateway]
+name = "llm-gateway"
+base_url = "http://127.0.0.1:8402/ns-personal/v1"
+wire_api = "responses"
+
+[model_providers.llm-gateway.auth]
+command = "llm-gateway"
+args = ["auth", "token", "--ns", "personal", "--sub", "kawaz-mbp-codex"]
+```
+
+- The `auth` table cannot be combined with `env_key`, `experimental_bearer_token` or `requires_openai_auth`
+- `command` is looked up on `PATH`, but `args` does not go through a shell, so `~` is not expanded. To read a configuration other than the default (`$XDG_CONFIG_HOME/llm-gateway/config.toml`), add `"--config", "<absolute path>"`
+- Make the token's lifetime (`--ttl`, 1 hour by default) longer than `refresh_interval_ms`. A shorter one expires before the next run and is sent anyway, earning a 401
+- The command has to finish within `timeout_ms` (5 seconds by default). `auth token` only reads local files and signs, so it never waits on the daemon
 
 The codex CLI sends a `Session-Id` header, so route affinity works the same way as it does for Messages traffic.
 
@@ -749,6 +770,8 @@ As Claude Code's `apiKeyHelper` (`settings.json`):
 ```
 
 Claude Code calls the helper again once the JWT is past `exp - 30s`, so it never sends an expired token. `ANTHROPIC_AUTH_TOKEN` takes precedence over the helper and also works from the parent process's environment, so override it with an empty string (`docs/findings/2026-10-06-api-key-helper.md`).
+
+For the codex CLI, put the same command in `[model_providers.<id>.auth]` `command` / `args` ([Pointing the codex CLI at the gateway](#pointing-the-codex-cli-at-the-gateway)).
 
 ```bash
 llm-gateway auth keygen --kid claude-mbp-2026-09 >> ~/.config/llm-gateway/keys/claude.jwks.jsonl   # append one line to the key ring
