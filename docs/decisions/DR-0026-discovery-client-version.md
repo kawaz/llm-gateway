@@ -24,7 +24,7 @@ gateway の版 (0.43.0) は `minimal_client_version` (gpt-6-astra で 0.153.0) �
 
 これは **単価表 (`preset/pricing.rs`) と同じ運用**。upstream 側の事実を写した定数で、リリース時に手で更新する。ローカルに入っている codex CLI は配布更新が遅れる場合があるため、その版を正本にはしない。
 
-**リリース時の更新手順**: upstream catalog が返す現行モデルの `minimal_client_version` と、その版の codex CLI が公開済みであることを確認して、`crates/llm-gateway/src/discovery.rs` の `CODEX_CLIENT_VERSION` を更新する。
+**更新手順**: 新モデルが一覧に出ない時は `client_version` を変えて実測し、出る最小の公開済み版 (か手元の codex CLI の版) に `crates/llm-gateway/src/discovery.rs` の `CODEX_CLIENT_VERSION` を更新する。`minimal_client_version` は目安にすぎず、一覧の絞り込みはそれだけではない ([findings](../findings/2026-10-14-codex-catalog-client-version-gate.md))。
 
 ### 2. catalog が取れた経路では catalog が勝つ。公開一覧の調整は `exclude` で行う
 
