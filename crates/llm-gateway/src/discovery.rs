@@ -19,12 +19,13 @@ use crate::{Error, Result};
 
 /// 定期 refresh で codex backend に名乗る版 (DR-0026)。
 ///
-/// Design rationale: backend は各モデルの `minimal_client_version` と
-/// 突き合わせ、古すぎる相手には空の一覧を返す。gateway 自身の版
-/// (`CARGO_PKG_VERSION`) を名乗ると常に 0 件になるため、catalog の現行モデルが
-/// 要求する公開済み codex CLI の版を名乗る。単価表と同じく、upstream の
-/// `minimal_client_version` に合わせて手で更新する定数として持つ。
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.155.0";
+/// Design rationale: backend は名乗った版で一覧を絞り、古すぎる相手には
+/// 空の一覧を返す。gateway 自身の版 (`CARGO_PKG_VERSION`) を名乗ると常に
+/// 0 件になるため、公開済みの codex CLI の版を名乗る。絞り方は各モデルの
+/// `minimal_client_version` だけではない (gpt-6.1-sol は `0.153.0` を返すが
+/// `0.159.0` 未満では一覧に出ない) ので、新しいモデルが見えない時は
+/// 実測で境界を探して上げる。単価表と同じく手で更新する定数として持つ。
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.162.0";
 
 /// upstream が公開している 1 モデル。
 #[derive(Debug, Clone, PartialEq, Eq)]
