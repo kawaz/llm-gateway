@@ -13,8 +13,8 @@ name = "llm-gateway"
 path = "src/main.rs"
 
 [dependencies]
-llm-gateway = { path = "../llm-gateway", version = "0.67" }
-llm-gateway-server = { path = "../llm-gateway-server", version = "0.67" }
+llm-gateway = { path = "../llm-gateway", version = "0.68" }
+llm-gateway-server = { path = "../llm-gateway-server", version = "0.68" }
 
 tokio = { workspace = true }
 serde = { workspace = true }
