@@ -27,7 +27,7 @@
 
 ### DP-Q1 一時ダンプ (DR-0038) を新機能として作るか、既存の tap で済ませるか
 
-[DR-0038](decisions/DR-0038-timed-request-dump.md) の起草で、[DR-0017 の tap](decisions/DR-0017-debug-tap-endpoint.md) が既に `GET /llm-gateway/tap?include=request_body,response_body&max_body=<n>` で本文を流せると分かった (issue 起票時は見落としていた)。`timeout 10m curl -N … > file` で「一時・外部から・時限」は満たせる。DR-0038 が足すのは、unit 側で書く (繋ぎっぱなしのプロセスが要らない)、容量上限で自動停止、`dumps/<unit>/<ns>/` 0600 への配置、48h の自動片付け、response を終端まで溜めない (並列分がメモリに乗らない)、の 5 点。統括は裁定が出るまで実装に進まず、研究は tap で行う (tap で不足が出ればそれが DR-0038 の根拠になる)。
+[DR-0038](decisions/DR-0038-timed-request-dump.md) の起草で、[DR-0017 の tap](decisions/DR-0017-debug-tap-endpoint.md) が既に `GET /llm-gateway/tap?include=request_body,response_body&max_body=<n>` で本文を流せると分かった (issue 起票時は見落としていた)。`timeout 10m curl -N … > file` で「一時・外部から・時限」は満たせる。DR-0038 が足すのは、unit 側で書く (繋ぎっぱなしのプロセスが要らない)、容量上限で自動停止、`dumps/<unit>/<ns>/` 0600 への配置、48h の自動片付け、response を終端まで溜めない (並列分がメモリに乗らない)、の 5 点。統括は裁定が出るまで実装に進まず、研究は tap で行う (tap で不足が出ればそれが DR-0038 の根拠になる)。tap で実際に研究を回した結果 ([research](research/2026-10-21-tap-body-capture-and-limits.md)): `max_body` を明示した `timeout` + `curl` で今回の用途は足りた。DR-0038 にしかない価値は ns で絞る / upstream へ送った形 (ttl 入り) を取る / 権限と 48h 片付け / 容量で止める、の 4 つに絞られ、「応答を溜めるのでメモリに乗る」は主因ではなかった (DR を実測に合わせて修正済み)。
 
 - [ ] a (推し): DR-0038 を実装する。理由: 片付けと容量上限は「貯まり事故」の要件そのもので、curl + timeout では人の手に残る
 - [ ] b: tap で済ませ、DR-0038 を `❌ 撤退` にして issue を close。runbook に curl の手順を書く
