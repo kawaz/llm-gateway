@@ -1,11 +1,11 @@
 ---
 title: request-dump-with-timeout (リクエスト本文の一時ダンプ)
-status: open
+status: wip
 category: request
 created: 2026-10-21T00:52:57+09:00
 last_read:
 open_entered: 2026-10-21T00:52:57+09:00
-wip_entered:
+wip_entered: 2026-10-21T01:04:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
@@ -22,6 +22,8 @@ origin: 自リポ TODO
 ## 概要
 
 リクエスト本文の一時ダンプ。外部から時限で on/off でき、古いものは自動で片付ける。
+
+DR-0038 を起草済み (docs/decisions/DR-0038-timed-request-dump.md、⬜ 未実装)。起草中に DR-0017 の tap が既に request_body / response_body を流せると分かり、新機能として作るか tap で済ませるかを docs/QUESTIONS.md の DP-Q1 で裁定待ち。裁定まで実装に進まない。
 
 ## 背景
 
