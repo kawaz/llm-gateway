@@ -810,7 +810,7 @@ async fn forward<P: CredentialPersistence + 'static>(
                 tap: Arc::clone(gateway.tap()),
                 response_body_limit: plan.response_body,
                 event: llm_gateway::tap::Event {
-                    ts: now_unix(),
+                    ts: now_unix_ms(),
                     ns: ns_name.clone(),
                     model: forwarded.model.clone(),
                     route: forwarded.route.clone(),
@@ -1784,6 +1784,11 @@ routes = ["a"]
         let metadata = tap_event(metadata.chunk().await.unwrap().expect("metadata event"));
         let bodies = tap_event(bodies.chunk().await.unwrap().expect("body event"));
         for event in [&metadata, &bodies] {
+            assert!(
+                event["ts"].as_i64().unwrap() > 1_700_000_000_000,
+                "the time is Unix milliseconds, like events: {}",
+                event["ts"]
+            );
             assert_eq!(event["ns"], "default");
             assert_eq!(event["model"], "m");
             assert_eq!(event["route"], "a");
