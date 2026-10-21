@@ -27,7 +27,7 @@ core は provider-neutral な契約と横断機構、provider preset の実装�
                               ├─ metering ─ stats     token 正規形・単価契約・日次集計
                               ├─ exchange             1 転送の節目・本文観測・終端
                               ├─ events ─ webhook     全 route の転送イベント
-                              ├─ tap                  購読中だけ動く観測口
+                              ├─ dump                 時限つきの本文の一時ダンプ
                               ├─ session              affinity key の導出
                               └─ persist              共有の原子的書き込み作法
 ```
@@ -39,7 +39,7 @@ core は provider-neutral な契約と横断機構、provider preset の実装�
 | `Gateway` | `Config`, `Router`, `CredentialStore`, HTTP client | リクエスト間で共有する転送基盤 |
 | `Router` | provider preset、model catalog、session affinity、event bus | route 選択と provider 間比較の横断状態 |
 | `Preset` | `RouteState` (denial、quota、probe schedule) | 状態の意味を読む provider と所有者を一致させる |
-| `Gateway` | `QuotaStore`, `Stats`, `Events`, `Tap` | provider を横断して保存・配信する 1 本の器 |
+| `Gateway` | `QuotaStore`, `Stats`, `Events`, `Dumps` | provider を横断して保存・配信する 1 本の器 |
 
 ## 2. コンポーネント責務
 
@@ -60,7 +60,7 @@ core は provider-neutral な契約と横断機構、provider preset の実装�
 | `exchange` | request span、本文受信・upstream header・先頭 chunk・終端を記録し、本文を変えず usage observer へ通す |
 | `gateway` | route 選択、credential 取得、交渉、送信、fallback、quota/event 観測、能動 probe の司会 |
 | `events` / `webhook` | 全 provider の転送イベントを 1 本の bus へ流し、購読先へ送る |
-| `tap` | 購読者がいる間だけ 1 転送 = 1 JSON 行を broadcast する観測口。本文は購読側の opt-in で載る |
+| `dump` | 制御口で始めた系列 (ns × 時限 × 容量の上限) が動いている間だけ、受けた request と upstream の生の応答を `[stats] dir` の `dumps/` に書き、48 時間で片付ける (DR-0038) |
 | `session` | client metadata と header から session affinity key を導出する |
 | `persist` (非公開) | tmp → rename、writer 名の sanitization など共通の書き込み作法 |
 | `error` (非公開) | core error。HTTP status への変換は server が担う |
@@ -90,7 +90,7 @@ POST /ns-x/v1/messages
   ① exchange::request_span で通し番号を作る
   ② 本文を 64 MiB 上限で読み、JSON と header を取り出す
   ③ namespace を解決し、Namespace::authorize で client を認可する
-  ④ tap の購読があれば、書き換え前の client request から観測値を控える
+  ④ その ns の一時ダンプが動いていれば、書き換え前の受けた本文を書く
   ⑤ ns に thinking_display があれば、request 本文の thinking.display を上書きする
 
   [core: Gateway::forward]
@@ -117,7 +117,7 @@ POST /ns-x/v1/messages
   [server: response]
   ⑪ provider の Metering が content-type に応じた UsageObserver を作る
   ⑫ exchange::observe が本文を変更せず client へ流し、節目と usage を記録する。
-       tap 購読があれば 1 行の JSON を broadcast する
+       ④ で書いた 1 本は、通り過ぎるチャンクをそのまま書き、終端で index.jsonl に 1 行足す
 ```
 
 不変条件:
@@ -127,7 +127,7 @@ POST /ns-x/v1/messages
 - **core の汎用 module は provider 名を知らない**。`lib.rs` のテストが production code を走査する
 - **route 固有状態は route が持つ**。router は `Availability` だけを受け取る
 - **ingress の書き換えは thinking.display だけ**。`thinking` object を持つ request に限り、`display` を ns の設定値へ上書きする。thinking の無い request、assistant prefill、forced `tool_choice` (`any` / `tool`)、`thinking.type = "disabled"` は触らない (DR-0016)
-- **本文を覗く口は求められている間だけ動く**。tap は購読数 0 ならシリアライズもしない。接続は loopback 直結 (proxy ヘッダを持たない peer) に限り、本文は query で opt-in する。この口は一時ダンプ (DR-0038) に置き換わり、ダンプも動いていない間は 1 バイトも控えない
+- **本文を書き出す口は求められている間だけ動く**。一時ダンプ (DR-0038) は動いている系列が無い間は atomic の load 1 つで抜け、1 バイトも控えない。始め・止めは監督者経由の制御口だけで、子の HTTP には置かない
 
 ## 4. 拡張点と責務境界
 
@@ -143,7 +143,7 @@ POST /ns-x/v1/messages
 | `Router::select` | route 試行前 | provider 間の候補選択と全滅応答 |
 | `exchange::observe` | 採用した response body | provider-neutral な stream lifecycle と集計への受け渡し |
 | `Events` | upstream header 受信時 / 全滅時 | 全 provider を束ねる横断 bus |
-| `Tap` | ingress の request 受領時と response 終端時 | 購読中だけ動く揮発的な観測口 |
+| `Dumps` | ingress の request 受領時と `exchange::observe` の各チャンク・終端 | 時限と容量の上限つきで本文を書き出す一時の口 |
 | `PricingSource` | stats report の生成時 | 集計行を回答 route の単価へ接続する役 |
 
 内部正規形は Messages 形式の `serde_json::Value` で、中立 IR は置かない。`Wire` が upstream 方言への変換を担い、`egress` が正規形共通の model 読み書きと HTTP の出口手順を担う。

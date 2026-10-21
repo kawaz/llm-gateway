@@ -33,7 +33,7 @@ There is no 429 detection → cooldown → failover either (measured: zero occur
 
 ## Status
 
-**In service.** Forwarding (claude / codex / Bedrock), operational observation (usage / stats / upstream status / tap), and web re-authentication are implemented (details in [docs/MANUAL-ja.md](./docs/MANUAL-ja.md), Japanese).
+**In service.** Forwarding (claude / codex / Bedrock), operational observation (usage / stats / upstream status / dump), and web re-authentication are implemented (details in [docs/MANUAL-ja.md](./docs/MANUAL-ja.md), Japanese).
 
 The CLI owns the resident processes. One config file is registered as a unit (`llm-gateway daemon add`), and a single supervisor holding those units is put on the OS (`llm-gateway service register`, DR-0028).
 

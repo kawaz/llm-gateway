@@ -40,12 +40,12 @@ llm-gateway-cli ──> llm-gateway-server ──> llm-gateway
 | `metering` | `stats` | `usage` 15, `cache` 15 | LLM (トークン区分と価格) |
 | `provider` | `credential`, `denial`, `egress`, `metering`, `quota` | `model` 12, `usage` 4 | LLM (preset の小 trait 群、DR-0014) |
 | `egress` | `credential`, `provider` | `model` 8, `usage` 3 | LLM (Messages 正規形の出口) |
-| `exchange` | `credential`, `egress`, `events`, `metering`, `provider`, `stats`, `tap` | `usage` 30 | LLM |
+| `exchange` | `credential`, `egress`, `events`, `metering`, `provider`, `stats`, `dump` | `usage` 30 | LLM |
 | `router` | `config`, `credential`, `denial`, `discovery`, `egress`, `events`, `preset`, `provider`, `session` | `model` 60 | LLM (model → route 解決。優先度順の並べ方 DR-0015 だけが汎用の芯) |
 | `gateway` | ほぼ全部 | `model` 64, `usage` 48, `cache` 69 | LLM (組み立て役) |
 | `cache`, `cache/keepalive*` | `config`, `provider`, `credential`, `egress`, `events`, `metering`, `persist` | `cache` 多数 | LLM |
 | `config`, `config/extends`, `config/path_expand` | `cache`, `discovery`, `metering`, `pattern` | `model` 40, `anthropic` 18 ほか | **混在**: `extends` / `path_expand` / `default_state_dir` は汎用、`Namespace` (`filter` / `routing` / `cache` / `aliases`) と credential 宣言は LLM。`Namespace.auth_token` だけが汎用 |
-| `discovery`, `session`, `tap`, `status`, `statuspage_v2`, `webhook`, `preset/*` | — | 各 provider 名 | LLM |
+| `discovery`, `session`, `dump`, `status`, `statuspage_v2`, `webhook`, `preset/*` | — | 各 provider 名 | LLM |
 
 ### 1.3 依存の形 (要点)
 
@@ -118,7 +118,7 @@ DR-0030 §1 の表の汎用層 5 項目 (認証の差し替え、credential の�
 
 ### 2.3 llm-gateway に残す
 
-`credential/oauth`、`discovery`、`provider`、`preset/*`、`egress`、`exchange`、`metering`、`router`、`gateway`、`cache/*`、`session`、`tap`、`status`、`statuspage_v2`、`webhook`、`quota` (AuthState を除く)、`config` の LLM 部分、`error` の LLM variant。
+`credential/oauth`、`discovery`、`provider`、`preset/*`、`egress`、`exchange`、`metering`、`router`、`gateway`、`cache/*`、`session`、`dump`、`status`、`statuspage_v2`、`webhook`、`quota` (AuthState を除く)、`config` の LLM 部分、`error` の LLM variant。
 
 ### 2.4 判断が要るもの (推しを付けて並べる)
 
