@@ -8,6 +8,8 @@
 //!   共有する unit が同時に走っても、増える鍵は 1 本
 //! - 新しい鍵は追記、消すのは一時ファイル + rename。切り詰めて書き直すと、空の
 //!   瞬間を読んだ発行と検証が失敗する
+//! - 読めないファイルは `<名前>.broken.<UTC の日時>` に退避し、新しい鍵 1 本の束で
+//!   作り直す。退避したファイルは消さない (人が原因を見る)
 //! - 発行 ([`newest`]) は読むだけ
 //!
 //! 時刻は全部、呼び出し側が渡す壁時計 (Unix 秒)。
@@ -231,6 +233,17 @@ pub struct Outcome {
     pub next_at: i64,
     /// `auto` を名乗るが印の欄が揃っていない行の kid。残してあるので知らせる。
     pub incomplete: Vec<String>,
+    /// 読めずに退避したファイル。退避した上で新しい鍵 1 本の束を書いたので知らせる。
+    pub broken: Option<Broken>,
+}
+
+/// 読めずに退避した鍵のファイル。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Broken {
+    /// 退避先 (`<名前>.broken.<UTC の日時>`)。
+    pub moved_to: PathBuf,
+    /// 読めなかった理由 (秘密鍵の中身は含めない)。
+    pub error: String,
 }
 
 /// 脇の `.lock` の置き場。
@@ -252,8 +265,10 @@ pub fn kid_for(ns: &str, now: i64, tag: [u8; 2]) -> String {
 
 /// 1 回入れ替える。`fill` は乱数で埋める口 (OS の生成器を呼び出し側が渡す)。
 ///
-/// 掴んでいる区間は読み直しから書き終わりまで。読めない中身の上には書かない
-/// (書くと他の鍵を消しうる)。
+/// 掴んでいる区間は読み直しから書き終わりまで。読めないファイル (無いのは読めない
+/// うちに入らない、最初の 1 本を作る) は退避して、新しい鍵 1 本の束で作り直す。
+/// 上に書き足すと他の鍵を消しうるし、残しておくと入れ替えも削除も止まり、最後に
+/// 読めていた自動の鍵が検証側で効き続ける (DR-0037 §13)。
 pub fn rotate(
     rotation: &Rotation<'_>,
     now: i64,
@@ -276,9 +291,20 @@ pub fn rotate(
     let _held = hold(&lock_path(path)).map_err(shown)?;
     sweep_temporaries(path);
 
-    let text = read(path)?;
-    let lines = parse(text.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{}: {e}; not rotating until it is fixed", path.display()))?;
+    let readable = read(path).and_then(|text| {
+        let lines =
+            parse(text.as_deref().unwrap_or("")).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok((text, lines))
+    });
+    let (text, lines, broken) = match readable {
+        Ok((text, lines)) => (text, lines, None),
+        Err(error) => {
+            let moved_to = set_aside(path, now).map_err(|e| {
+                format!("{error}; cannot move it aside ({e}), so not rotating until it is fixed")
+            })?;
+            (None, Vec::new(), Some(Broken { moved_to, error }))
+        }
+    };
     let plan = plan(&marked(&lines), now, rotation.every);
 
     let created = if plan.create {
@@ -322,7 +348,27 @@ pub fn rotate(
             .filter(|line| line.incomplete)
             .map(|line| line.kid.clone())
             .collect(),
+        broken,
     })
+}
+
+/// 読めないファイルを `<名前>.broken.<UTC の日時 YYYYMMDDTHHMMSSZ>` へ rename で
+/// 退避する。その名前が既にあれば `.1`、`.2` … を足す。退避先を作るのは flock の
+/// 内側の書き手だけなので、確かめてから rename するまでの間に別の書き手は来ない。
+fn set_aside(path: &Path, now: i64) -> std::io::Result<PathBuf> {
+    let stamp = crate::credential::time::format_rfc3339(now).replace(['-', ':'], "");
+    let base = format!(
+        "{}.broken.{stamp}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let mut moved_to = path.with_file_name(&base);
+    let mut seq = 0u32;
+    while std::fs::symlink_metadata(&moved_to).is_ok() {
+        seq += 1;
+        moved_to = path.with_file_name(format!("{base}.{seq}"));
+    }
+    std::fs::rename(path, &moved_to)?;
+    Ok(moved_to)
 }
 
 /// 新しい鍵の行を作る。kid は `taken` と重ならないよう引き直す。
@@ -761,9 +807,23 @@ mod tests {
         assert!(reader.join().unwrap() > 0);
     }
 
-    /// 読めないファイルの上には書かない。
+    /// 退避先の名前 (`<名前>.broken.<UTC の日時>`、NOW は 2026-10-06T07:00:00Z)。
+    const BROKEN: &str = "lab.jwks.jsonl.broken.20261006T070000Z";
+
+    /// ディレクトリにある `.broken.` の名前。
+    fn broken_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".broken."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 読めないファイルは中身のまま退避し、新しい自動の鍵 1 本の束で作り直す。
     #[test]
-    fn a_broken_file_is_not_written_over() {
+    fn a_broken_file_is_moved_aside_and_replaced_by_one_new_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lab.jwks.jsonl");
         let reserved = BTreeSet::new();
@@ -775,18 +835,113 @@ mod tests {
         ));
         let broken = format!("{}\n{mixed}\n", manual_line("by-hand", 9));
         std::fs::write(&path, &broken).unwrap();
-        let error = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap_err();
-        assert!(error.contains("line 2"), "{error}");
-        assert!(
-            !error.contains(&secret),
-            "the private key leaked into: {error}"
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
         let error = newest(&path).unwrap_err();
         assert!(
             !error.contains(&secret),
             "the private key leaked into: {error}"
         );
+
+        let outcome = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap();
+        let moved = outcome.broken.clone().unwrap();
+        assert_eq!(moved.moved_to, dir.path().join(BROKEN));
+        assert!(moved.error.contains("line 2"), "{}", moved.error);
+        assert!(
+            !moved.error.contains(&secret),
+            "the private key leaked into: {}",
+            moved.error
+        );
+        assert_eq!(std::fs::read_to_string(&moved.moved_to).unwrap(), broken);
+        let created = outcome.created.unwrap();
+        assert_eq!(kids(&path), vec![created.clone()], "only the new key");
+        assert_eq!(newest(&path).unwrap().unwrap().kid, created);
+        assert_eq!(outcome.next_at, NOW + WEEK);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // 作り直した束は読めるので、次の回は退避しない。
+        let again = rotate(&rotation(&path, &reserved), NOW + DAY, &mut counter()).unwrap();
+        assert_eq!(again.broken, None);
+        assert_eq!(broken_names(dir.path()), vec![BROKEN.to_owned()]);
+    }
+
+    /// JSON でない・UTF-8 でない中身も読めないうちに入る。退避先の名前が既にあれば
+    /// 番号を足し、前に退避したファイルには触らない。
+    #[test]
+    fn a_taken_broken_name_gets_a_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.jwks.jsonl");
+        let reserved = BTreeSet::new();
+        std::fs::write(dir.path().join(BROKEN), "earlier").unwrap();
+        std::fs::write(&path, "garbage\n").unwrap();
+        let first = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap();
+        assert_eq!(
+            first.broken.unwrap().moved_to,
+            dir.path().join(format!("{BROKEN}.1"))
+        );
+        std::fs::write(&path, [0xff, 0xfe, b'\n']).unwrap();
+        let second = rotate(&rotation(&path, &reserved), NOW, &mut counter()).unwrap();
+        assert_eq!(
+            second.broken.unwrap().moved_to,
+            dir.path().join(format!("{BROKEN}.2"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(BROKEN)).unwrap(),
+            "earlier"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(format!("{BROKEN}.1"))).unwrap(),
+            "garbage\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("{BROKEN}.2"))).unwrap(),
+            [0xff, 0xfe, b'\n']
+        );
+        assert_eq!(kids(&path).len(), 1);
+    }
+
+    /// 無いファイル・空のファイルは壊れていない (最初の 1 本を作るだけで、退避しない)。
+    #[test]
+    fn a_missing_or_empty_file_is_not_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserved = BTreeSet::new();
+        let missing = dir.path().join("lab.jwks.jsonl");
+        let outcome = rotate(&rotation(&missing, &reserved), NOW, &mut counter()).unwrap();
+        assert_eq!(outcome.broken, None);
+        assert!(outcome.created.is_some());
+        let empty = dir.path().join("empty/lab.jwks.jsonl");
+        std::fs::create_dir_all(empty.parent().unwrap()).unwrap();
+        std::fs::write(&empty, "\n").unwrap();
+        let outcome = rotate(&rotation(&empty, &reserved), NOW, &mut counter()).unwrap();
+        assert_eq!(outcome.broken, None);
+        assert_eq!(kids(&empty).len(), 1);
+        assert!(broken_names(dir.path()).is_empty());
+        assert!(broken_names(empty.parent().unwrap()).is_empty());
+    }
+
+    /// 退避できない (ディレクトリに書けない) 時は、何も書かずにエラーにする。
+    #[test]
+    fn a_broken_file_that_cannot_be_moved_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lab.jwks.jsonl");
+        let reserved = BTreeSet::new();
+        std::fs::write(&path, "garbage\n").unwrap();
+        // .lock は先に作っておく (書けないディレクトリには作れない)。
+        std::fs::write(lock_path(&path), "").unwrap();
+        let mode = |m: u32| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(dir.path(), mode(0o500)).unwrap();
+        // root は書けないディレクトリにも書けるので、確かめられない。
+        let enforced = std::fs::File::create(dir.path().join("probe")).is_err();
+        let result = rotate(&rotation(&path, &reserved), NOW, &mut counter());
+        std::fs::set_permissions(dir.path(), mode(0o700)).unwrap();
+        if !enforced {
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(error.contains("cannot move it aside"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "garbage\n");
+        assert!(broken_names(dir.path()).is_empty());
     }
 
     /// 作る kid は手の鍵束の kid と重ならない。

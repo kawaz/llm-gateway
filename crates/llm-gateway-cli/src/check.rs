@@ -392,10 +392,28 @@ main = "keepalive"
             "{last}"
         );
         assert!(!lines.concat().contains(&hidden), "{last}");
+
+        // 入れ替えが退避して作り直した後は、読めない表示が消える。
+        let reserved = std::collections::BTreeSet::new();
+        let rotation = jwt::auto::Rotation {
+            ns: "claude",
+            path: &automatic,
+            every: 7 * 86_400,
+            max_token_ttl: 86_400,
+            reserved: &reserved,
+        };
+        let outcome =
+            jwt::auto::rotate(&rotation, 1_791_270_000, &mut |b: &mut [u8]| b.fill(6)).unwrap();
+        assert!(outcome.broken.is_some());
+        let lines = namespace_summary_lines(&load(&path).unwrap());
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("             automatic kids {}", outcome.created.unwrap())
+        );
     }
 
     /// 設定に `jwt` の namespace として無い名前の自動の鍵のファイルを挙げる (ns を消した・
-    /// 改名した後に秘密鍵が残っている)。
+    /// 改名した後に秘密鍵が残っている)。入れ替えが退避した `.broken.<日時>` は挙げない。
     #[test]
     fn automatic_keys_of_namespaces_not_in_the_configuration_are_listed() {
         let dir = tempfile::tempdir().unwrap();
@@ -433,6 +451,8 @@ main = "keepalive"
             "gone.jwks.jsonl.lock",
             "open.jwks.jsonl",
             "lab.jwks.jsonl.tmp.1.2",
+            "lab.jwks.jsonl.broken.20261006T070000Z",
+            "gone.jwks.jsonl.broken.20261006T070000Z.1",
         ] {
             std::fs::write(keys.join(name), "").unwrap();
         }

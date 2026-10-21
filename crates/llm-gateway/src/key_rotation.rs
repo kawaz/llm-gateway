@@ -71,6 +71,9 @@ pub fn step(
         };
         let next_at = match auto::rotate(&rotation, now, fill) {
             Ok(outcome) => {
+                if let Some(broken) = &outcome.broken {
+                    tracing::warn!(ns = %job.ns, path = %job.path.display(), moved_to = %broken.moved_to.display(), error = %broken.error, "cannot read the automatic keys; moved the file aside and started over with a new key (tokens signed by the old keys are refused until the client fetches a new one)");
+                }
                 if let Some(kid) = &outcome.created {
                     tracing::info!(ns = %job.ns, kid = %kid, path = %job.path.display(), "created an automatic key");
                 }
@@ -239,13 +242,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ring = manual_ring(dir.path());
         let jobs = jobs(&config(dir.path(), &ring, ""));
-        std::fs::create_dir_all(jobs[0].path.parent().unwrap()).unwrap();
-        std::fs::write(&jobs[0].path, "broken").unwrap();
+        // 鍵のディレクトリの場所にファイルがあって、`.lock` を作れない。
+        std::fs::write(jobs[0].path.parent().unwrap(), "in the way").unwrap();
         let mut due = HashMap::from([("gone".to_owned(), NOW)]);
-        step(&jobs, &mut due, NOW, &mut fill());
+        let logs = crate::test_log::logs_of(|| {
+            step(&jobs, &mut due, NOW, &mut fill());
+            async {}
+        });
         assert_eq!(due.get("lab"), Some(&(NOW + auto::COOLTIME_SECS)));
         assert!(!due.contains_key("gone"));
-        assert_eq!(std::fs::read_to_string(&jobs[0].path).unwrap(), "broken");
+        assert!(logs.contains("trying again later"), "{logs}");
+    }
+
+    /// 読めない鍵のファイルは退避して新しい鍵で作り直し、退避先を警告に出す。次の時刻は
+    /// 新しい鍵の周期。
+    #[test]
+    fn a_broken_ring_is_moved_aside_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let ring = manual_ring(dir.path());
+        let jobs = jobs(&config(dir.path(), &ring, ""));
+        let path = &jobs[0].path;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "broken").unwrap();
+        let mut due = HashMap::new();
+        let logs = crate::test_log::logs_of(|| {
+            step(&jobs, &mut due, NOW, &mut fill());
+            async {}
+        });
+        let moved_to = path.with_file_name("lab.jwks.jsonl.broken.20261006T070000Z");
+        assert_eq!(std::fs::read_to_string(&moved_to).unwrap(), "broken");
+        let warnings: Vec<&str> = logs.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs}");
+        assert!(
+            warnings[0].contains("moved the file aside")
+                && warnings[0].contains(&path.display().to_string())
+                && warnings[0].contains(&moved_to.display().to_string()),
+            "{logs}"
+        );
+        assert!(logs.contains("created an automatic key"), "{logs}");
+        assert_eq!(due["lab"], NOW + 7 * DAY);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.lines().count(), 1, "one new key");
+        assert!(auto::newest(path).unwrap().is_some());
     }
 
     /// 仕事が落ちても、全 ns を cooltime 後に試し直す。
