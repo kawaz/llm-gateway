@@ -651,6 +651,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             thinking,
             low_priority: session::low_priority(&headers),
             dump,
+            sends: std::sync::atomic::AtomicU64::new(0),
         };
         let mut routes = self
             .router
@@ -753,6 +754,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             String,
             Option<crate::provider::ClientError>,
         )> = None;
+        // その断りを返した送信の番号 (一時ダンプの試行、DR-0038 決定 14)。
+        let mut denied_attempt = 0;
         for route in &routes {
             match self.try_route(route, &call, &headers, &skipped).await {
                 Err(Failure::Refuse(error)) => return Err(error),
@@ -804,6 +807,10 @@ impl<P: CredentialPersistence> Gateway<P> {
                     // だけで、そこは戦略から寿命が決まる。読んで決めるのは
                     // 素通しのときだけなので、書き換え前の本文で同じ答えになる。
                     let cache_ttl_secs = cache::ttl_secs(cache_strategy, call.body);
+                    // 返すのはこの経路で最後に送った 1 本 (送り直したならその方)。
+                    if let Some(capture) = call.dump {
+                        capture.adopt(call.sends.load(std::sync::atomic::Ordering::Acquire));
+                    }
                     return Ok(Forwarded {
                         response: resp,
                         credential: route.credential.clone(),
@@ -885,6 +892,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                             route.name().to_owned(),
                             client_error.map(|error| *error),
                         ));
+                        denied_attempt = call.sends.load(std::sync::atomic::Ordering::Acquire);
                     }
                 }
             }
@@ -906,6 +914,9 @@ impl<P: CredentialPersistence> Gateway<P> {
                 %missing,
                 "exhausted all routes; returning the last denial as-is"
             );
+            if let Some(capture) = call.dump {
+                capture.adopt(denied_attempt);
+            }
             return Ok(Forwarded {
                 response: resp,
                 credential,
@@ -1383,10 +1394,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         let keeping = (strategy == Some(CacheStrategy::Keepalive))
             .then(|| (body.clone(), headers.as_slice().to_vec()));
 
+        let attempt = call.sends.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
         let teeing = call.dump.map(|capture| {
             let credential = route.credential.as_ref().map(CredentialId::as_str);
             move |status: u16, body: egress::BodyStream| {
-                capture.tee(route.name(), credential, status, body)
+                capture.tee(attempt, route.name(), credential, status, body)
             }
         });
         let resp = match egress::send(
@@ -1930,6 +1942,9 @@ struct Call<'a> {
     low_priority: bool,
     /// 一時ダンプの 1 本 (DR-0038)。upstream から読んだ本文をここへ通す。
     dump: Option<&'a Arc<crate::dump::Capture>>,
+    /// upstream へ送った回数。送るたびに 1 つ進め、その番号を一時ダンプの試行の
+    /// 番号にする。返す応答を決めた時点の値が、その応答の試行。
+    sends: std::sync::atomic::AtomicU64,
 }
 
 impl<'a> Call<'a> {
@@ -7679,6 +7694,81 @@ routes = ["spare", "codex"]
                 .unwrap()
                 .ends_with(".2.response.sse")
         );
+    }
+
+    /// 同じ経路を 2 度並べた設定でも、`adopted` は経路名からの推定ではなく実際に
+    /// 返した送信の番号。1 度目の 429 を持ったまま 2 度目の 503 を捨てて 429 を
+    /// 返したら `adopted: 1` で、最上位の `status` と `attempts[0].status` が揃う。
+    #[tokio::test]
+    async fn a_dump_adopts_the_attempt_actually_returned_even_on_a_repeated_route() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&calls);
+        let flaky = FakeUpstream::start(move |_, _| {
+            match counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => (
+                    429,
+                    r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+                        .to_owned(),
+                ),
+                _ => (503, "upstream is down".to_owned()),
+            }
+        })
+        .await;
+        let gw = gateway(&format!(
+            r#"
+[routes.a]
+provider = "anthropic"
+url = "{}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a", "a"]
+"#,
+            flaky.url
+        ))
+        .await;
+        let stats = tempfile::tempdir().unwrap();
+        let (capture, dir) = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+                Some(&capture),
+            )
+            .await
+            .unwrap();
+        let status = forwarded.response.status;
+        let returned = body_text(forwarded.response).await;
+        capture.settle(&crate::dump::Answered {
+            status,
+            route: Some(forwarded.route.clone()),
+            ..Default::default()
+        });
+
+        let line: Value = serde_json::from_str(
+            std::fs::read_to_string(dir.join("index.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let attempts = line["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 2, "both sends reached the upstream: {line}");
+        assert_eq!(status, 429, "{returned}");
+        assert_eq!(line["adopted"], 1, "{line}");
+        assert_eq!(line["status"], attempts[0]["status"], "{line}");
+        assert_eq!(attempts[1]["status"], 503);
     }
 
     /// upstream の断りを gateway のエラー本文に差し替えて返しても、ダンプに残るのは

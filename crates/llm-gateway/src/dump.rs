@@ -515,6 +515,7 @@ impl Dumps {
             headers: kept_headers(received.headers),
             attempts: Mutex::new(Vec::new()),
             entries: Mutex::new(entries),
+            adopted: AtomicU64::new(0),
             settled: AtomicBool::new(false),
         }))
     }
@@ -562,6 +563,8 @@ pub struct Capture {
     /// upstream が答えた試行。経路を替えて試し直すたびに 1 つ増える。
     attempts: Mutex<Vec<Attempt>>,
     entries: Mutex<Vec<Entry>>,
+    /// クライアントへ返した試行の番号。0 は「upstream の応答を返していない」。
+    adopted: AtomicU64,
     settled: AtomicBool,
 }
 
@@ -635,9 +638,12 @@ impl Capture {
     /// (`<ts>-<seq>.<attempt>.response.sse`) に書く。前の試行の分は消さず、
     /// 系列の量からも差し引かない — gateway は先に断られた応答を持ったまま次を
     /// 試し、後の応答を捨てて先の応答を返すことがあるので、どの試行を返すかは
-    /// ここでは分からない。
+    /// ここでは分からない。返した試行は gateway が [`Self::adopt`] で伝える。
+    ///
+    /// `attempt` は gateway が送るたびに振る番号 (1 から)。
     pub fn tee(
         self: &Arc<Self>,
+        attempt: u64,
         route: &str,
         credential: Option<&str>,
         status: u16,
@@ -645,17 +651,12 @@ impl Capture {
     ) -> crate::egress::BodyStream {
         use futures_util::StreamExt as _;
 
-        let attempt = {
-            let mut attempts = self.attempts.lock().unwrap();
-            let attempt = attempts.len() as u64 + 1;
-            attempts.push(Attempt {
-                attempt,
-                route: route.to_owned(),
-                credential: credential.map(str::to_owned),
-                status,
-            });
-            attempt
-        };
+        self.attempts.lock().unwrap().push(Attempt {
+            attempt,
+            route: route.to_owned(),
+            credential: credential.map(str::to_owned),
+            status,
+        });
         self.open(attempt, crate::credential::time::now_unix_ms());
         let me = Arc::clone(self);
         body.map(move |item| {
@@ -741,6 +742,11 @@ impl Capture {
         }
     }
 
+    /// gateway がクライアントへ返すと決めた試行。決めた時点で gateway が呼ぶ。
+    pub fn adopt(&self, attempt: u64) {
+        self.adopted.store(attempt, Ordering::Release);
+    }
+
     /// upstream が答えた。行は応答の終端で [`Settling::finish`] が書く。
     pub fn answered(self: Arc<Self>, answered: Answered) -> Settling {
         Settling {
@@ -753,22 +759,18 @@ impl Capture {
     /// 何もしない。
     ///
     /// 行は 1 request 1 行で、upstream の試行を `attempts` に全部並べ、クライアントへ
-    /// 返した試行の番号を `adopted` に書く。返したのは、返した経路 (`answered.route`)
-    /// を最後に試した回 — 同じ経路を続けて試すのは送り直し (DR-0003) で、その時は
-    /// 送り直した方を返す。gateway が自分で組んだエラーを返した 1 本は `adopted`
-    /// が `null`。採用した試行の response の欄は、行の最上位にも写す。
+    /// 返した試行の番号 ([`Self::adopt`]) を `adopted` に書く。gateway が自分で組んだ
+    /// エラーを返した 1 本は `adopted` が `null`。採用した試行の response の欄は、
+    /// 行の最上位にも写す。
     pub fn settle(&self, answered: &Answered) {
         if self.settled.swap(true, Ordering::AcqRel) {
             return;
         }
         let attempts = self.attempts.lock().unwrap().clone();
-        let adopted = answered.route.as_ref().and_then(|route| {
-            attempts
-                .iter()
-                .rev()
-                .find(|attempt| attempt.route == *route)
-                .map(|attempt| attempt.attempt)
-        });
+        let adopted = match self.adopted.load(Ordering::Acquire) {
+            0 => None,
+            attempt => Some(attempt),
+        };
         for entry in self.entries.lock().unwrap().iter_mut() {
             let mut line = Map::new();
             line.insert("ts".to_owned(), json!(self.ts));
@@ -1017,7 +1019,7 @@ mod tests {
         )
         .boxed();
         let read: Vec<_> = capture
-            .tee("r", None, 200, body)
+            .tee(1, "r", None, 200, body)
             .collect::<Vec<_>>()
             .now_or_never()
             .expect("an in-memory stream is ready");
@@ -1037,11 +1039,13 @@ mod tests {
             return false;
         };
         drain(&capture, chunks);
+        capture.adopt(1);
         capture.settle(&answered());
         true
     }
 
-    /// 試験の upstream (`r`) が答えたことにした答え。
+    /// 試験の upstream (`r`) が答えたことにした答え。返したのは試行 1 として
+    /// 呼び手が [`Capture::adopt`] する。
     fn answered() -> Answered {
         Answered {
             status: 200,
@@ -1436,11 +1440,12 @@ mod tests {
             Ok(Bytes::from_static(b"second")),
         ])
         .boxed();
-        let mut teed = capture.tee("r", None, 200, body);
+        let mut teed = capture.tee(1, "r", None, 200, body);
         teed.next().now_or_never().unwrap().unwrap().unwrap();
         dumps.stop(&view.dump_id).unwrap();
         let rest = teed.next().now_or_never().unwrap().unwrap().unwrap();
         assert_eq!(&rest[..], b"second", "the client still gets everything");
+        capture.adopt(1);
         capture.settle(&answered());
 
         let line = &index(&view)[0];
@@ -1474,6 +1479,7 @@ mod tests {
             .unwrap();
 
         drain(&capture, &[b"late"]);
+        capture.adopt(1);
         capture.settle(&answered());
 
         let line = &index(&view)[0];
@@ -1483,8 +1489,8 @@ mod tests {
     }
 
     /// 経路を替えて試し直したら、試行ごとに別のファイルに書き、前の試行も消さず
-    /// 系列の量からも差し引かない。行には試行を全部並べ、返した経路を最後に試した
-    /// 回を `adopted` に書く。
+    /// 系列の量からも差し引かない。行には試行を全部並べ、gateway が返すと決めた
+    /// 試行を `adopted` に書く。
     #[test]
     fn every_attempt_is_kept_and_the_adopted_one_is_named() {
         let dir = tempfile::tempdir().unwrap();
@@ -1497,16 +1503,17 @@ mod tests {
             Ok(Bytes::from_static(b"-rest")),
         ])
         .boxed();
-        let mut earlier = capture.tee("a", Some("cred-a"), 429, earlier);
+        let mut earlier = capture.tee(1, "a", Some("cred-a"), 429, earlier);
         earlier.next().now_or_never().unwrap().unwrap().unwrap();
         let later: crate::egress::BodyStream =
             futures_util::stream::iter(vec![Ok(Bytes::from_static(b"answer"))]).boxed();
         capture
-            .tee("b", None, 200, later)
+            .tee(2, "b", None, 200, later)
             .collect::<Vec<_>>()
             .now_or_never()
             .unwrap();
         earlier.next().now_or_never().unwrap().unwrap().unwrap();
+        capture.adopt(2);
         capture.settle(&Answered {
             status: 200,
             route: Some("b".to_owned()),
