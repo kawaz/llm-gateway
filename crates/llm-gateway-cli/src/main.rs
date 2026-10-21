@@ -6,6 +6,7 @@
 //! - [`upstream`] upstream (Anthropic / OpenAI ...) が何と言っているか
 //! - [`check`] / [`models`] 設定ファイルそのものを対象にする確認
 //! - [`usage`] / [`stats`] 走っている台に聞いて整形する
+//! - [`dump`] 走っている台に本文の一時ダンプを頼む
 //! - [`login`] ブラウザで認可を通して認証情報を置く
 //! - [`auth`] ns 認証 `jwt` の鍵と token を手元で作る
 //! - [`version`] 置いてある版と走っている版を並べる
@@ -14,6 +15,7 @@ mod auth;
 mod check;
 mod daemon;
 mod destination;
+mod dump;
 mod executable;
 mod failure;
 mod help;
@@ -67,6 +69,7 @@ fn run(args: &[String]) -> Result<ExitCode, Failure> {
         "service" => return service::dispatch(rest),
         "upstream" => return upstream::run(rest),
         "auth" => return auth::dispatch(rest),
+        "dump" => return dump::dispatch(rest),
         _ => {}
     }
 
@@ -145,7 +148,9 @@ mod tests {
             vec!["daemon", "--help"],
             vec!["service", "--help"],
             vec!["upstream", "--help"],
+            vec!["dump", "--help"],
             vec!["daemon"],
+            vec!["dump"],
             vec!["service"],
             vec!["upstream"],
         ] {

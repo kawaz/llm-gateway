@@ -18,6 +18,7 @@ commands:
   models      list the models written in the configuration
   usage       list usage per credential (asks a running unit)
   stats       list token usage and USD cost per credential x model x day
+  dump        have a running unit write request and response bodies to disk for a while
   login       authorize in a browser and save the credential to <name>.json
   auth        make keys and tokens for namespaces that use auth = \"jwt\"
   version     show what is installed and what is running (and whether they differ)
@@ -100,6 +101,55 @@ log options:
 
 output:
   results are JSON on stdout, errors are JSON on stderr, and this help is text
+";
+
+/// `dump` の下 (DR-0038)。
+pub const DUMP: &str = "\
+llm-gateway dump — have a running unit write request and response bodies to disk for a while
+
+usage:
+  llm-gateway dump <command> [options]
+
+a dump covers one namespace of one unit and always ends by itself (--for). each
+start begins a new dump with its own dump_id; dumps of the same namespace may
+overlap, and a request is then written to each of them. the unit keeps them in
+memory only, so a restart ends every dump. it is asked through the supervisor,
+like `daemon reload`.
+
+commands:
+  start             start a dump of one namespace (needs --ns and --for)
+  stop <dump_id>|--all
+                    stop a dump before its time (stopping a stopped one succeeds)
+  status            list the running dumps
+
+start options:
+  --ns <ns>         the namespace to dump (required)
+  --for <duration>  how long it runs, like 10m / 1h (required, no default)
+  --max-bytes <n>   stop once this many bytes of bodies are written
+                    (default: 209715200, that is 200 MiB)
+  --request-only    write requests only, not responses
+
+stop options:
+  --all             stop every running dump of the unit
+
+options of every command:
+  --unit <name>     which running unit to ask
+                    (default: the only registered one; `daemon list` shows them)
+
+where it writes:
+  <[stats] dir>/dumps/<unit>/<ns>/<dump_id>/ (directories 700, files 600):
+  index.jsonl (one line per request: ts, seq, model, route, status, origin,
+  stream, credential, cache_strategy, cache_ttl_secs, request_bytes,
+  response_bytes, request_file, response_file, truncated, headers without
+  authorization / proxy-authorization / x-api-key / cookie), and per request
+  <ts>-<seq>.request.json (the body as received, before the gateway rewrites it)
+  and <ts>-<seq>.response.sse (the bytes upstream returned). dumps older than 48
+  hours are removed when a unit starts and on every start. the files hold the
+  conversation itself: do not paste them anywhere public.
+
+output:
+  answers are JSON {unit, ok, ...} on stdout; when ok is false the answer goes to
+  stderr and the exit status is non-zero. this help is text
 ";
 
 /// `service` の下。
@@ -247,7 +297,7 @@ mod tests {
     #[test]
     fn the_top_help_lists_every_command() {
         for command in [
-            "daemon", "service", "upstream", "check", "models", "usage", "stats", "login",
+            "daemon", "service", "upstream", "check", "models", "usage", "stats", "dump", "login",
             "version",
         ] {
             assert!(TOP.contains(command), "missing {command}");

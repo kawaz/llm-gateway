@@ -195,7 +195,7 @@ fn print(answer: &str) -> Result<ExitCode, Failure> {
 }
 
 /// 監督者に繋げなかった。何をすれば繋がるのかまで言う。
-fn not_running(reason: &dyn std::fmt::Display) -> Failure {
+pub(crate) fn not_running(reason: &dyn std::fmt::Display) -> Failure {
     Failure::new(
         "supervisor_not_running",
         format!(

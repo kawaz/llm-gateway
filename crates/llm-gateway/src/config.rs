@@ -1165,15 +1165,23 @@ impl RateLimitStore {
     }
 }
 
-/// 固定の秘密の id を検査する。id は置き場のファイル名 (`<id>.json`) になるので、
-/// 英数字と `.` `_` `-` だけを許し、`.` で始まるものは断る。
-fn check_secret_id(id: &str) -> Result<()> {
-    let ok = !id.is_empty()
-        && !id.starts_with('.')
-        && id
+/// 名前をそのまま置き場のファイル名・ディレクトリ名にしてよいか。
+///
+/// 英数字と `.` `_` `-` だけを許し、空と `.` で始まるもの (隠しファイル、`..`) は
+/// 断る。固定の秘密の id、自動の鍵の ns (DR-0037 §12)、一時ダンプの ns
+/// (DR-0038 決定 6) が同じ規則で確かめる。
+pub fn is_file_name_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if ok {
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// 固定の秘密の id を検査する。id は置き場のファイル名 (`<id>.json`) になるので、
+/// [`is_file_name_safe`] の規則で確かめる。
+fn check_secret_id(id: &str) -> Result<()> {
+    if is_file_name_safe(id) {
         Ok(())
     } else {
         Err(Error::Config(format!(
@@ -1727,11 +1735,7 @@ impl Config {
 
     fn validate_namespace(&self, ns_name: &str, ns: &Namespace) -> Result<()> {
         // 自動の鍵のファイル名になる (DR-0037 §12)。
-        let file_safe = !ns_name.starts_with('.')
-            && ns_name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-        if matches!(ns.auth, NsAuth::Jwt(_)) && !file_safe {
+        if matches!(ns.auth, NsAuth::Jwt(_)) && !is_file_name_safe(ns_name) {
             return Err(Error::Config(format!(
                 "namespace `{ns_name}` uses auth = \"jwt\", so its name may contain only letters, digits, `.`, `_` and `-`, and must not start with `.` (it names the file of its automatic keys)"
             )));

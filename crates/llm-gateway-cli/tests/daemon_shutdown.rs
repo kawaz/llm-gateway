@@ -130,14 +130,3 @@ fn sigterm_stops_daemon_with_an_events_subscription() {
 
     terminate(child);
 }
-
-/// tap も次の交換を無期限に待つため、events と同じ終了上限で強制切断する。
-#[test]
-fn sigterm_stops_daemon_with_a_tap_subscription() {
-    let root = tempfile::TempDir::new().unwrap();
-    let port = unused_port();
-    let child = start(root.path(), port);
-    let _subscription = subscribe(port, "/llm-gateway/tap");
-
-    terminate(child);
-}

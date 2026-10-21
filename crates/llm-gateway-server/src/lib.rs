@@ -5,12 +5,11 @@
 //! codex CLI 向けに `POST /v1/responses` も受ける (DR-0025)。どの形で受けたかは
 //! [`RequestShape`] で転送側へ渡す — 経路の選び方も本文の扱い方もそこで変わる。
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Form, Path as AxumPath, Request, State};
+use axum::extract::{Form, Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -56,7 +55,6 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/status", get(status))
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
-        .route("/llm-gateway/tap", get(tap))
         .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
@@ -327,6 +325,8 @@ async fn version() -> Response {
 
 /// 走っている本人の状態を返す (版と、見る側が追いつけずに落とした知らせの数)。
 ///
+/// 一時ダンプ (DR-0038) が動いていれば、その系列も並べる。
+///
 /// 版も本人にしか言えない自己申告なので、ここに同居させる。監督者は
 /// `daemon status` の各行をこの 1 回の問い合わせから埋める (DR-0028 決定 9)。
 /// 落とした数は起動からの累積で、0 でも欄を出す — 数えていることが分かる
@@ -336,11 +336,18 @@ async fn version() -> Response {
 async fn self_report<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
 ) -> Response {
-    json_utf8(Json(serde_json::json!({
+    let mut report = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "boot": gateway.events().boot(),
         "events": { "dropped": gateway.events().dropped() },
-    })))
+    });
+    // 動いている一時ダンプの系列 (DR-0038 決定 12)。止め忘れに気づけるよう
+    // 動いている間だけ出し、本文の置き場は載せない。
+    let dumping = gateway.dumps().running(now_unix_ms());
+    if !dumping.is_empty() {
+        report["dump"] = json!(dumping);
+    }
+    json_utf8(Json(report))
 }
 
 /// credential ごとの利用状況を返す。
@@ -462,92 +469,6 @@ fn sse_line(notice: &llm_gateway::events::Notice) -> SseEvent {
             error!(%e, "cannot serialize the event to JSON");
             SseEvent::default().comment("unserializable")
         })
-}
-
-/// 直接 loopback から接続した購読者へ転送の詳細を流す (DR-0017)。
-async fn tap<P: CredentialPersistence + 'static>(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(gateway): State<Arc<Gateway<P>>>,
-    request: Request,
-) -> Response {
-    if !peer.ip().is_loopback()
-        || request.headers().contains_key("forwarded")
-        || request.headers().contains_key("x-forwarded-for")
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            "tap is available only to direct loopback connections",
-        )
-            .into_response();
-    }
-
-    let options = match tap_options(request.uri().query()) {
-        Ok(options) => options,
-        Err(message) => return client_error("tap", StatusCode::BAD_REQUEST, &message),
-    };
-    let watching = gateway.tap().subscribe(options);
-    // SSE ではなく素の JSONL で返す。dump をそのままパースできる形が用途
-    // (curl でファイルに落として集計) の本体で、SSE の data: 枠は邪魔なだけ。
-    let stream = futures_util::stream::unfold(watching, |mut watching| async move {
-        match watching.recv().await {
-            Ok(event) => Some((
-                Ok::<axum::body::Bytes, std::convert::Infallible>(tap_line(&event)),
-                watching,
-            )),
-            // tap は現時点の交換を観測する口なので、欠落後に古い列へ復帰しない。
-            Err(RecvError::Lagged(missed)) => {
-                warn!(missed, "tap subscriber lagged; disconnecting");
-                None
-            }
-            Err(RecvError::Closed) => None,
-        }
-    });
-    (
-        [("content-type", "application/x-ndjson; charset=utf-8")],
-        axum::body::Body::from_stream(stream),
-    )
-        .into_response()
-}
-
-fn tap_line(event: &llm_gateway::tap::Event) -> axum::body::Bytes {
-    let mut line = serde_json::to_vec(event).unwrap_or_else(|e| {
-        error!(%e, "tap event could not be serialized");
-        b"{}".to_vec()
-    });
-    line.push(b'\n');
-    axum::body::Bytes::from(line)
-}
-
-fn tap_options(query: Option<&str>) -> Result<llm_gateway::tap::Options, String> {
-    let mut options = llm_gateway::tap::Options {
-        max_body: llm_gateway::tap::DEFAULT_MAX_BODY,
-        ..Default::default()
-    };
-    let Some(query) = query else {
-        return Ok(options);
-    };
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
-            "include" => {
-                for item in value.split(',').filter(|item| !item.is_empty()) {
-                    match item {
-                        "request_body" => options.request_body = true,
-                        "response_body" => options.response_body = true,
-                        _ => return Err(format!("unknown tap include: {item}")),
-                    }
-                }
-            }
-            "max_body" => {
-                options.max_body = value
-                    .parse()
-                    .map_err(|_| "max_body must be a non-negative integer".to_owned())?;
-            }
-            "" => {}
-            _ => return Err(format!("unknown tap parameter: {key}")),
-        }
-    }
-    Ok(options)
 }
 
 /// 使用量の日次集計を返す (DR-0011)。
@@ -708,7 +629,7 @@ async fn forward<P: CredentialPersistence + 'static>(
     // 節目 (本文を受け取った / ヘッダが返った / 流し始めた / 終端) を
     // 突き合わせられる。番号を振るのは本文を読む前 — 読むのにかかった
     // 時間も、この番号の下に残したい。
-    let span = exchange::request_span();
+    let (span, seq) = exchange::request_span_numbered();
     // 断るときのログにも載せるので、経路が決まる前に取り出しておく。
     let ns_name = namespace_of(uri.path()).to_owned();
 
@@ -772,13 +693,21 @@ async fn forward<P: CredentialPersistence + 'static>(
         Authorization::Accepted(principal) => Some(principal),
         _ => None,
     };
-    // tap に載せる値は gateway が書き換える前の client request から取る。
-    let tap_plan = gateway.tap().capture_plan();
-    let tap_thinking = json.get("thinking").cloned();
-    let tap_tool_choice = request_type(json.get("tool_choice"));
-    let tap_stream = json.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let tap_request_body =
-        tap_plan.and_then(|plan| llm_gateway::tap::capture(&bytes, plan.request_body));
+    // 一時ダンプは gateway が書き換える前の、受けた本文そのものを書く
+    // (DR-0038 決定 7・10)。動いている系列が無ければ何もしない。
+    let dumping = gateway.dumps().capture(
+        llm_gateway::dump::Received {
+            ns: &ns_name,
+            seq,
+            body: &bytes,
+            headers: &headers,
+            stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        },
+        now_unix_ms(),
+    );
+    let requested_model = dumping
+        .as_ref()
+        .and_then(|_| json.get("model").and_then(Value::as_str).map(str::to_owned));
     // namespace の thinking 方針は Messages 形式の欄に書く指示。Responses 形式の
     // 本文には置き場所が無いので当てない (DR-0025)。
     if shape == RequestShape::Messages {
@@ -806,32 +735,21 @@ async fn forward<P: CredentialPersistence + 'static>(
     {
         Ok(forwarded) => {
             let upstream = forwarded.response;
-            let tap = tap_plan.map(|plan| exchange::TapObservation {
-                tap: Arc::clone(gateway.tap()),
-                response_body_limit: plan.response_body,
-                event: llm_gateway::tap::Event {
-                    ts: now_unix_ms(),
-                    ns: ns_name.clone(),
-                    model: forwarded.model.clone(),
-                    route: forwarded.route.clone(),
+            let dumping = dumping.map(|capture| {
+                capture.respond(llm_gateway::dump::Answered {
                     status: upstream.status,
-                    thinking: tap_thinking,
-                    tool_choice: tap_tool_choice,
-                    stream: tap_stream,
-                    request_body_size: bytes.len(),
-                    response_body_size: 0,
+                    model: Some(forwarded.model.clone()),
+                    route: Some(forwarded.route.clone()),
+                    origin: Some(forwarded.origin.clone()),
                     credential: forwarded
                         .credential
                         .as_ref()
                         .map(|credential| credential.as_str().to_owned()),
-                    origin: forwarded.origin.clone(),
                     cache_strategy: forwarded
                         .cache_strategy
                         .map(|strategy| strategy.as_str().to_owned()),
                     cache_ttl_secs: forwarded.cache_ttl_secs,
-                    request_body: tap_request_body,
-                    response_body: None,
-                },
+                })
             });
             // 応答が閉じたら 1 通流す (DR-0012)。下書きは経路が決まった時点で
             // 作ってあり、終わり方を入れるのは本文の終端。
@@ -859,7 +777,7 @@ async fn forward<P: CredentialPersistence + 'static>(
                     },
                     span.clone(),
                 )
-                .with_tap(tap)
+                .with_dump(dumping)
                 .with_completion(completion),
             ))
             .unwrap_or_else(|e| {
@@ -872,7 +790,19 @@ async fn forward<P: CredentialPersistence + 'static>(
                 })
             })
         }
-        Err(e) => span.in_scope(|| error_response(&ns_name, &e)),
+        Err(e) => {
+            let response = span.in_scope(|| error_response(&ns_name, &e));
+            // upstream に届かずに gateway が答えた。返したのは upstream の
+            // バイト列ではないので、行だけを書く。
+            if let Some(capture) = dumping {
+                capture.settle_without_response(llm_gateway::dump::Answered {
+                    status: response.status().as_u16(),
+                    model: requested_model,
+                    ..Default::default()
+                });
+            }
+            response
+        }
     }
 }
 
@@ -1293,6 +1223,7 @@ pub(crate) mod tests {
     use llm_gateway::credential::{
         CredentialId, OauthTokens, Payload, Persistence, StoredCredential,
     };
+    use std::net::SocketAddr;
     use std::sync::{Mutex, OnceLock};
     use tokio::net::TcpListener;
 
@@ -1687,42 +1618,93 @@ content-length: {declared}\r\n\r\n{head}"
         })
     }
 
-    #[test]
-    fn tap_query_selects_bodies_and_limit() {
-        let options = tap_options(Some("include=request_body,response_body&max_body=123")).unwrap();
-        assert!(options.request_body);
-        assert!(options.response_body);
-        assert_eq!(options.max_body, 123);
-
-        let defaults = tap_options(None).unwrap();
-        assert!(!defaults.request_body);
-        assert!(!defaults.response_body);
-        assert_eq!(defaults.max_body, llm_gateway::tap::DEFAULT_MAX_BODY);
+    /// gateway を立てて、待ち受け先と gateway そのものを返す (一時ダンプを
+    /// 始めるのに要る)。
+    async fn serve_keeping(config_toml: &str) -> (String, Arc<Gateway<StaticStore>>) {
+        let config: llm_gateway::Config = toml::from_str(config_toml).unwrap();
+        config.validate().unwrap();
+        let gateway = Arc::new(Gateway::new(&config, crate::tests::StaticStore).unwrap());
+        gateway.refresh_models().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(serving).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        (format!("http://{addr}"), gateway)
     }
 
-    #[tokio::test]
-    async fn tap_rejects_proxy_headers() {
-        let base = serve("").await;
-        for (name, value) in [
-            ("x-forwarded-for", "127.0.0.1"),
-            ("forwarded", "for=127.0.0.1"),
-        ] {
-            let response = reqwest::Client::new()
-                .get(format!("{base}/llm-gateway/tap"))
-                .header(name, value)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
-            assert_eq!(
-                response.text().await.unwrap(),
-                "tap is available only to direct loopback connections"
-            );
-        }
+    /// 一時ダンプを試す gateway。`[stats] dir` を `stats` に向け、
+    /// `ns.default` は token 付き・display を書き換える。
+    async fn dumping_gateway(
+        stats: &std::path::Path,
+        upstream: &str,
+    ) -> (String, Arc<Gateway<StaticStore>>) {
+        serve_keeping(&format!(
+            r#"
+[stats]
+dir = {stats:?}
+
+[routes.a]
+provider = "anthropic"
+url = "{upstream}"
+models = ["m"]
+
+[ns.default]
+auth_token = "{TOKEN}"
+thinking_display = "summarized"
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a"]
+"#
+        ))
+        .await
     }
 
+    fn start_dump(gateway: &Gateway<StaticStore>, request_only: bool) -> llm_gateway::dump::View {
+        gateway
+            .dumps()
+            .start(
+                &llm_gateway::dump::Start {
+                    unit: "u",
+                    ns: "default",
+                    for_ms: 600_000,
+                    max_bytes: None,
+                    request_only,
+                },
+                now_unix_ms(),
+            )
+            .unwrap()
+    }
+
+    fn index_lines(dir: &str) -> Vec<Value> {
+        std::fs::read_to_string(std::path::Path::new(dir).join("index.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// 本文を覗く口はダンプ 1 つで、`/llm-gateway/tap` は持たない (DR-0038 決定 15)。
     #[tokio::test]
-    async fn tap_sends_metadata_and_truncates_bodies_per_subscriber() {
+    async fn there_is_no_tap() {
+        let base = serve("[ns.default]\n").await;
+        let response = reqwest::get(format!("{base}/llm-gateway/tap"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// 動いている系列には、受けた形の request と upstream が返した生のバイト列と、
+    /// 秘密のヘッダを落とした `index.jsonl` の 1 行が書かれる (DR-0038 決定 7・8・14)。
+    /// 動いている間は `/self` にも出る (決定 12)。
+    #[tokio::test]
+    async fn a_running_dump_writes_what_was_received_and_what_came_back() {
         let response_body = r#"{"type":"message","content":[]}"#;
         let upstream = fake_upstream(move || {
             (
@@ -1732,91 +1714,169 @@ content-length: {declared}\r\n\r\n{head}"
             )
         })
         .await;
-        let base = serve(&format!(
-            r#"
-[routes.a]
-provider = "anthropic"
-url = "{upstream}"
-models = ["m"]
+        let stats = tempfile::TempDir::new().unwrap();
+        let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
+        let view = start_dump(&gateway, false);
+        assert!(
+            std::path::Path::new(&view.dump_dir).is_absolute(),
+            "{}",
+            view.dump_dir
+        );
 
-[ns.default]
-
-[[ns.default.routing]]
-models = ["m"]
-routes = ["a"]
-"#
-        ))
-        .await;
-        let client = reqwest::Client::new();
-        let mut metadata = client
-            .get(format!("{base}/llm-gateway/tap"))
-            .send()
-            .await
-            .unwrap();
-        let mut bodies = client
-            .get(format!(
-                "{base}/llm-gateway/tap?include=request_body,response_body&max_body=12"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(metadata.status(), StatusCode::OK);
-        assert_eq!(bodies.status(), StatusCode::OK);
-
-        let request = json!({
-            "model": "m",
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hello"}],
-            "thinking": {"type": "adaptive"},
-            "tool_choice": {"type": "auto"},
-            "stream": false,
-        });
-        let raw_request = serde_json::to_vec(&request).unwrap();
-        let forwarded = client
-            .post(format!("{base}/v1/messages"))
-            .json(&request)
-            .send()
-            .await
-            .unwrap();
+        let mut sent = request_body();
+        sent["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
+        let raw = serde_json::to_vec(&sent).unwrap();
+        let forwarded = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("content-type", "application/json")
+                .header("anthropic-beta", "b-1")
+                .header("x-api-key", "secret-key")
+                .body(raw.clone()),
+        )
+        .send()
+        .await
+        .unwrap();
         assert_eq!(forwarded.status(), StatusCode::OK);
         assert_eq!(forwarded.text().await.unwrap(), response_body);
 
-        let metadata = tap_event(metadata.chunk().await.unwrap().expect("metadata event"));
-        let bodies = tap_event(bodies.chunk().await.unwrap().expect("body event"));
-        for event in [&metadata, &bodies] {
-            assert!(
-                event["ts"].as_i64().unwrap() > 1_700_000_000_000,
-                "the time is Unix milliseconds, like events: {}",
-                event["ts"]
-            );
-            assert_eq!(event["ns"], "default");
-            assert_eq!(event["model"], "m");
-            assert_eq!(event["route"], "a");
-            assert_eq!(event["status"], 200);
-            assert_eq!(event["thinking"], json!({"type": "adaptive"}));
-            assert_eq!(event["tool_choice"], "auto");
-            assert_eq!(event["stream"], false);
-            assert_eq!(event["request_body_size"], raw_request.len());
-            assert_eq!(event["response_body_size"], response_body.len());
-            assert_eq!(event["credential"], Value::Null);
+        let lines = index_lines(&view.dump_dir);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line["ts"].as_i64().unwrap() > 1_700_000_000_000, "{line}");
+        assert!(line["seq"].as_u64().is_some(), "{line}");
+        assert_eq!(line["model"], "m");
+        assert_eq!(line["route"], "a");
+        assert_eq!(line["status"], 200);
+        assert_eq!(line["stream"], false);
+        assert_eq!(line["request_bytes"], raw.len());
+        assert_eq!(line["response_bytes"], response_body.len());
+        assert_eq!(line["headers"]["anthropic-beta"], "b-1");
+        for secret in ["authorization", "x-api-key"] {
+            assert!(line["headers"].get(secret).is_none(), "{line}");
         }
-        assert!(metadata.get("request_body").is_none());
-        assert!(metadata.get("response_body").is_none());
+        let stem = format!("{}-{}", line["ts"], line["seq"]);
+        assert_eq!(line["request_file"], format!("{stem}.request.json"));
+        assert_eq!(line["response_file"], format!("{stem}.response.sse"));
+
+        let dir = std::path::Path::new(&view.dump_dir);
+        // gateway が display を書き換える前の、受けた本文そのもの。
         assert_eq!(
-            bodies["request_body"].as_str(),
-            Some(String::from_utf8_lossy(&raw_request[..12]).as_ref())
+            std::fs::read(dir.join(format!("{stem}.request.json"))).unwrap(),
+            raw
         );
-        assert_eq!(bodies["response_body"].as_str(), Some(&response_body[..12]));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{stem}.response.sse"))).unwrap(),
+            response_body
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(dir), 0o700);
+            assert_eq!(mode(&dir.join("index.jsonl")), 0o600);
+            assert_eq!(mode(&dir.join(format!("{stem}.request.json"))), 0o600);
+        }
+
+        let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            answered["dump"],
+            json!([{
+                "dump_id": view.dump_id,
+                "ns": "default",
+                "until": view.until,
+                "bytes_written": raw.len() + response_body.len(),
+            }])
+        );
+        gateway.dumps().stop(&view.dump_id).unwrap();
+        let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(answered.get("dump").is_none(), "{answered}");
     }
 
-    fn tap_event(chunk: impl AsRef<[u8]>) -> Value {
-        // tap は素の JSONL (1 行 = 1 JSON)。SSE の data: 枠は無い。
-        let text = String::from_utf8(chunk.as_ref().to_vec()).unwrap();
-        let line = text
-            .lines()
-            .find(|line| !line.is_empty())
-            .expect("JSONL line");
-        serde_json::from_str(line).unwrap()
+    /// `--request-only` の系列には response のファイルも欄も無い。upstream に
+    /// 届かなかった 1 本は、行だけが書かれる (DR-0038 決定 7・14)。
+    #[tokio::test]
+    async fn a_request_only_dump_and_a_refused_request_leave_no_response_file() {
+        let upstream = fake_upstream(|| (200, r#"{"type":"message"}"#.to_owned(), vec![])).await;
+        let stats = tempfile::TempDir::new().unwrap();
+        let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
+        let request_only = start_dump(&gateway, true);
+        let both = start_dump(&gateway, false);
+
+        let ok = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&request_body()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        ok.bytes().await.unwrap();
+        let mut unknown = request_body();
+        unknown["model"] = json!("nowhere");
+        let refused = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .json(&unknown),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        let lines = index_lines(&request_only.dump_dir);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|line| line.get("response_file").is_none()));
+        let files = std::fs::read_dir(&request_only.dump_dir).unwrap().count();
+        assert_eq!(files, 3, "index.jsonl and two requests");
+
+        // 重なっている系列には同じ 1 本が両方書かれる (決定 13)。
+        let lines = index_lines(&both.dump_dir);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let refused_line = lines.iter().find(|line| line["status"] == 404).unwrap();
+        assert_eq!(refused_line["model"], "nowhere");
+        assert!(refused_line.get("route").is_none(), "{refused_line}");
+        assert!(
+            refused_line.get("response_file").is_none(),
+            "{refused_line}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["status"] == 200 && line.get("response_file").is_some())
+        );
+    }
+
+    /// ns 認証に断られた 1 本は書かない (受けたのは gateway の外の誰か)。
+    #[tokio::test]
+    async fn nothing_is_written_for_a_request_with_a_bad_token() {
+        let upstream = fake_upstream(|| (200, r#"{"type":"message"}"#.to_owned(), vec![])).await;
+        let stats = tempfile::TempDir::new().unwrap();
+        let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
+        let view = start_dump(&gateway, false);
+
+        let denied = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .bearer_auth("wrong")
+            .json(&request_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        assert!(index_lines(&view.dump_dir).is_empty());
+        assert_eq!(std::fs::read_dir(&view.dump_dir).unwrap().count(), 0);
     }
 
     /// 転送のたびに、見ている人へ 1 通流れる。

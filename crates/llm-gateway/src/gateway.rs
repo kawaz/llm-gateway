@@ -31,7 +31,6 @@ use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Crossing, NamespaceView, Route, Router, Selection, ThinkingSession};
 use crate::session;
 use crate::stats::{self, Stats};
-use crate::tap::Tap;
 use crate::thinking_sources::ThinkingSources;
 use crate::{Error, Result};
 
@@ -54,7 +53,8 @@ pub struct Gateway<P: CredentialPersistence> {
     /// 送る相手は upstream で、1 リクエストで完結する — 届け先も戻りも
     /// 要らない。
     keepalive: Arc<keepalive::Keepalive>,
-    tap: Arc<Tap>,
+    /// 時限つきの一時ダンプの系列 (DR-0038)。制御口が始め、受け口が書く。
+    dumps: Arc<crate::dump::Dumps>,
     /// 登録した行き先への無変換の中継 (DR-0030 §2)。
     passthrough: crate::passthrough::Passthrough,
     status: crate::status::Manager,
@@ -169,7 +169,6 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         // 知らせの口は 1 本。発火は各経路と router、束ねるのはここ (DR-0014 §3)。
         let events = Arc::new(Events::new());
-        let tap = Arc::new(Tap::new());
         let router = Arc::new(Router::new(
             config.clone(),
             Arc::clone(&events),
@@ -204,7 +203,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             )),
             keepalive,
             events,
-            tap,
+            // 兄弟の unit と共有する走行状態の置き場 (DR-0038 決定 6)。
+            dumps: Arc::new(crate::dump::Dumps::new(&config.stats.resolve_dir())),
             passthrough: crate::passthrough::Passthrough::new(config)?,
             status: crate::status::Manager::new(config),
             web_logins: Mutex::new(HashMap::new()),
@@ -305,7 +305,7 @@ impl<P: CredentialPersistence> Gateway<P> {
 
     /// 使用量の日次集計。
     ///
-    /// 受け取り口が中継に tap を挟むのに使う。閲覧の報告は
+    /// 受け取り口が応答の観測に積み先として渡すのに使う。閲覧の報告は
     /// [`Self::stats_report`] から取る。
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
@@ -344,9 +344,10 @@ impl<P: CredentialPersistence> Gateway<P> {
         &self.events
     }
 
-    /// 購読中だけ転送の詳細を流すデバッグ用 tap。
-    pub fn tap(&self) -> &Arc<Tap> {
-        &self.tap
+    /// 時限つきの一時ダンプ (DR-0038)。制御口が系列を始め・止め、受け口が
+    /// 本文を書く。
+    pub fn dumps(&self) -> &Arc<crate::dump::Dumps> {
+        &self.dumps
     }
 
     /// 前回落とした分を読み戻す。待ち受けを始める前に 1 回だけ呼ぶ。
@@ -2062,8 +2063,9 @@ impl<P: CredentialPersistence> keepalive::Sender for Gateway<P> {
 /// 控えに持ち回してはいけないヘッダか。
 ///
 /// 認証は送るたびに経路が付け直す (DR-0027 決定 1 の「認証差し替え後の形」)。
-/// 控えに残すと、期限の切れた token を抱えたまま送り直すことになる。
-fn is_authorization(name: &str) -> bool {
+/// 控えに残すと、期限の切れた token を抱えたまま送り直すことになる。一時ダンプも
+/// 同じ述語で落とす (DR-0038 決定 8)。
+pub(crate) fn is_authorization(name: &str) -> bool {
     const SECRETS: [&str; 4] = [
         "authorization",
         "proxy-authorization",

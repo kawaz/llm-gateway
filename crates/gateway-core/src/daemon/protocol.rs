@@ -29,6 +29,43 @@ pub enum Request {
     Reload(Which),
     /// 書いたものを流し続ける (答えは JSONL)。
     Log(Which),
+    /// 指した台に一時ダンプを頼む (DR-0038 決定 2)。頼みの中身は台が解釈し、
+    /// 監督者は制御口へ渡すだけ。
+    Dump(DumpRelay),
+}
+
+/// 監督者に渡す一時ダンプの頼み。どの台かは CLI が登録簿から決めて書く
+/// (DR-0038 決定 3、走っている台に聞く他の命令と同じ指し方)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DumpRelay {
+    pub unit: String,
+    pub dump: DumpRequest,
+}
+
+/// 台の制御口が受ける一時ダンプの操作 (DR-0038 決定 1・3)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DumpRequest {
+    /// 1 つの ns の系列を今から `for_secs` の間だけ始める。
+    Start {
+        ns: String,
+        /// 時限の長さ (秒)。終わりの時刻は受けた台が自分の壁時計で決める。
+        for_secs: u64,
+        /// 系列に書く量の上限。無ければ台の既定。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        request_only: bool,
+    },
+    /// 系列を止める。`dump_id` で 1 つ、`all` でその台の全部。
+    Stop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dump_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+    },
+    /// 動いている系列の一覧。
+    Status,
 }
 
 /// どの台に対しての頼みか。
@@ -106,6 +143,10 @@ pub struct UnitStatus {
     /// で聞く。答えられなければ欄ごと出さない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub events: Option<UnitEvents>,
+    /// 走っている本人が答えた、動いている一時ダンプの系列 (DR-0038 決定 12)。
+    /// 1 つも動いていなければ欄ごと出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump: Option<Vec<UnitDump>>,
 
     /// 監督者が起こし直した回数。
     pub restarts: u32,
@@ -148,6 +189,18 @@ pub struct UnitEvents {
     pub dropped: u64,
 }
 
+/// 1 台で動いている一時ダンプの系列 1 つ (DR-0038 決定 12)。
+///
+/// 止め忘れに気づくための欄で、本文の置き場は載せない (`dump status` が答える)。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UnitDump {
+    pub dump_id: String,
+    pub ns: String,
+    /// 系列の終わりの時刻 (Unix ミリ秒)。
+    pub until: i64,
+    pub bytes_written: u64,
+}
+
 /// 子が書いた 1 行。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct LogLine {
@@ -166,6 +219,8 @@ pub struct LogLine {
 pub enum ControlRequest {
     /// 設定を読み直す。
     Reload,
+    /// 一時ダンプを操作する (DR-0038 決定 2)。
+    Dump(DumpRequest),
 }
 
 /// 1 台の読み直しの結果 (DR-0032 決定 5)。
@@ -296,6 +351,50 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"op":"reload","unit":"stable"}"#).unwrap(),
             Request::Reload(Which::named("stable"))
+        );
+    }
+
+    /// ダンプの頼みは、監督者宛ても制御口宛ても 1 行の 1 つの物として読める。
+    #[test]
+    fn a_dump_request_is_one_object_both_ways() {
+        let start = DumpRequest::Start {
+            ns: "lab".to_owned(),
+            for_secs: 600,
+            max_bytes: None,
+            request_only: false,
+        };
+        let relay = Request::Dump(DumpRelay {
+            unit: "unstable".to_owned(),
+            dump: start.clone(),
+        });
+        let text = serde_json::to_string(&relay).unwrap();
+        assert_eq!(
+            text,
+            r#"{"op":"dump","unit":"unstable","dump":{"action":"start","ns":"lab","for_secs":600}}"#
+        );
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), relay);
+
+        let control = ControlRequest::Dump(start);
+        let text = serde_json::to_string(&control).unwrap();
+        assert_eq!(
+            text,
+            r#"{"op":"dump","action":"start","ns":"lab","for_secs":600}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(&text).unwrap(),
+            control
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(r#"{"op":"dump","action":"stop","all":true}"#)
+                .unwrap(),
+            ControlRequest::Dump(DumpRequest::Stop {
+                dump_id: None,
+                all: true
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(r#"{"op":"dump","action":"status"}"#).unwrap(),
+            ControlRequest::Dump(DumpRequest::Status)
         );
     }
 

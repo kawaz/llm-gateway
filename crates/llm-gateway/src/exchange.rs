@@ -56,11 +56,11 @@ use tracing::{Span, error, info, info_span, warn};
 
 use crate::Result;
 use crate::credential::time::now_unix_ms;
+use crate::dump;
 use crate::egress::BodyStream;
 use crate::events::{self, Events};
 use crate::metering::{Outcome, TokenUsage, UsageObserver};
 use crate::stats::Stats;
-use crate::tap::{self, Tap};
 
 /// リクエストに振る通し番号。
 ///
@@ -72,12 +72,22 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// 転送の間に出るログはこの span の下に入る。`req` の番号で、開始
 /// (ヘッダ受信) と終了 (本文の終端) を突き合わせられる。
 pub fn request_span() -> Span {
-    info_span!(
+    request_span_numbered().0
+}
+
+/// [`request_span`] と、振った番号。
+///
+/// 番号は一時ダンプのファイル名と `index.jsonl` の `seq` にも使う (DR-0038
+/// 決定 14)。log の `req` と同じ番号なので、ダンプした 1 本の log を辿れる。
+pub fn request_span_numbered() -> (Span, u64) {
+    let req = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let span = info_span!(
         "exchange",
-        req = NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        req,
         // 受け取り終えた時点で [`record_request_body`] が埋める。
         body_bytes = Empty,
-    )
+    );
+    (span, req)
 }
 
 /// クライアントから本文を受け取り終えたことを記録する。
@@ -141,8 +151,7 @@ pub fn observe(
         credential: credential.map(str::to_owned),
         model: model.to_owned(),
         origin: origin.to_owned(),
-        tap: None,
-        response_body: Vec::new(),
+        dump: None,
         completion: None,
     }
 }
@@ -161,13 +170,6 @@ pub struct Attribution<'a> {
     pub model: &'a str,
     /// 出した側の 1 語 ([`crate::provider::RequestOrigin::as_str`])。
     pub origin: &'a str,
-}
-
-/// 1 exchange の tap 配信に必要な値。
-pub struct TapObservation {
-    pub tap: Arc<Tap>,
-    pub event: tap::Event,
-    pub response_body_limit: usize,
 }
 
 /// 応答が閉じたことを知らせるのに要る値 (DR-0012)。
@@ -231,16 +233,17 @@ pub struct BodyObservation {
     model: String,
     /// 出した側の 1 語 (DR-0029)。集計を素性で割るための鍵。
     origin: String,
-    tap: Option<TapObservation>,
-    response_body: Vec<u8>,
+    /// 一時ダンプの書き先 (DR-0038 決定 10)。動いている系列が無ければ `None`。
+    dump: Option<dump::Responding>,
     /// 応答が閉じたことを流す先と、その下書き。流さない応答では `None`。
     completion: Option<Completion>,
 }
 
 impl BodyObservation {
-    /// tap 購読時だけ応答本文を上限まで控え、交換の終端で 1 件配信する。
-    pub fn with_tap(mut self, tap: Option<TapObservation>) -> Self {
-        self.tap = tap;
+    /// 一時ダンプの系列が動いている間だけ、通り過ぎるチャンクをそのまま書く
+    /// (DR-0038 決定 10)。終端で溜めて 1 件にまとめない。
+    pub fn with_dump(mut self, dump: Option<dump::Responding>) -> Self {
+        self.dump = dump;
         self
     }
 
@@ -331,11 +334,8 @@ impl BodyObservation {
         self.note_gap(Instant::now());
         let outcome = self.finish_usage();
         self.tell_completed(outcome, completed);
-        if let Some(mut observation) = self.tap.take() {
-            observation.event.response_body_size = self.bytes as usize;
-            observation.event.response_body =
-                tap::capture(&self.response_body, observation.response_body_limit);
-            observation.tap.publish(observation.event);
+        if let Some(mut dump) = self.dump.take() {
+            dump.finish();
         }
         (
             self.bytes,
@@ -365,12 +365,8 @@ impl Stream for BodyObservation {
                 this.note_gap(now);
                 this.last_chunk = Some(now);
                 this.bytes += chunk.len() as u64;
-                if let Some(observation) = this.tap.as_ref()
-                    && this.response_body.len() < observation.response_body_limit
-                {
-                    let remaining = observation.response_body_limit - this.response_body.len();
-                    this.response_body
-                        .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if let Some(dump) = this.dump.as_mut() {
+                    dump.chunk(&chunk);
                 }
                 if let Some(observer) = this.observer.as_mut() {
                     observer.observe(&chunk);

@@ -1,8 +1,8 @@
 //! 走っている台の制御口 (DR-0032 決定 2・3)。
 //!
 //! 台は `daemon/control/<unit>.sock` で待ち、監督者だけがそこへ繋いで
-//! 設定の読み直しを命じる。子の HTTP (Caddy 越しに外から届く面) には
-//! 台の挙動を変える操作を置かない。
+//! 設定の読み直しと一時ダンプ (DR-0038 決定 2) を頼む。子の HTTP (Caddy 越しに
+//! 外から届く面) には台の挙動を変える操作を置かない。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,8 +10,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use super::protocol::{self, ControlRequest, ReloadFailure, Reloaded};
+use super::protocol::{self, ControlRequest, DumpRequest, ReloadFailure, Reloaded};
 use crate::credential::CredentialPersistence;
+use crate::credential::time::now_unix_ms;
 use crate::gateway::ReloadError;
 use crate::{Config, Gateway};
 
@@ -60,7 +61,7 @@ impl ControlSocket {
 
     /// 頼みに答え続ける。1 本の繋がりに 1 つの頼み。
     ///
-    /// 読み直しは 1 つずつ通す。同時に 2 つ来たとき、後から読んだ設定が
+    /// 頼みは 1 つずつ通す。読み直しが同時に 2 つ来たとき、後から読んだ設定が
     /// 先に差し替わって古い方で上書きされる、を起こさない。
     pub async fn serve<P: CredentialPersistence + 'static>(
         &self,
@@ -68,7 +69,6 @@ impl ControlSocket {
         config_path: &Path,
         gateway: Arc<Gateway<P>>,
     ) {
-        let one_at_a_time = tokio::sync::Mutex::new(());
         loop {
             let stream = match self.listener.accept().await {
                 Ok((stream, _)) => stream,
@@ -77,7 +77,6 @@ impl ControlSocket {
                     return;
                 }
             };
-            let _held = one_at_a_time.lock().await;
             answer(stream, unit, config_path, &gateway).await;
         }
     }
@@ -106,12 +105,16 @@ async fn answer<P: CredentialPersistence>(
     }
     let line = String::from_utf8_lossy(&line);
     let result = match serde_json::from_str::<ControlRequest>(&line) {
-        Ok(ControlRequest::Reload) => reload(unit, config_path, gateway).await,
-        Err(e) => Reloaded::failed(
+        Ok(ControlRequest::Reload) => {
+            serde_json::to_value(reload(unit, config_path, gateway).await).unwrap_or_default()
+        }
+        Ok(ControlRequest::Dump(request)) => dump(unit, request, gateway, now_unix_ms()),
+        Err(e) => serde_json::to_value(Reloaded::failed(
             unit,
             "bad_request",
             format!("could not read the request: {e}"),
-        ),
+        ))
+        .unwrap_or_default(),
     };
     let mut text = serde_json::to_string(&result).unwrap_or_default();
     text.push('\n');
@@ -155,6 +158,92 @@ pub async fn reload<P: CredentialPersistence>(
             }
         }
     }
+}
+
+/// 一時ダンプの頼みに答える (DR-0038 決定 2・11)。
+///
+/// 答えはどれも `unit` と `ok` で始まり、`ok: true` の答えには系列の欄を同じ
+/// 階層に添える。断る時は `ok: false` と `error: {kind, message}`。
+pub fn dump<P: CredentialPersistence>(
+    unit: &str,
+    request: DumpRequest,
+    gateway: &Gateway<P>,
+    now: i64,
+) -> serde_json::Value {
+    let dumps = gateway.dumps();
+    let answered = match request {
+        DumpRequest::Start {
+            ns,
+            for_secs,
+            max_bytes,
+            request_only,
+        } => {
+            // 走っている設定に無い ns は書く相手が無い (決定 4)。
+            if gateway.namespace(&ns).is_none() {
+                let known = gateway.namespace_names().join(", ");
+                return dump_failed(
+                    unit,
+                    "unknown_namespace",
+                    format!("this unit has no namespace `{ns}` (it has: {known})"),
+                );
+            }
+            let start = crate::dump::Start {
+                unit,
+                ns: &ns,
+                for_ms: i64::try_from(for_secs)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(1000),
+                max_bytes,
+                request_only,
+            };
+            dumps.start(&start, now).map(|view| fields(&view))
+        }
+        DumpRequest::Stop {
+            dump_id: Some(id),
+            all: false,
+        } => dumps.stop(&id).map(|view| fields(&view)),
+        DumpRequest::Stop {
+            dump_id: None,
+            all: true,
+        } => Ok(listed(&dumps.stop_all(now))),
+        DumpRequest::Stop { .. } => {
+            return dump_failed(unit, "bad_request", "say one dump_id, or --all");
+        }
+        DumpRequest::Status => Ok(listed(&dumps.status(now))),
+    };
+    match answered {
+        Ok(fields) => {
+            let mut answer = serde_json::Map::new();
+            answer.insert("unit".to_owned(), serde_json::json!(unit));
+            answer.insert("ok".to_owned(), serde_json::json!(true));
+            answer.extend(fields);
+            serde_json::Value::Object(answer)
+        }
+        Err(refusal) => dump_failed(unit, refusal.kind, refusal.message),
+    }
+}
+
+/// 系列 1 つの欄。
+fn fields(view: &crate::dump::View) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::to_value(view) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// 系列の一覧を `dumps` に並べる。
+fn listed(views: &[crate::dump::View]) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("dumps".to_owned(), serde_json::json!(views));
+    map
+}
+
+fn dump_failed(unit: &str, kind: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "unit": unit,
+        "ok": false,
+        "error": { "kind": kind, "message": message.into() },
+    })
 }
 
 #[cfg(test)]
@@ -312,5 +401,122 @@ routes = ["a"]
         let _ = task.await;
         drop(Arc::try_unwrap(socket).ok().unwrap());
         assert!(!path.exists());
+    }
+
+    fn dump_start(ns: &str) -> DumpRequest {
+        DumpRequest::Start {
+            ns: ns.to_owned(),
+            for_secs: 600,
+            max_bytes: None,
+            request_only: false,
+        }
+    }
+
+    /// 答えは `unit` と `ok` で始まり、系列の欄を同じ階層に添える (DR-0038 決定 11)。
+    #[tokio::test]
+    async fn a_dump_is_started_listed_and_stopped_through_the_control_socket() {
+        let u = unit();
+        let path = u.dir.path().join("control").join("u.sock");
+        let socket = Arc::new(ControlSocket::open_at(&path).unwrap());
+        let serving = Arc::clone(&socket);
+        let (config, gateway) = (u.config.clone(), Arc::clone(&u.gateway));
+        let task = tokio::spawn(async move { serving.serve("u", &config, gateway).await });
+
+        let ask = |request: DumpRequest| {
+            let path = path.clone();
+            async move {
+                let line = protocol::ask(&path, &ControlRequest::Dump(request))
+                    .await
+                    .unwrap();
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()
+            }
+        };
+
+        let started = ask(dump_start("default")).await;
+        assert_eq!(started["unit"], "u");
+        assert_eq!(started["ok"], true);
+        assert_eq!(started["ns"], "default");
+        assert_eq!(started["max_bytes"], crate::dump::DEFAULT_MAX_BYTES);
+        assert_eq!(started["request_only"], false);
+        assert!(started.get("bytes_written").is_none(), "{started}");
+        let id = started["dump_id"].as_str().unwrap().to_owned();
+        let dir = started["dump_dir"].as_str().unwrap();
+        assert!(
+            dir.ends_with(&format!("stats/dumps/u/default/{id}")),
+            "{dir}"
+        );
+
+        let listed = ask(DumpRequest::Status).await;
+        assert_eq!(listed["ok"], true);
+        assert_eq!(listed["dumps"][0]["dump_id"], id.as_str());
+        assert_eq!(listed["dumps"][0]["requests"], 0);
+
+        let stopped = ask(DumpRequest::Stop {
+            dump_id: Some(id.clone()),
+            all: false,
+        })
+        .await;
+        assert_eq!(stopped["ok"], true);
+        assert_eq!(stopped["active"], false);
+        assert_eq!(
+            ask(DumpRequest::Status).await,
+            serde_json::json!({"unit": "u", "ok": true, "dumps": []})
+        );
+        assert_eq!(
+            ask(DumpRequest::Stop {
+                dump_id: None,
+                all: true
+            })
+            .await,
+            serde_json::json!({"unit": "u", "ok": true, "dumps": []})
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// 走っている設定に無い ns、知らない id、どちらも指さない stop は断る。
+    #[tokio::test]
+    async fn a_dump_request_that_points_at_nothing_is_refused() {
+        let u = unit();
+        let now = now_unix_ms();
+        let kind = |answer: serde_json::Value| {
+            assert_eq!(answer["ok"], false, "{answer}");
+            assert_eq!(answer["unit"], "u", "{answer}");
+            answer["error"]["kind"].as_str().unwrap().to_owned()
+        };
+
+        let unknown = dump("u", dump_start("nope"), &u.gateway, now);
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("default"),
+            "{unknown}"
+        );
+        assert_eq!(kind(unknown), "unknown_namespace");
+        assert_eq!(
+            kind(dump(
+                "u",
+                DumpRequest::Stop {
+                    dump_id: Some("019a".to_owned()),
+                    all: false
+                },
+                &u.gateway,
+                now
+            )),
+            "unknown_dump"
+        );
+        for (dump_id, all) in [(None, false), (Some("019a".to_owned()), true)] {
+            assert_eq!(
+                kind(dump(
+                    "u",
+                    DumpRequest::Stop { dump_id, all },
+                    &u.gateway,
+                    now
+                )),
+                "bad_request"
+            );
+        }
     }
 }

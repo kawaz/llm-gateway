@@ -5,7 +5,7 @@
 //! - 登録簿で `enabled` になっている台を `<binary_path> daemon run <unit>` として起こす
 //! - 落ちたら間を置いて起こし直す (healthz が返れば間隔を戻す)
 //! - unix socket で受けた頼み (start / stop / restart / status / reload / log) に答える
-//! - 設定の読み直しを、台ごとの制御口へ中継する (DR-0032 決定 2)
+//! - 設定の読み直しと一時ダンプの頼みを、台ごとの制御口へ中継する (DR-0032 決定 2、DR-0038 決定 2)
 //!
 //! **設定は読まない**。読むのは子の `daemon run` で、監督者が設定に触るのは
 //! 待ち受け先 (healthz の宛先) を知るときだけ。その読み方と問い合わせの
@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 
 use crate::daemon::port;
 use crate::daemon::protocol::{
-    self, ControlRequest, LogLine, Reloaded, Request, UnitStatus, Which,
+    self, ControlRequest, DumpRelay, LogLine, Reloaded, Request, UnitStatus, Which,
 };
 use crate::daemon::registry::{Registry, Unit};
 
@@ -55,6 +55,11 @@ const VERSION_WAIT: Duration = Duration::from_secs(2);
 /// 台は差し替えた後にモデルの一覧を取り直してから答える (その上限は台の側で
 /// 30 秒)。それより長く取り、台が答えられない時だけ打ち切る。
 const RELOAD_WAIT: Duration = Duration::from_secs(45);
+
+/// 台に一時ダンプを頼んで、答えを待つ上限。
+///
+/// 台がするのは表の更新と古い系列の片付けだけで、upstream には触らない。
+const DUMP_WAIT: Duration = Duration::from_secs(10);
 
 /// healthz を叩き直す間隔。
 ///
@@ -290,6 +295,7 @@ impl Supervisor {
                     "units": units,
                 }))
             }
+            Request::Dump(relay) => Ok(self.dump_unit(relay).await),
             // 追従は [`Self::answer`] が先に拾っている。
             Request::Log(_) => Err(Refused::new(
                 "bad_request",
@@ -413,58 +419,12 @@ impl Supervisor {
     ///
     /// 設定を解釈するのは台の側で、監督者は制御口へ中継して答えを返すだけ。
     pub async fn reload_unit(&self, name: &str) -> Reloaded {
-        let running = {
-            let watched = self.watched.lock().await;
-            watched.get(name).and_then(|s| s.pid).is_some()
-        };
-        if !running {
-            return Reloaded::failed(
-                name,
-                "not_running",
-                format!(
-                    "`{name}` is not running; it reads its configuration when it starts. run `daemon start {name}`"
-                ),
-            );
-        }
-
-        let path = protocol::control_path(&self.controls, name);
-        let asked =
-            tokio::time::timeout(RELOAD_WAIT, protocol::ask(&path, &ControlRequest::Reload)).await;
-        let line = match asked {
-            Ok(Ok(line)) => line,
-            Ok(Err(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                // 制御口を持たない版が走っている。繋げないことを失敗として隠さない。
-                return Reloaded::failed(
-                    name,
-                    "restart_required",
-                    "this unit's version has no control socket; restart it",
-                );
-            }
-            Ok(Err(e)) => {
-                return Reloaded::failed(
-                    name,
-                    "unreachable",
-                    format!(
-                        "could not reach `{name}` at {}: {e}. restart the unit",
-                        path.display()
-                    ),
-                );
-            }
-            Err(_) => {
-                return Reloaded::failed(
-                    name,
-                    "no_answer",
-                    format!(
-                        "`{name}` did not answer within {}s; whether it reloaded is unknown. see `llm-gateway daemon log {name}`",
-                        RELOAD_WAIT.as_secs()
-                    ),
-                );
-            }
+        let line = match self
+            .ask_control(name, &ControlRequest::Reload, RELOAD_WAIT, "reloaded")
+            .await
+        {
+            Ok(line) => line,
+            Err(failed) => return Reloaded::failed(name, failed.kind, failed.message),
         };
         match serde_json::from_str::<Reloaded>(&line) {
             Ok(mut answer) => {
@@ -479,6 +439,105 @@ impl Supervisor {
                     excerpt(&line)
                 ),
             ),
+        }
+    }
+
+    /// 1 台に一時ダンプを頼む (DR-0038 決定 2)。
+    ///
+    /// 頼みの中身は台が解釈する。監督者は制御口へ渡し、答えの `unit` を自分が
+    /// 呼んだ名前に揃えて返すだけ。断る時も `{unit, ok: false, error}` の形で、
+    /// 制御口を持たない版・ダンプを知らない版には `ok: false` を返す。
+    pub async fn dump_unit(&self, relay: DumpRelay) -> serde_json::Value {
+        let name = relay.unit;
+        if !self.registry.names().contains(&name) {
+            return unit_failed(
+                &name,
+                "unknown_unit",
+                format!("there is no unit called `{name}`"),
+            );
+        }
+        let line = match self
+            .ask_control(
+                &name,
+                &ControlRequest::Dump(relay.dump),
+                DUMP_WAIT,
+                "started or stopped a dump",
+            )
+            .await
+        {
+            Ok(line) => line,
+            Err(failed) => return unit_failed(&name, failed.kind, failed.message),
+        };
+        match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(serde_json::Value::Object(mut answer))
+                if answer.get("ok").is_some_and(|ok| ok.is_boolean()) =>
+            {
+                answer.insert("unit".to_owned(), serde_json::json!(name));
+                serde_json::Value::Object(answer)
+            }
+            _ => unit_failed(
+                &name,
+                "bad_answer",
+                format!("could not read what `{name}` answered: {}", excerpt(&line)),
+            ),
+        }
+    }
+
+    /// 走っている台の制御口に 1 つ頼み、1 行の答えを受け取る。
+    ///
+    /// `done` は待ち切れなかった時に「何が済んだか分からない」と言うための語。
+    async fn ask_control(
+        &self,
+        name: &str,
+        request: &ControlRequest,
+        wait: Duration,
+        done: &str,
+    ) -> Result<String, ControlFailure> {
+        let running = {
+            let watched = self.watched.lock().await;
+            watched.get(name).and_then(|s| s.pid).is_some()
+        };
+        if !running {
+            let message = match request {
+                ControlRequest::Reload => format!(
+                    "`{name}` is not running; it reads its configuration when it starts. run `daemon start {name}`"
+                ),
+                ControlRequest::Dump(_) => format!(
+                    "`{name}` is not running; a dump lives in a running unit. run `daemon start {name}`"
+                ),
+            };
+            return Err(ControlFailure::new("not_running", message));
+        }
+
+        let path = protocol::control_path(&self.controls, name);
+        match tokio::time::timeout(wait, protocol::ask(&path, request)).await {
+            Ok(Ok(line)) => Ok(line),
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                // 制御口を持たない版が走っている。繋げないことを失敗として隠さない。
+                Err(ControlFailure::new(
+                    "restart_required",
+                    "this unit's version has no control socket; restart it",
+                ))
+            }
+            Ok(Err(e)) => Err(ControlFailure::new(
+                "unreachable",
+                format!(
+                    "could not reach `{name}` at {}: {e}. restart the unit",
+                    path.display()
+                ),
+            )),
+            Err(_) => Err(ControlFailure::new(
+                "no_answer",
+                format!(
+                    "`{name}` did not answer within {}s; whether it {done} is unknown. see `llm-gateway daemon log {name}`",
+                    wait.as_secs()
+                ),
+            )),
         }
     }
 
@@ -791,6 +850,7 @@ impl Supervisor {
                         since_ms: state.and_then(|s| s.since_ms),
                         version: None,
                         events: None,
+                        dump: None,
                         restarts: state.map_or(0, |s| s.restarts),
                         last_exit: state.and_then(|s| s.last_exit.clone()),
                         port: None,
@@ -816,6 +876,7 @@ impl Supervisor {
             if let Some(answer) = ask_self(&listen, &self.probe).await {
                 row.version = answer.version;
                 row.events = answer.events;
+                row.dump = answer.dump;
             }
         }
         Ok(rows)
@@ -914,6 +975,31 @@ fn units_answer(units: Vec<UnitStatus>) -> serde_json::Value {
 struct SelfAnswer {
     version: Option<String>,
     events: Option<super::protocol::UnitEvents>,
+    dump: Option<Vec<super::protocol::UnitDump>>,
+}
+
+/// 制御口に頼めなかった理由。
+struct ControlFailure {
+    kind: &'static str,
+    message: String,
+}
+
+impl ControlFailure {
+    fn new(kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+/// 台ごとの答えの形 (`{unit, ok: false, error}`) で断る。
+fn unit_failed(unit: &str, kind: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "unit": unit,
+        "ok": false,
+        "error": { "kind": kind, "message": message.into() },
+    })
 }
 
 /// 走っている台に、自分の状態 (版と配り損ね) を聞く。
@@ -933,6 +1019,7 @@ async fn ask_self(listen: &str, probe: &UnitProbe) -> Option<SelfAnswer> {
         return Some(SelfAnswer {
             version: body.get("version")?.as_str().map(str::to_owned),
             events: None,
+            dump: None,
         });
     }
     let body = json_of(resp).await?;
@@ -944,6 +1031,10 @@ async fn ask_self(listen: &str, probe: &UnitProbe) -> Option<SelfAnswer> {
         events: body
             .get("events")
             .and_then(|e| serde_json::from_value(e.clone()).ok()),
+        // 動いている系列が無ければ台は欄ごと出さない。読めない欄も出さない。
+        dump: body
+            .get("dump")
+            .and_then(|d| serde_json::from_value(d.clone()).ok()),
     })
 }
 
@@ -1534,6 +1625,16 @@ mod tests {
 
     /// 制御口の代わりに、決まった答えを 1 度だけ返す口を開く。
     fn a_control_socket_that_answers(world: &World, unit: &str, answer: &'static str) {
+        a_control_socket_that_answers_to(world, unit, r#"{"op":"reload"}"#, answer);
+    }
+
+    /// `expected` の頼みを受けて、決まった答えを 1 度だけ返す口を開く。
+    fn a_control_socket_that_answers_to(
+        world: &World,
+        unit: &str,
+        expected: &'static str,
+        answer: &'static str,
+    ) {
         let dir = world.root.join("control");
         std::fs::create_dir_all(&dir).unwrap();
         let listener = UnixListener::bind(protocol::control_path(&dir, unit)).unwrap();
@@ -1541,7 +1642,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (reading, mut writing) = stream.into_split();
             let asked = BufReader::new(reading).lines().next_line().await.unwrap();
-            assert_eq!(asked.as_deref(), Some(r#"{"op":"reload"}"#));
+            assert_eq!(asked.as_deref(), Some(expected));
             writing.write_all(answer.as_bytes()).await.unwrap();
             writing.write_all(b"\n").await.unwrap();
         });
@@ -1604,6 +1705,86 @@ mod tests {
                 .contains("no control socket"),
             "{units:?}"
         );
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// ダンプの頼みは指された台の制御口へそのまま渡し、答えの `unit` を
+    /// 呼んだ名前に揃えて返す。渡せない台には `{unit, ok: false, error}` を返す
+    /// (DR-0038 決定 2)。
+    #[tokio::test]
+    async fn a_dump_request_is_relayed_and_answered_per_unit() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, true);
+        world.register("c", &binary, true);
+        world.register("d", &binary, false);
+        world.supervisor.reload().await;
+        world.until("a", |s| s.running).await;
+        world.until("c", |s| s.running).await;
+
+        a_control_socket_that_answers_to(
+            &world,
+            "a",
+            r#"{"op":"dump","action":"status"}"#,
+            r#"{"unit":"whatever","ok":true,"dumps":[]}"#,
+        );
+        let relay = |unit: &str| {
+            Request::Dump(DumpRelay {
+                unit: unit.to_owned(),
+                dump: protocol::DumpRequest::Status,
+            })
+        };
+
+        let answer = world.supervisor.handle(relay("a")).await.unwrap();
+        assert_eq!(
+            answer,
+            serde_json::json!({"unit": "a", "ok": true, "dumps": []})
+        );
+
+        // c は制御口を持たない版、d は止まっている、e は登録されていない。
+        for (unit, kind) in [
+            ("c", "restart_required"),
+            ("d", "not_running"),
+            ("e", "unknown_unit"),
+        ] {
+            let answer = world.supervisor.handle(relay(unit)).await.unwrap();
+            assert_eq!(answer["unit"], serde_json::json!(unit));
+            assert_eq!(answer["ok"], serde_json::json!(false), "{answer}");
+            assert_eq!(answer["error"]["kind"], serde_json::json!(kind), "{answer}");
+        }
+
+        world.supervisor.shutdown().await;
+    }
+
+    /// `ok` を持たない答えは、台の答えとして通さない。
+    #[tokio::test]
+    async fn a_dump_answer_without_ok_is_refused() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, true);
+        world.supervisor.reload().await;
+        world.until("a", |s| s.running).await;
+        a_control_socket_that_answers_to(
+            &world,
+            "a",
+            r#"{"op":"dump","action":"stop","all":true}"#,
+            r#"{"dumps":[]}"#,
+        );
+
+        let answer = world
+            .supervisor
+            .dump_unit(DumpRelay {
+                unit: "a".to_owned(),
+                dump: protocol::DumpRequest::Stop {
+                    dump_id: None,
+                    all: true,
+                },
+            })
+            .await;
+
+        assert_eq!(answer["ok"], serde_json::json!(false));
+        assert_eq!(answer["error"]["kind"], serde_json::json!("bad_answer"));
 
         world.supervisor.shutdown().await;
     }
@@ -1952,7 +2133,11 @@ mod tests {
             let app = axum::Router::new().route(
                 "/unit/self",
                 axum::routing::get(|| async {
-                    axum::Json(serde_json::json!({"version": "0.1.3", "events": {"dropped": 7}}))
+                    axum::Json(serde_json::json!({
+                        "version": "0.1.3",
+                        "events": {"dropped": 7},
+                        "dump": [{"dump_id": "019a", "ns": "lab", "until": 1792000600000_i64, "bytes_written": 12}],
+                    }))
                 }),
             );
             let _ = axum::serve(listener, app).await;
@@ -1970,6 +2155,11 @@ mod tests {
         assert_eq!(
             answer["units"][0]["events"],
             serde_json::json!({"dropped": 7})
+        );
+        // 動いている一時ダンプの系列も写す (DR-0038 決定 12)。
+        assert_eq!(
+            answer["units"][0]["dump"],
+            serde_json::json!([{"dump_id": "019a", "ns": "lab", "until": 1792000600000_i64, "bytes_written": 12}])
         );
 
         world.supervisor.shutdown().await;

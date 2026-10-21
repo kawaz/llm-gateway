@@ -78,6 +78,11 @@ remove disabled from [server], or register another configuration",
         let store = FileStore::open(&dir).map_err(|e| Failure::from(e.to_string()))?;
         let gateway =
             Arc::new(Gateway::new(&config, store).map_err(|e| Failure::from(e.to_string()))?);
+        // 48 時間より古い一時ダンプを片付ける。上がった台はダンプしていない状態で
+        // 始まるので、ここでは兄弟の分も含めて古いものだけが消える (DR-0038 決定 9)。
+        gateway
+            .dumps()
+            .sweep(llm_gateway::credential::time::now_unix_ms());
 
         let listener = tokio::net::TcpListener::bind(&config.server.listen)
             .await
@@ -372,7 +377,7 @@ mod tests {
         assert_eq!(result, Ok(()));
     }
 
-    /// SSE や tap のような無期限接続が残っても、猶予の上限で待機を終える。
+    /// SSE のような無期限接続が残っても、猶予の上限で待機を終える。
     /// 監督者の 10 秒上限より先に最後の保存へ進めることが必要である。
     #[tokio::test]
     async fn an_active_connection_cannot_outlive_shutdown_grace() {
