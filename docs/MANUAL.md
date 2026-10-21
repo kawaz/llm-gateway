@@ -753,14 +753,14 @@ Asks a running unit to write the request and response bodies passing through one
 
 ```
 $ llm-gateway dump start --ns lab --for 10m --unit unstable
-{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
 $ llm-gateway dump status --unit unstable
-{"unit":"unstable","dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
+{"unit":"unstable","ok":true,"dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
 $ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
-{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
 ```
 
-The `start` answer is the series' id and directory plus every argument it received (`until` being the end time it settled on). `status` adds `bytes_written` (total written) and `requests` (how many) and lists one such entry per running series in `dumps` (an empty array when none). Times are Unix milliseconds.
+Every answer starts with `unit` and `ok`, as `daemon reload` does; a refusal is `ok: false` with `error.kind` (`unknown_namespace` / `unknown_dump` / `supervisor_not_running`, and so on). The `start` answer is the series' id and directory plus every argument it received (`until` being the end time it settled on). `status` adds `bytes_written` (total written) and `requests` (how many) and lists one such entry per running series in `dumps` (an empty array when none). Times are Unix milliseconds.
 
 ### `auth` — keys and tokens for `jwt` namespaces
 

@@ -755,14 +755,14 @@ reload で変えられない欄 (変えたら `daemon restart`): `[server]` の 
 
 ```
 $ llm-gateway dump start --ns lab --for 10m --unit unstable
-{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
 $ llm-gateway dump status --unit unstable
-{"unit":"unstable","dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
+{"unit":"unstable","ok":true,"dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
 $ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
-{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
 ```
 
-`start` の答えは系列の id と置き場に、受け取った引数の全部を添えたもの (`until` は決めた終わりの時刻)。`status` はそれに `bytes_written` (書いた合計) と `requests` (書いた本数) を足した 1 件を、動いている系列の分だけ `dumps` に並べる (無ければ空の配列)。時刻は Unix ミリ秒。
+答えは `daemon reload` と同じく `unit` と `ok` で始まり、断る時は `ok: false` と `error.kind` (`unknown_namespace` / `unknown_dump` / `supervisor_not_running` 等)。`start` の答えは系列の id と置き場に、受け取った引数の全部を添えたもの (`until` は決めた終わりの時刻)。`status` はそれに `bytes_written` (書いた合計) と `requests` (書いた本数) を足した 1 件を、動いている系列の分だけ `dumps` に並べる (無ければ空の配列)。時刻は Unix ミリ秒。
 
 ### `auth` — `jwt` の namespace の鍵と token
 

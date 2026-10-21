@@ -29,7 +29,7 @@ llm-gateway dump status [--unit <unit>]
 
 ### 2. on/off の経路は制御 socket で、設定ファイルには書かない (統括の補強案)
 
-DR-0032 決定 2 の経路をそのまま使う。CLI → 監督者 (`supervisor.sock`、`Request` に dump の語を足す) → unit の制御口 (`daemon/control/<unit>.sock`、`ControlRequest` に足す) で、unit は結果を 1 行の JSON で返す。答えの形は DR-0032 決定 5 の `{unit, ok, error}` の流儀に揃え、`ok: true` の答えには決定 11 の中身を添える。
+DR-0032 決定 2 の経路をそのまま使う。CLI → 監督者 (`supervisor.sock`、`Request` に dump の語を足す) → unit の制御口 (`daemon/control/<unit>.sock`、`ControlRequest` に足す) で、unit は結果を 1 行の JSON で返す。答えの形は DR-0032 決定 5 の `{unit, ok, error}` の流儀に揃え、`ok: true` の答えに決定 11 の欄を同じ階層で添える (`{"unit", "ok": true, "dump_id", …}` / `{"unit", "ok": true, "dumps": […]}`)。断る時は `ok: false` と `error: {kind, message}` で、`kind` は `unit_required` / `unknown_namespace` / `unknown_dump` / `supervisor_not_running` 等 (起草者の判断)。
 
 - 設定ファイルに `[dump]` のような欄を持たない。設定に書いたものは消し忘れでそのまま常設になり、要件の「一時的に」と逆になる。`daemon reload` の対象にもならない
 - 子の HTTP には置かない。ダンプは会話の本文をディスクへ書く操作で、外 (Caddy 越し) から届く面に置かない理由は DR-0032 が reload を HTTP に置かない理由と同じ
@@ -102,18 +102,18 @@ request は受け口 (`llm-gateway-server` の `messages` / `responses`) で本�
 
 ```
 llm-gateway dump start --ns lab --for 10m --unit unstable
-{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef",
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef",
  "dump_dir":"~/.local/state/llm-gateway/stats/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef",
  "ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
 
 llm-gateway dump status --unit unstable
-{"unit":"unstable","dumps":[
+{"unit":"unstable","ok":true,"dumps":[
  {"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…/dumps/unstable/lab/019a1b2c-…",
   "ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,
   "bytes_written":1234567,"requests":12}]}
 ```
 
-- `start` は始めた系列の `dump_id` と `dump_dir` に、受け取った引数の全部 (`ns` / `until` / `max_bytes` / `request_only`) を添えて返す。`until` は決めた終わりの時刻で、`--for` そのものは返さない
+- 答えはどれも `unit` と `ok: true` で始まる (決定 2)。`start` は始めた系列の `dump_id` と `dump_dir` に、受け取った引数の全部 (`ns` / `until` / `max_bytes` / `request_only`) を添えて返す。`until` は決めた終わりの時刻で、`--for` そのものは返さない
 - `status` は**走っている系列**の一覧で、`start` の欄に `bytes_written` (その系列に書いた合計) と `requests` (書いた本数) を足した 1 件ずつを `dumps` に並べる。止まった系列は載らず、1 つも動いていなければ空の配列
 - `stop <dump_id>` は止めた系列の 1 件 (`status` の欄に `active: false` を足した形) を返す。既に止まっていた系列も同じ形で `active: false`。`stop --all` は止めた系列の 1 件ずつを `dumps` に並べる (動いていなければ空の配列)
 - 系列が止まった理由 (`expired` / `max_bytes` / `stopped`) は unit の log に出す。答えの欄には持たない (起草者の判断)
@@ -187,7 +187,7 @@ events (DR-0012) は恒常の読み手 (ccmsg 等) を持つ公開契約で、�
 | 段 | 中身 | 完了条件 |
 |---|---|---|
 | 1 | unit 側: tap の取り外しと、同じ位置でのダンプの書き出し (系列の表: dump_id / ns / until / 上限 / 書いた量、`index.jsonl` と 1 本ごとのファイル)、起動時と start 時の片付け、`/self` への露出 | 試験で、`until` を過ぎた 1 本と上限を超える 1 本が書かれず、重なる 2 系列に同じ 1 本が両方書かれ、48 時間より古い系列だけがディレクトリごと消え、`GET /llm-gateway/tap` が無い |
-| 2 | 制御口と監督者の中継 (`ControlRequest` / `Request`)、答えの形 (決定 2・11) | 試験で、制御口を持たない unit に `ok: false` が返り、知らない id の `stop` が `unknown_dump` になる |
+| 2 | 制御口と監督者の中継 (`ControlRequest` / `Request`)、答えの形 (決定 2・11) | 試験で、制御口を持たない unit に `ok: false` が返り、知らない id の `stop` が `ok: false` + `unknown_dump` になる |
 | 3 | CLI `dump start|stop|status`、`--help`・zsh completion・MANUAL | `dump start --ns lab --for 10m` が `dump_id` と `dump_dir` を答え、`daemon status` の行に `dump` が出て、10 分後に消える |
 
 ## 未決
