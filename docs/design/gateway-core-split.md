@@ -14,7 +14,7 @@ llm-gateway-cli ──> llm-gateway-server ──> llm-gateway
 ```
 
 - `llm-gateway-server` (`src/lib.rs` 1 ファイル、axum) が URL の解釈 (`/ns-<ns>/...` の切り出し) と **ns 認証 (`auth_token` の照合)** を持つ。ns 認証は `llm-gateway` 側には無い
-- `llm-gateway-cli` は `llm_gateway::{credential, quota, daemon, config, tap, stats, preset, ...}` を直接使う (`credential` 25 箇所、`quota` 25 箇所、`daemon` 18 箇所)
+- `llm-gateway-cli` は `llm_gateway::{credential, quota, daemon, config, stats, preset, ...}` を直接使う (`dump` は使わず、監督者の socket 越しに頼む) (`credential` 25 箇所、`quota` 25 箇所、`daemon` 18 箇所)
 - どの crate にも `publish = false` は無いが、`cargo publish` を行う recipe / workflow も無い (crates.io には出していない)
 
 ### 1.2 `crates/llm-gateway/src/` の module

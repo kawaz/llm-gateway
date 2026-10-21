@@ -104,6 +104,7 @@ POST /ns-x/v1/messages
        credential.acquire
        → Negotiation::prepare
        → egress::send: Wire::encode → Auth::authorize → Wire::send
+         (④ で書いた 1 本は、Wire::send が upstream から読み出した本文を通訳する前に書く)
        → Preset::observe_quota + Events::publish
        → 400 + negotiation blame なら学習して 1 回だけ再送
        → ResponseAdmission::admit が本文先頭の最初の event 境界まで読んで採用可否を決める
@@ -117,7 +118,7 @@ POST /ns-x/v1/messages
   [server: response]
   ⑪ provider の Metering が content-type に応じた UsageObserver を作る
   ⑫ exchange::observe が本文を変更せず client へ流し、節目と usage を記録する。
-       ④ で書いた 1 本は、通り過ぎるチャンクをそのまま書き、終端で index.jsonl に 1 行足す
+       ④ で書いた 1 本は、終端で index.jsonl に 1 行足す
 ```
 
 不変条件:
@@ -143,7 +144,7 @@ POST /ns-x/v1/messages
 | `Router::select` | route 試行前 | provider 間の候補選択と全滅応答 |
 | `exchange::observe` | 採用した response body | provider-neutral な stream lifecycle と集計への受け渡し |
 | `Events` | upstream header 受信時 / 全滅時 | 全 provider を束ねる横断 bus |
-| `Dumps` | ingress の request 受領時と `exchange::observe` の各チャンク・終端 | 時限と容量の上限つきで本文を書き出す一時の口 |
+| `Dumps` | ingress の request 受領時、`Wire::send` が upstream の本文を読み出した直後 (`egress::observe_raw`)、`exchange::observe` の終端 | 時限と容量の上限つきで本文を書き出す一時の口 |
 | `PricingSource` | stats report の生成時 | 集計行を回答 route の単価へ接続する役 |
 
 内部正規形は Messages 形式の `serde_json::Value` で、中立 IR は置かない。`Wire` が upstream 方言への変換を担い、`egress` が正規形共通の model 読み書きと HTTP の出口手順を担う。
