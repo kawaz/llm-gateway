@@ -1,8 +1,8 @@
 //! 走っている台に、本文の一時ダンプを頼む (DR-0038)。
 //!
-//! 台を上げ下げも読み直しもしないので `daemon` の下には置かない (決定 3)。
+//! 台を上げ下げも読み直しもしないので `daemon` の下には置かない (決定 1)。
 //! 指し方は `usage` / `stats` と同じ `--unit` で、経路だけが HTTP でなく監督者の
-//! socket になる (決定 2)。CLI は頼んで答えを出すだけで、何も書かない。
+//! socket になる。CLI は頼んで答えを出すだけで、何も書かない。
 
 use std::process::ExitCode;
 
@@ -22,7 +22,8 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     let parsed = match args[0].as_str() {
         "start" => start(rest)?,
         "stop" => stop(rest)?,
-        "status" => status(rest)?,
+        "list" => list(rest)?,
+        "prune" => prune(rest)?,
         other => {
             return Err(Failure::from(format!(
                 "there is no `dump {other}` command. see `llm-gateway dump --help`"
@@ -75,15 +76,24 @@ fn start(args: &[String]) -> Result<Parsed, Failure> {
         return Ok(None);
     }
     let mut ns = None;
-    let mut duration = None;
+    let mut timeout_ms = None;
     let mut max_bytes = None;
-    let mut request_only = false;
+    let mut store = None;
+    let mut labels = std::collections::BTreeMap::new();
+    let mut follow = false;
+    let mut embed = None;
+    let mut persist = None;
     let mut unit = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match split(arg) {
             Some(("ns", inline)) => ns = Some(take_value("ns", inline, &mut it)?),
-            Some(("for", inline)) => duration = Some(take_value("for", inline, &mut it)?),
+            Some(("timeout", inline)) => {
+                let raw = take_value("timeout", inline, &mut it)?;
+                let secs = llm_gateway::config::parse_duration_secs(&raw)
+                    .map_err(|e| Failure::from(format!("--timeout: {e}")))?;
+                timeout_ms = Some(u64::try_from(secs).unwrap_or(0).saturating_mul(1000));
+            }
             Some(("max-bytes", inline)) => {
                 let raw = take_value("max-bytes", inline, &mut it)?;
                 max_bytes = Some(raw.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
@@ -92,70 +102,98 @@ fn start(args: &[String]) -> Result<Parsed, Failure> {
                     ))
                 })?);
             }
-            Some(("request-only", None)) => request_only = true,
+            Some(("store", inline)) => store = Some(take_value("store", inline, &mut it)?),
+            Some(("label", inline)) => {
+                let raw = take_value("label", inline, &mut it)?;
+                let (key, value) = raw.split_once('=').ok_or_else(|| {
+                    Failure::from(format!("--label takes key=value, got `{raw}`"))
+                })?;
+                labels.insert(key.to_owned(), value.to_owned());
+            }
+            Some(("follow", None)) => follow = true,
+            Some(("embed", inline)) => embed = Some(take_value("embed", inline, &mut it)?),
+            Some(("no-persist", None)) => persist = Some(false),
             Some(("unit", inline)) => unit = Some(take_value("unit", inline, &mut it)?),
             _ => return Err(Failure::from(format!("could not understand `{arg}`"))),
         }
     }
-    let ns = ns.ok_or_else(|| {
-        Failure::from("--ns is required: a dump covers one namespace (see `dump --help`)")
-    })?;
-    let duration = duration.ok_or_else(|| {
-        Failure::from("--for is required: a dump always ends by itself, like --for 10m")
-    })?;
-    let for_secs = llm_gateway::config::parse_duration_secs(&duration)
-        .map_err(|e| Failure::from(format!("--for: {e}")))?;
+    let Some(ns) = ns else {
+        // 必須の --ns が無ければ help (決定 1)。
+        return Ok(None);
+    };
     Ok(Some((
         unit,
         DumpRequest::Start {
             ns,
-            for_secs: u64::try_from(for_secs).unwrap_or(0),
+            timeout_ms,
             max_bytes,
-            request_only,
+            store,
+            labels,
+            follow,
+            embed,
+            persist,
         },
     )))
 }
 
 fn stop(args: &[String]) -> Result<Parsed, Failure> {
     let mut dump_id = None;
-    let mut all = false;
     let mut unit = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match split(arg) {
-            Some(("all", None)) => all = true,
             Some(("unit", inline)) => unit = Some(take_value("unit", inline, &mut it)?),
             Some(_) => return Err(Failure::from(format!("could not understand `{arg}`"))),
             None => {
                 if dump_id.replace(arg.clone()).is_some() {
                     return Err(Failure::from(
-                        "two dump ids were given. say one, or --all".to_owned(),
+                        "two dump ids were given. stop takes one".to_owned(),
                     ));
                 }
             }
         }
     }
-    if dump_id.is_some() && all {
-        return Err(Failure::from(
-            "a dump id and --all were both given. say one of them".to_owned(),
-        ));
-    }
-    if dump_id.is_none() && !all {
-        return Ok(None);
-    }
-    Ok(Some((unit, DumpRequest::Stop { dump_id, all })))
+    Ok(dump_id.map(|dump_id| (unit, DumpRequest::Stop { dump_id })))
 }
 
-fn status(args: &[String]) -> Result<Parsed, Failure> {
+fn list(args: &[String]) -> Result<Parsed, Failure> {
+    let mut selectors = Vec::new();
     let mut unit = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match split(arg) {
             Some(("unit", inline)) => unit = Some(take_value("unit", inline, &mut it)?),
-            _ => return Err(Failure::from(format!("could not understand `{arg}`"))),
+            Some(_) => return Err(Failure::from(format!("could not understand `{arg}`"))),
+            None => selectors.push(arg.clone()),
         }
     }
-    Ok(Some((unit, DumpRequest::Status)))
+    Ok(Some((unit, DumpRequest::List { selectors })))
+}
+
+fn prune(args: &[String]) -> Result<Parsed, Failure> {
+    let mut dump_ids = Vec::new();
+    let mut selectors = Vec::new();
+    let mut unit = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match split(arg) {
+            Some(("dump-id", inline)) => dump_ids.push(take_value("dump-id", inline, &mut it)?),
+            Some(("unit", inline)) => unit = Some(take_value("unit", inline, &mut it)?),
+            Some(_) => return Err(Failure::from(format!("could not understand `{arg}`"))),
+            None => selectors.push(arg.clone()),
+        }
+    }
+    if dump_ids.is_empty() && selectors.is_empty() {
+        // 無指定の全消しはしない。何も指さなければ help。
+        return Ok(None);
+    }
+    Ok(Some((
+        unit,
+        DumpRequest::Prune {
+            dump_ids,
+            selectors,
+        },
+    )))
 }
 
 /// 監督者に頼んで、答えの 1 行を受け取る。
@@ -202,18 +240,22 @@ mod tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    /// `start` は `--ns` と `--for` を読み、`--for` は秒にして渡す。
+    /// `start` は `--ns` ほかを読み、`--timeout` はミリ秒にして渡す。
     #[test]
     fn start_reads_its_options_in_any_order() {
         let (unit, request) = start(&args(&[
-            "--for=10m",
+            "--timeout=10m",
             "--ns",
             "lab",
             "--unit",
             "unstable",
             "--max-bytes",
             "1024",
-            "--request-only",
+            "--label",
+            "owner=kawaz",
+            "--label=memo=pr1234",
+            "--store",
+            "raw",
         ]))
         .unwrap()
         .unwrap();
@@ -222,72 +264,102 @@ mod tests {
             request,
             DumpRequest::Start {
                 ns: "lab".to_owned(),
-                for_secs: 600,
+                timeout_ms: Some(600_000),
                 max_bytes: Some(1024),
-                request_only: true,
+                store: Some("raw".to_owned()),
+                labels: std::collections::BTreeMap::from([
+                    ("memo".to_owned(), "pr1234".to_owned()),
+                    ("owner".to_owned(), "kawaz".to_owned()),
+                ]),
+                follow: false,
+                embed: None,
+                persist: None,
             }
         );
     }
 
-    /// `--for` は必須で既定値を持たない。`--ns` も必須 (決定 1・4)。
+    /// `--ns` は必須で、無ければ help。`--timeout` は省ける (台の既定)。
     #[test]
-    fn start_needs_a_namespace_and_a_duration() {
+    fn start_needs_a_namespace() {
         assert_eq!(
             start(&args(&[])).unwrap(),
             None,
             "no arguments shows the help"
         );
-        let e = start(&args(&["--ns", "lab"])).unwrap_err();
-        assert!(e.message().contains("--for is required"), "{e:?}");
-        let e = start(&args(&["--for", "10m"])).unwrap_err();
-        assert!(e.message().contains("--ns is required"), "{e:?}");
-        assert!(start(&args(&["--ns", "lab", "--for", "soon"])).is_err());
-        assert!(start(&args(&["--ns", "lab", "--for", "1m", "--max-bytes", "0"])).is_err());
-        assert!(start(&args(&["--ns", "lab", "--for", "1m", "--nope"])).is_err());
+        assert_eq!(start(&args(&["--timeout", "10m"])).unwrap(), None);
+        let (_, request) = start(&args(&["--ns", "lab"])).unwrap().unwrap();
+        assert!(matches!(
+            request,
+            DumpRequest::Start {
+                timeout_ms: None,
+                ..
+            }
+        ));
+        assert!(start(&args(&["--ns", "lab", "--timeout", "soon"])).is_err());
+        assert!(start(&args(&["--ns", "lab", "--max-bytes", "0"])).is_err());
+        assert!(start(&args(&["--ns", "lab", "--label", "novalue"])).is_err());
+        assert!(start(&args(&["--ns", "lab", "--nope"])).is_err());
     }
 
-    /// `stop` は id か `--all` のどちらか。どちらも無ければ help、両方は断る。
+    /// `stop` は id を 1 つ取る。無ければ help。
     #[test]
-    fn stop_takes_an_id_or_all() {
+    fn stop_takes_one_id() {
         assert_eq!(
             stop(&args(&["019a", "--unit=u"])).unwrap(),
             Some((
                 Some("u".to_owned()),
                 DumpRequest::Stop {
-                    dump_id: Some("019a".to_owned()),
-                    all: false
-                }
-            ))
-        );
-        assert_eq!(
-            stop(&args(&["--all"])).unwrap(),
-            Some((
-                None,
-                DumpRequest::Stop {
-                    dump_id: None,
-                    all: true
+                    dump_id: "019a".to_owned()
                 }
             ))
         );
         assert_eq!(stop(&args(&[])).unwrap(), None);
-        assert!(stop(&args(&["a", "--all"])).is_err());
         assert!(stop(&args(&["a", "b"])).is_err());
+        assert!(stop(&args(&["a", "--all"])).is_err());
     }
 
-    /// `status` は省略できる引数だけなので、引数なしで実行する。
+    /// `list` は選択子を並べて取り、無くても実行する。
     #[test]
-    fn status_runs_without_arguments() {
+    fn list_takes_selectors_and_runs_without_any() {
         assert_eq!(
-            status(&args(&[])).unwrap(),
-            Some((None, DumpRequest::Status))
+            list(&args(&[])).unwrap(),
+            Some((None, DumpRequest::List { selectors: vec![] }))
         );
-        assert!(status(&args(&["extra"])).is_err());
+        assert_eq!(
+            list(&args(&["state=active", "owner"])).unwrap(),
+            Some((
+                None,
+                DumpRequest::List {
+                    selectors: vec!["state=active".to_owned(), "owner".to_owned()]
+                }
+            ))
+        );
+    }
+
+    /// `prune` は `--dump-id` か選択子のどちらかが要り、無ければ help。
+    #[test]
+    fn prune_needs_an_id_or_a_selector() {
+        assert_eq!(prune(&args(&[])).unwrap(), None);
+        assert_eq!(
+            prune(&args(&["--dump-id", "a", "--dump-id=b"])).unwrap(),
+            Some((
+                None,
+                DumpRequest::Prune {
+                    dump_ids: vec!["a".to_owned(), "b".to_owned()],
+                    selectors: vec![]
+                }
+            ))
+        );
+        assert!(matches!(
+            prune(&args(&["owner=kawaz"])).unwrap(),
+            Some((_, DumpRequest::Prune { .. }))
+        ));
     }
 
     /// 受け付ける命令と、help に並ぶ命令は同じ (cli-design-preferences)。
     #[test]
     fn every_command_it_takes_is_written_in_the_help() {
-        for command in ["start", "stop", "status"] {
+        for command in ["start", "stop", "list", "prune"] {
             assert!(
                 help::DUMP.contains(&format!("  {command} ")),
                 "the help does not offer `{command}`"
@@ -295,10 +367,14 @@ mod tests {
         }
         for option in [
             "--ns <ns>",
-            "--for <duration>",
+            "--timeout <duration>",
             "--max-bytes <n>",
-            "--request-only",
-            "--all",
+            "--store raw",
+            "--label <key>=<value>",
+            "--follow",
+            "--embed bodies",
+            "--no-persist",
+            "--dump-id <id>",
             "--unit <name>",
         ] {
             assert!(help::DUMP.contains(option), "the help misses {option}");
@@ -310,7 +386,13 @@ mod tests {
     /// 子を持つレベルと必須の引数を持つ命令は、引数なしで help を出す。
     #[test]
     fn the_level_and_its_required_arguments_show_the_help() {
-        for level in [vec![], vec!["--help"], vec!["start"], vec!["stop"]] {
+        for level in [
+            vec![],
+            vec!["--help"],
+            vec!["start"],
+            vec!["stop"],
+            vec!["prune"],
+        ] {
             assert_eq!(
                 dispatch(&args(&level)).unwrap(),
                 ExitCode::SUCCESS,

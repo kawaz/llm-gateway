@@ -142,7 +142,7 @@ impl Wire for AnthropicWire {
                     })
                 })
                 .boxed();
-            let body = crate::egress::observe_raw(raw, status, body);
+            let body = crate::egress::observe_raw(raw, status, &headers, body);
 
             Ok(Response {
                 status,

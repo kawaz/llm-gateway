@@ -6,6 +6,7 @@
 //! 監督者が居なければ socket も無い。CLI はそれを「監督者が動いていない」と
 //! して断り、代わりに子を起こしたりはしない (所有者が 2 つになる)。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -42,30 +43,45 @@ pub struct DumpRelay {
     pub dump: DumpRequest,
 }
 
-/// 台の制御口が受ける一時ダンプの操作 (DR-0038 決定 1・3)。
+/// 台の制御口が受ける一時ダンプの操作 (DR-0038 決定 1)。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DumpRequest {
-    /// 1 つの ns の系列を今から `for_secs` の間だけ始める。
+    /// 1 つの ns の系列を始める。書かなかった値は台の `[dump]` の既定。
     Start {
         ns: String,
-        /// 時限の長さ (秒)。終わりの時刻は受けた台が自分の壁時計で決める。
-        for_secs: u64,
-        /// 系列に書く量の上限。無ければ台の既定。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u64>,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        request_only: bool,
-    },
-    /// 系列を止める。`dump_id` で 1 つ、`all` でその台の全部。
-    Stop {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        dump_id: Option<String>,
+        store: Option<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        labels: BTreeMap<String, String>,
+        /// 接続を保ってイベントを流す。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        all: bool,
+        follow: bool,
+        /// follow で本文も同梱する (`bodies`)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embed: Option<String>,
+        /// 保存するか (既定 `true`)。`false` は follow + embed の時だけ。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persist: Option<bool>,
     },
-    /// 動いている系列の一覧。
-    Status,
+    /// 系列を止める。冪等。
+    Stop { dump_id: String },
+    /// 系列の一覧。選択子 (`k=v` / `k!=v` / `k`) に当たるものだけ。
+    List {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selectors: Vec<String>,
+    },
+    /// 系列をディレクトリごと消す。`dump_ids` か選択子のどちらかが要る。
+    Prune {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dump_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selectors: Vec<String>,
+    },
 }
 
 /// どの台に対しての頼みか。
@@ -196,8 +212,8 @@ pub struct UnitEvents {
 pub struct UnitDump {
     pub dump_id: String,
     pub ns: String,
-    /// 系列の終わりの時刻 (Unix ミリ秒)。
-    pub until: i64,
+    /// 時限で止まる時刻 (Unix ミリ秒)。
+    pub expires_at: i64,
     pub bytes_written: u64,
 }
 
@@ -359,9 +375,13 @@ mod tests {
     fn a_dump_request_is_one_object_both_ways() {
         let start = DumpRequest::Start {
             ns: "lab".to_owned(),
-            for_secs: 600,
+            timeout_ms: Some(600_000),
             max_bytes: None,
-            request_only: false,
+            store: None,
+            labels: BTreeMap::from([("owner".to_owned(), "kawaz".to_owned())]),
+            follow: false,
+            embed: None,
+            persist: None,
         };
         let relay = Request::Dump(DumpRelay {
             unit: "unstable".to_owned(),
@@ -370,31 +390,40 @@ mod tests {
         let text = serde_json::to_string(&relay).unwrap();
         assert_eq!(
             text,
-            r#"{"op":"dump","unit":"unstable","dump":{"action":"start","ns":"lab","for_secs":600}}"#
+            r#"{"op":"dump","unit":"unstable","dump":{"action":"start","ns":"lab","timeout_ms":600000,"labels":{"owner":"kawaz"}}}"#
         );
         assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), relay);
 
         let control = ControlRequest::Dump(start);
         let text = serde_json::to_string(&control).unwrap();
         assert_eq!(
-            text,
-            r#"{"op":"dump","action":"start","ns":"lab","for_secs":600}"#
-        );
-        assert_eq!(
             serde_json::from_str::<ControlRequest>(&text).unwrap(),
             control
         );
         assert_eq!(
-            serde_json::from_str::<ControlRequest>(r#"{"op":"dump","action":"stop","all":true}"#)
-                .unwrap(),
+            serde_json::from_str::<ControlRequest>(
+                r#"{"op":"dump","action":"stop","dump_id":"x"}"#
+            )
+            .unwrap(),
             ControlRequest::Dump(DumpRequest::Stop {
-                dump_id: None,
-                all: true
+                dump_id: "x".to_owned()
             })
         );
         assert_eq!(
-            serde_json::from_str::<ControlRequest>(r#"{"op":"dump","action":"status"}"#).unwrap(),
-            ControlRequest::Dump(DumpRequest::Status)
+            serde_json::from_str::<ControlRequest>(r#"{"op":"dump","action":"list"}"#).unwrap(),
+            ControlRequest::Dump(DumpRequest::List {
+                selectors: Vec::new()
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<ControlRequest>(
+                r#"{"op":"dump","action":"prune","selectors":["owner=kawaz"]}"#
+            )
+            .unwrap(),
+            ControlRequest::Dump(DumpRequest::Prune {
+                dump_ids: Vec::new(),
+                selectors: vec!["owner=kawaz".to_owned()]
+            })
         );
     }
 

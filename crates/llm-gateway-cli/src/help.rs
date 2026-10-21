@@ -110,28 +110,41 @@ llm-gateway dump — have a running unit write request and response bodies to di
 usage:
   llm-gateway dump <command> [options]
 
-a dump covers one namespace of one unit and always ends by itself (--for). each
-start begins a new dump with its own dump_id; dumps of the same namespace may
-overlap, and a request is then written to each of them. the unit keeps them in
-memory only, so a restart ends every dump. it is asked through the supervisor,
-like `daemon reload`.
+a dump covers one namespace of one unit and always ends by itself (--timeout).
+each start begins a new dump with its own dump_id; dumps of the same namespace
+may overlap, and a request is then written to each of them. the unit keeps them
+in memory only, so a restart stops every dump. it is asked through the
+supervisor, like `daemon reload`. limits and defaults are in [dump] of the
+configuration.
 
 commands:
-  start             start a dump of one namespace (needs --ns and --for)
-  stop <dump_id>|--all
-                    stop a dump before its time (stopping a stopped one succeeds)
-  status            list the running dumps
+  start             start a dump of one namespace (needs --ns)
+  stop <dump_id>    stop a dump before its time (stopping a stopped one succeeds)
+  list [<selector>]...
+                    list this unit's dumps, stopped and left-over ones included
+  prune --dump-id <id>|<selector>...
+                    stop (if running) and remove dumps, directory and all
 
 start options:
   --ns <ns>         the namespace to dump (required)
-  --for <duration>  how long it runs, like 10m / 1h (required, no default,
-                    at most 24h)
+  --timeout <duration>
+                    how long it runs, like 10m / 1h
+                    (default: [dump] default_timeout; at most [dump] max_timeout)
   --max-bytes <n>   stop once this many bytes of bodies are written
-                    (default: 209715200, that is 200 MiB)
-  --request-only    write requests only, not responses
+                    (default: [dump] default_max_bytes)
+  --store raw       how bodies are kept (raw is the only one)
+  --label <key>=<value>
+                    a label to select it by later (repeatable; 1 to 63 letters,
+                    digits, `-`, `_`, `.`, starting and ending with a letter or digit)
+  --follow          keep the connection and print the events as they happen
+  --embed bodies    with --follow, also print the bodies
+  --no-persist      with --follow --embed bodies, remove the files when it stops
 
-stop options:
-  --all             stop every running dump of the unit
+prune options:
+  --dump-id <id>    the dump to remove (repeatable)
+
+selectors (list and prune):
+  key=value, key!=value, key (the label exists), and state=active|stopped
 
 options of every command:
   --unit <name>     which running unit to ask
@@ -139,19 +152,16 @@ options of every command:
 
 where it writes:
   <[stats] dir>/dumps/<unit>/<ns>/<dump_id>/ (directories 700, files 600):
-  index.jsonl (one line per request: ts, seq, model, route, status, origin,
-  stream, credential, cache_strategy, cache_ttl_secs, request_bytes,
-  request_file, attempts (one entry per upstream answer: attempt, route,
-  credential, status, response_file, response_bytes, truncated and reason for a
-  response cut off by the limit / --for / stop), adopted (the attempt returned
-  to the client, null when the gateway answered by itself) with its
-  response_file / response_bytes copied to the line, headers without
-  authorization / proxy-authorization / x-api-key / cookie), and per request
-  <ts>-<seq>.request.json (the body as received, before the gateway rewrites it)
-  and per attempt <ts>-<seq>.<attempt>.response.sse (the bytes upstream
-  returned, before the gateway translates or replaces them). dumps older than 48 hours are removed when a unit
-  starts and on every start. the files hold the conversation itself: do not
-  paste them anywhere public.
+  index.jsonl (the events: start, request_headers, request_body_end,
+  upstream_connect, upstream_headers, upstream_body_end, upstream_close,
+  response_headers_sent with adopted, response_body_end, transport_close, stop),
+  per request <ts>-<seq>.request.json and .request.body (the body as received,
+  before the gateway rewrites it), and per upstream attempt
+  <ts>-<seq>.<attempt>.response.json and .response.body (the bytes upstream
+  returned, before the gateway translates or replaces them). headers are kept
+  except authorization / proxy-authorization / x-api-key / cookie. a dump is
+  removed after [dump] cleanup_ttl from its start, when a unit starts and on every
+  start. the files hold the conversation itself: do not paste them anywhere public.
 
 output:
   answers are JSON {unit, ok, ...} on stdout; when ok is false the answer goes to

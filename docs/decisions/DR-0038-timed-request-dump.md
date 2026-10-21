@@ -1,6 +1,6 @@
-# DR-0038: リクエストと応答の本文を、時限と容量の上限つきで一時的にダンプする `dump start|end|list|prune`
+# DR-0038: リクエストと応答の本文を、時限と容量の上限つきで一時的にダンプする `dump start|stop|list|prune`
 
-- Status: Accepted (kawaz が 2026-10-21 に着手を裁定し、同日に設計の一般形を claude-rules-personal の reference `proxy-dump-design` へ切り出した。本 DR はその reference を正本とし、llm-gateway 固有の決定だけを持つ)。実装は同日の前の版の形で済んでおり、本版への差し替え (「影響」の段分け) が未実装
+- Status: Accepted (kawaz が 2026-10-21 に着手を裁定し、同日に設計の一般形を claude-rules-personal の reference `proxy-dump-design` へ切り出した。本 DR はその reference を正本とし、llm-gateway 固有の決定だけを持つ)。「影響」の段分けの段 1〜3 は実装済み、段 4 (`--follow` / `--embed bodies` / `--no-persist`) が未実装
 - Date: 2026-10-21
 
 ## 背景
@@ -13,19 +13,20 @@ kawaz の要件 (2026-10-21) は 3 つ。常時ではなく一時的に有効化
 
 ## 決定
 
-### 1. 経路は制御 socket で、CLI は最上位の `dump start|end|list|prune` (api)
+### 1. 経路は制御 socket で、CLI は最上位の `dump start|stop|list|prune` (api)
 
 ```
 llm-gateway dump start --ns <ns> [--timeout <duration>] [--max-bytes <n>] [--store raw] [--label <k>=<v>]... [--follow [--embed bodies [--no-persist]]] [--unit <unit>]
-llm-gateway dump end   <dump_id> [--unit <unit>]
+llm-gateway dump stop  <dump_id> [--unit <unit>]
 llm-gateway dump list  [<selector>]... [--unit <unit>]
-llm-gateway dump prune <dump_id>|<selector>... [--unit <unit>]
+llm-gateway dump prune --dump-id <dump_id>|<selector>... [--unit <unit>]
 ```
 
 - 書き込み系を HTTP に置かない構成なので、reference の `POST dump/start` 等は DR-0032 決定 2 の経路 (CLI → 監督者 `supervisor.sock` → unit の制御口 `daemon/control/<unit>.sock`) で同じ意味を持つ。ダンプは会話の本文をディスクへ書く操作で、外 (Caddy 越し) から届く面に置かない理由は DR-0032 が reload を HTTP に置かない理由と同じ。監督者が居なければ `supervisor_not_running` で断り (DR-0028 決定 3)、制御口が dump を知らない版の unit には `ok: false` を返す (DR-0032 の「版の混在」)
 - 最上位に置くのは、`daemon` が「この instance のプロセス操作」(DR-0028 決定 1) で、ダンプは unit を上げ下げも読み直しもせず、`usage` / `stats` と同じ「走っている unit に聞く・頼む」系だから。unit の指し方は DR-0028 決定 6 (`--unit`、登録が 1 つならそれ、複数で未指定なら `unit_required`)
-- `status` は持たず `list` に吸収する。動いているものだけ見たければ選択子 `state=active`。選択子は reference の labels の形 (`owner=kawaz` / `pr!=1234` / `owner`) に `state=active|stopped` を足したもの
-- `dump` は子を持つレベルなので、引数なしと `--help` はテキストの help。`start` は必須の `--ns` が無ければ help、`end` は `<dump_id>` が無ければ help、`prune` は `<dump_id>` も選択子も無ければ help (無指定の全消しは reference のとおり持たない)。`list` は省略可能な引数だけなので実行する
+- `status` は持たず `list` に吸収する。`list` は選択子が無ければその unit の系列を全部並べ、動いているものだけ見たければ選択子 `state=active`。選択子は reference の labels の形 (`owner=kawaz` / `pr!=1234` / `owner`) に `state=active|stopped` を足したもの
+- labels のキーと値は 1〜63 文字、英数字と `-` `_` `.`、先頭と末尾は英数字 (統括の裁定)。読めない labels・選択子は `bad_request`
+- `dump` は子を持つレベルなので、引数なしと `--help` はテキストの help。`start` は必須の `--ns` が無ければ help、`stop` は `<dump_id>` が無ければ help、`prune` は `--dump-id` も選択子も無ければ help (無指定の全消しは reference のとおり持たない)。`list` は省略可能な引数だけなので実行する
 - このリポの CLI は completion 定義を持たない (DR-0030 と同じ)。揃えるのは `--help` の文面と実装の 2 者
 
 ### 2. 一致条件は `--ns` だけで、必須 (model)
@@ -44,7 +45,7 @@ reference の設定キーから `dump_` 接頭辞を外した名前で `[dump]` 
 | `max_total_bytes` | `2147483648` (2 GiB) | `dump_max_total_bytes` |
 | `fs_min_free` | `1073741824` (1 GiB) | `dump_fs_min_free` |
 | `cleanup_ttl` | `48h` | `dump_cleanup_ttl` |
-| `max_concurrency` | 未決 1 | `dump_max_concurrency` |
+| `max_concurrency` | `16` | `dump_max_concurrency` |
 
 - duration は設定の他の欄と同じ書き方 (`10m` / `1h`)、サイズは bytes の整数
 - `max_timeout` は `cleanup_ttl` 以下 (reference の制約) で、`llm-gateway check` が検証する。`--timeout` が 0 か `max_timeout` を超えれば `invalid_duration` で断る
@@ -68,9 +69,9 @@ reference の `dump/{dump_id}/` を `<[stats] dir>/dumps/<unit>/<ns>/<dump_id>/`
 
 llm-gateway は upstream に圧縮を求めない (クライアントの `accept-encoding` を `egress` で落とし、自分でも付けない) ので、`raw` で保存した body の実態は非圧縮で、読む側に展開の責務は生じない。`--store decoded` は `bad_request` で断る。`store` の欄と `content-encoding` / `body_stored` は reference のとおり json に残す。
 
-### 7. `*.request.json` の `rewrites` に gateway の書き換えを書く (files)
+### 7. gateway の書き換えは試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書く (files)
 
-記録本体 (`*.request.body`) は受けた形のまま、gateway が upstream へ送る形を決めるまでに加えた書き換え (cache_control の `ttl` の付け替え、thinking の display の上書き、model の別名の解決) を `rewrites` に書く。欄の中身 (body 側の JSON の形) は実装に任せる。upstream へ送った本文そのものは残さない (reference `model`)。
+記録本体 (`*.request.body`) は受けた形のまま、gateway がその経路へ送る形を決めるまでに加えた書き換えを、試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書く (統括の裁定)。model の別名の解決と経路ごとの名前、cache の戦略と寿命 (DR-0024) は経路ごとに効くので、試行が複数ある 1 本では `*.request.json` 1 つに収まらない。`*.request.json` には置かない。中身は `model: {received, sent}` (送った名前が受けた名前と違う時)、`thinking_display` (受け口が display を上書きした時)、`thinking_as_text` (跨ぎで text にした時)、`cache_strategy`、`cache_ttl_secs`。upstream へ送った本文そのものは残さない (reference `model`)。
 
 ### 8. 認証系ヘッダの述語は `gateway.rs` の `is_authorization`、ヘッダは同名を保つ配列 (capacity / files)
 
@@ -80,7 +81,7 @@ gateway は控えに持ち回してはいけないヘッダの述語を既に 1 
 
 ### 9. 控える位置は受け口と、経路が upstream の本文を読み出した直後 (model)
 
-request は受け口 (`llm-gateway-server` の `forward`、`messages` / `responses` の両方が通る) で本文を読み切り ns 認証を通した直後に書く (`*.request.json` は `rewrites` を載せるため upstream へ送る形が決まった時点、reference `files` の「書く時点」)。response は各経路の `Wire::send` (`AnthropicWire` / `OpenAiWire`) が upstream から本文を読み出した直後に `egress::observe_raw` へ通し、方言の通訳 (`openai::response::translate`)、採用判定 (`ResponseAdmission::admit`)、集め直し (`egress::adapt_response`)、エラー本文への差し替え (`client_error_response`) を経る前のチャンクを、通り過ぎるたびに書く。
+request は受け口 (`llm-gateway-server` の `forward`、`messages` / `responses` の両方が通る) で本文を読み切り ns 認証を通した直後に書く (`*.request.json` も同じ時点。書き換えは試行ごとの response 側に載せるので、送る形が決まるのを待たない — 決定 7)。response は各経路の `Wire::send` (`AnthropicWire` / `OpenAiWire`) が upstream から本文を読み出した直後に `egress::observe_raw` へ通し、方言の通訳 (`openai::response::translate`)、採用判定 (`ResponseAdmission::admit`)、集め直し (`egress::adapt_response`)、エラー本文への差し替え (`client_error_response`) を経る前のチャンクを、通り過ぎるたびに書く。
 
 - ns 認証に断られた 1 本と JSON として読めない 1 本は書かない (request を受けた、と言えるのは認証を通ってから)
 - gateway が自分で組んだエラーを返した 1 本 (経路が尽きた・モデルが無い等) は、受け口がエラー応答を返す所で `response_headers_sent` (`adopted: null`) を書く
@@ -94,8 +95,8 @@ DR-0032 決定 5 の流儀に揃え、`ok: true` の答えに reference の欄�
 llm-gateway dump start --ns lab --timeout 10m --label owner=kawaz --unit unstable
 {"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-…","ns":"lab","timeout_ms":600000,"max_bytes":209715200,"store":"raw","labels":{"owner":"kawaz"},"started_at":1792000000000,"expires_at":1792000600000,"delete_after":1792172800000,"concurrency":{…},"storage":{…}}
 
-llm-gateway dump end 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
-{"unit":"unstable","ok":true,"dump_id":"019a1b2c-…","state":"stopped","reason":"ended","stopped_at":1792000312000,"bytes_written":1048576}
+llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-…","dump_dir":"…","ns":"lab","state":"stopped","reason":"stop","stopped_at":1792000312000,"bytes_written":1048576}
 
 llm-gateway dump list state=active --unit unstable
 {"unit":"unstable","ok":true,"dumps":[{"dump_id":"019a1b2c-…","dump_dir":"…","ns":"lab","state":"active","reason":null,"labels":{"owner":"kawaz"},"started_at":1792000000000,"expires_at":1792000600000,"delete_after":1792172800000,"stopped_at":null,"bytes_written":1048576}]}
@@ -105,9 +106,10 @@ llm-gateway dump prune owner=kawaz --unit unstable
 ```
 
 - `start` の答えは reference の欄 (`dump_id`、適用されたパラメータ、`concurrency`、`storage`) に `ns` と `dump_dir` を足したもの
-- `end` は reference のとおり冪等で、止まっていた系列にはその元の `reason` を返す。unit が知らない id は `unknown_dump` (restart で忘れた系列の id もここに入る)
+- `stop` は reference のとおり冪等で、止まっていた系列にはその元の `reason` を返す。答えは `list` の 1 件と同じ形。restart 前の系列 (置き場にディレクトリだけが残る) も止まっている系列として答え、メモリにも置き場にも無い id は `unknown_dump`
+- restart 前の系列は `list` に `state: "stopped"` で並ぶ。`reason` は `index.jsonl` の `stop` の行の値、その行が無ければ (止める前に unit が落ちた) `"interrupted"`。labels と時刻は `start` の行から読み、`prune` の対象になる (統括の裁定)
 - `list` の 1 件は `start` の答えから `concurrency` / `storage` を除き、`state` / `reason` / `stopped_at` / `bytes_written` を足した形。`prune` は消した `dump_id` を `pruned` に並べる
-- 断る時は `ok: false` と `error: {kind, message}`。`kind` は `unknown_namespace` / `invalid_namespace` / `unknown_dump` / `invalid_duration` / `bad_request` (`--max-bytes` が 0、`--store` が `raw` 以外、`--no-persist` が follow + embed 以外、選択子が読めない、版が dump を知らない) / `dump_dir_unwritable`、監督者と CLI の側は DR-0032 の表 (`not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` / `supervisor_not_running` / `unit_required` / `no_units`)
+- 断る時は `ok: false` と `error: {kind, message}`。`kind` は `unknown_namespace` / `invalid_namespace` / `unknown_dump` / `invalid_duration` / `too_many_dumps` (動いている系列が `max_concurrency` に達している) / `bad_request` (`--max-bytes` が 0、`--store` が `raw` 以外、`--no-persist` が follow + embed 以外、labels か選択子が読めない、`prune` に `--dump-id` も選択子も無い、版が dump を知らない) / `dump_dir_unwritable`。CLI が頼む先を決められない時 (`unit_required` 等) や監督者に届かない時 (`supervisor_not_running`) も同じ `{unit, ok: false, error}` の形で、頼む先が決まっていなければ `unit` を付けない、監督者と CLI の側は DR-0032 の表 (`not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` / `supervisor_not_running` / `unit_required` / `no_units`)
 
 ### 11. `/llm-gateway/self` と `daemon status` に、動いている間だけ `dump` を出す (api)
 
@@ -129,9 +131,9 @@ reference に移った判断 (1 本 1 ファイル、系列を `dump_id` で独�
 
 - **設定ファイルの `[dump]` に on / off や対象 ns を書いて `daemon reload` で効かせる**: 消し忘れると常設になり、要件の「一時的に」と逆になる。`[dump]` に置くのは歯止めと既定値だけ (決定 3)
 - **子の HTTP に `POST /llm-gateway/dump` を置く**: ダンプは本文をディスクへ書き残す操作で、外から届く面に置かない (決定 1)。DR-0032 が reload を HTTP に置かない構図と同じ
-- **`daemon dump start|end|list|prune`**: `daemon` はプロセス操作の語で、ダンプは unit の生死を触らない。`usage` / `stats` が最上位に居るのと同じ区分に置く (決定 1)
+- **`daemon dump start|stop|list|prune`**: `daemon` はプロセス操作の語で、ダンプは unit の生死を触らない。`usage` / `stats` が最上位に居るのと同じ区分に置く (決定 1)
 - **tap を残して併存させる**: 本文を覗く口が 2 つになり、`max_body` の既定や loopback の制限を両方で保守することになる。tap を `curl -N … > dump.jsonl` で取って済ませる案も、繋いでいるプロセスが生きている間しか取れず、置き場・権限・片付けは取得者の手に残る。購読者が止まった時に unit が本文を抱え続ける実測 (reference `model` の適用例) も tap 側の弱点 (決定 13)
-- **動いている間の `start` は断るか、前の指定を置き換える (unit × ns で同時に 1 つ)**: 断ると延長のたびに `end` → `start` が要り、その間の 1 本が抜ける。置き換えは「前の指定を引き継がない」規則と置き換えられた側の扱いを説明する必要が出る。系列を独立させれば延長は新しい `start`、短縮は `end` で済む (reference `model`)
+- **動いている間の `start` は断るか、前の指定を置き換える (unit × ns で同時に 1 つ)**: 断ると延長のたびに `stop` → `start` が要り、その間の 1 本が抜ける。置き換えは「前の指定を引き継がない」規則と置き換えられた側の扱いを説明する必要が出る。系列を独立させれば延長は新しい `start`、短縮は `stop` で済む (reference `model`)
 - **ns ごとの jsonl に追記する (1 ファイルの単位)**: response を生のまま残すには本文を JSON 文字列に包む変換が要り、調べたい 1 本だけを開けない (reference `files`)
 - **ディレクトリ名を `start` の日時にする**: 同じ unit で同じ秒に 2 つ始めると衝突する。UUIDv7 は時刻順に並ぶ性質を保ったまま衝突しない (reference `model`)
 - **定期の timer で片付ける**: 契機は unit の起動と `dump start` で足りる (決定 4)。間隔に根拠の無いループを足さない
@@ -142,7 +144,7 @@ reference に移った判断 (1 本 1 ファイル、系列を `dump_id` で独�
 
 - `GET /llm-gateway/tap`、`tap::` モジュール、`TapObservation` が消える (決定 13)。MANUAL と architecture-overview の tap の記述はダンプに置き換わる
 - `Request` (監督者) と `ControlRequest` (unit の制御口) に dump の語が増える。`--follow` (決定 12) は 1 行の答えでなくストリームなので、監督者の中継は接続を保って行を通し、CLI 側の切断を unit まで伝える形が要る (DR-0032 の経路の拡張)
-- 設定に `[dump]` テーブルが増える (決定 3)。`daemon reload` で差し替えられるかは未決 4
+- 設定に `[dump]` テーブルが増える (決定 3)。`daemon reload` で差し替わると以後の `start` に効く
 - `[stats] dir` の下に会話の本文が置かれる。keepalive の控えと同じ種類の機微で、置き場は 700 / 600 に閉じるが、ディスクを読める者には読める。ダンプしたファイルは会話の本文そのもので、リポや公開物に貼らない。外へコピーした先は取得者の責任 (reference `capacity`)
 - 同じ ns に系列を重ねると、1 本が系列の数だけディスクに書かれる。重ねるのは利用者の選択で、`daemon status` に系列が並ぶので気づける
 - `/llm-gateway/self` と `daemon status` の行に `dump` の欄が増える (決定 11)。欄を知らない読み手はそのまま動く
@@ -158,21 +160,24 @@ reference に移った判断 (1 本 1 ファイル、系列を `dump_id` で独�
 |---|---|---|
 | 1 | ファイル構成 (`*.request.json` + `*.request.body`、試行ごとの `*.response.json` + `*.response.body`、`body_file` で指す、`rewrites`、ヘッダの配列) と、index.jsonl を 1 本 1 行から時刻点ごとのイベント (reference `files` の表) に、1 秒以内の flush | 試験で、request のヘッダ受信の時点で `request_headers` の行が 1 秒以内に書かれ、応答が終わらないまま切れた 1 本にも `request_headers` が残り、試行ごとに `upstream_headers` / `upstream_body_end` が並び、`response_headers_sent` の `adopted` が返した試行の番号、`stop` の行に `reason` と `bytes_written` が入る |
 | 2 | `[dump]` テーブル (決定 3) と、全体の実使用量の上限・fs 空き容量の判定・`max_concurrency`、`start` の答えの `concurrency` / `storage`、片付けの基準を `delete_after` に | 試験で、`max_timeout` > `cleanup_ttl` の設定が `check` に落ち、全体上限に達した時に書こうとした系列だけが `total_limit` で止まり、request の来ない系列は `timeout` まで active のまま残る |
-| 3 | `stop` → `end`、`status` → `list` (選択子)、`prune`、`labels` | `end` が冪等で元の `reason` を返し、`prune` が無指定を断り、active な系列を `ended` で止めてから消し、`list state=active` に動いている分だけが並ぶ |
+| 3 | `status` → `list` (選択子)、`prune`、`labels` | `stop` が冪等で元の `reason` を返し、`prune` が無指定を断り、active な系列を `stop` で止めてから消し、`list state=active` に動いている分だけが並ぶ |
 | 4 | `--follow` (監督者のストリーム中継、`disconnected` / `lagged`)、`--embed bodies`、`--no-persist` | Ctrl-C で系列が `disconnected` で止まり、購読者を止めたままにすると `lagged` で切れ、`--no-persist` の系列が停止時にディレクトリごと消える |
 
 ## 未決
 
-reference の未決のうち llm-gateway で確定したもの: `{ts}` と各イベントの `ts` は Unix ミリ秒 (決定 5)、メタ json のヘッダは `{name, value}` の配列 (決定 8)、follow の形式は ndjson (決定 12)。残りは以下で、実装の着手を止めるものではなく、着手した worker が判断して DR に書き足すか、kawaz が裁定する。
+reference の未決のうち llm-gateway で確定したもの: `{ts}` と各イベントの `ts` は Unix ミリ秒 (決定 5)、メタ json のヘッダは `{name, value}` の配列 (決定 8)、follow の形式は ndjson (決定 12)、fs 空き容量の測り直しは 10 秒ごと、labels の長さと文字種 (決定 1)。
 
-1. **`max_concurrency` の既定値**と、上限に達した状態で `start` が来た時の `error.kind`。系列の数は `timeout` が必須なので放っておいても減るが、reference は歯止めとして持つ
-2. **`rewrites` を試行ごとに書くか**: model の別名の解決と cache_control の付け替えは経路ごとに効く (DR-0024) ので、試行が複数ある 1 本では `*.request.json` 1 つの `rewrites` に収まらない。`*.response.json` (試行ごと) に置くか、最初の試行の分だけ `*.request.json` に置くか
-3. **restart 前の系列を `list` / `prune` がどう扱うか**: unit のメモリに無くディスクにディレクトリだけ残る系列 (index.jsonl に `stop` の行が無い) を、`state: "stopped"` としてどの `reason` で並べるか、`prune` の選択子 (labels は index.jsonl の `start` 行から読める) に掛けるか
-4. **`daemon reload` と `[dump]`**: `[dump]` を reload で差し替えるか (起動時に掴む欄にするか)、指した ns が新しい設定から消えた系列をその場で止めるか `timeout` まで続けるか
-5. **labels の長さ上限と文字種**、**`--embed bodies` の本文の載せ方** (バイト列を 1 行 JSON にどう入れるか)、**fs 空き容量の cache 間隔**: reference の未決のまま
-6. **events (DR-0012) と stats (DR-0011) にダンプ中を見せるか**: events に `dump` の種類を足すと恒常の読み手に揺れが及ぶ (決定 13 の理由)。`daemon status` と `/self` (決定 11) で足りるなら足さない
-7. **全 unit に向ける旗**: Caddy は 11301 を優先し落ちていれば 11302 に回すので、調査中に両方へ流れうる。unit の数だけ `start` を繰り返せば同じ結果になるので、旗を持つか自体も含めて未決
-8. **response を書かない旗 (`--request-only`) を持つか**: reference は request と response の両方を残す形だけを持つ。request だけで足りる調査 (突き合わせ) のために持つなら、計数と index のイベントへの効き方を決めて足す
+統括が 2026-10-21 に裁定したもの:
+
+- `max_concurrency` の既定は 16、上限に達した `start` は `too_many_dumps` (決定 3・10)
+- `rewrites` は試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書き、`*.request.json` には置かない (決定 7)
+- restart 前の系列は `list` に `state: "stopped"` で並び、`reason` は `stop` の行の値か `"interrupted"`、`prune` の対象 (決定 10)
+- `daemon reload` で `[dump]` が変わったら以後の `start` に効き、動いている系列は始めた時の値のまま。指した ns が新しい設定から消えても系列は止めない (書く相手が無いまま時限まで残る)
+- events (DR-0012) と stats (DR-0011) にはダンプ中を見せない (`daemon status` と `/self` で足りる)。全 unit に向ける旗は持たない (unit の数だけ `start` する)。`--request-only` は持たない (reference のとおり request と response の両方を残す)
+
+残りは以下で、実装の着手を止めるものではない。
+
+1. **`--embed bodies` の本文の載せ方** (バイト列を 1 行 JSON にどう入れるか): 段 4 で決める
 
 ## 関連
 
@@ -182,9 +187,9 @@ reference の未決のうち llm-gateway で確定したもの: `{ts}` と各イ
 - [DR-0032](DR-0032-daemon-reload.md) — CLI → 監督者 → unit の制御 socket。dump の経路と答えの形はこれに乗る (決定 1・10)
 - [DR-0028](DR-0028-daemon-service-subcommands.md) — `daemon` の体系と、走っている unit に聞く系の `--unit` の規則 (決定 1)
 - [DR-0011](DR-0011-daily-usage-stats.md) — relay の外で本文を覗く形と、writer を分けて排他を消す形 (決定 4)
-- [DR-0012](DR-0012-request-events.md) — 時刻は Unix ミリ秒 (決定 5・10)。`seq` を揃える相手。events に足すかは未決 6
+- [DR-0012](DR-0012-request-events.md) — 時刻は Unix ミリ秒 (決定 5・10)。`seq` を揃える相手。events にはダンプ中を見せない
 - [DR-0020](DR-0020-denial-reason-visibility.md) — 揮発的な観測は events に混ぜず、恒久の語彙は events に置く、の切り分け
-- [DR-0024](DR-0024-cache-strategy-and-keepalive.md) — prompt cache の検証に response が要る。書き換えが経路ごとに効く (未決 2)
+- [DR-0024](DR-0024-cache-strategy-and-keepalive.md) — prompt cache の検証に response が要る。書き換えが経路ごとに効く (決定 7)
 - [DR-0027](DR-0027-keepalive-by-replay.md) — `[stats] dir` に本文を置く先例と、秘密のヘッダの述語 (決定 8)
 - [DR-0030](DR-0030-ns-auth-and-passthrough.md) — ns 認証の token と passthrough (決定 8・9)
 - [DR-0037](DR-0037-auto-rotated-ns-jwt-keys-and-auth-token.md) §12 / §13 — `[stats] dir` の下に置く時の作法 (700 / 600、ns の名前の制限) と壁時計の扱い

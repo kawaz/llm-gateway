@@ -160,10 +160,12 @@ pub async fn reload<P: CredentialPersistence>(
     }
 }
 
-/// 一時ダンプの頼みに答える (DR-0038 決定 2・11)。
+/// 一時ダンプの頼みに答える (DR-0038 決定 1・10)。
 ///
-/// 答えはどれも `unit` と `ok` で始まり、`ok: true` の答えには系列の欄を同じ
-/// 階層に添える。断る時は `ok: false` と `error: {kind, message}`。
+/// 答えはどれも `unit` と `ok` で始まり、`ok: true` の答えには reference
+/// `proxy-dump-design` の欄を同じ階層に添える。断る時は `ok: false` と
+/// `error: {kind, message}`。`follow` の頼みはここでは受けない (接続を保つ口で
+/// 受ける)。
 pub fn dump<P: CredentialPersistence>(
     unit: &str,
     request: DumpRequest,
@@ -174,11 +176,22 @@ pub fn dump<P: CredentialPersistence>(
     let answered = match request {
         DumpRequest::Start {
             ns,
-            for_secs,
+            timeout_ms,
             max_bytes,
-            request_only,
+            store,
+            labels,
+            follow,
+            embed,
+            persist,
         } => {
-            // 走っている設定に無い ns は書く相手が無い (決定 4)。
+            if follow || embed.is_some() || persist.is_some() {
+                return dump_failed(
+                    unit,
+                    "bad_request",
+                    "--embed and --no-persist need --follow, which this request did not ask for",
+                );
+            }
+            // 走っている設定に無い ns は書く相手が無い (DR-0038 決定 2)。
             if gateway.namespace(&ns).is_none() {
                 let known = gateway.namespace_names().join(", ");
                 return dump_failed(
@@ -190,26 +203,31 @@ pub fn dump<P: CredentialPersistence>(
             let start = crate::dump::Start {
                 unit,
                 ns: &ns,
-                for_ms: i64::try_from(for_secs)
-                    .unwrap_or(i64::MAX)
-                    .saturating_mul(1000),
+                timeout_ms: timeout_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
                 max_bytes,
-                request_only,
+                store: store.as_deref(),
+                labels,
             };
-            dumps.start(&start, now).map(|view| fields(&view))
+            dumps
+                .start(&start, &gateway.dump_config(), now)
+                .map(|started| fields(&started))
         }
-        DumpRequest::Stop {
-            dump_id: Some(id),
-            all: false,
-        } => dumps.stop(&id).map(|view| fields(&view)),
-        DumpRequest::Stop {
-            dump_id: None,
-            all: true,
-        } => Ok(listed(&dumps.stop_all(now))),
-        DumpRequest::Stop { .. } => {
-            return dump_failed(unit, "bad_request", "say one dump_id, or --all");
-        }
-        DumpRequest::Status => Ok(listed(&dumps.status(now))),
+        DumpRequest::Stop { dump_id } => dumps
+            .stop(unit, &dump_id, now)
+            .map(|listed| fields(&listed)),
+        DumpRequest::List { selectors } => dumps.list(unit, &selectors, now).map(|listed| {
+            let mut map = serde_json::Map::new();
+            map.insert("dumps".to_owned(), serde_json::json!(listed));
+            map
+        }),
+        DumpRequest::Prune {
+            dump_ids,
+            selectors,
+        } => dumps.prune(unit, &dump_ids, &selectors, now).map(|pruned| {
+            let mut map = serde_json::Map::new();
+            map.insert("pruned".to_owned(), serde_json::json!(pruned));
+            map
+        }),
     };
     match answered {
         Ok(fields) => {
@@ -223,19 +241,12 @@ pub fn dump<P: CredentialPersistence>(
     }
 }
 
-/// 系列 1 つの欄。
-fn fields(view: &crate::dump::View) -> serde_json::Map<String, serde_json::Value> {
-    match serde_json::to_value(view) {
+/// 構造体の欄を答えの欄にする。
+fn fields(value: &impl serde::Serialize) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::to_value(value) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => serde_json::Map::new(),
     }
-}
-
-/// 系列の一覧を `dumps` に並べる。
-fn listed(views: &[crate::dump::View]) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("dumps".to_owned(), serde_json::json!(views));
-    map
 }
 
 fn dump_failed(unit: &str, kind: &str, message: impl Into<String>) -> serde_json::Value {
@@ -406,15 +417,20 @@ routes = ["a"]
     fn dump_start(ns: &str) -> DumpRequest {
         DumpRequest::Start {
             ns: ns.to_owned(),
-            for_secs: 600,
+            timeout_ms: Some(600_000),
             max_bytes: None,
-            request_only: false,
+            store: None,
+            labels: std::collections::BTreeMap::from([("owner".to_owned(), "kawaz".to_owned())]),
+            follow: false,
+            embed: None,
+            persist: None,
         }
     }
 
-    /// 答えは `unit` と `ok` で始まり、系列の欄を同じ階層に添える (DR-0038 決定 11)。
+    /// 答えは `unit` と `ok` で始まり、reference の欄を同じ階層に添える
+    /// (DR-0038 決定 10)。
     #[tokio::test]
-    async fn a_dump_is_started_listed_and_stopped_through_the_control_socket() {
+    async fn a_dump_is_started_listed_stopped_and_pruned_through_the_control_socket() {
         let u = unit();
         let path = u.dir.path().join("control").join("u.sock");
         let socket = Arc::new(ControlSocket::open_at(&path).unwrap());
@@ -434,11 +450,17 @@ routes = ["a"]
 
         let started = ask(dump_start("default")).await;
         assert_eq!(started["unit"], "u");
-        assert_eq!(started["ok"], true);
+        assert_eq!(started["ok"], true, "{started}");
         assert_eq!(started["ns"], "default");
-        assert_eq!(started["max_bytes"], crate::dump::DEFAULT_MAX_BYTES);
-        assert_eq!(started["request_only"], false);
-        assert!(started.get("bytes_written").is_none(), "{started}");
+        assert_eq!(started["timeout_ms"], 600_000);
+        assert_eq!(started["max_bytes"], 200 * 1024 * 1024);
+        assert_eq!(started["store"], "raw");
+        assert_eq!(started["labels"]["owner"], "kawaz");
+        assert_eq!(started["concurrency"]["limit"], 16);
+        assert!(
+            started["storage"]["fs_free_bytes"].as_u64().is_some(),
+            "{started}"
+        );
         let id = started["dump_id"].as_str().unwrap().to_owned();
         let dir = started["dump_dir"].as_str().unwrap();
         assert!(
@@ -446,36 +468,42 @@ routes = ["a"]
             "{dir}"
         );
 
-        let listed = ask(DumpRequest::Status).await;
+        let listed = ask(DumpRequest::List {
+            selectors: vec!["state=active".to_owned()],
+        })
+        .await;
         assert_eq!(listed["ok"], true);
         assert_eq!(listed["dumps"][0]["dump_id"], id.as_str());
-        assert_eq!(listed["dumps"][0]["requests"], 0);
+        assert_eq!(listed["dumps"][0]["state"], "active");
 
         let stopped = ask(DumpRequest::Stop {
-            dump_id: Some(id.clone()),
-            all: false,
+            dump_id: id.clone(),
         })
         .await;
         assert_eq!(stopped["ok"], true);
-        assert_eq!(stopped["active"], false);
-        assert_eq!(
-            ask(DumpRequest::Status).await,
-            serde_json::json!({"unit": "u", "ok": true, "dumps": []})
-        );
-        assert_eq!(
-            ask(DumpRequest::Stop {
-                dump_id: None,
-                all: true
-            })
-            .await,
-            serde_json::json!({"unit": "u", "ok": true, "dumps": []})
-        );
+        assert_eq!(stopped["state"], "stopped");
+        assert_eq!(stopped["reason"], "stop");
+        assert!(stopped["stopped_at"].as_i64().is_some(), "{stopped}");
+        let listed = ask(DumpRequest::List {
+            selectors: vec!["state=active".to_owned()],
+        })
+        .await;
+        assert_eq!(listed["dumps"], serde_json::json!([]));
+
+        let pruned = ask(DumpRequest::Prune {
+            dump_ids: vec![id.clone()],
+            selectors: Vec::new(),
+        })
+        .await;
+        assert_eq!(pruned["pruned"], serde_json::json!([id]));
+        assert!(!Path::new(dir).exists());
 
         task.abort();
         let _ = task.await;
     }
 
-    /// 走っている設定に無い ns、知らない id、どちらも指さない stop は断る。
+    /// 走っている設定に無い ns、知らない id、指定の無い prune、follow の無い
+    /// embed は断る。
     #[tokio::test]
     async fn a_dump_request_that_points_at_nothing_is_refused() {
         let u = unit();
@@ -499,24 +527,35 @@ routes = ["a"]
             kind(dump(
                 "u",
                 DumpRequest::Stop {
-                    dump_id: Some("019a".to_owned()),
-                    all: false
+                    dump_id: "019a".to_owned(),
                 },
                 &u.gateway,
                 now
             )),
             "unknown_dump"
         );
-        for (dump_id, all) in [(None, false), (Some("019a".to_owned()), true)] {
-            assert_eq!(
-                kind(dump(
-                    "u",
-                    DumpRequest::Stop { dump_id, all },
-                    &u.gateway,
-                    now
-                )),
-                "bad_request"
-            );
-        }
+        assert_eq!(
+            kind(dump(
+                "u",
+                DumpRequest::Prune {
+                    dump_ids: Vec::new(),
+                    selectors: Vec::new(),
+                },
+                &u.gateway,
+                now
+            )),
+            "bad_request"
+        );
+        let embedded = DumpRequest::Start {
+            ns: "default".to_owned(),
+            timeout_ms: None,
+            max_bytes: None,
+            store: None,
+            labels: std::collections::BTreeMap::new(),
+            follow: false,
+            embed: Some("bodies".to_owned()),
+            persist: None,
+        };
+        assert_eq!(kind(dump("u", embedded, &u.gateway, now)), "bad_request");
     }
 }

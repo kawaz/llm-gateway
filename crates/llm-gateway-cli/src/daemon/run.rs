@@ -78,11 +78,12 @@ remove disabled from [server], or register another configuration",
         let store = FileStore::open(&dir).map_err(|e| Failure::from(e.to_string()))?;
         let gateway =
             Arc::new(Gateway::new(&config, store).map_err(|e| Failure::from(e.to_string()))?);
-        // 48 時間より古い一時ダンプを片付ける。上がった台はダンプしていない状態で
-        // 始まるので、ここでは兄弟の分も含めて古いものだけが消える (DR-0038 決定 9)。
-        gateway
-            .dumps()
-            .sweep(llm_gateway::credential::time::now_unix_ms());
+        // `delete_after` を過ぎた一時ダンプを片付ける。上がった台はダンプしていない
+        // 状態で始まるので、兄弟の分も含めて古いものだけが消える (DR-0038 決定 4)。
+        gateway.dumps().sweep(
+            llm_gateway::credential::time::now_unix_ms(),
+            i64::try_from(config.dump.cleanup_ttl.as_millis()).unwrap_or(i64::MAX),
+        );
 
         let listener = tokio::net::TcpListener::bind(&config.server.listen)
             .await

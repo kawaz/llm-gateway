@@ -80,6 +80,10 @@ pub struct Config {
     #[serde(default)]
     pub stats: Stats,
 
+    /// 一時ダンプの歯止めと既定値 (DR-0038 決定 3)。ダンプを始める指定は持たない。
+    #[serde(default)]
+    pub dump: DumpConfig,
+
     /// upstream service status の取得と観測。
     #[serde(default)]
     pub status: StatusConfig,
@@ -1402,6 +1406,81 @@ impl CredentialSpec {
     }
 }
 
+/// 一時ダンプの歯止めと既定値 (DR-0038 決定 3)。
+///
+/// どのキーも既定値を持つので、テーブルごと書かなくてよい。on / off や対象の
+/// ns は持たない (書いたものは消し忘れでそのまま常設になる)。`daemon reload` で
+/// 差し替わると以後の `start` に効き、動いている系列は始めた時の値のまま。
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DumpConfig {
+    /// `--timeout` を書かなかった時の長さ。
+    #[serde(default = "default_dump_default_timeout", with = "human_duration")]
+    pub default_timeout: Duration,
+    /// `--max-bytes` を書かなかった時の、系列 1 つの上限 (bytes)。
+    #[serde(default = "default_dump_default_max_bytes")]
+    pub default_max_bytes: u64,
+    /// `--timeout` に許す上限。`cleanup_ttl` 以下。
+    #[serde(default = "default_dump_max_timeout", with = "human_duration")]
+    pub max_timeout: Duration,
+    /// 動いている系列の実使用量の合計の上限 (bytes)。
+    #[serde(default = "default_dump_max_total_bytes")]
+    pub max_total_bytes: u64,
+    /// 置き場のファイルシステムに必ず残す空き容量 (bytes)。
+    #[serde(default = "default_dump_fs_min_free")]
+    pub fs_min_free: u64,
+    /// 系列を始めてから、ディレクトリごと消すまでの長さ。
+    #[serde(default = "default_dump_cleanup_ttl", with = "human_duration")]
+    pub cleanup_ttl: Duration,
+    /// 同時に動かせる系列の数。
+    #[serde(default = "default_dump_max_concurrency")]
+    pub max_concurrency: usize,
+}
+
+impl Default for DumpConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout: default_dump_default_timeout(),
+            default_max_bytes: default_dump_default_max_bytes(),
+            max_timeout: default_dump_max_timeout(),
+            max_total_bytes: default_dump_max_total_bytes(),
+            fs_min_free: default_dump_fs_min_free(),
+            cleanup_ttl: default_dump_cleanup_ttl(),
+            max_concurrency: default_dump_max_concurrency(),
+        }
+    }
+}
+
+fn default_dump_default_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+/// Claude Code の 1 本は request で 500 KB 前後〜1 MB 弱あり、並列の worker が
+/// 重なるので、reference の例 (5 MiB) より大きく取る。
+fn default_dump_default_max_bytes() -> u64 {
+    200 * 1024 * 1024
+}
+
+fn default_dump_max_timeout() -> Duration {
+    Duration::from_secs(24 * 3600)
+}
+
+fn default_dump_max_total_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_dump_fs_min_free() -> u64 {
+    1024 * 1024 * 1024
+}
+
+fn default_dump_cleanup_ttl() -> Duration {
+    Duration::from_secs(48 * 3600)
+}
+
+fn default_dump_max_concurrency() -> usize {
+    16
+}
+
 /// upstream service status の設定。
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1670,6 +1749,28 @@ impl Config {
     /// 起動時に落としておかないと、その規則を最初に踏んだ人が
     /// 500 を見るまで誰も気づかない。
     pub fn validate(&self) -> Result<()> {
+        // 片付けは始めた時刻から `cleanup_ttl` で消すので、それより長い時限を
+        // 許すと動いている系列が消される (DR-0038 決定 3)。
+        if self.dump.max_timeout > self.dump.cleanup_ttl {
+            return Err(Error::Config(format!(
+                "[dump] max_timeout ({}) must not exceed cleanup_ttl ({}); a dump would be removed while it is still running",
+                humantime::format_duration(self.dump.max_timeout),
+                humantime::format_duration(self.dump.cleanup_ttl)
+            )));
+        }
+        if self.dump.max_concurrency == 0 || self.dump.default_max_bytes == 0 {
+            return Err(Error::Config(
+                "[dump] max_concurrency and default_max_bytes must be larger than zero".to_owned(),
+            ));
+        }
+        if self.dump.default_timeout.is_zero() || self.dump.default_timeout > self.dump.max_timeout
+        {
+            return Err(Error::Config(format!(
+                "[dump] default_timeout ({}) must be longer than zero and at most max_timeout ({})",
+                humantime::format_duration(self.dump.default_timeout),
+                humantime::format_duration(self.dump.max_timeout)
+            )));
+        }
         if self.account_bound_thinking.iter().any(String::is_empty) {
             return Err(Error::Config(
                 "account_bound_thinking has an empty pattern; remove it or write a model name"
@@ -2294,6 +2395,30 @@ o = "claude-opus-*"
         assert!(err.to_string().contains("on_account_switch"), "{err}");
         let err = parse("[ns.default]\non_account_switch = \"stay\"\n").unwrap_err();
         assert!(err.to_string().contains("on_account_switch"), "{err}");
+    }
+
+    /// `[dump]` は書かなくてよく、書けば既定を置き換える。`max_timeout` は
+    /// `cleanup_ttl` を超えられない (DR-0038 決定 3)。
+    #[test]
+    fn the_dump_table_has_defaults_and_keeps_max_timeout_within_cleanup_ttl() {
+        let c = parse("").unwrap();
+        assert_eq!(c.dump, DumpConfig::default());
+        assert_eq!(c.dump.max_concurrency, 16);
+        assert_eq!(c.dump.default_max_bytes, 209_715_200);
+
+        let c = parse("[dump]\ndefault_timeout = \"10m\"\nmax_concurrency = 4\n").unwrap();
+        assert_eq!(c.dump.default_timeout, Duration::from_secs(600));
+        assert_eq!(c.dump.max_concurrency, 4);
+
+        let err = parse("[dump]\nmax_timeout = \"72h\"\n").unwrap_err();
+        assert!(err.to_string().contains("cleanup_ttl"), "{err}");
+        let err = parse("[dump]\ndefault_timeout = \"25h\"\n").unwrap_err();
+        assert!(err.to_string().contains("default_timeout"), "{err}");
+        assert!(parse("[dump]\nmax_concurrency = 0\n").is_err());
+        assert!(
+            parse("[dump]\nenabled = true\n").is_err(),
+            "no on / off in the table"
+        );
     }
 
     fn parse(s: &str) -> Result<Config> {

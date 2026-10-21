@@ -344,6 +344,12 @@ impl<P: CredentialPersistence> Gateway<P> {
         &self.events
     }
 
+    /// 一時ダンプの歯止めと既定値 (`[dump]`、DR-0038 決定 3)。読み直しで
+    /// 差し替わった値が、以後の `start` に効く。
+    pub fn dump_config(&self) -> crate::config::DumpConfig {
+        self.router.active().config().dump.clone()
+    }
+
     /// 時限つきの一時ダンプ (DR-0038)。制御口が系列を始め・止め、受け口が
     /// 本文を書く。
     pub fn dumps(&self) -> &Arc<crate::dump::Dumps> {
@@ -1395,10 +1401,38 @@ impl<P: CredentialPersistence> Gateway<P> {
             .then(|| (body.clone(), headers.as_slice().to_vec()));
 
         let attempt = call.sends.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        // 一時ダンプ (DR-0038) へは、この経路へ送る形を決めるまでの書き換えを
+        // 試行ごとに添える (別名の解決と cache の付け替えは経路ごとに効く)。
         let teeing = call.dump.map(|capture| {
+            let connected_at = capture.connect(attempt, route.name());
             let credential = route.credential.as_ref().map(CredentialId::as_str);
-            move |status: u16, body: egress::BodyStream| {
-                capture.tee(attempt, route.name(), credential, status, body)
+            let mut rewrites = serde_json::Map::new();
+            rewrites.insert(
+                "model".to_owned(),
+                Value::from(route.upstream_model.as_deref().unwrap_or(call.model)),
+            );
+            if crossing == Crossing::ThinkingAsText {
+                rewrites.insert("thinking_as_text".to_owned(), Value::Bool(true));
+            }
+            if let Some(strategy) = strategy {
+                rewrites.insert("cache_strategy".to_owned(), Value::from(strategy.as_str()));
+            }
+            if let Some(ttl) = cache_ttl_secs {
+                rewrites.insert("cache_ttl_secs".to_owned(), Value::from(ttl));
+            }
+            move |status: u16, headers: &Headers, body: egress::BodyStream| {
+                capture.tee(
+                    crate::dump::Upstream {
+                        attempt,
+                        route: route.name(),
+                        credential,
+                        status,
+                        headers,
+                        connected_at,
+                        rewrites: rewrites.clone(),
+                    },
+                    body,
+                )
             }
         });
         let resp = match egress::send(
@@ -1413,7 +1447,9 @@ impl<P: CredentialPersistence> Gateway<P> {
                 shape: call.shape,
             },
             teeing.as_ref().map(|tee| {
-                tee as &(dyn Fn(u16, egress::BodyStream) -> egress::BodyStream + Send + Sync)
+                tee as &(
+                     dyn Fn(u16, &Headers, egress::BodyStream) -> egress::BodyStream + Send + Sync
+                 )
             }),
         )
         .await
@@ -7531,18 +7567,52 @@ routes = ["spare", "codex"]
         serde_json::from_str(body).expect("a JSON body")
     }
 
-    /// 一時ダンプを 1 本ぶん用意する (DR-0038)。置き場は試験ごとの一時ディレクトリ。
-    fn dump_capture(dir: &std::path::Path) -> (Arc<crate::dump::Capture>, std::path::PathBuf) {
+    /// 一時ダンプの系列 1 つと、受けた 1 本 (DR-0038)。
+    struct DumpRig {
+        dumps: Arc<crate::dump::Dumps>,
+        dump_id: String,
+        dir: std::path::PathBuf,
+        capture: Arc<crate::dump::Capture>,
+    }
+
+    impl DumpRig {
+        /// 系列を止めて、書き手が書き終えた `index.jsonl` を読む。
+        fn events(&self) -> Vec<Value> {
+            self.dumps.stop("u", &self.dump_id, now_unix_ms()).unwrap();
+            std::fs::read_to_string(self.dir.join("index.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        /// 試行 `attempt` の response の本文 (止めた後で読む)。
+        fn response(&self, attempt: u64) -> String {
+            let suffix = format!(".{attempt}.response.body");
+            let name = std::fs::read_dir(&self.dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .find(|name| name.ends_with(&suffix))
+                .expect("a response file");
+            std::fs::read_to_string(self.dir.join(name)).unwrap()
+        }
+    }
+
+    /// 置き場は試験ごとの一時ディレクトリ。
+    fn dump_capture(dir: &std::path::Path) -> DumpRig {
         let dumps = Arc::new(crate::dump::Dumps::new(dir));
         let now = now_unix_ms();
-        let view = dumps
+        let started = dumps
             .start(
                 &crate::dump::Start {
                     unit: "u",
                     ns: NS,
-                    for_ms: 60_000,
-                    max_bytes: None,
-                    request_only: false,
+                    ..crate::dump::Start::default()
+                },
+                &crate::config::DumpConfig {
+                    fs_min_free: 0,
+                    ..crate::config::DumpConfig::default()
                 },
                 now,
             )
@@ -7550,27 +7620,48 @@ routes = ["spare", "codex"]
         let capture = dumps
             .capture(
                 crate::dump::Received {
-                    ns: NS,
+                    ns: NS.to_owned(),
                     seq: 1,
-                    body: b"{}",
-                    headers: &[],
+                    received_at: now,
+                    body_end_at: now,
+                    method: "POST".to_owned(),
+                    path: "/v1/messages".to_owned(),
+                    headers: Vec::new(),
+                    body: bytes::Bytes::from_static(b"{}"),
                     stream: false,
+                    model: Some("m".to_owned()),
                 },
                 now,
             )
             .unwrap();
-        (capture, std::path::PathBuf::from(view.dump_dir))
+        DumpRig {
+            dumps,
+            dump_id: started.dump_id,
+            dir: std::path::PathBuf::from(started.dump_dir),
+            capture,
+        }
     }
 
-    /// 書いた response のファイルの中身。
-    fn dumped_response(dir: &std::path::Path) -> String {
-        let name = std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .find(|name| name.ends_with(".response.sse"))
-            .expect("a response file");
-        std::fs::read_to_string(dir.join(name)).unwrap()
+    /// 書いた `upstream_headers` の status を、試行の順に。
+    fn upstream_statuses(events: &[Value]) -> Vec<(u64, u64)> {
+        events
+            .iter()
+            .filter(|e| e["event"] == "upstream_headers")
+            .map(|e| {
+                (
+                    e["attempt"].as_u64().unwrap(),
+                    e["status"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn adopted(events: &[Value]) -> Value {
+        events
+            .iter()
+            .find(|e| e["event"] == "response_headers_sent")
+            .expect("response_headers_sent")["adopted"]
+            .clone()
     }
 
     /// 一時ダンプの response は、Wire が通訳して gateway が JSON に集め直す前の、
@@ -7586,7 +7677,7 @@ routes = ["spare", "codex"]
         )
         .await;
         let stats = tempfile::tempdir().unwrap();
-        let (capture, dir) = dump_capture(stats.path());
+        let rig = dump_capture(stats.path());
 
         let forwarded = gw
             .forward_dumping(
@@ -7600,7 +7691,7 @@ routes = ["spare", "codex"]
                 },
                 request(),
                 vec![],
-                Some(&capture),
+                Some(&rig.capture),
             )
             .await
             .unwrap();
@@ -7613,7 +7704,8 @@ routes = ["spare", "codex"]
         );
         let answered = body_text(forwarded.response).await;
         assert!(answered.starts_with('{'), "{answered}");
-        let dumped = dumped_response(&dir);
+        rig.events();
+        let dumped = rig.response(1);
         assert!(
             dumped.starts_with("data: {\"type\":\"response.created\""),
             "{dumped}"
@@ -7623,7 +7715,7 @@ routes = ["spare", "codex"]
 
     /// 先に断った経路の応答 (429) を持ったまま次の経路を試し、そちらの 503 を本文を
     /// 読まずに捨てて 429 を返しても、試行は両方行に並び、429 の本文はその試行の
-    /// ファイルに残る。`adopted` は 429 を返した試行 (DR-0038 決定 14)。
+    /// ファイルに残る。`adopted` は 429 を返した試行 (DR-0038、reference `model`)。
     #[tokio::test]
     async fn a_dump_keeps_every_attempt_and_names_the_one_returned() {
         let limited = FakeUpstream::start(|_, _| {
@@ -7637,7 +7729,7 @@ routes = ["spare", "codex"]
         let down = FakeUpstream::start(|_, _| (503, "upstream is down".to_owned())).await;
         let gw = gateway(&two_credentials(&limited.url, &down.url)).await;
         let stats = tempfile::tempdir().unwrap();
-        let (capture, dir) = dump_capture(stats.path());
+        let rig = dump_capture(stats.path());
 
         let forwarded = gw
             .forward_dumping(
@@ -7651,54 +7743,24 @@ routes = ["spare", "codex"]
                 },
                 request(),
                 vec![],
-                Some(&capture),
+                Some(&rig.capture),
             )
             .await
             .unwrap();
         assert_eq!(forwarded.response.status, 429);
         let returned = body_text(forwarded.response).await;
         assert!(returned.contains("slow down"), "{returned}");
-        capture.settle(&crate::dump::Answered {
-            status: 429,
-            route: Some(forwarded.route.clone()),
-            ..Default::default()
-        });
+        rig.capture.headers_sent();
 
-        let line: Value = serde_json::from_str(
-            std::fs::read_to_string(dir.join("index.jsonl"))
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(line["adopted"], 1, "{line}");
-        let attempts = line["attempts"].as_array().unwrap();
-        assert_eq!(attempts.len(), 2, "{line}");
-        assert_eq!(attempts[0]["status"], 429);
-        assert_eq!(attempts[1]["status"], 503);
-        assert_eq!(line["response_file"], attempts[0]["response_file"]);
-        let first =
-            std::fs::read_to_string(dir.join(attempts[0]["response_file"].as_str().unwrap()))
-                .unwrap();
-        assert!(first.contains("slow down"), "{first}");
-        assert!(
-            attempts[0]["response_file"]
-                .as_str()
-                .unwrap()
-                .ends_with(".1.response.sse")
-        );
-        assert!(
-            attempts[1]["response_file"]
-                .as_str()
-                .unwrap()
-                .ends_with(".2.response.sse")
-        );
+        let events = rig.events();
+        assert_eq!(adopted(&events), 1);
+        assert_eq!(upstream_statuses(&events), [(1, 429), (2, 503)]);
+        assert!(rig.response(1).contains("slow down"));
     }
 
     /// 同じ経路を 2 度並べた設定でも、`adopted` は経路名からの推定ではなく実際に
     /// 返した送信の番号。1 度目の 429 を持ったまま 2 度目の 503 を捨てて 429 を
-    /// 返したら `adopted: 1` で、最上位の `status` と `attempts[0].status` が揃う。
+    /// 返したら `adopted: 1` で、返した status と試行 1 の status が揃う。
     #[tokio::test]
     async fn a_dump_adopts_the_attempt_actually_returned_even_on_a_repeated_route() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7729,7 +7791,7 @@ routes = ["a", "a"]
         ))
         .await;
         let stats = tempfile::tempdir().unwrap();
-        let (capture, dir) = dump_capture(stats.path());
+        let rig = dump_capture(stats.path());
 
         let forwarded = gw
             .forward_dumping(
@@ -7743,32 +7805,22 @@ routes = ["a", "a"]
                 },
                 request(),
                 vec![],
-                Some(&capture),
+                Some(&rig.capture),
             )
             .await
             .unwrap();
         let status = forwarded.response.status;
         let returned = body_text(forwarded.response).await;
-        capture.settle(&crate::dump::Answered {
-            status,
-            route: Some(forwarded.route.clone()),
-            ..Default::default()
-        });
+        rig.capture.headers_sent();
 
-        let line: Value = serde_json::from_str(
-            std::fs::read_to_string(dir.join("index.jsonl"))
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        let attempts = line["attempts"].as_array().unwrap();
-        assert_eq!(attempts.len(), 2, "both sends reached the upstream: {line}");
+        let events = rig.events();
         assert_eq!(status, 429, "{returned}");
-        assert_eq!(line["adopted"], 1, "{line}");
-        assert_eq!(line["status"], attempts[0]["status"], "{line}");
-        assert_eq!(attempts[1]["status"], 503);
+        assert_eq!(
+            upstream_statuses(&events),
+            [(1, 429), (2, 503)],
+            "both sends reached the upstream"
+        );
+        assert_eq!(adopted(&events), 1);
     }
 
     /// upstream の断りを gateway のエラー本文に差し替えて返しても、ダンプに残るのは
@@ -7810,7 +7862,7 @@ routes = ["codex"]
         )
         .await;
         let stats = tempfile::tempdir().unwrap();
-        let (capture, dir) = dump_capture(stats.path());
+        let rig = dump_capture(stats.path());
 
         let forwarded = gw
             .forward_dumping(
@@ -7824,7 +7876,7 @@ routes = ["codex"]
                 },
                 request(),
                 vec![],
-                Some(&capture),
+                Some(&rig.capture),
             )
             .await
             .unwrap();
@@ -7832,7 +7884,8 @@ routes = ["codex"]
         let answered = body_text(forwarded.response).await;
         assert!(answered.contains("\"type\":\"error\""), "{answered}");
         assert!(!answered.contains("response.failed"), "{answered}");
-        let dumped = dumped_response(&dir);
+        rig.events();
+        let dumped = rig.response(1);
         assert!(dumped.contains("response.failed"), "{dumped}");
         assert!(dumped.contains("currently overloaded"), "{dumped}");
     }

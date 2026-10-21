@@ -648,6 +648,8 @@ async fn forward<P: CredentialPersistence + 'static>(
     // 結局そこまで抱えることになるうえ、送り直しのために抱え続ける必要は
     // 変わらない。上限 (`MAX_BODY`) までのメモリを見込むのはその代償。
     let receiving = Instant::now();
+    // 一時ダンプの `request_headers` の時刻 (ヘッダを受け取り終えた時点)。
+    let received_at = now_unix_ms();
     let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -663,6 +665,7 @@ async fn forward<P: CredentialPersistence + 'static>(
     // 大きさは受け取った実バイト数で数える。Content-Length は手前の
     // プロキシが chunked で渡してくると付かないが、こちらは必ず取れる。
     exchange::record_request_body(&span, bytes.len(), receiving.elapsed());
+    let body_end_at = now_unix_ms();
 
     let mut json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -694,24 +697,32 @@ async fn forward<P: CredentialPersistence + 'static>(
         _ => None,
     };
     // 一時ダンプは gateway が書き換える前の、受けた本文そのものを書く
-    // (DR-0038 決定 7・10)。動いている系列が無ければ何もしない。
-    let dumping = gateway.dumps().capture(
-        llm_gateway::dump::Received {
-            ns: &ns_name,
+    // (DR-0038 決定 9)。動いている系列が無ければ atomic の load 1 つで抜ける。
+    let dumping = gateway
+        .dumps()
+        .capture_if_any(|| llm_gateway::dump::Received {
+            ns: ns_name.clone(),
             seq,
-            body: &bytes,
-            headers: &headers,
+            received_at,
+            body_end_at,
+            method: parts.method.to_string(),
+            path: uri.path().to_owned(),
+            headers: headers.clone(),
+            body: bytes.clone(),
             stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        },
-        now_unix_ms(),
-    );
-    let requested_model = dumping
-        .as_ref()
-        .and_then(|_| json.get("model").and_then(Value::as_str).map(str::to_owned));
+            model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        });
     // namespace の thinking 方針は Messages 形式の欄に書く指示。Responses 形式の
     // 本文には置き場所が無いので当てない (DR-0025)。
     if shape == RequestShape::Messages {
+        let before = dumping.as_ref().map(|_| json.get("thinking").cloned());
         apply_thinking_display(&mut json, ns.thinking_display);
+        if let (Some(capture), Some(before)) = (&dumping, before)
+            && json.get("thinking") != before.as_ref()
+            && let Some(display) = ns.thinking_display
+        {
+            capture.note_rewrite("thinking_display", Value::from(display.as_str()));
+        }
     }
 
     let path = upstream_path(uri.path()).to_owned();
@@ -736,22 +747,11 @@ async fn forward<P: CredentialPersistence + 'static>(
     {
         Ok(forwarded) => {
             let upstream = forwarded.response;
-            // 本文は upstream から読んだ所で書いてある。ここで決まるのは行の欄。
+            // 本文は upstream から読んだ所で書いてある。ここで書くのはクライアント
+            // へ返す側の節目。
             let dumping = dumping.map(|capture| {
-                capture.answered(llm_gateway::dump::Answered {
-                    status: upstream.status,
-                    model: Some(forwarded.model.clone()),
-                    route: Some(forwarded.route.clone()),
-                    origin: Some(forwarded.origin.clone()),
-                    credential: forwarded
-                        .credential
-                        .as_ref()
-                        .map(|credential| credential.as_str().to_owned()),
-                    cache_strategy: forwarded
-                        .cache_strategy
-                        .map(|strategy| strategy.as_str().to_owned()),
-                    cache_ttl_secs: forwarded.cache_ttl_secs,
-                })
+                capture.headers_sent();
+                capture.settling()
             });
             // 応答が閉じたら 1 通流す (DR-0012)。下書きは経路が決まった時点で
             // 作ってあり、終わり方を入れるのは本文の終端。
@@ -794,15 +794,10 @@ async fn forward<P: CredentialPersistence + 'static>(
         }
         Err(e) => {
             let response = span.in_scope(|| error_response(&ns_name, &e));
-            // gateway が答えた。返したのは upstream のバイト列ではないので
-            // 行の欄はこちらの答えから取る。upstream が答えていた経路があれば、
-            // その最後の 1 本の本文は書いてある。
+            // gateway が自分で組んだエラーを返す (`adopted: null`)。upstream が
+            // 答えていた試行があれば、その本文は書いてある。
             if let Some(capture) = dumping {
-                capture.settle(&llm_gateway::dump::Answered {
-                    status: response.status().as_u16(),
-                    model: requested_model,
-                    ..Default::default()
-                });
+                capture.headers_sent();
             }
             response
         }
@@ -1652,6 +1647,9 @@ content-length: {declared}\r\n\r\n{head}"
 [stats]
 dir = {stats:?}
 
+[dump]
+fs_min_free = 0
+
 [routes.a]
 provider = "anthropic"
 url = "{upstream}"
@@ -1669,31 +1667,42 @@ routes = ["a"]
         .await
     }
 
-    fn start_dump(gateway: &Gateway<StaticStore>, request_only: bool) -> llm_gateway::dump::View {
+    fn start_dump(gateway: &Gateway<StaticStore>) -> llm_gateway::dump::Started {
         gateway
             .dumps()
             .start(
                 &llm_gateway::dump::Start {
                     unit: "u",
                     ns: "default",
-                    for_ms: 600_000,
-                    max_bytes: None,
-                    request_only,
+                    ..llm_gateway::dump::Start::default()
                 },
+                &gateway.dump_config(),
                 now_unix_ms(),
             )
             .unwrap()
     }
 
-    fn index_lines(dir: &str) -> Vec<Value> {
-        std::fs::read_to_string(std::path::Path::new(dir).join("index.jsonl"))
+    /// 系列を止めて、書き手が書き終えた `index.jsonl` を読む。
+    fn stopped_events(
+        gateway: &Gateway<StaticStore>,
+        started: &llm_gateway::dump::Started,
+    ) -> Vec<Value> {
+        gateway
+            .dumps()
+            .stop("u", &started.dump_id, now_unix_ms())
+            .unwrap();
+        std::fs::read_to_string(std::path::Path::new(&started.dump_dir).join("index.jsonl"))
             .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     }
 
-    /// 本文を覗く口はダンプ 1 つで、`/llm-gateway/tap` は持たない (DR-0038 決定 15)。
+    fn event<'a>(events: &'a [Value], name: &str) -> Option<&'a Value> {
+        events.iter().find(|e| e["event"] == name)
+    }
+
+    /// 本文を覗く口はダンプ 1 つで、`/llm-gateway/tap` は持たない (DR-0038 決定 13)。
     #[tokio::test]
     async fn there_is_no_tap() {
         let base = serve("[ns.default]\n").await;
@@ -1703,9 +1712,9 @@ routes = ["a"]
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// 動いている系列には、受けた形の request と upstream が返した生のバイト列と、
-    /// 秘密のヘッダを落とした `index.jsonl` の 1 行が書かれる (DR-0038 決定 7・8・14)。
-    /// 動いている間は `/self` にも出る (決定 12)。
+    /// 動いている系列には、受けた形の request (gateway が display を書き換える前) と
+    /// upstream が返したバイト列が、メタ json と body に分かれて残る。認証系の
+    /// ヘッダは落とす。動いている間は `/self` にも出る (DR-0038 決定 9・11)。
     #[tokio::test]
     async fn a_running_dump_writes_what_was_received_and_what_came_back() {
         let response_body = r#"{"type":"message","content":[]}"#;
@@ -1719,12 +1728,7 @@ routes = ["a"]
         .await;
         let stats = tempfile::TempDir::new().unwrap();
         let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
-        let view = start_dump(&gateway, false);
-        assert!(
-            std::path::Path::new(&view.dump_dir).is_absolute(),
-            "{}",
-            view.dump_dir
-        );
+        let started = start_dump(&gateway);
 
         let mut sent = request_body();
         sent["thinking"] = json!({"type": "enabled", "budget_tokens": 1024});
@@ -1743,62 +1747,70 @@ routes = ["a"]
         assert_eq!(forwarded.status(), StatusCode::OK);
         assert_eq!(forwarded.text().await.unwrap(), response_body);
 
-        let lines = index_lines(&view.dump_dir);
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        assert!(line["ts"].as_i64().unwrap() > 1_700_000_000_000, "{line}");
-        assert!(line["seq"].as_u64().is_some(), "{line}");
-        assert_eq!(line["model"], "m");
-        assert_eq!(line["route"], "a");
-        assert_eq!(line["status"], 200);
-        assert_eq!(line["stream"], false);
-        assert_eq!(line["request_bytes"], raw.len());
-        assert_eq!(line["response_bytes"], response_body.len());
-        assert_eq!(line["headers"]["anthropic-beta"], "b-1");
-        for secret in ["authorization", "x-api-key"] {
-            assert!(line["headers"].get(secret).is_none(), "{line}");
-        }
-        let stem = format!("{}-{}", line["ts"], line["seq"]);
-        assert_eq!(line["request_file"], format!("{stem}.request.json"));
-        assert_eq!(line["response_file"], format!("{stem}.1.response.sse"));
-        assert_eq!(line["adopted"], 1);
-        assert_eq!(line["attempts"][0]["route"], "a");
-
-        let dir = std::path::Path::new(&view.dump_dir);
-        // gateway が display を書き換える前の、受けた本文そのもの。
-        assert_eq!(
-            std::fs::read(dir.join(format!("{stem}.request.json"))).unwrap(),
-            raw
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join(format!("{stem}.1.response.sse"))).unwrap(),
-            response_body
-        );
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode =
-                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(dir), 0o700);
-            assert_eq!(mode(&dir.join("index.jsonl")), 0o600);
-            assert_eq!(mode(&dir.join(format!("{stem}.request.json"))), 0o600);
-        }
-
         let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
+        assert_eq!(answered["dump"][0]["dump_id"], started.dump_id.as_str());
+        assert_eq!(answered["dump"][0]["expires_at"], started.expires_at);
+        assert!(answered["dump"][0].get("dump_dir").is_none(), "{answered}");
+
+        let events = stopped_events(&gateway, &started);
+        let first = event(&events, "request_headers").unwrap();
+        let stem = format!("{}-{}", first["ts"], first["seq"]);
+        assert_eq!(first["request_file"], format!("{stem}.request.json"));
         assert_eq!(
-            answered["dump"],
-            json!([{
-                "dump_id": view.dump_id,
-                "ns": "default",
-                "until": view.until,
-                "bytes_written": raw.len() + response_body.len(),
-            }])
+            event(&events, "request_body_end").unwrap()["bytes"],
+            raw.len()
         );
-        gateway.dumps().stop(&view.dump_id).unwrap();
+        assert_eq!(event(&events, "upstream_headers").unwrap()["status"], 200);
+        assert_eq!(
+            event(&events, "upstream_body_end").unwrap()["bytes"],
+            response_body.len()
+        );
+        assert_eq!(
+            event(&events, "response_headers_sent").unwrap()["adopted"],
+            1
+        );
+        assert_eq!(events.last().unwrap()["event"], "stop");
+
+        let dir = std::path::Path::new(&started.dump_dir);
+        // gateway が display を書き換える前の、受けた本文そのもの。
+        assert_eq!(
+            std::fs::read(dir.join(format!("{stem}.request.body"))).unwrap(),
+            raw
+        );
+        let request: Value = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("{stem}.request.json"))).unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = request["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"anthropic-beta"), "{names:?}");
+        assert!(
+            !names.contains(&"authorization") && !names.contains(&"x-api-key"),
+            "{names:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{stem}.1.response.body"))).unwrap(),
+            response_body
+        );
+        let response: Value = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("{stem}.1.response.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["route"], "a");
+        assert_eq!(
+            response["request_rewrites"]["thinking_display"], "summarized",
+            "{response}"
+        );
+
         let answered: Value = reqwest::get(format!("{base}/llm-gateway/self"))
             .await
             .unwrap()
@@ -1808,26 +1820,15 @@ routes = ["a"]
         assert!(answered.get("dump").is_none(), "{answered}");
     }
 
-    /// `--request-only` の系列には response のファイルも欄も無い。upstream に
-    /// 届かなかった 1 本は、行だけが書かれる (DR-0038 決定 7・14)。
+    /// gateway が自分で組んだエラーを返した 1 本は、upstream の行を持たず
+    /// `adopted: null` で残る。
     #[tokio::test]
-    async fn a_request_only_dump_and_a_refused_request_leave_no_response_file() {
+    async fn a_request_the_gateway_refused_has_no_upstream_attempt() {
         let upstream = fake_upstream(|| (200, r#"{"type":"message"}"#.to_owned(), vec![])).await;
         let stats = tempfile::TempDir::new().unwrap();
         let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
-        let request_only = start_dump(&gateway, true);
-        let both = start_dump(&gateway, false);
+        let started = start_dump(&gateway);
 
-        let ok = authed(
-            reqwest::Client::new()
-                .post(format!("{base}/v1/messages"))
-                .json(&request_body()),
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(ok.status(), StatusCode::OK);
-        ok.bytes().await.unwrap();
         let mut unknown = request_body();
         unknown["model"] = json!("nowhere");
         let refused = authed(
@@ -1840,26 +1841,15 @@ routes = ["a"]
         .unwrap();
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
 
-        let lines = index_lines(&request_only.dump_dir);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines.iter().all(|line| line.get("response_file").is_none()));
-        let files = std::fs::read_dir(&request_only.dump_dir).unwrap().count();
-        assert_eq!(files, 3, "index.jsonl and two requests");
-
-        // 重なっている系列には同じ 1 本が両方書かれる (決定 13)。
-        let lines = index_lines(&both.dump_dir);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        let refused_line = lines.iter().find(|line| line["status"] == 404).unwrap();
-        assert_eq!(refused_line["model"], "nowhere");
-        assert!(refused_line.get("route").is_none(), "{refused_line}");
-        assert!(
-            refused_line.get("response_file").is_none(),
-            "{refused_line}"
+        let events = stopped_events(&gateway, &started);
+        assert_eq!(
+            event(&events, "request_headers").unwrap()["model"],
+            "nowhere"
         );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line["status"] == 200 && line.get("response_file").is_some())
+        assert!(event(&events, "upstream_headers").is_none());
+        assert_eq!(
+            event(&events, "response_headers_sent").unwrap()["adopted"],
+            Value::Null
         );
     }
 
@@ -1869,7 +1859,7 @@ routes = ["a"]
         let upstream = fake_upstream(|| (200, r#"{"type":"message"}"#.to_owned(), vec![])).await;
         let stats = tempfile::TempDir::new().unwrap();
         let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
-        let view = start_dump(&gateway, false);
+        let started = start_dump(&gateway);
 
         let denied = reqwest::Client::new()
             .post(format!("{base}/v1/messages"))
@@ -1880,8 +1870,12 @@ routes = ["a"]
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
-        assert!(index_lines(&view.dump_dir).is_empty());
-        assert_eq!(std::fs::read_dir(&view.dump_dir).unwrap().count(), 0);
+        let events = stopped_events(&gateway, &started);
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["start", "stop"]);
     }
 
     /// 転送のたびに、見ている人へ 1 通流れる。

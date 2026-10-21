@@ -1726,13 +1726,15 @@ mod tests {
         a_control_socket_that_answers_to(
             &world,
             "a",
-            r#"{"op":"dump","action":"status"}"#,
+            r#"{"op":"dump","action":"list"}"#,
             r#"{"unit":"whatever","ok":true,"dumps":[]}"#,
         );
         let relay = |unit: &str| {
             Request::Dump(DumpRelay {
                 unit: unit.to_owned(),
-                dump: protocol::DumpRequest::Status,
+                dump: protocol::DumpRequest::List {
+                    selectors: Vec::new(),
+                },
             })
         };
 
@@ -1768,7 +1770,7 @@ mod tests {
         a_control_socket_that_answers_to(
             &world,
             "a",
-            r#"{"op":"dump","action":"stop","all":true}"#,
+            r#"{"op":"dump","action":"stop","dump_id":"x"}"#,
             r#"{"dumps":[]}"#,
         );
 
@@ -1777,8 +1779,7 @@ mod tests {
             .dump_unit(DumpRelay {
                 unit: "a".to_owned(),
                 dump: protocol::DumpRequest::Stop {
-                    dump_id: None,
-                    all: true,
+                    dump_id: "x".to_owned(),
                 },
             })
             .await;
@@ -2136,7 +2137,7 @@ mod tests {
                     axum::Json(serde_json::json!({
                         "version": "0.1.3",
                         "events": {"dropped": 7},
-                        "dump": [{"dump_id": "019a", "ns": "lab", "until": 1792000600000_i64, "bytes_written": 12}],
+                        "dump": [{"dump_id": "019a", "ns": "lab", "expires_at": 1792000600000_i64, "bytes_written": 12}],
                     }))
                 }),
             );
@@ -2159,7 +2160,7 @@ mod tests {
         // 動いている一時ダンプの系列も写す (DR-0038 決定 12)。
         assert_eq!(
             answer["units"][0]["dump"],
-            serde_json::json!([{"dump_id": "019a", "ns": "lab", "until": 1792000600000_i64, "bytes_written": 12}])
+            serde_json::json!([{"dump_id": "019a", "ns": "lab", "expires_at": 1792000600000_i64, "bytes_written": 12}])
         );
 
         world.supervisor.shutdown().await;

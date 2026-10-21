@@ -233,8 +233,8 @@ pub struct BodyObservation {
     model: String,
     /// 出した側の 1 語 (DR-0029)。集計を素性で割るための鍵。
     origin: String,
-    /// 一時ダンプの 1 本 (DR-0038 決定 14)。終端で `index.jsonl` に行を書く。
-    /// 動いている系列が無ければ `None`。
+    /// 一時ダンプの 1 本 (DR-0038)。終端と、捨てられる時に `index.jsonl` の行を
+    /// 書く。動いている系列が無ければ `None`。
     dump: Option<dump::Settling>,
     /// 応答が閉じたことを流す先と、その下書き。流さない応答では `None`。
     completion: Option<Completion>,
@@ -242,7 +242,7 @@ pub struct BodyObservation {
 
 impl BodyObservation {
     /// 一時ダンプの 1 本の行を、応答の終端 (完了・エラー・中断) で書く
-    /// (DR-0038 決定 14)。本文そのものは upstream から読んだ所で書いてある。
+    /// (DR-0038)。本文そのものは upstream から読んだ所で書いてある。
     pub fn with_dump(mut self, dump: Option<dump::Settling>) -> Self {
         self.dump = dump;
         self
@@ -335,8 +335,10 @@ impl BodyObservation {
         self.note_gap(Instant::now());
         let outcome = self.finish_usage();
         self.tell_completed(outcome, completed);
-        if let Some(dump) = self.dump.take() {
-            dump.finish();
+        // 一時ダンプへは、クライアントへ流し終えた (切れた) ことを書く。繋がりを
+        // 手放したこと (`transport_close`) は、この包みが捨てられる時に書く。
+        if let Some(dump) = &self.dump {
+            dump.body_end(self.bytes, completed);
         }
         (
             self.bytes,
