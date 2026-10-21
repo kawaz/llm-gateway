@@ -41,16 +41,19 @@ pub(super) struct Follow {
     pub(super) embed: bool,
 }
 
-/// 書き手へ渡すもの。
+/// 書き手へ渡すもの。中継の経路で JSON にはしない。
 pub(crate) enum Message {
-    /// `index.jsonl` の 1 行。
-    Event(Map<String, Value>),
-    /// メタ json (`*.request.json` / `*.response.json`)。書いた後は変えない。
-    Meta { name: String, json: Value },
-    /// 本文 (`*.body`) の続き。最初の 1 回でファイルを作る。
-    Body { name: String, chunk: Bytes },
+    /// `index.jsonl` の 1 行 (中継の経路から)。
+    Event(super::record::Event),
+    /// `*.request.json`。書いた後は変えない。
+    RequestMeta(Arc<super::record::RequestMeta>),
+    /// `*.<attempt>.response.json`。書いた後は変えない。
+    ResponseMeta(Arc<super::record::ResponseMeta>),
+    /// 本文 (`*.body`) の続き。最初の 1 回でファイルを作る。書き終えたら
+    /// (書けなくても) その大きさを fs の未確定分から外す。
+    Body { name: Arc<str>, chunk: Bytes },
     /// 本文のファイルを作る (中身はまだ無い)。
-    Open { name: String },
+    Open { name: Arc<str> },
     /// 止まったことに気づかせる。
     Wake,
 }
@@ -147,12 +150,17 @@ impl Writing {
     fn handle(&mut self, message: Message) {
         let result = match message {
             Message::Event(event) => {
-                self.event(event);
+                self.event(event.to_map());
                 Ok(())
             }
-            Message::Meta { name, json } => self.meta(&name, &json),
+            Message::RequestMeta(meta) => self.meta(&meta.file, &meta.to_json()),
+            Message::ResponseMeta(meta) => self.meta(&meta.file, &meta.to_json()),
             Message::Open { name } => self.body(&name, None),
-            Message::Body { name, chunk } => self.body(&name, Some(&chunk)),
+            Message::Body { name, chunk } => {
+                let written = self.body(&name, Some(&chunk));
+                self.series.usage.written(chunk.len() as u64);
+                written
+            }
             Message::Wake => Ok(()),
         };
         if let Err(e) = result {
@@ -241,14 +249,7 @@ impl Writing {
         event.insert("ts".to_owned(), json!(at));
         event.insert("reason".to_owned(), json!(reason.as_str()));
         event.insert("stopped_at".to_owned(), json!(at));
-        event.insert(
-            "bytes_written".to_owned(),
-            json!(
-                self.series
-                    .bytes_written
-                    .load(std::sync::atomic::Ordering::Acquire)
-            ),
-        );
+        event.insert("bytes_written".to_owned(), json!(self.series.written()));
         let line = Value::Object(event).to_string();
         let _ = self.index.write_all(format!("{line}\n").as_bytes());
         let _ = self.index.flush();

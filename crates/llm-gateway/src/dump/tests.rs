@@ -45,13 +45,11 @@ fn start_with(
         .unwrap()
 }
 
-fn received(ns: &str, seq: u64, body: &'static [u8]) -> Received {
-    let at = now();
-    Received {
+fn head(ns: &str, seq: u64, at: i64) -> RequestHead {
+    RequestHead {
         ns: ns.to_owned(),
         seq,
         received_at: at,
-        body_end_at: at + 3,
         method: "POST".to_owned(),
         path: "/ns-lab/v1/messages".to_owned(),
         headers: vec![
@@ -60,10 +58,21 @@ fn received(ns: &str, seq: u64, body: &'static [u8]) -> Received {
             ("anthropic-beta".to_owned(), "a".to_owned()),
             ("anthropic-beta".to_owned(), "b".to_owned()),
         ],
+    }
+}
+
+/// ヘッダと本文を受けたことにする (本文は 3ms 後に受け終える)。
+fn take(dumps: &Dumps, ns: &str, seq: u64, body: &'static [u8]) -> Option<Arc<Capture>> {
+    let at = now();
+    let capture = dumps.capture_head(|| head(ns, seq, at))?;
+    capture.body(RequestBody {
+        body_end_at: at + 3,
         body: Bytes::from_static(body),
+        error: None,
         stream: true,
         model: Some("opus".to_owned()),
-    }
+    });
+    Some(capture)
 }
 
 fn body(chunks: &[&'static [u8]]) -> BodyStream {
@@ -122,7 +131,7 @@ fn exchange(
     request: &'static [u8],
     chunks: &[&'static [u8]],
 ) -> bool {
-    let Some(capture) = dumps.capture(received(ns, seq, request), now()) else {
+    let Some(capture) = take(dumps, ns, seq, request) else {
         return false;
     };
     answer(&capture, 1, "r", 200, chunks);
@@ -253,7 +262,8 @@ fn events_reach_the_index_within_a_second() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
     let started = start(&dumps, "lab", None);
-    let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+    // ヘッダを受けただけで、本文はまだ来ていない。
+    let capture = dumps.capture_head(|| head("lab", 1, now())).unwrap();
     drop(capture);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -277,11 +287,11 @@ fn events_reach_the_index_within_a_second() {
 fn only_the_namespace_of_a_running_dump_is_captured() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
-    assert!(dumps.capture(received("lab", 1, b"{}"), now()).is_none());
+    assert!(take(&dumps, "lab", 1, b"{}").is_none());
     assert!(!dir.path().join("dumps").exists(), "nothing was made");
     start(&dumps, "lab", None);
-    assert!(dumps.capture(received("other", 2, b"{}"), now()).is_none());
-    assert!(dumps.capture_if_any(|| received("lab", 3, b"{}")).is_some());
+    assert!(take(&dumps, "other", 2, b"{}").is_none());
+    assert!(take(&dumps, "lab", 3, b"{}").is_some());
 }
 
 /// 試行ごとに別のファイルに残り、返した試行を `response_headers_sent` の
@@ -291,12 +301,12 @@ fn every_attempt_is_kept_and_the_adopted_one_is_named() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
     let started = start(&dumps, "lab", None);
-    let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+    let capture = take(&dumps, "lab", 1, b"{}").unwrap();
     answer(&capture, 1, "a", 429, &[b"denied"]);
     answer(&capture, 2, "a", 503, &[b"down"]);
     capture.adopt(1);
     capture.headers_sent();
-    let refused = dumps.capture(received("lab", 2, b"{}"), now()).unwrap();
+    let refused = take(&dumps, "lab", 2, b"{}").unwrap();
     refused.headers_sent();
 
     let events = finished(&dumps, &started);
@@ -324,10 +334,10 @@ fn the_size_limit_stops_a_dump_at_the_limit() {
     let dumps = dumps(dir.path());
 
     let refused = start(&dumps, "a", Some(4));
-    assert!(!exchange(&dumps, "a", 1, b"12345", &[]));
+    exchange(&dumps, "a", 1, b"12345", &[]);
     let events = events_after_stop(&dumps, &refused);
-    assert_eq!(names(&events), ["start", "stop"]);
-    assert_eq!(events[1]["reason"], "max_bytes");
+    assert_eq!(names(&events), ["start", "request_headers", "stop"]);
+    assert_eq!(events[2]["reason"], "max_bytes");
 
     let cut = start(&dumps, "b", Some(10));
     assert!(exchange(
@@ -350,7 +360,7 @@ fn the_size_limit_stops_a_dump_at_the_limit() {
     assert_eq!(read(&cut, &format!("{stem}.1.response.body")), b"abcdef");
 
     let exact = start(&dumps, "c", Some(2));
-    assert!(dumps.capture(received("c", 3, b"12"), now()).is_some());
+    assert!(take(&dumps, "c", 3, b"12").is_some());
     assert_eq!(
         events_after_stop(&dumps, &exact).last().unwrap()["reason"],
         "max_bytes"
@@ -400,7 +410,7 @@ fn the_free_space_floor_stops_a_dump() {
         ..config()
     };
     let started = start_with(&dumps, "a", None, &full);
-    assert!(!exchange(&dumps, "a", 1, b"{}", &[]));
+    exchange(&dumps, "a", 1, b"{}", &[]);
     assert_eq!(
         events_after_stop(&dumps, &started).last().unwrap()["reason"],
         "fs_min_free"
@@ -413,7 +423,7 @@ fn nothing_is_written_after_a_stop() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
     let started = start(&dumps, "lab", None);
-    let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+    let capture = take(&dumps, "lab", 1, b"{}").unwrap();
     let connected_at = capture.connect(1, "r");
     let headers = upstream_headers();
     let mut teed = capture.tee(
@@ -458,7 +468,7 @@ fn a_request_after_the_timeout_is_not_written() {
             now() - 1_000,
         )
         .unwrap();
-    assert!(dumps.capture(received("lab", 1, b"{}"), now()).is_none());
+    assert!(take(&dumps, "lab", 1, b"{}").is_none());
     assert!(dumps.running(now()).is_empty());
     assert_eq!(
         events_after_stop(&dumps, &started).last().unwrap()["reason"],
@@ -689,7 +699,7 @@ fn stopping_is_idempotent_and_keeps_the_first_reason() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
     let started = start(&dumps, "a", Some(1));
-    assert!(dumps.capture(received("a", 1, b"12"), now()).is_none());
+    take(&dumps, "a", 1, b"12");
     let first = dumps.stop("u", &started.dump_id, now()).unwrap();
     let again = dumps.stop("u", &started.dump_id, now()).unwrap();
     assert_eq!(first.reason.as_deref(), Some("max_bytes"));
@@ -889,7 +899,7 @@ fn a_follower_that_leaves_or_falls_behind_stops_the_dump() {
     );
 
     let (slow, _lines) = following(&dumps, false, true);
-    let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+    let capture = take(&dumps, "lab", 1, b"{}").unwrap();
     // 書き手の列 (4096) には収まり、follow の列 (1024) は溢れる数の行を置く。
     // 書き手が流すうちに溢れて、自分で系列を止める。
     for _ in 0..2_000 {
@@ -904,4 +914,190 @@ fn a_follower_that_leaves_or_falls_behind_stops_the_dump() {
             .as_deref(),
         Some("lagged")
     );
+}
+
+/// 本文を受け取りきれなかった・読めなかった 1 本も、受けたまま残し、
+/// `request_body_end` と `*.request.json` に理由を付ける (DR-0038 決定 9)。
+#[test]
+fn a_body_that_could_not_be_read_is_kept_as_received() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let started = start(&dumps, "lab", None);
+    let at = now();
+    let capture = dumps.capture_head(|| head("lab", 1, at)).unwrap();
+    capture.body(RequestBody {
+        body_end_at: at + 1,
+        body: Bytes::from_static(b"{\"cut"),
+        error: Some("truncated"),
+        stream: false,
+        model: None,
+    });
+    capture.headers_sent();
+
+    let events = finished(&dumps, &started);
+    let end = events
+        .iter()
+        .find(|e| e["event"] == "request_body_end")
+        .unwrap();
+    assert_eq!(end["error"], "truncated");
+    let stem = format!("{at}-1");
+    assert_eq!(read(&started, &format!("{stem}.request.body")), b"{\"cut");
+    let meta: Value =
+        serde_json::from_slice(&read(&started, &format!("{stem}.request.json"))).unwrap();
+    assert_eq!(meta["error"], "truncated");
+}
+
+/// 同時に始めても `max_concurrency` を超えない (枠を先に取る)。
+#[test]
+fn concurrent_starts_never_exceed_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let limited = DumpConfig {
+        max_concurrency: 3,
+        ..config()
+    };
+    let barrier = Arc::new(std::sync::Barrier::new(12));
+    let handles: Vec<_> = (0..12)
+        .map(|_| {
+            let (dumps, barrier, limited) =
+                (Arc::clone(&dumps), Arc::clone(&barrier), limited.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                dumps
+                    .start(
+                        &Start {
+                            unit: "u",
+                            ns: "lab",
+                            ..Start::default()
+                        },
+                        &limited,
+                        now(),
+                    )
+                    .map_err(|r| r.kind)
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+    assert!(
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|k| *k == "too_many_dumps")
+    );
+    assert_eq!(dumps.active.load(Ordering::Acquire), 3);
+}
+
+/// 書いている最中に止めても、全体の実使用量に止めた系列の分が残らない
+/// (二重にも引かない)。
+#[test]
+fn stopping_while_writing_leaves_no_bytes_in_the_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    for round in 0..20 {
+        let started = start(&dumps, "lab", None);
+        let capture = take(&dumps, "lab", round, b"{}").unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let capture = Arc::clone(&capture);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let connected_at = capture.connect(1, "r");
+                        let headers = upstream_headers();
+                        let _ = capture
+                            .tee(
+                                Upstream {
+                                    attempt: 1,
+                                    route: "r",
+                                    credential: None,
+                                    status: 200,
+                                    headers: &headers,
+                                    connected_at,
+                                    rewrites: Map::new(),
+                                },
+                                body(&[b"0123456789"]),
+                            )
+                            .collect::<Vec<_>>()
+                            .now_or_never();
+                    }
+                })
+            })
+            .collect();
+        dumps.stop("u", &started.dump_id, now()).unwrap();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(
+            dumps.usage.total.load(Ordering::Acquire),
+            0,
+            "round {round}"
+        );
+    }
+}
+
+/// 空き容量を測り直しても、書き手がまだ書いていない分は空きに戻らない。
+#[test]
+fn measuring_again_keeps_what_is_still_to_be_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let usage = &dumps.usage;
+    usage.refresh(now(), true);
+    let measured = usage.fs_measured.load(Ordering::Acquire);
+    assert_eq!(usage.take_fs(1000, 0), 1000);
+    usage.refresh(now(), true);
+    let after = usage.fs_measured.load(Ordering::Acquire);
+    assert_eq!(
+        usage.fs_available.load(Ordering::Acquire),
+        after - 1000,
+        "measured {measured} then {after}"
+    );
+    usage.written(1000);
+    usage.refresh(now(), true);
+    assert_eq!(
+        usage.fs_available.load(Ordering::Acquire),
+        usage.fs_measured.load(Ordering::Acquire)
+    );
+    // 床までしか取れない。
+    let available = usage.fs_available.load(Ordering::Acquire);
+    assert_eq!(usage.take_fs(u64::MAX, available - 10), 10);
+}
+
+/// 片付けは系列ごとの `start` の行の `delete_after` で決め、呼んだ unit の
+/// `cleanup_ttl` を兄弟の unit の系列に当てない。`start` の行が読めない系列だけ
+/// 呼んだ unit の値で代わりにする。
+#[test]
+fn sweeping_honours_each_dumps_own_delete_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let hour = 3600 * 1000;
+    let long = DumpConfig {
+        cleanup_ttl: std::time::Duration::from_secs(96 * 3600),
+        max_timeout: std::time::Duration::from_secs(24 * 3600),
+        ..config()
+    };
+    // 兄弟の unit が 50 時間前に始めた、96 時間残す系列。
+    let sibling = dumps(dir.path());
+    let kept = sibling
+        .start(
+            &Start {
+                unit: "sibling",
+                ns: "lab",
+                timeout_ms: Some(hour),
+                ..Start::default()
+            },
+            &long,
+            now() - 50 * hour,
+        )
+        .unwrap();
+    sibling.stop("sibling", &kept.dump_id, now()).unwrap();
+    // `start` の行が無い、50 時間前の系列。
+    let unreadable = dir
+        .path()
+        .join("dumps/sibling/lab")
+        .join(uuid_v7(now() - 50 * hour, &mut |b| b.fill(1)));
+    std::fs::create_dir_all(&unreadable).unwrap();
+
+    let this = dumps(dir.path());
+    assert_eq!(this.sweep(now(), 48 * hour), 1);
+    assert!(Path::new(&kept.dump_dir).exists(), "its own 96 hours apply");
+    assert!(!unreadable.exists());
 }

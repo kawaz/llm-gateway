@@ -71,25 +71,37 @@ fn follow(unit: &str, dump: DumpRequest) -> Result<ExitCode, Failure> {
         let mut lines = protocol::send(stream, &request)
             .await
             .map_err(|e| crate::daemon::control::not_running(&e))?;
-        let mut code = ExitCode::SUCCESS;
-        while let Ok(Some(line)) = lines.next_line().await {
-            let refused = serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|value| {
-                value.get("ok") == Some(&serde_json::json!(false))
-                    || value.get("error").is_some() && value.get("event").is_none()
-            });
-            if refused {
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(ExitCode::SUCCESS),
+                // 読めなくなったのは、系列が止まって閉じたのとは別。成功にしない。
+                Err(e) => {
+                    return Err(Failure::new(
+                        "follow_broken",
+                        format!("the stream from the supervisor broke: {e}"),
+                    ));
+                }
+            };
+            if refused_line(&line) {
                 eprintln!("{}", refusal(Some(unit), &line));
-                code = ExitCode::FAILURE;
-                break;
+                return Ok(ExitCode::FAILURE);
             }
             println!("{line}");
         }
-        Ok::<ExitCode, Failure>(code)
     });
     match streamed {
         Ok(code) => Ok(code),
         Err(failure) => Ok(refuse(Some(unit), &failure.to_json())),
     }
+}
+
+/// 流れてきた行が、始める前の断り (`ok: false` / `error`) か。
+fn refused_line(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+        value.get("ok") == Some(&serde_json::json!(false))
+            || (value.get("error").is_some() && value.get("event").is_none())
+    })
 }
 
 /// `{"error": …}` の形の断りを `{unit, ok: false, error}` に直して stderr へ出す。
@@ -481,5 +493,19 @@ mod tests {
             ),
             ExitCode::FAILURE
         );
+    }
+
+    /// follow で流れてきた行のうち、始める前の断りだけを失敗として扱う。
+    #[test]
+    fn a_refusal_in_the_follow_stream_is_told_apart() {
+        assert!(refused_line(
+            r#"{"unit":"u","ok":false,"error":{"kind":"x"}}"#
+        ));
+        assert!(refused_line(r#"{"error":{"kind":"bad_request"}}"#));
+        assert!(!refused_line(r#"{"event":"start","ts":1}"#));
+        assert!(!refused_line(
+            r#"{"event":"upstream_body_end","error":"broken"}"#
+        ));
+        assert!(!refused_line("not json"));
     }
 }

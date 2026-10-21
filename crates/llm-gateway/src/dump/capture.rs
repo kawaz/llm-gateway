@@ -1,48 +1,59 @@
 //! 1 本の request を、その時に動いている系列へ書き分ける。
 //!
 //! 中継の経路から呼ばれる所なので、ここでするのは時刻を読む・容量を atomic に
-//! 先加算する・書き手の列へ置く、だけ (reference `model` の「本体を阻害しない」)。
-//! 本文は複製 ([`Bytes`] の参照) で、中継が流すバイト列には触らない。
+//! 先加算する・値の束を書き手の列へ置く、だけ (reference `model` の「本体を
+//! 阻害しない」)。JSON にするのも、follow へ配るのも書き手のスレッド。本文は
+//! 複製 ([`Bytes`] の参照) で、中継が流すバイト列には触らない。
 //!
 //! 書くもの (reference `files`):
 //!
-//! - 受けた時点: `request_headers` / `request_body_end` の行、`*.request.json` と
-//!   `*.request.body`
+//! - ヘッダを受けて ns 認証を通した時点 ([`super::Dumps::capture_head`]):
+//!   `request_headers`
+//! - 本文を受け取り終えた時点 ([`Capture::body`]): `*.request.json`、
+//!   `*.request.body`、`request_body_end` (読めなかった本文も、受けたまま残す)
 //! - upstream へ送るたび ([`Capture::connect`] と [`Capture::tee`]):
 //!   `upstream_connect` / `upstream_headers` / `upstream_body_end` / `upstream_close`
-//!   の行、`*.<attempt>.response.json` と `*.<attempt>.response.body`
+//!   と、`*.<attempt>.response.json` / `*.<attempt>.response.body`
 //! - クライアントへ返す時 ([`Capture::headers_sent`] と [`Settling`]):
 //!   `response_headers_sent` (`adopted`) / `response_body_end` / `transport_close`
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures_util::Stream;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use super::Series;
+use super::record::{Event, Kind, RequestMeta, ResponseMeta, header};
 use super::writer::Message;
 use crate::credential::time::now_unix_ms;
 use crate::egress::{BodyStream, Headers};
 
-/// 受け口が受けた 1 本 (gateway が書き換える前の形)。
-pub struct Received {
+/// ヘッダを受け取り終えた 1 本 (本文はまだ)。
+pub struct RequestHead {
     pub ns: String,
     /// unit の通し番号 ([`crate::exchange::request_span_numbered`] のもの)。
     pub seq: u64,
     /// ヘッダを受け取り終えた時刻 (Unix ミリ秒)。ファイル名の `{ts}` になる。
     pub received_at: i64,
-    /// 本文を受け取り終えた時刻。
-    pub body_end_at: i64,
     pub method: String,
     pub path: String,
-    /// 受けたヘッダ (受けた順)。認証系のものはここで落とす。
+    /// 受けたヘッダ (受けた順)。認証系のものは書き手が落とす。
     pub headers: Vec<(String, String)>,
-    /// 受けた本文そのまま。
+}
+
+/// 受け取り終えた本文 (gateway が書き換える前の形)。
+pub struct RequestBody {
+    /// 本文を受け取り終えた (または諦めた) 時刻。
+    pub body_end_at: i64,
+    /// 受けた本文そのまま。受け取りきれなかった時は、そこまでの分。
     pub body: Bytes,
+    /// 受け取りきれなかった・読めなかった理由 (`invalid_json` / `truncated` /
+    /// `too_large`)。
+    pub error: Option<&'static str>,
     /// クライアントが `stream` を求めたか。
     pub stream: bool,
     /// クライアントが名乗ったモデル名 (別名の解決前)。
@@ -67,8 +78,15 @@ pub struct Upstream<'a> {
 pub struct Capture {
     seq: u64,
     stem: String,
-    model: Option<String>,
+    ns: Arc<str>,
+    received_at: i64,
+    method: Arc<str>,
+    path: Arc<str>,
+    headers: Arc<[(String, String)]>,
     entries: Vec<Arc<Series>>,
+    /// 系列ごとに、この 1 本をまだ書くか (request を書けなかった系列は外す)。
+    open: Vec<AtomicBool>,
+    model: std::sync::OnceLock<Option<String>>,
     /// 受け口が加えた書き換え (thinking の display)。試行ごとの
     /// `request_rewrites` に写す。
     ingress_rewrites: std::sync::Mutex<Map<String, Value>>,
@@ -80,89 +98,114 @@ pub struct Capture {
 
 impl Capture {
     pub(super) fn begin(
-        received: Received,
+        head: RequestHead,
         targets: Vec<Arc<Series>>,
         now: i64,
     ) -> Option<Arc<Self>> {
-        let stem = format!("{}-{}", received.received_at, received.seq);
-        let request_file = format!("{stem}.request.json");
-        let body_file = format!("{stem}.request.body");
-        let size = received.body.len() as u64;
-        let content_type = header(&received.headers, "content-type");
-        let content_encoding = header(&received.headers, "content-encoding");
-        let headers = kept_headers(&received.headers);
+        let stem = format!("{}-{}", head.received_at, head.seq);
+        let request_file: Arc<str> = Arc::from(format!("{stem}.request.json"));
+        let method: Arc<str> = Arc::from(head.method);
+        let path: Arc<str> = Arc::from(head.path);
+        let first = Event {
+            ts: head.received_at,
+            seq: head.seq,
+            kind: Kind::RequestHeaders {
+                request_file,
+                method: Arc::clone(&method),
+                path: Arc::clone(&path),
+            },
+        };
+        let entries: Vec<Arc<Series>> = targets
+            .into_iter()
+            .filter(|series| series.send(Message::Event(first.clone()), now))
+            .collect();
+        if entries.is_empty() {
+            return None;
+        }
+        let open = entries.iter().map(|_| AtomicBool::new(true)).collect();
+        Some(Arc::new(Self {
+            seq: head.seq,
+            stem,
+            ns: Arc::from(head.ns),
+            received_at: head.received_at,
+            method,
+            path,
+            headers: Arc::from(head.headers),
+            entries,
+            open,
+            model: std::sync::OnceLock::new(),
+            ingress_rewrites: std::sync::Mutex::new(Map::new()),
+            adopted: AtomicU64::new(0),
+            headers_sent_at: AtomicI64::new(0),
+        }))
+    }
 
-        let mut entries = Vec::new();
-        for series in targets {
-            // 書くと上限を超えるなら書かずに止まる (reference `capacity`)。
+    /// まだ書く系列。
+    fn writing(&self, now: i64) -> impl Iterator<Item = (usize, &Arc<Series>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(move |(i, series)| self.open[*i].load(Ordering::Acquire) && series.live(now))
+    }
+
+    /// 本文を受け取り終えた。受けたまま書く (読めなかった本文も、何を送って
+    /// きたかが調査の材料なので残す)。
+    ///
+    /// 書くと上限を超えるなら書かずにその系列を止める (reference `capacity`)。
+    pub fn body(&self, body: RequestBody) {
+        let now = now_unix_ms();
+        let size = body.body.len() as u64;
+        let _ = self.model.set(body.model.clone());
+        let body_file: Arc<str> = Arc::from(format!("{}.request.body", self.stem));
+        let meta = Arc::new(RequestMeta {
+            file: Arc::from(format!("{}.request.json", self.stem)),
+            seq: self.seq,
+            ts: self.received_at,
+            ns: Arc::clone(&self.ns),
+            method: Arc::clone(&self.method),
+            path: Arc::clone(&self.path),
+            headers: Arc::clone(&self.headers),
+            body_file: Arc::clone(&body_file),
+            body_bytes: size,
+            stream: body.stream,
+            error: body.error,
+        });
+        let end = Event {
+            ts: body.body_end_at,
+            seq: self.seq,
+            kind: Kind::RequestBodyEnd {
+                bytes: size,
+                duration_ms: body.body_end_at - self.received_at,
+                error: body.error,
+                model: body.model.as_deref().map(Arc::from),
+                stream: body.stream,
+            },
+        };
+        for (i, series) in self.writing(now) {
             let grant = series.reserve(size, true);
             if grant.bytes < size {
+                self.open[i].store(false, Ordering::Release);
                 if let Some(reason) = grant.limited {
                     series.stop(reason, now);
                 }
                 continue;
             }
-            let mut first = event("request_headers", received.received_at, received.seq);
-            first.insert("request_file".to_owned(), json!(request_file));
-            first.insert("method".to_owned(), json!(received.method));
-            first.insert("path".to_owned(), json!(received.path));
-            first.insert("model".to_owned(), json!(received.model));
-            first.insert("stream".to_owned(), json!(received.stream));
-            let meta = json!({
-                "seq": received.seq,
-                "ts": received.received_at,
-                "ns": received.ns,
-                "method": received.method,
-                "path": received.path,
-                "headers": headers,
-                "content_type": content_type,
-                "content_encoding": content_encoding,
-                "stream": received.stream,
-                "body_file": body_file,
-                "body_stored": "raw",
-                "body_bytes": size,
-            });
-            let mut end = event("request_body_end", received.body_end_at, received.seq);
-            end.insert("bytes".to_owned(), json!(size));
-            end.insert(
-                "duration_ms".to_owned(),
-                json!(received.body_end_at - received.received_at),
-            );
-            let sent = series.send(Message::Event(first), now)
-                && series.send(
-                    Message::Meta {
-                        name: request_file.clone(),
-                        json: meta,
-                    },
-                    now,
-                )
+            let sent = series.send(Message::RequestMeta(Arc::clone(&meta)), now)
                 && series.send(
                     Message::Body {
-                        name: body_file.clone(),
-                        chunk: received.body.clone(),
+                        name: Arc::clone(&body_file),
+                        chunk: body.body.clone(),
                     },
                     now,
                 )
-                && series.send(Message::Event(end), now);
+                && series.send(Message::Event(end.clone()), now);
+            if !sent {
+                self.open[i].store(false, Ordering::Release);
+            }
             if let Some(reason) = grant.limited {
                 series.stop(reason, now);
             }
-            if sent {
-                entries.push(series);
-            }
         }
-        if entries.is_empty() {
-            return None;
-        }
-        Some(Arc::new(Self {
-            seq: received.seq,
-            stem,
-            model: received.model,
-            entries,
-            ingress_rewrites: std::sync::Mutex::new(Map::new()),
-            adopted: AtomicU64::new(0),
-            headers_sent_at: AtomicI64::new(0),
-        }))
     }
 
     /// 受け口が本文に加えた書き換えを覚える (試行ごとの `request_rewrites` に写す)。
@@ -170,22 +213,27 @@ impl Capture {
         super::lock(&self.ingress_rewrites).insert(key.to_owned(), value);
     }
 
-    /// 動いている系列へ 1 行置く。
-    fn emit(&self, event: &Map<String, Value>, now: i64) {
-        for series in &self.entries {
-            if series.live(now) {
-                series.send(Message::Event(event.clone()), now);
-            }
+    /// まだ書く系列へ 1 行置く。
+    fn emit(&self, event: &Event, now: i64) {
+        for (_, series) in self.writing(now) {
+            series.send(Message::Event(event.clone()), now);
         }
     }
 
     /// upstream へ送り始める。`upstream_connect` を書き、その時刻を返す。
     pub fn connect(&self, attempt: u64, route: &str) -> i64 {
         let now = now_unix_ms();
-        let mut line = event("upstream_connect", now, self.seq);
-        line.insert("attempt".to_owned(), json!(attempt));
-        line.insert("route".to_owned(), json!(route));
-        self.emit(&line, now);
+        self.emit(
+            &Event {
+                ts: now,
+                seq: self.seq,
+                kind: Kind::UpstreamConnect {
+                    attempt,
+                    route: Arc::from(route),
+                },
+            },
+            now,
+        );
         now
     }
 
@@ -198,71 +246,74 @@ impl Capture {
     /// 応答を返すことがある)。返した試行は gateway が [`Self::adopt`] で伝える。
     pub fn tee(self: &Arc<Self>, upstream: Upstream<'_>, body: BodyStream) -> BodyStream {
         let now = now_unix_ms();
-        let response_file = format!("{}.{}.response.json", self.stem, upstream.attempt);
-        let body_file = format!("{}.{}.response.body", self.stem, upstream.attempt);
-        let pairs: Vec<(String, String)> = upstream
+        let response_file: Arc<str> =
+            Arc::from(format!("{}.{}.response.json", self.stem, upstream.attempt));
+        let body_file: Arc<str> =
+            Arc::from(format!("{}.{}.response.body", self.stem, upstream.attempt));
+        let headers: Vec<(String, String)> = upstream
             .headers
             .iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        let content_type = header(&pairs, "content-type");
-        let stream = content_type
+        let stream = header(&headers, "content-type")
             .as_deref()
             .and_then(|v| v.split(';').next())
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"));
         let mut rewrites = super::lock(&self.ingress_rewrites).clone();
-        if let Some(Value::String(sent)) = upstream.rewrites.get("model")
-            && self.model.as_deref() != Some(sent.as_str())
-        {
-            rewrites.insert(
-                "model".to_owned(),
-                json!({"received": self.model, "sent": sent}),
-            );
-        }
+        let received_model = self.model.get().cloned().flatten();
         for (key, value) in upstream.rewrites {
-            if key != "model" {
+            if key == "model" {
+                if value.as_str() != received_model.as_deref() {
+                    rewrites.insert(
+                        key,
+                        serde_json::json!({"received": received_model, "sent": value}),
+                    );
+                }
+            } else {
                 rewrites.insert(key, value);
             }
         }
-        let meta = json!({
-            "seq": self.seq,
-            "ts": now,
-            "attempt": upstream.attempt,
-            "route": upstream.route,
-            "credential": upstream.credential,
-            "status": upstream.status,
-            "headers": kept_headers(&pairs),
-            "content_type": content_type,
-            "content_encoding": header(&pairs, "content-encoding"),
-            "stream": stream,
-            "body_file": body_file,
-            "body_stored": "raw",
-            "request_rewrites": rewrites,
+        let meta = Arc::new(ResponseMeta {
+            file: Arc::clone(&response_file),
+            seq: self.seq,
+            ts: now,
+            attempt: upstream.attempt,
+            route: Arc::from(upstream.route),
+            credential: upstream.credential.map(Arc::from),
+            status: upstream.status,
+            headers,
+            body_file: Arc::clone(&body_file),
+            stream,
+            request_rewrites: rewrites,
         });
-        let mut line = event("upstream_headers", now, self.seq);
-        line.insert("attempt".to_owned(), json!(upstream.attempt));
-        line.insert("status".to_owned(), json!(upstream.status));
-        line.insert("response_file".to_owned(), json!(response_file));
-        line.insert("stream".to_owned(), json!(stream));
-        line.insert("duration_ms".to_owned(), json!(now - upstream.connected_at));
-        let mut writing = Vec::new();
-        for series in &self.entries {
-            let open = series.live(now)
-                && series.send(Message::Event(line.clone()), now)
-                && series.send(
-                    Message::Meta {
-                        name: response_file.clone(),
-                        json: meta.clone(),
-                    },
-                    now,
-                )
+        let line = Event {
+            ts: now,
+            seq: self.seq,
+            kind: Kind::UpstreamHeaders {
+                attempt: upstream.attempt,
+                status: upstream.status,
+                response_file,
+                stream,
+                duration_ms: now - upstream.connected_at,
+            },
+        };
+        let mut writing: Vec<Progress> = self
+            .entries
+            .iter()
+            .map(|_| Progress {
+                bytes: 0,
+                open: false,
+            })
+            .collect();
+        for (i, series) in self.writing(now) {
+            writing[i].open = series.send(Message::Event(line.clone()), now)
+                && series.send(Message::ResponseMeta(Arc::clone(&meta)), now)
                 && series.send(
                     Message::Open {
-                        name: body_file.clone(),
+                        name: Arc::clone(&body_file),
                     },
                     now,
                 );
-            writing.push(Progress { bytes: 0, open });
         }
         Box::pin(Teed {
             inner: body,
@@ -289,9 +340,14 @@ impl Capture {
             0 => None,
             attempt => Some(attempt),
         };
-        let mut line = event("response_headers_sent", now, self.seq);
-        line.insert("adopted".to_owned(), json!(adopted));
-        self.emit(&line, now);
+        self.emit(
+            &Event {
+                ts: now,
+                seq: self.seq,
+                kind: Kind::ResponseHeadersSent { adopted },
+            },
+            now,
+        );
     }
 
     /// クライアントへ流す本文の終わりを [`Settling`] に任せる。
@@ -315,7 +371,7 @@ struct Teed {
     inner: BodyStream,
     capture: Arc<Capture>,
     attempt: u64,
-    body_file: String,
+    body_file: Arc<str>,
     headers_at: i64,
     ended_at: Option<i64>,
     writing: Vec<Progress>,
@@ -333,13 +389,12 @@ impl Teed {
                 progress.open = false;
                 continue;
             }
-            let want = chunk.len() as u64;
-            let grant = series.reserve(want, false);
+            let grant = series.reserve(chunk.len() as u64, false);
             let length = usize::try_from(grant.bytes).unwrap_or(chunk.len());
             if length > 0
                 && !series.send(
                     Message::Body {
-                        name: self.body_file.clone(),
+                        name: Arc::clone(&self.body_file),
                         chunk: chunk.slice(..length),
                     },
                     now,
@@ -351,12 +406,20 @@ impl Teed {
             progress.bytes += grant.bytes;
             if let Some(reason) = grant.limited {
                 // 上限に達した。この試行を打ち切りとして閉じてから系列を止める。
-                let mut line = event("upstream_body_end", now, self.capture.seq);
-                line.insert("attempt".to_owned(), json!(self.attempt));
-                line.insert("bytes".to_owned(), json!(progress.bytes));
-                line.insert("truncated".to_owned(), json!(true));
-                line.insert("duration_ms".to_owned(), json!(now - self.headers_at));
-                series.send(Message::Event(line), now);
+                series.send(
+                    Message::Event(Event {
+                        ts: now,
+                        seq: self.capture.seq,
+                        kind: Kind::UpstreamBodyEnd {
+                            attempt: self.attempt,
+                            bytes: progress.bytes,
+                            truncated: true,
+                            duration_ms: now - self.headers_at,
+                            error: None,
+                        },
+                    }),
+                    now,
+                );
                 series.stop(reason, now);
                 progress.open = false;
             }
@@ -370,19 +433,25 @@ impl Teed {
         }
         let now = now_unix_ms();
         self.ended_at = Some(now);
+        let error: Option<Arc<str>> = error.map(Arc::from);
         for (series, progress) in self.capture.entries.iter().zip(self.writing.iter_mut()) {
             if !progress.open || !series.live(now) {
                 continue;
             }
-            let mut line = event("upstream_body_end", now, self.capture.seq);
-            line.insert("attempt".to_owned(), json!(self.attempt));
-            line.insert("bytes".to_owned(), json!(progress.bytes));
-            line.insert("truncated".to_owned(), json!(false));
-            line.insert("duration_ms".to_owned(), json!(now - self.headers_at));
-            if let Some(error) = &error {
-                line.insert("error".to_owned(), json!(error));
-            }
-            series.send(Message::Event(line), now);
+            series.send(
+                Message::Event(Event {
+                    ts: now,
+                    seq: self.capture.seq,
+                    kind: Kind::UpstreamBodyEnd {
+                        attempt: self.attempt,
+                        bytes: progress.bytes,
+                        truncated: false,
+                        duration_ms: now - self.headers_at,
+                        error: error.clone(),
+                    },
+                }),
+                now,
+            );
         }
     }
 }
@@ -409,12 +478,14 @@ impl Drop for Teed {
     /// (gateway が後の応答を捨てた等) は `upstream_body_end` を持たない。
     fn drop(&mut self) {
         let now = now_unix_ms();
-        let mut line = event("upstream_close", now, self.capture.seq);
-        line.insert("attempt".to_owned(), json!(self.attempt));
-        line.insert(
-            "duration_ms".to_owned(),
-            json!(now - self.ended_at.unwrap_or(self.headers_at)),
-        );
+        let line = Event {
+            ts: now,
+            seq: self.capture.seq,
+            kind: Kind::UpstreamClose {
+                attempt: self.attempt,
+                duration_ms: now - self.ended_at.unwrap_or(self.headers_at),
+            },
+        };
         for (series, progress) in self.capture.entries.iter().zip(&self.writing) {
             if progress.open && series.live(now) {
                 series.send(Message::Event(line.clone()), now);
@@ -435,11 +506,18 @@ impl Settling {
         let now = now_unix_ms();
         self.body_end_at.store(now, Ordering::Release);
         let sent = self.capture.headers_sent_at.load(Ordering::Acquire);
-        let mut line = event("response_body_end", now, self.capture.seq);
-        line.insert("bytes".to_owned(), json!(bytes));
-        line.insert("completed".to_owned(), json!(completed));
-        line.insert("duration_ms".to_owned(), json!(now - sent));
-        self.capture.emit(&line, now);
+        self.capture.emit(
+            &Event {
+                ts: now,
+                seq: self.capture.seq,
+                kind: Kind::ResponseBodyEnd {
+                    bytes,
+                    completed,
+                    duration_ms: now - sent,
+                },
+            },
+            now,
+        );
     }
 }
 
@@ -451,34 +529,15 @@ impl Drop for Settling {
             0 => self.capture.headers_sent_at.load(Ordering::Acquire),
             at => at,
         };
-        let mut line = event("transport_close", now, self.capture.seq);
-        line.insert("duration_ms".to_owned(), json!(now - since));
-        self.capture.emit(&line, now);
+        self.capture.emit(
+            &Event {
+                ts: now,
+                seq: self.capture.seq,
+                kind: Kind::TransportClose {
+                    duration_ms: now - since,
+                },
+            },
+            now,
+        );
     }
-}
-
-/// `event` / `ts` / `seq` を持つ行の書き出し。
-fn event(name: &str, ts: i64, seq: u64) -> Map<String, Value> {
-    let mut line = Map::new();
-    line.insert("event".to_owned(), json!(name));
-    line.insert("ts".to_owned(), json!(ts));
-    line.insert("seq".to_owned(), json!(seq));
-    line
-}
-
-fn header(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
-}
-
-/// メタ json に書くヘッダ: 受けた順の `{name, value}` の配列。同名を繋がない。
-/// 認証系 (keepalive の控えと同じ述語) だけを落とす。
-fn kept_headers(headers: &[(String, String)]) -> Vec<Value> {
-    headers
-        .iter()
-        .filter(|(name, _)| !crate::gateway::is_authorization(name))
-        .map(|(name, value)| json!({"name": name.to_ascii_lowercase(), "value": value}))
-        .collect()
 }

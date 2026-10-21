@@ -58,7 +58,7 @@ reference の `dump/{dump_id}/` を `<[stats] dir>/dumps/<unit>/<ns>/<dump_id>/`
 - `<unit>` を挟むので書き手が unit ごとに分かれ、`.lock` の flock は要らない (DR-0011 の「writer 毎に分けて排他を消す」)。stable と unstable が同じ ns を同時にダンプしても互いのファイルに触らない
 - `<ns>` を挟むのは決定 2 の理由 (面の内容が別の面の作業で読まれにくくする)
 - 権限は reference のとおりディレクトリ 700、ファイル 600 で、自動の鍵のファイルと同じ閉じ方
-- クリーンアップの契機は unit が上がった時と `dump start` を受けた時の 2 つで、定期の timer を足さない。どちらも「ダンプに関心が向いた瞬間」だから、そこで掃けば溜まらない。掃く範囲は `dumps/` の下全体 (他の unit の分も含む)。止まったままの unit は自分の分を掃けないので、どれかの unit が上がれば全部が片付く形にする。古さは `dump_id` (UUIDv7) の時刻部 = 開始時刻で判定し、`delete_after` を過ぎたものをディレクトリごと消す。`max_timeout` ≤ `cleanup_ttl` (決定 3) なので、兄弟 unit が動かしている系列を消すことがない。空になった `<ns>/` と `<unit>/` も消す
+- クリーンアップの契機は unit が上がった時と `dump start` を受けた時の 2 つで、定期の timer を足さない。どちらも「ダンプに関心が向いた瞬間」だから、そこで掃けば溜まらない。掃く範囲は `dumps/` の下全体 (他の unit の分も含む)。止まったままの unit は自分の分を掃けないので、どれかの unit が上がれば全部が片付く形にする。古さは系列ごとの `delete_after` (始めた時刻 + 始めた unit の `cleanup_ttl`) で判定し、過ぎたものをディレクトリごと消す。`delete_after` は系列の `index.jsonl` の `start` の行から読み、掃く unit の `cleanup_ttl` を兄弟の unit の系列に当てない (兄弟の設定は違いうる)。`start` の行が読めない系列だけ、`dump_id` (UUIDv7) の時刻部に掃く unit の `cleanup_ttl` を足して代わりにし、log に出す。`max_timeout` ≤ `cleanup_ttl` (決定 3) なので、兄弟 unit が動かしている系列を消すことがない。空になった `<ns>/` と `<unit>/` も消す
 - `start` と `list` の答えに系列のディレクトリの絶対パス (`dump_dir`) を載せる。突き合わせる人が置き場を導出し直さずに済む
 
 ### 5. `seq` は `exchange::request_span` の通し番号、`{ts}` は Unix ミリ秒 (files)
@@ -81,9 +81,10 @@ gateway は控えに持ち回してはいけないヘッダの述語を既に 1 
 
 ### 9. 控える位置は受け口と、経路が upstream の本文を読み出した直後 (model)
 
-request は受け口 (`llm-gateway-server` の `forward`、`messages` / `responses` の両方が通る) で本文を読み切り ns 認証を通した直後に書く (`*.request.json` も同じ時点。書き換えは試行ごとの response 側に載せるので、送る形が決まるのを待たない — 決定 7)。response は各経路の `Wire::send` (`AnthropicWire` / `OpenAiWire`) が upstream から本文を読み出した直後に `egress::observe_raw` へ通し、方言の通訳 (`openai::response::translate`)、採用判定 (`ResponseAdmission::admit`)、集め直し (`egress::adapt_response`)、エラー本文への差し替え (`client_error_response`) を経る前のチャンクを、通り過ぎるたびに書く。
+request は受け口 (`llm-gateway-server` の `forward`、`messages` / `responses` の両方が通る) で、ヘッダを受けて ns 認証 (ヘッダだけで決まる) を通した直後、本文を読む前に `request_headers` を書き、本文を受け取り終えたら `*.request.json` / `*.request.body` / `request_body_end` を書く (書き換えは試行ごとの response 側に載せるので、送る形が決まるのを待たない — 決定 7)。応答の順 (本文が読めない → JSON でない → ns が無い → 認証に断られる) は変えない。response は各経路の `Wire::send` (`AnthropicWire` / `OpenAiWire`) が upstream から本文を読み出した直後に `egress::observe_raw` へ通し、方言の通訳 (`openai::response::translate`)、採用判定 (`ResponseAdmission::admit`)、集め直し (`egress::adapt_response`)、エラー本文への差し替え (`client_error_response`) を経る前のチャンクを、通り過ぎるたびに書く。
 
-- ns 認証に断られた 1 本と JSON として読めない 1 本は書かない (request を受けた、と言えるのは認証を通ってから)
+- ns 認証に断られた 1 本は書かない (request を受けた、と言えるのは認証を通ってから)
+- 本文を受け取りきれなかった・読めなかった 1 本 (JSON として読めない、途中で切れた、64 MiB を超えた) は、`request_body_end` と `*.request.json` に `error: "invalid_json" | "truncated" | "too_large"` を付けて残し、受けた本文 (切れたならそこまで、超えたなら上限まで) を生のまま `*.request.body` に書く。クライアントが何を送ったかが調査の材料だから (統括の裁定)
 - gateway が自分で組んだエラーを返した 1 本 (経路が尽きた・モデルが無い等) は、受け口がエラー応答を返す所で `response_headers_sent` (`adopted: null`) を書く
 - 認証差し替えの中継 (DR-0030 §2 の passthrough) は本文を読まずに流す口で、対象にしない
 
@@ -158,7 +159,7 @@ reference に移った判断 (1 本 1 ファイル、系列を `dump_id` で独�
 
 | 段 | 中身 | 完了条件 |
 |---|---|---|
-| 1 | ファイル構成 (`*.request.json` + `*.request.body`、試行ごとの `*.response.json` + `*.response.body`、`body_file` で指す、`rewrites`、ヘッダの配列) と、index.jsonl を 1 本 1 行から時刻点ごとのイベント (reference `files` の表) に、1 秒以内の flush | 試験で、request のヘッダ受信の時点で `request_headers` の行が 1 秒以内に書かれ、応答が終わらないまま切れた 1 本にも `request_headers` が残り、試行ごとに `upstream_headers` / `upstream_body_end` が並び、`response_headers_sent` の `adopted` が返した試行の番号、`stop` の行に `reason` と `bytes_written` が入る |
+| 1 | ファイル構成 (`*.request.json` + `*.request.body`、試行ごとの `*.response.json` + `*.response.body`、`body_file` で指す、`rewrites`、ヘッダの配列) と、index.jsonl を 1 本 1 行から時刻点ごとのイベント (reference `files` の表) に、1 秒以内の flush | 試験で、ns 認証を通したヘッダ受信の時点 (本文を読む前) で `request_headers` の行が 1 秒以内に書かれ、本文が来ないまま切れた 1 本にも `request_headers` が残り、読めなかった本文も理由付きで受けたまま残り、試行ごとに `upstream_headers` / `upstream_body_end` が並び、`response_headers_sent` の `adopted` が返した試行の番号、`stop` の行に `reason` と `bytes_written` が入る |
 | 2 | `[dump]` テーブル (決定 3) と、全体の実使用量の上限・fs 空き容量の判定・`max_concurrency`、`start` の答えの `concurrency` / `storage`、片付けの基準を `delete_after` に | 試験で、`max_timeout` > `cleanup_ttl` の設定が `check` に落ち、全体上限に達した時に書こうとした系列だけが `total_limit` で止まり、request の来ない系列は `timeout` まで active のまま残る |
 | 3 | `status` → `list` (選択子)、`prune`、`labels` | `stop` が冪等で元の `reason` を返し、`prune` が無指定を断り、active な系列を `stop` で止めてから消し、`list state=active` に動いている分だけが並ぶ |
 | 4 | `--follow` (監督者のストリーム中継、`disconnected` / `lagged`)、`--embed bodies`、`--no-persist` | Ctrl-C で系列が `disconnected` で止まり、購読者を止めたままにすると `lagged` で切れ、`--no-persist` の系列が停止時にディレクトリごと消える |

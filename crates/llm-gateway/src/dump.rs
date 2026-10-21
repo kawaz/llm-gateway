@@ -20,6 +20,7 @@
 //! `cleanup_ttl` を足した `delete_after` を過ぎた系列をディレクトリごと消す。
 
 mod capture;
+mod record;
 mod writer;
 
 use std::collections::BTreeMap;
@@ -32,7 +33,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 
-pub use capture::{Capture, Received, Settling, Upstream};
+pub use capture::{Capture, RequestBody, RequestHead, Settling, Upstream};
 
 /// fs の空き容量を測り直す間隔 (DR-0038 未決の裁定)。
 const FS_CHECK_MS: i64 = 10_000;
@@ -69,12 +70,18 @@ impl StopReason {
 struct Usage {
     /// 動いている系列が書いた本文の合計。止まった系列の分は差し引く。
     total: AtomicU64,
-    /// 置き場の fs の空き容量 (測った時の値)。
-    fs_free: AtomicU64,
+    /// fs の空き容量の見込み: 測った値から、その後に書くことにした分を引いたもの。
+    /// 書く側はここから compare_exchange で引き、測り直しは新しい値から書き手が
+    /// まだ書いていない分 ([`Self::fs_pending`]) を引いて置き直す。1 つの atomic に
+    /// まとめるのは、「測った値」と「その後に引いた分」を別々に読み書きすると、
+    /// 測り直しの合間に引いた分が消えるため。
+    fs_available: AtomicU64,
+    /// 書くことにしたが、書き手がまだ書いていない分。
+    fs_pending: AtomicU64,
+    /// 最後に測った空き容量 (答えの `fs_free_bytes`)。
+    fs_measured: AtomicU64,
     /// それを測った時刻。0 は未計測。
     fs_checked_at: AtomicI64,
-    /// 測ってから書いたことにした量。測り直すまで空き容量から差し引く。
-    fs_consumed: AtomicU64,
     /// 測る場所 (`dumps/` が無ければ、在る祖先)。
     root: PathBuf,
 }
@@ -89,18 +96,69 @@ impl Usage {
         let Some(free) = fs_free(&self.root) else {
             return;
         };
-        self.fs_free.store(free, Ordering::Release);
-        self.fs_consumed.store(0, Ordering::Release);
+        let mut current = self.fs_available.load(Ordering::Acquire);
+        loop {
+            let available = free.saturating_sub(self.fs_pending.load(Ordering::Acquire));
+            match self.fs_available.compare_exchange_weak(
+                current,
+                available,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => current = now,
+            }
+        }
+        self.fs_measured.store(free, Ordering::Release);
         self.fs_checked_at.store(now, Ordering::Release);
     }
 
-    /// 測った空き容量から、その後に書いた分を引いた見込み。
-    fn fs_estimate(&self) -> u64 {
-        self.fs_free
-            .load(Ordering::Acquire)
-            .saturating_sub(self.fs_consumed.load(Ordering::Acquire))
+    /// 空き容量の見込みから、`floor` を残して `want` までを取る。取れた量を返す。
+    ///
+    /// 未確定分には先に足しておく (測り直しが取った分を見落とさないよう、
+    /// 取る前から未確定に数える。取れなかった分は後で外す)。
+    fn take_fs(&self, want: u64, floor: u64) -> u64 {
+        self.fs_pending.fetch_add(want, Ordering::AcqRel);
+        let mut current = self.fs_available.load(Ordering::Acquire);
+        let got = loop {
+            let got = want.min(current.saturating_sub(floor));
+            match self.fs_available.compare_exchange_weak(
+                current,
+                current - got,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break got,
+                Err(now) => current = now,
+            }
+        };
+        self.written(want - got);
+        got
+    }
+
+    /// 取ったが書かないことにした分を返す。
+    fn give_back_fs(&self, bytes: u64) {
+        self.fs_available.fetch_add(bytes, Ordering::AcqRel);
+        self.written(bytes);
+    }
+
+    /// 書き手が書いた (書けなかった) 分を未確定から外す。
+    fn written(&self, bytes: u64) {
+        let mut pending = self.fs_pending.load(Ordering::Acquire);
+        while let Err(now) = self.fs_pending.compare_exchange_weak(
+            pending,
+            pending.saturating_sub(bytes),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            pending = now;
+        }
     }
 }
+
+/// 止まった系列の [`Series::bytes_written`] に立てる印。立った後は誰も足し引き
+/// しない ([`Series::stop`] と [`Series::reserve`] の順の約束)。
+const SEALED: u64 = 1 << 63;
 
 /// `path` (無ければ在る祖先) の fs で、一般の利用者が使える空き容量。
 fn fs_free(path: &Path) -> Option<u64> {
@@ -144,6 +202,13 @@ pub(crate) struct Series {
 
 impl Series {
     /// 動いていれば止めて、理由を log に出す。既に止まっていれば何もしない。
+    ///
+    /// 全体の実使用量が数えるのは動いている系列だけなので、書いた量を引く
+    /// (reference `capacity`)。引く量は [`SEALED`] を立てるのと同じ 1 回の
+    /// fetch_or で読む。[`Self::reserve`] は系列の量への加算を印が無い時だけ
+    /// 行い、加算した分は (後で止まっても) 全体へも必ず 1 回足す。だから印より前の
+    /// 加算はここで引く量に入り、印より後の加算は起きない — 二重にも引かず、
+    /// 取りこぼしもしない。
     pub(crate) fn stop(&self, reason: StopReason, now: i64) {
         if self
             .active
@@ -154,8 +219,7 @@ impl Series {
         }
         *lock(&self.stopped) = Some((reason, now));
         self.counter.fetch_sub(1, Ordering::AcqRel);
-        // 全体の上限が数えるのは動いている系列だけ (reference `capacity`)。
-        let written = self.bytes_written.load(Ordering::Acquire);
+        let written = self.bytes_written.fetch_or(SEALED, Ordering::AcqRel) & !SEALED;
         let mut total = self.usage.total.load(Ordering::Acquire);
         while let Err(now) = self.usage.total.compare_exchange_weak(
             total,
@@ -173,6 +237,11 @@ impl Series {
             "a dump stopped"
         );
         self.writer.wake();
+    }
+
+    /// 本文に書いた量 ([`SEALED`] を除く)。
+    fn written(&self) -> u64 {
+        self.bytes_written.load(Ordering::Acquire) & !SEALED
     }
 
     /// `now` に動いているか。時限を過ぎていればここで止める。
@@ -210,13 +279,20 @@ impl Series {
     /// `max_total_bytes`、fs の `fs_min_free`) を先に加算して確かめる
     /// (reference `capacity`)。`whole` なら全部書けない時は 1 バイトも書かない。
     ///
-    /// 上限に**達した**ら (超えなくても) `limited` に理由を返す。
+    /// 上限に**達した**ら (超えなくても) `limited` に理由を返す。系列が止まって
+    /// いれば 0 で、理由は付けない (止めた側が理由を持っている)。
     fn reserve(&self, want: u64, whole: bool) -> Grant {
-        // この系列の上限。
+        let stopped = Grant {
+            bytes: 0,
+            limited: None,
+        };
+        // この系列の上限。止まった系列 (印あり) には足さない。
         let mut written = self.bytes_written.load(Ordering::Acquire);
-        let mut granted;
-        loop {
-            granted = want.min(self.max_bytes.saturating_sub(written));
+        let granted = loop {
+            if written & SEALED != 0 {
+                return stopped;
+            }
+            let mut granted = want.min(self.max_bytes.saturating_sub(written));
             if whole && granted < want {
                 granted = 0;
             }
@@ -226,14 +302,15 @@ impl Series {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => break granted,
                 Err(now) => written = now,
             }
-        }
+        };
         let mut limited =
             (granted < want || written + granted >= self.max_bytes).then_some(StopReason::MaxBytes);
 
-        // 全体の上限 (先に足してから確かめ、超えた分を戻す)。
+        // 全体の上限 (先に足してから確かめる)。系列に足した分は、この後に止まって
+        // いても必ず 1 回足す (止めた側が印の時点の量を引くので)。
         let before = self.usage.total.fetch_add(granted, Ordering::AcqRel);
         let allowed = granted.min(self.max_total_bytes.saturating_sub(before));
         if allowed < granted {
@@ -241,29 +318,51 @@ impl Series {
         } else if before + allowed >= self.max_total_bytes {
             limited = limited.or(Some(StopReason::TotalLimit));
         }
-        let mut kept = allowed;
 
-        // fs の空き容量 (測った値から、その後に書いた分を引いた見込み)。
-        let free = self.usage.fs_estimate().saturating_sub(self.fs_min_free);
-        if kept > free {
-            kept = free;
+        // fs の空き容量。
+        let mut kept = self.usage.take_fs(allowed, self.fs_min_free);
+        if kept < allowed {
             limited = Some(StopReason::FsMinFree);
-        } else if kept == free && kept > 0 {
+        } else if kept > 0 && self.usage.fs_available.load(Ordering::Acquire) <= self.fs_min_free {
             limited = limited.or(Some(StopReason::FsMinFree));
         }
         if whole && kept < want {
+            self.usage.give_back_fs(kept);
             kept = 0;
         }
-        self.usage.fs_consumed.fetch_add(kept, Ordering::AcqRel);
-        // 書かない分を戻す。
+        // 書かない分を戻す。止まった後 (印あり) は戻さない — 止めた側が印の時点の
+        // 量を全体から引いたので、ここで引くと二重になる。
         let back = granted - kept;
-        if back > 0 {
-            self.bytes_written.fetch_sub(back, Ordering::AcqRel);
+        if back > 0 && self.unreserve(back) {
             self.usage.total.fetch_sub(back, Ordering::AcqRel);
+        }
+        // 先に止まっていたら書かない (書き手にも渡らない)。
+        if self.bytes_written.load(Ordering::Acquire) & SEALED != 0 {
+            self.usage.give_back_fs(kept);
+            return stopped;
         }
         Grant {
             bytes: kept,
             limited,
+        }
+    }
+
+    /// 系列の量から `bytes` を戻す。止まっていたら戻さずに `false`。
+    fn unreserve(&self, bytes: u64) -> bool {
+        let mut written = self.bytes_written.load(Ordering::Acquire);
+        loop {
+            if written & SEALED != 0 {
+                return false;
+            }
+            match self.bytes_written.compare_exchange_weak(
+                written,
+                written - bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => written = now,
+            }
         }
     }
 
@@ -295,7 +394,7 @@ impl Series {
             expires_at: Some(self.expires_at),
             delete_after: Some(self.delete_after),
             stopped_at,
-            bytes_written: Some(self.bytes_written.load(Ordering::Acquire)),
+            bytes_written: Some(self.written()),
         }
     }
 }
@@ -434,9 +533,10 @@ impl Dumps {
         Self {
             usage: Arc::new(Usage {
                 total: AtomicU64::new(0),
-                fs_free: AtomicU64::new(0),
+                fs_available: AtomicU64::new(0),
+                fs_pending: AtomicU64::new(0),
+                fs_measured: AtomicU64::new(0),
                 fs_checked_at: AtomicI64::new(0),
-                fs_consumed: AtomicU64::new(0),
                 root: root.clone(),
             }),
             root,
@@ -534,16 +634,96 @@ impl Dumps {
                 "--no-persist needs --embed bodies: a dump that keeps nothing and streams no bodies shows nothing",
             ));
         }
-        let active = self.active.load(Ordering::Acquire);
-        if active >= config.max_concurrency {
-            return Err(Refusal::new(
-                "too_many_dumps",
-                format!(
-                    "{active} dumps are running, which is the limit ([dump] max_concurrency = {}). stop one, or wait for one to end",
-                    config.max_concurrency
-                ),
-            ));
+        // 同時に動かせる数の枠を先に取る (取ってから重い支度をする)。支度に
+        // 失敗したら枠を返す。
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= config.max_concurrency {
+                return Err(Refusal::new(
+                    "too_many_dumps",
+                    format!(
+                        "{active} dumps are running, which is the limit ([dump] max_concurrency = {}). stop one, or wait for one to end",
+                        config.max_concurrency
+                    ),
+                ));
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(now) => active = now,
+            }
         }
+        let active = active + 1;
+        let opened = self.open_series(start, config, now, timeout_ms);
+        let (series, following) = match opened {
+            Ok(opened) => opened,
+            Err(refusal) => {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(refusal);
+            }
+        };
+        let id = series.id.clone();
+        let dir = series.dir.clone();
+        let max_bytes = series.max_bytes;
+        info!(
+            dump_id = %id,
+            ns = %series.ns,
+            expires_at = series.expires_at,
+            max_bytes,
+            dir = %dir.display(),
+            "a dump started"
+        );
+        self.after_start(&series, timeout_ms);
+
+        let requested: u64 = lock(&self.series)
+            .values()
+            .filter(|s| s.active.load(Ordering::Acquire))
+            .map(|s| s.max_bytes)
+            .sum();
+        let used = self.usage.total.load(Ordering::Acquire);
+        let fs_free = self.usage.fs_measured.load(Ordering::Acquire);
+        let started = Started {
+            dump_id: id,
+            dump_dir: dir.display().to_string(),
+            ns: start.ns.to_owned(),
+            timeout_ms,
+            max_bytes,
+            store: "raw",
+            labels: start.labels.clone(),
+            started_at: now,
+            expires_at: series.expires_at,
+            delete_after: series.delete_after,
+            concurrency: Concurrency {
+                limit: config.max_concurrency,
+                active,
+            },
+            storage: Storage {
+                active_used_bytes: used,
+                active_requested_bytes: requested,
+                total_available_bytes: config
+                    .max_total_bytes
+                    .min(fs_free.saturating_sub(config.fs_min_free)),
+                total_limit_bytes: config.max_total_bytes,
+                fs_min_free_bytes: config.fs_min_free,
+                fs_free_bytes: fs_free,
+                fs_checked_at: self.usage.fs_checked_at.load(Ordering::Acquire),
+            },
+        };
+        Ok((started, following))
+    }
+
+    /// 片付け・空き容量の測り直し・置き場と書き手の支度をして、系列を表に載せる。
+    fn open_series(
+        &self,
+        start: &Start<'_>,
+        config: &crate::config::DumpConfig,
+        now: i64,
+        timeout_ms: i64,
+    ) -> Result<(Arc<Series>, Option<Following>), Refusal> {
         let cleanup_ttl = duration_ms(config.cleanup_ttl);
         self.sweep(now, cleanup_ttl);
         self.usage.refresh(now, true);
@@ -618,20 +798,15 @@ impl Dumps {
                 )
             })?;
         *lock(&series.thread) = Some(thread);
-        lock(&self.series).insert(id.clone(), Arc::clone(&series));
-        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-        info!(
-            dump_id = %id,
-            ns = %series.ns,
-            expires_at = series.expires_at,
-            max_bytes,
-            dir = %dir.display(),
-            "a dump started"
-        );
+        lock(&self.series).insert(id, Arc::clone(&series));
+        Ok((series, following))
+    }
 
+    /// 始めた系列の時限の timer を張る (tokio の上で呼ばれた時だけ)。
+    fn after_start(&self, series: &Arc<Series>, timeout_ms: i64) {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let wait = std::time::Duration::from_millis(timeout_ms.unsigned_abs());
-            let expiring = Arc::downgrade(&series);
+            let expiring = Arc::downgrade(series);
             runtime.spawn(async move {
                 tokio::time::sleep(wait).await;
                 if let Some(series) = Weak::upgrade(&expiring) {
@@ -639,42 +814,6 @@ impl Dumps {
                 }
             });
         }
-
-        let requested: u64 = lock(&self.series)
-            .values()
-            .filter(|s| s.active.load(Ordering::Acquire))
-            .map(|s| s.max_bytes)
-            .sum();
-        let used = self.usage.total.load(Ordering::Acquire);
-        let fs_free = self.usage.fs_free.load(Ordering::Acquire);
-        let started = Started {
-            dump_id: id,
-            dump_dir: dir.display().to_string(),
-            ns: start.ns.to_owned(),
-            timeout_ms,
-            max_bytes,
-            store: "raw",
-            labels: start.labels.clone(),
-            started_at: now,
-            expires_at: series.expires_at,
-            delete_after: series.delete_after,
-            concurrency: Concurrency {
-                limit: config.max_concurrency,
-                active,
-            },
-            storage: Storage {
-                active_used_bytes: used,
-                active_requested_bytes: requested,
-                total_available_bytes: config
-                    .max_total_bytes
-                    .min(fs_free.saturating_sub(config.fs_min_free)),
-                total_limit_bytes: config.max_total_bytes,
-                fs_min_free_bytes: config.fs_min_free,
-                fs_free_bytes: fs_free,
-                fs_checked_at: self.usage.fs_checked_at.load(Ordering::Acquire),
-            },
-        };
-        Ok((started, following))
     }
 
     /// 書き手が自分で系列を止めて終わるのを待つ (試験用。止めはしない)。
@@ -788,7 +927,7 @@ impl Dumps {
                 dump_id: series.id.clone(),
                 ns: series.ns.clone(),
                 expires_at: series.expires_at,
-                bytes_written: series.bytes_written.load(Ordering::Acquire),
+                bytes_written: series.written(),
             })
             .collect()
     }
@@ -797,11 +936,9 @@ impl Dumps {
         if self.active.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
-        lock(&self.series)
-            .values()
-            .filter(|series| series.live(now))
-            .cloned()
-            .collect()
+        // 時限を過ぎた系列を止める処理 (log と書き手への合図) は錠の外でする。
+        let all: Vec<Arc<Series>> = lock(&self.series).values().cloned().collect();
+        all.into_iter().filter(|series| series.live(now)).collect()
     }
 
     /// メモリにある系列と、置き場に残っているだけの系列 (restart 前の分)。
@@ -844,8 +981,12 @@ impl Dumps {
         found
     }
 
-    /// `delete_after` (= `dump_id` の時刻部 + `cleanup_ttl`) を過ぎた系列を
-    /// ディレクトリごと消す。消した数を返す。
+    /// `delete_after` を過ぎた系列をディレクトリごと消す。消した数を返す。
+    ///
+    /// `delete_after` は系列ごとの `index.jsonl` の `start` の行から読む — 兄弟の
+    /// unit は `[dump] cleanup_ttl` が違いうるので、呼んだ unit の値を他の unit の
+    /// 系列に当てない。読めない系列 (`start` の行が無い・壊れている) だけは、
+    /// `dump_id` の時刻部に呼んだ unit の `cleanup_ttl_ms` を足して代わりにする。
     ///
     /// 掃くのは `dumps/` の下全体 (他の unit の分も)。止まったままの unit は
     /// 自分の分を掃けないので、どれかの unit が上がれば全部が片付く。
@@ -863,7 +1004,16 @@ impl Dumps {
                     else {
                         continue;
                     };
-                    if now < started.saturating_add(cleanup_ttl_ms) {
+                    let delete_after = start_line(&series)
+                        .and_then(|start| start.get("delete_after").and_then(Value::as_i64))
+                        .unwrap_or_else(|| {
+                            info!(
+                                dir = %series.display(),
+                                "a dump has no readable start line; judging its age by this unit's cleanup_ttl"
+                            );
+                            started.saturating_add(cleanup_ttl_ms)
+                        });
+                    if now < delete_after {
                         continue;
                     }
                     match std::fs::remove_dir_all(&series) {
@@ -884,36 +1034,29 @@ impl Dumps {
         removed
     }
 
-    /// 受けた 1 本を、その ns で動いている系列の全部に書く。
+    /// ヘッダを受けて ns 認証を通した 1 本を、その ns で動いている系列の全部に
+    /// 書き始める (`request_headers`)。本文は後で [`Capture::body`] が書く。
     ///
-    /// 動いている系列が無ければ atomic の load 1 つで `None`。どの系列に
-    /// 書くかはここで決まり、途中から始めた系列にこの 1 本は入らない。
-    /// 書けた系列が 1 つも無ければ `None`。
-    pub fn capture(&self, received: Received, now: i64) -> Option<Arc<Capture>> {
-        self.capture_if_any_at(|| received, now)
-    }
-
-    /// [`Self::capture`] の、動いている系列がある時だけ `received` を組み立てる形。
-    /// 動いている系列が無い間は本文の複製もしない。
-    pub fn capture_if_any(&self, received: impl FnOnce() -> Received) -> Option<Arc<Capture>> {
-        self.capture_if_any_at(received, crate::credential::time::now_unix_ms())
-    }
-
-    fn capture_if_any_at(
-        &self,
-        received: impl FnOnce() -> Received,
-        now: i64,
-    ) -> Option<Arc<Capture>> {
+    /// 動いている系列が無ければ atomic の load 1 つで `None` (`head` も組み立て
+    /// ない)。どの系列に書くかはここで決まり、途中から始めた系列にこの 1 本は
+    /// 入らない。系列の表の錠は候補を写す間だけ持ち、止める処理 (log と書き手への
+    /// 合図) は錠の外でする。
+    pub fn capture_head(&self, head: impl FnOnce() -> RequestHead) -> Option<Arc<Capture>> {
         if self.active.load(Ordering::Acquire) == 0 {
             return None;
         }
-        let received = received();
-        let targets: Vec<Arc<Series>> = lock(&self.series)
+        let head = head();
+        let now = crate::credential::time::now_unix_ms();
+        let candidates: Vec<Arc<Series>> = lock(&self.series)
             .values()
-            .filter(|series| series.ns == received.ns && series.live(now))
+            .filter(|series| series.ns == head.ns && series.active.load(Ordering::Acquire))
             .cloned()
             .collect();
-        Capture::begin(received, targets, now)
+        let targets: Vec<Arc<Series>> = candidates
+            .into_iter()
+            .filter(|series| series.live(now))
+            .collect();
+        Capture::begin(head, targets, now)
     }
 }
 
@@ -969,6 +1112,17 @@ fn read_listed(id: &str, ns_dir: &Path, dir: &Path) -> Listed {
         listed.bytes_written = Some(body_bytes(dir));
     }
     listed
+}
+
+/// 系列の `index.jsonl` の最初の行 (`start`)。読めなければ `None`。
+fn start_line(dir: &Path) -> Option<Value> {
+    use std::io::BufRead as _;
+
+    let file = std::fs::File::open(dir.join("index.jsonl")).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    let line: Value = serde_json::from_str(&first).ok()?;
+    (line.get("event").and_then(Value::as_str) == Some("start")).then_some(line)
 }
 
 /// 置き場にある本文 (`*.body`) の大きさの合計。

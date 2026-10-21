@@ -7618,22 +7618,22 @@ routes = ["spare", "codex"]
             )
             .unwrap();
         let capture = dumps
-            .capture(
-                crate::dump::Received {
-                    ns: NS.to_owned(),
-                    seq: 1,
-                    received_at: now,
-                    body_end_at: now,
-                    method: "POST".to_owned(),
-                    path: "/v1/messages".to_owned(),
-                    headers: Vec::new(),
-                    body: bytes::Bytes::from_static(b"{}"),
-                    stream: false,
-                    model: Some("m".to_owned()),
-                },
-                now,
-            )
+            .capture_head(|| crate::dump::RequestHead {
+                ns: NS.to_owned(),
+                seq: 1,
+                received_at: now,
+                method: "POST".to_owned(),
+                path: "/v1/messages".to_owned(),
+                headers: Vec::new(),
+            })
             .unwrap();
+        capture.body(crate::dump::RequestBody {
+            body_end_at: now,
+            body: bytes::Bytes::from_static(b"{}"),
+            error: None,
+            stream: false,
+            model: Some("m".to_owned()),
+        });
         DumpRig {
             dumps,
             dump_id: started.dump_id,

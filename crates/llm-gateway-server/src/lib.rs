@@ -648,16 +648,53 @@ async fn forward<P: CredentialPersistence + 'static>(
     // 結局そこまで抱えることになるうえ、送り直しのために抱え続ける必要は
     // 変わらない。上限 (`MAX_BODY`) までのメモリを見込むのはその代償。
     let receiving = Instant::now();
-    // 一時ダンプの `request_headers` の時刻 (ヘッダを受け取り終えた時点)。
-    let received_at = now_unix_ms();
-    let bytes = match axum::body::to_bytes(body, MAX_BODY).await {
-        Ok(b) => b,
-        Err(e) => {
+    // ns 認証はヘッダだけで決まるので、本文を読む前に判定しておく。断る・答える
+    // 順 (本文が読めない → JSON でない → ns が無い → 認証に断られる) は変えない。
+    let headers = collect_headers(&parts.headers);
+    let ns = gateway.namespace(&ns_name);
+    let verdict = ns.as_ref().map(|ns| {
+        let presented = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        ns.auth.verify(&ns_name, presented)
+    });
+    // 一時ダンプは、ns 認証を通した 1 本をヘッダの時点で書き始める (DR-0038
+    // 決定 9)。動いている系列が無ければ atomic の load 1 つで抜ける。
+    let dumping = match &verdict {
+        Some(Authorization::Accepted(_) | Authorization::Open) => {
+            gateway
+                .dumps()
+                .capture_head(|| llm_gateway::dump::RequestHead {
+                    ns: ns_name.clone(),
+                    seq,
+                    received_at: now_unix_ms(),
+                    method: parts.method.to_string(),
+                    path: uri.path().to_owned(),
+                    headers: headers.clone(),
+                })
+        }
+        _ => None,
+    };
+    let bytes = match read_body(body, MAX_BODY).await {
+        Ok(bytes) => bytes,
+        Err(unread) => {
+            // 受け取りきれなかった分も、受けたまま残す (何を送ってきたかが調査の材料)。
+            if let Some(capture) = &dumping {
+                capture.body(llm_gateway::dump::RequestBody {
+                    body_end_at: now_unix_ms(),
+                    body: unread.received,
+                    error: Some(unread.kind),
+                    stream: false,
+                    model: None,
+                });
+                capture.headers_sent();
+            }
             return span.in_scope(|| {
                 client_error(
                     &ns_name,
                     StatusCode::BAD_REQUEST,
-                    &format!("cannot read the body: {e}"),
+                    &format!("cannot read the body: {}", unread.reason),
                 )
             });
         }
@@ -670,6 +707,16 @@ async fn forward<P: CredentialPersistence + 'static>(
     let mut json: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
+            if let Some(capture) = &dumping {
+                capture.body(llm_gateway::dump::RequestBody {
+                    body_end_at,
+                    body: bytes.clone(),
+                    error: Some("invalid_json"),
+                    stream: false,
+                    model: None,
+                });
+                capture.headers_sent();
+            }
             return span.in_scope(|| {
                 client_error(
                     &ns_name,
@@ -679,16 +726,19 @@ async fn forward<P: CredentialPersistence + 'static>(
             });
         }
     };
+    if let Some(capture) = &dumping {
+        capture.body(llm_gateway::dump::RequestBody {
+            body_end_at,
+            body: bytes.clone(),
+            error: None,
+            stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
+            model: json.get("model").and_then(Value::as_str).map(str::to_owned),
+        });
+    }
 
-    let headers = collect_headers(&parts.headers);
-    let Some(ns) = gateway.namespace(&ns_name) else {
+    let (Some(ns), Some(verdict)) = (ns, verdict) else {
         return span.in_scope(|| unknown_namespace(&ns_name, &gateway.namespace_names()));
     };
-    let presented = parts
-        .headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let verdict = ns.auth.verify(&ns_name, presented);
     if let Some(denied) = span.in_scope(|| denied(&ns_name, &verdict)) {
         return denied;
     }
@@ -696,22 +746,6 @@ async fn forward<P: CredentialPersistence + 'static>(
         Authorization::Accepted(principal) => Some(principal),
         _ => None,
     };
-    // 一時ダンプは gateway が書き換える前の、受けた本文そのものを書く
-    // (DR-0038 決定 9)。動いている系列が無ければ atomic の load 1 つで抜ける。
-    let dumping = gateway
-        .dumps()
-        .capture_if_any(|| llm_gateway::dump::Received {
-            ns: ns_name.clone(),
-            seq,
-            received_at,
-            body_end_at,
-            method: parts.method.to_string(),
-            path: uri.path().to_owned(),
-            headers: headers.clone(),
-            body: bytes.clone(),
-            stream: json.get("stream").and_then(Value::as_bool).unwrap_or(false),
-            model: json.get("model").and_then(Value::as_str).map(str::to_owned),
-        });
     // namespace の thinking 方針は Messages 形式の欄に書く指示。Responses 形式の
     // 本文には置き場所が無いので当てない (DR-0025)。
     if shape == RequestShape::Messages {
@@ -802,6 +836,48 @@ async fn forward<P: CredentialPersistence + 'static>(
             response
         }
     }
+}
+
+/// 読み切れなかった本文。
+struct Unread {
+    /// `too_large` (上限を超えた) か `truncated` (途中で切れた)。
+    kind: &'static str,
+    /// そこまでに受けた分。
+    received: axum::body::Bytes,
+    reason: String,
+}
+
+/// 本文を上限まで読む。読み切れなかった時も、そこまでに受けた分を返す
+/// (一時ダンプが受けたまま残す、DR-0038 決定 9)。
+async fn read_body(body: Body, limit: usize) -> Result<axum::body::Bytes, Unread> {
+    use futures_util::StreamExt as _;
+
+    let mut stream = body.into_data_stream();
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                if received.len() + chunk.len() > limit {
+                    let room = limit - received.len();
+                    received.extend_from_slice(&chunk[..room]);
+                    return Err(Unread {
+                        kind: "too_large",
+                        received: received.into(),
+                        reason: "length limit exceeded".to_owned(),
+                    });
+                }
+                received.extend_from_slice(&chunk);
+            }
+            Err(e) => {
+                return Err(Unread {
+                    kind: "truncated",
+                    received: received.into(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(received.into())
 }
 
 /// 登録した行き先へ無変換で中継する (DR-0030 §2 / §4)。
@@ -1843,13 +1919,59 @@ routes = ["a"]
 
         let events = stopped_events(&gateway, &started);
         assert_eq!(
-            event(&events, "request_headers").unwrap()["model"],
+            event(&events, "request_body_end").unwrap()["model"],
             "nowhere"
         );
         assert!(event(&events, "upstream_headers").is_none());
         assert_eq!(
             event(&events, "response_headers_sent").unwrap()["adopted"],
             Value::Null
+        );
+    }
+
+    /// JSON として読めない本文も、ns 認証を通っていれば受けたまま残す。
+    /// `request_body_end` に理由が付き、gateway が組んだ 400 は `adopted: null`
+    /// (DR-0038 決定 9)。
+    #[tokio::test]
+    async fn an_unreadable_body_is_kept_as_received() {
+        let upstream = fake_upstream(|| (200, r#"{"type":"message"}"#.to_owned(), vec![])).await;
+        let stats = tempfile::TempDir::new().unwrap();
+        let (base, gateway) = dumping_gateway(stats.path(), &upstream).await;
+        let started = start_dump(&gateway);
+
+        let broken = authed(
+            reqwest::Client::new()
+                .post(format!("{base}/v1/messages"))
+                .header("content-type", "application/json")
+                .body("{\"model\": "),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(broken.status(), StatusCode::BAD_REQUEST);
+
+        let events = stopped_events(&gateway, &started);
+        let names: Vec<&str> = events
+            .iter()
+            .map(|e| e["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "start",
+                "request_headers",
+                "request_body_end",
+                "response_headers_sent",
+                "stop"
+            ]
+        );
+        assert_eq!(events[2]["error"], "invalid_json");
+        assert_eq!(events[3]["adopted"], Value::Null);
+        let stem = format!("{}-{}", events[1]["ts"], events[1]["seq"]);
+        let dir = std::path::Path::new(&started.dump_dir);
+        assert_eq!(
+            std::fs::read(dir.join(format!("{stem}.request.body"))).unwrap(),
+            b"{\"model\": "
         );
     }
 
