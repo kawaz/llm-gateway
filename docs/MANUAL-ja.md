@@ -769,10 +769,10 @@ $ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
 | `unknown_namespace` | 指した ns が走っている設定に無い |
 | `invalid_namespace` | ns の名前がディレクトリ名にできない (英数字と `.` `_` `-` 以外を含む、`.` で始まる) |
 | `unknown_dump` | 台が知らない `dump_id` (restart で消えた系列も) |
-| `bad_request` | `--for` / `--max-bytes` が 0、`stop` の指し方が読めない、台か監督者の版が `dump` を知らない (監督者が断った時は `{"error": …}` の形。監督者を上げ直す) |
+| `bad_request` | `--for` / `--max-bytes` が 0、`stop` の指し方が読めない、台か監督者の版が `dump` を知らない (監督者の時は上げ直す) |
 | `dump_dir_unwritable` | 系列のディレクトリを作れなかった |
 | `not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` | 監督者が台に渡せなかった (`daemon reload` の表と同じ。`restart_required` は制御口を持たない版が走っている) |
-| `supervisor_not_running` / `unit_required` / `no_units` | CLI が頼む先を決められなかった (この時の出力は `{"error": …}` の形) |
+| `supervisor_not_running` / `unit_required` / `no_units` / `unknown_unit` | CLI が頼む先を決められなかった・監督者に届かなかった (頼む先が決まっていなければ `unit` は付かない。`unit_required` には登録されている名前の `units` が付く) |
 
 ### `auth` — `jwt` の namespace の鍵と token
 

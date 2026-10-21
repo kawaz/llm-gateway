@@ -34,8 +34,37 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
         print!("{}", help::DUMP);
         return Ok(ExitCode::SUCCESS);
     };
-    let target = destination::resolve(&llm_gateway::daemon::registry::open(), unit.as_deref())?;
-    ask(target.unit, request)
+    // 頼む先を決められない・監督者に届かない時も、台の答えと同じ
+    // `{unit, ok: false, error}` の形で断る (決定 2)。
+    let target = match destination::resolve(&llm_gateway::daemon::registry::open(), unit.as_deref())
+    {
+        Ok(target) => target,
+        Err(failure) => return Ok(refuse(unit.as_deref(), &failure.to_json())),
+    };
+    match ask(&target.unit, request) {
+        Ok(answer) => print(&target.unit, &answer),
+        Err(failure) => Ok(refuse(Some(&target.unit), &failure.to_json())),
+    }
+}
+
+/// `{"error": …}` の形の断りを `{unit, ok: false, error}` に直して stderr へ出す。
+fn refuse(unit: Option<&str>, refused: &str) -> ExitCode {
+    eprintln!("{}", refusal(unit, refused));
+    ExitCode::FAILURE
+}
+
+fn refusal(unit: Option<&str>, refusal: &str) -> serde_json::Value {
+    let error = serde_json::from_str::<serde_json::Value>(refusal)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .unwrap_or_else(|| serde_json::json!({"kind": "bad_answer", "message": refusal}));
+    let mut answer = serde_json::Map::new();
+    if let Some(unit) = unit {
+        answer.insert("unit".to_owned(), serde_json::json!(unit));
+    }
+    answer.insert("ok".to_owned(), serde_json::json!(false));
+    answer.insert("error".to_owned(), error);
+    serde_json::Value::Object(answer)
 }
 
 /// 頼みの形と、指された台 (無ければ登録簿で決める)。`None` は help を出す時。
@@ -129,29 +158,40 @@ fn status(args: &[String]) -> Result<Parsed, Failure> {
     Ok(Some((unit, DumpRequest::Status)))
 }
 
-/// 監督者に頼んで、台の答えをそのまま出す。`ok: false` なら stderr へ回して非 0。
-fn ask(unit: String, dump: DumpRequest) -> Result<ExitCode, Failure> {
+/// 監督者に頼んで、答えの 1 行を受け取る。
+fn ask(unit: &str, dump: DumpRequest) -> Result<String, Failure> {
     let socket = protocol::socket_path();
-    let request = Request::Dump(DumpRelay { unit, dump });
-    let answer = tokio::runtime::Runtime::new()
+    let request = Request::Dump(DumpRelay {
+        unit: unit.to_owned(),
+        dump,
+    });
+    tokio::runtime::Runtime::new()
         .map_err(|e| Failure::from(format!("could not start the async runtime: {e}")))?
         .block_on(async move {
             protocol::ask(&socket, &request)
                 .await
                 .map_err(|e| crate::daemon::control::not_running(&e))
-        })?;
-    print(&answer)
+        })
 }
 
-fn print(answer: &str) -> Result<ExitCode, Failure> {
+/// 台の答えをそのまま出す。`ok: false` なら stderr へ回して非 0。
+///
+/// `ok` を持たない答えは、dump を知らない版の監督者が `{"error": …}` で
+/// 断ったもの。台の答えと同じ形に直して出す。
+fn print(unit: &str, answer: &str) -> Result<ExitCode, Failure> {
     let value: serde_json::Value = serde_json::from_str(answer)
         .map_err(|e| Failure::from(format!("could not read the answer: {e}")))?;
-    if value["ok"] != serde_json::json!(true) {
-        eprintln!("{answer}");
-        return Ok(ExitCode::FAILURE);
+    match value.get("ok") {
+        Some(serde_json::Value::Bool(true)) => {
+            println!("{answer}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(_) => {
+            eprintln!("{answer}");
+            Ok(ExitCode::FAILURE)
+        }
+        None => Ok(refuse(Some(unit), answer)),
     }
-    println!("{answer}");
-    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -283,14 +323,37 @@ mod tests {
     #[test]
     fn a_refusal_comes_back_as_a_failure() {
         assert_eq!(
-            print(r#"{"unit":"u","ok":true,"dumps":[]}"#).unwrap(),
+            print("u", r#"{"unit":"u","ok":true,"dumps":[]}"#).unwrap(),
             ExitCode::SUCCESS
         );
         assert_eq!(
-            print(r#"{"unit":"u","ok":false,"error":{"kind":"unknown_dump","message":"x"}}"#)
-                .unwrap(),
+            print(
+                "u",
+                r#"{"unit":"u","ok":false,"error":{"kind":"unknown_dump","message":"x"}}"#
+            )
+            .unwrap(),
             ExitCode::FAILURE
         );
-        assert!(print("not json").is_err());
+        // dump を知らない監督者の断り (`ok` が無い) も失敗。
+        assert_eq!(
+            print("u", r#"{"error":{"kind":"bad_request","message":"x"}}"#).unwrap(),
+            ExitCode::FAILURE
+        );
+        assert!(print("u", "not json").is_err());
+    }
+
+    /// 頼む先を決められない時も `{unit, ok: false, error}` の形で、`error` は
+    /// 元の断りの欄 (kind / message / 添えた欄) をそのまま持つ (決定 2)。
+    #[test]
+    fn a_refusal_before_reaching_the_unit_has_the_same_shape() {
+        let failure = Failure::new("unit_required", "say which").with("units", vec!["a", "b"]);
+        assert_eq!(refuse(None, &failure.to_json()), ExitCode::FAILURE);
+        assert_eq!(
+            refuse(
+                Some("u"),
+                r#"{"error":{"kind":"supervisor_not_running","message":"x"}}"#
+            ),
+            ExitCode::FAILURE
+        );
     }
 }

@@ -767,10 +767,10 @@ Every answer starts with `unit` and `ok`, as `daemon reload` does; a refusal is 
 | `unknown_namespace` | The namespace is not in the running configuration |
 | `invalid_namespace` | The namespace name cannot be a directory name (anything other than letters, digits, `.` `_` `-`, or a leading `.`) |
 | `unknown_dump` | The unit does not know the `dump_id` (including series a restart forgot) |
-| `bad_request` | `--for` / `--max-bytes` is zero, `stop` was pointed at nothing readable, or the unit's or supervisor's version does not know `dump` (when the supervisor refuses, the output is `{"error": …}`; restart the supervisor) |
+| `bad_request` | `--for` / `--max-bytes` is zero, `stop` was pointed at nothing readable, or the unit's or supervisor's version does not know `dump` (for the supervisor, restart it) |
 | `dump_dir_unwritable` | The series directory could not be made |
 | `not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` | The supervisor could not hand the request to the unit (same as the `daemon reload` table; `restart_required` means a version without a control socket is running) |
-| `supervisor_not_running` / `unit_required` / `no_units` | The CLI could not settle where to ask (the output then has the `{"error": …}` shape) |
+| `supervisor_not_running` / `unit_required` / `no_units` / `unknown_unit` | The CLI could not settle where to ask, or could not reach the supervisor (`unit` is absent when no unit was settled; `unit_required` carries the registered names in `units`) |
 
 ### `auth` — keys and tokens for `jwt` namespaces
 
