@@ -199,8 +199,8 @@ impl Capture {
                     now,
                 );
             if !body_sent {
-                // 書くことにしたが書き手に渡らなかった分は、未確定から外す。
-                series.usage.written(size);
+                // 足したが書き手へ渡らなかった分は、全部の計数から戻す。
+                series.cancel(size);
             }
             if !(body_sent && series.send(Message::Event(end.clone()), now)) {
                 self.open[i].store(false, Ordering::Release);
@@ -403,8 +403,8 @@ impl Teed {
                     now,
                 )
             {
-                // 書くことにしたが書き手に渡らなかった分は、未確定から外す。
-                series.usage.written(grant.bytes);
+                // 足したが書き手へ渡らなかった分は、全部の計数から戻す。
+                series.cancel(grant.bytes);
                 progress.open = false;
                 continue;
             }

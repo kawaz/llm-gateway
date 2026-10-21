@@ -280,6 +280,22 @@ impl Series {
         }
     }
 
+    /// [`Self::reserve`] で足したが書き手へ渡せなかった `bytes` を、全部の計数
+    /// から戻す (錠の中で 1 回に)。fs の見込みと未確定分は必ず戻す。全体の量は、
+    /// 系列が動いている時だけ戻す — 止まっていれば止めた側が系列の量ごと引いて
+    /// いる。
+    fn cancel(&self, bytes: u64) {
+        let mut accounting = lock(&self.usage.accounting);
+        accounting.fs_available += bytes;
+        accounting.fs_pending = accounting.fs_pending.saturating_sub(bytes);
+        let written = self.bytes_written.load(Ordering::Acquire);
+        self.bytes_written
+            .store(written.saturating_sub(bytes), Ordering::Release);
+        if self.active.load(Ordering::Acquire) {
+            accounting.total = accounting.total.saturating_sub(bytes);
+        }
+    }
+
     /// 書き手のスレッドが終わるのを待つ (止まった後で呼ぶ)。
     fn join(&self) {
         let thread = lock(&self.thread).take();
@@ -329,6 +345,9 @@ pub struct Dumps {
     usage: Arc<Usage>,
     /// この unit が始めた系列の全部 (止まったものも)。restart まで覚える。
     series: Mutex<BTreeMap<String, Arc<Series>>>,
+    /// 片付け (空になった段を消す) と系列のディレクトリ作りを、この unit の中で
+    /// 1 つずつ通す。制御の経路だけが持ち、中継の経路は触らない。
+    dirs: Mutex<()>,
 }
 
 /// `start` で頼まれたこと。
@@ -454,6 +473,7 @@ impl Dumps {
             root,
             active: Arc::new(AtomicUsize::new(0)),
             series: Mutex::new(BTreeMap::new()),
+            dirs: Mutex::new(()),
         }
     }
 
@@ -637,7 +657,8 @@ impl Dumps {
         timeout_ms: i64,
     ) -> Result<(Arc<Series>, Option<Following>), Refusal> {
         let cleanup_ttl = duration_ms(config.cleanup_ttl);
-        self.sweep(now, cleanup_ttl);
+        let held = lock(&self.dirs);
+        self.sweep_held(now, cleanup_ttl);
         self.usage.refresh(now, true);
 
         let id = uuid_v7(now, &mut |buf| rand::fill(buf));
@@ -648,6 +669,7 @@ impl Dumps {
                 format!("could not make {}: {e}", dir.display()),
             )
         })?;
+        drop(held);
         let max_bytes = start.max_bytes.unwrap_or(config.default_max_bytes);
         let (writer, receiving) = writer::Writer::channel();
         let (follow, following) = match start.follow {
@@ -735,6 +757,41 @@ impl Dumps {
         if let Some(series) = series {
             series.join();
         }
+    }
+
+    /// 書き手の居ない (列を誰も取り出さない) 系列を表に載せる (試験用)。
+    #[cfg(test)]
+    fn stalled(
+        &self,
+        ns: &str,
+        config: &crate::config::DumpConfig,
+        now: i64,
+    ) -> (Arc<Series>, std::sync::mpsc::Receiver<writer::Message>) {
+        let (writer, receiving) = writer::Writer::channel();
+        let id = uuid_v7(now, &mut |buf| rand::fill(buf));
+        let series = Arc::new(Series {
+            id: id.clone(),
+            unit: "u".to_owned(),
+            ns: ns.to_owned(),
+            dir: self.root.join("u").join(ns).join(&id),
+            labels: BTreeMap::new(),
+            started_at: now,
+            expires_at: now + 60_000,
+            delete_after: now + 60_000,
+            max_bytes: config.default_max_bytes,
+            max_total_bytes: config.max_total_bytes,
+            fs_min_free: config.fs_min_free,
+            bytes_written: AtomicU64::new(0),
+            active: AtomicBool::new(true),
+            stopped: Mutex::new(None),
+            writer,
+            counter: Arc::clone(&self.active),
+            usage: Arc::clone(&self.usage),
+            thread: Mutex::new(None),
+        });
+        self.active.fetch_add(1, Ordering::AcqRel);
+        lock(&self.series).insert(id, Arc::clone(&series));
+        (series, receiving)
     }
 
     /// follow の接続が閉じた。系列を `disconnected` で止める。
@@ -825,6 +882,7 @@ impl Dumps {
                 }
             }
             if let Some(ns_dir) = Path::new(&listed.dump_dir).parent() {
+                let _held = lock(&self.dirs);
                 let _ = std::fs::remove_dir(ns_dir);
             }
         }
@@ -905,6 +963,12 @@ impl Dumps {
     /// `max_timeout` ≤ `cleanup_ttl` なので、動いている系列を消すことはない。
     /// 空になった `<ns>/` と `<unit>/` も消す。
     pub fn sweep(&self, now: i64, cleanup_ttl_ms: i64) -> usize {
+        let _held = lock(&self.dirs);
+        self.sweep_held(now, cleanup_ttl_ms)
+    }
+
+    /// [`Self::sweep`] の中身 (`dirs` の錠を持って呼ぶ)。
+    fn sweep_held(&self, now: i64, cleanup_ttl_ms: i64) -> usize {
         let mut removed = 0;
         for unit in subdirectories(&self.root) {
             for ns in subdirectories(&unit) {
@@ -1135,10 +1199,28 @@ fn duration_ms(duration: std::time::Duration) -> i64 {
 fn make_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    // 作っている途中で、別の片付け (この unit の別の `start`、兄弟の unit) が空に
+    // なった `<ns>/` / `<unit>/` を消すことがある。消されたら作り直す。
+    let mut tries = 0;
+    loop {
+        match std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+        {
+            Ok(()) => break,
+            // macOS は消されている途中の段に作ると EINVAL を返す。
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) && tries < 3 =>
+            {
+                tries += 1
+            }
+            Err(e) => return Err(e),
+        }
+    }
     // `<dump_id>` / `<ns>` / `<unit>` / `dumps`。
     for level in dir.ancestors().take(4) {
         std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o700))?;

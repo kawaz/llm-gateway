@@ -973,17 +973,21 @@ fn concurrent_starts_never_exceed_the_limit() {
                         &limited,
                         now(),
                     )
-                    .map_err(|r| r.kind)
+                    .map_err(|r| format!("{}: {}", r.kind, r.message))
             })
         })
         .collect();
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        3,
+        "{results:?}"
+    );
     assert!(
         results
             .iter()
             .filter_map(|r| r.as_ref().err())
-            .all(|k| *k == "too_many_dumps")
+            .all(|k| k.starts_with("too_many_dumps"))
     );
     assert_eq!(dumps.active.load(Ordering::Acquire), 3);
 }
@@ -1125,4 +1129,62 @@ fn sweeping_honours_each_dumps_own_delete_after() {
     assert_eq!(this.sweep(now(), 48 * hour), 1);
     assert!(Path::new(&kept.dump_dir).exists(), "its own 96 hours apply");
     assert!(!unreadable.exists());
+}
+
+/// 書き手の列が溢れて渡せなかった本文の分は、fs の見込み・全体・系列の量から
+/// 全部戻り、他の系列はそのまま書ける (戻さないと、測り直すまで他の系列が
+/// `fs_min_free` で止まる)。
+#[test]
+fn a_body_that_could_not_be_queued_is_taken_back_from_every_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let other = start(&dumps, "other", None);
+    let (stalled, queue) = dumps.stalled("lab", &config(), now());
+    // 渡す先の列を誰も取り出さないまま埋め、`request_headers` の 1 行分だけ空ける。
+    while stalled.writer.try_send(writer::Message::Wake).is_ok() {}
+    queue.try_recv().unwrap();
+    // 空きは 20 バイトだけ。
+    lock(&dumps.usage.accounting).fs_available = 20;
+
+    assert!(take(&dumps, "lab", 1, b"0123456789").is_some());
+    assert!(
+        !stalled.active.load(Ordering::Acquire),
+        "the body could not be queued, so the dump stopped with error"
+    );
+    {
+        let accounting = lock(&dumps.usage.accounting);
+        assert_eq!(accounting.fs_available, 20);
+        assert_eq!(accounting.fs_pending, 0);
+        assert_eq!(accounting.total, 0);
+    }
+
+    // 戻っていなければ、ここで空きが床に達して `fs_min_free` で止まる。
+    assert!(exchange(&dumps, "other", 2, b"0123456789", &[]));
+    let events = finished(&dumps, &other);
+    assert_eq!(events.last().unwrap()["reason"], "stop");
+}
+
+/// `request_headers` は列に置けたが本文で溢れた系列: 本文の分を全部の計数から戻す。
+#[test]
+fn a_reservation_that_was_not_queued_is_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let (stalled, _queue) = dumps.stalled("lab", &config(), now());
+    {
+        let mut accounting = lock(&dumps.usage.accounting);
+        accounting.fs_available = 100;
+    }
+    let grant = stalled.reserve(40, true);
+    assert_eq!(grant.bytes, 40);
+    stalled.cancel(40);
+    let accounting = lock(&dumps.usage.accounting);
+    assert_eq!(
+        (
+            accounting.fs_available,
+            accounting.fs_pending,
+            accounting.total
+        ),
+        (100, 0, 0)
+    );
+    assert_eq!(stalled.written(), 0);
 }
