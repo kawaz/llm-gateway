@@ -80,6 +80,7 @@ key_rotation = "7d"       # 任意。gateway が自動の鍵を入れ替える�
 - `max_token_ttl` を守らせるのは `auth token` だけ。`auth sign --key <自動の鍵のファイル>` で長い token を鋳造すると、`exp` に関わらず gateway がその鍵を消した時点 (後継 + `max_token_ttl` + 1 時間) で効かなくなる。自動の鍵は `auth token` で使う
 - 起動時に確かめ、最新の自動の鍵が無いか `key_rotation` 以上古ければ新しい鍵を追記する。kid は `<ns>-<日付>-<16 進 4 桁>` (例 `lab-2026-10-06-3fa9`)。新しい鍵の `max_token_ttl` は `key_rotation` と `max_ttl` の小さい方
 - 古い自動の鍵は、後継ができてから「その鍵の `max_token_ttl` + 1 時間」で消す (一時ファイル + rename)。消すのは印のある行だけで、`keys_file` には触らない
+- 自動の鍵のファイルが読めない・壊れていたら、入れ替えの仕事が次にそのファイルを読む回 (起動時・入れ替えや削除の時刻・`daemon reload`) に `<ns>.jwks.jsonl.broken.<UTC の日時>` (例 `lab.jwks.jsonl.broken.20261006T070000Z`。名前が埋まっていれば `.1` … を足す) へ退避し、新しい自動の鍵 1 本で作り直す (警告に退避先を出す)。それまでの自動の鍵の token は断られ、`auth token` を helper にしたクライアントは 401 を受けて取り直す。退避したファイルは消さないので (秘密鍵を含みうる)、原因を見てから手で消す
 - 次にやることの時刻は鍵の作成時刻から計算してタイマーを張る (寝るのは 1 回 1 時間まで。macOS のスリープで単調時計が止まる分を壁時計で補う)。`daemon reload` でも全 namespace を確かめ直す
 - stable / unstable のように `[stats] dir` を共有する unit は、同じファイルを `.lock` の flock で調停する。どちらが先でも増える鍵は 1 本
 - 自動の鍵のファイルを読まない版 (0.67.0 以前) は、自動の鍵の token を `unknown_kid` で断る。クライアントを `auth token` に切り替えるのは、届きうる全 unit が新しい版になってから。`key_rotation` を書いた設定も古い版では読めない
