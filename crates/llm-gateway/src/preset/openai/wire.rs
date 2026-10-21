@@ -91,6 +91,7 @@ impl Wire for OpenAiWire {
         http: &'a reqwest::Client,
         request: UpstreamRequest,
         shape: RequestShape,
+        raw: crate::egress::RawBody<'a>,
     ) -> BoxFuture<'a, Result<Response>> {
         Box::pin(async move {
             let UpstreamRequest { url, headers, body } = request;
@@ -131,6 +132,8 @@ impl Wire for OpenAiWire {
                     })
                 })
                 .boxed();
+            // 通訳する前の、upstream が返したバイト列 (DR-0038 決定 10)。
+            let body = crate::egress::observe_raw(raw, body);
             // Responses 形式で受けたなら通訳しない。上流の event をそのまま
             // 流す (DR-0025) — 送り主は Responses API の返事を待っている。
             // content-type を補うのは通訳の有無と無関係: 名乗らない SSE を

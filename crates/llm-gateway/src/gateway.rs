@@ -579,8 +579,27 @@ impl<P: CredentialPersistence> Gateway<P> {
         ns: &NamespaceView,
         ns_name: &str,
         received: Ingress<'_>,
+        body: Value,
+        headers: Vec<(String, String)>,
+    ) -> Result<Forwarded> {
+        self.forward_dumping(principal, ns, ns_name, received, body, headers, None)
+            .await
+    }
+
+    /// [`Self::forward_as`] に、一時ダンプの 1 本 (DR-0038) を添えて転送する。
+    ///
+    /// upstream が答えるたびに、Wire が解釈する前の本文を `dump` に通す
+    /// (決定 10)。経路を替えて試し直せば、書き先も最後の応答に切り替わる。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_dumping(
+        &self,
+        principal: Option<&gateway_core::ns::Principal>,
+        ns: &NamespaceView,
+        ns_name: &str,
+        received: Ingress<'_>,
         mut body: Value,
         headers: Vec<(String, String)>,
+        dump: Option<&Arc<crate::dump::Capture>>,
     ) -> Result<Forwarded> {
         let Ingress { path, query, shape } = received;
         let requested = egress::model_of(&body)?.to_owned();
@@ -631,6 +650,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             shape,
             thinking,
             low_priority: session::low_priority(&headers),
+            dump,
         };
         let mut routes = self
             .router
@@ -1224,6 +1244,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                 headers,
                 shape: kept.shape,
             },
+            None,
         )
         .await
         {
@@ -1362,6 +1383,9 @@ impl<P: CredentialPersistence> Gateway<P> {
         let keeping = (strategy == Some(CacheStrategy::Keepalive))
             .then(|| (body.clone(), headers.as_slice().to_vec()));
 
+        let teeing = call
+            .dump
+            .map(|capture| move |body: egress::BodyStream| capture.tee(body));
         let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
@@ -1373,6 +1397,9 @@ impl<P: CredentialPersistence> Gateway<P> {
                 headers,
                 shape: call.shape,
             },
+            teeing.as_ref().map(|tee| {
+                tee as &(dyn Fn(egress::BodyStream) -> egress::BodyStream + Send + Sync)
+            }),
         )
         .await
         {
@@ -1823,7 +1850,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             .await
             .map_err(|e| e.to_string())?;
 
-        let sent = egress::send(&self.http, preset, Some(&credential), probe.request)
+        let sent = egress::send(&self.http, preset, Some(&credential), probe.request, None)
             .await
             .map_err(|e| e.to_string())?;
         let resp = egress::finish_response(sent)
@@ -1898,6 +1925,8 @@ struct Call<'a> {
     /// 読む。立っていれば、429 / 529 で経路を替えず、印も付けず、消費の上限
     /// (DR-0019) にも掛けない。
     low_priority: bool,
+    /// 一時ダンプの 1 本 (DR-0038)。upstream から読んだ本文をここへ通す。
+    dump: Option<&'a Arc<crate::dump::Capture>>,
 }
 
 impl<'a> Call<'a> {
@@ -7482,6 +7511,162 @@ routes = ["spare", "codex"]
     fn sent_body(raw: &str) -> Value {
         let (_, body) = raw.split_once("\r\n\r\n").expect("headers end");
         serde_json::from_str(body).expect("a JSON body")
+    }
+
+    /// 一時ダンプを 1 本ぶん用意する (DR-0038)。置き場は試験ごとの一時ディレクトリ。
+    fn dump_capture(dir: &std::path::Path) -> (Arc<crate::dump::Capture>, std::path::PathBuf) {
+        let dumps = Arc::new(crate::dump::Dumps::new(dir));
+        let now = now_unix_ms();
+        let view = dumps
+            .start(
+                &crate::dump::Start {
+                    unit: "u",
+                    ns: NS,
+                    for_ms: 60_000,
+                    max_bytes: None,
+                    request_only: false,
+                },
+                now,
+            )
+            .unwrap();
+        let capture = dumps
+            .capture(
+                crate::dump::Received {
+                    ns: NS,
+                    seq: 1,
+                    body: b"{}",
+                    headers: &[],
+                    stream: false,
+                },
+                now,
+            )
+            .unwrap();
+        (capture, std::path::PathBuf::from(view.dump_dir))
+    }
+
+    /// 書いた response のファイルの中身。
+    fn dumped_response(dir: &std::path::Path) -> String {
+        let name = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.ends_with(".response.sse"))
+            .expect("a response file");
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    /// 一時ダンプの response は、Wire が通訳して gateway が JSON に集め直す前の、
+    /// upstream が返した Responses API の SSE そのもの (DR-0038 決定 7・10)。
+    #[tokio::test]
+    async fn a_dump_keeps_the_upstream_bytes_before_they_are_translated_and_collected() {
+        let codex = responses_upstream().await;
+        let spare = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &responses_config(&codex.url, &spare.url)
+                .replace(r#"routes = ["spare", "codex"]"#, r#"routes = ["codex"]"#),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+        let stats = tempfile::tempdir().unwrap();
+        let (capture, dir) = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+                Some(&capture),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.route, "codex");
+        assert_eq!(
+            forwarded.response.headers.get("content-type"),
+            Some("application/json"),
+            "the client asked without stream, so it gets one JSON"
+        );
+        let answered = body_text(forwarded.response).await;
+        assert!(answered.starts_with('{'), "{answered}");
+        let dumped = dumped_response(&dir);
+        assert!(
+            dumped.starts_with("data: {\"type\":\"response.created\""),
+            "{dumped}"
+        );
+        assert!(dumped.contains("response.completed"), "{dumped}");
+    }
+
+    /// upstream の断りを gateway のエラー本文に差し替えて返しても、ダンプに残るのは
+    /// upstream が返した本文 (DR-0038 決定 7)。
+    #[tokio::test]
+    async fn a_dump_keeps_the_upstream_denial_the_gateway_replaced() {
+        let crowded = FakeUpstream::start_sse(|_, _| {
+            (
+                200,
+                concat!(
+                    "data: {\"type\":\"error\",\"error\":{\"message\":",
+                    "\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{}}\n\n"
+                )
+                .to_owned(),
+            )
+        })
+        .await;
+        let gw = gateway_with(
+            &format!(
+                r#"
+[credentials.codex]
+type = "codex_oauth"
+
+[routes.codex]
+provider = "openai"
+credential = "codex"
+url = "{}/backend-api/codex"
+models = ["m"]
+
+[ns.default]
+[[ns.default.routing]]
+models = ["m"]
+routes = ["codex"]
+"#,
+                crowded.url
+            ),
+            StaticStore::holding(valid_codex_credential()),
+        )
+        .await;
+        let stats = tempfile::tempdir().unwrap();
+        let (capture, dir) = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+                Some(&capture),
+            )
+            .await
+            .unwrap();
+
+        let answered = body_text(forwarded.response).await;
+        assert!(answered.contains("\"type\":\"error\""), "{answered}");
+        assert!(!answered.contains("response.failed"), "{answered}");
+        let dumped = dumped_response(&dir);
+        assert!(dumped.contains("response.failed"), "{dumped}");
+        assert!(dumped.contains("currently overloaded"), "{dumped}");
     }
 
     /// Responses 形式の本文は、model 欄の解決を除いてそのまま上流へ届く。

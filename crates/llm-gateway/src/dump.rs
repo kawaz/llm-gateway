@@ -37,6 +37,11 @@ pub const DEFAULT_MAX_BYTES: u64 = 200 * 1024 * 1024;
 /// これより古い系列は片付けで消える (決定 9)。
 const KEEP_MS: i64 = 48 * 3600 * 1000;
 
+/// `--for` の上限 (決定 1)。片付けの閾値 ([`KEEP_MS`]) の半分以下に抑えるので、
+/// 動いている系列のディレクトリの mtime は必ず片付けの閾値より新しく、兄弟の
+/// unit の片付けが動いている系列を消すことがない。
+pub const MAX_FOR_MS: i64 = 24 * 3600 * 1000;
+
 /// 系列の表と、置き場。
 pub struct Dumps {
     /// `<[stats] dir>/dumps`。
@@ -63,11 +68,15 @@ struct Series {
     /// 書いた本数。
     requests: AtomicU64,
     active: AtomicBool,
+    /// 止まった理由。動いている間は `None`。
+    stopped_by: Mutex<Option<StopReason>>,
     /// [`Dumps::active`] と同じもの。止まる時に減らす。
     counter: Arc<AtomicUsize>,
 }
 
-/// 系列が止まった理由。答えには載せず、log にだけ出す (決定 11)。
+/// 系列が止まった理由。`start` / `status` / `stop` の答えには載せず log に出し
+/// (決定 11)、止まったせいで打ち切った 1 本の `index.jsonl` の行にも `reason` で
+/// 残す (決定 5・14)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopReason {
     Expired,
@@ -93,6 +102,7 @@ impl Series {
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            *self.stopped_by.lock().unwrap() = Some(reason);
             self.counter.fetch_sub(1, Ordering::AcqRel);
             info!(
                 dump_id = %self.id,
@@ -118,6 +128,23 @@ impl Series {
             return false;
         }
         true
+    }
+
+    /// 止まった理由。止まった直後に別の書き手が見ても `stopped` と取り違え
+    /// ないよう、理由が書かれる前なら `stopped` を返す。
+    fn reason(&self) -> StopReason {
+        self.stopped_by
+            .lock()
+            .unwrap()
+            .unwrap_or(StopReason::Stopped)
+    }
+
+    /// 上限ちょうどまで書いたら止める (決定 5)。超えてからではなく、次の 1 バイトを
+    /// 書けなくなった時点で止まる。
+    fn stop_if_full(&self) {
+        if self.bytes_written.load(Ordering::Acquire) >= self.max_bytes {
+            self.finish(StopReason::MaxBytes);
+        }
     }
 
     /// `want` バイトを丸ごと書けるなら、その分を書いたことにして `true`。
@@ -269,10 +296,10 @@ impl Dumps {
                 ),
             ));
         }
-        if start.for_ms <= 0 {
+        if start.for_ms <= 0 || start.for_ms > MAX_FOR_MS {
             return Err(Refusal::new(
-                "bad_request",
-                "--for must be longer than zero",
+                "invalid_duration",
+                "--for must be longer than zero and at most 24h (a dump is temporary, and dumps older than 48 hours are removed)",
             ));
         }
         if start.max_bytes == Some(0) {
@@ -301,6 +328,7 @@ impl Dumps {
             bytes_written: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             active: AtomicBool::new(true),
+            stopped_by: Mutex::new(None),
             counter: Arc::clone(&self.active),
         });
         self.series
@@ -433,7 +461,7 @@ impl Dumps {
     /// 動いている系列が無ければ atomic の load 1 つで `None`。どの系列に
     /// 書くかはここで決まり、途中から始めた系列にこの 1 本は入らない。
     /// 書けた系列が 1 つも無ければ `None`。
-    pub fn capture(&self, received: Received<'_>, now: i64) -> Option<Capture> {
+    pub fn capture(&self, received: Received<'_>, now: i64) -> Option<Arc<Capture>> {
         if self.active.load(Ordering::Acquire) == 0 {
             return None;
         }
@@ -460,8 +488,7 @@ impl Dumps {
                     series.finish(StopReason::MaxBytes);
                     return None;
                 }
-                // 兄弟の unit の片付けが、しばらく書いていない系列を消していても
-                // 書けるよう、毎回置き場を確かめる。
+                // 置き場が外から消されていても書けるよう、毎回確かめて閉じ直す。
                 let written = make_dir(&series.dir)
                     .and_then(|()| write_new(&series.dir.join(&request_file), received.body));
                 if let Err(e) = written {
@@ -469,18 +496,20 @@ impl Dumps {
                     return None;
                 }
                 series.requests.fetch_add(1, Ordering::AcqRel);
+                series.stop_if_full();
                 Some(Entry {
                     series,
-                    response: None,
+                    response_file: None,
+                    file: None,
                     response_bytes: 0,
-                    truncated: false,
+                    cut: None,
                 })
             })
             .collect();
         if entries.is_empty() {
             return None;
         }
-        Some(Capture {
+        Some(Arc::new(Capture {
             ts: now,
             seq: received.seq,
             stem,
@@ -488,8 +517,10 @@ impl Dumps {
             request_bytes: size,
             stream: received.stream,
             headers: kept_headers(received.headers),
-            entries,
-        })
+            entries: Mutex::new(entries),
+            attempt: AtomicU64::new(0),
+            settled: AtomicBool::new(false),
+        }))
     }
 }
 
@@ -521,6 +552,9 @@ pub struct Answered {
 }
 
 /// request を書き終えて、応答を待っている 1 本。
+///
+/// response は upstream から読んだバイト列を Wire が解釈する前に [`Self::tee`]
+/// で書き (決定 7・10)、`index.jsonl` の行は応答の終端で [`Self::settle`] が書く。
 pub struct Capture {
     ts: i64,
     seq: u64,
@@ -529,107 +563,161 @@ pub struct Capture {
     request_bytes: u64,
     stream: bool,
     headers: Map<String, Value>,
-    entries: Vec<Entry>,
+    entries: Mutex<Vec<Entry>>,
+    /// 経路を試すたびに進む番号。書くのは最後に upstream が返した応答だけ。
+    attempt: AtomicU64,
+    settled: AtomicBool,
+}
+
+/// 答えが決まり、応答の終端を待っている 1 本。
+pub struct Settling {
+    capture: Arc<Capture>,
+    answered: Answered,
+}
+
+impl Settling {
+    /// 応答の終端で `index.jsonl` に行を書く。
+    pub fn finish(&self) {
+        self.capture.settle(&self.answered);
+    }
 }
 
 /// 1 本の、系列 1 つぶんの書き先。
 struct Entry {
     series: Arc<Series>,
-    /// response のファイル名と、まだ書ける間の書き口。
-    response: Option<(String, Option<std::fs::File>)>,
+    /// response のファイル名。upstream が 1 度でも答えていれば付く。
+    response_file: Option<String>,
+    /// まだ書ける間の書き口。
+    file: Option<std::fs::File>,
     response_bytes: u64,
-    truncated: bool,
+    /// 打ち切った理由。最後まで書けた 1 本は `None`。
+    cut: Option<StopReason>,
+}
+
+impl Entry {
+    /// 書き口を閉じ、打ち切った理由を残す。ファイル名は行に残す。
+    fn cut(&mut self, reason: StopReason) {
+        self.file = None;
+        self.cut = Some(reason);
+    }
 }
 
 impl Capture {
-    /// upstream が答えた。ここから response のバイト列を書く。
-    pub fn respond(mut self, answered: Answered) -> Responding {
+    /// upstream から読んだ本文を、そのまま流しながら系列ごとのファイルに書く
+    /// (決定 7・10)。Wire が方言を通訳する前、gateway が本文を集め直したり
+    /// エラーの本文に差し替えたりする前のバイト列。
+    ///
+    /// 経路を試すたびに呼ばれ、呼ばれるたびにファイルを空にして書き直す。残るのは
+    /// 最後に upstream が返した応答で、それより前の経路の分は書かない。
+    pub fn tee(self: &Arc<Self>, body: crate::egress::BodyStream) -> crate::egress::BodyStream {
+        use futures_util::StreamExt as _;
+
+        let attempt = self.attempt.fetch_add(1, Ordering::AcqRel) + 1;
+        self.restart(crate::credential::time::now_unix_ms());
+        let me = Arc::clone(self);
+        body.map(move |item| {
+            if let Ok(chunk) = &item
+                && me.attempt.load(Ordering::Acquire) == attempt
+            {
+                me.write(chunk, crate::credential::time::now_unix_ms());
+            }
+            item
+        })
+        .boxed()
+    }
+
+    /// 応答のファイルを空にして開き直す。前の経路で書いた分は系列の量から戻す。
+    fn restart(&self, now: i64) {
         let response_file = format!("{}.response.sse", self.stem);
-        for entry in &mut self.entries {
+        for entry in self.entries.lock().unwrap().iter_mut() {
             if entry.series.request_only {
                 continue;
             }
-            let file = match open_new(&entry.series.dir.join(&response_file)) {
+            entry
+                .series
+                .bytes_written
+                .fetch_sub(entry.response_bytes, Ordering::AcqRel);
+            entry.response_bytes = 0;
+            entry.cut = None;
+            entry.file = match open_fresh(&entry.series.dir.join(&response_file)) {
                 Ok(file) => Some(file),
                 Err(e) => {
                     warn!(%e, dump_id = %entry.series.id, "could not open a dumped response");
                     None
                 }
             };
-            entry.response = Some((response_file.clone(), file));
-        }
-        Responding {
-            capture: self,
-            answered,
-            finished: false,
+            entry.response_file = Some(response_file.clone());
+            // 応答が届いた時点で系列が止まっていれば、1 バイトも書かずに打ち切る。
+            if !entry.series.live(now) {
+                let reason = entry.series.reason();
+                entry.cut(reason);
+            }
         }
     }
 
-    /// upstream に届かずに gateway が答えた。response のファイルは作らず、
-    /// `index.jsonl` の行だけを書く。
-    pub fn settle_without_response(self, answered: Answered) {
-        Responding {
-            capture: self,
-            answered,
-            finished: false,
-        }
-        .finish();
-    }
-}
-
-/// 応答のバイト列を書いている 1 本。
-pub struct Responding {
-    capture: Capture,
-    answered: Answered,
-    finished: bool,
-}
-
-impl Responding {
     /// 通り過ぎたチャンクをそのまま書く (決定 10)。
     ///
-    /// 上限に達したら、収まる分まで書いて打ち切り、その系列を止める (決定 5)。
+    /// 系列が止まっていれば (時限・`stop`・上限) 以後は書かずに打ち切る (決定 5)。
+    /// 上限に掛かるチャンクは収まる分まで書いて打ち切り、系列を止める。
     ///
     /// Design rationale: チャンクはその場で同期に書く。書き手の task と
     /// channel を挟むと、詰まった時に溜まる分が上限の外でメモリに乗る。
     /// 書くのは page cache までの短い write で、ダンプは調査の間だけ動く。
-    pub fn chunk(&mut self, bytes: &[u8]) {
-        for entry in &mut self.capture.entries {
-            let Some((_, Some(file))) = entry.response.as_mut() else {
+    fn write(&self, bytes: &[u8], now: i64) {
+        for entry in self.entries.lock().unwrap().iter_mut() {
+            if entry.file.is_none() {
                 continue;
-            };
+            }
+            if !entry.series.live(now) {
+                let reason = entry.series.reason();
+                entry.cut(reason);
+                continue;
+            }
             let granted = entry.series.reserve_some(bytes.len() as u64);
             let written = usize::try_from(granted).unwrap_or(bytes.len());
+            let Some(file) = entry.file.as_mut() else {
+                continue;
+            };
             if let Err(e) = file.write_all(&bytes[..written]) {
                 warn!(%e, dump_id = %entry.series.id, "could not write a dumped response");
-                close(entry);
+                entry.file = None;
                 continue;
             }
             entry.response_bytes += granted;
             if written < bytes.len() {
-                entry.truncated = true;
-                close(entry);
+                entry.cut(StopReason::MaxBytes);
                 entry.series.finish(StopReason::MaxBytes);
+            } else {
+                entry.series.stop_if_full();
             }
         }
     }
 
+    /// upstream が答えた。行は応答の終端で [`Settling::finish`] が書く。
+    pub fn answered(self: Arc<Self>, answered: Answered) -> Settling {
+        Settling {
+            capture: self,
+            answered,
+        }
+    }
+
     /// 応答の終端。系列ごとの `index.jsonl` に 1 行足す (決定 14)。2 度目は
-    /// 何もしない。
-    pub fn finish(&mut self) {
-        if self.finished {
+    /// 何もしない。upstream が答えなかった 1 本 (gateway が断った) は
+    /// response の欄を持たない。
+    pub fn settle(&self, answered: &Answered) {
+        if self.settled.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.finished = true;
-        let (capture, answered) = (&self.capture, &self.answered);
-        for entry in &capture.entries {
+        for entry in self.entries.lock().unwrap().iter_mut() {
+            entry.file = None;
             let mut line = Map::new();
-            line.insert("ts".to_owned(), json!(capture.ts));
-            line.insert("seq".to_owned(), json!(capture.seq));
+            line.insert("ts".to_owned(), json!(self.ts));
+            line.insert("seq".to_owned(), json!(self.seq));
             put(&mut line, "model", answered.model.as_ref());
             put(&mut line, "route", answered.route.as_ref());
             line.insert("status".to_owned(), json!(answered.status));
             put(&mut line, "origin", answered.origin.as_ref());
-            line.insert("stream".to_owned(), json!(capture.stream));
+            line.insert("stream".to_owned(), json!(self.stream));
             put(&mut line, "credential", answered.credential.as_ref());
             put(
                 &mut line,
@@ -641,29 +729,23 @@ impl Responding {
                 "cache_ttl_secs",
                 answered.cache_ttl_secs.as_ref(),
             );
-            line.insert("request_bytes".to_owned(), json!(capture.request_bytes));
-            line.insert("request_file".to_owned(), json!(capture.request_file));
-            if let Some((name, _)) = &entry.response {
+            line.insert("request_bytes".to_owned(), json!(self.request_bytes));
+            line.insert("request_file".to_owned(), json!(self.request_file));
+            if let Some(name) = &entry.response_file {
                 line.insert("response_bytes".to_owned(), json!(entry.response_bytes));
                 line.insert("response_file".to_owned(), json!(name));
             }
-            if entry.truncated {
+            if let Some(reason) = entry.cut {
                 line.insert("truncated".to_owned(), json!(true));
+                line.insert("reason".to_owned(), json!(reason.as_str()));
             }
-            line.insert("headers".to_owned(), Value::Object(capture.headers.clone()));
+            line.insert("headers".to_owned(), Value::Object(self.headers.clone()));
             let mut text = Value::Object(line).to_string();
             text.push('\n');
             if let Err(e) = append(&entry.series.dir.join("index.jsonl"), text.as_bytes()) {
                 warn!(%e, dump_id = %entry.series.id, "could not write the dump index");
             }
         }
-    }
-}
-
-/// response の書き口を閉じる。ファイル名は `index.jsonl` の行に残す。
-fn close(entry: &mut Entry) {
-    if let Some((_, file)) = entry.response.as_mut() {
-        *file = None;
     }
 }
 
@@ -699,12 +781,20 @@ fn kept_headers(headers: &[(String, String)]) -> Map<String, Value> {
     kept
 }
 
-/// 自分だけが入れるディレクトリを、途中の段も含めて作る。
+/// 系列のディレクトリを、`dumps/` までの途中の段も含めて自分だけが入れる形で
+/// 作る。既にあった段も 700 に閉じ直す (作る時の mode は既存の段に効かない)。
 fn make_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
+        .create(dir)?;
+    // `<dump_id>` / `<ns>` / `<unit>` / `dumps`。
+    for level in dir.ancestors().take(4) {
+        std::fs::set_permissions(level, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// 新しいファイルを自分だけが読める形で開く。
@@ -716,18 +806,37 @@ fn open_new(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// 空にして開く (経路を替えて書き直す response)。既にあったファイルも 600 に閉じる。
+fn open_fresh(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 fn write_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
     open_new(path)?.write_all(body)
 }
 
 /// 1 行を足す。行は 1 回の write で書く (`tail -f` で半端な行を見せない)。
+///
+/// 既にあったファイルも 600 に閉じる (作る時の mode は既存のファイルに効かない)。
 fn append(path: &Path, line: &[u8]) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(line)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(line)
 }
 
 /// 直下のディレクトリ (symlink は辿らない)。読めなければ空。
@@ -776,7 +885,15 @@ fn uuid_v7(now_ms: i64, fill: &mut dyn FnMut(&mut [u8])) -> String {
 mod tests {
     use super::*;
 
-    const NOW: i64 = 1_792_000_000_000;
+    use bytes::Bytes;
+    use futures_util::{FutureExt as _, StreamExt as _};
+
+    /// 試験の「今」。応答のチャンクは書く時点の壁時計で時限を見るので、
+    /// 本物の今に揃える。
+    fn now() -> i64 {
+        static NOW: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *NOW.get_or_init(crate::credential::time::now_unix_ms)
+    }
 
     fn dumps(dir: &Path) -> Arc<Dumps> {
         Arc::new(Dumps::new(dir))
@@ -792,7 +909,7 @@ mod tests {
                     max_bytes,
                     request_only: false,
                 },
-                NOW,
+                now(),
             )
             .unwrap()
     }
@@ -808,6 +925,24 @@ mod tests {
     }
 
     /// 1 本を受けて応答を書き切る。書いた系列が無ければ `false`。
+    /// upstream が `chunks` を返したことにして、tee を通して読み切る。
+    fn drain(capture: &Arc<Capture>, chunks: &[&[u8]]) {
+        let body: crate::egress::BodyStream = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>(),
+        )
+        .boxed();
+        let read: Vec<_> = capture
+            .tee(body)
+            .collect::<Vec<_>>()
+            .now_or_never()
+            .expect("an in-memory stream is ready");
+        assert_eq!(read.len(), chunks.len(), "every chunk still flows");
+    }
+
+    /// 1 本を受けて応答を書き切る。書いた系列が無ければ `false`。
     fn exchange(
         dumps: &Dumps,
         ns: &str,
@@ -819,14 +954,11 @@ mod tests {
         let Some(capture) = dumps.capture(received(ns, seq, request), now) else {
             return false;
         };
-        let mut responding = capture.respond(Answered {
+        drain(&capture, chunks);
+        capture.settle(&Answered {
             status: 200,
             ..Default::default()
         });
-        for chunk in chunks {
-            responding.chunk(chunk);
-        }
-        responding.finish();
         true
     }
 
@@ -843,18 +975,18 @@ mod tests {
     fn only_the_namespace_of_a_running_dump_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let dumps = dumps(dir.path());
-        assert!(!exchange(&dumps, "lab", 1, b"{}", &[], NOW));
+        assert!(!exchange(&dumps, "lab", 1, b"{}", &[], now()));
         assert!(!dir.path().join("dumps").exists(), "nothing was made");
 
         let view = start(&dumps, "lab", 60_000, None);
-        assert!(!exchange(&dumps, "other", 2, b"{}", &[], NOW));
+        assert!(!exchange(&dumps, "other", 2, b"{}", &[], now()));
         assert!(exchange(
             &dumps,
             "lab",
             3,
             b"{\"a\":1}",
             &[b"event: x\n", b"data: {}\n\n"],
-            NOW
+            now()
         ));
 
         let lines = index(&view);
@@ -881,12 +1013,12 @@ mod tests {
         let dumps = dumps(dir.path());
         let view = start(&dumps, "lab", 1_000, None);
 
-        assert!(exchange(&dumps, "lab", 1, b"{}", &[], NOW + 999));
-        assert!(!exchange(&dumps, "lab", 2, b"{}", &[], NOW + 1_000));
+        assert!(exchange(&dumps, "lab", 1, b"{}", &[], now() + 999));
+        assert!(!exchange(&dumps, "lab", 2, b"{}", &[], now() + 1_000));
 
         assert_eq!(index(&view).len(), 1);
-        assert!(dumps.status(NOW + 1_000).is_empty());
-        assert!(dumps.running(NOW).is_empty(), "stopped for good");
+        assert!(dumps.status(now() + 1_000).is_empty());
+        assert!(dumps.running(now()).is_empty(), "stopped for good");
         assert_eq!(dumps.active.load(Ordering::Acquire), 0);
     }
 
@@ -911,8 +1043,8 @@ mod tests {
         let dumps = dumps(dir.path());
 
         let refused = start(&dumps, "a", 60_000, Some(4));
-        assert!(!exchange(&dumps, "a", 1, b"12345", &[], NOW));
-        assert!(dumps.status(NOW).is_empty(), "stopped by the limit");
+        assert!(!exchange(&dumps, "a", 1, b"12345", &[], now()));
+        assert!(dumps.status(now()).is_empty(), "stopped by the limit");
         assert_eq!(std::fs::read_dir(&refused.dump_dir).unwrap().count(), 0);
 
         let truncated = start(&dumps, "b", 60_000, Some(10));
@@ -922,10 +1054,11 @@ mod tests {
             2,
             b"1234",
             &[b"abc", b"defgh", b"ij"],
-            NOW
+            now()
         ));
         let lines = index(&truncated);
         assert_eq!(lines[0]["truncated"], true);
+        assert_eq!(lines[0]["reason"], "max_bytes");
         assert_eq!(lines[0]["response_bytes"], 6);
         let response =
             Path::new(&truncated.dump_dir).join(lines[0]["response_file"].as_str().unwrap());
@@ -934,7 +1067,7 @@ mod tests {
         assert_eq!(stopped.bytes_written, Some(10));
         assert_eq!(stopped.active, Some(false));
         assert!(
-            !exchange(&dumps, "b", 3, b"x", &[], NOW),
+            !exchange(&dumps, "b", 3, b"x", &[], now()),
             "it stays stopped"
         );
     }
@@ -948,12 +1081,12 @@ mod tests {
         let second = start(&dumps, "lab", 60_000, None);
         assert_ne!(first.dump_id, second.dump_id);
 
-        assert!(exchange(&dumps, "lab", 7, b"{}", &[b"x"], NOW));
+        assert!(exchange(&dumps, "lab", 7, b"{}", &[b"x"], now()));
 
         for view in [&first, &second] {
             assert_eq!(index(view).len(), 1);
         }
-        let status = dumps.status(NOW);
+        let status = dumps.status(now());
         assert_eq!(status.len(), 2);
         assert!(
             status
@@ -975,10 +1108,10 @@ mod tests {
         assert_eq!(dumps.stop(&a.dump_id).unwrap().active, Some(false));
         assert_eq!(dumps.stop("nope").unwrap_err().kind, "unknown_dump");
 
-        let stopped = dumps.stop_all(NOW);
+        let stopped = dumps.stop_all(now());
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].dump_id, b.dump_id);
-        assert!(dumps.stop_all(NOW).is_empty());
+        assert!(dumps.stop_all(now()).is_empty());
         assert_eq!(dumps.active.load(Ordering::Acquire), 0);
     }
 
@@ -997,7 +1130,7 @@ mod tests {
                         max_bytes: None,
                         request_only: false,
                     },
-                    NOW,
+                    now(),
                 )
                 .unwrap_err();
             assert_eq!(refused.kind, "invalid_namespace", "{ns}");
@@ -1009,13 +1142,33 @@ mod tests {
             max_bytes: None,
             request_only: false,
         };
-        assert_eq!(dumps.start(&zero, NOW).unwrap_err().kind, "bad_request");
+        assert_eq!(
+            dumps.start(&zero, now()).unwrap_err().kind,
+            "invalid_duration"
+        );
+        let too_long = Start {
+            for_ms: MAX_FOR_MS + 1,
+            ..zero.clone()
+        };
+        assert_eq!(
+            dumps.start(&too_long, now()).unwrap_err().kind,
+            "invalid_duration"
+        );
+        let longest = Start {
+            ns: "longest",
+            for_ms: MAX_FOR_MS,
+            ..zero.clone()
+        };
+        assert!(
+            dumps.start(&longest, now()).is_ok(),
+            "24h itself is allowed"
+        );
         let empty = Start {
             for_ms: 1,
             max_bytes: Some(0),
             ..zero
         };
-        assert_eq!(dumps.start(&empty, NOW).unwrap_err().kind, "bad_request");
+        assert_eq!(dumps.start(&empty, now()).unwrap_err().kind, "bad_request");
     }
 
     /// 片付けは 48 時間より古い系列だけをディレクトリごと消し、空になった
@@ -1057,9 +1210,10 @@ mod tests {
     fn a_running_dump_survives_the_sweep_and_its_directory_comes_back() {
         let dir = tempfile::tempdir().unwrap();
         let dumps = dumps(dir.path());
-        let later = NOW + KEEP_MS * 2;
-        let view = start(&dumps, "lab", KEEP_MS * 4, None);
-        let aged = std::time::UNIX_EPOCH + std::time::Duration::from_millis(NOW as u64);
+        let later = now() + 3600 * 1000;
+        let view = start(&dumps, "lab", MAX_FOR_MS, None);
+        let aged = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis((now() - KEEP_MS - 3600 * 1000) as u64);
         std::fs::File::open(&view.dump_dir)
             .unwrap()
             .set_modified(aged)
@@ -1125,8 +1279,8 @@ mod tests {
     fn a_dump_id_is_a_uuid_v7_ordered_by_time() {
         let id = uuid_v7(0x0190_0000_0001, &mut |buf| buf.fill(0xff));
         assert_eq!(id, "01900000-0001-7fff-bfff-ffffffffffff");
-        let earlier = uuid_v7(NOW, &mut |buf| buf.fill(0xff));
-        let later = uuid_v7(NOW + 1, &mut |buf| buf.fill(0));
+        let earlier = uuid_v7(now(), &mut |buf| buf.fill(0xff));
+        let later = uuid_v7(now() + 1, &mut |buf| buf.fill(0));
         assert!(earlier < later);
     }
 
@@ -1138,9 +1292,9 @@ mod tests {
         let view = start(&dumps, "lab", 60_000, None);
 
         dumps
-            .capture(received("lab", 9, b"{}"), NOW)
+            .capture(received("lab", 9, b"{}"), now())
             .unwrap()
-            .settle_without_response(Answered {
+            .settle(&Answered {
                 status: 503,
                 model: Some("m".to_owned()),
                 ..Default::default()
@@ -1151,5 +1305,155 @@ mod tests {
         assert_eq!(lines[0]["model"], "m");
         assert!(lines[0].get("response_file").is_none());
         assert_eq!(std::fs::read_dir(&view.dump_dir).unwrap().count(), 2);
+    }
+
+    /// 上限ちょうどまで書いたら止まる。最後まで収まった 1 本は打ち切りではなく、
+    /// その後のチャンクから `reason: "max_bytes"` で打ち切る (決定 5)。
+    #[test]
+    fn reaching_the_limit_exactly_stops_the_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+
+        let exact = start(&dumps, "a", 60_000, Some(6));
+        assert!(exchange(&dumps, "a", 1, b"12", &[b"abcd"], now()));
+        assert!(dumps.status(now()).is_empty(), "stopped at the limit");
+        let line = &index(&exact)[0];
+        assert!(line.get("truncated").is_none(), "{line}");
+
+        let over = start(&dumps, "b", 60_000, Some(6));
+        assert!(exchange(&dumps, "b", 2, b"12", &[b"abcd", b"e"], now()));
+        let line = &index(&over)[0];
+        assert_eq!(line["truncated"], true);
+        assert_eq!(line["reason"], "max_bytes");
+        assert_eq!(line["response_bytes"], 4);
+
+        let request_fills = start(&dumps, "c", 60_000, Some(2));
+        assert!(exchange(&dumps, "c", 3, b"12", &[b"x"], now()));
+        let line = &index(&request_fills)[0];
+        assert_eq!(line["reason"], "max_bytes", "{line}");
+        assert_eq!(line["response_bytes"], 0);
+    }
+
+    /// 止めた系列には、流れている途中の応答も以後のチャンクを書かず、行に
+    /// `truncated: true` と `reason: "stopped"` が付く (決定 5)。
+    #[test]
+    fn stopping_cuts_a_response_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+        let view = start(&dumps, "lab", 60_000, None);
+        let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+
+        let body: crate::egress::BodyStream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"first")),
+            Ok(Bytes::from_static(b"second")),
+        ])
+        .boxed();
+        let mut teed = capture.tee(body);
+        teed.next().now_or_never().unwrap().unwrap().unwrap();
+        dumps.stop(&view.dump_id).unwrap();
+        let rest = teed.next().now_or_never().unwrap().unwrap().unwrap();
+        assert_eq!(&rest[..], b"second", "the client still gets everything");
+        capture.settle(&Answered {
+            status: 200,
+            ..Default::default()
+        });
+
+        let line = &index(&view)[0];
+        assert_eq!(line["truncated"], true);
+        assert_eq!(line["reason"], "stopped");
+        assert_eq!(line["response_bytes"], 5);
+    }
+
+    /// 時限を過ぎた系列も、流れている途中の応答を書かずに `reason: "expired"` で
+    /// 打ち切る。チャンクを書く時点の壁時計で見る (決定 1)。
+    #[test]
+    fn expiry_cuts_a_response_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+        // 時限が今ちょうどで終わる系列。受けたのはその手前。
+        let started = crate::credential::time::now_unix_ms() - 10_000;
+        let view = dumps
+            .start(
+                &Start {
+                    unit: "u",
+                    ns: "lab",
+                    for_ms: 10_000,
+                    max_bytes: None,
+                    request_only: false,
+                },
+                started,
+            )
+            .unwrap();
+        let capture = dumps
+            .capture(received("lab", 1, b"{}"), started + 9_999)
+            .unwrap();
+
+        drain(&capture, &[b"late"]);
+        capture.settle(&Answered {
+            status: 200,
+            ..Default::default()
+        });
+
+        let line = &index(&view)[0];
+        assert_eq!(line["truncated"], true);
+        assert_eq!(line["reason"], "expired");
+        assert_eq!(line["response_bytes"], 0);
+    }
+
+    /// 経路を替えて試し直したら、書き先は最後に upstream が返した応答に切り替わり、
+    /// 前の経路の分は系列の量からも戻る。前の応答の残りが後から流れても書かない。
+    #[test]
+    fn a_retried_route_replaces_the_earlier_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+        let view = start(&dumps, "lab", 60_000, None);
+        let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+
+        let earlier: crate::egress::BodyStream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"denied")),
+            Ok(Bytes::from_static(b"-rest")),
+        ])
+        .boxed();
+        let mut earlier = capture.tee(earlier);
+        earlier.next().now_or_never().unwrap().unwrap().unwrap();
+        drain(&capture, &[b"answer"]);
+        earlier.next().now_or_never().unwrap().unwrap().unwrap();
+        capture.settle(&Answered {
+            status: 200,
+            ..Default::default()
+        });
+
+        let line = &index(&view)[0];
+        let response = Path::new(&view.dump_dir).join(line["response_file"].as_str().unwrap());
+        assert_eq!(std::fs::read_to_string(response).unwrap(), "answer");
+        assert_eq!(line["response_bytes"], 6);
+        assert_eq!(dumps.status(now())[0].bytes_written, Some(2 + 6));
+    }
+
+    /// 前からあった `index.jsonl` とディレクトリも、書く時に 600 / 700 に閉じ直す。
+    #[test]
+    fn existing_files_and_directories_are_closed_again() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+        let view = start(&dumps, "lab", 60_000, None);
+        let series = Path::new(&view.dump_dir);
+        let index_path = series.join("index.jsonl");
+        std::fs::write(&index_path, "").unwrap();
+        let open = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(&index_path, open.clone()).unwrap();
+        let open_dir = std::fs::Permissions::from_mode(0o755);
+        for level in series.ancestors().take(4) {
+            std::fs::set_permissions(level, open_dir.clone()).unwrap();
+        }
+
+        assert!(exchange(&dumps, "lab", 1, b"{}", &[b"x"], now()));
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&index_path), 0o600);
+        for level in series.ancestors().take(4) {
+            assert_eq!(mode(level), 0o700, "{}", level.display());
+        }
     }
 }

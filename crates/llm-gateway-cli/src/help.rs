@@ -124,7 +124,8 @@ commands:
 
 start options:
   --ns <ns>         the namespace to dump (required)
-  --for <duration>  how long it runs, like 10m / 1h (required, no default)
+  --for <duration>  how long it runs, like 10m / 1h (required, no default,
+                    at most 24h)
   --max-bytes <n>   stop once this many bytes of bodies are written
                     (default: 209715200, that is 200 MiB)
   --request-only    write requests only, not responses
@@ -140,12 +141,14 @@ where it writes:
   <[stats] dir>/dumps/<unit>/<ns>/<dump_id>/ (directories 700, files 600):
   index.jsonl (one line per request: ts, seq, model, route, status, origin,
   stream, credential, cache_strategy, cache_ttl_secs, request_bytes,
-  response_bytes, request_file, response_file, truncated, headers without
-  authorization / proxy-authorization / x-api-key / cookie), and per request
+  response_bytes, request_file, response_file, truncated and reason for a
+  response cut off by the limit / --for / stop, headers without authorization /
+  proxy-authorization / x-api-key / cookie), and per request
   <ts>-<seq>.request.json (the body as received, before the gateway rewrites it)
-  and <ts>-<seq>.response.sse (the bytes upstream returned). dumps older than 48
-  hours are removed when a unit starts and on every start. the files hold the
-  conversation itself: do not paste them anywhere public.
+  and <ts>-<seq>.response.sse (the bytes upstream returned, before the gateway
+  translates or replaces them). dumps older than 48 hours are removed when a unit
+  starts and on every start. the files hold the conversation itself: do not
+  paste them anywhere public.
 
 output:
   answers are JSON {unit, ok, ...} on stdout; when ok is false the answer goes to

@@ -102,6 +102,7 @@ impl Wire for AnthropicWire {
         request: UpstreamRequest,
         // 上流もクライアントも Anthropic 方言なので、通訳する余地が無い。
         _shape: RequestShape,
+        raw: crate::egress::RawBody<'a>,
     ) -> BoxFuture<'a, Result<Response>> {
         Box::pin(async move {
             let UpstreamRequest { url, headers, body } = request;
@@ -141,6 +142,7 @@ impl Wire for AnthropicWire {
                     })
                 })
                 .boxed();
+            let body = crate::egress::observe_raw(raw, body);
 
             Ok(Response {
                 status,

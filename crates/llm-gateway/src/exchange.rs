@@ -233,16 +233,17 @@ pub struct BodyObservation {
     model: String,
     /// 出した側の 1 語 (DR-0029)。集計を素性で割るための鍵。
     origin: String,
-    /// 一時ダンプの書き先 (DR-0038 決定 10)。動いている系列が無ければ `None`。
-    dump: Option<dump::Responding>,
+    /// 一時ダンプの 1 本 (DR-0038 決定 14)。終端で `index.jsonl` に行を書く。
+    /// 動いている系列が無ければ `None`。
+    dump: Option<dump::Settling>,
     /// 応答が閉じたことを流す先と、その下書き。流さない応答では `None`。
     completion: Option<Completion>,
 }
 
 impl BodyObservation {
-    /// 一時ダンプの系列が動いている間だけ、通り過ぎるチャンクをそのまま書く
-    /// (DR-0038 決定 10)。終端で溜めて 1 件にまとめない。
-    pub fn with_dump(mut self, dump: Option<dump::Responding>) -> Self {
+    /// 一時ダンプの 1 本の行を、応答の終端 (完了・エラー・中断) で書く
+    /// (DR-0038 決定 14)。本文そのものは upstream から読んだ所で書いてある。
+    pub fn with_dump(mut self, dump: Option<dump::Settling>) -> Self {
         self.dump = dump;
         self
     }
@@ -334,7 +335,7 @@ impl BodyObservation {
         self.note_gap(Instant::now());
         let outcome = self.finish_usage();
         self.tell_completed(outcome, completed);
-        if let Some(mut dump) = self.dump.take() {
+        if let Some(dump) = self.dump.take() {
             dump.finish();
         }
         (
@@ -365,9 +366,6 @@ impl Stream for BodyObservation {
                 this.note_gap(now);
                 this.last_chunk = Some(now);
                 this.bytes += chunk.len() as u64;
-                if let Some(dump) = this.dump.as_mut() {
-                    dump.chunk(&chunk);
-                }
                 if let Some(observer) = this.observer.as_mut() {
                     observer.observe(&chunk);
                 }

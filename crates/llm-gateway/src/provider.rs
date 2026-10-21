@@ -49,11 +49,15 @@ pub trait Wire: Send + Sync {
     ///
     /// `shape` は**クライアントから受けた形**。上流の方言をクライアントの
     /// 方言へ通訳するかどうかがこれで決まる (同じ形で受けたなら通訳しない)。
+    ///
+    /// upstream から読んだ本文は、通訳する前に `raw` へ通す
+    /// ([`crate::egress::observe_raw`])。
     fn send<'a>(
         &'a self,
         http: &'a reqwest::Client,
         request: UpstreamRequest,
         shape: RequestShape,
+        raw: crate::egress::RawBody<'a>,
     ) -> BoxFuture<'a, Result<Response>>;
 }
 
@@ -490,6 +494,7 @@ mod tests {
             _http: &'a reqwest::Client,
             _request: UpstreamRequest,
             _shape: RequestShape,
+            _raw: crate::egress::RawBody<'a>,
         ) -> BoxFuture<'a, Result<Response>> {
             Box::pin(async {
                 let body: BodyStream = Box::pin(futures_util::stream::empty());

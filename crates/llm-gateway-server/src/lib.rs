@@ -718,7 +718,7 @@ async fn forward<P: CredentialPersistence + 'static>(
     let query = uri.query().map(str::to_owned);
 
     match gateway
-        .forward_as(
+        .forward_dumping(
             principal.as_ref(),
             &ns,
             &ns_name,
@@ -729,14 +729,16 @@ async fn forward<P: CredentialPersistence + 'static>(
             },
             json,
             headers,
+            dumping.as_ref(),
         )
         .instrument(span.clone())
         .await
     {
         Ok(forwarded) => {
             let upstream = forwarded.response;
+            // 本文は upstream から読んだ所で書いてある。ここで決まるのは行の欄。
             let dumping = dumping.map(|capture| {
-                capture.respond(llm_gateway::dump::Answered {
+                capture.answered(llm_gateway::dump::Answered {
                     status: upstream.status,
                     model: Some(forwarded.model.clone()),
                     route: Some(forwarded.route.clone()),
@@ -792,10 +794,11 @@ async fn forward<P: CredentialPersistence + 'static>(
         }
         Err(e) => {
             let response = span.in_scope(|| error_response(&ns_name, &e));
-            // upstream に届かずに gateway が答えた。返したのは upstream の
-            // バイト列ではないので、行だけを書く。
+            // gateway が答えた。返したのは upstream のバイト列ではないので
+            // 行の欄はこちらの答えから取る。upstream が答えていた経路があれば、
+            // その最後の 1 本の本文は書いてある。
             if let Some(capture) = dumping {
-                capture.settle_without_response(llm_gateway::dump::Answered {
+                capture.settle(&llm_gateway::dump::Answered {
                     status: response.status().as_u16(),
                     model: requested_model,
                     ..Default::default()

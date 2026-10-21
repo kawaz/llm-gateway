@@ -211,6 +211,20 @@ impl std::fmt::Debug for Response {
     }
 }
 
+/// upstream から読んだ本文を、Wire が解釈する前に通す口 (DR-0038 決定 10)。
+///
+/// 一時ダンプが upstream の生のバイト列を控えるのに使う。通した本文は
+/// そのまま流れ、Wire はその後で方言を通訳する。控えない 1 本は `None`。
+pub type RawBody<'a> = Option<&'a (dyn Fn(BodyStream) -> BodyStream + Send + Sync)>;
+
+/// upstream から読んだ本文を [`RawBody`] に通す。
+pub fn observe_raw(raw: RawBody<'_>, body: BodyStream) -> BodyStream {
+    match raw {
+        Some(observe) => observe(body),
+        None => body,
+    }
+}
+
 /// 1 本送る。
 ///
 /// 返るのは upstream のヘッダを受け取った時点。本文はまだ流れていないので、
@@ -224,6 +238,7 @@ pub async fn send(
     preset: &Preset,
     credential: Option<&Credential>,
     request: EgressRequest,
+    raw: RawBody<'_>,
 ) -> Result<SentResponse> {
     let shape = request.shape;
     let EncodedRequest {
@@ -234,7 +249,7 @@ pub async fn send(
     preset.auth().authorize(credential, &mut upstream)?;
     // 受けた形も渡す。上流の応答をクライアントの方言へ通訳するかどうかは
     // 「何で受けたか」で決まり、送る内容 ([`UpstreamRequest`]) からは読めない。
-    let response = preset.wire().send(http, upstream, shape).await?;
+    let response = preset.wire().send(http, upstream, shape, raw).await?;
     Ok(SentResponse {
         response,
         mode,
