@@ -83,7 +83,7 @@ gateway は控えに持ち回してはいけないヘッダの述語を既に 1 
 
 request は受け口 (`llm-gateway-server` の `forward`、`messages` / `responses` の両方が通る) で、ヘッダを受けて ns 認証 (ヘッダだけで決まる) を通した直後、本文を読む前に `request_headers` を書き、本文を受け取り終えたら `*.request.json` / `*.request.body` / `request_body_end` を書く (書き換えは試行ごとの response 側に載せるので、送る形が決まるのを待たない — 決定 7)。応答の順 (本文が読めない → JSON でない → ns が無い → 認証に断られる) は変えない。response は各経路の `Wire::send` (`AnthropicWire` / `OpenAiWire`) が upstream から本文を読み出した直後に `egress::observe_raw` へ通し、方言の通訳 (`openai::response::translate`)、採用判定 (`ResponseAdmission::admit`)、集め直し (`egress::adapt_response`)、エラー本文への差し替え (`client_error_response`) を経る前のチャンクを、通り過ぎるたびに書く。
 
-- ns 認証に断られた 1 本は書かない (request を受けた、と言えるのは認証を通ってから)
+- ns 認証に断られた 1 本は書かない (request を受けた、と言えるのは認証を通ってから)。それ以外は、本文がどうであってもヘッダの時点で記録を始める
 - 本文を受け取りきれなかった・読めなかった 1 本 (JSON として読めない、途中で切れた、64 MiB を超えた) は、`request_body_end` と `*.request.json` に `error: "invalid_json" | "truncated" | "too_large"` を付けて残し、受けた本文 (切れたならそこまで、超えたなら上限まで) を生のまま `*.request.body` に書く。クライアントが何を送ったかが調査の材料だから (統括の裁定)
 - gateway が自分で組んだエラーを返した 1 本 (経路が尽きた・モデルが無い等) は、受け口がエラー応答を返す所で `response_headers_sent` (`adopted: null`) を書く
 - 認証差し替えの中継 (DR-0030 §2 の passthrough) は本文を読まずに流す口で、対象にしない

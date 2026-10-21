@@ -68,16 +68,16 @@ impl StopReason {
 
 /// 動いている系列が共有する、全体の実使用量と fs の空き容量。
 struct Usage {
-    /// 動いている系列が書いた本文の合計。止まった系列の分は差し引く。
-    total: AtomicU64,
-    /// fs の空き容量の見込み: 測った値から、その後に書くことにした分を引いたもの。
-    /// 書く側はここから compare_exchange で引き、測り直しは新しい値から書き手が
-    /// まだ書いていない分 ([`Self::fs_pending`]) を引いて置き直す。1 つの atomic に
-    /// まとめるのは、「測った値」と「その後に引いた分」を別々に読み書きすると、
-    /// 測り直しの合間に引いた分が消えるため。
-    fs_available: AtomicU64,
-    /// 書くことにしたが、書き手がまだ書いていない分。
-    fs_pending: AtomicU64,
+    /// 容量の数。系列ごとの書いた量・止まったかと合わせて、この錠の中だけで
+    /// 読み書きする。
+    ///
+    /// Design rationale: 系列の量・全体の量・fs の見込みは 3 つの上限を同時に
+    /// 満たすかで決まり、止める側は系列の量を全体から引く。atomic を別々に
+    /// 足し引きすると、確かめてから足すまでの間に止める側が割り込み、順序次第で
+    /// 他の系列の量を消したり止まった系列の量を残したりする。区間は数の読み書き
+    /// だけで I/O も alloc もしないので、中継を待たせない (動いている系列が無い
+    /// 間は錠に触らない)。
+    accounting: Mutex<Accounting>,
     /// 最後に測った空き容量 (答えの `fs_free_bytes`)。
     fs_measured: AtomicU64,
     /// それを測った時刻。0 は未計測。
@@ -86,8 +86,20 @@ struct Usage {
     root: PathBuf,
 }
 
+/// 容量の数。
+#[derive(Debug, Default)]
+struct Accounting {
+    /// 動いている系列が書いた本文の合計。止まった系列の分は差し引く。
+    total: u64,
+    /// fs の空き容量の見込み: 測った値から、その後に書くことにした分を引いたもの。
+    fs_available: u64,
+    /// 書くことにしたが、書き手がまだ書いていない分。測り直す時に空き容量から引く。
+    fs_pending: u64,
+}
+
 impl Usage {
     /// 空き容量を測り直す。間隔より新しければ何もしない (`force` で必ず)。
+    /// 測るのは錠の外、置き直すのは錠の中。
     fn refresh(&self, now: i64, force: bool) {
         let checked = self.fs_checked_at.load(Ordering::Acquire);
         if !force && checked != 0 && now - checked < FS_CHECK_MS {
@@ -96,69 +108,24 @@ impl Usage {
         let Some(free) = fs_free(&self.root) else {
             return;
         };
-        let mut current = self.fs_available.load(Ordering::Acquire);
-        loop {
-            let available = free.saturating_sub(self.fs_pending.load(Ordering::Acquire));
-            match self.fs_available.compare_exchange_weak(
-                current,
-                available,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(now) => current = now,
-            }
+        {
+            let mut accounting = lock(&self.accounting);
+            accounting.fs_available = free.saturating_sub(accounting.fs_pending);
         }
         self.fs_measured.store(free, Ordering::Release);
         self.fs_checked_at.store(now, Ordering::Release);
     }
 
-    /// 空き容量の見込みから、`floor` を残して `want` までを取る。取れた量を返す。
-    ///
-    /// 未確定分には先に足しておく (測り直しが取った分を見落とさないよう、
-    /// 取る前から未確定に数える。取れなかった分は後で外す)。
-    fn take_fs(&self, want: u64, floor: u64) -> u64 {
-        self.fs_pending.fetch_add(want, Ordering::AcqRel);
-        let mut current = self.fs_available.load(Ordering::Acquire);
-        let got = loop {
-            let got = want.min(current.saturating_sub(floor));
-            match self.fs_available.compare_exchange_weak(
-                current,
-                current - got,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break got,
-                Err(now) => current = now,
-            }
-        };
-        self.written(want - got);
-        got
-    }
-
-    /// 取ったが書かないことにした分を返す。
-    fn give_back_fs(&self, bytes: u64) {
-        self.fs_available.fetch_add(bytes, Ordering::AcqRel);
-        self.written(bytes);
-    }
-
     /// 書き手が書いた (書けなかった) 分を未確定から外す。
     fn written(&self, bytes: u64) {
-        let mut pending = self.fs_pending.load(Ordering::Acquire);
-        while let Err(now) = self.fs_pending.compare_exchange_weak(
-            pending,
-            pending.saturating_sub(bytes),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            pending = now;
-        }
+        let mut accounting = lock(&self.accounting);
+        accounting.fs_pending = accounting.fs_pending.saturating_sub(bytes);
+    }
+
+    fn total(&self) -> u64 {
+        lock(&self.accounting).total
     }
 }
-
-/// 止まった系列の [`Series::bytes_written`] に立てる印。立った後は誰も足し引き
-/// しない ([`Series::stop`] と [`Series::reserve`] の順の約束)。
-const SEALED: u64 = 1 << 63;
 
 /// `path` (無ければ在る祖先) の fs で、一般の利用者が使える空き容量。
 fn fs_free(path: &Path) -> Option<u64> {
@@ -204,31 +171,20 @@ impl Series {
     /// 動いていれば止めて、理由を log に出す。既に止まっていれば何もしない。
     ///
     /// 全体の実使用量が数えるのは動いている系列だけなので、書いた量を引く
-    /// (reference `capacity`)。引く量は [`SEALED`] を立てるのと同じ 1 回の
-    /// fetch_or で読む。[`Self::reserve`] は系列の量への加算を印が無い時だけ
-    /// 行い、加算した分は (後で止まっても) 全体へも必ず 1 回足す。だから印より前の
-    /// 加算はここで引く量に入り、印より後の加算は起きない — 二重にも引かず、
-    /// 取りこぼしもしない。
+    /// (reference `capacity`)。止めるのと引くのは容量の錠の中で 1 回にする
+    /// ([`Usage::accounting`])。
     pub(crate) fn stop(&self, reason: StopReason, now: i64) {
-        if self
-            .active
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        *lock(&self.stopped) = Some((reason, now));
+        let written = {
+            let mut accounting = lock(&self.usage.accounting);
+            if !self.active.swap(false, Ordering::AcqRel) {
+                return;
+            }
+            *lock(&self.stopped) = Some((reason, now));
+            let written = self.bytes_written.load(Ordering::Acquire);
+            accounting.total = accounting.total.saturating_sub(written);
+            written
+        };
         self.counter.fetch_sub(1, Ordering::AcqRel);
-        let written = self.bytes_written.fetch_or(SEALED, Ordering::AcqRel) & !SEALED;
-        let mut total = self.usage.total.load(Ordering::Acquire);
-        while let Err(now) = self.usage.total.compare_exchange_weak(
-            total,
-            total.saturating_sub(written),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            total = now;
-        }
         info!(
             dump_id = %self.id,
             ns = %self.ns,
@@ -239,9 +195,9 @@ impl Series {
         self.writer.wake();
     }
 
-    /// 本文に書いた量 ([`SEALED`] を除く)。
+    /// 本文に書いた量。
     fn written(&self) -> u64 {
-        self.bytes_written.load(Ordering::Acquire) & !SEALED
+        self.bytes_written.load(Ordering::Acquire)
     }
 
     /// `now` に動いているか。時限を過ぎていればここで止める。
@@ -276,93 +232,51 @@ impl Series {
     }
 
     /// `want` バイトを書く前に、3 つの上限 (この系列の `max_bytes`、全体の
-    /// `max_total_bytes`、fs の `fs_min_free`) を先に加算して確かめる
-    /// (reference `capacity`)。`whole` なら全部書けない時は 1 バイトも書かない。
+    /// `max_total_bytes`、fs の `fs_min_free`) を確かめて足す (reference
+    /// `capacity`)。`whole` なら全部書けない時は 1 バイトも書かない。
     ///
-    /// 上限に**達した**ら (超えなくても) `limited` に理由を返す。系列が止まって
-    /// いれば 0 で、理由は付けない (止めた側が理由を持っている)。
+    /// 止まっていないかの確認・3 つの上限・3 つへの加算を、容量の錠の中で 1 回に
+    /// する ([`Usage::accounting`])。上限に**達した**ら (超えなくても) `limited` に
+    /// 理由を返す。止まっていれば 0 で、理由は付けない (止めた側が持っている)。
     fn reserve(&self, want: u64, whole: bool) -> Grant {
-        let stopped = Grant {
-            bytes: 0,
-            limited: None,
-        };
-        // この系列の上限。止まった系列 (印あり) には足さない。
-        let mut written = self.bytes_written.load(Ordering::Acquire);
-        let granted = loop {
-            if written & SEALED != 0 {
-                return stopped;
-            }
-            let mut granted = want.min(self.max_bytes.saturating_sub(written));
-            if whole && granted < want {
-                granted = 0;
-            }
-            match self.bytes_written.compare_exchange_weak(
-                written,
-                written + granted,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break granted,
-                Err(now) => written = now,
-            }
-        };
-        let mut limited =
-            (granted < want || written + granted >= self.max_bytes).then_some(StopReason::MaxBytes);
-
-        // 全体の上限 (先に足してから確かめる)。系列に足した分は、この後に止まって
-        // いても必ず 1 回足す (止めた側が印の時点の量を引くので)。
-        let before = self.usage.total.fetch_add(granted, Ordering::AcqRel);
-        let allowed = granted.min(self.max_total_bytes.saturating_sub(before));
-        if allowed < granted {
-            limited = Some(StopReason::TotalLimit);
-        } else if before + allowed >= self.max_total_bytes {
-            limited = limited.or(Some(StopReason::TotalLimit));
+        let mut accounting = lock(&self.usage.accounting);
+        if !self.active.load(Ordering::Acquire) {
+            return Grant {
+                bytes: 0,
+                limited: None,
+            };
         }
-
-        // fs の空き容量。
-        let mut kept = self.usage.take_fs(allowed, self.fs_min_free);
-        if kept < allowed {
-            limited = Some(StopReason::FsMinFree);
-        } else if kept > 0 && self.usage.fs_available.load(Ordering::Acquire) <= self.fs_min_free {
-            limited = limited.or(Some(StopReason::FsMinFree));
+        let written = self.bytes_written.load(Ordering::Acquire);
+        let room = [
+            (self.max_bytes.saturating_sub(written), StopReason::MaxBytes),
+            (
+                self.max_total_bytes.saturating_sub(accounting.total),
+                StopReason::TotalLimit,
+            ),
+            (
+                accounting.fs_available.saturating_sub(self.fs_min_free),
+                StopReason::FsMinFree,
+            ),
+        ];
+        // いちばん狭い上限が、書ける量と止まる理由を決める。
+        let (narrowest, reason) = room
+            .into_iter()
+            .min_by_key(|(room, _)| *room)
+            .unwrap_or((0, StopReason::MaxBytes));
+        let mut granted = want.min(narrowest);
+        if whole && granted < want {
+            granted = 0;
         }
-        if whole && kept < want {
-            self.usage.give_back_fs(kept);
-            kept = 0;
-        }
-        // 書かない分を戻す。止まった後 (印あり) は戻さない — 止めた側が印の時点の
-        // 量を全体から引いたので、ここで引くと二重になる。
-        let back = granted - kept;
-        if back > 0 && self.unreserve(back) {
-            self.usage.total.fetch_sub(back, Ordering::AcqRel);
-        }
-        // 先に止まっていたら書かない (書き手にも渡らない)。
-        if self.bytes_written.load(Ordering::Acquire) & SEALED != 0 {
-            self.usage.give_back_fs(kept);
-            return stopped;
-        }
+        self.bytes_written
+            .store(written + granted, Ordering::Release);
+        accounting.total += granted;
+        accounting.fs_available -= granted;
+        accounting.fs_pending += granted;
+        // 書けない分があった、または書いて上限ちょうどに達した。
+        let limited = (granted < want || narrowest == granted).then_some(reason);
         Grant {
-            bytes: kept,
+            bytes: granted,
             limited,
-        }
-    }
-
-    /// 系列の量から `bytes` を戻す。止まっていたら戻さずに `false`。
-    fn unreserve(&self, bytes: u64) -> bool {
-        let mut written = self.bytes_written.load(Ordering::Acquire);
-        loop {
-            if written & SEALED != 0 {
-                return false;
-            }
-            match self.bytes_written.compare_exchange_weak(
-                written,
-                written - bytes,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(now) => written = now,
-            }
         }
     }
 
@@ -532,9 +446,7 @@ impl Dumps {
             .join("dumps");
         Self {
             usage: Arc::new(Usage {
-                total: AtomicU64::new(0),
-                fs_available: AtomicU64::new(0),
-                fs_pending: AtomicU64::new(0),
+                accounting: Mutex::new(Accounting::default()),
                 fs_measured: AtomicU64::new(0),
                 fs_checked_at: AtomicI64::new(0),
                 root: root.clone(),
@@ -684,7 +596,7 @@ impl Dumps {
             .filter(|s| s.active.load(Ordering::Acquire))
             .map(|s| s.max_bytes)
             .sum();
-        let used = self.usage.total.load(Ordering::Acquire);
+        let used = self.usage.total();
         let fs_free = self.usage.fs_measured.load(Ordering::Acquire);
         let started = Started {
             dump_id: id,

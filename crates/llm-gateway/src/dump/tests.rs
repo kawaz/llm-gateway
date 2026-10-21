@@ -1027,11 +1027,7 @@ fn stopping_while_writing_leaves_no_bytes_in_the_total() {
         for writer in writers {
             writer.join().unwrap();
         }
-        assert_eq!(
-            dumps.usage.total.load(Ordering::Acquire),
-            0,
-            "round {round}"
-        );
+        assert_eq!(dumps.usage.total(), 0, "round {round}");
     }
 }
 
@@ -1041,25 +1037,54 @@ fn measuring_again_keeps_what_is_still_to_be_written() {
     let dir = tempfile::tempdir().unwrap();
     let dumps = dumps(dir.path());
     let usage = &dumps.usage;
+    lock(&usage.accounting).fs_pending = 1000;
     usage.refresh(now(), true);
     let measured = usage.fs_measured.load(Ordering::Acquire);
-    assert_eq!(usage.take_fs(1000, 0), 1000);
-    usage.refresh(now(), true);
-    let after = usage.fs_measured.load(Ordering::Acquire);
-    assert_eq!(
-        usage.fs_available.load(Ordering::Acquire),
-        after - 1000,
-        "measured {measured} then {after}"
-    );
+    assert_eq!(lock(&usage.accounting).fs_available, measured - 1000);
     usage.written(1000);
     usage.refresh(now(), true);
     assert_eq!(
-        usage.fs_available.load(Ordering::Acquire),
+        lock(&usage.accounting).fs_available,
         usage.fs_measured.load(Ordering::Acquire)
     );
-    // 床までしか取れない。
-    let available = usage.fs_available.load(Ordering::Acquire);
-    assert_eq!(usage.take_fs(u64::MAX, available - 10), 10);
+}
+
+/// 書いている最中に測り直しが重なっても、書き終えれば未確定は 0 に戻り、
+/// 止めた系列の分は全体に残らない。
+#[test]
+fn measuring_while_writing_settles_back_to_nothing_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let started = start(&dumps, "lab", None);
+    let stop_measuring = Arc::new(AtomicBool::new(false));
+    let measuring = {
+        let (dumps, stop) = (Arc::clone(&dumps), Arc::clone(&stop_measuring));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                dumps.usage.refresh(now(), true);
+            }
+        })
+    };
+    let writers: Vec<_> = (0..4)
+        .map(|n| {
+            let dumps = Arc::clone(&dumps);
+            std::thread::spawn(move || {
+                for seq in 0..100 {
+                    exchange(&dumps, "lab", n * 1000 + seq, b"{}", &[b"0123456789"]);
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    stop_measuring.store(true, Ordering::Release);
+    measuring.join().unwrap();
+    dumps.stop("u", &started.dump_id, now()).unwrap();
+
+    let accounting = lock(&dumps.usage.accounting);
+    assert_eq!(accounting.fs_pending, 0);
+    assert_eq!(accounting.total, 0);
 }
 
 /// 片付けは系列ごとの `start` の行の `delete_after` で決め、呼んだ unit の

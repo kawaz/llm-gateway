@@ -190,16 +190,19 @@ impl Capture {
                 }
                 continue;
             }
-            let sent = series.send(Message::RequestMeta(Arc::clone(&meta)), now)
+            let body_sent = series.send(Message::RequestMeta(Arc::clone(&meta)), now)
                 && series.send(
                     Message::Body {
                         name: Arc::clone(&body_file),
                         chunk: body.body.clone(),
                     },
                     now,
-                )
-                && series.send(Message::Event(end.clone()), now);
-            if !sent {
+                );
+            if !body_sent {
+                // 書くことにしたが書き手に渡らなかった分は、未確定から外す。
+                series.usage.written(size);
+            }
+            if !(body_sent && series.send(Message::Event(end.clone()), now)) {
                 self.open[i].store(false, Ordering::Release);
             }
             if let Some(reason) = grant.limited {
@@ -400,6 +403,8 @@ impl Teed {
                     now,
                 )
             {
+                // 書くことにしたが書き手に渡らなかった分は、未確定から外す。
+                series.usage.written(grant.bytes);
                 progress.open = false;
                 continue;
             }
