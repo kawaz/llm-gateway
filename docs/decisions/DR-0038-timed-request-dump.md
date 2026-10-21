@@ -1,6 +1,6 @@
 # DR-0038: リクエストと応答の本文を、時限と容量の上限つきで一時的にダンプする `dump start|stop|list|prune`
 
-- Status: Accepted (kawaz が 2026-10-21 に着手を裁定し、同日に設計の一般形を claude-rules-personal の reference `proxy-dump-design` へ切り出した。本 DR はその reference を正本とし、llm-gateway 固有の決定だけを持つ)。「影響」の段分けの段 1〜3 は実装済み、段 4 (`--follow` / `--embed bodies` / `--no-persist`) が未実装
+- Status: Accepted (kawaz が 2026-10-21 に着手を裁定し、同日に設計の一般形を claude-rules-personal の reference `proxy-dump-design` へ切り出した。本 DR はその reference を正本とし、llm-gateway 固有の決定だけを持つ)。決定 1〜13 と「影響」の段分けの段 1〜4 は実装済み
 - Date: 2026-10-21
 
 ## 背景
@@ -175,9 +175,10 @@ reference の未決のうち llm-gateway で確定したもの: `{ts}` と各イ
 - `daemon reload` で `[dump]` が変わったら以後の `start` に効き、動いている系列は始めた時の値のまま。指した ns が新しい設定から消えても系列は止めない (書く相手が無いまま時限まで残る)
 - events (DR-0012) と stats (DR-0011) にはダンプ中を見せない (`daemon status` と `/self` で足りる)。全 unit に向ける旗は持たない (unit の数だけ `start` する)。`--request-only` は持たない (reference のとおり request と response の両方を残す)
 
-残りは以下で、実装の着手を止めるものではない。
+実装で決めたもの:
 
-1. **`--embed bodies` の本文の載せ方** (バイト列を 1 行 JSON にどう入れるか): 段 4 で決める
+- `--embed bodies` の行は、メタ json が `{"event":"file","file":<名前>,"content":<json>}`、本文が書いたチャンクごとの `{"event":"body","file":<名前>,"data_base64":<base64>}`。どちらも follow の接続にだけ流し、`index.jsonl` には書かない
+- `--no-persist` の系列は、動いている間はファイルも書き (計数はファイルの側)、止まった時にディレクトリごと消す。reference の「送り終えた本文ファイルをその場で消し、全体の実使用量から引く」は持たない (動いている間の全体の実使用量は、送り終えた分も含めて数える)
 
 ## 関連
 

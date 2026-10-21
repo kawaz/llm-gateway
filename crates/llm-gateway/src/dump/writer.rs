@@ -30,6 +30,17 @@ const QUEUE: usize = 4096;
 /// `index.jsonl` を書き足す間隔の上限。
 pub(super) const FLUSH: Duration = Duration::from_millis(500);
 
+/// follow の送信の列の長さ (行数)。購読者が読まずに溢れたら `lagged` で切る
+/// (止まったまま繋がっている購読者に、本文をメモリへ抱え続けさせない)。
+pub(super) const FOLLOW_QUEUE: usize = 1024;
+
+/// follow の購読者へ流す口。
+pub(super) struct Follow {
+    pub(super) tx: tokio::sync::mpsc::Sender<String>,
+    /// メタ json と本文も同梱する。
+    pub(super) embed: bool,
+}
+
 /// 書き手へ渡すもの。
 pub(crate) enum Message {
     /// `index.jsonl` の 1 行。
@@ -74,6 +85,8 @@ pub(super) fn spawn(
     series: Arc<Series>,
     rx: Receiver<Message>,
     start: Map<String, Value>,
+    follow: Option<Follow>,
+    persist: bool,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let index = open_private(&series.dir.join("index.jsonl"), true)?;
     std::thread::Builder::new()
@@ -85,6 +98,8 @@ pub(super) fn spawn(
                 pending: false,
                 last_flush: Instant::now(),
                 bodies: HashMap::new(),
+                follow,
+                persist,
             };
             writing.event(start);
             writing.run(rx);
@@ -98,6 +113,9 @@ struct Writing {
     pending: bool,
     last_flush: Instant,
     bodies: HashMap<String, std::fs::File>,
+    follow: Option<Follow>,
+    /// 止まった時にディレクトリを残すか (`--no-persist` なら消す)。
+    persist: bool,
 }
 
 impl Writing {
@@ -143,19 +161,25 @@ impl Writing {
     }
 
     fn event(&mut self, event: Map<String, Value>) {
-        let mut line = Value::Object(event).to_string();
-        line.push('\n');
-        if let Err(e) = self.index.write_all(line.as_bytes()) {
+        let line = Value::Object(event).to_string();
+        let mut written = line.clone();
+        written.push('\n');
+        if let Err(e) = self.index.write_all(written.as_bytes()) {
             self.failed(&e);
             return;
         }
         self.pending = true;
+        self.forward(line);
     }
 
     fn meta(&mut self, name: &str, json: &Value) -> std::io::Result<()> {
         let mut text = serde_json::to_vec_pretty(json).map_err(std::io::Error::other)?;
         text.push(b'\n');
-        open_private(&self.series.dir.join(name), false)?.write_all(&text)
+        open_private(&self.series.dir.join(name), false)?.write_all(&text)?;
+        if self.follow.as_ref().is_some_and(|f| f.embed) {
+            self.forward(json!({"event": "file", "file": name, "content": json}).to_string());
+        }
+        Ok(())
     }
 
     fn body(&mut self, name: &str, chunk: Option<&Bytes>) -> std::io::Result<()> {
@@ -166,8 +190,32 @@ impl Writing {
         if let (Some(chunk), Some(file)) = (chunk, self.bodies.get_mut(name)) {
             file.write_all(chunk)?;
             self.series.usage.refresh(now_unix_ms(), false);
+            // 同梱する本文は、ファイルに書けた分だけ (書けない本文は流さない)。
+            if self.follow.as_ref().is_some_and(|f| f.embed) {
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+                self.forward(
+                    json!({"event": "body", "file": name, "data_base64": data}).to_string(),
+                );
+            }
         }
         Ok(())
+    }
+
+    /// follow の購読者へ 1 行渡す。待たない: 溢れたら `lagged`、閉じていたら
+    /// `disconnected` で系列を止め、以後は流さない。
+    fn forward(&mut self, line: String) {
+        let Some(follow) = &self.follow else {
+            return;
+        };
+        let reason = match follow.tx.try_send(line) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => StopReason::Lagged,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => StopReason::Disconnected,
+        };
+        warn!(dump_id = %self.series.id, reason = reason.as_str(), "the follower went away or fell behind; stopping the dump");
+        self.follow = None;
+        self.series.stop(reason, now_unix_ms());
     }
 
     fn flush(&mut self) {
@@ -201,10 +249,18 @@ impl Writing {
                     .load(std::sync::atomic::Ordering::Acquire)
             ),
         );
-        let mut line = Value::Object(event).to_string();
-        line.push('\n');
-        let _ = self.index.write_all(line.as_bytes());
+        let line = Value::Object(event).to_string();
+        let _ = self.index.write_all(format!("{line}\n").as_bytes());
         let _ = self.index.flush();
         self.bodies.clear();
+        // follow には `stop` の行を流してから閉じる。溢れていれば行は諦める。
+        if let Some(follow) = self.follow.take() {
+            let _ = follow.tx.try_send(line);
+        }
+        if !self.persist
+            && let Err(e) = std::fs::remove_dir_all(&self.series.dir)
+        {
+            warn!(%e, dump_id = %self.series.id, "could not remove a dump that was not to be kept");
+        }
     }
 }

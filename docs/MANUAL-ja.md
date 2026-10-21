@@ -732,8 +732,6 @@ reload で変えられない欄 (変えたら `daemon restart`): `[server]` の 
 
 ### `dump` — 本文の一時ダンプ
 
-(`--follow` / `--embed bodies` / `--no-persist` は実装中で、今は `bad_request` で断る)
-
 走っている台に、1 つの namespace を通る request と response の本文を**時限つきで**ディスクに書かせる (DR-0038。設計の一般形は claude-rules-personal の reference `proxy-dump-design`)。prompt cache の検証や「upstream が何を返したか」の調査のための一時手段で、常時の観測ではない。始める・止めるは設定ファイルに書かず、`daemon reload` と同じ経路 (CLI → 監督者 → 台の制御口) で頼む。監督者が動いていなければ `supervisor_not_running` で断る。
 
 | コマンド | 内容 |
@@ -753,7 +751,7 @@ reload で変えられない欄 (変えたら `daemon restart`): `[server]` の 
 - 置き場は系列ごとのディレクトリ `<stats の置き場>/dumps/<台>/<ns>/<dump_id>/` (ディレクトリ 700、ファイル 600)。`start` と `list` の答えに展開した絶対パス (`dump_dir`) が載る。UUIDv7 なので `ls` で始まった順に並ぶ
 - ディレクトリの中は `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` (ヘッダ・本文のファイル名などのメタ) と `<ts>-<seq>.request.body` (受けた本文そのまま)、upstream が答えた試行ごとの `<ts>-<seq>.<attempt>.response.json` (status・ヘッダ・stream かどうか・`request_rewrites`) と `<ts>-<seq>.<attempt>.response.body` (生のバイト列。`attempt` は 1 から)。`<ts>` は request を受けた時刻 (Unix ミリ秒)、`<seq>` は台の通し番号 (`/llm-gateway/events` の `seq`、台の log の `req` と同じ)。body の種類は json 側の `content-type` で見る (拡張子は変えない)
 - `index.jsonl` は系列の進行を時刻点ごとに追記したイベントの行 (`start` / `request_headers` / `request_body_end` / `upstream_connect` / `upstream_headers` / `upstream_body_end` / `upstream_close` / `response_headers_sent` / `response_body_end` / `transport_close` / `stop`)。各行に `ts` (Unix ミリ秒) と `seq`、区間を閉じる行には `duration_ms` が付くので、どの待ちで遅いかを切り分けられる。`response_headers_sent` の `adopted` がクライアントへ返した試行の番号 (gateway が自分で組んだエラーを返した 1 本は `null`)。行は起きたら 1 秒以内に書かれるので、応答が終わらないまま切れた 1 本も `request_headers` までは残る。`index.jsonl` を入口にして、調べたい 1 本のファイルだけを開く。その場で見たければ `dump start --follow` か `tail -f index.jsonl`
-- `--follow` は繋いだまま `index.jsonl` の行を 1 行 1 JSON で標準出力へ流す (最初の行は `start`)。Ctrl-C で繋ぎを切ると系列は `disconnected` で止まり、時限や上限で止まれば `stop` の行を流して終わる。読むのが遅くて台の送信が溢れると `lagged` で切られる。ファイルは `--follow` でも書く。`--embed bodies` で本文も行に同梱し、`--no-persist` (follow + embed の時だけ) は流すだけで止まった時にディレクトリごと消す
+- `--follow` は繋いだまま `index.jsonl` の行を 1 行 1 JSON で標準出力へ流す (最初の行は `start`)。Ctrl-C で繋ぎを切ると系列は `disconnected` で止まり、時限や上限で止まれば `stop` の行を流して終わる。読むのが遅くて台の送信が溢れると `lagged` で切られる。ファイルは `--follow` でも書く。`--embed bodies` でメタ json (`{"event":"file","file":…,"content":{…}}`) と本文 (`{"event":"body","file":…,"data_base64":"…"}`、書いたチャンクごと) の行も同梱する (これらは `index.jsonl` には書かない)。`--no-persist` (follow + embed の時だけ) は止まった時にディレクトリごと消す (動いている間はファイルも書き、上限の計数もファイルの側で数える)
 - **48 時間より古い系列はディレクトリごと勝手に消える** (基準は始めた時刻。`start` の答えの `delete_after`)。掃くのは台が上がった時と `dump start` の時で、`dumps/` の下全体 (他の台の分も) が対象。`--timeout` が 24 時間以下なので、動いている系列は消えない。置き場の中身は会話の本文そのものなので、リポや公開物に貼らない。外へコピーした分は手で消す
 - 動いている間は `daemon status` の各行と `/llm-gateway/self` に `dump` (`dump_id`・namespace・`expires_at`・書いた量) が系列ごとに出る。止め忘れはここで気づく
 - 書くかどうかは request を受けた時点で決まる。系列を始めた時点で流れている 1 本は書かない。ns 認証に断られた 1 本・JSON として読めない 1 本は書かない。認証差し替えのパススルー (`/{ns}/{upstream}/{rest}`) は対象外

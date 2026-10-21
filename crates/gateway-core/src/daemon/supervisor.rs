@@ -262,6 +262,10 @@ impl Supervisor {
             self.stream_log(which.clone(), writing).await;
             return;
         }
+        if let Request::DumpFollow(relay) = request {
+            self.follow_dump(relay, lines, writing).await;
+            return;
+        }
 
         let answer = self.handle(request).await;
         let value = match answer {
@@ -296,6 +300,11 @@ impl Supervisor {
                 }))
             }
             Request::Dump(relay) => Ok(self.dump_unit(relay).await),
+            // 流し続ける頼みは [`Self::answer`] が先に拾っている。
+            Request::DumpFollow(_) => Err(Refused::new(
+                "bad_request",
+                "following a dump is a stream, not a question",
+            )),
             // 追従は [`Self::answer`] が先に拾っている。
             Request::Log(_) => Err(Refused::new(
                 "bad_request",
@@ -481,6 +490,108 @@ impl Supervisor {
                 format!("could not read what `{name}` answered: {}", excerpt(&line)),
             ),
         }
+    }
+
+    /// `dump start --follow` を台へ中継し、台が流す行をそのまま通す
+    /// (DR-0038 決定 12)。
+    ///
+    /// 頼んだ側 (CLI) が繋がりを閉じたら台への繋がりも閉じ、台はそれを見て系列を
+    /// `disconnected` で止める。台が閉じたら (系列が止まった) こちらも閉じる。
+    /// 中継できない時は `{unit, ok: false, error}` の 1 行で断る。
+    async fn follow_dump(
+        &self,
+        relay: DumpRelay,
+        mut asking: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        mut writing: tokio::net::unix::OwnedWriteHalf,
+    ) {
+        let name = relay.unit;
+        let refuse = |kind: &str, message: String| unit_failed(&name, kind, message);
+        let refused = if !self.registry.names().contains(&name) {
+            Some(refuse(
+                "unknown_unit",
+                format!("there is no unit called `{name}`"),
+            ))
+        } else if !self.running(&name).await {
+            Some(refuse(
+                "not_running",
+                format!(
+                    "`{name}` is not running; a dump lives in a running unit. run `daemon start {name}`"
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
+            let _ = write_line(&mut writing, &refused).await;
+            return;
+        }
+        let path = protocol::control_path(&self.controls, &name);
+        let connected = tokio::time::timeout(DUMP_WAIT, UnixStream::connect(&path)).await;
+        let stream = match connected {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                let refused = refuse(
+                    "restart_required",
+                    "this unit's version has no control socket; restart it".to_owned(),
+                );
+                let _ = write_line(&mut writing, &refused).await;
+                return;
+            }
+            Ok(Err(e)) => {
+                let refused = refuse(
+                    "unreachable",
+                    format!(
+                        "could not reach `{name}` at {}: {e}. restart the unit",
+                        path.display()
+                    ),
+                );
+                let _ = write_line(&mut writing, &refused).await;
+                return;
+            }
+            Err(_) => {
+                let refused = refuse(
+                    "no_answer",
+                    format!("`{name}` did not accept within {}s", DUMP_WAIT.as_secs()),
+                );
+                let _ = write_line(&mut writing, &refused).await;
+                return;
+            }
+        };
+        let Ok(mut flowing) = protocol::send(stream, &ControlRequest::Dump(relay.dump)).await
+        else {
+            let refused = refuse("unreachable", format!("could not ask `{name}`"));
+            let _ = write_line(&mut writing, &refused).await;
+            return;
+        };
+        loop {
+            tokio::select! {
+                line = flowing.next_line() => {
+                    let Ok(Some(line)) = line else { break };
+                    let mut text = line;
+                    text.push('\n');
+                    if writing.write_all(text.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                // 頼んだ側は何も書かない。閉じたら (読めなくなったら) 終わる。
+                asked = asking.next_line() => {
+                    if !matches!(asked, Ok(Some(_))) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 台がいま走っているか (監督者の子として)。
+    async fn running(&self, name: &str) -> bool {
+        let watched = self.watched.lock().await;
+        watched.get(name).and_then(|s| s.pid).is_some()
     }
 
     /// 走っている台の制御口に 1 つ頼み、1 行の答えを受け取る。
@@ -1756,6 +1867,90 @@ mod tests {
             assert_eq!(answer["error"]["kind"], serde_json::json!(kind), "{answer}");
         }
 
+        world.supervisor.shutdown().await;
+    }
+
+    /// `dump start --follow` は台が流す行をそのまま通し、頼んだ側が閉じたら台への
+    /// 繋がりも閉じる。中継できない台には 1 行で断る (DR-0038 決定 12)。
+    #[tokio::test]
+    async fn a_following_dump_is_streamed_and_the_close_reaches_the_unit() {
+        let world = world();
+        let binary = a_long_running_child(&world.root);
+        world.register("a", &binary, true);
+        world.register("d", &binary, false);
+        world.supervisor.reload().await;
+        world.until("a", |s| s.running).await;
+
+        let dir = world.root.join("control");
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = UnixListener::bind(protocol::control_path(&dir, "a")).unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = unit.accept().await.unwrap();
+            let (reading, mut writing) = stream.into_split();
+            let mut reading = BufReader::new(reading);
+            let mut asked = String::new();
+            reading.read_line(&mut asked).await.unwrap();
+            assert!(asked.contains(r#""follow":true"#), "{asked}");
+            writing
+                .write_all(b"{\"event\":\"start\"}\n{\"event\":\"request_headers\"}\n")
+                .await
+                .unwrap();
+            // 頼んだ側が閉じるまで繋がりを保つ。
+            let mut rest = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut reading, &mut rest).await;
+            let _ = closed_tx.send(());
+        });
+
+        let listener = world.supervisor.listen().unwrap();
+        let serving = Arc::clone(&world.supervisor);
+        let accepting = tokio::spawn(async move { serving.serve(listener).await });
+        let socket = world.root.join("supervisor.sock");
+        let follow = |unit: &str| {
+            Request::DumpFollow(DumpRelay {
+                unit: unit.to_owned(),
+                dump: protocol::DumpRequest::Start {
+                    ns: "lab".to_owned(),
+                    timeout_ms: None,
+                    max_bytes: None,
+                    store: None,
+                    labels: std::collections::BTreeMap::new(),
+                    follow: true,
+                    embed: None,
+                    persist: None,
+                },
+            })
+        };
+
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let mut lines = protocol::send(stream, &follow("a")).await.unwrap();
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some(r#"{"event":"start"}"#)
+        );
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some(r#"{"event":"request_headers"}"#)
+        );
+        drop(lines);
+        tokio::time::timeout(Duration::from_secs(10), closed_rx)
+            .await
+            .expect("the close reached the unit")
+            .unwrap();
+
+        // 止まっている台・登録の無い台には 1 行で断る。
+        for (unit, kind) in [("d", "not_running"), ("e", "unknown_unit")] {
+            let stream = UnixStream::connect(&socket).await.unwrap();
+            let mut lines = protocol::send(stream, &follow(unit)).await.unwrap();
+            let answer: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["error"]["kind"], kind);
+        }
+        let refused = world.supervisor.handle(follow("a")).await.unwrap_err();
+        assert_eq!(refused.kind, "bad_request");
+
+        accepting.abort();
         world.supervisor.shutdown().await;
     }
 

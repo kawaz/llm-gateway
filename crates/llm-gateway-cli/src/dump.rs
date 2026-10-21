@@ -42,9 +42,53 @@ pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
         Ok(target) => target,
         Err(failure) => return Ok(refuse(unit.as_deref(), &failure.to_json())),
     };
+    if matches!(request, DumpRequest::Start { follow: true, .. }) {
+        return follow(&target.unit, request);
+    }
     match ask(&target.unit, request) {
         Ok(answer) => print(&target.unit, &answer),
         Err(failure) => Ok(refuse(Some(&target.unit), &failure.to_json())),
+    }
+}
+
+/// `start --follow`: 台が流す行をそのまま stdout へ出し続ける (DR-0038 決定 12)。
+///
+/// 系列が止まると台は `stop` の行の後で閉じ、ここも終わる。Ctrl-C でこの
+/// プロセスが終わると繋がりが閉じ、台は系列を `disconnected` で止める。
+/// 断られた時 (`ok: false` の 1 行) は stderr へ出して非 0。
+fn follow(unit: &str, dump: DumpRequest) -> Result<ExitCode, Failure> {
+    let socket = protocol::socket_path();
+    let request = Request::DumpFollow(DumpRelay {
+        unit: unit.to_owned(),
+        dump,
+    });
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| Failure::from(format!("could not start the async runtime: {e}")))?;
+    let streamed = runtime.block_on(async move {
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .map_err(|e| crate::daemon::control::not_running(&e))?;
+        let mut lines = protocol::send(stream, &request)
+            .await
+            .map_err(|e| crate::daemon::control::not_running(&e))?;
+        let mut code = ExitCode::SUCCESS;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let refused = serde_json::from_str::<serde_json::Value>(&line).is_ok_and(|value| {
+                value.get("ok") == Some(&serde_json::json!(false))
+                    || value.get("error").is_some() && value.get("event").is_none()
+            });
+            if refused {
+                eprintln!("{}", refusal(Some(unit), &line));
+                code = ExitCode::FAILURE;
+                break;
+            }
+            println!("{line}");
+        }
+        Ok::<ExitCode, Failure>(code)
+    });
+    match streamed {
+        Ok(code) => Ok(code),
+        Err(failure) => Ok(refuse(Some(unit), &failure.to_json())),
     }
 }
 

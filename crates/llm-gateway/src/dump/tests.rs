@@ -757,3 +757,151 @@ fn a_dump_id_is_a_uuid_v7_ordered_by_time() {
     assert_eq!(uuid_v7_ms("not-a-uuid"), None);
     assert!(uuid_v7(1, &mut |b| b.fill(0xff)) < uuid_v7(2, &mut |b| b.fill(0)));
 }
+
+fn following(dumps: &Arc<Dumps>, embed: bool, persist: bool) -> (Started, Following) {
+    dumps
+        .start_following(
+            &Start {
+                unit: "u",
+                ns: "lab",
+                follow: Some(Follow { embed, persist }),
+                ..Start::default()
+            },
+            &config(),
+            now(),
+        )
+        .unwrap()
+}
+
+/// 届いている行を全部取る (止まった系列は `stop` の後で閉じる)。
+fn drain_lines(lines: &mut Following) -> Vec<Value> {
+    let mut got = Vec::new();
+    while let Some(line) = lines.blocking_recv() {
+        got.push(serde_json::from_str(&line).unwrap());
+    }
+    got
+}
+
+/// follow は `index.jsonl` の行をそのまま流し (最初は `start`)、止まったら
+/// `stop` の行の後で閉じる。ファイルも書く。
+#[test]
+fn following_streams_the_index_lines_and_ends_with_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let (started, mut lines) = following(&dumps, false, true);
+    assert!(exchange(&dumps, "lab", 1, b"{}", &[b"x"]));
+    dumps.stop("u", &started.dump_id, now()).unwrap();
+
+    let got = drain_lines(&mut lines);
+    assert_eq!(names(&got).first().map(String::as_str), Some("start"));
+    assert_eq!(names(&got).last().map(String::as_str), Some("stop"));
+    assert_eq!(
+        names(&got),
+        names(&events(&started)),
+        "the same lines as the file"
+    );
+    assert!(
+        !names(&got).contains(&"body".to_owned()),
+        "no bodies without embed"
+    );
+}
+
+/// `--embed bodies` はメタ json と本文 (base64) も流す。`--no-persist` は止まった
+/// 時にディレクトリごと消す。
+#[test]
+fn embedding_streams_bodies_and_no_persist_removes_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let (started, mut lines) = following(&dumps, true, false);
+    assert!(exchange(&dumps, "lab", 1, b"{\"q\":1}", &[b"answer"]));
+    dumps.stop("u", &started.dump_id, now()).unwrap();
+
+    let got = drain_lines(&mut lines);
+    let bodies: Vec<String> = got
+        .iter()
+        .filter(|e| e["event"] == "body")
+        .map(|e| {
+            use base64::Engine as _;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(e["data_base64"].as_str().unwrap())
+                .unwrap();
+            String::from_utf8(data).unwrap()
+        })
+        .collect();
+    assert_eq!(bodies, ["{\"q\":1}", "answer"]);
+    let files: Vec<&Value> = got.iter().filter(|e| e["event"] == "file").collect();
+    assert_eq!(files.len(), 2, "request.json and response.json");
+    assert_eq!(files[1]["content"]["status"], 200);
+    assert!(!Path::new(&started.dump_dir).exists(), "nothing is kept");
+}
+
+/// 残さず流しもしない系列は始めない。follow を求めない `start` で follow は断る。
+#[test]
+fn a_follow_that_shows_nothing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+    let nothing = Start {
+        unit: "u",
+        ns: "lab",
+        follow: Some(Follow {
+            embed: false,
+            persist: false,
+        }),
+        ..Start::default()
+    };
+    assert_eq!(
+        dumps
+            .start_following(&nothing, &config(), now())
+            .unwrap_err()
+            .kind,
+        "bad_request"
+    );
+    let streaming = Start {
+        follow: Some(Follow {
+            embed: false,
+            persist: true,
+        }),
+        ..nothing
+    };
+    assert_eq!(
+        dumps.start(&streaming, &config(), now()).unwrap_err().kind,
+        "bad_request"
+    );
+}
+
+/// 購読口を捨てる (接続が閉じた) と `disconnected`、読まずに溢れさせると
+/// `lagged` で系列が止まる。
+#[test]
+fn a_follower_that_leaves_or_falls_behind_stops_the_dump() {
+    let dir = tempfile::tempdir().unwrap();
+    let dumps = dumps(dir.path());
+
+    let (gone, lines) = following(&dumps, false, true);
+    dumps.disconnected(&gone.dump_id, now());
+    drop(lines);
+    assert_eq!(
+        dumps
+            .stop("u", &gone.dump_id, now())
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("disconnected")
+    );
+
+    let (slow, _lines) = following(&dumps, false, true);
+    let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+    // 書き手の列 (4096) には収まり、follow の列 (1024) は溢れる数の行を置く。
+    // 書き手が流すうちに溢れて、自分で系列を止める。
+    for _ in 0..2_000 {
+        capture.headers_sent();
+    }
+    dumps.wait_for_writer(&slow.dump_id);
+    assert_eq!(
+        dumps
+            .stop("u", &slow.dump_id, now())
+            .unwrap()
+            .reason
+            .as_deref(),
+        Some("lagged")
+    );
+}

@@ -61,14 +61,16 @@ impl ControlSocket {
 
     /// 頼みに答え続ける。1 本の繋がりに 1 つの頼み。
     ///
-    /// 頼みは 1 つずつ通す。読み直しが同時に 2 つ来たとき、後から読んだ設定が
-    /// 先に差し替わって古い方で上書きされる、を起こさない。
+    /// 繋がりごとに別の task で答える (`dump start --follow` は繋がりを保ち続ける)。
+    /// 読み直しだけは 1 つずつ通す。同時に 2 つ来たとき、後から読んだ設定が先に
+    /// 差し替わって古い方で上書きされる、を起こさない。
     pub async fn serve<P: CredentialPersistence + 'static>(
         &self,
         unit: &str,
         config_path: &Path,
         gateway: Arc<Gateway<P>>,
     ) {
+        let reloading = Arc::new(tokio::sync::Mutex::new(()));
         loop {
             let stream = match self.listener.accept().await {
                 Ok((stream, _)) => stream,
@@ -77,7 +79,11 @@ impl ControlSocket {
                     return;
                 }
             };
-            answer(stream, unit, config_path, &gateway).await;
+            let (unit, config_path) = (unit.to_owned(), config_path.to_path_buf());
+            let (gateway, reloading) = (Arc::clone(&gateway), Arc::clone(&reloading));
+            tokio::spawn(async move {
+                answer(stream, &unit, &config_path, &gateway, &reloading).await;
+            });
         }
     }
 }
@@ -93,10 +99,11 @@ async fn answer<P: CredentialPersistence>(
     unit: &str,
     config_path: &Path,
     gateway: &Gateway<P>,
+    reloading: &tokio::sync::Mutex<()>,
 ) {
     let (reading, mut writing) = stream.into_split();
-    // 読み直しは 1 つずつ通すので、改行を寄越さない繋がりが 1 本あると
-    // 監督者の頼みが後ろで待たされる。1 行を読む時間と長さに上限を置く。
+    // 改行を寄越さない繋がりに task を抱え込ませないよう、1 行を読む時間と長さに
+    // 上限を置く。
     let mut line = Vec::new();
     let mut limited = BufReader::new(reading).take(REQUEST_LIMIT + 1);
     match tokio::time::timeout(REQUEST_WAIT, limited.read_until(b'\n', &mut line)).await {
@@ -106,7 +113,12 @@ async fn answer<P: CredentialPersistence>(
     let line = String::from_utf8_lossy(&line);
     let result = match serde_json::from_str::<ControlRequest>(&line) {
         Ok(ControlRequest::Reload) => {
+            let _held = reloading.lock().await;
             serde_json::to_value(reload(unit, config_path, gateway).await).unwrap_or_default()
+        }
+        Ok(ControlRequest::Dump(request @ DumpRequest::Start { follow: true, .. })) => {
+            follow(unit, request, gateway, limited.into_inner(), writing).await;
+            return;
         }
         Ok(ControlRequest::Dump(request)) => dump(unit, request, gateway, now_unix_ms()),
         Err(e) => serde_json::to_value(Reloaded::failed(
@@ -119,6 +131,52 @@ async fn answer<P: CredentialPersistence>(
     let mut text = serde_json::to_string(&result).unwrap_or_default();
     text.push('\n');
     let _ = writing.write_all(text.as_bytes()).await;
+}
+
+/// `dump start --follow` に答える (DR-0038 決定 12)。
+///
+/// 断る時は 1 行の `{unit, ok: false, error}` で閉じる。始めたら繋がりを保ち、
+/// `index.jsonl` の行 (最初は `start`) を 1 行ずつ流す。相手が繋がりを閉じたら
+/// 系列を `disconnected` で止め、系列が止まったら `stop` の行の後で閉じる。
+async fn follow<P: CredentialPersistence>(
+    unit: &str,
+    request: DumpRequest,
+    gateway: &Gateway<P>,
+    mut reading: impl tokio::io::AsyncRead + Unpin,
+    mut writing: tokio::net::unix::OwnedWriteHalf,
+) {
+    let now = now_unix_ms();
+    let following = start_dump(unit, request, gateway).and_then(|start| {
+        gateway
+            .dumps()
+            .start_following(&start.borrowed(unit), &gateway.dump_config(), now)
+            .map_err(|refusal| dump_failed(unit, refusal.kind, refusal.message))
+    });
+    let (started, mut lines) = match following {
+        Ok(following) => following,
+        Err(refused) => {
+            let _ = writing.write_all(format!("{refused}\n").as_bytes()).await;
+            return;
+        }
+    };
+    let mut sink = [0u8; 256];
+    loop {
+        tokio::select! {
+            line = lines.recv() => {
+                let Some(line) = line else { break };
+                if writing.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                    gateway.dumps().disconnected(&started.dump_id, now_unix_ms());
+                    break;
+                }
+            }
+            read = reading.read(&mut sink) => {
+                if matches!(read, Ok(0) | Err(_)) {
+                    gateway.dumps().disconnected(&started.dump_id, now_unix_ms());
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// 設定を読み直す。`check` と同じ経路で全体を読み、通った時だけ差し替える
@@ -174,44 +232,12 @@ pub fn dump<P: CredentialPersistence>(
 ) -> serde_json::Value {
     let dumps = gateway.dumps();
     let answered = match request {
-        DumpRequest::Start {
-            ns,
-            timeout_ms,
-            max_bytes,
-            store,
-            labels,
-            follow,
-            embed,
-            persist,
-        } => {
-            if follow || embed.is_some() || persist.is_some() {
-                return dump_failed(
-                    unit,
-                    "bad_request",
-                    "--embed and --no-persist need --follow, which this request did not ask for",
-                );
-            }
-            // 走っている設定に無い ns は書く相手が無い (DR-0038 決定 2)。
-            if gateway.namespace(&ns).is_none() {
-                let known = gateway.namespace_names().join(", ");
-                return dump_failed(
-                    unit,
-                    "unknown_namespace",
-                    format!("this unit has no namespace `{ns}` (it has: {known})"),
-                );
-            }
-            let start = crate::dump::Start {
-                unit,
-                ns: &ns,
-                timeout_ms: timeout_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
-                max_bytes,
-                store: store.as_deref(),
-                labels,
-            };
-            dumps
-                .start(&start, &gateway.dump_config(), now)
-                .map(|started| fields(&started))
-        }
+        request @ DumpRequest::Start { .. } => match start_dump(unit, request, gateway) {
+            Ok(start) => dumps
+                .start(&start.borrowed(unit), &gateway.dump_config(), now)
+                .map(|started| fields(&started)),
+            Err(refused) => return refused,
+        },
         DumpRequest::Stop { dump_id } => dumps
             .stop(unit, &dump_id, now)
             .map(|listed| fields(&listed)),
@@ -239,6 +265,87 @@ pub fn dump<P: CredentialPersistence>(
         }
         Err(refusal) => dump_failed(unit, refusal.kind, refusal.message),
     }
+}
+
+/// `start` の頼みを読んだもの (ns が走っている設定にあることは確かめてある)。
+struct StartRequest {
+    ns: String,
+    timeout_ms: Option<i64>,
+    max_bytes: Option<u64>,
+    store: Option<String>,
+    labels: std::collections::BTreeMap<String, String>,
+    follow: Option<crate::dump::Follow>,
+}
+
+impl StartRequest {
+    fn borrowed<'a>(&'a self, unit: &'a str) -> crate::dump::Start<'a> {
+        crate::dump::Start {
+            unit,
+            ns: &self.ns,
+            timeout_ms: self.timeout_ms,
+            max_bytes: self.max_bytes,
+            store: self.store.as_deref(),
+            labels: self.labels.clone(),
+            follow: self.follow,
+        }
+    }
+}
+
+/// `start` の頼みを確かめて読む。断るなら答えの形で返す。
+fn start_dump<P: CredentialPersistence>(
+    unit: &str,
+    request: DumpRequest,
+    gateway: &Gateway<P>,
+) -> Result<StartRequest, serde_json::Value> {
+    let DumpRequest::Start {
+        ns,
+        timeout_ms,
+        max_bytes,
+        store,
+        labels,
+        follow,
+        embed,
+        persist,
+    } = request
+    else {
+        return Err(dump_failed(unit, "bad_request", "not a start request"));
+    };
+    if let Some(embed) = &embed
+        && embed != "bodies"
+    {
+        return Err(dump_failed(
+            unit,
+            "bad_request",
+            format!("--embed `{embed}` is not supported; only bodies is"),
+        ));
+    }
+    if !follow && (embed.is_some() || persist.is_some()) {
+        return Err(dump_failed(
+            unit,
+            "bad_request",
+            "--embed and --no-persist need --follow",
+        ));
+    }
+    // 走っている設定に無い ns は書く相手が無い (DR-0038 決定 2)。
+    if gateway.namespace(&ns).is_none() {
+        let known = gateway.namespace_names().join(", ");
+        return Err(dump_failed(
+            unit,
+            "unknown_namespace",
+            format!("this unit has no namespace `{ns}` (it has: {known})"),
+        ));
+    }
+    Ok(StartRequest {
+        ns,
+        timeout_ms: timeout_ms.map(|ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+        max_bytes,
+        store,
+        labels,
+        follow: follow.then_some(crate::dump::Follow {
+            embed: embed.is_some(),
+            persist: persist.unwrap_or(true),
+        }),
+    })
 }
 
 /// 構造体の欄を答えの欄にする。
@@ -557,5 +664,68 @@ routes = ["a"]
             persist: None,
         };
         assert_eq!(kind(dump("u", embedded, &u.gateway, now)), "bad_request");
+    }
+
+    /// `--follow` は繋がりを保って `index.jsonl` の行を流し (最初は `start`)、
+    /// 相手が閉じたら系列を `disconnected` で止める。断る時は 1 行で閉じる。
+    /// follow の繋がりが開いている間も、他の頼みには答える。
+    #[tokio::test]
+    async fn a_following_dump_streams_until_the_asker_leaves() {
+        let u = unit();
+        let path = u.dir.path().join("control").join("u.sock");
+        let socket = Arc::new(ControlSocket::open_at(&path).unwrap());
+        let serving = Arc::clone(&socket);
+        let (config, gateway) = (u.config.clone(), Arc::clone(&u.gateway));
+        let task = tokio::spawn(async move { serving.serve("u", &config, gateway).await });
+
+        let mut start = dump_start("default");
+        if let DumpRequest::Start { follow, .. } = &mut start {
+            *follow = true;
+        }
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let mut lines = protocol::send(stream, &ControlRequest::Dump(start))
+            .await
+            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["event"], "start");
+        let id = first["dump_id"].as_str().unwrap().to_owned();
+
+        // 流している間も、他の頼みには答える。
+        let listed = protocol::ask(
+            &path,
+            &ControlRequest::Dump(DumpRequest::List {
+                selectors: vec!["state=active".to_owned()],
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(listed.contains(&id), "{listed}");
+
+        drop(lines);
+        let dumps = Arc::clone(u.gateway.dumps());
+        let waiting = id.clone();
+        tokio::task::spawn_blocking(move || dumps.wait_for_writer(&waiting))
+            .await
+            .unwrap();
+        let stopped = dump(
+            "u",
+            DumpRequest::Stop { dump_id: id },
+            &u.gateway,
+            now_unix_ms(),
+        );
+        assert_eq!(stopped["reason"], "disconnected", "{stopped}");
+
+        let mut refused = dump_start("nope");
+        if let DumpRequest::Start { follow, .. } = &mut refused {
+            *follow = true;
+        }
+        let answer = protocol::ask(&path, &ControlRequest::Dump(refused))
+            .await
+            .unwrap();
+        assert!(answer.contains("unknown_namespace"), "{answer}");
+
+        task.abort();
+        let _ = task.await;
     }
 }

@@ -329,7 +329,22 @@ pub struct Start<'a> {
     /// `raw` だけを受ける (DR-0038 決定 6)。
     pub store: Option<&'a str>,
     pub labels: BTreeMap<String, String>,
+    /// 接続を保ってイベントを流すなら、その流し方。
+    pub follow: Option<Follow>,
 }
+
+/// follow の流し方 (reference `api`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Follow {
+    /// メタ json と本文も行に同梱する (`--embed bodies`)。
+    pub embed: bool,
+    /// 保存するか。`false` は `embed` の時だけで、止まったらディレクトリごと消す。
+    pub persist: bool,
+}
+
+/// follow の購読口。`index.jsonl` の行 (と同梱の本文) が 1 行ずつ届き、系列が
+/// 止まると `stop` の行の後で閉じる。捨てると系列は `disconnected` で止まる。
+pub type Following = tokio::sync::mpsc::Receiver<String>;
 
 /// `start` の答えの、系列と適用されたパラメータの欄 (reference `api`)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,6 +455,35 @@ impl Dumps {
         config: &crate::config::DumpConfig,
         now: i64,
     ) -> Result<Started, Refusal> {
+        if start.follow.is_some() {
+            return Err(Refusal::new(
+                "bad_request",
+                "a dump that follows needs a connection to stream to",
+            ));
+        }
+        self.begin(start, config, now).map(|(started, _)| started)
+    }
+
+    /// 接続を保ってイベントを流す系列を始める (`--follow`)。返す購読口から
+    /// `index.jsonl` の行が届く。購読口を捨てると系列は `disconnected` で止まる。
+    pub fn start_following(
+        self: &Arc<Self>,
+        start: &Start<'_>,
+        config: &crate::config::DumpConfig,
+        now: i64,
+    ) -> Result<(Started, Following), Refusal> {
+        let (started, following) = self.begin(start, config, now)?;
+        following
+            .map(|following| (started, following))
+            .ok_or_else(|| Refusal::new("bad_request", "follow was not asked for"))
+    }
+
+    fn begin(
+        self: &Arc<Self>,
+        start: &Start<'_>,
+        config: &crate::config::DumpConfig,
+        now: i64,
+    ) -> Result<(Started, Option<Following>), Refusal> {
         if !crate::config::is_file_name_safe(start.ns) {
             return Err(Refusal::new(
                 "invalid_namespace",
@@ -481,6 +525,15 @@ impl Dumps {
         for (key, value) in &start.labels {
             check_label(key).and_then(|()| check_label(value))?;
         }
+        if let Some(follow) = start.follow
+            && !follow.persist
+            && !follow.embed
+        {
+            return Err(Refusal::new(
+                "bad_request",
+                "--no-persist needs --embed bodies: a dump that keeps nothing and streams no bodies shows nothing",
+            ));
+        }
         let active = self.active.load(Ordering::Acquire);
         if active >= config.max_concurrency {
             return Err(Refusal::new(
@@ -505,6 +558,20 @@ impl Dumps {
         })?;
         let max_bytes = start.max_bytes.unwrap_or(config.default_max_bytes);
         let (writer, receiving) = writer::Writer::channel();
+        let (follow, following) = match start.follow {
+            Some(options) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(writer::FOLLOW_QUEUE);
+                (
+                    Some(writer::Follow {
+                        tx,
+                        embed: options.embed,
+                    }),
+                    Some(rx),
+                )
+            }
+            None => (None, None),
+        };
+        let persist = start.follow.is_none_or(|f| f.persist);
         let series = Arc::new(Series {
             id: id.clone(),
             unit: start.unit.to_owned(),
@@ -538,12 +605,18 @@ impl Dumps {
         event.insert("started_at".to_owned(), json!(now));
         event.insert("expires_at".to_owned(), json!(series.expires_at));
         event.insert("delete_after".to_owned(), json!(series.delete_after));
-        let thread = writer::spawn(Arc::clone(&series), receiving, event).map_err(|e| {
-            Refusal::new(
-                "dump_dir_unwritable",
-                format!("could not start writing {}: {e}", dir.display()),
-            )
-        })?;
+        if let Some(options) = start.follow {
+            event.insert("follow".to_owned(), json!(true));
+            event.insert("embed".to_owned(), json!(options.embed.then_some("bodies")));
+            event.insert("persist".to_owned(), json!(options.persist));
+        }
+        let thread = writer::spawn(Arc::clone(&series), receiving, event, follow, persist)
+            .map_err(|e| {
+                Refusal::new(
+                    "dump_dir_unwritable",
+                    format!("could not start writing {}: {e}", dir.display()),
+                )
+            })?;
         *lock(&series.thread) = Some(thread);
         lock(&self.series).insert(id.clone(), Arc::clone(&series));
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
@@ -574,7 +647,7 @@ impl Dumps {
             .sum();
         let used = self.usage.total.load(Ordering::Acquire);
         let fs_free = self.usage.fs_free.load(Ordering::Acquire);
-        Ok(Started {
+        let started = Started {
             dump_id: id,
             dump_dir: dir.display().to_string(),
             ns: start.ns.to_owned(),
@@ -600,7 +673,25 @@ impl Dumps {
                 fs_free_bytes: fs_free,
                 fs_checked_at: self.usage.fs_checked_at.load(Ordering::Acquire),
             },
-        })
+        };
+        Ok((started, following))
+    }
+
+    /// 書き手が自分で系列を止めて終わるのを待つ (試験用。止めはしない)。
+    #[cfg(test)]
+    pub(crate) fn wait_for_writer(&self, dump_id: &str) {
+        let series = lock(&self.series).get(dump_id).cloned();
+        if let Some(series) = series {
+            series.join();
+        }
+    }
+
+    /// follow の接続が閉じた。系列を `disconnected` で止める。
+    pub fn disconnected(&self, dump_id: &str, now: i64) {
+        let series = lock(&self.series).get(dump_id).cloned();
+        if let Some(series) = series {
+            series.stop(StopReason::Disconnected, now);
+        }
     }
 
     /// 系列を時限を待たずに止める。冪等で、止まっていた系列にはその時の状態
