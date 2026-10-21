@@ -43,7 +43,7 @@ DR-0032 決定 2 の経路をそのまま使う。CLI → 監督者 (`supervisor
 - `--unit <unit>` で指す。登録が 1 つならそれを使い、複数あって未指定なら `unit_required` で名前を求める (`usage` / `stats` と同じ `destination::resolve` の規則)。経路が HTTP でなく監督者の socket である点だけが違い、利用者の指し方は変わらない
 - `dump` は子を持つレベルなので、引数なしと `--help` はテキストの help を出す。`start` は必須の引数 (`--ns` / `--for`) を持つので、引数なしなら help。`stop` は `<dump_id>` か `--all` のどちらかが要り、どちらも無ければ help。`status` は省略可能な引数だけなので実行する
 - `start` のたびに新しい系列 (決定 13) が始まる。`stop <dump_id>` はその系列を時限を待たず止め、`stop --all` はその unit で動いている全系列を止める。`stop` は冪等で、既に止まっている系列には `active: false` で成功する (DR-0028 決定 7 の `register` と同じ姿勢)。unit が知らない id は `unknown_dump` で断る (restart で消えた系列の id もここに入る)
-- `--help` の文面と実装を揃える (cli-design-preferences)。このリポは zsh completion を持たないので、揃える相手は help と実装の 2 者
+- このリポの CLI は completion 定義を持たない (DR-0030 と同じ)。揃えるのは `--help` の文面と実装の 2 者 (cli-design-preferences)
 
 ### 4. `--ns` は必須で、全 ns 一括はしない (統括の補強案)
 
@@ -76,7 +76,7 @@ cache の検証と upstream の応答の調査には response が要る。ダン
 
 - request は gateway が受けた本文 (ハーネスが送ろうとしたもの)。Claude Code の api-request 記録と同じものを表し、`requestDigest` まで突き合わせられる (research の A3)。gateway の書き換え (cache の `ttl` の付け替え、thinking の display の上書き、model の別名の解決、thinking_as_text の変換) は載らない。書き換えの有無は events (DR-0012: `cache_ttl_secs` / `thinking_as_text` 等) と stats (DR-0011: 5m / 1h の内訳) と応答の usage から読む
 - response は解釈せず、upstream が返したバイト列 (SSE なら `event:` / `data:` の行そのまま) を残す。経路が方言を通訳する前 (Responses API の SSE を Messages の SSE にする)、gateway が SSE を JSON 1 本に集め直す前 (`stream` を付けなかったクライアントへの応答)、upstream の断りを gateway のエラー本文に差し替える前の形。upstream が加工後の request に答えた結果なので、書き換えの効き方はここから読める
-- 経路を替えて試し直した 1 本では、最後に upstream が返した応答を残す。前の経路の応答は書き直して消え、書いた量からも戻す
+- 経路を替えて試し直した 1 本では、upstream が答えた試行を全部残す。試行ごとに別のファイルに書き、前の試行を消さず、書いた量からも差し引かない。gateway は先に断られた応答を持ったまま次の経路を試し、後の応答を本文を読まずに捨てて先の応答を返すことがあるので、どの試行を返したかは行の `adopted` で示す (決定 14、統括の裁定)
 - `--request-only` は request だけを書き、response を書かない。response だけを取る旗は持たない (要件が無い)
 - 1 本に添えるメタデータは `index.jsonl` の 1 行 (決定 14)。時刻は Unix ミリ秒 (DR-0012 の規約) で、欄の定義は events の `request` と揃え、2 つ持たない (起草者の判断)
 
@@ -138,20 +138,21 @@ llm-gateway dump status --unit unstable
 - `dump_id` が UUIDv7 なのは、時刻を先頭に持つので `ls` で系列が始まった順に並び、別の unit が同じ ns に同時に始めても衝突しないため。ディレクトリ名 (決定 6) と `stop` の引数と `status` / `/self` の欄はすべてこの id
 - `start` の置き換えや `unit × ns で 1 つ` の制限は持たない。「延長したい」は新しい系列を始めることで足り、前の系列は自分の `until` で止まる。「短くしたい」は `stop <dump_id>`
 
-### 14. 系列のディレクトリの中身: `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` / `.response.sse` (kawaz 裁定)
+### 14. 系列のディレクトリの中身: `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json`、試行ごとの `<ts>-<seq>.<attempt>.response.sse` (kawaz 裁定 + 統括の裁定)
 
 ```
 dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef/
   index.jsonl
   1792000012345-42.request.json
-  1792000012345-42.response.sse
+  1792000012345-42.1.response.sse
   1792000013210-43.request.json
-  1792000013210-43.response.sse
+  1792000013210-43.1.response.sse
+  1792000013210-43.2.response.sse
 ```
 
-- `index.jsonl` は 1 本 1 行のメタデータで、系列の入口。欄は `ts` (request を受けた時刻、Unix ミリ秒) / `seq` (unit の通し番号、`exchange::request_span_numbered` のもの) / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / `request_bytes` / `response_bytes` / `request_file` / `response_file` / `headers` (未決 2) と、打ち切った 1 本の `truncated: true` と `reason` (`max_bytes` / `expired` / `stopped`、決定 5)。欄の意味は events の `request` と同じ (決定 7)。行は応答の終端で書くので、並びは終わった順
+- `index.jsonl` は 1 本 1 行のメタデータで、系列の入口。欄は `ts` (request を受けた時刻、Unix ミリ秒) / `seq` (unit の通し番号、`exchange::request_span_numbered` のもの) / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / `request_bytes` / `request_file` / `attempts` / `adopted` / `headers` (未決 2)。`attempts` は upstream が答えた試行ごとに `{attempt, route, credential, status, response_file, response_bytes, truncated?, reason?}` を並べた配列 (1 試行でも配列 1 件、`attempt` は 1 から、`status` は upstream が返した status)。打ち切った試行には `truncated: true` と `reason` (`max_bytes` / `expired` / `stopped`、決定 5) が付く。`adopted` はクライアントへ返した試行の番号で、返した経路を最後に試した回 (同じ経路を続けて試すのは送り直しで、送り直した方を返す)。gateway が自分で組んだエラーを返した 1 本は `adopted: null` で、upstream が 1 度も答えていなければ `attempts` は空。最上位の `route` / `credential` / `status` はクライアントへ返した値、`response_file` / `response_bytes` (と `truncated` / `reason`) は採用した試行の値を写したもので、`attempts` と重複するが grep しやすさを取る (統括の裁定)。欄の意味は events の `request` と同じ (決定 7)。行は応答の終端で書くので、並びは終わった順
 - `<ts>-<seq>.request.json` は受けた本文そのまま (決定 7)。`<ts>` と `<seq>` は `index.jsonl` の同じ欄で、ファイル名だけで時刻順に並び、同じミリ秒の 2 本も `seq` で分かれる
-- response のファイルは常に `.response.sse` で、中身は upstream が返した生のバイト列 (SSE なら `event:` / `data:` の行、SSE でない応答ならその JSON 1 本)。応答の種類で拡張子を分けない (分けると扱いにくい、kawaz 2026-10-21)。SSE かどうかは `index.jsonl` の `stream` と応答の `content-type` で分かる。`--request-only` の系列では response のファイルも `response_file` の欄も無い
+- response のファイルは試行ごとに 1 つ (`<ts>-<seq>.<attempt>.response.sse`) で、拡張子は常に `.response.sse`。中身は upstream が返した生のバイト列 (SSE なら `event:` / `data:` の行、SSE でない応答ならその JSON 1 本)。応答の種類で拡張子を分けない (分けると扱いにくい、kawaz 2026-10-21)。SSE かどうかは `index.jsonl` の `stream` と応答の `content-type` で分かる。`--request-only` の系列では response のファイルも `response_file` / `response_bytes` の欄も無い (`attempts` の試行と `adopted` は載る)
 - 1 本 1 ファイルにするのは、response を生のまま残すのに 1 ファイル追記 (jsonl) だと本文を JSON 文字列に包む変換が要り、伸び続けるファイルは mtime が常に新しくて片付けが部分的にしか効かず、調べたい 1 本だけを開けないため。系列あたり数百〜千のファイルになる懸念は、`index.jsonl` を入口にして `request_file` / `response_file` から辿ることで受ける
 - ヘッダをどこに置くかは未決 2 (本文のファイルに含めるか、`index.jsonl` の行に載せるか)
 
@@ -183,7 +184,7 @@ events (DR-0012) は恒常の読み手 (ccmsg 等) を持つ公開契約で、�
 - `[stats] dir` の下に会話の本文が置かれる。keepalive の控えと同じ種類の機微で、置き場は 700 / 600 に閉じるが、ディスクを読める者には読める。ダンプしたファイルは会話の本文そのもので、リポや公開物に貼らない。置き場の中は 48 時間の片付けが面倒を見るが、外へコピーした先は取得者の責任
 - 同じ ns に系列を重ねると、1 本が系列の数だけディスクに書かれる (決定 13)。重ねるのは利用者の選択で、`daemon status` に系列が並ぶので気づける
 - `/llm-gateway/self` と `daemon status` の行に `dump` の欄が増える (決定 12)。欄を知らない読み手はそのまま動く
-- `dump` の最上位コマンドが増え、help / MANUAL に載る
+- `dump` の最上位コマンドが増え、help / MANUAL に載る (completion 定義はこのリポに無い)
 - 認証差し替えの中継 (passthrough) は対象外 (決定 10)。中継の本文を残したくなったら別に決める
 - 常時の観測は OTel (docs/issue/2026-10-21-otel-observability-for-dev-environment.md) の側で、ダンプは調査用の一時手段に留める。ダンプに常設の機能 (検索・集計) を足さない
 
@@ -193,7 +194,7 @@ events (DR-0012) は恒常の読み手 (ccmsg 等) を持つ公開契約で、�
 |---|---|---|
 | 1 | unit 側: tap の取り外しと、同じ位置でのダンプの書き出し (系列の表: dump_id / ns / until / 上限 / 書いた量、`index.jsonl` と 1 本ごとのファイル)、起動時と start 時の片付け、`/self` への露出 | 試験で、`until` を過ぎた 1 本と上限を超える 1 本が書かれず、重なる 2 系列に同じ 1 本が両方書かれ、48 時間より古い系列だけがディレクトリごと消え、`GET /llm-gateway/tap` が無い |
 | 2 | 制御口と監督者の中継 (`ControlRequest` / `Request`)、答えの形 (決定 2・11) | 試験で、制御口を持たない unit に `ok: false` が返り、知らない id の `stop` が `ok: false` + `unknown_dump` になる |
-| 3 | CLI `dump start|stop|status`、`--help`・MANUAL | `dump start --ns lab --for 10m` が `dump_id` と `dump_dir` を答え、`daemon status` の行に `dump` が出て、10 分後に消える |
+| 3 | CLI `dump start|stop|status`、`--help`・MANUAL (completion 定義はこのリポに無いので揃える相手に含めない) | `dump start --ns lab --for 10m` が `dump_id` と `dump_dir` を答え、`daemon status` の行に `dump` が出て、10 分後に消える |
 
 ## 未決
 
