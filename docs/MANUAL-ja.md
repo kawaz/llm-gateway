@@ -407,7 +407,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 
 ### `GET /llm-gateway/self`
 
-**走っているこのプロセスの状態**を返す。版と、起動の印 (`boot`、起動時刻の Unix ミリ秒。再起動で変わる) と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。一時ダンプ (`dump`) の系列が動いている間だけ、`dump` に系列ごとの `{dump_id, ns, until, bytes_written}` が並ぶ (置き場は載せない)。`daemon status` の各行はここから埋める。
+**走っているこのプロセスの状態**を返す。版と、起動の印 (`boot`、起動時刻の Unix ミリ秒。再起動で変わる) と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。一時ダンプ (`dump`) の系列が動いている間だけ、`dump` に系列ごとの `{dump_id, ns, expires_at, bytes_written}` が並ぶ (置き場は載せない)。`daemon status` の各行はここから埋める。
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
@@ -732,45 +732,53 @@ reload で変えられない欄 (変えたら `daemon restart`): `[server]` の 
 
 ### `dump` — 本文の一時ダンプ
 
-走っている台に、1 つの namespace を通る request と response の本文を**時限つきで**ディスクに書かせる (DR-0038)。prompt cache の検証や「upstream が何を返したか」の調査のための一時手段で、常時の観測ではない。設定ファイルには書かず、`daemon reload` と同じ経路 (CLI → 監督者 → 台の制御口) で頼む。監督者が動いていなければ `supervisor_not_running` で断る。
+(この節の形は実装差し替え中。現行の実装は旧形)
+
+走っている台に、1 つの namespace を通る request と response の本文を**時限つきで**ディスクに書かせる (DR-0038。設計の一般形は claude-rules-personal の reference `proxy-dump-design`)。prompt cache の検証や「upstream が何を返したか」の調査のための一時手段で、常時の観測ではない。始める・止めるは設定ファイルに書かず、`daemon reload` と同じ経路 (CLI → 監督者 → 台の制御口) で頼む。監督者が動いていなければ `supervisor_not_running` で断る。
 
 | コマンド | 内容 |
 | --- | --- |
-| `dump start --ns <ns> --for <長さ> [--max-bytes <n>] [--request-only]` | その namespace の系列を 1 つ、今から `--for` の間だけ始める。`dump_id` と置き場を答える |
-| `dump stop <dump_id>\|--all` | その系列を時限を待たずに止める。`--all` はその台で動いている全系列。既に止まっていても成功する (`active: false`)。知らない id は `unknown_dump` |
-| `dump status` | 動いている系列の一覧 (`dump_id`・namespace・`until`・書いた量・置き場) |
+| `dump start --ns <ns> [--timeout <長さ>] [--max-bytes <n>] [--store raw] [--label <k>=<v>]... [--follow [--embed bodies [--no-persist]]]` | その namespace の系列を 1 つ、今から `--timeout` の間だけ始める。`dump_id` と置き場を答える。`--follow` は答える代わりに繋いだまま `index.jsonl` の行を流す |
+| `dump end <dump_id>` | その系列を時限を待たずに止める。既に止まっていても成功し、止まった理由を返す。知らない id は `unknown_dump` |
+| `dump list [<選択子>]...` | 系列の一覧 (止まったもの・削除待ちも)。`state=active` で動いているものだけ |
+| `dump prune <dump_id>\|<選択子>...` | 系列をディレクトリごと消す。動いていれば止めてから消す。無指定では消さない |
 
-- **`start` 1 回 = 1 系列**。系列には台が `dump_id` (UUIDv7) を振り、時限・上限・`--request-only`・書いた量・置き場はすべて系列ごと。同じ namespace に期間の重なる系列を何本始めてもよく、重なっている間の 1 本は動いている系列の全部に書かれる (その分ディスクも増える)。延長したければ新しく `start` する (前の系列は自分の時限で止まる)、短くしたければ `stop <dump_id>`。系列の数に上限は無い
-- `--for` は必須で既定値を持たず、上限は 24 時間 (超えると `invalid_duration`)。書き方は設定の duration と同じ (`10m` / `1h`)。終わりの時刻は台がメモリに持ち、`daemon restart` で消える (上がった台はダンプしていない状態で始まり、前の系列の id は `unknown_dump` になる)。時限を過ぎた 1 本は timer が遅れても書かない
-- `--max-bytes` はその系列に書く本文の量 (request と response のファイルの合計。`index.jsonl` の行は数えない) の上限で、既定は 209715200 (200 MiB)。上限ちょうどに達したら時限を待たずに止まる。request は書くと超えるなら書かずに止まり、response は収まる分まで書いて打ち切り、止まる
-- request は **gateway が受けた形** (クライアントが送ろうとしたもの。Claude Code の api-request 記録と同じ) で、gateway の書き換え (cache の `ttl`、thinking の display、model の別名) は載らない。書き換えの有無は `/llm-gateway/events` と `stats` と応答の usage から読む。response は **upstream が返した生のバイト列** (SSE なら `event:` / `data:` の行そのまま)。経路が方言を通訳する前、`stream` を付けなかったクライアント向けに gateway が JSON 1 本へ集め直す前、upstream の断りを gateway のエラー本文に差し替える前の形で、クライアントが受け取った本文とは違うことがある。経路を替えて試し直した 1 本は、upstream が答えた試行を全部、試行ごとのファイルに残す (前の試行も消さず、書いた量にも数える)。`--request-only` で request だけにできる
-- 受けたヘッダは `index.jsonl` の行の `headers` に置く (本文のファイルは生のまま)。秘密のヘッダ (`authorization` / `proxy-authorization` / `x-api-key` / `cookie`) だけを落とし、残りは全部残す。同じ名前が複数あれば `, ` で繋ぐ
-- 置き場は系列ごとのディレクトリ `<stats の置き場>/dumps/<台>/<ns>/<dump_id>/` (ディレクトリ 700、ファイル 600)。`start` と `status` の答えに展開した絶対パス (`dump_dir`) が載る。UUIDv7 なので `ls` で始まった順に並ぶ
-- ディレクトリの中は、1 本 1 行のメタデータ `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` (受けた本文そのまま) と、upstream が答えた試行ごとの `<ts>-<seq>.<attempt>.response.sse` (upstream が返した生のバイト列。`attempt` は 1 から。SSE の行でも JSON 1 本でも拡張子は変えない)。`index.jsonl` の欄は `ts` / `seq` / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / `request_bytes` / `request_file` / `attempts` / `adopted` / `headers`。`attempts` は試行ごとの `{attempt, route, credential, status, response_file, response_bytes}` (打ち切った試行には `truncated` と `reason`) の配列で、1 試行でも配列 1 件。`adopted` はクライアントへ返した試行の番号で、gateway が自分で組んだエラーを返した 1 本は `null`。最上位の `route` / `credential` / `status` はクライアントへ返した値で、採用した試行の `response_file` / `response_bytes` (と `truncated` / `reason`) も最上位に写す。`index.jsonl` を入口にして、調べたい 1 本のファイルだけを開く。その場で見たければ `tail -f index.jsonl`
-- **48 時間より古い系列はディレクトリごと勝手に消える** (判定はディレクトリの mtime = 最後に 1 本書いてから)。掃くのは台が上がった時と `dump start` の時で、`dumps/` の下全体 (他の台の分も) が対象。`--for` が 24 時間以下なので、動いている系列は消えない。置き場の中身は会話の本文そのものなので、リポや公開物に貼らない。外へコピーした分は手で消す
-- 動いている間は `daemon status` の各行と `/llm-gateway/self` に `dump` (`dump_id`・namespace・`until`・書いた量) が系列ごとに出る。止め忘れはここで気づく。止まった理由 (時限・容量・`stop`) は台の log に出る
-- 書くかどうかは request を受けた時点で決まる。系列を始めた時点で流れている 1 本は書かない。系列が止まった後 (上限・時限・`stop`) は、流れている途中の応答も以後のチャンクを書かず、その 1 本の行に `truncated: true` と `reason` (`max_bytes` / `expired` / `stopped`) が付く
-- `index.jsonl` の行は応答の終端で書くので、並びは終わった順。`seq` は台の log の `req` と同じ番号。gateway が自分で組んだエラーを返した 1 本 (経路が尽きた・モデルが無い等) は `adopted: null` で、行の最上位には `status` と受けたモデル名だけが載る (upstream が 1 度も答えていなければ `attempts` も空)。ns 認証に断られた 1 本・JSON として読めない 1 本は書かない
-- 認証差し替えのパススルー (`/{ns}/{upstream}/{rest}`) は対象外
+選択子は `state=active` / `state=stopped` と、labels に対する `owner=kawaz` / `pr!=1234` / `owner` (キーがある)。
+
+- **`start` 1 回 = 1 系列**。系列には台が `dump_id` (UUIDv7) を振り、時限・上限・labels・書いた量・置き場はすべて系列ごと。同じ namespace に期間の重なる系列を何本始めてもよく、重なっている間の 1 本は動いている系列の全部に書かれる (その分ディスクも増える)。延長したければ新しく `start` する (前の系列は自分の時限で止まる)、短くしたければ `end <dump_id>`
+- `--timeout` の既定は 5 分、上限は 24 時間 (超えると `invalid_duration`)。書き方は設定の duration と同じ (`10m` / `1h`)。終わりの時刻は台がメモリに持ち、`daemon restart` で消える (上がった台はダンプしていない状態で始まり、前の系列の id は `unknown_dump` になる)。時限を過ぎた 1 本は timer が遅れても書かない
+- `--max-bytes` はその系列に書く本文 (`*.body` のファイルの合計。`index.jsonl` とメタ json は数えない) の上限で、既定は 209715200 (200 MiB)。上限ちょうどに達したら時限を待たずに止まる。request は書くと超えるなら書かずに止まり、response は収まる分まで書いて打ち切り (`truncated: true`)、止まる。全体の上限 (動いている全系列の合計 2 GiB) と fs の空き (1 GiB を残す) でも止まり、止まった理由は `end` / `list` の `reason` (`timeout` / `max_bytes` / `total_limit` / `fs_min_free` / `ended` / `disconnected` / `lagged`) に出る。止まった系列は再開しない
+- request は **gateway が受けた形** (クライアントが送ろうとしたもの。Claude Code の api-request 記録と同じ) で、gateway の書き換え (cache の `ttl`、thinking の display、model の別名) は本文に載らず、`*.request.json` の `rewrites` に差分として載る。response は **upstream が返した生のバイト列** (SSE なら `event:` / `data:` の行そのまま)。経路が方言を通訳する前、`stream` を付けなかったクライアント向けに gateway が JSON 1 本へ集め直す前、upstream の断りを gateway のエラー本文に差し替える前の形で、クライアントが受け取った本文とは違うことがある。経路を替えて試し直した 1 本は、upstream が答えた試行を全部、試行ごとのファイルに残す (前の試行も消さず、書いた量にも数える)
+- ヘッダはメタ json (`*.request.json` / `*.response.json`) に `{name, value}` の配列で入る (同じ名前も繋がずそのまま)。秘密のヘッダ (`authorization` / `proxy-authorization` / `x-api-key` / `cookie`) だけを落とし、残りは全部残す
+- 置き場は系列ごとのディレクトリ `<stats の置き場>/dumps/<台>/<ns>/<dump_id>/` (ディレクトリ 700、ファイル 600)。`start` と `list` の答えに展開した絶対パス (`dump_dir`) が載る。UUIDv7 なので `ls` で始まった順に並ぶ
+- ディレクトリの中は `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` (ヘッダ・`rewrites`・本文のファイル名などのメタ) と `<ts>-<seq>.request.body` (受けた本文そのまま)、upstream が答えた試行ごとの `<ts>-<seq>.<attempt>.response.json` (status・ヘッダ・stream かどうか) と `<ts>-<seq>.<attempt>.response.body` (生のバイト列。`attempt` は 1 から)。`<ts>` は request を受けた時刻 (Unix ミリ秒)、`<seq>` は台の通し番号 (`/llm-gateway/events` の `seq`、台の log の `req` と同じ)。body の種類は json 側の `content-type` で見る (拡張子は変えない)
+- `index.jsonl` は系列の進行を時刻点ごとに追記したイベントの行 (`start` / `request_headers` / `request_body_end` / `upstream_connect` / `upstream_headers` / `upstream_body_end` / `upstream_close` / `response_headers_sent` / `response_body_end` / `transport_close` / `stop`)。各行に `ts` (Unix ミリ秒) と `seq`、区間を閉じる行には `duration_ms` が付くので、どの待ちで遅いかを切り分けられる。`response_headers_sent` の `adopted` がクライアントへ返した試行の番号 (gateway が自分で組んだエラーを返した 1 本は `null`)。行は起きたら 1 秒以内に書かれるので、応答が終わらないまま切れた 1 本も `request_headers` までは残る。`index.jsonl` を入口にして、調べたい 1 本のファイルだけを開く。その場で見たければ `dump start --follow` か `tail -f index.jsonl`
+- `--follow` は繋いだまま `index.jsonl` の行を 1 行 1 JSON で標準出力へ流す (最初の行は `start`)。Ctrl-C で繋ぎを切ると系列は `disconnected` で止まり、時限や上限で止まれば `stop` の行を流して終わる。読むのが遅くて台の送信が溢れると `lagged` で切られる。ファイルは `--follow` でも書く。`--embed bodies` で本文も行に同梱し、`--no-persist` (follow + embed の時だけ) は流すだけで止まった時にディレクトリごと消す
+- **48 時間より古い系列はディレクトリごと勝手に消える** (基準は始めた時刻。`start` の答えの `delete_after`)。掃くのは台が上がった時と `dump start` の時で、`dumps/` の下全体 (他の台の分も) が対象。`--timeout` が 24 時間以下なので、動いている系列は消えない。置き場の中身は会話の本文そのものなので、リポや公開物に貼らない。外へコピーした分は手で消す
+- 動いている間は `daemon status` の各行と `/llm-gateway/self` に `dump` (`dump_id`・namespace・`expires_at`・書いた量) が系列ごとに出る。止め忘れはここで気づく
+- 書くかどうかは request を受けた時点で決まる。系列を始めた時点で流れている 1 本は書かない。ns 認証に断られた 1 本・JSON として読めない 1 本は書かない。認証差し替えのパススルー (`/{ns}/{upstream}/{rest}`) は対象外
+- 歯止めと既定値は設定の `[dump]` で変えられる (どれも既定値があるので書かなくてよい): `default_timeout` (`5m`) / `default_max_bytes` (`209715200`) / `max_timeout` (`24h`、`cleanup_ttl` 以下) / `max_total_bytes` (`2147483648`) / `fs_min_free` (`1073741824`) / `cleanup_ttl` (`48h`) / `max_concurrency`。始める・止めるは設定に書けない
 
 ```
-$ llm-gateway dump start --ns lab --for 10m --unit unstable
-{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
-$ llm-gateway dump status --unit unstable
-{"unit":"unstable","ok":true,"dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
-$ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
-{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
+$ llm-gateway dump start --ns lab --timeout 10m --label owner=kawaz --unit unstable
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","timeout_ms":600000,"max_bytes":209715200,"store":"raw","labels":{"owner":"kawaz"},"started_at":1792000000000,"expires_at":1792000600000,"delete_after":1792172800000,"concurrency":{"limit":16,"active":1},"storage":{"active_used_bytes":0,"active_requested_bytes":209715200,"total_available_bytes":2147483648,"total_limit_bytes":2147483648,"fs_min_free_bytes":1073741824,"fs_free_bytes":53687091200,"fs_checked_at":1792000000000}}
+$ llm-gateway dump list state=active --unit unstable
+{"unit":"unstable","ok":true,"dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","state":"active","reason":null,"labels":{"owner":"kawaz"},"started_at":1792000000000,"expires_at":1792000600000,"delete_after":1792172800000,"stopped_at":null,"bytes_written":1234567}]}
+$ llm-gateway dump end 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
+{"unit":"unstable","ok":true,"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","state":"stopped","reason":"ended","stopped_at":1792000312000,"bytes_written":1234567}
+$ llm-gateway dump prune owner=kawaz --unit unstable
+{"unit":"unstable","ok":true,"pruned":["019a1b2c-3d4e-7f80-9123-456789abcdef"]}
 ```
 
-答えは `daemon reload` と同じく `unit` と `ok` で始まり、断る時は `ok: false` と `error.kind` で、答えは stderr に出て exit は非 0。`start` の答えは系列の id と置き場に、受け取った引数の全部を添えたもの (`until` は決めた終わりの時刻)。`status` はそれに `bytes_written` (書いた合計) と `requests` (書いた本数) を足した 1 件を、動いている系列の分だけ `dumps` に並べる (無ければ空の配列)。時刻は Unix ミリ秒。
+答えは `daemon reload` と同じく `unit` と `ok` で始まり、断る時は `ok: false` と `error.kind` で、答えは stderr に出て exit は非 0。`start` の答えは系列の id と置き場に、適用された引数 (既定値を補ったもの) と、その時点の並列度 (`concurrency`) と容量 (`storage`: 動いている系列の実使用量・申告の合計、全体の上限、fs の空き) を添えたもの。容量は重ねすぎに気づくための参考値で、書けることの保証ではない。時刻は Unix ミリ秒。
 
 | `error.kind` | 意味 |
 | --- | --- |
 | `unknown_namespace` | 指した ns が走っている設定に無い |
 | `invalid_namespace` | ns の名前がディレクトリ名にできない (英数字と `.` `_` `-` 以外を含む、`.` で始まる) |
 | `unknown_dump` | 台が知らない `dump_id` (restart で消えた系列も) |
-| `invalid_duration` | `--for` が 0 か 24 時間を超える |
-| `bad_request` | `--max-bytes` が 0、`stop` の指し方が読めない、台か監督者の版が `dump` を知らない (監督者の時は上げ直す) |
+| `invalid_duration` | `--timeout` が 0 か `max_timeout` (既定 24 時間) を超える |
+| `bad_request` | `--max-bytes` が 0、`--store` が `raw` 以外、`--no-persist` が follow + embed 以外に付いている、選択子が読めない、台か監督者の版が `dump` を知らない (監督者の時は上げ直す) |
 | `dump_dir_unwritable` | 系列のディレクトリを作れなかった |
 | `not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` | 監督者が台に渡せなかった (`daemon reload` の表と同じ。`restart_required` は制御口を持たない版が走っている) |
 | `supervisor_not_running` / `unit_required` / `no_units` / `unknown_unit` | CLI が頼む先を決められなかった・監督者に届かなかった (頼む先が決まっていなければ `unit` は付かない。`unit_required` には登録されている名前の `units` が付く) |
@@ -851,12 +859,15 @@ OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を�
 | `--config <path>` | `check` / `models` / `daemon add` / `login` | 設定ファイルそのものを対象にするコマンドだけが取る |
 | `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | どの台に聞くか (登録が 1 つならその台) |
 | `--ns <ns>` | `dump start` (必須) | 対象の namespace |
-| `--for <長さ>` | `dump start` (必須) | 今からどれだけの間ダンプするか (`10m` / `1h`) |
-| `--max-bytes <n>` | `dump start` | 書く量の上限。超えたら止まる |
-| `--request-only` | `dump start` | request だけを書き、response を書かない |
+| `--timeout <長さ>` | `dump start` | 今からどれだけの間ダンプするか (`10m` / `1h`。既定 5 分、上限 24 時間) |
+| `--max-bytes <n>` | `dump start` | その系列に書く量の上限。達したら止まる |
+| `--store raw` | `dump start` | 本文を通信上のバイト列のまま保存する (`raw` だけ) |
+| `--label <k>=<v>` | `dump start` | 系列に付ける自由な kv (`list` / `prune` の選択子)。複数可 |
+| `--embed bodies` | `dump start --follow` | 流す行に本文も同梱する |
+| `--no-persist` | `dump start --follow --embed bodies` | 流すだけで残さない |
 | `--name <name>` | `daemon add` | unit の名前 (既定: 設定ファイル名から拡張子を落としたもの) |
-| `--all` | `daemon` の上げ下げ・状態・ログ / `dump stop` | 登録されている全部 (`dump stop` ではその台で動いている全系列) |
-| `--follow` | `daemon log` / `service log` | 書かれ続けるものを追う |
+| `--all` | `daemon` の上げ下げ・状態・ログ | 登録されている全部 |
+| `--follow` | `daemon log` / `service log` / `dump start` | 書かれ続けるものを追う (`dump start` では繋いだまま `index.jsonl` の行を流す) |
 | `--dry-run` | `service register` | 何が起きるかを出すだけで登録しない |
 | `--force` | `service register` | 固定してある `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が今の shell の導出結果と違っても置き換える |
 | `--executable <path>` | `service register` | 焼き込む実行ファイル (既定: 同じ binary を指す PATH 上の安定な場所) |
