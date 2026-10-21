@@ -59,7 +59,7 @@ object storage 等の分散 backend は作らない (兄弟は同一ホストの
 
 保持するのは会話本文そのものである。この事実を DR / README / 設定ファイルのコメントに明記する。それだけで、同意フラグ・暗号化・マスキングは持たない。
 
-同じホストには既にセッションの transcript が丸ごと置いてあり、tap (`?include=request_body`、DR-0017) からも本文は読める。gateway だけに保護の儀式を足しても実際に守られるものは増えず、「守っている」という誤った印象だけが残る。
+同じホストには既にセッションの transcript が丸ごと置いてあり、一時ダンプ (DR-0038) でも同じ本文を取れる。gateway だけに保護の儀式を足しても実際に守られるものは増えず、「守っている」という誤った印象だけが残る。
 
 ### 5. sub も keepalive の対象にできる
 
@@ -136,7 +136,7 @@ object storage 等の分散 backend は作らない (兄弟は同一ホストの
 ## 関連
 
 - DR-0024 (cache 戦略、keepalive を仕掛ける条件と止める口、損益)
-- DR-0010 (置き場の flock 排他)、DR-0011 (日別 stats)、DR-0012 (request event / prefix)、DR-0017 (tap)
+- DR-0010 (置き場の flock 排他)、DR-0011 (日別 stats)、DR-0012 (request event / prefix)、DR-0038 (一時ダンプ)
 - docs/findings/2026-09-08-cache-ttl-refresh-on-hit.md (ヒットで TTL が更新される実測)
 - docs/findings/2026-09-08-keepalive-field-observation.md (合図方式の実運用評価)
 - docs/research/2026-09-08-session-injection-and-json-port.md (却下した注入経路)

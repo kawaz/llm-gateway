@@ -1,6 +1,6 @@
 # DR-0017: デバッグ用 tap endpoint (購読時のみ動く観測口)
 
-- Status: Active
+- Status: Superseded by [DR-0038](../DR-0038-timed-request-dump.md) (2026-10-21、tap を廃止し本文を控える口を一時ダンプに一本化)。それまでは Active、実装済み
 - Date: 2026-08-14
 
 ## 背景

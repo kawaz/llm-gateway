@@ -127,7 +127,7 @@ POST /ns-x/v1/messages
 - **core の汎用 module は provider 名を知らない**。`lib.rs` のテストが production code を走査する
 - **route 固有状態は route が持つ**。router は `Availability` だけを受け取る
 - **ingress の書き換えは thinking.display だけ**。`thinking` object を持つ request に限り、`display` を ns の設定値へ上書きする。thinking の無い request、assistant prefill、forced `tool_choice` (`any` / `tool`)、`thinking.type = "disabled"` は触らない (DR-0016)
-- **tap は購読者がいる間だけ動く**。購読数 0 ならシリアライズもしない。接続は loopback 直結 (proxy ヘッダを持たない peer) に限り、本文は query で opt-in する (DR-0017)
+- **本文を覗く口は求められている間だけ動く**。tap は購読数 0 ならシリアライズもしない。接続は loopback 直結 (proxy ヘッダを持たない peer) に限り、本文は query で opt-in する。この口は一時ダンプ (DR-0038) に置き換わり、ダンプも動いていない間は 1 バイトも控えない
 
 ## 4. 拡張点と責務境界
 

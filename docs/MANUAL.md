@@ -137,7 +137,7 @@ A `keepalive` series keeps its last forwarded request in `<stats dir>/keepalive/
 
 What gets kept is the real request — the one carrying tools — and only when it actually landed on the cache. A series whose usage reports a miss is not kept, and any existing entry is dropped: resending a body with no cache to extend would only spend the full input again. When the route it last used (namespace / model / credential) is down, nothing is sent, and it tries again 55 minutes later.
 
-**What is kept is the conversation body itself** (DR-0027 decision 4). There is no consent flag, no encryption, no masking — the same host already holds the session transcripts in full and the tap (`?include=request_body`) serves the same bodies, so guarding only this one place would protect nothing. Treat the directory as holding conversation content. A series whose body exceeds 8MB is not kept, and is not extended.
+**What is kept is the conversation body itself** (DR-0027 decision 4). There is no consent flag, no encryption, no masking — the same host already holds the session transcripts in full, so guarding only this one place would protect nothing. Treat the directory as holding conversation content. A series whose body exceeds 8MB is not kept, and is not extended.
 
 ### Requests that did not land
 
@@ -615,30 +615,6 @@ base_url = "http://127.0.0.1:7777"
 base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 ```
 
-### `GET /llm-gateway/tap`
-
-Streams the details of each forward as JSONL, one JSON object per line (DR-0017). It is not SSE, so the output can be saved to a file and processed directly.
-
-**Only direct loopback connections may use it.** Connections from anywhere else, and connections carrying a `Forwarded` / `X-Forwarded-For` header, receive 403.
-
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `include` | absent | `request_body` / `response_body`, comma-separated |
-| `max_body` | `65536` | Byte limit at which an included body is truncated |
-
-An unknown `include` value, an unknown parameter name, or a non-numeric `max_body` returns 400. A subscriber that falls too far behind is disconnected (it does not rejoin an older position in the stream).
-
-```bash
-curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_body&max_body=4096' \
-  > tap.jsonl
-```
-
-```json
-{"ts":1785326400000,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
-```
-
-`origin` says who asked. `cache_strategy` appears when a prompt cache strategy was applied, and `cache_ttl_secs` when the request leaves a prefix behind. `request_body` / `response_body` appear only for subscriptions that asked for them, and the truncation limit is independent per subscription. `thinking`, `tool_choice`, and `stream` are the values the client sent, before the gateway rewrote anything.
-
 ## Re-authorization (login)
 
 Endpoints for redoing OAuth from a browser once a refresh token has expired (DR-0023). **Only `claude_oauth` credentials** are covered; for `codex_oauth` the page points you at the CLI instead.
@@ -700,6 +676,7 @@ llm-gateway <command> [options]
 | `models` | List the models written in the configuration | — |
 | `usage` | Usage per credential (asks a running unit) | `/llm-gateway/usage` |
 | `stats` | Token counts and USD per credential × model × day | `/llm-gateway/stats` |
+| `dump` | Dump request / response bodies to disk for a limited time (asks a running unit; not implemented yet, DR-0038) | — |
 | `login` | Authorize in a browser and save to `<name>.json` | `/llm-gateway/login` |
 | `version` | What is installed, what is running, and whether they differ | `/llm-gateway/version` |
 
@@ -750,6 +727,40 @@ $ llm-gateway daemon reload --all
 | `bad_answer` | The unit's answer could not be read (`message` carries at most its first 200 bytes) | Unknown |
 
 Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `binary_path` / `disabled`, `[store]`, `[stats]`, `[discovery]`, `[webhook]`, `[status]`, `routes.<name>.status_source`, `[upstreams]`, `[secret_store]`, `[secrets]`, `[ratelimit]`. The `message` shows the old and new values (`[webhook]` / `[upstreams]` / `[secrets]` may hold secrets, so only the field is named).
+
+### `dump` — dumping bodies for a limited time
+
+(Not implemented yet, DR-0038)
+
+Asks a running unit to write the request and response bodies passing through one namespace to disk, **for a limited time** (DR-0038). It is a temporary tool for checking the prompt cache or for seeing what the upstream actually returned, not continuous observation. Nothing is written to the configuration file; the request travels the same path as `daemon reload` (CLI → supervisor → the unit's control socket). Without a running supervisor it is refused with `supervisor_not_running`.
+
+| Command | What it does |
+| --- | --- |
+| `dump start --ns <ns> --for <duration> [--max-bytes <n>] [--request-only]` | Start one series for that namespace, from now, for `--for`. Answers with the `dump_id` and the directory |
+| `dump stop <dump_id>\|--all` | Stop that series without waiting for its time. `--all` stops every series running on the unit. Succeeds even if the series has already stopped (`active: false`). An unknown id is `unknown_dump` |
+| `dump status` | The running series (`dump_id`, namespace, `until`, bytes written, directory) |
+
+- **One `start` is one series.** The unit gives it a `dump_id` (UUIDv7); time limit, cap, `--request-only`, bytes written, and directory all belong to the series. Any number of series may overlap on the same namespace, and while they overlap, each request is written to every running series (and takes disk space in each). To extend, `start` again (the earlier series stops at its own time); to cut short, `stop <dump_id>`. There is no limit on the number of series
+- `--for` is required and has no default. It takes the same format as durations in the configuration (`10m` / `1h`). The unit keeps the end time in memory, and `daemon restart` clears it (a unit comes up with nothing being dumped, and the earlier ids become `unknown_dump`). A request past the end time is not written even if the timer is late
+- `--max-bytes` caps the bytes written to that series; past it, the series stops without waiting for the time. A request that would cross the cap is not written and the series stops; a response is cut off where the cap is reached and the series stops (that request's line in `index.jsonl` carries `truncated: true`). The default is fixed at implementation time
+- The request is **what the gateway received** (what the client set out to send; the same thing as Claude Code's api-request records). The gateway's rewrites (cache `ttl`, thinking display, model aliases) are not in it; read whether they applied from `/llm-gateway/events`, `stats`, and the usage in the response. The response is **the raw bytes the upstream returned** (for SSE, the `event:` / `data:` lines as they were). `--request-only` writes only the request
+- Secret headers (`authorization` / `proxy-authorization` / `x-api-key` / `cookie`) are dropped before writing. Which other headers are kept, and where, is fixed at implementation time
+- Each series is one directory, `<stats dir>/dumps/<unit>/<ns>/<dump_id>/` (directory 700, files 600). `start` and `status` answer with the expanded absolute path (`dump_dir`). Because the id is a UUIDv7, `ls` lists series in the order they started
+- Inside: `index.jsonl`, one line of metadata per request (`ts` / `seq` / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / body sizes / file names), and per request `<ts>-<seq>.request.json` (the received body as is) plus `<ts>-<seq>.response.sse` (the raw lines, when the response is SSE) or `<ts>-<seq>.response.json` (otherwise). Use `index.jsonl` as the entry point and open only the request you are after; to watch live, `tail -f index.jsonl`
+- **A series older than 48 hours is deleted on its own, directory and all** (judged by the directory's mtime, so 48 hours after its last request was written). The sweep runs when a unit comes up and on every `dump start`, over everything under `dumps/` (other units' directories included). A series still being written is never deleted. The directory holds conversation content as is; do not paste it into a repository or anything public, and delete by hand whatever you copied out
+- While a series runs, each line of `daemon status` and `/llm-gateway/self` carry `dump` (`dump_id`, namespace, `until`, bytes written) per series. That is where a forgotten dump shows up. Why a series stopped (time, cap, or `stop`) goes to the unit's log
+- A request already in flight when the series starts is not written. The authentication pass-through (`/{ns}/{upstream}/{rest}`) is not covered
+
+```
+$ llm-gateway dump start --ns lab --for 10m --unit unstable
+{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
+$ llm-gateway dump status --unit unstable
+{"unit":"unstable","dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats dir>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
+$ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
+{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
+```
+
+The `start` answer is the series' id and directory plus every argument it received (`until` being the end time it settled on). `status` adds `bytes_written` (total written) and `requests` (how many) and lists one such entry per running series in `dumps` (an empty array when none). Times are Unix milliseconds.
 
 ### `auth` — keys and tokens for `jwt` namespaces
 
@@ -825,9 +836,13 @@ Options:
 | Option | Applies to | Meaning |
 | --- | --- | --- |
 | `--config <path>` | `check` / `models` / `daemon add` / `login` | Only the commands that take a configuration file itself |
-| `--unit <name>` | `usage` / `stats` / `upstream status` | Which running unit to ask (the only one, if only one is registered) |
+| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | Which running unit to ask (the only one, if only one is registered) |
+| `--ns <ns>` | `dump start` (required) | The namespace |
+| `--for <duration>` | `dump start` (required) | How long to dump from now (`10m` / `1h`) |
+| `--max-bytes <n>` | `dump start` | Cap on bytes written; the dump stops past it |
+| `--request-only` | `dump start` | Write only the request, not the response |
 | `--name <name>` | `daemon add` | Name of the unit (default: the configuration file name without its extension) |
-| `--all` | `daemon` start/stop/restart/status/log | Everything that is registered |
+| `--all` | `daemon` start/stop/restart/status/log / `dump stop` | Everything that is registered (with `dump stop`, every series running on that unit) |
 | `--follow` | `daemon log` / `service log` | Keep printing as more is written |
 | `--dry-run` | `service register` | Print what would happen instead of registering |
 | `--force` | `service register` | Swap the unit in even when the pinned `XDG_STATE_HOME` / `XDG_CONFIG_HOME` differ from what this shell resolves |

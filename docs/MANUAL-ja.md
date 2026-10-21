@@ -137,7 +137,7 @@ sub = "none"
 
 控えるのは、道具を持つ本流の 1 本のうち **cache に乗ったもの**だけ。応答の usage が「乗らなかった」と答えた系列は控えない・畳む — 繋ぐ cache が無い本文を送り直しても、全量入力を払うだけになる。直前に通った先 (namespace / モデル / 経路) が塞がっているときは送らず、55 分後に改めて試す。
 
-**控えるのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグ・暗号化・マスキングは持たない — 同じホストにはセッションの transcript が丸ごと置いてあり、tap (`?include=request_body`) からも本文は読めるので、ここだけに保護を足しても守られるものは増えない。置き場を配る・共有するときは、会話の中身がそのまま入っている前提で扱うこと。1 系列 8MB を超える会話は控えず、その系列は延命しない。
+**控えるのは会話の本文そのもの**である (DR-0027 決定 4)。同意フラグ・暗号化・マスキングは持たない — 同じホストにはセッションの transcript が丸ごと置いてあるので、ここだけに保護を足しても守られるものは増えない。置き場を配る・共有するときは、会話の中身がそのまま入っている前提で扱うこと。1 系列 8MB を超える会話は控えず、その系列は延命しない。
 
 ### 乗らなかった request の退避
 
@@ -617,30 +617,6 @@ base_url = "http://127.0.0.1:7777"
 base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 ```
 
-### `GET /llm-gateway/tap`
-
-転送 1 件ごとの詳細を JSONL (1 行 1 JSON) で流す (DR-0017)。SSE ではないので、そのままファイルに落として集計できる。
-
-**直接 loopback から繋いだ接続だけが使える。** loopback 以外からの接続、および `Forwarded` / `X-Forwarded-For` ヘッダが付いた接続は 403 を返す。
-
-| パラメータ | 既定 | 意味 |
-| --- | --- | --- |
-| `include` | なし | `request_body` / `response_body` をカンマ区切りで指定 |
-| `max_body` | `65536` | 本文を載せるときの切り詰めバイト数 |
-
-未知の `include` 値・未知のパラメータ名・数値でない `max_body` は 400。購読が追いつけなくなった場合、その購読は切断される (古い列へ復帰しない)。
-
-```bash
-curl -sSN 'http://127.0.0.1:8402/llm-gateway/tap?include=request_body,response_body&max_body=4096' \
-  > tap.jsonl
-```
-
-```json
-{"ts":1785326400000,"ns":"default","model":"claude-opus-5","route":"anthropic-a","status":200,"thinking":{"type":"adaptive"},"tool_choice":"auto","stream":false,"request_body_size":2481,"response_body_size":712,"credential":"personal","origin":"main"}
-```
-
-`origin` はその 1 本を出した側。効かせた prompt cache 戦略があれば `cache_strategy`、この 1 本が残す寿命があれば `cache_ttl_secs` が加わる。`include` を指定した購読にだけ `request_body` / `response_body` が加わる。切り詰め長は購読ごとに独立している。`thinking` / `tool_choice` / `stream` は gateway が書き換える前の、クライアントが送ってきた値。
-
 ## 再認証 (login)
 
 refresh token が失効したときに、ブラウザから OAuth をやり直す口 (DR-0023)。**`claude_oauth` の credential だけ**が対象。`codex_oauth` はページ上で CLI の実行を案内する。
@@ -702,6 +678,7 @@ llm-gateway <command> [options]
 | `models` | 設定に書かれたモデルを一覧する | — |
 | `usage` | credential ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
 | `stats` | credential × モデル × 日のトークン数と USD | `/llm-gateway/stats` |
+| `dump` | request / response の本文を時限で一時的にダンプする (走っている台に頼む。未実装、DR-0038) | — |
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |
 | `version` | 置いてある版と走っている版、食い違っているか | `/llm-gateway/version` |
 
@@ -752,6 +729,40 @@ $ llm-gateway daemon reload --all
 | `bad_answer` | 台の答えが読めなかった (`message` には答えの先頭 200 バイトまで) | 不明 |
 
 reload で変えられない欄 (変えたら `daemon restart`): `[server]` の `listen` / `binary_path` / `disabled`、`[store]`、`[stats]`、`[discovery]`、`[webhook]`、`[status]`、`routes.<name>.status_source`、`[upstreams]`、`[secret_store]`、`[secrets]`、`[ratelimit]`。`message` には旧→新の値を並べる (`[webhook]` / `[upstreams]` / `[secrets]` は秘密を含みうるので欄名だけ)。
+
+### `dump` — 本文の一時ダンプ
+
+(未実装、DR-0038)
+
+走っている台に、1 つの namespace を通る request と response の本文を**時限つきで**ディスクに書かせる (DR-0038)。prompt cache の検証や「upstream が何を返したか」の調査のための一時手段で、常時の観測ではない。設定ファイルには書かず、`daemon reload` と同じ経路 (CLI → 監督者 → 台の制御口) で頼む。監督者が動いていなければ `supervisor_not_running` で断る。
+
+| コマンド | 内容 |
+| --- | --- |
+| `dump start --ns <ns> --for <長さ> [--max-bytes <n>] [--request-only]` | その namespace の系列を 1 つ、今から `--for` の間だけ始める。`dump_id` と置き場を答える |
+| `dump stop <dump_id>\|--all` | その系列を時限を待たずに止める。`--all` はその台で動いている全系列。既に止まっていても成功する (`active: false`)。知らない id は `unknown_dump` |
+| `dump status` | 動いている系列の一覧 (`dump_id`・namespace・`until`・書いた量・置き場) |
+
+- **`start` 1 回 = 1 系列**。系列には台が `dump_id` (UUIDv7) を振り、時限・上限・`--request-only`・書いた量・置き場はすべて系列ごと。同じ namespace に期間の重なる系列を何本始めてもよく、重なっている間の 1 本は動いている系列の全部に書かれる (その分ディスクも増える)。延長したければ新しく `start` する (前の系列は自分の時限で止まる)、短くしたければ `stop <dump_id>`。系列の数に上限は無い
+- `--for` は必須で既定値を持たない。書き方は設定の duration と同じ (`10m` / `1h`)。終わりの時刻は台がメモリに持ち、`daemon restart` で消える (上がった台はダンプしていない状態で始まり、前の系列の id は `unknown_dump` になる)。時限を過ぎた 1 本は timer が遅れても書かない
+- `--max-bytes` はその系列に書く量の上限で、超えたら時限を待たずに止まる。request は書くと超えるなら書かずに止まり、response は途中で打ち切って止まる (その 1 本は `index.jsonl` の行に `truncated: true`)。既定値は実装時に確定
+- request は **gateway が受けた形** (クライアントが送ろうとしたもの。Claude Code の api-request 記録と同じ) で、gateway の書き換え (cache の `ttl`、thinking の display、model の別名) は載らない。書き換えの有無は `/llm-gateway/events` と `stats` と応答の usage から読む。response は **upstream が返した生のバイト列** (SSE なら `event:` / `data:` の行そのまま)。`--request-only` で request だけにできる
+- 秘密のヘッダ (`authorization` / `proxy-authorization` / `x-api-key` / `cookie`) は落として書く。それ以外のヘッダをどこまで残しどこに置くかは実装時に確定
+- 置き場は系列ごとのディレクトリ `<stats の置き場>/dumps/<台>/<ns>/<dump_id>/` (ディレクトリ 700、ファイル 600)。`start` と `status` の答えに展開した絶対パス (`dump_dir`) が載る。UUIDv7 なので `ls` で始まった順に並ぶ
+- ディレクトリの中は、1 本 1 行のメタデータ `index.jsonl` (`ts` / `seq` / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / 本文の大きさ / ファイル名) と、1 本ごとの `<ts>-<seq>.request.json` (受けた本文そのまま) と `<ts>-<seq>.response.sse` (応答が SSE の時、生の行) または `<ts>-<seq>.response.json` (それ以外)。`index.jsonl` を入口にして、調べたい 1 本のファイルだけを開く。その場で見たければ `tail -f index.jsonl`
+- **48 時間より古い系列はディレクトリごと勝手に消える** (判定はディレクトリの mtime = 最後に 1 本書いてから)。掃くのは台が上がった時と `dump start` の時で、`dumps/` の下全体 (他の台の分も) が対象。書いている最中の系列は消えない。置き場の中身は会話の本文そのものなので、リポや公開物に貼らない。外へコピーした分は手で消す
+- 動いている間は `daemon status` の各行と `/llm-gateway/self` に `dump` (`dump_id`・namespace・`until`・書いた量) が系列ごとに出る。止め忘れはここで気づく。止まった理由 (時限・容量・`stop`) は台の log に出る
+- 系列を始めた時点で流れている 1 本は書かない。認証差し替えのパススルー (`/{ns}/{upstream}/{rest}`) は対象外
+
+```
+$ llm-gateway dump start --ns lab --for 10m --unit unstable
+{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false}
+$ llm-gateway dump status --unit unstable
+{"unit":"unstable","dumps":[{"dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"<stats の置き場>/dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12}]}
+$ llm-gateway dump stop 019a1b2c-3d4e-7f80-9123-456789abcdef --unit unstable
+{"unit":"unstable","dump_id":"019a1b2c-3d4e-7f80-9123-456789abcdef","dump_dir":"…","ns":"lab","until":1792000600000,"max_bytes":209715200,"request_only":false,"bytes_written":1234567,"requests":12,"active":false}
+```
+
+`start` の答えは系列の id と置き場に、受け取った引数の全部を添えたもの (`until` は決めた終わりの時刻)。`status` はそれに `bytes_written` (書いた合計) と `requests` (書いた本数) を足した 1 件を、動いている系列の分だけ `dumps` に並べる (無ければ空の配列)。時刻は Unix ミリ秒。
 
 ### `auth` — `jwt` の namespace の鍵と token
 
@@ -827,9 +838,13 @@ OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を�
 | オプション | 対象 | 意味 |
 | --- | --- | --- |
 | `--config <path>` | `check` / `models` / `daemon add` / `login` | 設定ファイルそのものを対象にするコマンドだけが取る |
-| `--unit <name>` | `usage` / `stats` / `upstream status` | どの台に聞くか (登録が 1 つならその台) |
+| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | どの台に聞くか (登録が 1 つならその台) |
+| `--ns <ns>` | `dump start` (必須) | 対象の namespace |
+| `--for <長さ>` | `dump start` (必須) | 今からどれだけの間ダンプするか (`10m` / `1h`) |
+| `--max-bytes <n>` | `dump start` | 書く量の上限。超えたら止まる |
+| `--request-only` | `dump start` | request だけを書き、response を書かない |
 | `--name <name>` | `daemon add` | unit の名前 (既定: 設定ファイル名から拡張子を落としたもの) |
-| `--all` | `daemon` の上げ下げ・状態・ログ | 登録されている全部 |
+| `--all` | `daemon` の上げ下げ・状態・ログ / `dump stop` | 登録されている全部 (`dump stop` ではその台で動いている全系列) |
 | `--follow` | `daemon log` / `service log` | 書かれ続けるものを追う |
 | `--dry-run` | `service register` | 何が起きるかを出すだけで登録しない |
 | `--force` | `service register` | 固定してある `XDG_STATE_HOME` / `XDG_CONFIG_HOME` が今の shell の導出結果と違っても置き換える |
