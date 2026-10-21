@@ -9,7 +9,9 @@
 
 通知を出す口も無い。`[webhook]` (DR-0012) は ccmsg の受け口 1 つのための形で、送り先に `/webhook/llm-gateway` を固定で足し、合言葉の既定パスに ccmsg の名前が入っている (`config.rs` の `default_token_file`)。gateway が受け手を知っている密結合で、別の受け手 (bark 等の通知) に同じイベントを流すには受け手ごとに同じ形の口を増やすことになる。
 
-kawaz の要件 (2026-10-21) は 3 つ。credential の状態遷移を events の語彙に足すこと、gateway 自身が選んだイベントで URL を叩く `[[hooks]]` を足して通知 (bark 等) と ccmsg の配達を同じ枠組みに載せること、テンプレートはプアに固定すること (`{{field}}` / `{{field.field2}}` / `{{event}}` だけ、if / loop / 整形は持たない、無い欄は黙って空にしない)。hooks は本体を阻害しない (reference `proxy-dump-design` の「実装の原則」と同じ: 透過、非ブロッキング、失敗は log のみ)。
+認証 proxy としての知らせも同じ穴にある。refresh token が無効になった (`oauth.rs` の `refresh_failure_class` が `refresh_token_expired` / `refresh_token_invalidated` / `refresh_token_reused` と 400 / 401 を `ReloginRequired` に分類する) ことは usage の `auth` と log にしか出ず、気づくのは次の 1 本が全経路で断られてから。refresh token 自体の寿命は upstream が返さない (`expires_in` は access token の分) ので、切れる前に知る手段が無い。
+
+kawaz の要件 (2026-10-21) は 3 つ。credential の状態遷移 (締め出し / refresh の失敗 / 寿命の接近) を events の語彙に足すこと、gateway 自身が選んだイベントで URL を叩く `[[hooks]]` を足して通知 (bark 等) と ccmsg の配達を同じ枠組みに載せること、テンプレートはプアに固定すること (`{{field}}` / `{{field.field2}}` / `{{event}}` だけ、if / loop / 整形は持たない、無い欄は黙って空にしない)。hooks は本体を阻害しない (reference `proxy-dump-design` の「実装の原則」と同じ: 透過、非ブロッキング、失敗は log のみ)。
 
 ## 決定
 
@@ -32,7 +34,7 @@ data: {"type":"credential_recovered","ts":1785618060000,"seq":97,"boot":17855900
 - `reason` — 印の理由。`skipped` / usage の `denials` と同じ語 (`limited` / `busy` / `org_not_allowed`)。`paced` は出ない (下記)
 - `model` — 印の範囲。経路全体の印 (`Scope::Everything`) では欄ごと出さず、モデル単位・モデル群の印では usage の `denials` (DR-0020 §2) と同じくその名前 / パターン
 - `until` — `credential_limited` だけ。この時刻までは候補にしない (印の `until` をミリ秒にしたもの)。`recovered` には無い (戻った時刻は `ts`)
-- `by` — 何がその遷移を起こしたか。`limited` は `response` (断られた応答から印を付けた、`Preset::reject` / `Preset::admit`) か `probe` (枠照会の答えで印を引き直した、`Preset::apply_quota`)。`recovered` は `expired` (`until` が過ぎた) / `allowed` (通常の優先度の 2xx が印を消した、`Preset::allow`) / `probe` (枠照会が開いていると答えた)
+- `by` — 何がその遷移を起こしたか。`limited` は `response` (断られた応答から印を付けた、`Preset::reject` / `Preset::admit`) か `probe` (枠照会の答えで印を引き直した、`Preset::apply_quota`)。`recovered` は `expired` (`until` が過ぎた) / `allowed` (通常の優先度の 2xx が印を消した、`Preset::allow`) / `probe` (枠照会が開いていると答えた) / `login` (決定 8 の refresh の失敗が再ログインで直った)
 - `ns` / `fallback` — 契機が 1 本の転送 (`by: "response"` / `"allowed"`) の時だけ出す。`ns` はその 1 本の面、`fallback` はその 1 本で**断った経路の後ろに残っていた候補**の名前を試される順に並べたもの (`credential_limited` だけ)。契機が枠照会なら両方とも欄ごと出さない
 
 **どの印の変化で出すか**は、印を触る 1 箇所 (`RouteState` の `deny` / `allow` / `clear` / `apply`) で前後の「有効な印」(`until > now`) を scope ごとに比べて決める:
@@ -74,8 +76,8 @@ follow_redirects = true                                # 既定 true
 
 | 欄 | 意味 |
 |---|---|
-| `on` | 配るイベントの種類。SSE の `event:` 名と同じ語 (`request` / `response` / `cache_expired` / `passthrough` / `credential_limited` / `credential_recovered`)。知らない語は `check` が断る |
-| `ns` / `credential` / `reason` | 任意の絞り。イベントの同名の欄がどれかの値に等しい 1 件だけ配る。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その絞りを書いた hook には当たらない。3 欄の間は AND |
+| `on` | 配るイベントの種類。SSE の `event:` 名と同じ語 (`llm_request` (決定 7) / `response` / `cache_expired` / `passthrough` / `credential_limited` / `credential_recovered` / `credential_refresh_failed` (決定 8) / `credential_expiring` (決定 9))。知らない語は `check` が断る |
+| `ns` / `credential` / `reason` | 任意の絞り。イベントの同名の欄がどれかの値に等しい 1 件だけ配る。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その絞りを書いた hook には当たらない。3 欄の間は AND。`credential` の値は決定 1 の種類では経路名、決定 8 / 9 の種類では認証情報の名前 (各決定の欄の説明) |
 | `url` | 送り先。`http` / `https` だけ。テンプレートを展開した結果を URL として読む |
 | `method` | `GET` / `POST` / `PUT` / `PATCH` / `DELETE`。既定 `POST` |
 | `headers` | 名前 → 値。値はテンプレート。`Content-Type` を書かなければ `body` がある時だけ `application/json` を付ける |
@@ -124,7 +126,7 @@ ccmsg の受け口は hooks でこう書く:
 
 ```toml
 [[hooks]]
-on = ["request", "response", "cache_expired", "passthrough"]
+on = ["llm_request", "response", "cache_expired", "passthrough"]
 url = "http://127.0.0.1:8643/webhook/llm-gateway"
 headers = { Authorization = "Bearer {{secret:ccmsg-webhook}}" }
 body = "[{{event}}]"
@@ -146,19 +148,80 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 
 [[hooks]]
 on = ["credential_recovered"]
-reason = ["limited"]
+reason = ["limited", "relogin_required"]
 url = "https://bark.example/bark-admin/push"
 body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}} recovered","body":"{{by}}"}'
+
+[[hooks]]
+on = ["credential_refresh_failed"]
+url = "https://bark.example/bark-admin/push"
+body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","level":"timeSensitive","title":"{{credential}} needs login","body":"{{reason}}; routes {{routes}}","url":"https://gw.example{{login_path}}"}'
 ```
 
 - `reason` を絞るのは、混雑 (`busy`) の 60 秒の退避で鳴らさないため
+- 再ログインの催促は bark の `url` (タップで開く) に login ページを入れる。gateway は自分の外向きの URL を知らない (`login_path` はパスだけ、決定 8) ので、ホストは hook を書く人が前に付ける。`login_path` の無い認証情報 (codex_oauth、DR-0023 の対象外) ではこの hook は発火しない (決定 3) ので、codex も鳴らしたいなら `url` を外した hook を別に書く
 - `fallback` は JSON 文字列の中に置かれているので `["claude-b","claude-c"]` のテキストが入る。枠照会が付けた印 (`by: "probe"`) には `fallback` が無く、この hook のその 1 件は発火しない (決定 3)。欠けても鳴らしたいなら `fallback` を本文から外す
 - `until` は Unix ミリ秒のまま入る。人が読む形への整形はテンプレートに無く、イベントにも載せない (DR-0012 の「同じ瞬間を 2 通りで並べない」)。通知で読める時刻が要るかは未決 6
 - bark-admin の cold start の 302 は `follow_redirects` (既定) が同じ POST で追う
 
 ### 6. events (SSE) は変えず、hooks は購読者の 1 つ
 
-`/llm-gateway/events` の形・配り方 (`tokio::sync::broadcast`、256 件、追いつけない見物人の分は落とす) は変えない。新しい 2 種は `Notice` の種類として増え、SSE にも同じ `seq` で流れる。events の語彙が正本で、hooks はその上の配達 (絞り + 整形 + 送信) に徹する。hooks のためにイベントの欄を足す・変えることはしない — hook で要る値は、まず events の契約として正しいかを問う。
+`/llm-gateway/events` の形・配り方 (`tokio::sync::broadcast`、256 件、追いつけない見物人の分は落とす) は変えない。新しい 4 種 (決定 1・8・9) は `Notice` の種類として増え、SSE にも同じ `seq` で流れる。events の語彙が正本で、hooks はその上の配達 (絞り + 整形 + 送信) に徹する。hooks のためにイベントの欄を足す・変えることはしない — hook で要る値は、まず events の契約として正しいかを問う。
+
+### 7. 転送の知らせ `request` を `llm_request` に改名し、`type` を持たせる
+
+SSE の `event:` 名と `Notice::name`、hooks の `on` に書く語を `request` から **`llm_request`** に変える。gateway は認証差し替えの中継 (`passthrough`、DR-0030 §2) も持つので、設定に書く語として「LLM の交換」であることが名前で分かるようにする。`response` / `cache_expired` / `passthrough` はそのまま。
+
+合わせて、この種類にも **`"type":"llm_request"`** を先頭の欄として持たせる。`type` を持たないのはこの種類だけで (DR-0012: 先にあったので後から足すと読む側が壊れる)、名前を変える以上は読み側の変更が避けられないので、同じ機会に揃える。これで `untagged` の列で種類の順に依る読み分け (`events.rs` の `Notice` の並びの注記) が要らなくなり、webhook の配列の各件が `type` で見分けられる。
+
+公開契約の変更だが、`[webhook]` の廃止 (決定 4) で ccmsg 側の設定変更が同じリリースに入るので、このタイミングで一緒に変える。MANUAL の例と `docs/` の `event: request` の記述も全部置き換える。
+
+### 8. refresh token が無効になったら `credential_refresh_failed` を 1 回、直ったら `credential_recovered`
+
+```
+event: credential_refresh_failed
+id: 120
+data: {"type":"credential_refresh_failed","ts":1785700000000,"seq":120,"boot":1785590000000,"credential":"claude-main","reason":"refresh_token_expired","routes":["claude-a","claude-a-low"],"login_path":"/llm-gateway/login/claude-main/start"}
+
+event: credential_recovered
+id: 131
+data: {"type":"credential_recovered","ts":1785700600000,"seq":131,"boot":1785590000000,"credential":"claude-main","reason":"relogin_required","by":"login","routes":["claude-a","claude-a-low"]}
+```
+
+- `credential` — **認証情報の名前** (`[credentials.<name>]`、`CredentialId`)。決定 1 の `credential` (経路名) とは指すものが違う: 締め出しの印は経路の状態 (`[routes.<name>]` ごと、DR-0014 §3) で、refresh の失敗は認証情報の状態 (`CredentialStore` の `auth`、同じ認証情報を指す経路が何本あっても 1 つ)。usage (DR-0007 / DR-0023) も経路の 1 件の下に認証情報の `auth` を付ける同じ二層
+- `routes` — その認証情報を指す経路の名前 (設定順)。その経路が全部使えなくなるという意味で、hook の本文に書く用。`credential_recovered` (`reason: "relogin_required"`) にも同じ値
+- `reason` — 失敗の種類。`refresh_token_expired` / `refresh_token_invalidated` / `refresh_token_reused` (応答本文の語、`oauth.rs` の `refresh_failure_class` が見るもの) / `rejected` (語の無い 400 / 401)。出すのは `ReloginRequired` に分類された失敗だけで、`Degraded` (繋がらない、5xx、429、読めない応答) は一時的な失敗なので出さない (usage の `auth.status: "degraded"` と log に出る)
+- `login_path` — 再ログインの Web ページ (DR-0023、`GET /llm-gateway/login/<name>/start`)。usage の `auth.login_path` と同じ値・同じ条件 (claude_oauth だけ。codex_oauth は Web login の対象外なので欄ごと出さない)。パスだけなのは gateway が自分の外向きの URL を知らないため (決定 5 の例)。CLI の手当て (`llm-gateway login --type …`) は log の文言にあり、イベントには載せない (本文に CLI の文を入れると受け手が整形できない)
+
+**出す場所は 1 つ**: `gateway_core::credential::refreshing` の `record_auth` (認証の観測を `AuthState` に書く唯一の口。refresh の結果と `save_login` の両方がここを通る)。前の `AuthState.status` と新しい `status` を比べ、`ReloginRequired` 以外 → `ReloginRequired` で `credential_refresh_failed`、`ReloginRequired` → `Ok` で `credential_recovered` (`by: "login"`。refresh が通って直ることは refresh token が無効な以上ほぼ無いが、通ったなら同じ口で出る)。`ReloginRequired` のまま refresh を試し続けても (`acquire` のたびに `needs_refresh` → 失敗) 状態が変わらないので繰り返さない。`Degraded` ↔ `ReloginRequired` は失敗の種類が変わっただけで、`Degraded` → `ReloginRequired` は失敗状態に**入った**として出し、逆は出さない (`Degraded` は直ったとは言えない)。gateway-core は events を知らないので、`record_auth` が前の状態を返し、llm-gateway 側の `CredentialStore` が差を見て publish する (配線は実装の判断)。
+
+**再起動では出ない**。`auth` はメモリだけで (再起動で `AuthState` は空)、起動後の最初の refresh の失敗が `credential_refresh_failed` を出す (決定 1 の印と同じ構え)。
+
+### 9. refresh token の寿命が設定の割合を過ぎたら `credential_expiring` を 1 回
+
+upstream は refresh token の寿命を返さない。`expires_in` は access token の分で、credential ファイルの `expired` もその期限 (`payload` の欄は `claude_oauth` = `access_token` / `email` / `expired` / `refresh_token`、`codex_oauth` はそれに `account_id` / `id_token`、外側に `last_refresh` 等。login の時刻を持つ欄は無い)。codex の `id_token` は JWT で `iat` / `exp` を持つが、それは id token の寿命であって refresh token の寿命ではない。
+
+寿命は**設定で与える**。書かなければこの知らせは出ない:
+
+```toml
+[credentials.claude-main]
+type = "claude_oauth"
+refresh_lifetime = "90d"            # refresh token の寿命 (書かなければ credential_expiring は出ない)
+refresh_lifetime_from = "login"     # 起点: "login" (最後のログイン) / "refresh" (最後の refresh)。既定は未決 9
+refresh_notice_ratio = 0.9          # 寿命のこの割合を過ぎたら知らせる。既定 0.9
+```
+
+```
+event: credential_expiring
+id: 140
+data: {"type":"credential_expiring","ts":1792000000000,"seq":140,"boot":1785590000000,"credential":"claude-main","routes":["claude-a"],"expires_at":1792777600000,"remaining_secs":777600,"from":"login"}
+```
+
+- `credential` / `routes` — 決定 8 と同じ (認証情報の名前と、それを指す経路)
+- `expires_at` — 起点 + `refresh_lifetime` (Unix ミリ秒)。`remaining_secs` は `expires_at` − `ts` (長さなので名前に単位、DR-0012)。`from` — どちらの起点で計算したか (`login` / `refresh`)
+- **起点ごとに 1 回**。`login` 起点なら再ログインで、`refresh` 起点なら refresh が通るたびに起点が進み、次に割合を過ぎた時にまた 1 回出る。決定 1 の `until` の timer と同じ「最も早い予定時刻まで寝る」タスクで出し、起動時に既に過ぎていれば起動直後に 1 回出す (再起動で忘れる代わりに、過ぎている事実を 1 回は伝える)
+- `refresh_lifetime_from = "login"` に要る login の時刻は credential ファイルに無いので、login 時 (`save_login` と CLI の `login`) に `ext.logged_in_at` (RFC 3339、`last_refresh` と同じ書き方) を記録する欄を足す。欄の無い既存の認証情報では `login` 起点を計算できず、この知らせを出さずに `check` が warning で知らせる (次のログインで欄が入る)。`refresh` 起点は `last_refresh` をそのまま使う
+- refresh token がローテーションする provider (`oauth.rs`: Anthropic / OpenAI とも更新で refresh token 自体が入れ替わる) で寿命が「最後の refresh から」なら、使い続ける限り切れない。実際にどちらなのか (ローテーション後の新しい token の寿命が最初のログインから数えるのか) は Anthropic / OpenAI の実態を調べてから既定を決める (未決 9)。それまで `refresh_lifetime_from` は必須にせず、`refresh_lifetime` を書いて `_from` を書かなければ `check` が「既定が未定なので書け」と断る
 
 ## 採らなかった案
 
@@ -174,10 +237,22 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 - **`paced` も `credential_limited` に含める**: 印が無く、namespace × モデル群ごとに判定が違う。遷移として定義できない (決定 1)
 - **複数件を 1 通にまとめる窓 (`[webhook]` の 200 ms / 100 件) を hooks に持つ**: テンプレートが 1 件の形で書かれているので、まとめるには配列の文法 (loop) が要る。1 件 1 配達で接続は増えるが、pool で使い回し、落とす数は `hooks.dropped` で見える
 - **hook に名前 (`name`) を持たせる**: log と `/self` の識別は `url` (展開前) で足りる。識別のためだけの欄を足さない
+- **転送の知らせを `request` のまま残す**: `passthrough` とは別種なので区別は付くが、`on = ["request"]` と設定に書いた時に「中継は入らない」と名前から読めない。自己説明的でない語を設定の語彙にしない (決定 7)
+- **`exchange` に改名する**: コードの span 名 (`exchange::request_span`) と一致するが、設定に書く語としては何と何の交換かが読めず意味が薄い。利用者の語彙 (LLM の 1 本) で付ける (決定 7)
+- **`credential_refresh_failed` を refresh を試すたびに出す**: `ReloginRequired` のまま `acquire` のたびに失敗するので、リクエストごとに繰り返す。状態の遷移 (決定 8 の `record_auth` の前後) でだけ出す
+- **`credential_refresh_failed` に CLI の手当ての文を載せる**: 受け手が整形できない文を契約に入れない。`reason` の語と `login_path` から受け手が組む
+- **refresh token の寿命を `id_token` の `exp` や access token の `expired` から推定する**: どちらも別の token の寿命 (決定 9)。推定で鳴らすと外れた時に信用を失う。設定で与え、書かなければ出さない
+- **`credential_expiring` を定期的に繰り返す (1 日 1 回等)**: 間隔に根拠が無く、起点が進まない限り同じ事実。起点ごとに 1 回にし、しつこく鳴らしたいなら受け手 (bark の `level`) で決める
 
 ## 影響
 
-- `Notice` に `CredentialLimited` / `CredentialRecovered` が増える (印 `type` を持つ種類なので `untagged` の列で `Request` より前)。SSE と hooks の両方に流れる。知らない `type` を無視する読み手 (DR-0012) はそのまま動く
+- `Notice` に `CredentialLimited` / `CredentialRecovered` / `CredentialRefreshFailed` / `CredentialExpiring` が増える。SSE と hooks の両方に流れる。知らない `type` を無視する読み手 (DR-0012) はそのまま動く
+- 転送の知らせの名前が `request` → `llm_request` に変わり、`type` 欄が付く (決定 7)。**ccmsg 側は受け口の読み分け (`type` の無い件を転送として読む判定と、SSE の `event: request`) を `llm_request` に追従させる**。`[webhook]` → `[[hooks]]` の設定変更と同じリリースで入る
+- `Notice` の全種が `type` を持つので `untagged` の読み分けを `type` で引ける形にできる (読み戻しの順序依存が消える)
+- `credential_refresh_failed` / `credential_recovered (relogin_required)` の配線: `refreshing::Inner::record_auth` が前の `AuthStatus` を返し、llm-gateway の `CredentialStore` が差を見て publish する。gateway-core は events を知らないまま
+- credential ファイルの `ext` に `logged_in_at` が増える (決定 9)。書くのは `save_login` (Web login、DR-0023) と CLI の `login`。既存のファイルには無く、次のログインで入る。読み戻しは `serde(default)` で欄が無くても壊れない
+- `[credentials.<name>]` に `refresh_lifetime` / `refresh_lifetime_from` / `refresh_notice_ratio` が増える (決定 9)。`check` が `_from` 無しの `refresh_lifetime` と `ratio` の範囲 (0 < r ≤ 1) を検証する
+- `until` の timer (決定 1) と `credential_expiring` の予定 (決定 9) は同じ「最も早い予定時刻まで寝る」タスクで扱う
 - `RouteState` に「前後の有効な印の差」を返す口と、`until` の到来を待つ timer のタスクが増える。印を触る 4 つの口 (`deny` / `allow` / `clear` / `apply`) から events へ届ける配線は、`Preset` が events を知らない (DR-0014 §3) ので、呼び出し側 (`gateway.rs` の `reject` / `allow` / `apply_quota` の周り) で publish する形になる。`fallback` は `forward` の経路の列から写す
 - `webhook.rs` と `config::Webhook` が消え、`hooks.rs` と `config::Hook` が増える。`[webhook]` を書いた設定は `check` で断られ、書き換え例が出る。ccmsg の合言葉ファイル (`webhook-llm-gateway.token`) は `[secret_store]` の `ccmsg-webhook.json` へ写す (運用の手順、MANUAL に書く)
 - `[secret_store]` は `[upstreams]` が空だと開かない (`passthrough.rs`)。`{{secret:…}}` を使う hook があれば開く
@@ -196,6 +271,9 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 6. **通知で人が読める時刻**: イベントに載せると DR-0012 の規約に反し、テンプレートに整形を持つと決定 3 に反する。`until` と `ts` の差を長さの欄 (`for_secs`) として載せる案は、欄が派生値で DR-0012 の「足し算をさせない」に沿うが、`recovered` には無い欄になる
 7. **サスペンド跨ぎの timer**: 寝ている間に壁時計が `until` を過ぎた時、復帰後にいつ `recovered` を出すか (tokio の sleep は単調時計、DR-0037 §13 と同じ問題)
 8. **hook ごとの列の長さ (既定 64)** と、`hooks.dropped` を hook ごとに出すか合計だけか
+9. **`refresh_lifetime_from` の既定**: Anthropic / OpenAI の refresh token の寿命がローテーション後の新しい token にも最初のログインから数えて掛かるのか、最後の refresh から数え直すのかを実態で確かめてから決める (前者なら `login`、後者なら `refresh`、provider で違うなら `type` ごとの既定)。確かめるまでは `refresh_lifetime` を書く時に `_from` を必須にする (決定 9)
+10. **決定 1 と決定 8 / 9 で `credential` の指すものが違う** (経路名 / 認証情報の名前)。usage の二層 (経路の 1 件の下に `auth`) と同じ構造だが、hooks の `credential` の絞りを書く人が両方の名前を知る必要がある。決定 1 の種類に `routes` と対になる認証情報の名前の欄を足すか、欄名を分けるか
+11. **`credential_refresh_failed` の `login_path` を絶対 URL にするか**: gateway に外向きの URL の設定 (`[server] public_url` 等) を足せば `login_url` が出せるが、欄を 1 つ出すためだけに設定を増やすことになる。今は hook の側でホストを前に付ける (決定 5)
 
 ## 関連
 
@@ -205,7 +283,10 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 - [DR-0015](DR-0015-routing-priority-and-reset-aware-ordering.md) / [DR-0018](DR-0018-spend-down-priority.md) / [DR-0035](DR-0035-judge-thinking-crossing-by-session-sources.md) — 候補列の順序が会話ごとに動く理由 (`fallback` を契機の 1 本から写す根拠)
 - [DR-0019](DR-0019-pace-cap.md) — pace_cap は印を残さない (`paced` を対象にしない根拠)
 - [DR-0036](DR-0036-low-priority-requests-wait-instead-of-switching.md) — 低優先度の 1 本は印を付けも外しもしない (遷移の契機にならない)
-- [DR-0030](DR-0030-general-purpose-auth-gateway.md) §3 / §5 — `[secret_store]` と秘密の id (`{{secret:<id>}}` の参照先)
+- [DR-0030](DR-0030-general-purpose-auth-gateway.md) §2 / §3 / §5 — 認証差し替えの中継 (`passthrough`、決定 7 で `llm_request` と名前で分ける理由) と `[secret_store]` と秘密の id (`{{secret:<id>}}` の参照先)
+- [DR-0023](DR-0023-web-login-endpoint.md) — Web login の口 (`login_path` の指す先、claude_oauth だけ)
+- [DR-0010](DR-0010-credential-cross-process-lock.md) — 認証情報ファイルの書き換えと版 (`logged_in_at` を足す先、`{{secret:<id>}}` の読み直し)
+- [DR-0007](DR-0007-usage-visibility.md) — usage の `auth` (`status` / `login_path`)。決定 8 のイベントと同じ値を出す口
 - [DR-0032](DR-0032-daemon-reload.md) — reload で差し替えられる欄の区分
 - [DR-0014](DR-0014-target-architecture-provider-preset.md) §3 — `Preset` / `RouteState` は events を知らない (配線の位置)
 - claude-rules-personal の reference `proxy-dump-design` (`model` の「実装の原則」) — 透過 / 非ブロッキング / 失敗は log のみ
