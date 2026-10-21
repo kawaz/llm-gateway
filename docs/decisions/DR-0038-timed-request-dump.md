@@ -133,7 +133,7 @@ llm-gateway dump status --unit unstable
 - `dump_id` が UUIDv7 なのは、時刻を先頭に持つので `ls` で系列が始まった順に並び、別の unit が同じ ns に同時に始めても衝突しないため。ディレクトリ名 (決定 6) と `stop` の引数と `status` / `/self` の欄はすべてこの id
 - `start` の置き換えや `unit × ns で 1 つ` の制限は持たない。「延長したい」は新しい系列を始めることで足り、前の系列は自分の `until` で止まる。「短くしたい」は `stop <dump_id>`
 
-### 14. 系列のディレクトリの中身: `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` / `.response.sse` または `.response.json` (kawaz 裁定 + 起草者の判断)
+### 14. 系列のディレクトリの中身: `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` / `.response.sse` (kawaz 裁定)
 
 ```
 dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef/
@@ -141,12 +141,12 @@ dumps/unstable/lab/019a1b2c-3d4e-7f80-9123-456789abcdef/
   1792000012345-42.request.json
   1792000012345-42.response.sse
   1792000013210-43.request.json
-  1792000013210-43.response.json
+  1792000013210-43.response.sse
 ```
 
 - `index.jsonl` は 1 本 1 行のメタデータで、系列の入口。欄は `ts` (request を受けた時刻、Unix ミリ秒) / `seq` (unit の通し番号、`exchange::request_span` のもの) / `model` / `route` / `status` / `origin` / `stream` / `credential` / `cache_strategy` / `cache_ttl_secs` / `request_bytes` / `response_bytes` / `request_file` / `response_file` と、打ち切った 1 本の `truncated: true` (決定 5)。欄の意味は events の `request` と同じ (決定 7)。行は応答の終端で書くので、並びは終わった順
 - `<ts>-<seq>.request.json` は受けた本文そのまま (決定 7)。`<ts>` と `<seq>` は `index.jsonl` の同じ欄で、ファイル名だけで時刻順に並び、同じミリ秒の 2 本も `seq` で分かれる
-- response のファイルは、upstream の応答の `content-type` が `text/event-stream` なら `.response.sse` (生の SSE 行)、それ以外なら `.response.json`。request の `stream` でなく応答の種類で決めるのは、stream を求めた 1 本が JSON で断られる (prompt too long の 400 等) ことがあり、中身に合った拡張子にするため (起草者の判断)。`--request-only` の系列では response のファイルも `response_file` の欄も無い
+- response のファイルは常に `.response.sse` で、中身は upstream が返した生のバイト列 (SSE なら `event:` / `data:` の行、SSE でない応答ならその JSON 1 本)。応答の種類で拡張子を分けない (分けると扱いにくい、kawaz 2026-10-21)。SSE かどうかは `index.jsonl` の `stream` と応答の `content-type` で分かる。`--request-only` の系列では response のファイルも `response_file` の欄も無い
 - 1 本 1 ファイルにするのは、response を生のまま残すのに 1 ファイル追記 (jsonl) だと本文を JSON 文字列に包む変換が要り、伸び続けるファイルは mtime が常に新しくて片付けが部分的にしか効かず、調べたい 1 本だけを開けないため。系列あたり数百〜千のファイルになる懸念は、`index.jsonl` を入口にして `request_file` / `response_file` から辿ることで受ける
 - ヘッダをどこに置くかは未決 2 (本文のファイルに含めるか、`index.jsonl` の行に載せるか)
 

@@ -30,7 +30,7 @@ DR-0038 を起草済み (docs/decisions/DR-0038-timed-request-dump.md、⬜ 未�
 - **tap (DR-0017) を廃止して DR-0038 に一本化する** (DP-Q1a)。DR-0017 は `Superseded by DR-0038` で archive へ。`GET /llm-gateway/tap` と `tap::` モジュール、`TapObservation` は実装時に取り除き、本文を控える位置はダンプが引き継ぐ
 - **request は gateway が受けた形** (ハーネスが送ろうとしたもの)、**response は upstream が返した生のバイト列**。gateway の書き換え (ttl 1h、thinking display、alias 解決) は events / stats 側で分かるので、ダンプには両端の生の姿だけを残す
 - **`start` 1 回 = 1 系列、系列は `dump_id` (UUIDv7)**。置き場は `<[stats] dir>/dumps/<unit>/<ns>/<dump_id>/`。同じ ns に期間の重なる系列を複数作れる (1 本が両方に書かれるのは明示的に許容)。置き換えの規則・`replaced`・unit × ns で 1 つの制限・系列数の上限は持たない (`--for` 必須で自然に減る)。`start` の応答は `{dump_id, dump_dir, unit, ns, until, max_bytes, request_only}`、`stop <dump_id>|--all` (知らない id は `unknown_dump`、冪等で既に止まっていれば `active: false`)、`status` は走っている系列の一覧 (+ `bytes_written` / `requests`)
-- **ファイルの形**: 系列のディレクトリに `index.jsonl` (1 req 1 行のメタ、ファイル名を含む) と、1 req ごとの `<ts>-<seq>.request.json` (受けた本文そのまま) と `<ts>-<seq>.response.sse` (SSE の生の行) / `.response.json` (非 stream)。48h の片付けはディレクトリ単位
+- **ファイルの形**: 系列のディレクトリに `index.jsonl` (1 req 1 行のメタ、ファイル名を含む) と、1 req ごとの `<ts>-<seq>.request.json` (受けた本文そのまま) と `<ts>-<seq>.response.sse` (upstream の生のバイト列。拡張子は応答の種類で変えない)。48h の片付けはディレクトリ単位
 
 裁定は DR-0038 (決定 3・5・6・9・11・13・14・15) と MANUAL の `dump` 節に反映済み。実装に着手してよい。
 
