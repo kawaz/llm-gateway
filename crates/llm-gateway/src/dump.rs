@@ -6,8 +6,9 @@
 //! メモリにだけ置き、restart で消える (決定 1)。
 //!
 //! 置き場は `[stats] dir` の `dumps/<unit>/<ns>/<dump_id>/` で、中身は 1 本 1 行の
-//! `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json` / `.response.sse`
-//! (決定 6・14)。ディレクトリは 700、ファイルは 600。
+//! `index.jsonl` と、1 本ごとの `<ts>-<seq>.request.json`、upstream の試行ごとの
+//! `<ts>-<seq>.<attempt>.response.sse` (決定 6・14)。ディレクトリは 700、
+//! ファイルは 600。
 //!
 //! 書き手は受け口 ([`Dumps::capture`]、gateway が受けた本文) と応答の観測
 //! ([`crate::exchange::observe`] の包み、upstream が返したバイト列) の 2 か所で、
@@ -488,9 +489,7 @@ impl Dumps {
                     series.finish(StopReason::MaxBytes);
                     return None;
                 }
-                // 置き場が外から消されていても書けるよう、毎回確かめて閉じ直す。
-                let written = make_dir(&series.dir)
-                    .and_then(|()| write_new(&series.dir.join(&request_file), received.body));
+                let written = write_into(&series.dir, &request_file, received.body);
                 if let Err(e) = written {
                     warn!(%e, dump_id = %series.id, "could not write a dumped request");
                     return None;
@@ -499,10 +498,7 @@ impl Dumps {
                 series.stop_if_full();
                 Some(Entry {
                     series,
-                    response_file: None,
-                    file: None,
-                    response_bytes: 0,
-                    cut: None,
+                    responses: Vec::new(),
                 })
             })
             .collect();
@@ -517,8 +513,8 @@ impl Dumps {
             request_bytes: size,
             stream: received.stream,
             headers: kept_headers(received.headers),
+            attempts: Mutex::new(Vec::new()),
             entries: Mutex::new(entries),
-            attempt: AtomicU64::new(0),
             settled: AtomicBool::new(false),
         }))
     }
@@ -563,10 +559,21 @@ pub struct Capture {
     request_bytes: u64,
     stream: bool,
     headers: Map<String, Value>,
+    /// upstream が答えた試行。経路を替えて試し直すたびに 1 つ増える。
+    attempts: Mutex<Vec<Attempt>>,
     entries: Mutex<Vec<Entry>>,
-    /// 経路を試すたびに進む番号。書くのは最後に upstream が返した応答だけ。
-    attempt: AtomicU64,
     settled: AtomicBool,
+}
+
+/// upstream の 1 回の答え (経路を試した 1 回)。
+#[derive(Debug, Clone)]
+pub struct Attempt {
+    /// 1 から数える。ファイル名の `<ts>-<seq>.<attempt>.response.sse` の番号。
+    pub attempt: u64,
+    pub route: String,
+    pub credential: Option<String>,
+    /// upstream が返した status。クライアントへ返した status とは違うことがある。
+    pub status: u16,
 }
 
 /// 答えが決まり、応答の終端を待っている 1 本。
@@ -585,20 +592,37 @@ impl Settling {
 /// 1 本の、系列 1 つぶんの書き先。
 struct Entry {
     series: Arc<Series>,
-    /// response のファイル名。upstream が 1 度でも答えていれば付く。
-    response_file: Option<String>,
+    /// 試行ごとの response。`--request-only` の系列では空のまま。
+    responses: Vec<Written>,
+}
+
+/// 1 回の試行の response を、系列 1 つに書いた分。
+struct Written {
+    attempt: u64,
+    file_name: String,
     /// まだ書ける間の書き口。
     file: Option<std::fs::File>,
-    response_bytes: u64,
-    /// 打ち切った理由。最後まで書けた 1 本は `None`。
+    bytes: u64,
+    /// 打ち切った理由。最後まで書けた試行は `None`。
     cut: Option<StopReason>,
 }
 
-impl Entry {
+impl Written {
     /// 書き口を閉じ、打ち切った理由を残す。ファイル名は行に残す。
     fn cut(&mut self, reason: StopReason) {
         self.file = None;
         self.cut = Some(reason);
+    }
+
+    fn fields(&self) -> Map<String, Value> {
+        let mut fields = Map::new();
+        fields.insert("response_file".to_owned(), json!(self.file_name));
+        fields.insert("response_bytes".to_owned(), json!(self.bytes));
+        if let Some(reason) = self.cut {
+            fields.insert("truncated".to_owned(), json!(true));
+            fields.insert("reason".to_owned(), json!(reason.as_str()));
+        }
+        fields
     }
 }
 
@@ -607,55 +631,72 @@ impl Capture {
     /// (決定 7・10)。Wire が方言を通訳する前、gateway が本文を集め直したり
     /// エラーの本文に差し替えたりする前のバイト列。
     ///
-    /// 経路を試すたびに呼ばれ、呼ばれるたびにファイルを空にして書き直す。残るのは
-    /// 最後に upstream が返した応答で、それより前の経路の分は書かない。
-    pub fn tee(self: &Arc<Self>, body: crate::egress::BodyStream) -> crate::egress::BodyStream {
+    /// 経路を試すたびに呼ばれ、試行ごとに別のファイル
+    /// (`<ts>-<seq>.<attempt>.response.sse`) に書く。前の試行の分は消さず、
+    /// 系列の量からも差し引かない — gateway は先に断られた応答を持ったまま次を
+    /// 試し、後の応答を捨てて先の応答を返すことがあるので、どの試行を返すかは
+    /// ここでは分からない。
+    pub fn tee(
+        self: &Arc<Self>,
+        route: &str,
+        credential: Option<&str>,
+        status: u16,
+        body: crate::egress::BodyStream,
+    ) -> crate::egress::BodyStream {
         use futures_util::StreamExt as _;
 
-        let attempt = self.attempt.fetch_add(1, Ordering::AcqRel) + 1;
-        self.restart(crate::credential::time::now_unix_ms());
+        let attempt = {
+            let mut attempts = self.attempts.lock().unwrap();
+            let attempt = attempts.len() as u64 + 1;
+            attempts.push(Attempt {
+                attempt,
+                route: route.to_owned(),
+                credential: credential.map(str::to_owned),
+                status,
+            });
+            attempt
+        };
+        self.open(attempt, crate::credential::time::now_unix_ms());
         let me = Arc::clone(self);
         body.map(move |item| {
-            if let Ok(chunk) = &item
-                && me.attempt.load(Ordering::Acquire) == attempt
-            {
-                me.write(chunk, crate::credential::time::now_unix_ms());
+            if let Ok(chunk) = &item {
+                me.write(attempt, chunk, crate::credential::time::now_unix_ms());
             }
             item
         })
         .boxed()
     }
 
-    /// 応答のファイルを空にして開き直す。前の経路で書いた分は系列の量から戻す。
-    fn restart(&self, now: i64) {
-        let response_file = format!("{}.response.sse", self.stem);
+    /// 試行 `attempt` の response のファイルを、系列ごとに開く。
+    fn open(&self, attempt: u64, now: i64) {
+        let file_name = format!("{}.{attempt}.response.sse", self.stem);
         for entry in self.entries.lock().unwrap().iter_mut() {
             if entry.series.request_only {
                 continue;
             }
-            entry
-                .series
-                .bytes_written
-                .fetch_sub(entry.response_bytes, Ordering::AcqRel);
-            entry.response_bytes = 0;
-            entry.cut = None;
-            entry.file = match open_fresh(&entry.series.dir.join(&response_file)) {
+            let file = match open_in(&entry.series.dir, &file_name) {
                 Ok(file) => Some(file),
                 Err(e) => {
                     warn!(%e, dump_id = %entry.series.id, "could not open a dumped response");
                     None
                 }
             };
-            entry.response_file = Some(response_file.clone());
+            let mut written = Written {
+                attempt,
+                file_name: file_name.clone(),
+                file,
+                bytes: 0,
+                cut: None,
+            };
             // 応答が届いた時点で系列が止まっていれば、1 バイトも書かずに打ち切る。
             if !entry.series.live(now) {
-                let reason = entry.series.reason();
-                entry.cut(reason);
+                written.cut(entry.series.reason());
             }
+            entry.responses.push(written);
         }
     }
 
-    /// 通り過ぎたチャンクをそのまま書く (決定 10)。
+    /// 試行 `attempt` のチャンクをそのまま書く (決定 10)。
     ///
     /// 系列が止まっていれば (時限・`stop`・上限) 以後は書かずに打ち切る (決定 5)。
     /// 上限に掛かるチャンクは収まる分まで書いて打ち切り、系列を止める。
@@ -663,32 +704,39 @@ impl Capture {
     /// Design rationale: チャンクはその場で同期に書く。書き手の task と
     /// channel を挟むと、詰まった時に溜まる分が上限の外でメモリに乗る。
     /// 書くのは page cache までの短い write で、ダンプは調査の間だけ動く。
-    fn write(&self, bytes: &[u8], now: i64) {
+    fn write(&self, attempt: u64, bytes: &[u8], now: i64) {
         for entry in self.entries.lock().unwrap().iter_mut() {
-            if entry.file.is_none() {
-                continue;
-            }
-            if !entry.series.live(now) {
-                let reason = entry.series.reason();
-                entry.cut(reason);
-                continue;
-            }
-            let granted = entry.series.reserve_some(bytes.len() as u64);
-            let written = usize::try_from(granted).unwrap_or(bytes.len());
-            let Some(file) = entry.file.as_mut() else {
+            let series = Arc::clone(&entry.series);
+            let Some(written) = entry
+                .responses
+                .iter_mut()
+                .find(|written| written.attempt == attempt)
+            else {
                 continue;
             };
-            if let Err(e) = file.write_all(&bytes[..written]) {
-                warn!(%e, dump_id = %entry.series.id, "could not write a dumped response");
-                entry.file = None;
+            if written.file.is_none() {
                 continue;
             }
-            entry.response_bytes += granted;
-            if written < bytes.len() {
-                entry.cut(StopReason::MaxBytes);
-                entry.series.finish(StopReason::MaxBytes);
+            if !series.live(now) {
+                written.cut(series.reason());
+                continue;
+            }
+            let granted = series.reserve_some(bytes.len() as u64);
+            let length = usize::try_from(granted).unwrap_or(bytes.len());
+            let Some(file) = written.file.as_mut() else {
+                continue;
+            };
+            if let Err(e) = file.write_all(&bytes[..length]) {
+                warn!(%e, dump_id = %series.id, "could not write a dumped response");
+                written.file = None;
+                continue;
+            }
+            written.bytes += granted;
+            if length < bytes.len() {
+                written.cut(StopReason::MaxBytes);
+                series.finish(StopReason::MaxBytes);
             } else {
-                entry.series.stop_if_full();
+                series.stop_if_full();
             }
         }
     }
@@ -702,14 +750,26 @@ impl Capture {
     }
 
     /// 応答の終端。系列ごとの `index.jsonl` に 1 行足す (決定 14)。2 度目は
-    /// 何もしない。upstream が答えなかった 1 本 (gateway が断った) は
-    /// response の欄を持たない。
+    /// 何もしない。
+    ///
+    /// 行は 1 request 1 行で、upstream の試行を `attempts` に全部並べ、クライアントへ
+    /// 返した試行の番号を `adopted` に書く。返したのは、返した経路 (`answered.route`)
+    /// を最後に試した回 — 同じ経路を続けて試すのは送り直し (DR-0003) で、その時は
+    /// 送り直した方を返す。gateway が自分で組んだエラーを返した 1 本は `adopted`
+    /// が `null`。採用した試行の response の欄は、行の最上位にも写す。
     pub fn settle(&self, answered: &Answered) {
         if self.settled.swap(true, Ordering::AcqRel) {
             return;
         }
+        let attempts = self.attempts.lock().unwrap().clone();
+        let adopted = answered.route.as_ref().and_then(|route| {
+            attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.route == *route)
+                .map(|attempt| attempt.attempt)
+        });
         for entry in self.entries.lock().unwrap().iter_mut() {
-            entry.file = None;
             let mut line = Map::new();
             line.insert("ts".to_owned(), json!(self.ts));
             line.insert("seq".to_owned(), json!(self.seq));
@@ -731,15 +791,38 @@ impl Capture {
             );
             line.insert("request_bytes".to_owned(), json!(self.request_bytes));
             line.insert("request_file".to_owned(), json!(self.request_file));
-            if let Some(name) = &entry.response_file {
-                line.insert("response_bytes".to_owned(), json!(entry.response_bytes));
-                line.insert("response_file".to_owned(), json!(name));
-            }
-            if let Some(reason) = entry.cut {
-                line.insert("truncated".to_owned(), json!(true));
-                line.insert("reason".to_owned(), json!(reason.as_str()));
+            let listed: Vec<Value> = attempts
+                .iter()
+                .map(|attempt| {
+                    let mut item = Map::new();
+                    item.insert("attempt".to_owned(), json!(attempt.attempt));
+                    item.insert("route".to_owned(), json!(attempt.route));
+                    put(&mut item, "credential", attempt.credential.as_ref());
+                    item.insert("status".to_owned(), json!(attempt.status));
+                    if let Some(written) = entry
+                        .responses
+                        .iter()
+                        .find(|written| written.attempt == attempt.attempt)
+                    {
+                        item.extend(written.fields());
+                    }
+                    Value::Object(item)
+                })
+                .collect();
+            line.insert("attempts".to_owned(), Value::Array(listed));
+            line.insert("adopted".to_owned(), json!(adopted));
+            if let Some(written) = adopted.and_then(|adopted| {
+                entry
+                    .responses
+                    .iter()
+                    .find(|written| written.attempt == adopted)
+            }) {
+                line.extend(written.fields());
             }
             line.insert("headers".to_owned(), Value::Object(self.headers.clone()));
+            for written in &mut entry.responses {
+                written.file = None;
+            }
             let mut text = Value::Object(line).to_string();
             text.push('\n');
             if let Err(e) = append(&entry.series.dir.join("index.jsonl"), text.as_bytes()) {
@@ -806,22 +889,21 @@ fn open_new(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// 空にして開く (経路を替えて書き直す response)。既にあったファイルも 600 に閉じる。
-fn open_fresh(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    Ok(file)
+/// 系列のディレクトリに新しいファイルを開く。ディレクトリが消えていた時だけ
+/// 作り直して閉じ直す (権限を正すのは系列を作る時と作り直す時だけ)。
+fn open_in(dir: &Path, name: &str) -> std::io::Result<std::fs::File> {
+    match open_new(&dir.join(name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            make_dir(dir)?;
+            open_new(&dir.join(name))
+        }
+        opened => opened,
+    }
 }
 
-fn write_new(path: &Path, body: &[u8]) -> std::io::Result<()> {
-    open_new(path)?.write_all(body)
+/// 系列のディレクトリに新しいファイルを書く ([`open_in`])。
+fn write_into(dir: &Path, name: &str, body: &[u8]) -> std::io::Result<()> {
+    open_in(dir, name)?.write_all(body)
 }
 
 /// 1 行を足す。行は 1 回の write で書く (`tail -f` で半端な行を見せない)。
@@ -935,7 +1017,7 @@ mod tests {
         )
         .boxed();
         let read: Vec<_> = capture
-            .tee(body)
+            .tee("r", None, 200, body)
             .collect::<Vec<_>>()
             .now_or_never()
             .expect("an in-memory stream is ready");
@@ -955,11 +1037,17 @@ mod tests {
             return false;
         };
         drain(&capture, chunks);
-        capture.settle(&Answered {
-            status: 200,
-            ..Default::default()
-        });
+        capture.settle(&answered());
         true
+    }
+
+    /// 試験の upstream (`r`) が答えたことにした答え。
+    fn answered() -> Answered {
+        Answered {
+            status: 200,
+            route: Some("r".to_owned()),
+            ..Default::default()
+        }
     }
 
     fn index(view: &View) -> Vec<Value> {
@@ -1348,15 +1436,12 @@ mod tests {
             Ok(Bytes::from_static(b"second")),
         ])
         .boxed();
-        let mut teed = capture.tee(body);
+        let mut teed = capture.tee("r", None, 200, body);
         teed.next().now_or_never().unwrap().unwrap().unwrap();
         dumps.stop(&view.dump_id).unwrap();
         let rest = teed.next().now_or_never().unwrap().unwrap().unwrap();
         assert_eq!(&rest[..], b"second", "the client still gets everything");
-        capture.settle(&Answered {
-            status: 200,
-            ..Default::default()
-        });
+        capture.settle(&answered());
 
         let line = &index(&view)[0];
         assert_eq!(line["truncated"], true);
@@ -1389,10 +1474,7 @@ mod tests {
             .unwrap();
 
         drain(&capture, &[b"late"]);
-        capture.settle(&Answered {
-            status: 200,
-            ..Default::default()
-        });
+        capture.settle(&answered());
 
         let line = &index(&view)[0];
         assert_eq!(line["truncated"], true);
@@ -1400,10 +1482,11 @@ mod tests {
         assert_eq!(line["response_bytes"], 0);
     }
 
-    /// 経路を替えて試し直したら、書き先は最後に upstream が返した応答に切り替わり、
-    /// 前の経路の分は系列の量からも戻る。前の応答の残りが後から流れても書かない。
+    /// 経路を替えて試し直したら、試行ごとに別のファイルに書き、前の試行も消さず
+    /// 系列の量からも差し引かない。行には試行を全部並べ、返した経路を最後に試した
+    /// 回を `adopted` に書く。
     #[test]
-    fn a_retried_route_replaces_the_earlier_response() {
+    fn every_attempt_is_kept_and_the_adopted_one_is_named() {
         let dir = tempfile::tempdir().unwrap();
         let dumps = dumps(dir.path());
         let view = start(&dumps, "lab", 60_000, None);
@@ -1414,46 +1497,92 @@ mod tests {
             Ok(Bytes::from_static(b"-rest")),
         ])
         .boxed();
-        let mut earlier = capture.tee(earlier);
+        let mut earlier = capture.tee("a", Some("cred-a"), 429, earlier);
         earlier.next().now_or_never().unwrap().unwrap().unwrap();
-        drain(&capture, &[b"answer"]);
+        let later: crate::egress::BodyStream =
+            futures_util::stream::iter(vec![Ok(Bytes::from_static(b"answer"))]).boxed();
+        capture
+            .tee("b", None, 200, later)
+            .collect::<Vec<_>>()
+            .now_or_never()
+            .unwrap();
         earlier.next().now_or_never().unwrap().unwrap().unwrap();
         capture.settle(&Answered {
             status: 200,
+            route: Some("b".to_owned()),
             ..Default::default()
         });
 
         let line = &index(&view)[0];
-        let response = Path::new(&view.dump_dir).join(line["response_file"].as_str().unwrap());
-        assert_eq!(std::fs::read_to_string(response).unwrap(), "answer");
-        assert_eq!(line["response_bytes"], 6);
-        assert_eq!(dumps.status(now())[0].bytes_written, Some(2 + 6));
+        assert_eq!(line["adopted"], 2);
+        assert_eq!(
+            line["response_file"],
+            "{}-1.2.response.sse".replace("{}", &line["ts"].to_string())
+        );
+        assert_eq!(line["attempts"][0]["route"], "a");
+        assert_eq!(line["attempts"][0]["credential"], "cred-a");
+        assert_eq!(line["attempts"][0]["status"], 429);
+        assert_eq!(line["attempts"][0]["response_bytes"], 11);
+        assert_eq!(line["attempts"][1]["status"], 200);
+        let read = |name: &Value| {
+            std::fs::read_to_string(Path::new(&view.dump_dir).join(name.as_str().unwrap())).unwrap()
+        };
+        assert_eq!(read(&line["attempts"][0]["response_file"]), "denied-rest");
+        assert_eq!(read(&line["attempts"][1]["response_file"]), "answer");
+        assert_eq!(dumps.status(now())[0].bytes_written, Some(2 + 11 + 6));
     }
 
-    /// 前からあった `index.jsonl` とディレクトリも、書く時に 600 / 700 に閉じ直す。
+    /// gateway が自分で組んだエラーを返した 1 本は `adopted: null`。upstream が
+    /// 1 度も答えていなければ `attempts` は空で、response の欄も無い。
+    #[test]
+    fn an_answer_the_gateway_made_adopts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dumps = dumps(dir.path());
+        let view = start(&dumps, "lab", 60_000, None);
+        let capture = dumps.capture(received("lab", 1, b"{}"), now()).unwrap();
+        capture.settle(&Answered {
+            status: 503,
+            ..Default::default()
+        });
+
+        let line = &index(&view)[0];
+        assert_eq!(line["adopted"], Value::Null);
+        assert_eq!(line["attempts"], json!([]));
+        assert!(line.get("response_file").is_none(), "{line}");
+    }
+
+    /// 前からあった `index.jsonl` は書く時に 600 に、前からあったディレクトリは系列を
+    /// 始める時に 700 に閉じ直す (権限を正すのは系列を作る時と作り直す時だけ)。
     #[test]
     fn existing_files_and_directories_are_closed_again() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let open_dir = std::fs::Permissions::from_mode(0o755);
+        let ns_dir = dir.path().join("dumps/u/lab");
+        std::fs::create_dir_all(&ns_dir).unwrap();
+        for level in ns_dir.ancestors().take(3) {
+            std::fs::set_permissions(level, open_dir.clone()).unwrap();
+        }
         let dumps = dumps(dir.path());
         let view = start(&dumps, "lab", 60_000, None);
         let series = Path::new(&view.dump_dir);
-        let index_path = series.join("index.jsonl");
-        std::fs::write(&index_path, "").unwrap();
-        let open = std::fs::Permissions::from_mode(0o644);
-        std::fs::set_permissions(&index_path, open.clone()).unwrap();
-        let open_dir = std::fs::Permissions::from_mode(0o755);
-        for level in series.ancestors().take(4) {
-            std::fs::set_permissions(level, open_dir.clone()).unwrap();
-        }
-
-        assert!(exchange(&dumps, "lab", 1, b"{}", &[b"x"], now()));
-
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&index_path), 0o600);
         for level in series.ancestors().take(4) {
             assert_eq!(mode(level), 0o700, "{}", level.display());
         }
+
+        let index_path = series.join("index.jsonl");
+        std::fs::write(&index_path, "").unwrap();
+        std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(exchange(&dumps, "lab", 1, b"{}", &[b"x"], now()));
+        assert_eq!(mode(&index_path), 0o600);
+
+        // 消えた置き場は作り直し、その時に閉じる。
+        std::fs::remove_dir_all(series).unwrap();
+        std::fs::set_permissions(&ns_dir, open_dir).unwrap();
+        assert!(exchange(&dumps, "lab", 2, b"{}", &[b"x"], now()));
+        assert_eq!(mode(series), 0o700);
+        assert_eq!(mode(&ns_dir), 0o700);
     }
 }

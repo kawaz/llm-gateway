@@ -1760,7 +1760,9 @@ routes = ["a"]
         }
         let stem = format!("{}-{}", line["ts"], line["seq"]);
         assert_eq!(line["request_file"], format!("{stem}.request.json"));
-        assert_eq!(line["response_file"], format!("{stem}.response.sse"));
+        assert_eq!(line["response_file"], format!("{stem}.1.response.sse"));
+        assert_eq!(line["adopted"], 1);
+        assert_eq!(line["attempts"][0]["route"], "a");
 
         let dir = std::path::Path::new(&view.dump_dir);
         // gateway が display を書き換える前の、受けた本文そのもの。
@@ -1769,7 +1771,7 @@ routes = ["a"]
             raw
         );
         assert_eq!(
-            std::fs::read_to_string(dir.join(format!("{stem}.response.sse"))).unwrap(),
+            std::fs::read_to_string(dir.join(format!("{stem}.1.response.sse"))).unwrap(),
             response_body
         );
         {

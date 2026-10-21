@@ -1383,9 +1383,12 @@ impl<P: CredentialPersistence> Gateway<P> {
         let keeping = (strategy == Some(CacheStrategy::Keepalive))
             .then(|| (body.clone(), headers.as_slice().to_vec()));
 
-        let teeing = call
-            .dump
-            .map(|capture| move |body: egress::BodyStream| capture.tee(body));
+        let teeing = call.dump.map(|capture| {
+            let credential = route.credential.as_ref().map(CredentialId::as_str);
+            move |status: u16, body: egress::BodyStream| {
+                capture.tee(route.name(), credential, status, body)
+            }
+        });
         let resp = match egress::send(
             &self.http,
             route.preset.as_ref(),
@@ -1398,7 +1401,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                 shape: call.shape,
             },
             teeing.as_ref().map(|tee| {
-                tee as &(dyn Fn(egress::BodyStream) -> egress::BodyStream + Send + Sync)
+                tee as &(dyn Fn(u16, egress::BodyStream) -> egress::BodyStream + Send + Sync)
             }),
         )
         .await
@@ -7601,6 +7604,81 @@ routes = ["spare", "codex"]
             "{dumped}"
         );
         assert!(dumped.contains("response.completed"), "{dumped}");
+    }
+
+    /// 先に断った経路の応答 (429) を持ったまま次の経路を試し、そちらの 503 を本文を
+    /// 読まずに捨てて 429 を返しても、試行は両方行に並び、429 の本文はその試行の
+    /// ファイルに残る。`adopted` は 429 を返した試行 (DR-0038 決定 14)。
+    #[tokio::test]
+    async fn a_dump_keeps_every_attempt_and_names_the_one_returned() {
+        let limited = FakeUpstream::start(|_, _| {
+            (
+                429,
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+                    .to_owned(),
+            )
+        })
+        .await;
+        let down = FakeUpstream::start(|_, _| (503, "upstream is down".to_owned())).await;
+        let gw = gateway(&two_credentials(&limited.url, &down.url)).await;
+        let stats = tempfile::tempdir().unwrap();
+        let (capture, dir) = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+                Some(&capture),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 429);
+        let returned = body_text(forwarded.response).await;
+        assert!(returned.contains("slow down"), "{returned}");
+        capture.settle(&crate::dump::Answered {
+            status: 429,
+            route: Some(forwarded.route.clone()),
+            ..Default::default()
+        });
+
+        let line: Value = serde_json::from_str(
+            std::fs::read_to_string(dir.join("index.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(line["adopted"], 1, "{line}");
+        let attempts = line["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 2, "{line}");
+        assert_eq!(attempts[0]["status"], 429);
+        assert_eq!(attempts[1]["status"], 503);
+        assert_eq!(line["response_file"], attempts[0]["response_file"]);
+        let first =
+            std::fs::read_to_string(dir.join(attempts[0]["response_file"].as_str().unwrap()))
+                .unwrap();
+        assert!(first.contains("slow down"), "{first}");
+        assert!(
+            attempts[0]["response_file"]
+                .as_str()
+                .unwrap()
+                .ends_with(".1.response.sse")
+        );
+        assert!(
+            attempts[1]["response_file"]
+                .as_str()
+                .unwrap()
+                .ends_with(".2.response.sse")
+        );
     }
 
     /// upstream の断りを gateway のエラー本文に差し替えて返しても、ダンプに残るのは

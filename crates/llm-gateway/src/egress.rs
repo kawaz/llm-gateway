@@ -213,14 +213,15 @@ impl std::fmt::Debug for Response {
 
 /// upstream から読んだ本文を、Wire が解釈する前に通す口 (DR-0038 決定 10)。
 ///
-/// 一時ダンプが upstream の生のバイト列を控えるのに使う。通した本文は
-/// そのまま流れ、Wire はその後で方言を通訳する。控えない 1 本は `None`。
-pub type RawBody<'a> = Option<&'a (dyn Fn(BodyStream) -> BodyStream + Send + Sync)>;
+/// 一時ダンプが upstream の生のバイト列を控えるのに使う。渡すのは upstream が
+/// 返した status と本文で、通した本文はそのまま流れ、Wire はその後で方言を
+/// 通訳する。控えない 1 本は `None`。
+pub type RawBody<'a> = Option<&'a (dyn Fn(u16, BodyStream) -> BodyStream + Send + Sync)>;
 
 /// upstream から読んだ本文を [`RawBody`] に通す。
-pub fn observe_raw(raw: RawBody<'_>, body: BodyStream) -> BodyStream {
+pub fn observe_raw(raw: RawBody<'_>, status: u16, body: BodyStream) -> BodyStream {
     match raw {
-        Some(observe) => observe(body),
+        Some(observe) => observe(status, body),
         None => body,
     }
 }

@@ -141,12 +141,15 @@ where it writes:
   <[stats] dir>/dumps/<unit>/<ns>/<dump_id>/ (directories 700, files 600):
   index.jsonl (one line per request: ts, seq, model, route, status, origin,
   stream, credential, cache_strategy, cache_ttl_secs, request_bytes,
-  response_bytes, request_file, response_file, truncated and reason for a
-  response cut off by the limit / --for / stop, headers without authorization /
-  proxy-authorization / x-api-key / cookie), and per request
+  request_file, attempts (one entry per upstream answer: attempt, route,
+  credential, status, response_file, response_bytes, truncated and reason for a
+  response cut off by the limit / --for / stop), adopted (the attempt returned
+  to the client, null when the gateway answered by itself) with its
+  response_file / response_bytes copied to the line, headers without
+  authorization / proxy-authorization / x-api-key / cookie), and per request
   <ts>-<seq>.request.json (the body as received, before the gateway rewrites it)
-  and <ts>-<seq>.response.sse (the bytes upstream returned, before the gateway
-  translates or replaces them). dumps older than 48 hours are removed when a unit
+  and per attempt <ts>-<seq>.<attempt>.response.sse (the bytes upstream
+  returned, before the gateway translates or replaces them). dumps older than 48 hours are removed when a unit
   starts and on every start. the files hold the conversation itself: do not
   paste them anywhere public.
 
