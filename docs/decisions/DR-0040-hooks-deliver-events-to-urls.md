@@ -81,12 +81,12 @@ ccmsg の受け口は hooks でこう書く:
 [[hooks]]
 on = ["llm_request", "response", "cache_expired", "passthrough"]
 url = "http://127.0.0.1:8643/webhook/llm-gateway"
-headers = { Authorization = "Bearer {{secret:ccmsg-webhook}}" }
+sign = true
 body = "[{{event}}]"
 ```
 
 - 送り先はパスまで書く。gateway がパスを足さない
-- 合言葉は `[secret_store]` の `ccmsg-webhook.json` に置く (`{"type":"static","payload":{"value":"<token>"}}`)。1 行テキストのファイルを直接指す形は持たず、秘密の置き場を 1 つにする
+- 認証は `sign = true` の署名 (DR-0041)。合言葉は持たず、ccmsg 側は設定に gateway の `jwks_url` (`https://<gateway の FQDN>/llm-gateway/hooks/jwks`) を書いて受け口で JWT を検証する
 - `[{{event}}]` で受け口の契約 (常に配列、DR-0012) を保つ。1 件 1 配達になるので、短時間に起きた分が 1 通にまとまることは無くなる (各件が自分の `seq` / `boot` を持つのは同じ)
 - 複数の受け口は `[[hooks]]` を受け口の数だけ書く。全部へ同じ知らせを流し gateway は宛先を選ばない、1 つが落ちていても他への配達を止めない、はそのまま成り立つ (hook ごとに別タスク)
 
@@ -142,7 +142,7 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 
 ## 影響
 
-- `webhook.rs` と `config::Webhook` が消え、`hooks.rs` と `config::Hook` が増える。`[webhook]` を書いた設定は `check` で断られ、書き換え例が出る。ccmsg の合言葉ファイル (`webhook-llm-gateway.token`) は `[secret_store]` の `ccmsg-webhook.json` へ写す (運用の手順、MANUAL に書く)
+- `webhook.rs` と `config::Webhook` が消え、`hooks.rs` と `config::Hook` が増える。`[webhook]` を書いた設定は `check` で断られ、書き換え例が出る。ccmsg の合言葉ファイル (`webhook-llm-gateway.token`) は要らなくなる (認証は DR-0041 の署名)
 - `[secret_store]` は `[upstreams]` が空だと開かない (`passthrough.rs`)。`{{secret:…}}` を使う hook があれば開く
 - `/llm-gateway/self` と `daemon status` の各行に `hooks.dropped` が増える。`[[hooks]]` は `daemon reload` で変えられる欄にする (`[webhook]` は restart を要する欄)
 - 1 件 1 配達になるので、受け口への接続数は `[webhook]` の窓でまとめていた時より増える。ccmsg の受け口は配列を受けるのでそのまま動く
@@ -155,6 +155,7 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 ## 関連
 
 - [DR-0039](DR-0039-credential-events-and-llm-request.md) — hooks が購読する events の語彙 (credential の遷移と秘密の寿命の種類、`llm_request`、`route` / `credential` の 2 欄)
+- [DR-0041](DR-0041-hooks-sign-deliveries-with-ephemeral-jwks.md) — 自前の受け口 (ccmsg) への配達の認証 (`sign` / `aud`、gateway の JWKS)
 - [DR-0012](DR-0012-request-events.md) — events の契約 (`seq` / `boot`、Unix ミリ秒、未知の `type` は無視、転送の邪魔をしない)。`[webhook]` の決定はこの DR で置き換わる
 - [DR-0030](DR-0030-general-purpose-auth-gateway.md) §3 / §5 — `[secret_store]` と秘密の id (`{{secret:<id>}}` の参照先)
 - [DR-0010](DR-0010-credential-cross-process-lock.md) — ファイルの書き換えと版 (`{{secret:<id>}}` の読み直し)
