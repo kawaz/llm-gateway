@@ -47,7 +47,7 @@ data: {"type":"credential_recovered","ts":1785618060000,"seq":97,"boot":17855900
 
 `until` だけの更新で出さないのは、混雑 (`busy`) の印が 429 のたびに `now + 60` で置き直される (`RouteState::deny` は同じ範囲の期限を縮めない) ため。ここで出すとリクエストごとに繰り返すことになり、本決定の趣旨と逆になる。上限 (`limited`) の `until` が延びた (5h の次に 7d が塞がった) ことは usage の `denials` で読む (未決 2)。
 
-**`recovered` は `until` の経過で出す (timer)**。候補に戻るのは `until` が過ぎた瞬間で (`Router::select` は `availability` の `until > now` で判定する)、そこで戻ったと知らせるのが事実に合う。最初の 2xx で出すと、会話が止まっている間は戻っても知らせが無く (戻ったことを見て作業を再開する用途に使えない)、2xx 自体は `request` の `status` が既に伝えている。印を持つ経路の最も早い `until` まで寝る 1 本のタスクを置き、印の集合が変わるたびに起こし直す。印の実体を timer が消すのではない — 期限切れの印はこれまでどおり次に印を触った時に掃かれ (`deny` の `retain`)、timer は「有効でなくなった」知らせを出すだけ。`until` 到来の前に 2xx や枠照会で消えれば、そちらが `by: "allowed"` / `"probe"` で出し、timer は出し直さない。
+**`recovered` は `until` の経過で出す (timer)**。timer は tokio の sleep (単調時計) で、機械のスリープ中は進まないので、復帰後の最初の判定で壁時計が `until` を過ぎていればその時に出す (DR-0037 §13 と同じ扱い)。候補に戻るのは `until` が過ぎた瞬間で (`Router::select` は `availability` の `until > now` で判定する)、そこで戻ったと知らせるのが事実に合う。最初の 2xx で出すと、会話が止まっている間は戻っても知らせが無く (戻ったことを見て作業を再開する用途に使えない)、2xx 自体は `request` の `status` が既に伝えている。印を持つ経路の最も早い `until` まで寝る 1 本のタスクを置き、印の集合が変わるたびに起こし直す。印の実体を timer が消すのではない — 期限切れの印はこれまでどおり次に印を触った時に掃かれ (`deny` の `retain`)、timer は「有効でなくなった」知らせを出すだけ。`until` 到来の前に 2xx や枠照会で消えれば、そちらが `by: "allowed"` / `"probe"` で出し、timer は出し直さない。
 
 **`paced` は対象にしない**。pace_cap (DR-0019) は経路に印を残さず (`Route::paced_out` は判定のたびに計算する、DR-0019 §3)、namespace × モデル群ごとに結果が違うので「経路の状態の遷移」が無い。外れたことは `request` の `skipped` で読む (DR-0020 §2 と同じ切り分け)。
 
@@ -158,11 +158,7 @@ data: {"type":"credential_expired","ts":1792777600000,"seq":205,"boot":178559000
 
 ## 未決
 
-1. **`upstream_sent` (upstream へ送った時点のイベント) の要否**: `request` の `ts` が送り始めの時刻なので、今の語彙で足りているかもしれない
-2. **`until` が延びた時 (5h の次に 7d が塞がった) に知らせるか**: `limited` の印に限って `until` の変化で出す案があるが、決定 1 の表を `reason` で場合分けすることになる
-3. **通知で人が読める時刻**: イベントに載せると DR-0012 の規約に反し、テンプレートに整形を持つと DR-0040 決定 2 に反する。`until` と `ts` の差を長さの欄 (`for_secs`) として載せる案は、欄が派生値で DR-0012 の「足し算をさせない」に沿うが、`recovered` には無い欄になる
-4. **サスペンド跨ぎの timer**: 寝ている間に壁時計が `until` を過ぎた時、復帰後にいつ `recovered` を出すか (tokio の sleep は単調時計、DR-0037 §13 と同じ問題)
-5. **`credential_refresh_failed` の `login_path` を絶対 URL にするか**: gateway に外向きの URL の設定 (`[server] public_url` 等) を足せば `login_url` が出せるが、欄を 1 つ出すためだけに設定を増やすことになる。今は hook の側でホストを前に付ける (DR-0040 決定 4)
+(無し。kawaz 2026-10-30 に次を裁定: `upstream_sent` は `llm_request` の `ts` (upstream へ送り始めた瞬間、DR-0012) そのものなので足さない。`until` が延びた時の知らせ、人が読める時刻の欄、`login_path` の絶対 URL 化はいずれも持たない。`recovered` の timer がスリープを跨いだ時は DR-0037 §13 と同じく、復帰後に壁時計と `until` を比べて出す (決定 1 に記載))
 
 ## 関連
 
