@@ -76,7 +76,7 @@ body = "[{{event}}]"
 `sign = true` の時の本文と header:
 
 - `Content-Type` は `application/jwt`、本文は compact JWS。header は `{"alg":"Ed25519","kid":"<現の鍵の kid>","typ":"webhook+jwt"}`
-- claims は reference のとおり `aud` / `iat` / `exp` (`iat` + 30 秒) / `jti` (送信試行ごとに乱数) / `event`。**`event` には `body` のテンプレートを展開した JSON 値を入れる** (`[{{event}}]` なら 1 件の配列、`{{event}}` なら object)。`body` を書かなければ `{{event}}` とする。`iss` は入れない (採らなかった案)
+- claims は reference のとおり `iss` / `aud` / `iat` / `exp` (`iat` + 30 秒) / `jti` (送信試行ごとに乱数) / `event`。`iss` は固定の識別子 `llm-gateway` (URI でなくてよい。gateway は自分の外向き URL を知らないので名前で名指す。受け口は設定に `iss` があれば完全一致で見る)。**`event` には `body` のテンプレートを展開した JSON 値を入れる** (`[{{event}}]` なら 1 件の配列、`{{event}}` なら object)。`body` を書かなければ `{{event}}` とする。`iss` は入れない (採らなかった案)
 - **送信試行ごとに署名し直す**。DR-0040 の「通信失敗 / 5xx / timeout は 1 回だけ送り直す」の送り直しも新しい `jti` と `iat` で署名する (1 回目の `exp` が切れている)
 - 受け手の冪等処理の鍵は `event` の中の `seq` / `boot` (DR-0012)。`jti` はリプレイ防止だけ
 
@@ -113,7 +113,6 @@ ccmsg 側の変更は 2 つだけ: 受け口 (`/webhook/llm-gateway`) で `appli
 - **unit ごとの鍵をメモリに持ち、公開鍵だけを `[stats] dir` に書いて各 unit の JWKS が全 unit の公開鍵を合わせて出す**: P4 は満たせるが、落ちた unit の公開鍵の掃除、unit の名前でのファイル分け、版の違う unit の書式の揃え、と新しい仕組みが要る。DR-0037 の flock + 1 ファイルを借りれば同じ結果がもっと少ない部品で出る。秘密鍵が state に置かれる危険は DR-0037 の自動の鍵と同じ種類で、寿命が 1 時間なので漏れても最長 1.6 時間で効かなくなる (決定 2)
 - **監督者 (`daemon supervise`) が JWKS を集約して出す**: 監督者は HTTP を持たない (DR-0028 決定 3)。集約のために口を足すと監督者が面を持つことになる
 - **`sign` の既定を `true` にする**: DR-0040 の bark の例が全部 `sign = false` を書くことになり、固定 token しか受けない受け口に `application/jwt` を送って壊れる。署名を検証できる受け口は自前のものだけで、そちらが opt-in する方が書く量が少ない (決定 4)
-- **`iss` を token に入れる**: gateway は自分の外向きの URL を知らない (DR-0039 決定 3 の `login_path` と同じ)。受け口の受信 path で送り元は一意に引けるし、reference でも送り側の identity は受け口の設定の `jwks_url` に置く。設定で `iss` を書かせる欄は、使う場面が出てから足す (決定 4)
 - **`/.well-known/jwks.json` に置く**: root の名前は Caddy の後ろの他のサービスと競合する。gateway 自身の口は `/llm-gateway/` の下に揃っている (決定 3)
 - **受け口が同じホストなら `jwks_url` を loopback にする**: 受け口の https 限定に例外を作り、unit を 1 つ選ぶことで rolling restart の間の再取得が落ちる (決定 6)
 - **鍵の寿命を設定で持つ**: 変える理由が無く (reference の成立条件 `10% × 鍵寿命 > 30s + 30s + 受け口の再取得 interval` は 1 時間で余裕がある)、短くすると成立条件を破る口になる。DR-0040 の queue の長さと同じく固定 (決定 2)
