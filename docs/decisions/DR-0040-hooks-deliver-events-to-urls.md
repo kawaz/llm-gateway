@@ -150,10 +150,7 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 
 ## 未決
 
-1. **`[webhook]` の猶予**: 1 リリースの間は読み替えて警告だけにするか、最初から断るか。読み替える場合 `token_file` の 1 行テキストを `[secret_store]` へ写す処理を持つか
-2. **`match` で `prefix` / `session_id` を絞る使い方を認めるか**: 文法上は top-level の欄なので書けるが、会話ごとに別の受け口へ、は DR-0012 の「gateway は宛先を選ばない」と逆の形になる。`check` で断るか、書けるが勧めない (MANUAL に書かない) か
-3. **dotted path で配列の添字 (`{{fallback.0}}`) を許すか**、`url` に埋める値の URL エンコードを持つか
-4. **hook ごとの列の長さ (既定 64)** と、`hooks.dropped` を hook ごとに出すか合計だけか
+(無し。kawaz 2026-10-30 に次を裁定: `[webhook]` の猶予と `token_file` の写しは持たない (`[webhook]` を書いた設定は `check` が断る)。ccmsg 等の自前の受け口に対する配達の認証は共有 secret でなく、gateway がエフェメラル鍵で各 POST を JWT 署名し受け口が gateway の JWKS で検証する方式 (reference `auth-patterns/webhook-jws-jwks`) を別 DR で決める。`{{secret:<id>}}` は bark のように受け口が固定 token を要求する場合の口として残す。`match` で `prefix` / `session_id` を絞る使い方は認めない (`check` で断る。会話ごとに受け口を分けるのは DR-0012 の「gateway は宛先を選ばない」に反する)。dotted path の配列添字と `url` 値の URL エンコードは持たない。hook ごとの bounded queue の長さは 64 固定 (設定にしない)、`hooks.dropped` は合計だけ)
 
 ## 関連
 
