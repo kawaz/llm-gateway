@@ -30,10 +30,10 @@ follow_redirects = true                                # 既定 true
 | 欄 | 意味 |
 |---|---|
 | `on` | 配るイベントの種類。SSE の `event:` 名と同じ語 (`llm_request` (DR-0039 決定 2) / `response` / `cache_expired` / `passthrough` / `credential_limited` / `credential_recovered` / `credential_refresh_failed` (DR-0039 決定 3) / `credential_expiring` / `credential_expired` / `secret_expiring` / `secret_expired` (DR-0039 決定 4))。知らない語は `check` が断る |
-| `match` | 任意の絞り。`{ <欄> = "<値>" }` で、イベントの **top-level の欄**の値が一致する 1 件だけ配る。値は完全一致か `*` glob (`chatgpt-*`)、複数の欄は AND。欄は列挙せずどの top-level 欄でも書ける (`ns` / `credential` / `secret` / `upstream` / `reason` / `origin` / `status` …) ので、欄が増えても文法は変わらない。値は**文字列だけ** (TOML の数値 / 真偽は `check` が断る)。文字列以外の欄 (`status` の数値、`aborted` の真偽) は JSON の表記 (`"200"` / `"true"`) で比べ、配列 / object の欄には当たらない。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その欄を書いた hook には当たらない。`credential` はどの種類でも認証情報の名前、経路は `route` (DR-0039 決定 1・2)。`check` は欄名を検証しない (どの種類にどの欄があるかは events の契約で、増える) |
-| `url` | 送り先。`http` / `https` だけ。テンプレートを展開した結果を URL として読む |
+| `match` | 任意の絞り。`{ <欄> = "<値>" }` で、イベントの **top-level の欄**の値が一致する 1 件だけ配る。値は完全一致か `*` glob (`chatgpt-*`)、複数の欄は AND。欄は列挙せずどの top-level 欄でも書ける (`ns` / `credential` / `secret` / `upstream` / `reason` / `origin` / `status` …) ので、欄が増えても文法は変わらない。値は**文字列だけ** (TOML の数値 / 真偽は `check` が断る)。文字列以外の欄 (`status` の数値、`aborted` の真偽) は JSON の表記 (`"200"` / `"true"`) で比べ、配列 / object の欄には当たらない。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その欄を書いた hook には当たらない。`credential` はどの種類でも認証情報の名前、経路は `route` (DR-0039 決定 1・2)。会話・token 単位の欄 `prefix` / `session_id` / `agent_id` / `cache_notice` / `subject` / `kid` は `check` が断る (会話ごとに受け口を分けるのは DR-0012 の「gateway は宛先を選ばない」に反する)。`check` が見るのはこの列挙だけで、他の欄名は検証しない (どの種類にどの欄があるかは events の契約で、増える) |
+| `url` | 送り先。`http` / `https` だけ。テンプレートを展開した結果を URL として読む。置ける `{{…}}` は決定 2 の「設定由来の欄」と `{{secret:…}}` だけ |
 | `method` | `GET` / `POST` / `PUT` / `PATCH` / `DELETE`。既定 `POST` |
-| `headers` | 名前 → 値。値はテンプレート。`Content-Type` を書かなければ `body` がある時だけ `application/json` を付ける |
+| `headers` | 名前 → 値。値はテンプレート (置ける `{{…}}` は `url` と同じ制限)。`Content-Type` を書かなければ `body` がある時だけ付ける: JSON 文脈 (決定 2) なら `application/json`、素の文脈なら `text/plain` |
 | `body` | テンプレート。無ければ本文なし |
 | `timeout` | 1 回の送信を諦めるまで。既定 `5s` |
 | `follow_redirects` | 3xx の `Location` を**同じ method と本文で**追う (既定 `true`、最大 3 回、同じ origin に限る)。cold start で 302 を返す受け口 (bark-admin) を 1 回で通すため。ブラウザの意味論 (POST の 302 を GET に変える) は採らない — 送り先は設定で決めた 1 つの受け口で、結果ページへ移る用途が無い。別 origin への `Location` は追わず失敗にする (合言葉を別の相手に送らない) |
@@ -41,9 +41,10 @@ follow_redirects = true                                # 既定 true
 配達の原則 (本体を阻害しない):
 
 - **events の購読者の 1 つ**として走る (決定 5)。転送側は `Events::publish` で流すだけで、hook の有無も結果も知らない
-- **hook ごとに別タスクと bounded queue**。購読タスクが受けた 1 件を、当たる hook の列 (既定 64 件) へ入れる。列が一杯ならその 1 件を**落として数え**、転送も購読も待たない。溢れるのは受け口が遅い時で、遅れて届く知らせに価値が無いのは SSE と同じ (DR-0012)
+- **hook ごとに別タスクと bounded queue**。購読タスクが受けた 1 件を、当たる hook の列 (64 件、固定) へ入れる。列が一杯ならその 1 件を**落として数え**、転送も購読も待たない。溢れるのは受け口が遅い時で、遅れて届く知らせに価値が無いのは SSE と同じ (DR-0012)
+- **hook 1 本の配達は逐次**。配達タスクは列の順に 1 件ずつ取り出し、その 1 件を送り切って (`timeout` 5s × 送り直し 1 回、下記) から次へ進む。同じ hook の件を並列に送らない (受け口に届く順を `seq` の順に保つ。並列にすると `limited` と直後の `recovered` が入れ替わって届きうる)。受け口が遅ければ列が溢れて落ちるだけで、転送側には波及しない
 - 落とした数は `/llm-gateway/self` の `hooks.dropped` (全 hook の合計、起動からの累積、0 でも欄は出す) と `daemon status` の各行に出る。購読の段で追いつけずに落ちた分は従来どおり `events.dropped` に入る (2 段で数える: 購読の遅れと配達の遅れは別の事象)
-- **失敗は log だけ**。2xx 以外の応答、通信失敗、timeout、テンプレートの展開失敗はすべて warning で、再送の仕組みは持たない。例外として**通信失敗と 5xx と timeout は 1 回だけ送り直す** (bark-admin の cold start が 1〜2 秒かかる実測に合わせる。4xx は同じ結果になるので送り直さない)。連続失敗は最初の 1 回だけ warning を出し、復帰時に失敗回数を記録する (`webhook.rs` と同じ形)
+- **失敗は log だけ**。2xx 以外の応答、通信失敗、timeout、テンプレートの展開失敗はすべて warning で、再送の仕組みは持たない。例外として**通信失敗と 5xx と timeout は 1 回だけ送り直す** (bark-admin の cold start が 1〜2 秒かかる実測に合わせる。4xx は同じ結果になるので送り直さない。`sign = true` の hook では 401 も送り直す対象に入る、DR-0041 決定 4)。連続失敗は最初の 1 回だけ warning を出し、復帰時に失敗回数を記録する (`webhook.rs` と同じ形)
 - **log に合言葉と本文を出さない**。展開前のテンプレート (`{{secret:…}}` のまま) と状態コードまで。受け口の応答本文も記録しない
 - 1 件 1 配達。複数件をまとめる窓は持たない (「採らなかった案」)。接続は reqwest の pool で使い回す
 - `[[hooks]]` は `daemon reload` で差し替えられる (購読タスクを止めて組み直す)。配達の途中の 1 件は送り切る
@@ -65,28 +66,31 @@ follow_redirects = true                                # 既定 true
 - 文字列の外 (値の位置) に置かれた `{{…}}` は、値を **JSON 値として**埋める。文字列なら引用符付き、数値はそのまま、配列 / object はその JSON
 - `body` 全体が `{{event}}` なら、イベントの JSON がそのまま本文になる (生 POST)。`[{{event}}]` なら 1 件の配列
 
-`null` に置き換えたテキストが JSON として読めなければ**素の文脈**で、どの `{{…}}` も値を文字列にして (エスケープなしで) 埋める (文字列はそのまま、他は JSON テキスト)。`url` と `headers` は常に素の文脈で、URL エンコードも持たない (未決 3)。
+`null` に置き換えたテキストが JSON として読めなければ**素の文脈**で、どの `{{…}}` も値を文字列にして (エスケープなしで) 埋める (文字列はそのまま、他は JSON テキスト)。素の文脈の既定の `Content-Type` は `text/plain` (決定 1)。ただし `body` が `{` か `[` で始まるのに JSON として読めなければ、JSON を書こうとして崩れている (閉じ括弧の欠け、引用符の外の `{{…}}` の置き方の誤り) ので `check` が断る — 黙って素の文脈に落とすと、受け口に壊れた JSON が `text/plain` で届いて設定の誤りが見えなくなる。
 
-**無い欄はエラー**。イベントにその欄が無い (`cache_expired` に `credential` は無い、`fallback` は契機が枠照会の時は無い、`until` は `recovered` に無い) か、`{{secret:<id>}}` が読めなければ、その hook の**その 1 件は発火せず** warning に残す (どの hook の、どのイベントの、どの欄が無かったか)。黙って空文字にすると、受け手が「値が空だった」と「テンプレートが間違っている」を区別できない。欄ごと出ないことのある欄 (DR-0012 の `skip_serializing_if` の欄) をテンプレートに書くと、その欄の無い 1 件は配達されない。全部の欄が要るなら `{{event}}` で丸ごと送る。
+**`url` と `headers` は常に素の文脈**で、URL エンコードも持たない。ここに置ける `{{…}}` は `{{secret:…}}` と**設定由来の欄**だけ: `type` / `ns` / `route` / `credential` / `secret` / `upstream` / `reason` / `by` (値が設定ファイルか gateway の語彙から来る欄)。それ以外の欄 (`session_id` / `agent_id` / `subject` / `stop_reason` / `prefix` / `model` / `fallback` 等、クライアントの入力か upstream の応答から来る値) は `check` が断る。URL やヘッダに展開した値はエスケープされないので、クライアントが選べる文字列を置くと区切り文字や制御文字で URL の経路・クエリ・ヘッダの境界を書き換えられる。`body` は JSON エスケープされるので (JSON 文脈)、この制限は無い。
+
+**無い欄はエラー**。イベントにその欄が無い (`cache_expired` に `credential` は無い、`fallback` は契機が枠照会の時は無い、`until` は `recovered` に無い) か、`{{secret:<id>}}` が読めなければ、その hook の**その 1 件は発火せず** warning に残す (どの hook の、どのイベントの、どの欄が無かったか)。黙って空文字にすると、受け手が「値が空だった」と「テンプレートが間違っている」を区別できない。欄ごと出ないことのある欄 (DR-0012 の `skip_serializing_if` の欄) をテンプレートに書くと、その欄の無い 1 件は配達されない。全部の欄が要るなら `{{event}}` で丸ごと送る。無い欄を**意図したフィルタ**として使う書き方 (決定 4 の `{{credential}}` で relay を外す、`{{login_path}}` で codex を外す) も正当なので、warning は **hook ごと・欄ごとに最初の 1 回だけ** log に出し、以後は数えるだけにする (発火しなかった件の数は失敗回数と同じ扱いで、復帰時の記録に載る)。`{{secret:<id>}}` が読めない失敗は設定か置き場の問題で意図したフィルタにならないので、毎回 warning。
 
 `{{` を文字として書く手段は持たない。閉じの無い `{{`、知らない予約語 (`{{foo:bar}}`) は `check` が断る。
 
 ### 3. `[webhook]` の廃止と ccmsg の受け口の書き方
 
-`[webhook]` を設定から取り除く。設定に残っていれば `check` (と `daemon reload` の検証、起動時の読み込み) が **`[[hooks]]` への書き換え例を出して断る** (`[secrets] type` / `dir` の移転と同じ形、`config.rs` の `secret_specs`)。1 リリースの猶予を置くかは未決 1。
+`[webhook]` を設定から取り除く。設定に残っていれば `check` (と `daemon reload` の検証、起動時の読み込み) が **`[[hooks]]` への書き換え例を出して断る** (`[secrets] type` / `dir` の移転と同じ形、`config.rs` の `secret_specs`)。猶予のリリースは置かない (影響の移行手順)。
 
 ccmsg の受け口は hooks でこう書く:
 
 ```toml
 [[hooks]]
 on = ["llm_request", "response", "cache_expired", "passthrough"]
-url = "http://127.0.0.1:8643/webhook/llm-gateway"
+url = "https://ccmsg.example/webhook/llm-gateway"
 sign = true
+aud = "https://ccmsg.example/webhook/llm-gateway"
 body = "[{{event}}]"
 ```
 
-- 送り先はパスまで書く。gateway がパスを足さない
-- 認証は `sign = true` の署名 (DR-0041)。合言葉は持たず、ccmsg 側は設定に gateway の `jwks_url` (`https://<gateway の FQDN>/llm-gateway/hooks/jwks`) を書いて受け口で JWT を検証する
+- 送り先はパスまで書く。gateway がパスを足さない。受け口は https (reference `auth-patterns/webhook-jws-jwks` の前提 P2: 送信先の確認は TLS に依る)
+- 認証は `sign = true` の署名 (DR-0041)。合言葉は持たず、ccmsg 側は設定に gateway の `jwks_url` (`https://<gateway の FQDN>/llm-gateway/hooks/jwks`) を書いて受け口で JWT を検証する。`aud` は既定 (`url` と同じ) でよいが、受け口に転記する値なので明示して書く
 - `[{{event}}]` で受け口の契約 (常に配列、DR-0012) を保つ。1 件 1 配達になるので、短時間に起きた分が 1 通にまとまることは無くなる (各件が自分の `seq` / `boot` を持つのは同じ)
 - 複数の受け口は `[[hooks]]` を受け口の数だけ書く。全部へ同じ知らせを流し gateway は宛先を選ばない、1 つが落ちていても他への配達を止めない、はそのまま成り立つ (hook ごとに別タスク)
 
@@ -122,7 +126,8 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 - `reason` を絞るのは、混雑 (`busy`) の 60 秒の退避で鳴らさないため。`org_not_allowed` も鳴らしたいなら `[[hooks]]` をもう 1 つ書く (`match` の値は 1 つで、OR は hook を分けて表す)
 - 再ログインの催促は bark の `url` (タップで開く) に login ページを入れる。gateway は自分の外向きの URL を知らない (`login_path` はパスだけ、DR-0039 決定 3) ので、ホストは hook を書く人が前に付ける。`login_path` の無い認証情報 (codex_oauth、DR-0023 の対象外) ではこの hook は発火しない (決定 2) ので、codex も鳴らしたいなら `url` を外した hook を別に書く
 - `fallback` は JSON 文字列の中に置かれているので `["claude-b","claude-c"]` のテキストが入る。枠照会が付けた印 (`by: "probe"`) には `fallback` が無く、この hook のその 1 件は発火しない (決定 2)。欠けても鳴らしたいなら `fallback` を本文から外す
-- `until` は Unix ミリ秒のまま入る。人が読む形への整形はテンプレートに無く、イベントにも載せない (DR-0012 の「同じ瞬間を 2 通りで並べない」)。通知で読める時刻が要るかは DR-0039 の未決 3
+- `until` は Unix ミリ秒のまま入る。人が読む形への整形はテンプレートに無く、イベントにも載せない (DR-0012 の「同じ瞬間を 2 通りで並べない」、DR-0039 の裁定)
+- 1 つ目と 3 つ目の hook が「無い欄で発火しない」ことを relay / codex を外すフィルタとして使っているので、その warning は hook ごと・欄ごとに最初の 1 回しか出ない (決定 2)
 - bark-admin の cold start の 302 は `follow_redirects` (既定) が同じ POST で追う
 
 ### 5. events (SSE) は変えず、hooks は購読者の 1 つ
@@ -146,7 +151,8 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 - `[secret_store]` は `[upstreams]` が空だと開かない (`passthrough.rs`)。`{{secret:…}}` を使う hook があれば開く
 - `/llm-gateway/self` と `daemon status` の各行に `hooks.dropped` が増える。`[[hooks]]` は `daemon reload` で変えられる欄にする (`[webhook]` は restart を要する欄)
 - 1 件 1 配達になるので、受け口への接続数は `[webhook]` の窓でまとめていた時より増える。ccmsg の受け口は配列を受けるのでそのまま動く
-- MANUAL の webhook の節を hooks に置き換える。`docs/architecture-overview` の webhook の記述も同様
+- **版の混在**: 旧版は `[[hooks]]` を、新版は `[webhook]` を、どちらも `deny_unknown_fields` で断るので、両版が同時に読める設定ファイルは無い。stable と unstable (DR-0028) は別の設定ファイルを読む前提で、次の順で上げる: (1) unstable を新版にし、unstable の設定を `[webhook]` → `[[hooks]]` に書き換える (stable は旧版 + `[webhook]` のまま動く)、(2) ccmsg の受け口を JWT 検証 (DR-0041) に切り替える (この間、stable からは合言葉付き、unstable からは署名付きで届くので、受け口は両方を受ける版にしてから切り替える)、(3) stable を上げる時に stable の設定も同じ形に差し替える。同じ設定ファイルを両 unit で読む構成では (1) と (3) を分けられないので、先に設定を分ける
+- MANUAL の webhook の節を hooks に置き換える。合わせて直す箇所: 冒頭の path 欄の一覧 (`[webhook] token_file` を外す)、`GET /llm-gateway/self` の説明 (`hooks.dropped` を足し、webhook の語を hooks に)、`daemon reload` で変えられない欄の一覧 (`[webhook]` を外す。`[[hooks]]` は変えられる側)。`docs/architecture-overview` の webhook の記述も同様
 
 ## 未決
 
@@ -162,3 +168,4 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 - [DR-0032](DR-0032-daemon-reload.md) — reload で差し替えられる欄の区分
 - claude-rules-personal の reference `proxy-dump-design` (`model` の「実装の原則」) — 透過 / 非ブロッキング / 失敗は log のみ
 - claude-rules-personal の reference `bark-push` — bark-admin の送り方 (cold start の 302、宛先は `device` タグ)
+- claude-rules-personal の reference `auth-patterns/webhook-jws-jwks` — 署名する hook の受け口が https である前提 (P2) と、再送の規則 (`sign = true` で 401 を送り直す根拠)
