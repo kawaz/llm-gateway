@@ -18,11 +18,11 @@ kawaz の要件 (2026-10-21) のうち、本 DR が扱うのは 2 つ。gateway 
 ```toml
 [[hooks]]
 on = ["credential_limited", "credential_recovered"]   # 配るイベントの種類 (必須、1 つ以上)
-match = { route = "claude-*", reason = "limited" }        # 任意: top-level の欄の値で絞る (AND、`*` glob)
+match = { route = "claude-*" }                         # 任意: top-level の欄の値で絞る (AND、`*` glob)
 url = "https://bark.example/bark-admin/push"           # 必須。テンプレート可
 method = "POST"                                        # 既定 POST
 headers = { "Content-Type" = "application/json", Authorization = "Bearer {{secret:bark}}" }   # 値はテンプレート可
-body = '{"device":{"owner":"kawaz"},"title":"{{route}} is {{reason}}","body":"until {{until}}; next {{fallback}}","group":"llm-gateway"}'   # テンプレート
+body = '{"device":{"owner":"kawaz"},"title":"{{route}} is limited","body":"until {{until}}; next {{fallback}}","group":"llm-gateway"}'   # テンプレート
 timeout = "5s"                                         # 既定 5s
 follow_redirects = true                                # 既定 true
 ```
@@ -30,7 +30,7 @@ follow_redirects = true                                # 既定 true
 | 欄 | 意味 |
 |---|---|
 | `on` | 配るイベントの種類。SSE の `event:` 名と同じ語 (`llm_request` (DR-0039 決定 2) / `response` / `cache_expired` / `passthrough` / `credential_limited` / `credential_recovered` / `credential_refresh_failed` (DR-0039 決定 3) / `credential_expiring` / `credential_expired` / `secret_expiring` / `secret_expired` (DR-0039 決定 4))。知らない語は `check` が断る |
-| `match` | 任意の絞り。`{ <欄> = "<値>" }` で、イベントの **top-level の欄**の値が一致する 1 件だけ配る。値は完全一致か `*` glob (`chatgpt-*`)、複数の欄は AND。欄は列挙せずどの top-level 欄でも書ける (`ns` / `credential` / `secret` / `upstream` / `reason` / `origin` / `status` …) ので、欄が増えても文法は変わらない。値は**文字列だけ** (TOML の数値 / 真偽は `check` が断る)。文字列以外の欄 (`status` の数値、`aborted` の真偽) は JSON の表記 (`"200"` / `"true"`) で比べ、配列 / object の欄には当たらない。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その欄を書いた hook には当たらない。`credential` はどの種類でも認証情報の名前、経路は `route` (DR-0039 決定 1・2)。会話・token 単位の欄 `prefix` / `session_id` / `agent_id` / `cache_notice` / `subject` / `kid` は `check` が断る (会話ごとに受け口を分けるのは DR-0012 の「gateway は宛先を選ばない」に反する)。`check` が見るのはこの列挙だけで、他の欄名は検証しない (どの種類にどの欄があるかは events の契約で、増える) |
+| `match` | 任意の絞り。`{ <欄> = "<値>" }` で、イベントの **top-level の欄**の値が一致する 1 件だけ配る。値は完全一致か `*` glob (`chatgpt-*`)、複数の欄は AND (1 つの欄に複数の値は書けず、OR は hook を分けて表す)。欄は列挙せずどの top-level 欄でも書ける (`ns` / `credential` / `secret` / `upstream` / `reason` / `origin` / `status` …) ので、欄が増えても文法は変わらない。値は**文字列だけ** (TOML の数値 / 真偽は `check` が断る)。文字列以外の欄 (`status` の数値、`aborted` の真偽) は JSON の表記 (`"200"` / `"true"`) で比べ、配列 / object の欄には当たらない。欄を持たないイベント (`cache_expired` に `credential` は無い) は、その欄を書いた hook には当たらない。`credential` はどの種類でも認証情報の名前、経路は `route` (DR-0039 決定 1・2)。会話・token 単位の欄 `prefix` / `session_id` / `agent_id` / `cache_notice` / `subject` / `kid` は `check` が断る (会話ごとに受け口を分けるのは DR-0012 の「gateway は宛先を選ばない」に反する)。`check` が見るのはこの列挙だけで、他の欄名は検証しない (どの種類にどの欄があるかは events の契約で、増える) |
 | `url` | 送り先。`http` / `https` だけ。テンプレートを展開した結果を URL として読む。置ける `{{…}}` は決定 2 の「設定由来の欄」と `{{secret:…}}` だけ |
 | `method` | `GET` / `POST` / `PUT` / `PATCH` / `DELETE`。既定 `POST` |
 | `headers` | 名前 → 値。値はテンプレート (置ける `{{…}}` は `url` と同じ制限)。`Content-Type` を書かなければ `body` がある時だけ付ける: JSON 文脈 (決定 2) なら `application/json`、素の文脈なら `text/plain` |
@@ -68,7 +68,7 @@ follow_redirects = true                                # 既定 true
 
 `null` に置き換えたテキストが JSON として読めなければ**素の文脈**で、どの `{{…}}` も値を文字列にして (エスケープなしで) 埋める (文字列はそのまま、他は JSON テキスト)。素の文脈の既定の `Content-Type` は `text/plain` (決定 1)。ただし `body` が `{` か `[` で始まるのに JSON として読めなければ、JSON を書こうとして崩れている (閉じ括弧の欠け、引用符の外の `{{…}}` の置き方の誤り) ので `check` が断る — 黙って素の文脈に落とすと、受け口に壊れた JSON が `text/plain` で届いて設定の誤りが見えなくなる。
 
-**`url` と `headers` は常に素の文脈**で、URL エンコードも持たない。ここに置ける `{{…}}` は `{{secret:…}}` と**設定由来の欄**だけ: `type` / `ns` / `route` / `credential` / `secret` / `upstream` / `reason` / `by` (値が設定ファイルか gateway の語彙から来る欄)。それ以外の欄 (`session_id` / `agent_id` / `subject` / `stop_reason` / `prefix` / `model` / `fallback` 等、クライアントの入力か upstream の応答から来る値) は `check` が断る。URL やヘッダに展開した値はエスケープされないので、クライアントが選べる文字列を置くと区切り文字や制御文字で URL の経路・クエリ・ヘッダの境界を書き換えられる。`body` は JSON エスケープされるので (JSON 文脈)、この制限は無い。
+**`url` と `headers` は常に素の文脈**で、URL エンコードも持たない。ここに置ける `{{…}}` は `{{secret:…}}` と**設定由来の欄**だけ: `type` / `ns` / `route` / `credential` / `secret` / `upstream` / `reason` (値が設定ファイルか gateway の語彙から来る欄)。それ以外の欄 (`session_id` / `agent_id` / `subject` / `stop_reason` / `prefix` / `model` / `fallback` 等、クライアントの入力か upstream の応答から来る値) は `check` が断る。URL やヘッダに展開した値はエスケープされないので、クライアントが選べる文字列を置くと区切り文字や制御文字で URL の経路・クエリ・ヘッダの境界を書き換えられる。`body` は JSON エスケープされるので (JSON 文脈)、この制限は無い。URL やヘッダに gateway が作る値以上のものが要るなら、`body = "{{event}}"` で payload を丸ごと送り、受け口側で読む (MANUAL にこの一文を書く)。
 
 **無い欄はエラー**。イベントにその欄が無い (`cache_expired` に `credential` は無い、`fallback` は契機が枠照会の時は無い、`until` は `recovered` に無い) か、`{{secret:<id>}}` が読めなければ、その hook の**その 1 件は発火せず** warning に残す (どの hook の、どのイベントの、どの欄が無かったか)。黙って空文字にすると、受け手が「値が空だった」と「テンプレートが間違っている」を区別できない。欄ごと出ないことのある欄 (DR-0012 の `skip_serializing_if` の欄) をテンプレートに書くと、その欄の無い 1 件は配達されない。全部の欄が要るなら `{{event}}` で丸ごと送る。無い欄を**意図したフィルタ**として使う書き方 (決定 4 の `{{credential}}` で relay を外す、`{{login_path}}` で codex を外す) も正当なので、warning は **hook ごと・欄ごとに最初の 1 回だけ** log に出し、以後は数えるだけにする (発火しなかった件の数は失敗回数と同じ扱いで、復帰時の記録に載る)。`{{secret:<id>}}` が読めない失敗は設定か置き場の問題で意図したフィルタにならないので、毎回 warning。
 
@@ -101,15 +101,13 @@ DR-0039 の `credential_limited` / `credential_recovered` / `credential_refresh_
 ```toml
 [[hooks]]
 on = ["credential_limited"]
-match = { reason = "limited" }
 url = "https://bark.example/bark-admin/push"
-body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{route}} ({{credential}}): {{reason}}","body":"until {{until}}, next: {{fallback}}","level":"timeSensitive"}'
+body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{route}} ({{credential}}) is limited","body":"until {{until}}, next: {{fallback}}","level":"timeSensitive"}'
 
 [[hooks]]
 on = ["credential_recovered"]
-match = { reason = "limited" }
 url = "https://bark.example/bark-admin/push"
-body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{route}} recovered","body":"{{by}}"}'
+body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{route}} ({{credential}}) recovered","body":"quota reset"}'
 
 [[hooks]]
 on = ["credential_refresh_failed"]
@@ -123,9 +121,9 @@ body = '{"device":{"owner":"kawaz"},"group":"llm-gateway","title":"{{credential}
 ```
 
 - 1 つ目の `{{credential}}` は認証情報を持たない経路 (relay) では無い欄なので、その経路の 1 件は発火しない (決定 2)。relay も鳴らすなら `{{route}}` だけにする
-- `reason` を絞るのは、混雑 (`busy`) の 60 秒の退避で鳴らさないため。`org_not_allowed` も鳴らしたいなら `[[hooks]]` をもう 1 つ書く (`match` の値は 1 つで、OR は hook を分けて表す)
+- `credential_limited` / `recovered` は枠 (`limited`) の印だけで出る (DR-0039 決定 1) ので、混雑 (`busy`) の 60 秒の退避では鳴らない。`match` で絞る必要は無い
 - 再ログインの催促は bark の `url` (タップで開く) に login ページを入れる。gateway は自分の外向きの URL を知らない (`login_path` はパスだけ、DR-0039 決定 3) ので、ホストは hook を書く人が前に付ける。`login_path` の無い認証情報 (codex_oauth、DR-0023 の対象外) ではこの hook は発火しない (決定 2) ので、codex も鳴らしたいなら `url` を外した hook を別に書く
-- `fallback` は JSON 文字列の中に置かれているので `["claude-b","claude-c"]` のテキストが入る。枠照会が付けた印 (`by: "probe"`) には `fallback` が無く、この hook のその 1 件は発火しない (決定 2)。欠けても鳴らしたいなら `fallback` を本文から外す
+- `fallback` は JSON 文字列の中に置かれているので `["claude-b","claude-c"]` のテキストが入る。枠照会が付けた印 (`apply_quota`) には `fallback` が無く、この hook のその 1 件は発火しない (決定 2)。欠けても鳴らしたいなら `fallback` を本文から外す
 - `until` は Unix ミリ秒のまま入る。人が読む形への整形はテンプレートに無く、イベントにも載せない (DR-0012 の「同じ瞬間を 2 通りで並べない」、DR-0039 の裁定)
 - 1 つ目と 3 つ目の hook が「無い欄で発火しない」ことを relay / codex を外すフィルタとして使っているので、その warning は hook ごと・欄ごとに最初の 1 回しか出ない (決定 2)
 - bark-admin の cold start の 302 は `follow_redirects` (既定) が同じ POST で追う
