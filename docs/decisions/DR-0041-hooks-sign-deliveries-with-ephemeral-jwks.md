@@ -1,6 +1,6 @@
 # DR-0041: hooks の配達を gateway のエフェメラル鍵で JWT 署名し、受け口は gateway の JWKS で検証する
 
-- Status: Proposed
+- Status: Proposed (ccmsg 連携は DR-0042 の pull に移り、本 DR の用途は bark 等 push でしか届かない相手に限る。DR-0042 / 0043 の後に再評価)
 - Date: 2026-10-30
 
 ## 背景

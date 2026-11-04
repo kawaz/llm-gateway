@@ -1,6 +1,6 @@
 # DR-0039: credential の遷移と秘密の寿命を events の語彙に足し、`request` を `llm_request` に改名する
 
-- Status: Proposed
+- Status: Proposed (`credential_limited` / `recovered` は DR-0042 の pull で代替可、`llm_request` 改名と `refresh_failed` / 寿命通知は残る候補。DR-0042 の後に再評価)
 - Date: 2026-10-21
 
 ## 背景
