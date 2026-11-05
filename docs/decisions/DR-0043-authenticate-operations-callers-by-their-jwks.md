@@ -9,7 +9,7 @@ ccmsg と gateway の連携は ccmsg が取りに来る (pull) だけにする (
 
 呼び手を認証する形として、共有 secret (`[webhook] token_file` のような合言葉を両側に配って保管し、漏れたら両側で入れ替える) は持たない。**ccmsg が自分の短命の Ed25519 鍵で各 request を JWT 署名し、gateway は設定に書いた信頼する呼び手の `jwks_url` の一覧で検証する** (kawaz 裁定 2026-11-04)。方式は claude-rules-personal の reference `auth-patterns/webhook-jws-jwks` が正本 (前提 P1〜P4、鍵の 3 状態と 50% / 100% / 110% の遷移、検証の順序、鍵キャッシュと再取得、やらないこと) で、役割は reference と逆: **ccmsg が送り側 (S)、gateway が受け側 (R)**。DR-0041 (hooks の配達を gateway が署名する) は同じ方式を逆向きに当てたもので、鍵も口も別で、互いに依存しない。
 
-本 DR で決めるのは、方式を gateway の受け側に当てた時に決まらないことだけ: 設定の形、署名を求める口、body の無い `GET` に対する token の形 (reference は body を token に内包する webhook 用)、`jti` の使用済み集合をどの単位で持つか (stable / unstable は別プロセス)、鍵の取得に使う HTTP、認証を掛ける段階、運用者の CLI と手動確認、ccmsg 側に要るもの。
+本 DR で決めるのは、方式を gateway の受け側に当てた時に決まらないことだけ: 設定の形、署名を求める口、body の無い `GET` に対する token の形 (reference は body を token に内包する webhook 用)、リプレイ対策の形 (短い `exp` を主にし `jti` は任意にする時、`jti` が付いてきたら使用済み集合をどの単位で持つか。stable / unstable は別プロセス)、鍵の取得に使う HTTP、認証を掛ける段階、運用者の CLI と手動確認、ccmsg 側に要るもの。
 
 ## 決定
 
@@ -52,7 +52,7 @@ jwks_file = "keys/operator.jwks.jsonl"   # 設定ファイルからの相対。�
 
 求めない口は今までどおり手前の境界を信頼する。**Caddy が外へ通すのは、署名を求める口のうち外の呼び手が読むもの (ccmsg なら `/llm-gateway/sessions*`、使うなら `keepalive/pause`) と `hooks/jwks` だけ**で、求めない口は tailnet の内側に留める (DR-0041 決定 6 の線を、署名で守られた口の分だけ広げる)。
 
-### 3. token は `Authorization: Bearer <JWT>`。claims は `iss` / `aud` (= method + path) / `iat` / `exp` / `jti` だけで、query と body は覆わない
+### 3. token は `Authorization: Bearer <JWT>`。claims は `iss` / `aud` (= method + path) / `exp` (署名時刻 + 10 秒) と任意の `jti` だけで、`iat` は持たず、query と body は覆わない
 
 reference の token は body (`event`) を claims に内包する webhook 用で、本 DR の口は `GET` が主で body が無い。token は本文ではなく **`Authorization` header の Bearer** で運ぶ (RFC 6750)。
 
@@ -64,9 +64,8 @@ header:  { "alg": "Ed25519", "kid": "<kid>", "typ": "request+jwt" }
 claims:  {
   "iss": "ccmsg",
   "aud": "GET /llm-gateway/sessions/0f3c6d1a-…",   # method (大文字) + 空白 1 つ + path。query は含めない
-  "iat": 1762300000,
-  "exp": 1762300030,                                # iat + 30 秒
-  "jti": "<ランダム、request ごとに一意>"
+  "exp": 1762300010,                                # 署名時刻 + 10 秒
+  "jti": "<任意。付けるならランダム、request ごとに一意>"
 }
 ```
 
@@ -75,11 +74,12 @@ claims:  {
 - **body は覆わない**。署名を求める口で body を持つのは `POST /llm-gateway/keepalive/pause` (`{"session_id"}`) だけ。書き換えられて起きる最悪は別の会話の keepalive が 1 回落ちることで、次の実リクエストで控えが置き直される (DR-0024 §2)。body まで覆う必要が出た時 (台の挙動を変える口が HTTP に増えた時) は RFC 9421 (HTTP Message Signatures) へ移る (reference の「やらないこと」と同じ判断)
 - `typ` は **`request+jwt`**。DR-0041 の `webhook+jwt` と ns 認証の `JWT` とは別の値で、互いに通らない (RFC 8725 の explicit typing)。比べ方は reference のとおり正規化 (小文字化、`application/` 接頭辞を落とす) してから完全一致
 - `alg` は **`Ed25519` と `EdDSA` の両方を受ける** (固定、設定にしない)。gateway は ed25519-dalek で直接検証し、鍵は取り込みの時に `kty: OKP` / `crv: Ed25519` を確かめる (決定 5) ので、`EdDSA` の曲線の多義は鍵の側で閉じている。呼び手の JOSE ライブラリが fully-specified の `Ed25519` を出せない場合と、gateway 自身の `auth sign` (`alg: EdDSA`) で手動確認する場合 (決定 7) のため。JWK に `alg` があれば header の `alg` との一致を見る (reference 検証 3)
-- `exp` は `iat` + 30 秒。request ごとに署名し直す (queue に積んで使い回さない) ので、再送でも `exp` 切れにならない
-- `jti` は request ごとに新しくする。リプレイ防止だけの用で、冪等処理の鍵ではない (本 DR の口は読み出しと、落とすだけの pause)
+- **リプレイ対策は短い `exp` を主にする** (reference の「body の無い request への適用」)。`exp` は署名時刻 + 10 秒で必須。gateway は `exp` から寿命の上限を状態無しに強制する (決定 4 の 5) ので、`iat` は持たない。request ごとに署名し直す (queue に積んで使い回さない) ので、再送でも `exp` 切れにならない
+- `jti` は**任意**。付けるなら request ごとに新しくし、gateway は使用済み集合で見る (決定 4 の 7)。無くても断らない。リプレイ防止だけの用で、冪等処理の鍵ではない
+- 本 DR の口は読み出しと、副作用が「keepalive を落とす」だけの `keepalive/pause` で、pause も読み出しと同じ扱いにする: `exp` の窓の内側でリプレイされても、keepalive が 1 回余計に落ちる (既に落ちていれば no-op) だけで、次の実リクエストで控えが置き直される (DR-0024 §2)
 - `events` (SSE) も同じ形。繋ぐ時の 1 request に署名し、繋がった後の stream は再検証しない (token の `exp` が切れても stream は切らない。切るのは繋ぐ時の判定だけ)。ブラウザの `EventSource` は header を付けられないが、ccmsg は events を繋がない (DR-0042 背景) ので困らない。curl は `-H` で付けられる
 
-### 4. 検証は reference の順序で、`jti` の使用済み集合は unit ごとに持つ
+### 4. 検証は reference の順序で、`exp` の寿命の上限を状態無しに見る。`jti` が付いてきた時の使用済み集合は unit ごとに持つ
 
 署名を求める口に request が来たら、`[callers]` が空でなければ (決定 6) 次の順で検証する。1 つ落ちたらそこで終わり、救済 (別の呼び手の鍵で試す、`alg` の緩和) はしない:
 
@@ -87,13 +87,13 @@ claims:  {
 2. header の `alg` が `Ed25519` / `EdDSA`、`typ` が `request+jwt` (正規化して比較)、`kid` がある。`jku` / `jwk` / `x5u` / `x5c` は無視する
 3. claims の `iss` (署名前なのでまだ信じない) で `[callers.<name>]` を引く。無ければ拒否。その呼び手の鍵キャッシュから `kid` を引き、無ければ再取得 (決定 5) して再度引き、それでも無ければ拒否
 4. 署名を検証する
-5. `exp` が未来 (ずれ許容 30 秒)、`iat` が過去 (未来方向に 30 秒の猶予)、`exp - iat` が 60 秒以内
+5. `exp` が未来 (ずれ許容 30 秒) かつ `exp` ≤ `now` + 10 秒 + 30 秒 (寿命の上限を状態無しに強制する)
 6. `aud` が「method + 空白 + path」と完全一致。`iss` が引いた呼び手の `iss` と完全一致 (3 で引いた以上一致するが、検証後に改めて見る)
-7. `jti` が未使用。使用済みなら拒否。集合は `exp` + 30 秒まで保持し、上限 (65,536 件) に達したら新しい token を**拒否する** (古い順に捨てない、reference 検証 7)
+7. `jti` があれば使用済み集合で検証し、使用済みなら拒否。無ければ断らない。集合は unit ごとに持ち、`exp` + 30 秒まで保持する。上限 (65,536 件) に達したら、**その token の `jti` 検証を飛ばす** (拒否しない)。読み出しの口で `exp` が短いので飛ばしても実害が無く、満杯で全拒否する方が可用性を削る
 
-応答は reference の表のとおり **401** (署名不一致、未知 `kid`、`exp` 切れ、`iat` が未来、`jti` 使用済み / 集合の満杯、鍵キャッシュが stale の上限超え。呼び手が署名し直せば通りうる) と **400** (`Authorization` の形、parse、`alg` / `typ` / `kid` / `aud` / `iss` の不一致、`exp - iat` の上限超え。直しても通らない)。401 には `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750) を付ける。本文は ns 認証と同じ JSON のエラー (`authentication_error`、DR-0008 のとおり英語) で、`message` にどの段で落ちたかを `ns/jwt.rs` の `Reason` の語 (`unknown_kid` / `expired` / …) を借りて書く。`[callers]` を 1 つも持たない unit は検証せず、`Authorization` があっても見ない。
+応答は reference の表のとおり **401** (署名不一致、未知 `kid`、`exp` 切れ、`jti` 使用済み、鍵キャッシュが stale の上限超え。呼び手が署名し直せば通りうる) と **400** (`Authorization` の形、parse、`alg` / `typ` / `kid` / `aud` / `iss` の不一致、`exp` の寿命の上限超え。直しても通らない)。401 には `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750) を付ける。本文は ns 認証と同じ JSON のエラー (`authentication_error`、DR-0008 のとおり英語) で、`message` にどの段で落ちたかを `ns/jwt.rs` の `Reason` の語 (`unknown_kid` / `expired` / …) を借りて書く。`[callers]` を 1 つも持たない unit は検証せず、`Authorization` があっても見ない。
 
-**`jti` の使用済み集合は unit ごと (プロセスのメモリ) に持ち、stable / unstable で共有しない**。reference は「R が複数インスタンスなら集合を共有する (LB 越しに同じ token が別インスタンスで通る)」と言うが、共有するには request ごとに `[stats] dir` のファイルを flock で読み書きすることになり、読み出しの口の 1 request に書き込みが 1 回増える。守れるのは「同じ token を 30 秒以内に兄弟の unit へ送り直す」リプレイだけで、その結果は読み出しなら同じ答え (控えは共有、DR-0042 決定 2)、pause なら 2 回目は既に落ちている控えに対する no-op。tailnet の内側で token を盗んで 30 秒以内に兄弟へ送れる相手は、転送系の面 (無認証、DR-0006) を直接叩ける相手でもあるので、ここだけ守っても境界は変わらない。集合はプロセスが落ちれば消え、再起動直後の 30 秒だけ再起動前の token が通りうる (同じ理由で許容)。
+リプレイの窓は 5 の上限で `exp` の寿命 (10 秒 + ずれ 30 秒) に閉じ、`jti` はその窓の中をさらに狭める任意の層。**`jti` の使用済み集合は unit ごと (プロセスのメモリ) に持ち、stable / unstable で共有しない** (reference の「`jti` を使う場合、使用済み集合は読み出しの口に限り R のインスタンスごとに持ってよい」)。共有するには request ごとに `[stats] dir` のファイルを flock で読み書きすることになり、読み出しの口の 1 request に書き込みが 1 回増える。守れるのは「同じ token を `exp` の窓の内側で兄弟の unit へ送り直す」リプレイだけで、その結果は読み出しなら同じ答え (控えは共有、DR-0042 決定 2)、pause なら 2 回目は既に落ちている控えに対する no-op。tailnet の内側で token を盗んで窓の内側で兄弟へ送れる相手は、転送系の面 (無認証、DR-0006) を直接叩ける相手でもあるので、ここだけ守っても境界は変わらない。集合はプロセスが落ちれば消え、再起動直後は再起動前の token が `exp` の窓の内側で通りうる (同じ理由で許容)。
 
 ### 5. 鍵キャッシュと再取得は reference のとおり。`jwks_url` の取得は専用の小さな HTTP client で https のみ、`jwks_file` は mtime で読み直す
 
@@ -134,12 +134,14 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 - **無認証のまま tailnet の境界に任せる**: ccmsg が tailnet の外に居る構成で Caddy が `/llm-gateway/sessions*` を外へ通すと、全会話の id と状態、認証情報の枠が誰にでも読める。DR-0041 決定 6 が JWKS 以外を外に出さなかった理由がそのまま当てはまる (決定 2・6)
 - **`[[callers]]` の配列**: 呼び手には名前があり、`extends` で表は鍵ごとに重ねられる (決定 1)
 - **`[callers.<name>]` に `aud` を持つ**: `aud` は request ごとに method と path から決まり、固定値を転記する場面が無い。固定の `aud` にすると 1 つの token で全部の口が読めてしまう (決定 1・3)
-- **`aud` に scheme と host も入れる**: gateway は自分の外向き URL を知らない (`Host` header は Caddy の設定次第)。同じ呼び手を信頼する別の gateway へ 30 秒以内に token を回すリプレイは残るが、その 2 台は同じ運用者のもので、決定 4 の兄弟 unit と同じ扱い (決定 3)
+- **`aud` に scheme と host も入れる**: gateway は自分の外向き URL を知らない (`Host` header は Caddy の設定次第)。同じ呼び手を信頼する別の gateway へ `exp` の窓の内側で token を回すリプレイは残るが、その 2 台は同じ運用者のもので、決定 4 の兄弟 unit と同じ扱い (決定 3)
 - **query も `aud` に含める**: path が同じなら読める範囲は同じで、覆っても守れるものが増えない。含めると query の正規化 (並び、エンコード) を両側で揃える仕事が増える (決定 3)
 - **pause の body を claims に内包する (reference の `event` の形)**: 口が 1 つのために token の形を 2 通り持つことになる。書き換えの最悪が「別の会話の keepalive が 1 回落ちる」で、次の実リクエストで戻る (決定 3)
 - **body の hash を claims に持つ (`body_sha256`)**: RFC 9421 の部分的な再発明。必要になった時に RFC 9421 へ移る (決定 3)
 - **`alg` を `Ed25519` だけにする**: 呼び手の JOSE ライブラリと gateway 自身の `auth sign` が `EdDSA` を出す。曲線は JWK の `crv` で固定しているので、`EdDSA` を受けても多義は無い (決定 3)
-- **`jti` の集合を `[stats] dir` で兄弟の unit と共有する**: 読み出しの 1 request に flock 付きの書き込みが 1 回増え、守れるのは tailnet の内側からの 30 秒以内のリプレイだけで、その相手は転送系を直接叩ける (決定 4)
+- **`jti` 必須 + `iat` (reference の webhook の形)**: 使用済み集合という状態が要り、保持と掃除が実装の負担になる。怠惰な実装が集合を省くと、`jti` で防ぐはずだったリプレイが丸ごと素通りになる。状態無しで検証できる短い `exp` なら省かれにくい。本 DR の口は読み出しと落とすだけの pause で、`exp` の数秒〜数十秒の窓のリプレイに実害が無い (決定 3・4)
+- **`jti` の集合が満杯の時に拒否する (reference の webhook の規則)**: 読み出しの口では `exp` が短く、飛ばしても実害が無い。満杯で全拒否すると呼び手が全部読めなくなり、可用性を削る (決定 4)
+- **`jti` の集合を `[stats] dir` で兄弟の unit と共有する**: 読み出しの 1 request に flock 付きの書き込みが 1 回増え、守れるのは tailnet の内側からの `exp` の窓の内側のリプレイだけで、その相手は転送系を直接叩ける (決定 4)
 - **`self` にも署名を求める**: 監督者が問う口で、監督者に鍵を持たせることになる。答えはプロセスの状態で、会話も認証情報も無い (決定 2)
 - **`healthz` / `version` にも署名を求める**: `restart` の待ちと `daemon status` の行が止まる。生きているかと版は秘密ではない (決定 2)
 - **`events` だけ無認証のまま残す**: 全会話の流れを流す口で、sessions より読める範囲が広い。外へ通さないなら tailnet の内側で無認証なのは他の口と同じだが、求める口と求めない口の線は「何を読めるか」で引く (決定 2)
@@ -154,12 +156,12 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 
 - `llm-gateway-server` の決定 2 の口に、`[callers]` が空でない時だけ効く検証の層が入る (`Authorization` の Bearer → 決定 4 の順序)。検証の部品 (compact JWS の parse、ed25519-dalek、JWK の読み込み) は `ns/jwt.rs` から借り、`typ` / `aud` / `jti` の扱いは本 DR の形で別に組む (`JwtAuth` は ns の token 用で `max_ttl` と `sub` を見る)
 - `config::Config` に `callers: BTreeMap<String, Caller>` (`jwks_url` / `jwks_file` / `iss`) が増え、`check` が決定 6 の組み合わせを断る。`daemon reload` で差し替えられる
-- 呼び手ごとの鍵キャッシュ (`jwks_url` → JWKS、最後の成功時刻、最後の再取得時刻) と、unit ごとの `jti` の集合 (`exp` + 30 秒で掃く、上限 65,536) がプロセスのメモリに増える。取得用の reqwest Client が 1 つ増える
+- 呼び手ごとの鍵キャッシュ (`jwks_url` → JWKS、最後の成功時刻、最後の再取得時刻) と、unit ごとの `jti` の集合 (`jti` を付けた token だけ、`exp` + 30 秒で掃く、上限 65,536 で満杯なら検証を飛ばす) がプロセスのメモリに増える。取得用の reqwest Client が 1 つ増える
 - 401 / 400 の応答と `WWW-Authenticate` が運用系の口に初めて現れる。MANUAL の「Operations」の冒頭 (「None of them carry authentication」) を決定 2 / 6 の形に書き換え、`[callers]` の節と、呼び手が token を作る手順 (claims の形、`auth sign` での手動確認) を足す
 - `llm-gateway-cli` の `usage` / `stats` / `upstream status` に `--caller <name>` と署名の経路が増え、署名できる呼び手が無ければ `caller_required` で断る。`auth sign` の扱いは未決
 - Caddy の設定: 外へ通す path に、署名を求める口のうち外の呼び手が読むもの (`/llm-gateway/sessions*`、使うなら `/llm-gateway/keepalive/pause`) が加わる。求めない口 (`healthz` / `version` / `self` / `login*`) と、外の呼び手が読まない口は通さない (決定 2)
-- **ccmsg 側に要るもの** (設計は ccmsg のリポが持つ): 短命の Ed25519 鍵の 3 状態 (次 / 現 / 旧、鍵寿命 1 時間、50% で次を公開、110% で旧を外す) を回し、`/.well-known/jwks.json` を https で出す (reference の S 側。複数インスタンスなら鍵をファイルに置いて同じ束を出す、前提 P4)。gateway への各 request に決定 3 の token を `Authorization: Bearer` で付け、401 / 5xx / 接続失敗は署名し直して送り直す (backoff 付き)、400 は捨てて log。`aud` は request の method と path から組む。時計は OS の時刻同期に任せる (前提 P3)
-- **reference `auth-patterns/webhook-jws-jwks` に「body の無い request への適用」の節を足す** (統括が反映): token を `Authorization: Bearer` で運ぶこと、claims から `event` を落とし `aud` を method + path にすること、query / body を覆わない判断と RFC 9421 への移行条件、`typ` を `request+jwt` のように用途ごとに分けること、SSE では繋ぐ時の 1 request だけ検証すること、`jti` の集合をインスタンスごとに持ってよい条件 (読み出しの口で、リプレイの結果が同じ答えか no-op)。本 DR はその節の最初の適用例
+- **ccmsg 側に要るもの** (設計は ccmsg のリポが持つ): 短命の Ed25519 鍵の 3 状態 (次 / 現 / 旧、鍵寿命 1 時間、50% で次を公開、110% で旧を外す) を回し、`/.well-known/jwks.json` を https で出す (reference の S 側。複数インスタンスなら鍵をファイルに置いて同じ束を出す、前提 P4)。gateway への各 request に決定 3 の token (`exp` は署名時刻 + 10 秒、`iat` は要らない、`jti` は付けてよいが必須でない) を `Authorization: Bearer` で付け、401 / 5xx / 接続失敗は署名し直して送り直す (backoff 付き)、400 は捨てて log。`aud` は request の method と path から組む。時計は OS の時刻同期に任せる (前提 P3)
+- **reference `auth-patterns/webhook-jws-jwks` に「body の無い request への適用」の節を足す** (統括が反映): token を `Authorization: Bearer` で運ぶこと、claims から `event` を落とし `aud` を method + path にすること、query / body を覆わない判断と RFC 9421 への移行条件、`typ` を `request+jwt` のように用途ごとに分けること、SSE では繋ぐ時の 1 request だけ検証すること、リプレイ対策を短い `exp` 主体にし `jti` を任意にすること、`jti` の集合をインスタンスごとに持ってよい条件 (読み出しの口で、リプレイの結果が同じ答えか no-op)。本 DR はその節の最初の適用例
 - DR-0041 (hooks の署名) とは鍵も口も別で、両方を同時に持ってよい。ccmsg の用途では DR-0040 / 0041 を使わない (DR-0042 背景) ので、gateway の設定に ccmsg 宛ての `[[hooks]]` は書かず ccmsg は受け口を持たない。`jwks_url` を書くのは gateway の設定 (`[callers.ccmsg]`) で、ccmsg が書くのは gateway の根 (DR-0042 決定 6) だけ
 - `[webhook]` (`token_file`) は本 DR では触らない。廃止は DR-0040 の提案のまま
 - 版が混在する間: `[callers]` を知らない版の unit は設定を `deny_unknown_fields` で断る。stable と unstable が同じ設定を読むなら、両方が新しい版になるまで `[callers]` を書かない (DR-0041 の既知の端と同じ)
@@ -168,7 +170,7 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 
 - **呼び手の再起動で鍵が全部変わる構成** (ccmsg が鍵をメモリにしか持たない): 再起動後の最初の request が未知 `kid` で、gateway は再取得して通す。再取得の最小 interval (30 秒) の内側に当たった request は 401 で、ccmsg が署名し直して送り直す。hook のたびの 1 request なので失うものは無い
 - **`jwks_url` 側 (ccmsg の https) が落ちている間**: gateway は最後の束を 66 分まで信じ、ccmsg が鍵を回していれば現と事前公開済みの次で検証が続く。66 分を超えると 401 で、ccmsg の https が戻って定期再取得が通るまで読めない。pull の口なので、ccmsg は戻った後の次の hook で読み直せば足りる
-- **gateway の再起動**: `jti` の集合が消え、再起動前 30 秒の token がもう 1 度通りうる (決定 4 で許容)。鍵キャッシュも消え、起動時に取り直す
+- **gateway の再起動**: `jti` の集合が消え、再起動前に通った token が `exp` の窓の内側でもう 1 度通りうる (決定 4 で許容)。鍵キャッシュも消え、起動時に取り直す
 
 ## 未決
 
@@ -177,7 +179,7 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 (起草時に次を決めた:
 
 - `typ` の値は `request+jwt`。reference に足す節で一般の値として提示し、llm-gateway 固有の名前にしない (決定 3 の部品)
-- `exp - iat` の上限は 60 秒、ずれの猶予は双方向 30 秒、`jti` の集合の上限は 65,536 件。全部 reference の標準値か、`(30 + 30) 秒 × 受信レート` を十分上回る固定値で、設定にしない (決定 4 の部品)
+- `exp` は署名時刻 + 10 秒、寿命の上限は `now` + 10 秒 + ずれの猶予 30 秒、`jti` の集合の上限は 65,536 件。全部 reference の標準値か、`(10 + 30 + 30) 秒 × 受信レート` を十分上回る固定値で、設定にしない (決定 3・4 の部品)
 - stale の上限 66 分、未知 `kid` の最小 interval 30 秒、定期 10 分。reference の標準値で固定 (決定 5 の部品)
 - `jwks_file` の相対パスは設定ファイルの置き場から (`keys_file` と同じ) (決定 1 の部品))
 
