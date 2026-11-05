@@ -75,7 +75,7 @@ claims:  {
 - **body は覆わない**。署名を求める口で body を持つのは `POST /llm-gateway/keepalive/pause` (`{"session_id"}`) だけ。書き換えられて起きる最悪は別の会話の keepalive が 1 回落ちることで、次の実リクエストで控えが置き直される (DR-0024 §2)。body まで覆う必要が出た時 (台の挙動を変える口が HTTP に増えた時) は RFC 9421 (HTTP Message Signatures) へ移る (reference の「やらないこと」と同じ判断)
 - `typ` は **`request+jwt`**。DR-0041 の `webhook+jwt` と ns 認証の `JWT` とは別の値で、互いに通らない (RFC 8725 の explicit typing)。比べ方は reference のとおり正規化 (小文字化、`application/` 接頭辞を落とす) してから完全一致
 - `alg` は **`Ed25519` と `EdDSA` の両方を受ける** (固定、設定にしない)。gateway は ed25519-dalek で直接検証し、鍵は取り込みの時に `kty: OKP` / `crv: Ed25519` を確かめる (決定 5) ので、`EdDSA` の曲線の多義は鍵の側で閉じている。呼び手の JOSE ライブラリが fully-specified の `Ed25519` を出せない場合と、gateway 自身の `auth sign` (`alg: EdDSA`) で手動確認する場合 (決定 7) のため。JWK に `alg` があれば header の `alg` との一致を見る (reference 検証 3)
-- **リプレイ対策は短い `exp` を主にする** (reference の「body の無い request への適用」)。`iat` (署名時刻) と `exp` (= `iat` + 10 秒) は必須で、**token の枠はこの 2 つで固まっている**。gateway は評価時点の `now` に何も足し引きせず、`now` < `exp` と `exp` − `iat` ≤ 10 秒だけを見る (決定 4 の 5)。`iat` ≤ `now` は見ない (超高速な request で送り手の時計が数 ms 進んでいるだけで落ちる。`iat` の役目は `exp` との差で寿命を固めることだけ)。時刻のずれの猶予は持たない (request は 10 秒もかからず、時計がずれた呼び手は信頼の対象外で、401 で分かる)。request ごとに署名し直す (queue に積んで使い回さない) ので、再送でも `exp` 切れにならない
+- **リプレイ対策は短い `exp` を主にする** (reference の「body の無い request への適用」)。この用途の token の寿命 (age) は **10 秒**で、呼び手は `exp` = `iat` + 10 秒で作り、gateway は reference の規則で検証する (枠は `iat` / `exp` の 2 つ、`now` に足し引きしない、`iat` ≤ `now` は見ない)。request ごとに署名し直す (queue に積んで使い回さない) ので、再送でも `exp` 切れにならない
 - `jti` は**任意**。付けるなら request ごとに新しくし、gateway は使用済み集合で見る (決定 4 の 7)。無くても断らない。リプレイ防止だけの用で、冪等処理の鍵ではない
 - 本 DR の口は読み出しと、副作用が「keepalive を落とす」だけの `keepalive/pause` で、pause も読み出しと同じ扱いにする: `exp` の窓の内側でリプレイされても、keepalive が 1 回余計に落ちる (既に落ちていれば no-op) だけで、次の実リクエストで控えが置き直される (DR-0024 §2)
 - `events` (SSE) も同じ形。繋ぐ時の 1 request に署名し、繋がった後の stream は再検証しない (token の `exp` が切れても stream は切らない。切るのは繋ぐ時の判定だけ)。ブラウザの `EventSource` は header を付けられないが、ccmsg は events を繋がない (DR-0042 背景) ので困らない。curl は `-H` で付けられる
@@ -88,7 +88,7 @@ claims:  {
 2. header の `alg` が `Ed25519` / `EdDSA`、`typ` が `request+jwt` (正規化して比較)、`kid` がある。`jku` / `jwk` / `x5u` / `x5c` は無視する
 3. claims の `iss` (署名前なのでまだ信じない) で `[callers.<name>]` を引く。無ければ拒否。その呼び手の鍵キャッシュから `kid` を引き、無ければ再取得 (決定 5) して再度引き、それでも無ければ拒否
 4. 署名を検証する
-5. `now` < `exp` (`now` に猶予を足し引きしない) かつ `exp` − `iat` ≤ 10 秒 (`iat` ≤ `now` は見ない) (寿命の上限は token の枠そのもので、`now` に依らず状態無しに見る)
+5. `now` < `exp` かつ `exp` − `iat` ≤ 10 秒 (reference の規則、age は 10 秒)
 6. `aud` が「method + 空白 + path」と完全一致。`iss` が引いた呼び手の `iss` と完全一致 (3 で引いた以上一致するが、検証後に改めて見る)
 7. `jti` があれば使用済み集合で検証し、使用済みなら拒否。無ければ断らない。集合は unit ごとに持ち、`exp` まで保持する (保持の寿命は `exp` の判定と同じ意味なので猶予を足さない。掃除は即時でなくてよく、次の検証のついでか定期でよい)。上限 (65,536 件) に達したら、**その token の `jti` 検証を飛ばす** (拒否しない)。読み出しの口で `exp` が短いので飛ばしても実害が無く、満杯で全拒否する方が可用性を削る
 
@@ -180,7 +180,7 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 (起草時に次を決めた:
 
 - `typ` の値は `request+jwt`。reference に足す節で一般の値として提示し、llm-gateway 固有の名前にしない (決定 3 の部品)
-- token の枠は `iat` と `exp` (= `iat` + 10 秒) で固まっていて、gateway は `now` < `exp` と `exp` − `iat` ≤ 10 秒だけを見て `now` に何も足し引きせず `iat` ≤ `now` も見ない (kawaz 2026-11-05: ずれの猶予を何度も足さない、10 秒で十分ぬるい、数十秒ずれる機器は信頼の対象外)、`jti` の集合の保持は `exp` まで、上限は 65,536 件。`10 秒 × 受信レート` を十分上回る固定値で、設定にしない (決定 3・4 の部品)
+- age は 10 秒 (kawaz 2026-11-05: 10 秒で十分ぬるい。検証の規則は reference に置き、本 DR は値だけ持つ)、`jti` の集合の保持は `exp` まで、上限は 65,536 件。`10 秒 × 受信レート` を十分上回る固定値で、設定にしない (決定 3・4 の部品)
 - stale の上限 66 分、未知 `kid` の最小 interval 30 秒、定期 10 分。reference の標準値で固定 (決定 5 の部品)
 - `jwks_file` の相対パスは設定ファイルの置き場から (`keys_file` と同じ) (決定 1 の部品))
 
