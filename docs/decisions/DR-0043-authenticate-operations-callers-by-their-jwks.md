@@ -115,7 +115,7 @@ claims:  {
 
 `[callers.<name>]` が設定に 1 つでもある unit は、決定 2 の口で `Authorization` の無い request を **401** で断る (無認証の request を通す段階も、通す設定も持たない)。1 つも無い unit は今までどおり認証を持たず、手前の境界を信頼する (DR-0006)。「呼び手を 1 つでも書いた = この unit の運用系の口は呼び手を確かめる」で、設定の有無だけで決まる。
 
-`[callers]` は `daemon reload` で変えられる欄 (DR-0032): 増えた呼び手の鍵を取り、消えた呼び手のキャッシュを捨て、空になれば検証を止める。`check` が断るのは `jwks_url` と `jwks_file` の両方 / どちらも無い、`jwks_url` が https でない (userinfo / fragment を持つ、`http://`)、`jwks_file` が読めない、`iss` の重複、呼び手の名前が `[ns.<name>]` と同じ規則に合わない (英数字と `.` / `_` / `-`)。`jwks_url` へ実際に取りに行くのは `check` ではしない (ネットワークに出ない。起動後の最初の request で分かる)。
+`[callers]` は `daemon reload` で変えられる欄 (DR-0032): 増えた呼び手の鍵を取り、消えた呼び手のキャッシュを捨て、空になれば検証を止める。`check` が断るのは `jwks_url` と `jwks_file` の両方 / どちらも無い、`jwks_url` が https でない (userinfo / fragment を持つ、`http://`)、`jwks_file` が読めない、`iss` の重複、`jwks_url` の重複 (同じ鍵束を 2 つの名前で信頼すると、片方の鍵でもう片方を名乗れる。1 つの呼び手は 1 つの鍵束)、呼び手の名前が `[ns.<name>]` と同じ規則に合わない (英数字と `.` / `_` / `-`)。`jwks_url` へ実際に取りに行くのは `check` ではしない (ネットワークに出ない。起動後の最初の request で分かる)。
 
 ### 7. 運用者の CLI と curl は、`jwks_file` の呼び手として署名する
 
