@@ -455,7 +455,7 @@ pub enum JtiOutcome {
     Recorded,
     /// 使用済み。
     Reused,
-    /// 集合が満杯で、見ずに通した (記録もしない)。
+    /// 初見だが、集合が満杯で記録しなかった。
     Skipped,
 }
 
@@ -463,10 +463,12 @@ pub enum JtiOutcome {
 ///
 /// 記録は `exp` まで保持し、`exp` を過ぎたものは次の記録のついでに掃く (`now` ≥
 /// `exp` の token は検証の段 5 で落ちるので、保持の寿命に猶予を足さない)。
-/// 上限 ([`JTI_CAPACITY`]) に達している間は、来た token の `jti` を見ずに通す。
+/// 上限 ([`JTI_CAPACITY`]) に達している間も使用済みかの照合はし、初見の `jti` を
+/// 記録せずに通す。
 ///
-/// Design rationale: 満杯で拒否せず飛ばすのは DR-0043 決定 4 の判断 (読み出しの口で
-/// `exp` が短く、飛ばしても実害が無い。満杯で全拒否すると呼び手が全部読めなくなる)。
+/// Design rationale: 満杯で拒否せず記録だけ飛ばすのは DR-0043 決定 4 の判断 (読み出しの
+/// 口で `exp` が短く、満杯で全拒否すると呼び手が全部読めなくなる。照合は続けるので、
+/// 集合に残っている `jti` のリプレイは満杯の間も断る)。
 /// 記録は呼び手の名前と `jti` の SHA-256 で持つ。`jti` の長さは呼び手しだいなので、
 /// 上限の件数で使うメモリを `jti` の長さから切り離す。呼び手の名前を混ぜるのは、
 /// ある呼び手の `jti` が別の呼び手の `jti` を使用済みにしないため。
@@ -515,20 +517,21 @@ impl JtiSet {
             .into();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.sweep(now);
+        if state.seen.contains(&id) {
+            return JtiOutcome::Reused;
+        }
         if state.seen.len() >= self.capacity {
             if !state.warned_full {
                 state.warned_full = true;
                 tracing::warn!(
                     capacity = self.capacity,
-                    "the set of used jti is full; accepting tokens without checking jti until entries expire"
+                    "the set of used jti is full; accepting new jti without recording them until entries expire"
                 );
             }
             return JtiOutcome::Skipped;
         }
         state.warned_full = false;
-        if !state.seen.insert(id) {
-            return JtiOutcome::Reused;
-        }
+        state.seen.insert(id);
         state.by_exp.insert((exp, id));
         JtiOutcome::Recorded
     }

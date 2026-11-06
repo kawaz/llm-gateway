@@ -522,9 +522,9 @@ fn a_non_string_jti_is_a_bad_request() {
     }
 }
 
-/// 満杯の間は jti を見ずに通す (拒否しない、記録もしない)。期限を過ぎた記録が掃かれれば、また記録して見る。
+/// 満杯の間も使用済みかは照合し (再利用は 401)、初見の jti は記録せずに通す。期限を過ぎた記録が掃かれれば、また記録する。
 #[test]
-fn a_full_jti_set_skips_the_check() {
+fn a_full_jti_set_still_refuses_reuse_but_does_not_record() {
     let f = Fixture::with_jtis(JtiSet::with_capacity(2));
     let at = |jti: &str, iat: i64| {
         bearer_of(
@@ -535,16 +535,20 @@ fn a_full_jti_set_skips_the_check() {
     };
     assert_eq!(f.verify(&at("one", NOW)), Ok(alpha()));
     assert_eq!(f.verify(&at("two", NOW)), Ok(alpha()));
-    assert_eq!(f.verify(&at("three", NOW)), Ok(alpha()));
+    assert_eq!(
+        f.verify(&at("three", NOW)),
+        Ok(alpha()),
+        "a new jti passes while full"
+    );
     assert_eq!(
         f.verify(&at("three", NOW)),
         Ok(alpha()),
         "not recorded while full"
     );
-    assert_eq!(
+    assert_rejected(
         f.verify(&at("one", NOW)),
-        Ok(alpha()),
-        "not looked up while full"
+        Reason::JtiReused,
+        Status::Unauthorized,
     );
     assert_eq!(f.jtis.len(), 2);
 
@@ -570,6 +574,11 @@ fn jti_records_are_kept_until_exp() {
         JtiOutcome::Recorded
     );
     assert_eq!(set.record("e", "j", NOW + 10, NOW + 9), JtiOutcome::Skipped);
+    assert_eq!(
+        set.record("c", "j", NOW + 10, NOW + 9),
+        JtiOutcome::Reused,
+        "full, still looked up"
+    );
     // exp に達した記録は掃かれ、同じ jti をまた記録できる。
     assert_eq!(
         set.record("c", "j", NOW + 20, NOW + 10),
