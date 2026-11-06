@@ -18,13 +18,7 @@
 
 ## 裁定待ち
 
-### CA-Q5 運用者の CLI / curl が署名する鍵の置き場 (`jwks_file` の是非、DR-0043 決定 1・7)
-
-`jwks_file` と「手動確認の道具」は kawaz の裁定 (`jwks_url` の一覧を持つ) に無く、起草時に AI が導いた派生: `[callers]` を書くと `usage` / `stats` / `events` / `pause` が署名必須になり、運用者自身の CLI (`llm-gateway usage` 等) と curl も「呼び手」になるので署名する鍵が要る、という筋。統括推しは c。
-
-- [ ] a: `jwks_file` を残す (運用者が `auth keygen` で鍵を作り `[callers.operator] jwks_file` で指す。相対パスの基準は設定ファイル)
-- [ ] b: `jwks_file` を捨て、CLI は署名しない (`[callers]` を書いた unit では CLI の `usage` 等が 401 になる)
-- [ ] c: `jwks_file` を捨て、daemon が自分の鍵を持つ (DR-0037 の自動の鍵と同じ仕組みで `request+jwt` 用の鍵を `[stats] dir` で回し、自分を暗黙の呼び手として信頼。CLI と `llm-gateway call <METHOD> <path>` はその秘密鍵で署名。設定は `jwks_url` だけになる) ← 推し
+（現在なし）
 
 ## 確認待ち
 
