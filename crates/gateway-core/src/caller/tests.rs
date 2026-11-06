@@ -169,16 +169,21 @@ fn authorization_must_be_a_bearer_token() {
         format!("Bearer{token}"),
         token.clone(),
     ] {
-        assert_rejected(f.verify(&value), Reason::NotBearer, Status::BadRequest);
+        // Bearer の token が無いのは、認証情報が無いのと同じ (RFC 6750 §3.1)。
+        assert_rejected(f.verify(&value), Reason::NotBearer, Status::Unauthorized);
     }
-    let not_utf8 = verify(
-        Some(b"Bearer \xff\xfe"),
-        AUD,
-        NOW,
-        |_, _| unreachable!(),
-        &f.jtis,
+    let raw = |value: &[u8]| verify(Some(value), AUD, NOW, |_, _| unreachable!(), &f.jtis);
+    assert_rejected(
+        raw(b"Basic \xff\xfe"),
+        Reason::NotBearer,
+        Status::Unauthorized,
     );
-    assert_rejected(not_utf8, Reason::NotBearer, Status::BadRequest);
+    // Bearer の token はあるが UTF-8 でない: token の形の誤り。
+    assert_rejected(
+        raw(b"Bearer \xff\xfe"),
+        Reason::Malformed,
+        Status::BadRequest,
+    );
     // scheme の大文字小文字と、間の空白の数は問わない。
     assert_eq!(f.verify(&format!("bearer {token}")), Ok(alpha()));
     assert_eq!(f.verify(&format!("BEARER   {token}")), Ok(alpha()));
@@ -654,12 +659,14 @@ fn verification_stops_at_the_first_failure() {
     assert!(f.jtis.is_empty());
 }
 
-/// 401 は署名し直せば通りうるもの、400 は直しても通らないもの (DR-0043 決定 4 の表)。
+/// 401 は認証情報が無いか署名し直せば通りうるもの、400 は直しても通らないもの
+/// (DR-0043 決定 4 の表)。Bearer 以外の方式は認証情報が無いのと同じ (RFC 6750 §3.1)。
 #[test]
 fn every_reason_has_the_status_of_the_decision_table() {
     use Reason::*;
     for reason in [
         MissingAuthorization,
+        NotBearer,
         UnknownKid,
         KeysStale,
         BadSignature,
@@ -669,7 +676,6 @@ fn every_reason_has_the_status_of_the_decision_table() {
         assert_eq!(reason.status(), Status::Unauthorized, "{reason}");
     }
     for reason in [
-        NotBearer,
         Malformed,
         AlgNotAccepted,
         TypMismatch,

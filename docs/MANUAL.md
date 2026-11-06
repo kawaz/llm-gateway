@@ -448,10 +448,10 @@ A refused request gets the same JSON error as namespace authentication, with one
 
 | Status | Meaning | What the caller does |
 | --- | --- | --- |
-| 401 | No `Authorization`, an unknown `kid`, a signature that does not verify, an expired token, a reused `jti`, or keys the gateway can no longer trust | Sign again with fresh `iat` / `exp` and resend |
-| 400 | `Authorization` is not `Bearer <token>`, the token cannot be parsed or carries `crit`, `alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` are missing or do not match this request (including `exp − iat` outside 0 to 10), or `jti` is not a string | Resending the same will not pass; fix how the token is made |
+| 401 | No `Authorization` or a scheme other than `Bearer` (`Basic` …), an unknown `kid`, a signature that does not verify, an expired token, a reused `jti`, or keys the gateway can no longer trust | Sign again with fresh `iat` / `exp` and resend |
+| 400 | The Bearer token cannot be parsed or carries `crit`, `alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` are missing or do not match this request (including `exp − iat` outside 0 to 10), or `jti` is not a string | Resending the same will not pass; fix how the token is made |
 
-`WWW-Authenticate` follows RFC 6750: `Bearer` alone when the request carried no `Authorization`, `Bearer error="invalid_token"` on any other 401, and `Bearer error="invalid_request"` on 400.
+`WWW-Authenticate` follows RFC 6750: `Bearer` alone when the request carried no Bearer token (no `Authorization`, or another scheme such as `Basic`), `Bearer error="invalid_token"` on any other 401, and `Bearer error="invalid_request"` on 400.
 
 ```json
 {"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}

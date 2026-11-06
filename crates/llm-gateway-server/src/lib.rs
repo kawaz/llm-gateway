@@ -132,10 +132,10 @@ fn refused_caller(
 ) -> Response {
     use gateway_core::caller::{Reason, Status};
 
-    // `WWW-Authenticate` は RFC 6750 §3 のとおり: 認証情報の無い request には error code を
-    // 付けず、token があって通らなければ 401 は invalid_token、400 は invalid_request。
+    // `WWW-Authenticate` は RFC 6750 §3 のとおり: 認証情報の無い request (Bearer 以外の方式を
+    // 含む、§3.1) には error code を付けず、token があって通らなければ 401 は invalid_token、400 は invalid_request。
     let (status, message, challenge) = match (reason, reason.status()) {
-        (Reason::MissingAuthorization, _) => {
+        (Reason::MissingAuthorization | Reason::NotBearer, _) => {
             (StatusCode::UNAUTHORIZED, CALLER_UNAUTHORIZED, "Bearer")
         }
         (_, Status::Unauthorized) => (
@@ -6195,7 +6195,7 @@ mod callers_tests {
     /// 断り方。status と `WWW-Authenticate` の組 (RFC 6750 §3)。
     #[derive(Debug, Clone, Copy)]
     enum Refusal {
-        /// `Authorization` が無い: 401、error code 無し。
+        /// Bearer の token が無い (`Authorization` が無い、Bearer 以外の方式): 401、error code 無し。
         Unsigned,
         /// token があって署名し直せば通りうる: 401、invalid_token。
         InvalidToken,
@@ -6392,49 +6392,57 @@ mod callers_tests {
         let aud = format!("GET {path}");
         let now = now_unix();
 
+        // 各段の token は `Authorization` の値ごと並べる (Bearer 以外の方式も試すため)。
+        let bearer = |token: String| Some(format!("Bearer {token}"));
         let unauthorized = [
             (Unsigned, None),
+            (Unsigned, Some("Basic dXNlcjpwYXNz".to_owned())),
+            (Unsigned, Some("Bearer".to_owned())),
             (
                 InvalidToken,
-                Some(sign(
+                bearer(sign(
                     &json!({"alg": "EdDSA", "typ": "request+jwt", "kid": "nobody"}),
                     &claims(&aud),
                 )),
             ),
             (
                 InvalidToken,
-                Some(sign_with(SEED + 1, &header(), &claims(&aud))),
+                bearer(sign_with(SEED + 1, &header(), &claims(&aud))),
             ),
             (
                 InvalidToken,
-                Some(sign(
+                bearer(sign(
                     &header(),
                     &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
                 )),
             ),
         ];
         let bad_request = [
-            Some("not-a-jwt".to_owned()),
-            Some(sign(
+            "not-a-jwt".to_owned(),
+            sign(
                 &json!({"alg": "RS256", "typ": "request+jwt", "kid": KID}),
                 &claims(&aud),
-            )),
-            Some(signed("GET /llm-gateway/usage")),
-            Some(sign(
+            ),
+            signed("GET /llm-gateway/usage"),
+            sign(
                 &header(),
                 &json!({"iss": "someone", "aud": aud, "iat": now, "exp": now + 10}),
-            )),
-            Some(sign(
+            ),
+            sign(
                 &header(),
                 &json!({"iss": "ccmsg", "aud": aud, "iat": now, "exp": now + 60}),
-            )),
+            ),
         ]
-        .map(|token| (InvalidRequest, token));
+        .map(|token| (InvalidRequest, bearer(token)));
         for (status, cases) in [(401, &unauthorized[..]), (400, &bad_request[..])] {
             let mut bodies = std::collections::BTreeSet::new();
-            for (refusal, token) in cases {
-                let resp = call(&base, "GET", path, token.as_deref()).await;
-                bodies.insert(refused(resp, *refusal, &format!("{token:?}")).await);
+            for (refusal, authorization) in cases {
+                let mut builder = reqwest::Client::new().get(format!("{base}{path}"));
+                if let Some(authorization) = authorization {
+                    builder = builder.header("authorization", authorization);
+                }
+                let resp = builder.send().await.unwrap();
+                bodies.insert(refused(resp, *refusal, &format!("{authorization:?}")).await);
             }
             assert_eq!(bodies.len(), 1, "every {status} reads the same: {bodies:?}");
             let body = bodies.into_iter().next().unwrap();

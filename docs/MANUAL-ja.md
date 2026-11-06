@@ -450,10 +450,10 @@ curl -sS https://gateway.example/llm-gateway/sessions -H "Authorization: Bearer 
 
 | status | 意味 | 呼び手がすること |
 | --- | --- | --- |
-| 401 | `Authorization` が無い、未知の `kid`、署名が合わない、期限切れ、`jti` の使い回し、gateway が鍵を信じられなくなった | `iat` / `exp` を新しくして署名し直し、送り直す |
-| 400 | `Authorization` が `Bearer <token>` でない、token が読めないか `crit` を持つ、`alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` が無いかこの request と合わない (`exp − iat` が 0〜10 の外を含む)、`jti` が文字列でない | 同じものを送り直しても通らない。token の作り方を直す |
+| 401 | `Authorization` が無いか `Bearer` 以外の方式 (`Basic` 等)、未知の `kid`、署名が合わない、期限切れ、`jti` の使い回し、gateway が鍵を信じられなくなった | `iat` / `exp` を新しくして署名し直し、送り直す |
+| 400 | Bearer の token が読めないか `crit` を持つ、`alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` が無いかこの request と合わない (`exp − iat` が 0〜10 の外を含む)、`jti` が文字列でない | 同じものを送り直しても通らない。token の作り方を直す |
 
-`WWW-Authenticate` は RFC 6750 のとおり: `Authorization` の無い request には `Bearer` だけ、それ以外の 401 には `Bearer error="invalid_token"`、400 には `Bearer error="invalid_request"` を付ける。
+`WWW-Authenticate` は RFC 6750 のとおり: Bearer の token の無い request (`Authorization` が無い、`Basic` 等の別の方式) には `Bearer` だけ、それ以外の 401 には `Bearer error="invalid_token"`、400 には `Bearer error="invalid_request"` を付ける。
 
 ```json
 {"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}

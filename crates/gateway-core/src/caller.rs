@@ -47,9 +47,11 @@ pub enum Status {
 pub enum Reason {
     /// `Authorization` が無い。
     MissingAuthorization,
-    /// `Authorization` が `Bearer <token>` の形でない。
+    /// `Authorization` が Bearer の token を持たない (別の方式、または Bearer の後が空)。
+    /// 認証情報が無いのと同じ扱い (RFC 6750 §3.1)。
     NotBearer,
-    /// token が compact JWS として読めない (3 段、base64url、JSON のオブジェクト)。
+    /// Bearer の後の token が compact JWS として読めない (UTF-8、3 段、base64url、JSON の
+    /// オブジェクト)。
     Malformed,
     /// header の `alg` が `Ed25519` / `EdDSA` でない。
     AlgNotAccepted,
@@ -92,13 +94,13 @@ impl Reason {
     pub fn status(self) -> Status {
         match self {
             Self::MissingAuthorization
+            | Self::NotBearer
             | Self::UnknownKid
             | Self::KeysStale
             | Self::BadSignature
             | Self::Expired
             | Self::JtiReused => Status::Unauthorized,
-            Self::NotBearer
-            | Self::Malformed
+            Self::Malformed
             | Self::AlgNotAccepted
             | Self::TypMismatch
             | Self::MissingKid
@@ -422,14 +424,21 @@ fn text<'v>(object: &'v Value, name: &str) -> Option<&'v str> {
 }
 
 /// `Bearer <token>` から token を取り出す。scheme の大文字小文字は問わない (RFC 9110 §11.1)。
+///
+/// 方式が Bearer でない・token が空なら [`Reason::NotBearer`] (認証情報が無い)、Bearer の
+/// token が UTF-8 でなければ [`Reason::Malformed`] (token の形の誤り)。方式の判定は
+/// バイトで行い、token の中身で分類が変わらないようにする。
 fn bearer(value: &[u8]) -> Result<&str, Reason> {
-    let value = std::str::from_utf8(value).map_err(|_| Reason::NotBearer)?;
-    let (scheme, token) = value.trim().split_once(' ').ok_or(Reason::NotBearer)?;
-    let token = token.trim_start_matches(' ');
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
+    let value = value.trim_ascii();
+    let (scheme, token) = match value.iter().position(|&b| b == b' ') {
+        Some(at) => (&value[..at], &value[at + 1..]),
+        None => (value, &value[value.len()..]),
+    };
+    let token = &token[token.iter().take_while(|&&b| b == b' ').count()..];
+    if !scheme.eq_ignore_ascii_case(b"bearer") || token.is_empty() {
         return Err(Reason::NotBearer);
     }
-    Ok(token)
+    std::str::from_utf8(token).map_err(|_| Reason::Malformed)
 }
 
 /// `typ` を正規化 (小文字化、`application/` 接頭辞を落とす、RFC 7515 §4.1.9) して比べる。
