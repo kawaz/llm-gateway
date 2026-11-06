@@ -130,11 +130,24 @@ fn refused_caller(
     authorization: Option<&[u8]>,
     reason: gateway_core::caller::Reason,
 ) -> Response {
-    use gateway_core::caller::Status;
+    use gateway_core::caller::{Reason, Status};
 
-    let (status, message) = match reason.status() {
-        Status::Unauthorized => (StatusCode::UNAUTHORIZED, CALLER_UNAUTHORIZED),
-        Status::BadRequest => (StatusCode::BAD_REQUEST, CALLER_BAD_REQUEST),
+    // `WWW-Authenticate` は RFC 6750 §3 のとおり: 認証情報の無い request には error code を
+    // 付けず、token があって通らなければ 401 は invalid_token、400 は invalid_request。
+    let (status, message, challenge) = match (reason, reason.status()) {
+        (Reason::MissingAuthorization, _) => {
+            (StatusCode::UNAUTHORIZED, CALLER_UNAUTHORIZED, "Bearer")
+        }
+        (_, Status::Unauthorized) => (
+            StatusCode::UNAUTHORIZED,
+            CALLER_UNAUTHORIZED,
+            "Bearer error=\"invalid_token\"",
+        ),
+        (_, Status::BadRequest) => (
+            StatusCode::BAD_REQUEST,
+            CALLER_BAD_REQUEST,
+            "Bearer error=\"invalid_request\"",
+        ),
     };
     // 名乗りは署名を確かめる前の値なので、制御文字を逃がす `?` で出す。
     let iss = authorization.and_then(claimed_iss);
@@ -147,12 +160,10 @@ fn refused_caller(
         "refused an operations caller"
     );
     let mut response = error_body(status, "authentication_error", message);
-    if status == StatusCode::UNAUTHORIZED {
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            header::HeaderValue::from_static("Bearer error=\"invalid_token\""),
-        );
-    }
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static(challenge),
+    );
     response
 }
 
@@ -6181,23 +6192,49 @@ mod callers_tests {
         builder.send().await.unwrap()
     }
 
-    /// 断った応答の形を確かめ、本文を返す。401 だけが `WWW-Authenticate` を持つ。
-    async fn refused(resp: reqwest::Response, status: u16, what: &str) -> String {
-        assert_eq!(resp.status(), status, "{what}");
-        let challenge = resp
+    /// 断り方。status と `WWW-Authenticate` の組 (RFC 6750 §3)。
+    #[derive(Debug, Clone, Copy)]
+    enum Refusal {
+        /// `Authorization` が無い: 401、error code 無し。
+        Unsigned,
+        /// token があって署名し直せば通りうる: 401、invalid_token。
+        InvalidToken,
+        /// token があって直さないと通らない: 400、invalid_request。
+        InvalidRequest,
+    }
+
+    impl Refusal {
+        fn status(self) -> u16 {
+            match self {
+                Self::Unsigned | Self::InvalidToken => 401,
+                Self::InvalidRequest => 400,
+            }
+        }
+
+        fn challenge(self) -> &'static str {
+            match self {
+                Self::Unsigned => "Bearer",
+                Self::InvalidToken => "Bearer error=\"invalid_token\"",
+                Self::InvalidRequest => "Bearer error=\"invalid_request\"",
+            }
+        }
+    }
+
+    use Refusal::{InvalidRequest, InvalidToken, Unsigned};
+
+    /// 断った応答の形 (status、`WWW-Authenticate`、本文) を確かめ、本文を返す。
+    async fn refused(resp: reqwest::Response, refusal: Refusal, what: &str) -> String {
+        assert_eq!(resp.status(), refusal.status(), "{what}");
+        let challenge: Vec<_> = resp
             .headers()
-            .get("www-authenticate")
-            .map(|v| v.to_str().unwrap().to_owned());
-        let message = if status == 401 {
-            assert_eq!(
-                challenge.as_deref(),
-                Some("Bearer error=\"invalid_token\""),
-                "{what}"
-            );
-            CALLER_UNAUTHORIZED
-        } else {
-            assert_eq!(challenge, None, "{what}");
-            CALLER_BAD_REQUEST
+            .get_all("www-authenticate")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(challenge, [refusal.challenge()], "{what}");
+        let message = match refusal {
+            Unsigned | InvalidToken => CALLER_UNAUTHORIZED,
+            InvalidRequest => CALLER_BAD_REQUEST,
         };
         let text = resp.text().await.unwrap();
         let body: Value = serde_json::from_str(&text).unwrap();
@@ -6222,14 +6259,14 @@ mod callers_tests {
             let what = |case: &str| format!("{case}: {method} {path}");
 
             let unsigned = call(&base, method, path, None).await;
-            refused(unsigned, 401, &what("unsigned")).await;
+            refused(unsigned, Unsigned, &what("unsigned")).await;
 
             let good = call(&base, method, path, Some(&signed(&aud))).await;
             assert_eq!(good.status(), 200, "{}", what("signed"));
 
             let other_path = signed(&format!("{method} /llm-gateway/self"));
             let resp = call(&base, method, path, Some(&other_path)).await;
-            refused(resp, 400, &what("aud of another path")).await;
+            refused(resp, InvalidRequest, &what("aud of another path")).await;
 
             let now = now_unix();
             let expired = sign(
@@ -6237,14 +6274,14 @@ mod callers_tests {
                 &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
             );
             let resp = call(&base, method, path, Some(&expired)).await;
-            refused(resp, 401, &what("expired")).await;
+            refused(resp, InvalidToken, &what("expired")).await;
 
             let jwt_typ = sign(
                 &json!({"alg": "EdDSA", "typ": "JWT", "kid": KID}),
                 &claims(&aud),
             );
             let resp = call(&base, method, path, Some(&jwt_typ)).await;
-            refused(resp, 400, &what("typ JWT")).await;
+            refused(resp, InvalidRequest, &what("typ JWT")).await;
 
             let mut once = claims(&aud);
             once["jti"] = json!(format!("jti-{n}"));
@@ -6252,7 +6289,7 @@ mod callers_tests {
             let first = call(&base, method, path, Some(&once)).await;
             assert_eq!(first.status(), 200, "{}", what("first jti"));
             let again = call(&base, method, path, Some(&once)).await;
-            refused(again, 401, &what("reused jti")).await;
+            refused(again, InvalidToken, &what("reused jti")).await;
         }
     }
 
@@ -6327,7 +6364,7 @@ mod callers_tests {
 
         let decoded = signed("GET /llm-gateway/sessions/s 1");
         let resp = call(&base, "GET", encoded, Some(&decoded)).await;
-        refused(resp, 400, "a decoded path in aud").await;
+        refused(resp, InvalidRequest, "a decoded path in aud").await;
 
         let with_query = signed("GET /llm-gateway/sessions?ns=default");
         let resp = call(
@@ -6337,11 +6374,11 @@ mod callers_tests {
             Some(&with_query),
         )
         .await;
-        refused(resp, 400, "the query in aud").await;
+        refused(resp, InvalidRequest, "the query in aud").await;
 
         let other_method = signed("POST /llm-gateway/sessions");
         let resp = call(&base, "GET", "/llm-gateway/sessions", Some(&other_method)).await;
-        refused(resp, 400, "another method in aud").await;
+        refused(resp, InvalidRequest, "another method in aud").await;
     }
 
     /// どの段で落ちても、応答は 401 / 400 ごとに同じ本文で、段の語を出さない。
@@ -6356,16 +6393,25 @@ mod callers_tests {
         let now = now_unix();
 
         let unauthorized = [
-            None,
-            Some(sign(
-                &json!({"alg": "EdDSA", "typ": "request+jwt", "kid": "nobody"}),
-                &claims(&aud),
-            )),
-            Some(sign_with(SEED + 1, &header(), &claims(&aud))),
-            Some(sign(
-                &header(),
-                &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
-            )),
+            (Unsigned, None),
+            (
+                InvalidToken,
+                Some(sign(
+                    &json!({"alg": "EdDSA", "typ": "request+jwt", "kid": "nobody"}),
+                    &claims(&aud),
+                )),
+            ),
+            (
+                InvalidToken,
+                Some(sign_with(SEED + 1, &header(), &claims(&aud))),
+            ),
+            (
+                InvalidToken,
+                Some(sign(
+                    &header(),
+                    &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
+                )),
+            ),
         ];
         let bad_request = [
             Some("not-a-jwt".to_owned()),
@@ -6382,12 +6428,13 @@ mod callers_tests {
                 &header(),
                 &json!({"iss": "ccmsg", "aud": aud, "iat": now, "exp": now + 60}),
             )),
-        ];
-        for (status, tokens) in [(401, &unauthorized[..]), (400, &bad_request[..])] {
+        ]
+        .map(|token| (InvalidRequest, token));
+        for (status, cases) in [(401, &unauthorized[..]), (400, &bad_request[..])] {
             let mut bodies = std::collections::BTreeSet::new();
-            for token in tokens {
+            for (refusal, token) in cases {
                 let resp = call(&base, "GET", path, token.as_deref()).await;
-                bodies.insert(refused(resp, status, &format!("{token:?}")).await);
+                bodies.insert(refused(resp, *refusal, &format!("{token:?}")).await);
             }
             assert_eq!(bodies.len(), 1, "every {status} reads the same: {bodies:?}");
             let body = bodies.into_iter().next().unwrap();
@@ -6429,7 +6476,12 @@ mod callers_tests {
         let (base, gateway) = serve_callers(dir.path(), true).await;
         let path = "/llm-gateway/events";
 
-        refused(call(&base, "GET", path, None).await, 401, "unsigned events").await;
+        refused(
+            call(&base, "GET", path, None).await,
+            Unsigned,
+            "unsigned events",
+        )
+        .await;
 
         // 窓の残りを 1 秒にして、繋いだ後に `exp` を過ぎさせる。
         let now = now_unix();
@@ -6453,7 +6505,7 @@ mod callers_tests {
         }
         refused(
             call(&base, "GET", path, Some(&token)).await,
-            401,
+            InvalidToken,
             "the same token after exp",
         )
         .await;
