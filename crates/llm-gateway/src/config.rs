@@ -1123,6 +1123,7 @@ fn destination_url(base: &str) -> std::result::Result<url::Url, String> {
 #[serde(deny_unknown_fields)]
 pub struct Caller {
     /// 呼び手の公開鍵の置き場 (JWKS)。https だけで、userinfo と fragment を持たない。
+    #[serde(deserialize_with = "url_without_echo")]
     pub jwks_url: url::Url,
 
     /// token の `iss` と完全一致で比べる名前。省略時は表の名前 ([`Caller::iss`])。
@@ -1600,6 +1601,21 @@ impl StatusSourceSpec {
             Self::Link { page_url, .. } => vec![page_url],
         }
     }
+}
+
+/// URL を読む。読めない時の文に URL を出さない (userinfo に秘密を含みうる)。
+///
+/// Design rationale: `url::Url` の `Deserialize` は失敗の文に入力の URL をそのまま
+/// 載せ、`check` の出力や起動時のログに残る。文字列で受けて自分で読む。
+fn url_without_echo<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<url::Url, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    url::Url::parse(&text).map_err(|e| {
+        serde::de::Error::custom(format!(
+            "is not a valid URL ({e}); the value is not shown because it may hold credentials"
+        ))
+    })
 }
 
 mod human_duration {
@@ -3854,6 +3870,22 @@ jwks_url = "https://b.example/jwks.json"
         let err =
             parse("[callers.a]\njwks_url = \"https://a.example/j\"\niss = \"\"\n").unwrap_err();
         assert!(err.to_string().contains("iss is empty"), "{err}");
+    }
+
+    /// 読めない `jwks_url` を断る文に、URL (userinfo の秘密を含みうる) を出さない。
+    #[test]
+    fn an_invalid_caller_jwks_url_is_refused_without_echoing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unit.toml");
+        for url in [
+            "https://user:secret@%zz/jwks.json",
+            "secret-relative/jwks.json",
+        ] {
+            std::fs::write(&path, format!("[callers.a]\njwks_url = {url:?}\n")).unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(err.contains("not a valid URL"), "{err}");
+            assert!(!err.contains("secret"), "{err}");
+        }
     }
 
     /// 1 つの鍵束は 1 つの呼び手だけが指す (DR-0043 決定 6)。URL は正規化してから比べる。
