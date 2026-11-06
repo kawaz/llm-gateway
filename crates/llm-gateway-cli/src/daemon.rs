@@ -60,6 +60,12 @@ fn add(registry: &Registry, args: &[String]) -> Result<ExitCode, Failure> {
         Some(name) => name,
         None => registry::name_from_config(&config)?,
     };
+    // 運用系の口の既定の path は unit の名前で決まるので、名前が決まったここで見る。
+    // 登録してから bind に失敗すると、TCP は動くのに CLI だけが台に届かない。
+    loaded
+        .server
+        .check_unix_for(&name)
+        .map_err(|e| Failure::from(e.to_string()))?;
     // 設定に書いてあればそれ、無ければ「今の自分」を焼く。ただし今の自分が
     // `target/debug` のような消えるパスなら、同じ binary を指す PATH 上の
     // 安定な場所を選ぶ (焼いたパスが消えると、監督者は上げ直せない)。
@@ -254,6 +260,23 @@ mod tests {
         assert_eq!(unit.binary_path, std::env::current_exe().unwrap());
         assert!(unit.enabled, "a freshly added unit is wanted");
         assert!(!unit.added_at.is_empty());
+    }
+
+    /// 運用系の口の既定の path が socket の path の上限を超える名前は、登録の前に断る。
+    #[test]
+    fn add_refuses_a_name_whose_default_socket_path_is_too_long() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = Registry::at(dir.path().join("units"));
+        let config = config_file(dir.path(), "c", "127.0.0.1:11301");
+        let name = "n".repeat(110);
+
+        let e = add(
+            &registry,
+            &args(&[config.to_str().unwrap(), "--name", &name]),
+        )
+        .unwrap_err();
+        assert!(e.message().contains("[server] unix"), "{e:?}");
+        assert!(registry.list().unwrap().is_empty(), "nothing is registered");
     }
 
     /// 設定に実行ファイルが書いてあれば、そちらを焼き込む

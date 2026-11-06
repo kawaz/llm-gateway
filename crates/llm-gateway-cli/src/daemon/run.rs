@@ -107,7 +107,12 @@ remove disabled from [server], or register another configuration",
         // 残った子が居れば TCP の bind で先に止まり、その子の socket に触らない。開けなくても
         // 台は動かす — 中継を止める理由にはならず、CLI は繋げない旨を言う。
         let operations_path = config.server.unix_path(unit);
-        let operations = match llm_gateway_server::socket::OperationsSocket::bind(&operations_path) {
+        let operations = match config
+            .server
+            .check_unix_for(unit)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|()| llm_gateway_server::socket::OperationsSocket::bind(&operations_path))
+        {
             Ok(socket) => Some(socket),
             Err(e) => {
                 tracing::error!(

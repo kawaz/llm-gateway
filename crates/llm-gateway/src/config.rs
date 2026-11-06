@@ -987,8 +987,9 @@ fn default_watch_secs() -> u64 {
 pub struct Server {
     /// 待ち受け先。
     ///
-    /// **この設定が指す面の住所**でもある。CLI (`usage` / `stats`) は、
-    /// ここへ問い合わせる。
+    /// 転送の口と、Caddy 越しに外の呼び手が読む運用系の口。運用者の CLI (`usage` /
+    /// `stats` / `upstream status`) はここでなく [`Server::unix_path`] を読む
+    /// (DR-0043 決定 7)。
     #[serde(default = "default_listen")]
     pub listen: String,
 
@@ -1000,7 +1001,7 @@ pub struct Server {
     /// `serve` を始めると、既に動いている面と待ち受け先を取り合う。
     ///
     /// **`listen` の意味は変わらない** — 「どこで待つか」ではなく「どこに
-    /// いるか」を書いた欄として、問い合わせ先の組み立てには使い続ける。
+    /// いるか」を書いた欄として、`daemon status` の port の行などに使い続ける。
     #[serde(default)]
     pub disabled: bool,
 
@@ -1055,27 +1056,46 @@ impl Server {
         })
     }
 
-    /// `unix` を bind できる形か。相対パスは台と CLI で cwd が違うので同じ場所を
-    /// 指さず、`sun_path` に収まらない長さは bind も connect もできない。
+    /// 書かれた `unix` を確かめる (設定を読む時)。既定の path は unit の名前で決まるので
+    /// ここでは見ず、名前が分かる所 (`daemon add` / `daemon run`) が
+    /// [`Server::check_unix_for`] で見る。
     fn check_unix(&self) -> Result<()> {
-        let Some(path) = &self.unix else {
-            return Ok(());
-        };
-        if !path.is_absolute() {
-            return Err(Error::Config(format!(
-                "[server] unix must be an absolute path, not `{}`; the unit and the CLI run in different directories",
-                path.display()
-            )));
+        match &self.unix {
+            Some(path) => check_socket_path(path, "[server] unix").map_err(Error::Config),
+            None => Ok(()),
         }
-        let len = path.as_os_str().len();
-        if len > MAX_UNIX_PATH {
-            return Err(Error::Config(format!(
-                "[server] unix is {len} bytes long, but a socket path can be at most {MAX_UNIX_PATH} on this system: {}",
-                path.display()
-            )));
-        }
-        Ok(())
     }
+
+    /// unit `unit` が開く socket ([`Server::unix_path`]) が bind できる形か。書かれた
+    /// `unix` も既定の path も同じ規則で見る。既定が長すぎる (`XDG_STATE_HOME` や unit
+    /// の名前が長い) なら、短い path を `[server] unix` に書く案内を添える。
+    pub fn check_unix_for(&self, unit: &str) -> Result<()> {
+        if self.unix.is_some() {
+            return self.check_unix();
+        }
+        let path = self.unix_path(unit);
+        check_socket_path(&path, &format!("the default operations socket of `{unit}`"))
+            .map_err(|e| Error::Config(format!("{e}; write a shorter path as [server] unix")))
+    }
+}
+
+/// socket の path が bind できる形か。相対パスは台と CLI で cwd が違うので同じ場所を
+/// 指さず、`sun_path` に収まらない長さは bind も connect もできない。
+fn check_socket_path(path: &Path, what: &str) -> std::result::Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "{what} must be an absolute path, not `{}`; the unit and the CLI run in different directories",
+            path.display()
+        ));
+    }
+    let len = path.as_os_str().len();
+    if len > MAX_UNIX_PATH {
+        return Err(format!(
+            "{what} is {len} bytes long, but a socket path can be at most {MAX_UNIX_PATH} on this system: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Unix socket のパスの上限 (バイト)。`sockaddr_un.sun_path` から終端の NUL を除いた分
@@ -3715,6 +3735,25 @@ routes = ["a", "typo-here"]
         let said = e.to_string();
         assert!(said.contains("[server] unix"), "{said}");
         assert!(said.contains(&format!("at most {MAX_UNIX_PATH}")), "{said}");
+    }
+
+    /// 既定の path も、unit の名前が分かる所で同じ規則で見る。長すぎれば `[server] unix`
+    /// に短い path を書く案内を添える。書いた `unix` があればそちらを見る。
+    #[test]
+    fn the_default_operations_socket_is_checked_with_the_unit_name() {
+        let c = parse("").unwrap();
+        c.server.check_unix_for("stable").unwrap();
+
+        let long_unit = "u".repeat(MAX_UNIX_PATH);
+        let said = c.server.check_unix_for(&long_unit).unwrap_err().to_string();
+        assert!(said.contains("default operations socket"), "{said}");
+        assert!(
+            said.contains("write a shorter path as [server] unix"),
+            "{said}"
+        );
+
+        let written = parse("[server]\nunix = \"/run/gw.sock\"\n").unwrap();
+        written.server.check_unix_for(&long_unit).unwrap();
     }
 
     /// `unix` は起動時に bind するので、読み直しでは変えられない。

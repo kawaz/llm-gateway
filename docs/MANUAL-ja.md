@@ -479,9 +479,10 @@ unix = "~/.local/state/llm-gateway/daemon/http/unstable.sock"   # 省略可。�
 ```
 
 - 既定では台ごとに `$XDG_STATE_HOME/llm-gateway/daemon/http/<unit>.sock` を開く (制御口の隣で、台の名前が付く)。同じ土台の設定から 2 台を走らせても 1 つの socket を取り合わない
-- socket ファイルは 0600 で、繋いできたプロセスが台と同じユーザで動いている時だけ受ける (macOS は `getpeereid`、Linux は `SO_PEERCRED`)。それ以外は HTTP を話す前に切る。親ディレクトリが無ければ 0700 で作り、既にあるディレクトリの権限は変えない
+- socket ファイルは 0600 で、繋いできたプロセスが台と同じユーザで動いている時だけ受ける (macOS は `getpeereid`、Linux は `SO_PEERCRED`)。それ以外は HTTP を話す前に切る。親ディレクトリが無ければ 0700 で作り、既にあるディレクトリの権限は変えないが、台のユーザのもので group / other が書き込めない (sticky でも不可) ディレクトリでなければ socket を開かない — 他のユーザが socket を偽物に差し替え、CLI がそれを信じてしまうため
+- socket を開いている間、台は隣の `<path>.lock` を握る (台が止まってもファイルは残す)。同じ path を指した 2 台目は lock を取れず、socket を開かない
 - 起動時、落ちた台が残した socket は片付ける。誰かがまだ待っている socket と、socket でないファイルは消さずに socket を開かない (台は理由をログに残し、TCP の口は動かし続ける)。台が止まると socket ファイルは消える
-- `llm-gateway check` が断るのは、`unix` が絶対パスでない (台と CLI は別のディレクトリで動く) か、socket の path に収まらない長さ (macOS は 103 バイト、Linux は 107 バイトまで) の時
+- `llm-gateway check` が断るのは、`unix` が絶対パスでない (台と CLI は別のディレクトリで動く) か、socket の path に収まらない長さ (macOS は 103 バイト、Linux は 107 バイトまで) の時。既定の path は台の名前で決まるので、`daemon add` が同じ規則で見て、長くなりすぎる名前 (や `$XDG_STATE_HOME`) を断る。その時は短い path を `unix` に書く
 - `unix` は台の起動時に読む。変えたら `daemon restart`
 - **socket をリバースプロキシで外へ出さない。** 外の呼び手は TCP の口を読み、そちらは `[callers]` を書けば署名を求める
 
