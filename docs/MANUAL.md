@@ -431,7 +431,7 @@ claims:  {"iss": "ccmsg", "aud": "GET /llm-gateway/sessions/0f3c6d1a-…", "iat"
 | `kid` | The `kid` of the signing key in the caller's JWKS |
 | `typ` | `request+jwt` (compared case-insensitively; `application/request+jwt` also matches). Namespace tokens (`JWT`) do not pass here |
 | `iss` | The caller's `iss` (`[callers.<name>] iss`, or the table name) |
-| `aud` | The method, one space, and the path **exactly as it is on the request line**: still percent-encoded, without scheme, host or query. `GET /llm-gateway/sessions?ns=personal` signs `GET /llm-gateway/sessions`; a session id `a b` sent as `/llm-gateway/sessions/a%20b` signs `GET /llm-gateway/sessions/a%20b` |
+| `aud` | The method as sent (`HEAD` for a HEAD request), one space, and the path **exactly as it is on the request line**: still percent-encoded, without scheme, host or query. `GET /llm-gateway/sessions?ns=personal` signs `GET /llm-gateway/sessions`; a session id `a b` sent as `/llm-gateway/sessions/a%20b` signs `GET /llm-gateway/sessions/a%20b` |
 | `iat` | When it was signed (Unix seconds) |
 | `exp` | `iat` + 10 |
 | `jti` | Optional. When present, a string fresh for every request: a `jti` seen again before its `exp` is refused |
@@ -451,7 +451,7 @@ A refused request gets the same JSON error as namespace authentication, with one
 | 401 | No `Authorization` or a scheme other than `Bearer` (`Basic` …), an unknown `kid`, a signature that does not verify, an expired token, a reused `jti`, or keys the gateway can no longer trust | Sign again with fresh `iat` / `exp` and resend |
 | 400 | The Bearer token cannot be parsed or carries `crit`, `alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` are missing or do not match this request (including `exp − iat` outside 0 to 10), or `jti` is not a string | Resending the same will not pass; fix how the token is made |
 
-`WWW-Authenticate` follows RFC 6750: `Bearer` alone when the request carried no Bearer token (no `Authorization`, or another scheme such as `Basic`), `Bearer error="invalid_token"` on any other 401, and `Bearer error="invalid_request"` on 400.
+`WWW-Authenticate` follows RFC 6750: `Bearer realm="llm-gateway"` when the request carried no Bearer token (no `Authorization`, or another scheme such as `Basic`), `Bearer realm="llm-gateway", error="invalid_token"` on any other 401, and `Bearer realm="llm-gateway", error="invalid_request"` on 400.
 
 ```json
 {"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}

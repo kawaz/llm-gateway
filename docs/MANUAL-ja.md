@@ -433,7 +433,7 @@ claims:  {"iss": "ccmsg", "aud": "GET /llm-gateway/sessions/0f3c6d1a-…", "iat"
 | `kid` | 呼び手の JWKS にある、署名した鍵の `kid` |
 | `typ` | `request+jwt` (大文字小文字は問わず、`application/request+jwt` も合う)。namespace の token (`JWT`) はここを通らない |
 | `iss` | 呼び手の `iss` (`[callers.<name>] iss`、無ければ表の名前) |
-| `aud` | method、空白 1 つ、**request line に載る path そのもの**: percent-encode されたまま、scheme・host・query を含めない。`GET /llm-gateway/sessions?ns=personal` なら `GET /llm-gateway/sessions`、会話の id `a b` を `/llm-gateway/sessions/a%20b` で送るなら `GET /llm-gateway/sessions/a%20b` |
+| `aud` | 送る method (HEAD の request なら `HEAD`)、空白 1 つ、**request line に載る path そのもの**: percent-encode されたまま、scheme・host・query を含めない。`GET /llm-gateway/sessions?ns=personal` なら `GET /llm-gateway/sessions`、会話の id `a b` を `/llm-gateway/sessions/a%20b` で送るなら `GET /llm-gateway/sessions/a%20b` |
 | `iat` | 署名した時刻 (Unix 秒) |
 | `exp` | `iat` + 10 |
 | `jti` | 任意。付けるなら request ごとに新しい文字列。`exp` までに同じ `jti` が来たら断る |
@@ -453,7 +453,7 @@ curl -sS https://gateway.example/llm-gateway/sessions -H "Authorization: Bearer 
 | 401 | `Authorization` が無いか `Bearer` 以外の方式 (`Basic` 等)、未知の `kid`、署名が合わない、期限切れ、`jti` の使い回し、gateway が鍵を信じられなくなった | `iat` / `exp` を新しくして署名し直し、送り直す |
 | 400 | Bearer の token が読めないか `crit` を持つ、`alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` が無いかこの request と合わない (`exp − iat` が 0〜10 の外を含む)、`jti` が文字列でない | 同じものを送り直しても通らない。token の作り方を直す |
 
-`WWW-Authenticate` は RFC 6750 のとおり: Bearer の token の無い request (`Authorization` が無い、`Basic` 等の別の方式) には `Bearer` だけ、それ以外の 401 には `Bearer error="invalid_token"`、400 には `Bearer error="invalid_request"` を付ける。
+`WWW-Authenticate` は RFC 6750 のとおり: Bearer の token の無い request (`Authorization` が無い、`Basic` 等の別の方式) には `Bearer realm="llm-gateway"`、それ以外の 401 には `Bearer realm="llm-gateway", error="invalid_token"`、400 には `Bearer realm="llm-gateway", error="invalid_request"` を付ける。
 
 ```json
 {"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}

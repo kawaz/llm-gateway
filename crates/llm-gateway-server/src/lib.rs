@@ -95,6 +95,14 @@ const CALLER_UNAUTHORIZED: &str = "caller authentication failed; sign the reques
 const CALLER_BAD_REQUEST: &str =
     "the caller token is malformed or does not match this request; fix how the token is made";
 
+/// `WWW-Authenticate` の値 (RFC 6750 §3)。scheme の後に auth-param が 1 つ以上要るので、
+/// どれにも `realm` を付ける。Bearer の token が無い request (`Authorization` が無い、別の
+/// 方式) には error code を付けず (§3.1)、token があって通らなければ 401 は invalid_token、
+/// 400 は invalid_request。
+const CHALLENGE_NO_TOKEN: &str = "Bearer realm=\"llm-gateway\"";
+const CHALLENGE_INVALID_TOKEN: &str = "Bearer realm=\"llm-gateway\", error=\"invalid_token\"";
+const CHALLENGE_INVALID_REQUEST: &str = "Bearer realm=\"llm-gateway\", error=\"invalid_request\"";
+
 /// 呼び手の token を確かめ、通らなければ断る (DR-0043 決定 3・4・6)。
 ///
 /// `aud` と比べるのは request line の path そのもの (percent-encode されたまま、query を
@@ -132,21 +140,21 @@ fn refused_caller(
 ) -> Response {
     use gateway_core::caller::{Reason, Status};
 
-    // `WWW-Authenticate` は RFC 6750 §3 のとおり: 認証情報の無い request (Bearer 以外の方式を
-    // 含む、§3.1) には error code を付けず、token があって通らなければ 401 は invalid_token、400 は invalid_request。
     let (status, message, challenge) = match (reason, reason.status()) {
-        (Reason::MissingAuthorization | Reason::NotBearer, _) => {
-            (StatusCode::UNAUTHORIZED, CALLER_UNAUTHORIZED, "Bearer")
-        }
+        (Reason::MissingAuthorization | Reason::NotBearer, _) => (
+            StatusCode::UNAUTHORIZED,
+            CALLER_UNAUTHORIZED,
+            CHALLENGE_NO_TOKEN,
+        ),
         (_, Status::Unauthorized) => (
             StatusCode::UNAUTHORIZED,
             CALLER_UNAUTHORIZED,
-            "Bearer error=\"invalid_token\"",
+            CHALLENGE_INVALID_TOKEN,
         ),
         (_, Status::BadRequest) => (
             StatusCode::BAD_REQUEST,
             CALLER_BAD_REQUEST,
-            "Bearer error=\"invalid_request\"",
+            CHALLENGE_INVALID_REQUEST,
         ),
     };
     // 名乗りは署名を確かめる前の値なので、制御文字を逃がす `?` で出す。
@@ -6213,9 +6221,9 @@ mod callers_tests {
 
         fn challenge(self) -> &'static str {
             match self {
-                Self::Unsigned => "Bearer",
-                Self::InvalidToken => "Bearer error=\"invalid_token\"",
-                Self::InvalidRequest => "Bearer error=\"invalid_request\"",
+                Self::Unsigned => "Bearer realm=\"llm-gateway\"",
+                Self::InvalidToken => "Bearer realm=\"llm-gateway\", error=\"invalid_token\"",
+                Self::InvalidRequest => "Bearer realm=\"llm-gateway\", error=\"invalid_request\"",
             }
         }
     }
@@ -6308,6 +6316,36 @@ mod callers_tests {
             let resp = call(&base, "GET", path, None).await;
             assert_eq!(resp.status(), 200, "{path}");
         }
+
+        // login の残りの口も層に掛からず、handler が答える (設定に無い名前は 404、
+        // 始めていない login の貼り付けは 400 の HTML)。
+        let client = reqwest::Client::new();
+        let start = client
+            .get(format!("{base}/llm-gateway/login/nobody/start"))
+            .send()
+            .await
+            .unwrap();
+        let finish = client
+            .post(format!("{base}/llm-gateway/login/nobody"))
+            .form(&[("code", "code#state")])
+            .send()
+            .await
+            .unwrap();
+        for (resp, status, what) in [(start, 404, "login start"), (finish, 400, "login finish")] {
+            assert_eq!(resp.status(), status, "{what}");
+            assert!(
+                resp.headers().get("www-authenticate").is_none(),
+                "{what}: {:?}",
+                resp.headers()
+            );
+            assert!(
+                resp.headers()["content-type"]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html"),
+                "{what} is answered by the login handler"
+            );
+        }
     }
 
     /// `[callers]` の無い unit は確かめない。`Authorization` が無くても、読めない
@@ -6379,6 +6417,28 @@ mod callers_tests {
         let other_method = signed("POST /llm-gateway/sessions");
         let resp = call(&base, "GET", "/llm-gateway/sessions", Some(&other_method)).await;
         refused(resp, InvalidRequest, "another method in aud").await;
+
+        // HEAD は `get` の口が受け、`aud` の method も `HEAD`。
+        let head = call(
+            &base,
+            "HEAD",
+            "/llm-gateway/usage",
+            Some(&signed("HEAD /llm-gateway/usage")),
+        )
+        .await;
+        assert_eq!(head.status(), 200, "HEAD signed as HEAD");
+        let head = call(
+            &base,
+            "HEAD",
+            "/llm-gateway/usage",
+            Some(&signed("GET /llm-gateway/usage")),
+        )
+        .await;
+        assert_eq!(head.status(), 400, "HEAD signed as GET");
+        assert_eq!(
+            head.headers()["www-authenticate"],
+            "Bearer realm=\"llm-gateway\", error=\"invalid_request\""
+        );
     }
 
     /// どの段で落ちても、応答は 401 / 400 ごとに同じ本文で、段の語を出さない。
@@ -6491,15 +6551,21 @@ mod callers_tests {
         )
         .await;
 
-        // 窓の残りを 1 秒にして、繋いだ後に `exp` を過ぎさせる。
+        // 繋ぐ時は秒の境界をまたいでも窓の内側に残る (3 秒) ようにし、繋いだ後に `exp` を
+        // 過ぎさせる。
         let now = now_unix();
-        let exp = now + 1;
+        let exp = now + 3;
         let token = sign(
             &header(),
             &json!({"iss": "ccmsg", "aud": format!("GET {path}"), "iat": exp - 10, "exp": exp}),
         );
         let mut watching = call(&base, "GET", path, Some(&token)).await;
         assert_eq!(watching.status(), 200);
+        assert_eq!(
+            watching.headers()["access-control-allow-origin"],
+            "*",
+            "the layer keeps the stream's own headers"
+        );
         let events = Arc::clone(gateway.events());
         while events.watchers() == 0 {
             tokio::task::yield_now().await;
@@ -6507,7 +6573,7 @@ mod callers_tests {
 
         // Design rationale: `exp` は壁時計の秒で比べるので、壁時計がそこを過ぎるまで
         // 待つしかない (通知してくれる口は無い)。待つ長さは `exp` から決まる。
-        let until_ms = (exp + 1) * 1000 - now_unix_ms();
+        let until_ms = exp * 1000 - now_unix_ms();
         if until_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(until_ms.unsigned_abs())).await;
         }
