@@ -62,6 +62,10 @@ pub struct Gateway<P: CredentialPersistence> {
     web_logins: Mutex<HashMap<String, WebLoginSession>>,
     /// 自動の鍵を入れ替える仕事を起こす口 (DR-0037 §13)。設定の読み直しで鳴らす。
     key_rotation: Arc<tokio::sync::Notify>,
+    /// 運用系の口の呼び手の鍵 (DR-0043 決定 5)。定期の取り直しの仕事と共有する。
+    caller_keys: Arc<crate::caller_keys::CallerKeys>,
+    /// 呼び手の token の `jti` の使用済み集合 (DR-0043 決定 4)。unit ごとに持つ。
+    caller_jtis: gateway_core::caller::JtiSet,
 }
 
 /// 設定として通るが、書き落としの疑いがある箇所を挙げる。
@@ -210,6 +214,114 @@ impl<P: CredentialPersistence> Gateway<P> {
             status: crate::status::Manager::new(config),
             web_logins: Mutex::new(HashMap::new()),
             key_rotation: Arc::new(tokio::sync::Notify::new()),
+            caller_keys: Arc::new(crate::caller_keys::CallerKeys::new(Arc::new(
+                crate::caller_keys::HttpFetcher::new()?,
+            ))),
+            caller_jtis: gateway_core::caller::JtiSet::new(),
+        })
+    }
+
+    /// 呼び手の鍵を取る口を差し替える (試験用)。持っていた鍵は捨てる。
+    pub fn set_jwks_fetcher(&mut self, fetcher: Arc<dyn crate::caller_keys::FetchJwks>) {
+        self.caller_keys = Arc::new(crate::caller_keys::CallerKeys::new(fetcher));
+    }
+
+    /// `[callers]` の全呼び手の鍵を取る (DR-0043 決定 5)。起動時、待ち受ける前に 1 回
+    /// 呼ぶ。取れなかった呼び手はログに出し、最初の request で取り直す (起動は止めない)。
+    pub async fn fetch_caller_keys(&self) {
+        let urls = crate::caller_keys::jwks_urls(&self.router.active().config().callers);
+        self.caller_keys.sync(&urls, true, now_unix()).await;
+    }
+
+    /// 呼び手の鍵の定期の取り直しを始める (DR-0043 決定 5)。最初の回は
+    /// [`crate::caller_keys::PERIOD_SECS`] 後 (起動時の分は [`Self::fetch_caller_keys`])。
+    pub fn start_caller_keys(&self) {
+        tokio::spawn(crate::caller_keys::run(
+            Arc::clone(&self.router),
+            Arc::clone(&self.caller_keys),
+            now_unix().saturating_add(crate::caller_keys::PERIOD_SECS),
+        ));
+    }
+
+    /// 運用系の口の request の呼び手を確かめる (DR-0043 決定 4・6)。
+    ///
+    /// - `authorization`: `Authorization` の値 (無ければ `None`)
+    /// - `method` / `path`: 受けた request の method と path (query を含めない)
+    /// - `now`: unix 秒
+    ///
+    /// 走っている設定の `[callers]` が空なら確かめずに `Ok(None)` (この unit の運用系の
+    /// 口は無認証)。空でなければ、通った呼び手か落ちた段を返す。`kid` が呼び手の鍵に
+    /// 無ければ、その呼び手の `jwks_url` を取り直して (間隔の下限の内なら取り直さずに)
+    /// もう 1 度だけ確かめる。落ちた段はログにも応答にも出さないので、呼び出し側が
+    /// 段をログに出し、応答は [`gateway_core::caller::Reason::status`] ごとの固定文にする。
+    pub async fn verify_caller(
+        &self,
+        authorization: Option<&[u8]>,
+        method: &str,
+        path: &str,
+        now: i64,
+    ) -> std::result::Result<Option<gateway_core::caller::Verified>, gateway_core::caller::Reason>
+    {
+        use gateway_core::caller::{self, Reason};
+
+        let active = self.router.active();
+        let callers = &active.config().callers;
+        if callers.is_empty() {
+            return Ok(None);
+        }
+        let audience = caller::audience(method, path);
+        let mut unknown_kid_of = None;
+        let first = caller::verify(
+            authorization,
+            &audience,
+            now,
+            |iss, kid| self.resolve_caller(callers, iss, kid, now, &mut unknown_kid_of),
+            &self.caller_jtis,
+        );
+        let (Err(Reason::UnknownKid), Some(url)) = (&first, unknown_kid_of) else {
+            return first.map(Some);
+        };
+        if !self.caller_keys.refetch_for_unknown_kid(&url, now).await {
+            return first.map(Some);
+        }
+        caller::verify(
+            authorization,
+            &audience,
+            now,
+            |iss, kid| self.resolve_caller(callers, iss, kid, now, &mut None),
+            &self.caller_jtis,
+        )
+        .map(Some)
+    }
+
+    /// `iss` の呼び手を `callers` から引き、その呼び手の鍵だけから `kid` を引く。
+    /// `kid` が無かった時は、その呼び手の `jwks_url` を `unknown_kid_of` に残す。
+    fn resolve_caller(
+        &self,
+        callers: &std::collections::BTreeMap<String, crate::config::Caller>,
+        iss: &str,
+        kid: &str,
+        now: i64,
+        unknown_kid_of: &mut Option<url::Url>,
+    ) -> std::result::Result<gateway_core::caller::Resolved, gateway_core::caller::Missing> {
+        use gateway_core::caller::{Missing, Resolved};
+
+        let (name, found) = callers
+            .iter()
+            .find(|(name, found)| found.iss(name) == iss)
+            .ok_or(Missing::UnknownIss)?;
+        let key = self
+            .caller_keys
+            .lookup(&found.jwks_url, kid, now)
+            .inspect_err(|missing| {
+                if *missing == Missing::UnknownKid {
+                    *unknown_kid_of = Some(found.jwks_url.clone());
+                }
+            })?;
+        Ok(Resolved {
+            caller: name.clone(),
+            iss: found.iss(name).to_owned(),
+            key,
         })
     }
 
@@ -505,18 +617,31 @@ impl<P: CredentialPersistence> Gateway<P> {
             return Err(ReloadError::RestartRequired { changes });
         }
         warn_about_gaps(&config);
+        let caller_urls = crate::caller_keys::jwks_urls(&config.callers);
         self.router.reload(config).await;
         info!("reloaded the configuration");
         // `jwt` になった ns の鍵をすぐ作り、周期の変更をすぐ効かせる (DR-0037 §13)。
         self.key_rotation.notify_one();
-        let warnings = self
-            .router
-            .refresh_until(
-                &self.http,
-                &self.credentials,
-                Some(tokio::time::Instant::now() + refresh_limit),
-            )
-            .await;
+        // 消えた呼び手の鍵を捨て、増えた (`jwks_url` が変わった) 呼び手の鍵を取る
+        // (DR-0043 決定 6)。取れなくても差し替えは済んでいて、最初の request で取り直す。
+        let mut warnings: Vec<String> = self
+            .caller_keys
+            .sync(&caller_urls, false, now_unix())
+            .await
+            .into_iter()
+            .map(|(url, why)| {
+                format!("cannot fetch the caller keys from {url} ({why}); trying again on the first request")
+            })
+            .collect();
+        warnings.extend(
+            self.router
+                .refresh_until(
+                    &self.http,
+                    &self.credentials,
+                    Some(tokio::time::Instant::now() + refresh_limit),
+                )
+                .await,
+        );
         Ok(ReloadOutcome { warnings })
     }
 
@@ -10111,5 +10236,271 @@ routes = ["a", "b"]
         assert_eq!(prefixes(gw.session("a b").await), ["0000000a"]);
         assert_eq!(prefixes(gw.session("a/b").await), ["0000000b"]);
         assert_eq!(prefixes(gw.session("a-b").await), Vec::<String>::new());
+    }
+
+    /// 運用系の口の呼び手の確かめ方と鍵の持ち方 (DR-0043 決定 4〜6)。
+    mod callers {
+        use super::*;
+        use crate::caller_keys::tests::FakeJwks;
+        use crate::caller_keys::{PERIOD_SECS, REFETCH_INTERVAL_SECS, STALE_AFTER_SECS};
+        use gateway_core::caller::{Reason, Status, Verified};
+
+        const PATH: &str = "/llm-gateway/sessions";
+
+        fn jwks_url(name: &str) -> url::Url {
+            url::Url::parse(&format!("https://{name}.example/jwks.json")).unwrap()
+        }
+
+        /// `[callers.<name>]` を `(名前, jwks_url の名前)` で並べた設定。
+        fn callers_config(callers: &[(&str, &str)]) -> Config {
+            let text: String = callers
+                .iter()
+                .map(|(name, at)| format!("[callers.{name}]\njwks_url = \"{}\"\n", jwks_url(at)))
+                .collect();
+            loaded(&text)
+        }
+
+        fn callers_gateway(callers: &[(&str, &str)]) -> (Gateway<StaticStore>, Arc<FakeJwks>) {
+            let mut gw = Gateway::new(&callers_config(callers), StaticStore::new()).unwrap();
+            let fake = Arc::new(FakeJwks::default());
+            gw.set_jwks_fetcher(Arc::clone(&fake) as Arc<dyn crate::caller_keys::FetchJwks>);
+            (gw, fake)
+        }
+
+        /// 鍵 `signing_key(&[seed; 32])` で署名した `GET` の [`PATH`] 宛ての `Authorization` の値。
+        fn bearer(seed: u8, kid: &str, iss: &str, iat: i64) -> Vec<u8> {
+            use base64::Engine as _;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+            use ed25519_dalek::Signer as _;
+            let key = gateway_core::ns::jwt::signing_key(&[seed; 32]);
+            let header = json!({"alg": "EdDSA", "typ": "request+jwt", "kid": kid});
+            let claims = json!({
+                "iss": iss,
+                "aud": format!("GET {PATH}"),
+                "iat": iat,
+                "exp": iat + 10,
+            });
+            let input = format!(
+                "{}.{}",
+                B64.encode(serde_json::to_vec(&header).unwrap()),
+                B64.encode(serde_json::to_vec(&claims).unwrap())
+            );
+            let signature = key.sign(input.as_bytes());
+            format!("Bearer {input}.{}", B64.encode(signature.to_bytes())).into_bytes()
+        }
+
+        async fn verify(
+            gw: &Gateway<StaticStore>,
+            authorization: &[u8],
+            now: i64,
+        ) -> std::result::Result<Option<Verified>, Reason> {
+            gw.verify_caller(Some(authorization), "GET", PATH, now)
+                .await
+        }
+
+        fn passed(caller: &str, kid: &str) -> std::result::Result<Option<Verified>, Reason> {
+            Ok(Some(Verified {
+                caller: caller.to_owned(),
+                kid: kid.to_owned(),
+            }))
+        }
+
+        /// 確かめる処理は HTTP の handler (複数スレッドの runtime) から呼べる。
+        #[test]
+        fn verifying_a_caller_is_send() {
+            fn send<T: Send>(_: T) {}
+            let (gw, _) = callers_gateway(&[]);
+            send(gw.verify_caller(None, "GET", PATH, 0));
+        }
+
+        /// `[callers]` が無い unit は確かめない (`Authorization` があっても見ない)。
+        #[tokio::test]
+        async fn a_unit_without_callers_does_not_verify() {
+            let (gw, fake) = callers_gateway(&[]);
+            gw.fetch_caller_keys().await;
+            assert_eq!(verify(&gw, b"Bearer junk", now_unix()).await, Ok(None));
+            assert_eq!(
+                gw.verify_caller(None, "GET", PATH, now_unix()).await,
+                Ok(None)
+            );
+            assert_eq!(fake.total_calls(), 0);
+        }
+
+        /// 起動時に全呼び手分を取り、取れた鍵で通す (取り直さない)。
+        #[tokio::test]
+        async fn the_start_fetches_every_caller() {
+            let (gw, fake) = callers_gateway(&[("notifier", "n"), ("ops", "o")]);
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            fake.serve(&jwks_url("o"), &[("o1", 2)]);
+            gw.fetch_caller_keys().await;
+            assert_eq!(fake.calls(&jwks_url("n")), 1);
+            assert_eq!(fake.calls(&jwks_url("o")), 1);
+
+            let now = now_unix();
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", now), now).await,
+                passed("notifier", "n1")
+            );
+            assert_eq!(
+                verify(&gw, &bearer(2, "o1", "ops", now), now).await,
+                passed("ops", "o1")
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 1);
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "ops", now), now).await,
+                Err(Reason::UnknownKid),
+                "another caller's iss is looked up in that caller's keys only"
+            );
+        }
+
+        /// 起動時に取れなくても起動し、最初の request で取り直して通す。
+        #[tokio::test]
+        async fn a_failed_start_fetch_is_retried_by_the_first_request() {
+            let (gw, fake) = callers_gateway(&[("notifier", "n")]);
+            gw.fetch_caller_keys().await;
+            assert_eq!(fake.calls(&jwks_url("n")), 1);
+
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            let now = now_unix();
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", now), now).await,
+                passed("notifier", "n1")
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 2);
+        }
+
+        /// 未知の `kid` は取り直して通す。最小 interval の内の未知の `kid` は取り直さず 401。
+        #[tokio::test]
+        async fn an_unknown_kid_refetches_once_per_interval() {
+            let (gw, fake) = callers_gateway(&[("notifier", "n")]);
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            gw.fetch_caller_keys().await;
+
+            fake.serve(&jwks_url("n"), &[("n1", 1), ("n2", 2)]);
+            let now = now_unix();
+            assert_eq!(
+                verify(&gw, &bearer(2, "n2", "notifier", now), now).await,
+                passed("notifier", "n2")
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 2);
+
+            fake.serve(&jwks_url("n"), &[("n1", 1), ("n2", 2), ("n3", 3)]);
+            let soon = now + REFETCH_INTERVAL_SECS - 1;
+            let refused = verify(&gw, &bearer(3, "n3", "notifier", soon), soon).await;
+            assert_eq!(refused, Err(Reason::UnknownKid));
+            assert_eq!(Reason::UnknownKid.status(), Status::Unauthorized);
+            assert_eq!(
+                fake.calls(&jwks_url("n")),
+                2,
+                "not fetched inside the interval"
+            );
+
+            let later = now + REFETCH_INTERVAL_SECS;
+            assert_eq!(
+                verify(&gw, &bearer(3, "n3", "notifier", later), later).await,
+                passed("notifier", "n3")
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 3);
+        }
+
+        /// 最後の成功から 66 分を過ぎた束では通さず (401)、取り直しもしない (定期に任せる)。
+        #[tokio::test]
+        async fn stale_keys_are_refused() {
+            let (gw, fake) = callers_gateway(&[("notifier", "n")]);
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            gw.fetch_caller_keys().await;
+            let fetched = now_unix();
+
+            let edge = fetched + STALE_AFTER_SECS - 1;
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", edge), edge).await,
+                passed("notifier", "n1")
+            );
+            let late = fetched + STALE_AFTER_SECS + 1;
+            let refused = verify(&gw, &bearer(1, "n1", "notifier", late), late).await;
+            assert_eq!(refused, Err(Reason::KeysStale));
+            assert_eq!(Reason::KeysStale.status(), Status::Unauthorized);
+            assert_eq!(fake.calls(&jwks_url("n")), 1);
+        }
+
+        /// 取り直しに成功したら丸ごと置き換わり、消えた `kid` は通らない。
+        #[tokio::test]
+        async fn a_refetch_replaces_the_keys() {
+            let (gw, fake) = callers_gateway(&[("notifier", "n")]);
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            gw.fetch_caller_keys().await;
+
+            fake.serve(&jwks_url("n"), &[("n2", 2)]);
+            let now = now_unix();
+            assert_eq!(
+                verify(&gw, &bearer(2, "n2", "notifier", now), now).await,
+                passed("notifier", "n2")
+            );
+            let later = now + PERIOD_SECS;
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", later), later).await,
+                Err(Reason::UnknownKid),
+                "n1 is gone from the JWKS, so the refetch does not bring it back"
+            );
+        }
+
+        /// 読み直しで消えた呼び手の鍵は捨て、増えた (`jwks_url` が変わった) 呼び手の鍵は
+        /// 取る。変わらない呼び手は取り直さない。取れなかった呼び手は警告に出る。
+        #[tokio::test]
+        async fn a_reload_drops_gone_callers_and_fetches_new_ones() {
+            let (gw, fake) = callers_gateway(&[("gone", "g"), ("kept", "k"), ("moved", "m")]);
+            for (at, seed) in [("g", 1), ("k", 2), ("m", 3), ("m2", 4)] {
+                fake.serve(&jwks_url(at), &[(&format!("{at}1"), seed)]);
+            }
+            gw.fetch_caller_keys().await;
+
+            let outcome = gw
+                .reload_within(
+                    callers_config(&[("kept", "k"), ("moved", "m2"), ("new", "x")]),
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                gw.caller_keys.urls(),
+                [jwks_url("k"), jwks_url("m2"), jwks_url("x")].into(),
+            );
+            assert_eq!(
+                fake.calls(&jwks_url("k")),
+                1,
+                "an unchanged caller is not refetched"
+            );
+            assert_eq!(fake.calls(&jwks_url("m2")), 1);
+            assert_eq!(fake.calls(&jwks_url("x")), 1);
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("https://x.example/jwks.json")),
+                "{:?}",
+                outcome.warnings
+            );
+
+            let now = now_unix();
+            assert_eq!(
+                verify(&gw, &bearer(1, "g1", "gone", now), now).await,
+                Err(Reason::UnknownIss)
+            );
+            assert_eq!(
+                verify(&gw, &bearer(4, "m21", "moved", now), now).await,
+                passed("moved", "m21")
+            );
+            assert_eq!(
+                verify(&gw, &bearer(3, "m1", "moved", now), now).await,
+                Err(Reason::UnknownKid),
+                "the old jwks_url's keys are not used"
+            );
+
+            gw.reload_within(callers_config(&[]), std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(gw.caller_keys.urls().is_empty());
+            assert_eq!(verify(&gw, b"Bearer junk", now).await, Ok(None));
+        }
     }
 }

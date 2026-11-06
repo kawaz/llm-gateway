@@ -128,7 +128,8 @@ remove disabled from [server], or register another configuration",
         });
 
         // 待ち受ける前に一覧を揃える。空の状態で受けると 404 を返してしまう。
-        gateway.refresh_models().await;
+        // 呼び手の鍵も同じ間に取る (取れなくても待ち受けは始め、最初の request で取り直す)。
+        tokio::join!(gateway.refresh_models(), gateway.fetch_caller_keys());
 
         // 前回落とした分 (当日の集計・credential ごとの利用状況) を読み戻す。
         gateway
@@ -137,6 +138,7 @@ remove disabled from [server], or register another configuration",
         gateway.start_status();
         gateway.start_keepalive();
         gateway.start_key_rotation();
+        gateway.start_caller_keys();
 
         tracing::info!(
             unit,

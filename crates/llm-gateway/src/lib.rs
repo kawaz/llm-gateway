@@ -18,9 +18,11 @@
 //! - [`quota`] 枠の観測スナップショットと、その置き場 (DR-0007)
 //! - [`metering`] トークン集計の正規形と、単価を引き当てる契約
 //! - [`stats`] 応答の usage を日ごとに積む (DR-0011)
+//! - [`caller_keys`] 運用系の口の呼び手の鍵を `jwks_url` から取って持つ (DR-0043)
 //! - [`thinking`] / [`thinking_sources`] session の thinking の出所を unit 間で共有し、跨ぎを判定・変換する (DR-0035)
 
 pub mod cache;
+pub mod caller_keys;
 pub mod config;
 pub mod credential;
 pub mod daemon;

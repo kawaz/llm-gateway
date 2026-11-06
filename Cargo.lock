@@ -951,6 +951,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "ed25519-dalek",
  "futures-util",
  "gateway-core",
  "humantime",

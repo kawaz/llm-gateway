@@ -35,3 +35,5 @@ tempfile = { workspace = true }
 # 記録が残ることを試験で確かめるための受け取り先。
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# 呼び手の token (`request+jwt`) を試験で署名する。
+ed25519-dalek = { workspace = true }
