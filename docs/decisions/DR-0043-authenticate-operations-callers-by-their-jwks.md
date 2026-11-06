@@ -1,6 +1,6 @@
 # DR-0043: 運用系 HTTP の呼び手を、呼び手の JWKS で認証する (ccmsg が最初の呼び手)
 
-- Status: Proposed
+- Status: Accepted (kawaz 2026-11-06。決定 1 の `jwks_file` と決定 7 の運用者の鍵は裁定待ち CA-Q5 で、c (daemon が自分の鍵を持ち設定は `jwks_url` だけ) なら書き換える)
 - Date: 2026-11-05
 
 ## 背景
