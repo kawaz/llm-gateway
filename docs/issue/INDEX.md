@@ -3,6 +3,7 @@
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
 | 2026-10-21 | request | wip | [request-dump-with-timeout](./2026-10-21-request-dump-with-timeout.md) | リクエスト本文の一時ダンプ。外部から時限で on/off、古いものは自動で片付け |
+| 2026-11-06 | bug | open | [openai-translation-rejects-non-text-system-blocks](./2026-11-06-openai-translation-rejects-non-text-system-blocks.md) | OpenAI 変換が text 以外の system block で request 全体を 400 で断る |
 | 2026-11-06 | bug | open | [keepalive-stem-collision-overwrites-sibling-conversation](./2026-11-06-keepalive-stem-collision-overwrites-sibling-conversation.md) | keepalive の控えのファイル名 stem が会話どうしで衝突し、後から書いた方が上書きする |
 | 2026-10-21 | design | open | [otel-observability-for-dev-environment](./2026-10-21-otel-observability-for-dev-environment.md) | 手元の開発全般で使う OpenTelemetry 観測基盤の検討 (Claude Code の classifier 理由から着手) |
 | 2026-10-04 | design | open | [service-reregister-env-drift-not-detected](./2026-10-04-service-reregister-env-drift-not-detected.md) | service register は XDG を plist に固定しているが、re-register で値が変わっても止まらず、client 側の検知も無い (hyoui からのフラグ) |
