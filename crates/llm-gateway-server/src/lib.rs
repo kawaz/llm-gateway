@@ -56,6 +56,8 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
+        .route("/llm-gateway/sessions", get(sessions))
+        .route("/llm-gateway/sessions/{session_id}", get(session))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
@@ -384,6 +386,46 @@ async fn keepalive_pause<P: CredentialPersistence + 'static>(
 #[derive(Deserialize)]
 struct PauseRequest {
     session_id: String,
+}
+
+/// この会話の cache / keepalive の状態を返す (DR-0042 決定 1)。
+///
+/// 控えと経路の印の写しで、期限が過ぎたか・経路が使えるかの判定はしない。
+/// 控えの無い会話は `series: []` の 200 — gateway は「無い会話」と「控えの
+/// 無い会話」を区別できないので、エラーにしない。本文は載せない。
+///
+/// `Access-Control-Allow-Origin` は付けない。呼び手はサーバ (ccmsg) で、
+/// ブラウザが直接読む使い方は無い (DR-0042 決定 4)。呼び手の認証は DR-0043
+/// で掛け、この口はそれより前に出さない。
+async fn session<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    AxumPath(session_id): AxumPath<String>,
+) -> Response {
+    // 控えの読み出しは同期のファイル I/O だが、pause と同じく handler の中で待つ (問われるのは hook のたびに 1 回、答えは経路の名前を引く async なので spawn_blocking に包むと中で block_on が要る)。
+    json_utf8(Json(gateway.session(&session_id).await))
+}
+
+/// 控えのある会話の一覧を返す (DR-0042 決定 2)。`?ns=<name>` でその面を
+/// 通った系列だけに絞る。
+///
+/// 扱いは [`session`] と同じ (判定しない、本文を載せない、
+/// `Access-Control-Allow-Origin` を付けない)。
+async fn sessions<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+) -> Response {
+    let ns = requested_ns(request.uri().query());
+    // 置き場の全件を同期で読む。session と同じく handler の中で待つ (使い手は daemon の再起動と webui の初期表示)。
+    json_utf8(Json(gateway.sessions(ns.as_deref()).await))
+}
+
+/// `?ns=<name>` を読む。付いていなければ絞らない。
+///
+/// path の session_id と同じく percent-decode した値で比べる。
+fn requested_ns(query: Option<&str>) -> Option<String> {
+    url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == "ns")
+        .map(|(_, value)| value.into_owned())
 }
 
 /// configured upstream の公式状態と実測状態を返す。
@@ -5541,5 +5583,354 @@ nothing = ["GET /x"]
         };
         assert_eq!(relay(&good()).await.unwrap().status(), 404);
         assert_eq!(relay(&bad[0]).await.unwrap().status(), 401);
+    }
+}
+
+#[cfg(test)]
+mod sessions_tests {
+    use super::tests::serve;
+    use super::*;
+    use llm_gateway::cache::keepalive::Kept;
+    use llm_gateway::cache::keepalive::store::Store;
+
+    /// 答えに出てはならない本文の目印。
+    const KEPT_BODY_TEXT: &str = "the conversation itself must not leak";
+
+    /// 会話の状態を問う gateway。`[stats] dir` を `dir` に向け (控えの置き場は
+    /// その下の `keepalive/`)、面 `default` と `other` はどちらも `m` を
+    /// `a` (認証情報 `main` を持つ) → `b` (持たない) の順に試す。
+    async fn sessions_gateway(dir: &std::path::Path, kept: &[Kept]) -> String {
+        let store = Store::new(dir);
+        for kept in kept {
+            assert!(store.save(kept), "the fixture is kept");
+        }
+        serve(&format!(
+            r#"
+[stats]
+dir = "{dir}"
+
+[credentials.main]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "main"
+url = "http://127.0.0.1:9"
+models = ["m"]
+
+[routes.b]
+provider = "anthropic"
+url = "http://127.0.0.1:9"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a", "b"]
+
+[[ns.other.routing]]
+models = ["m"]
+routes = ["a", "b"]
+"#,
+            dir = dir.display(),
+        ))
+        .await
+    }
+
+    /// 会話 `session` の系列 `prefix` の控え。起点 `since_ms` に実リクエストが
+    /// 来た直後の形 (送り直しは 0 本、期間は 8 時間)。
+    fn kept_at(session: &str, prefix: &str, ns: &str, since_ms: i64) -> Kept {
+        Kept {
+            session_id: session.to_owned(),
+            prefix: prefix.to_owned(),
+            ns: ns.to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+            body: json!({"messages": [{"role": "user", "content": KEPT_BODY_TEXT}]}),
+            headers: vec![("anthropic-beta".to_owned(), KEPT_BODY_TEXT.to_owned())],
+            path: "/v1/messages".to_owned(),
+            query: None,
+            shape: RequestShape::Messages,
+            fires_at_ms: since_ms + 55 * 60 * 1000,
+            expires_at_ms: since_ms + (60 * 60 - 30) * 1000,
+            horizon_end_ms: since_ms + 8 * 60 * 60 * 1000,
+            since_ms,
+            count: 0,
+            cache_notice: Some(format!("notice-{prefix}")),
+        }
+    }
+
+    async fn get(url: String) -> reqwest::Response {
+        reqwest::get(url).await.unwrap()
+    }
+
+    /// 1 つの会話の答えは控えの欄と経路を写した JSON で、本文は載らない。
+    #[tokio::test]
+    async fn a_session_answers_its_kept_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let base =
+            sessions_gateway(dir.path(), &[kept_at("s-1", "2cf24dba", "default", since)]).await;
+
+        let resp = get(format!("{base}/llm-gateway/sessions/s-1")).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json; charset=utf-8"
+        );
+        let text = resp.text().await.unwrap();
+        let answer: Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(answer["session_id"], "s-1");
+        let series = answer["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1);
+        let one = &series[0];
+        assert_eq!(one["prefix"], "2cf24dba");
+        assert_eq!(one["ns"], "default");
+        assert_eq!(one["model"], "m");
+        assert_eq!(one["route"], "a");
+        assert_eq!(one["cache_notice"], "notice-2cf24dba");
+        assert_eq!(one["cache_since"], since);
+        assert_eq!(one["cache_count"], 0);
+        assert_eq!(one["next_keepalive_at"], since + 55 * 60 * 1000);
+        assert_eq!(one["cache_expires_at"], since + (60 * 60 - 30) * 1000);
+        for field in ["cache_until", "cache_until_count"] {
+            assert!(one[field].is_number(), "{field} is always present: {one}");
+        }
+        assert_eq!(
+            one["routes"],
+            json!([
+                {"route": "a", "credential": "main"},
+                {"route": "b"},
+            ]),
+            "the routes this series tries, in order; a route without a credential omits the field"
+        );
+        assert!(
+            !text.contains(KEPT_BODY_TEXT)
+                && !text.contains("\"body\"")
+                && !text.contains("\"headers\""),
+            "the kept body and headers never appear in the answer: {text}"
+        );
+    }
+
+    /// path の session_id は percent-decode した値で引く。
+    #[tokio::test]
+    async fn a_session_id_is_percent_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("s 1", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+
+        let answer: Value = get(format!("{base}/llm-gateway/sessions/s%201"))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(answer["session_id"], "s 1");
+        assert_eq!(answer["series"].as_array().unwrap().len(), 1, "{answer}");
+    }
+
+    /// 控えの無い会話は、エラーではなく空の系列で答える。
+    #[tokio::test]
+    async fn a_session_without_kept_series_answers_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+
+        let resp = get(format!("{base}/llm-gateway/sessions/s-2")).await;
+        assert_eq!(resp.status(), 200);
+        let answer: Value = resp.json().await.unwrap();
+        assert_eq!(answer, json!({"session_id": "s-2", "series": []}));
+    }
+
+    /// 一覧は控えのある会話を並べ、`?ns=` でその面を通った系列だけに絞る。
+    /// 系列を 1 つも持たなくなった会話は落ちる。
+    #[tokio::test]
+    async fn the_list_narrows_to_a_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let base = sessions_gateway(
+            dir.path(),
+            &[
+                kept_at("s-1", "11111111", "default", since),
+                kept_at("s-1", "22222222", "other", since + 1_000),
+                kept_at("s-2", "33333333", "other", since + 2_000),
+                kept_at("s-3", "44444444", "default", since + 3_000),
+            ],
+        )
+        .await;
+
+        let shape = |answer: Value| -> Vec<(String, Vec<String>)> {
+            answer["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| {
+                    (
+                        session["session_id"].as_str().unwrap().to_owned(),
+                        session["series"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|series| series["prefix"].as_str().unwrap().to_owned())
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        let list = |query: &'static str| {
+            let url = format!("{base}/llm-gateway/sessions{query}");
+            async move {
+                let resp = get(url).await;
+                assert_eq!(resp.status(), 200);
+                resp.json::<Value>().await.unwrap()
+            }
+        };
+
+        let owned = |rows: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            rows.iter()
+                .map(|(session, prefixes)| {
+                    (
+                        (*session).to_owned(),
+                        prefixes.iter().map(|p| (*p).to_owned()).collect(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            shape(list("").await),
+            owned(&[
+                ("s-3", &["44444444"]),
+                ("s-2", &["33333333"]),
+                ("s-1", &["22222222", "11111111"]),
+            ]),
+            "every conversation with a kept series, newest first"
+        );
+        assert_eq!(
+            shape(list("?ns=default").await),
+            owned(&[("s-3", &["44444444"]), ("s-1", &["11111111"])]),
+            "only the series that went through `default`; s-2 has none left and drops out"
+        );
+        assert_eq!(
+            shape(list("?ns=nowhere").await),
+            owned(&[]),
+            "a namespace no series went through leaves an empty list"
+        );
+    }
+
+    /// gateway 自身の口なので namespace の下には生やさない (DR-0006)。
+    #[tokio::test]
+    async fn sessions_is_not_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("x", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+
+        for path in [
+            "/ns-default/llm-gateway/sessions",
+            "/ns-default/llm-gateway/sessions/x",
+        ] {
+            let resp = get(format!("{base}{path}")).await;
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+    }
+
+    /// 呼び手はサーバで、ブラウザが直接読む使い方は無い (DR-0042 決定 4)。
+    #[tokio::test]
+    async fn sessions_does_not_allow_other_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+
+        for path in ["/llm-gateway/sessions", "/llm-gateway/sessions/s-1"] {
+            let resp = get(format!("{base}{path}")).await;
+            assert_eq!(resp.status(), 200, "{path}");
+            assert!(
+                resp.headers().get("access-control-allow-origin").is_none(),
+                "{path}: {:?}",
+                resp.headers()
+            );
+        }
+    }
+
+    /// 一覧の答えにも本文は載らない。
+    #[tokio::test]
+    async fn the_list_carries_no_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+
+        let text = get(format!("{base}/llm-gateway/sessions"))
+            .await
+            .text()
+            .await
+            .unwrap();
+        assert!(text.contains("2cf24dba"), "the series is listed: {text}");
+        assert!(
+            !text.contains(KEPT_BODY_TEXT)
+                && !text.contains("\"body\"")
+                && !text.contains("\"headers\""),
+            "the kept body and headers never appear in the list: {text}"
+        );
+    }
+
+    /// 読むだけの口で、書き込みの動詞は受けない (DR-0042 決定 5)。
+    #[tokio::test]
+    async fn sessions_answers_only_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", "default", 1_785_600_000_000)],
+        )
+        .await;
+        let client = reqwest::Client::new();
+
+        for path in ["/llm-gateway/sessions", "/llm-gateway/sessions/s-1"] {
+            for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
+                let resp = client
+                    .request(method.clone(), format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 405, "{method} {path}");
+            }
+        }
+        assert_eq!(
+            get(format!("{base}/llm-gateway/sessions/s-1"))
+                .await
+                .json::<Value>()
+                .await
+                .unwrap()["series"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "a refused DELETE drops nothing"
+        );
+    }
+
+    #[test]
+    fn the_ns_query_is_read_decoded() {
+        assert_eq!(requested_ns(None), None);
+        assert_eq!(requested_ns(Some("")), None);
+        assert_eq!(requested_ns(Some("days=3")), None);
+        assert_eq!(
+            requested_ns(Some("ns=personal")).as_deref(),
+            Some("personal")
+        );
+        assert_eq!(requested_ns(Some("x=1&ns=a%2Db")).as_deref(), Some("a-b"));
     }
 }

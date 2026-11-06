@@ -42,6 +42,8 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 
 `GET` / `HEAD` の `/ns-<ns>/api/hello` は、Claude Code が `ANTHROPIC_BASE_URL` に token を付けずに送る疎通確認のため、どの認証方式の namespace でも認証なしで 200 (本文なし) を返し、upstream には流さない。設定に無い namespace は他のパスと同じく 404。
 
+gateway 自身の口 ([運用系](#運用系)) は namespace の下に無い (`/ns-<ns>/llm-gateway/…` は 404)。クライアントの `ANTHROPIC_BASE_URL` から辿るときは、末尾の `ns-<name>` の段を落とした根に `/llm-gateway/…` を足す (`https://gw.example.net/ns-personal` → `https://gw.example.net/llm-gateway/sessions/<session_id>`)。
+
 ### `jwt` の namespace
 
 固定 token の代わりに、Ed25519 で署名した JWT を受ける namespace も作れる (DR-0030 §6)。送り方は固定 token と同じ `Authorization: Bearer <jwt>` なので、Claude Code なら `ANTHROPIC_AUTH_TOKEN` に入れる。
@@ -153,7 +155,7 @@ uncached_days = 7    # この日数まで (既定 7)
 
 複数プロセスで同じ置き場を共有してよい。送る直前に系列ごとの `.lock` を掴むので、撫でるのは常に 1 台だけになる。起動時に読むのは自分の命名 (`<会話>.<系列>.json`) だけで、置き場にある他のファイルは無視する。振り分けは優先度型 (Caddy の `lb_policy first`) か、`X-Claude-Code-Session-Id` ヘッダを鍵にした sticky を推奨。round-robin でも正しく動く (控えは共有なので、どちらが撫でても同じ 1 本になる)。
 
-`POST /llm-gateway/keepalive/pause` にその会話の `session_id` を渡すと、控えを落として送り直しを止められる。解除の口は持たない — その会話から実リクエストが 1 本来れば、そこで控えが置き直される。
+`POST /llm-gateway/keepalive/pause` にその会話の `session_id` を渡すと、控えを落として送り直しを止められる。解除の口は持たない — その会話から実リクエストが 1 本来れば、そこで控えが置き直される。会話に何が控えてあり次にいつ送り直すかは [`GET /llm-gateway/sessions/{session_id}`](#get-llm-gatewaysessionssession_id) で読める。pause した会話はそこで `series: []` になる。
 
 送り直した 1 本は、転送の知らせ (DR-0012) に `origin: "keepalive"` で並び、usage / stats にも通常どおり計上される。
 
@@ -616,6 +618,66 @@ data: {"type":"cache_expired","ts":1785330001000,"seq":57,"boot":1785320000000,"
 base_url = "http://127.0.0.1:7777"
 base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 ```
+
+### `GET /llm-gateway/sessions/{session_id}`
+
+1 つの会話の cache / keepalive の状態を返す (DR-0042)。中身は gateway がその会話について持っている控え ([keepalive の運用](#keepalive-の運用)) と、その会話が使う経路に付いている上限の印の写し。`{session_id}` は Claude Code が `X-Claude-Code-Session-Id` に載せる会話の id で、path には percent-encode して置く。問われた時点での判定はしない — 期限が過ぎたか・経路が使えるかは gateway が送る直前に決める。時刻は受け取った側で壁時計と比べる。
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
+```
+
+```json
+{"session_id":"0f3c6d1a-…","series":[
+  {"prefix":"2cf24dba","ns":"personal","model":"claude-fable-5-1","route":"claude-main",
+   "cache_notice":"kUu1xR4-tQ9nSp2Zc0dBvA","cache_expires_at":1785603570000,
+   "cache_since":1785600000000,"cache_count":0,"next_keepalive_at":1785603300000,
+   "cache_until":1785633300000,"cache_until_count":9,
+   "routes":[
+     {"route":"claude-main","credential":"main"},
+     {"route":"claude-b","credential":"sub","limited":{"until":1785618060000}}
+   ]}
+]}
+```
+
+`series` には控えた系列が 1 系列 1 要素で、`cache_since` の新しい順に並ぶ。1 つの会話が複数の系列を持つことがある (`sub = "keepalive"` の面で main と並ぶ subagent の種類、`system` 先頭ブロックが変わった後の新旧)。`routes` 以外の欄は必ず出る。欄の名前は [`/llm-gateway/events`](#get-llm-gatewayevents) の `request` の知らせと [`/llm-gateway/usage`](#get-llm-gatewayusage) の `denials` と同じ意味。
+
+| 欄 | 意味 |
+|---|---|
+| `prefix` | 系列 (`system` 先頭ブロックのハッシュ)。知らせの `prefix` と突き合わせる |
+| `ns` / `model` | 直前の実リクエストが通った namespace と、解決後のモデル |
+| `route` | 直前の実リクエストが通った経路 (知らせでは `credential` の欄に同じ値が載る)。送り直しはこの経路が使える時だけ出る |
+| `cache_notice` | この系列について最後に約束した寿命の名前。`cache_expired` の `of` と突き合わせる。欄が足される前に置かれた控えでは `null` |
+| `cache_expires_at` | gateway が cache を「もう無い」と見なす時刻。最後に送った 1 本の時刻 + 1 時間から余裕の 30 秒を引いた値で、知らせの `cache_expires_at` より 30 秒早い |
+| `cache_since` | 連鎖の起点 = 最後の実リクエスト。送り直しが `written` で返った時はその時刻に置き直される |
+| `cache_count` | ここまでに送り直した本数 (実リクエストの直後は 0) |
+| `next_keepalive_at` | 次の送り直しの実際の予定。経路が塞がって見送った後は置き直した予定が載る |
+| `cache_until` / `cache_until_count` | 送り直しで継ぎ足せる終わりと、連鎖で送る総数 (知らせと同じ見立て) |
+| `routes` | この系列の `ns` と `model` で試される経路を試す順に、経路ごとに `{route, credential?, limited?}`。`credential` は認証情報の名前で、持たない経路 (relay) では出ない。`limited` はその経路にこの `model` に効く上限の印が付いている間だけ出て、`until` は再び候補になる時刻 (複数効くなら遅い方)。混雑と `org_not_allowed` の印はここに載らない (usage の `denials` で読む) |
+
+`routes[].limited` は**この unit の**印で、兄弟の unit とは違いうる。それ以外は控えから組むので、置き場を共有する unit ならどれに問うても同じ。`routes` が空になるのは、その namespace にそのモデルを扱える経路がもう無い時だけ。
+
+`{"session_id":"…","series":[]}` (200) は「この会話について gateway は何も送り直していない」という答え。gateway が知っているのは控えだけなので、知らない会話と、`keepalive` 戦略の無い面の会話・道具を持たない 1 本だけの会話・pause した会話・cache か `keepalive_horizon` が尽きた会話を区別しない。エラーではなく状態。
+
+**控えの本文は載せない** — 出るのは id・名前・時刻・本数まで。本文を見る口は `dump` だけ。走行中の 1 本はまだ反映されない (控えは応答を読み切った後に置かれる) ので、turn が閉じてから問う。
+
+### `GET /llm-gateway/sessions`
+
+控えのある会話の一覧。1 件の形は上と同じで、各会話の先頭 (最新) の系列の `cache_since` の新しい順に並ぶ。
+
+| パラメータ | 既定 | 意味 |
+| --- | --- | --- |
+| `ns` | なし | その namespace を通った系列だけを残す。系列が 1 つも残らない会話は落とす |
+
+```bash
+curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
+```
+
+```json
+{"sessions":[{"session_id":"0f3c6d1a-…","series":[{…}]}, …]}
+```
+
+置き場を共有する unit ならどれに問うても、`routes[].limited` を除いて同じ一覧になる。
 
 ## 再認証 (login)
 

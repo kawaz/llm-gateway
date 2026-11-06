@@ -42,6 +42,8 @@ Authentication is per namespace. Only a namespace with `auth_token` under `[ns.<
 
 `GET` / `HEAD` on `/ns-<ns>/api/hello` returns 200 (no body) without authentication in every namespace, whatever its auth scheme, and is not forwarded upstream: Claude Code sends it to `ANTHROPIC_BASE_URL` without a token as a connectivity check. A namespace that is not configured still returns 404, as on any other path.
 
+The gateway's own endpoints ([Operations](#operations)) are never under a namespace: `/ns-<ns>/llm-gateway/…` returns 404. To reach them from a client's `ANTHROPIC_BASE_URL`, drop a trailing `ns-<name>` segment and append `/llm-gateway/…` to what remains (`https://gw.example.net/ns-personal` → `https://gw.example.net/llm-gateway/sessions/<session_id>`).
+
 ### `jwt` namespaces
 
 A namespace can instead accept Ed25519-signed JWTs (DR-0030 §6). The token is sent as `Authorization: Bearer <jwt>`, the same way as a fixed token, so a client such as Claude Code puts it in `ANTHROPIC_AUTH_TOKEN`.
@@ -153,7 +155,7 @@ Anything past `uncached_keep` entries or older than `uncached_days` is dropped w
 
 Several processes may share the directory. The `.lock` beside a series is taken right before sending, so only one of them ever touches it. On startup each process only reads its own naming (`<session>.<series>.json`) and ignores anything else in the directory. Prefer a priority policy (Caddy's `lb_policy first`) or sticky routing keyed on the `X-Claude-Code-Session-Id` header; round-robin also works correctly (the kept request is shared, so whichever process handles it sends the same one).
 
-`POST /llm-gateway/keepalive/pause`, given that conversation's `session_id`, drops the kept request and stops resending. There is no separate resume endpoint — one real request from that conversation puts the kept request back.
+`POST /llm-gateway/keepalive/pause`, given that conversation's `session_id`, drops the kept request and stops resending. There is no separate resume endpoint — one real request from that conversation puts the kept request back. What is kept for a conversation, and when it is resent next, is read with [`GET /llm-gateway/sessions/{session_id}`](#get-llm-gatewaysessionssession_id); a paused conversation answers `series: []` there.
 
 A resent request appears in the forwarding notices (DR-0012) with `origin: "keepalive"`, and is counted in usage / stats like any other request.
 
@@ -614,6 +616,66 @@ To receive the same stream without holding a connection open (ccmsg on another h
 base_url = "http://127.0.0.1:7777"
 base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 ```
+
+### `GET /llm-gateway/sessions/{session_id}`
+
+Reports the cache / keepalive state of one conversation (DR-0042): a copy of what the gateway keeps for it ([Running keepalive](#running-keepalive)) and of the limit marks on the routes it would use. `{session_id}` is the conversation id Claude Code sends in `X-Claude-Code-Session-Id`, percent-encoded in the path. Nothing is judged at the time of asking — whether a deadline has passed or a route is usable is decided by the gateway right before it sends; compare the times with the wall clock on your side.
+
+```bash
+curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
+```
+
+```json
+{"session_id":"0f3c6d1a-…","series":[
+  {"prefix":"2cf24dba","ns":"personal","model":"claude-fable-5-1","route":"claude-main",
+   "cache_notice":"kUu1xR4-tQ9nSp2Zc0dBvA","cache_expires_at":1785603570000,
+   "cache_since":1785600000000,"cache_count":0,"next_keepalive_at":1785603300000,
+   "cache_until":1785633300000,"cache_until_count":9,
+   "routes":[
+     {"route":"claude-main","credential":"main"},
+     {"route":"claude-b","credential":"sub","limited":{"until":1785618060000}}
+   ]}
+]}
+```
+
+`series` holds one entry per kept series, newest `cache_since` first. One conversation can hold several: a subagent kind beside the main agent under `sub = "keepalive"`, or an old and a new series after the first `system` block changed. Every field except `routes` is always present. Field names mean what they mean in the `request` notice of [`/llm-gateway/events`](#get-llm-gatewayevents) and in `denials` of [`/llm-gateway/usage`](#get-llm-gatewayusage).
+
+| Field | Meaning |
+|---|---|
+| `prefix` | The series: the hash of the first `system` block, matching `prefix` in the notices |
+| `ns` / `model` | The namespace and the resolved model the last real request went through |
+| `route` | The route the last real request used (the notices carry the same value in `credential`). Resends go out only while it is usable |
+| `cache_notice` | The name of the last lifetime promised for this series, matching `of` in `cache_expired`. `null` for a kept request written before the field existed |
+| `cache_expires_at` | When the gateway treats the cache as gone: the last send plus one hour, minus a 30-second margin. 30 seconds earlier than `cache_expires_at` in the notices |
+| `cache_since` | Where the chain starts: the last real request, moved to a resend's time when that resend came back `written` |
+| `cache_count` | Resends sent so far (0 right after a real request) |
+| `next_keepalive_at` | When the next resend is actually scheduled. After a resend was skipped because the route was down, this is the rescheduled time |
+| `cache_until` / `cache_until_count` | How far resends can carry the cache, and how many the chain sends in total (the same projection as the notices) |
+| `routes` | The routes this series' `ns` and `model` try, in the order they are tried, each `{route, credential?, limited?}`. `credential` is the credential name and is absent for a route without one (relay). `limited` appears only while the route carries a limit mark that applies to this `model`; `until` is when it becomes a candidate again (the later one if several apply). Busy and `org_not_allowed` marks are not listed here; `denials` in usage has them |
+
+`routes[].limited` is **this unit's** marks, which a sibling unit may not share; everything else comes from the kept requests, which all units sharing the directory read alike. `routes` is empty only when no route in that namespace serves that model any more.
+
+`{"session_id":"…","series":[]}` with 200 means the gateway is resending nothing for that conversation. The gateway knows only what it keeps, so it cannot tell an unknown conversation from one in a namespace without a `keepalive` strategy, a single call without tools, a paused one, or one whose cache or `keepalive_horizon` ran out. It is a state, not an error.
+
+**The kept body is never included** — only ids, names, times and counts. Bodies are seen only through `dump`. A request still in flight is not reflected: the kept request is written after its response has been read in full, so ask after the turn has closed.
+
+### `GET /llm-gateway/sessions`
+
+Lists every conversation that has a kept series, each in the shape above, ordered by the `cache_since` of its newest series.
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `ns` | absent | Keep only the series that went through this namespace; a conversation left with none drops out |
+
+```bash
+curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
+```
+
+```json
+{"sessions":[{"session_id":"0f3c6d1a-…","series":[{…}]}, …]}
+```
+
+Any unit sharing the keepalive directory gives the same list, except for `routes[].limited`.
 
 ## Re-authorization (login)
 
