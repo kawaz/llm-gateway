@@ -64,6 +64,29 @@ pub struct Kept {
     pub cache_notice: Option<String>,
 }
 
+/// 控えのうち、本文 (`body` / `headers`) を除いた欄。会話の状態を問われた
+/// ときに読む形 (DR-0042)。
+///
+/// 欄の意味は [`Kept`] と同じ。本文は読み飛ばす — `serde` は知らない欄を
+/// 値の木に組まずに捨てるので、8MB まである本文を答えのたびに組み立てずに
+/// 済む。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct KeptMeta {
+    pub session_id: String,
+    pub prefix: String,
+    pub ns: String,
+    pub model: String,
+    pub route: String,
+    pub fires_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub horizon_end_ms: i64,
+    pub since_ms: i64,
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub cache_notice: Option<String>,
+}
+
 /// 系列を指す鍵。ファイル名にもなる。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Series {
@@ -79,18 +102,24 @@ impl Series {
     /// **prefix を後ろに付ける** — prefix はこちらが本文から作る 16 進なので
     /// そのまま名前に使える。
     pub(super) fn stem(&self) -> String {
-        let cleaned: String = self
-            .session_id
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let trimmed = cleaned.trim_matches('-');
-        let session = if trimmed.is_empty() {
-            "unknown"
-        } else {
-            trimmed
-        };
-        format!("{session}.{}", self.prefix)
+        format!("{}.{}", session_stem(&self.session_id), self.prefix)
+    }
+}
+
+/// ファイル名のうち会話の id を潰した部分 ([`Series::stem`] の `.` より前)。
+///
+/// 潰すので、違う会話が同じ名前になりうる。名前で候補を絞った後は、中の
+/// `session_id` で確かめる ([`Store::load_meta_of`])。
+fn session_stem(session_id: &str) -> String {
+    let cleaned: String = session_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_owned()
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -109,6 +138,23 @@ pub(super) fn is_ours(stem: &str) -> bool {
         && session
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// 控えのファイル 1 つを読む。読めない・壊れているものは警告して飛ばす。
+fn read_kept<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    match std::fs::read(path).map(|raw| serde_json::from_slice::<T>(&raw)) {
+        Ok(Ok(kept)) => Some(kept),
+        Ok(Err(e)) => {
+            tracing::warn!(path = %path.display(), %e, "the kept request is unreadable; dropping it");
+            None
+        }
+        // 一覧を取ってから読むまでの間に畳まれた系列 (期限・pause・兄弟)。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), %e, "cannot read the kept request");
+            None
+        }
+    }
 }
 
 /// 系列の控えを置くディレクトリ 1 つ。
@@ -196,33 +242,55 @@ impl Store {
 
     /// 置いてある控えを全部読む。起動時に予定を張り直すために使う。
     pub fn load_all(&self) -> Vec<Kept> {
+        self.our_files()
+            .into_iter()
+            .filter_map(|(path, _)| read_kept(&path))
+            .collect()
+    }
+
+    /// この会話の控えを、本文を除いて読む (DR-0042)。無ければ空。
+    ///
+    /// 名前で候補を絞ってから、中の `session_id` が完全に一致するものだけを
+    /// 残す — 名前は会話の id を潰した形なので、違う会話が同じ名前に落ちる。
+    pub fn load_meta_of(&self, session_id: &str) -> Vec<KeptMeta> {
+        let wanted = session_stem(session_id);
+        self.our_files()
+            .into_iter()
+            .filter(|(_, stem)| {
+                stem.rsplit_once('.')
+                    .is_some_and(|(session, _)| session == wanted)
+            })
+            .filter_map(|(path, _)| read_kept::<KeptMeta>(&path))
+            .filter(|meta| meta.session_id == session_id)
+            .collect()
+    }
+
+    /// 置いてある控えを全部、本文を除いて読む (DR-0042)。`ns` を渡すと、
+    /// その面を通った系列だけを残す。
+    pub fn load_meta_all(&self, ns: Option<&str>) -> Vec<KeptMeta> {
+        self.our_files()
+            .into_iter()
+            .filter_map(|(path, _)| read_kept::<KeptMeta>(&path))
+            .filter(|meta| ns.is_none_or(|ns| meta.ns == ns))
+            .collect()
+    }
+
+    /// 自分が置いた形の名前を持つ控えのファイルと、その名前 (拡張子なし)。
+    fn our_files(&self) -> Vec<(PathBuf, String)> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return Vec::new();
         };
-        let mut all = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "json") {
-                continue;
-            }
-            if path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_none_or(|stem| !is_ours(stem))
-            {
-                continue;
-            }
-            match std::fs::read(&path).map(|raw| serde_json::from_slice::<Kept>(&raw)) {
-                Ok(Ok(kept)) => all.push(kept),
-                Ok(Err(e)) => {
-                    tracing::warn!(path = %path.display(), %e, "the kept request is unreadable; dropping it");
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "json") {
+                    return None;
                 }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), %e, "cannot read the kept request");
-                }
-            }
-        }
-        all
+                let stem = path.file_stem()?.to_str()?.to_owned();
+                is_ours(&stem).then_some((path, stem))
+            })
+            .collect()
     }
 
     /// この系列の控えを書く。大きすぎる本文は**持たない** (= 延命しない)。
@@ -463,5 +531,59 @@ mod tests {
         store.remove(&series("s-1"));
         assert_eq!(store.load(&series("s-1")), None);
         store.remove(&series("s-1"));
+    }
+
+    /// 本文を除いた読み方でも、本文以外の欄は書いたとおりに読み戻る。
+    #[test]
+    fn the_fields_beside_the_body_read_back_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let written = kept("s-1", serde_json::json!({"messages": [{"role": "user"}]}));
+        store.save(&written);
+
+        assert_eq!(
+            store.load_meta_of("s-1"),
+            [KeptMeta {
+                session_id: written.session_id,
+                prefix: written.prefix,
+                ns: written.ns,
+                model: written.model,
+                route: written.route,
+                fires_at_ms: written.fires_at_ms,
+                expires_at_ms: written.expires_at_ms,
+                horizon_end_ms: written.horizon_end_ms,
+                since_ms: written.since_ms,
+                count: written.count,
+                cache_notice: written.cache_notice,
+            }]
+        );
+        assert_eq!(store.load_meta_of("s-2"), []);
+    }
+
+    /// 全件の読み方は面で絞れる。壊れたファイル・他人のファイルは飛ばす。
+    #[test]
+    fn every_kept_series_reads_back_by_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        store.save(&kept("s-1", serde_json::json!({"a": 1})));
+        let mut elsewhere = kept("s-2", serde_json::json!({"a": 2}));
+        elsewhere.ns = "other".to_owned();
+        store.save(&elsewhere);
+        std::fs::write(store.dir.join("s-3.deadbeef.json"), b"{ not json").unwrap();
+        std::fs::write(store.dir.join("127-0-0-1-11301.json"), b"{\"watched\":[]}").unwrap();
+
+        let sessions = |ns: Option<&str>| {
+            let mut sessions: Vec<String> = store
+                .load_meta_all(ns)
+                .into_iter()
+                .map(|meta| meta.session_id)
+                .collect();
+            sessions.sort();
+            sessions
+        };
+        assert_eq!(sessions(None), ["s-1", "s-2"]);
+        assert_eq!(sessions(Some("default")), ["s-1"]);
+        assert_eq!(sessions(Some("other")), ["s-2"]);
+        assert_eq!(sessions(Some("nowhere")), Vec::<String>::new());
     }
 }

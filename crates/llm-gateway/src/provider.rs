@@ -376,6 +376,11 @@ impl Preset {
         self.state.denials(now)
     }
 
+    /// このモデルに効いている上限の印の期限 (Unix 秒)。遅く開く方。
+    pub fn limited(&self, model: &str, now: i64) -> Option<i64> {
+        self.state.limited(model, now)
+    }
+
     /// 最後に観測した枠。
     pub fn quota(&self) -> Option<Snapshot> {
         self.state.quota()

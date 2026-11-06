@@ -40,7 +40,7 @@ use crate::events::{self, Events};
 pub mod store;
 pub mod uncached;
 
-pub use store::{Kept, Series};
+pub use store::{Kept, KeptMeta, Series};
 pub use uncached::{Dropped, Evidence, Uncached};
 
 /// 1 本送ってから、次に送り直すまでの時間。
@@ -126,6 +126,18 @@ impl Chain {
             0,
             since_ms + refresh_ms(),
             since_ms + horizon.as_millis() as i64,
+        )
+    }
+
+    /// 控えに書いてある連鎖 (DR-0042 の `cache_until` / `cache_until_count`)。
+    ///
+    /// [`Keepalive::chain`] と同じ見立てを、読み終えた控えから組む。
+    pub fn of_kept(kept: &KeptMeta) -> Self {
+        Self::laid_out(
+            kept.since_ms,
+            kept.count,
+            kept.fires_at_ms,
+            kept.horizon_end_ms,
         )
     }
 
@@ -434,6 +446,17 @@ impl Keepalive {
             kept.fires_at_ms,
             kept.horizon_end_ms,
         ))
+    }
+
+    /// この会話の控え (本文を除く、DR-0042)。控えが無ければ空。
+    pub fn kept_of(&self, session_id: &str) -> Vec<KeptMeta> {
+        self.store.load_meta_of(session_id)
+    }
+
+    /// 置いてある全系列の控え (本文を除く、DR-0042)。`ns` を渡すと、その面を
+    /// 通った系列だけ。
+    pub fn kept_all(&self, ns: Option<&str>) -> Vec<KeptMeta> {
+        self.store.load_meta_all(ns)
     }
 
     /// 予定を 1 つ置く。

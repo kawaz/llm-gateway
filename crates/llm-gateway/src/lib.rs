@@ -40,6 +40,7 @@ pub mod provider;
 pub mod quota;
 pub mod router;
 pub mod session;
+pub mod sessions;
 pub mod stats;
 pub mod status;
 mod statuspage_v2;

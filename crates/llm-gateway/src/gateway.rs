@@ -30,6 +30,7 @@ use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
 use crate::quota::{self, QuotaLimit, QuotaStore};
 use crate::router::{Crossing, NamespaceView, Route, Router, Selection, ThinkingSession};
 use crate::session;
+use crate::sessions;
 use crate::stats::{self, Stats};
 use crate::thinking_sources::ThinkingSources;
 use crate::{Error, Result};
@@ -1578,6 +1579,96 @@ impl<P: CredentialPersistence> Gateway<P> {
     pub fn pause_keepalive(&self, session_id: &str) {
         info!(session = session_id, "pausing the cache keepalive");
         self.keepalive.pause(session_id);
+    }
+
+    /// この会話の cache / keepalive の状態 (DR-0042 決定 1)。
+    ///
+    /// 控えと経路の印を写すだけで、期限や経路の判定はしない。控えの無い会話は
+    /// `series` が空。
+    pub async fn session(&self, session_id: &str) -> sessions::SessionReport {
+        let series = self
+            .series_reports(self.keepalive.kept_of(session_id))
+            .await
+            .into_iter()
+            .map(|(_, series)| series)
+            .collect();
+        sessions::SessionReport::new(session_id.to_owned(), series)
+    }
+
+    /// 控えのある会話の一覧 (DR-0042 決定 2)。`ns` を渡すと、その面を通った
+    /// 系列だけを残し、系列を持たなくなった会話は落とす。
+    pub async fn sessions(&self, ns: Option<&str>) -> sessions::SessionsReport {
+        let mut by_session: std::collections::BTreeMap<String, Vec<sessions::SeriesReport>> =
+            std::collections::BTreeMap::new();
+        for (session_id, series) in self.series_reports(self.keepalive.kept_all(ns)).await {
+            by_session.entry(session_id).or_default().push(series);
+        }
+        sessions::SessionsReport::new(
+            by_session
+                .into_iter()
+                .map(|(session_id, series)| sessions::SessionReport::new(session_id, series)),
+        )
+    }
+
+    /// 控えを、会話の id と系列の答えの組にする。
+    ///
+    /// 系列が試す経路は面とモデルで決まるので、同じ組は 1 回だけ引く。
+    async fn series_reports(
+        &self,
+        kept: Vec<keepalive::KeptMeta>,
+    ) -> Vec<(String, sessions::SeriesReport)> {
+        // 印は秒で持ち、答えに載る時刻はミリ秒 (usage の `denials` と同じ)。
+        let now_secs = now_unix();
+        let mut routes_by: HashMap<(String, String), Vec<sessions::RouteReport>> = HashMap::new();
+        let mut reports = Vec::with_capacity(kept.len());
+        for kept in kept {
+            let key = (kept.ns.clone(), kept.model.clone());
+            let routes = match routes_by.get(&key) {
+                Some(routes) => routes.clone(),
+                None => {
+                    let routes = self.series_routes(&kept.ns, &kept.model, now_secs).await;
+                    routes_by.insert(key, routes.clone());
+                    routes
+                }
+            };
+            let session_id = kept.session_id.clone();
+            reports.push((session_id, sessions::SeriesReport::new(kept, routes)));
+        }
+        reports
+    }
+
+    /// この面とモデルで試される経路を試す順に並べ、経路ごとに認証情報の名前と
+    /// このモデルに効く上限の印を添える (DR-0042 決定 1 の `routes`)。
+    ///
+    /// 面が設定から消えていれば空。経路の名前と印は同じ設定の世代から引く。
+    async fn series_routes(
+        &self,
+        ns_name: &str,
+        model: &str,
+        now_secs: i64,
+    ) -> Vec<sessions::RouteReport> {
+        let Some(ns) = self.namespace(ns_name) else {
+            return Vec::new();
+        };
+        let names = self.router.route_names(&ns, model).await;
+        let active = ns.active();
+        names
+            .into_iter()
+            .map(|name| sessions::RouteReport {
+                credential: active
+                    .config()
+                    .routes
+                    .get(&name)
+                    .and_then(|route| route.credential.clone()),
+                limited: active
+                    .preset(&name)
+                    .and_then(|preset| preset.limited(model, now_secs))
+                    .map(|until| sessions::Limited {
+                        until: crate::credential::time::to_unix_ms(until),
+                    }),
+                route: name,
+            })
+            .collect()
     }
 
     /// ns 認証 `jwt` の自動の鍵の入れ替えを始める (DR-0037 §3)。最初の 1 回は
@@ -9570,5 +9661,342 @@ models = ["n"]
                 .iter()
                 .all(|(_, as_text, dropped)| !as_text && !dropped)
         );
+    }
+
+    /// 会話の状態を問う試験 (DR-0042) の設定。
+    ///
+    /// `a` は認証情報を持つ経路、`b` は持たない経路 (relay)。面は `default` と
+    /// `other` の 2 つで、どちらも `m` を `a` → `b` の順に試す。
+    fn sessions_config(dir: &std::path::Path, url: &str) -> String {
+        format!(
+            r#"
+[stats]
+dir = "{dir}"
+
+[credentials.main]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "main"
+url = "{url}"
+models = ["m"]
+
+[routes.b]
+provider = "anthropic"
+url = "{url}"
+models = ["m"]
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a", "b"]
+
+[[ns.other.routing]]
+models = ["m"]
+routes = ["a", "b"]
+"#,
+            dir = dir.display(),
+        )
+    }
+
+    /// 答えに出てはならない本文の目印。
+    const KEPT_BODY_TEXT: &str = "the conversation itself must not leak";
+
+    /// 会話 `session` の系列 `prefix` の控え。起点 `since_ms` に実リクエストが
+    /// 来た直後の形 (送り直しは 0 本、期間は 8 時間)。
+    fn kept_at(session: &str, prefix: &str, ns: &str, since_ms: i64) -> keepalive::Kept {
+        keepalive::Kept {
+            session_id: session.to_owned(),
+            prefix: prefix.to_owned(),
+            ns: ns.to_owned(),
+            model: MODEL.to_owned(),
+            route: "a".to_owned(),
+            body: json!({"messages": [{"role": "user", "content": KEPT_BODY_TEXT}]}),
+            headers: vec![("anthropic-beta".to_owned(), KEPT_BODY_TEXT.to_owned())],
+            path: "/v1/messages".to_owned(),
+            query: None,
+            shape: RequestShape::Messages,
+            fires_at_ms: since_ms + 55 * 60 * 1000,
+            expires_at_ms: since_ms + (60 * 60 - 30) * 1000,
+            horizon_end_ms: since_ms + 8 * 60 * 60 * 1000,
+            since_ms,
+            count: 0,
+            cache_notice: Some(format!("notice-{prefix}")),
+        }
+    }
+
+    /// 控えを置いた gateway (DR-0042 の試験用)。
+    async fn sessions_gateway(dir: &std::path::Path, kept: &[keepalive::Kept]) -> Rig {
+        let store = keepalive::store::Store::new(dir);
+        for kept in kept {
+            assert!(store.save(kept), "the fixture is kept");
+        }
+        let up = FakeUpstream::always(200).await;
+        gateway(&sessions_config(dir, &up.url)).await
+    }
+
+    /// 1 つの会話の答えは、控えの欄と、控えから組んだ連鎖の見立てと、その系列が
+    /// 試す経路をそのまま写す。本文は載らない。
+    #[tokio::test]
+    async fn a_session_answer_copies_what_was_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let mut kept = kept_at("s-1", "2cf24dba", NS, since);
+        kept.count = 2;
+        kept.fires_at_ms = since + 3 * 55 * 60 * 1000 + 7_000;
+        let gw = sessions_gateway(dir.path(), &[kept]).await;
+
+        let answer = gw.session("s-1").await;
+        let json = serde_json::to_value(&answer).unwrap();
+
+        // 3 本目の予定から 8 時間の終わりまで、格子 (起点 + 55 分刻み) で
+        // あと 6 本 (終わりを跨ぐ 1 本まで)。連鎖は 2 + 1 + 6 = 9 本で、
+        // 9 本目が置く cache の終わりが `cache_until`。
+        let refresh = 55 * 60 * 1000;
+        assert_eq!(
+            json,
+            json!({
+                "session_id": "s-1",
+                "series": [{
+                    "prefix": "2cf24dba",
+                    "ns": NS,
+                    "model": MODEL,
+                    "route": "a",
+                    "cache_notice": "notice-2cf24dba",
+                    "cache_expires_at": since + (60 * 60 - 30) * 1000,
+                    "cache_since": since,
+                    "cache_count": 2,
+                    "next_keepalive_at": since + 3 * refresh + 7_000,
+                    "cache_until": since + 9 * refresh + 60 * 60 * 1000,
+                    "cache_until_count": 9,
+                    "routes": [
+                        {"route": "a", "credential": "main"},
+                        {"route": "b"},
+                    ],
+                }],
+            }),
+            "next_keepalive_at は格子でなく控えの予定、credential の無い経路は欄ごと出ない"
+        );
+        let text = json.to_string();
+        assert!(
+            !text.contains(KEPT_BODY_TEXT)
+                && !text.contains("\"body\"")
+                && !text.contains("\"headers\""),
+            "the kept body and headers never appear in the answer: {text}"
+        );
+    }
+
+    /// 控えの無い会話は、エラーではなく空の系列で答える。
+    #[tokio::test]
+    async fn a_session_without_kept_series_answers_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", NS, 1_785_600_000_000)],
+        )
+        .await;
+
+        assert_eq!(
+            serde_json::to_value(gw.session("s-2").await).unwrap(),
+            json!({"session_id": "s-2", "series": []})
+        );
+    }
+
+    /// 1 つの会話が持つ系列は全部並び、`cache_since` の新しい順。
+    ///
+    /// `cache_notice` を持たない古い控えでも、欄は `null` で出る。
+    #[tokio::test]
+    async fn every_series_of_a_session_is_listed_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let mut old = kept_at("s-1", "0000000a", NS, since);
+        old.cache_notice = None;
+        let gw = sessions_gateway(
+            dir.path(),
+            &[
+                old,
+                kept_at("s-1", "0000000c", NS, since + 2_000),
+                kept_at("s-1", "0000000b", NS, since + 1_000),
+                kept_at("s-2", "0000000d", NS, since + 3_000),
+            ],
+        )
+        .await;
+
+        let answer = gw.session("s-1").await;
+        let prefixes: Vec<&str> = answer.series.iter().map(|s| s.prefix.as_str()).collect();
+        assert_eq!(prefixes, ["0000000c", "0000000b", "0000000a"]);
+
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(
+            json["series"][2].get("cache_notice"),
+            Some(&Value::Null),
+            "the field is always there, null when the kept series predates it"
+        );
+    }
+
+    /// `routes` に載る印は上限 (`limited`) だけ。混雑 (`busy`) は印が付いて
+    /// いても載らない。上限が複数効いていれば遅く開く方。
+    #[tokio::test]
+    async fn only_a_limit_shows_on_the_routes_of_a_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", NS, 1_785_600_000_000)],
+        )
+        .await;
+        let now = now_unix();
+        let a = preset_of(&gw, "a");
+        a.deny(window_closed(now + 300), now);
+        a.deny(
+            Denial {
+                until: now + 600,
+                reason: Reason::Limited,
+                scope: Scope::Model(MODEL.to_owned()),
+            },
+            now,
+        );
+        preset_of(&gw, "b").deny(
+            Denial {
+                until: now + 60,
+                reason: Reason::Busy,
+                scope: Scope::Model(MODEL.to_owned()),
+            },
+            now,
+        );
+
+        let json = serde_json::to_value(gw.session("s-1").await).unwrap();
+        assert_eq!(
+            json["series"][0]["routes"],
+            json!([
+                {"route": "a", "credential": "main", "limited": {"until": (now + 600) * 1000}},
+                {"route": "b"},
+            ]),
+            "the later of the two limits, in Unix milliseconds; busy is not a limit"
+        );
+    }
+
+    /// 他のモデルにしか効かない上限の印は、この系列の経路には載らない。
+    #[tokio::test]
+    async fn a_limit_on_another_model_does_not_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", NS, 1_785_600_000_000)],
+        )
+        .await;
+        let now = now_unix();
+        preset_of(&gw, "a").deny(
+            Denial {
+                until: now + 600,
+                reason: Reason::Limited,
+                scope: Scope::Model("m-other".to_owned()),
+            },
+            now,
+        );
+        preset_of(&gw, "b").deny(
+            Denial {
+                until: now + 600,
+                reason: Reason::Limited,
+                scope: Scope::Models("m-*".to_owned()),
+            },
+            now,
+        );
+
+        let json = serde_json::to_value(gw.session("s-1").await).unwrap();
+        assert_eq!(
+            json["series"][0]["routes"],
+            json!([{"route": "a", "credential": "main"}, {"route": "b"}]),
+        );
+    }
+
+    /// 面が設定から消えた系列は、試す経路を持たない (`routes` は空)。
+    #[tokio::test]
+    async fn a_series_whose_namespace_is_gone_has_no_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", "gone", 1_785_600_000_000)],
+        )
+        .await;
+
+        let answer = gw.session("s-1").await;
+        assert_eq!(answer.series.len(), 1, "the kept series is still there");
+        assert_eq!(answer.series[0].routes, []);
+    }
+
+    /// 一覧は会話ごとに系列を束ね、先頭の系列の `cache_since` の新しい順。
+    /// `ns` で絞ると、その面の系列だけが残り、系列を持たなくなった会話は落ちる。
+    #[tokio::test]
+    async fn the_list_can_be_narrowed_to_a_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let gw = sessions_gateway(
+            dir.path(),
+            &[
+                kept_at("s-1", "0000000a", NS, since),
+                kept_at("s-1", "0000000b", "other", since + 4_000),
+                kept_at("s-2", "0000000c", "other", since + 3_000),
+                kept_at("s-3", "0000000d", NS, since + 2_000),
+            ],
+        )
+        .await;
+
+        let shape = |report: sessions::SessionsReport| -> Vec<(String, Vec<String>)> {
+            report
+                .sessions
+                .into_iter()
+                .map(|session| {
+                    (
+                        session.session_id,
+                        session.series.into_iter().map(|s| s.prefix).collect(),
+                    )
+                })
+                .collect()
+        };
+        let owned = |id: &str, prefixes: &[&str]| {
+            (
+                id.to_owned(),
+                prefixes.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(
+            shape(gw.sessions(None).await),
+            [
+                owned("s-1", &["0000000b", "0000000a"]),
+                owned("s-2", &["0000000c"]),
+                owned("s-3", &["0000000d"]),
+            ]
+        );
+        assert_eq!(
+            shape(gw.sessions(Some(NS)).await),
+            [owned("s-3", &["0000000d"]), owned("s-1", &["0000000a"])],
+            "s-1 is ordered by what is left of it; s-2 has nothing left and is dropped"
+        );
+        let json = serde_json::to_value(gw.sessions(Some("nowhere")).await).unwrap();
+        assert_eq!(json, json!({"sessions": []}));
+    }
+
+    /// 置き場の名前は会話の id の英数字以外を潰した形なので、違う会話が同じ
+    /// 名前に落ちうる。1 つの会話の答えには、その id の控えだけが載る。
+    #[tokio::test]
+    async fn a_session_id_folding_to_the_same_name_is_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let gw = sessions_gateway(
+            dir.path(),
+            &[
+                kept_at("a b", "0000000a", NS, since),
+                kept_at("a/b", "0000000b", NS, since),
+            ],
+        )
+        .await;
+
+        let prefixes = |answer: sessions::SessionReport| -> Vec<String> {
+            answer.series.into_iter().map(|s| s.prefix).collect()
+        };
+        assert_eq!(prefixes(gw.session("a b").await), ["0000000a"]);
+        assert_eq!(prefixes(gw.session("a/b").await), ["0000000b"]);
+        assert_eq!(prefixes(gw.session("a-b").await), Vec::<String>::new());
     }
 }
