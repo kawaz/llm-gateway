@@ -1015,6 +1015,18 @@ pub struct Server {
         with = "path_expand::serde_opt_path"
     )]
     pub binary_path: Option<PathBuf>,
+
+    /// 運用系の口を Unix domain socket でも出す先 (DR-0043 決定 7)。
+    ///
+    /// 運用者の CLI と curl が読む口で、`listen` と同じ Router を呼び手の署名の層なしで
+    /// 出す。相手は socket ファイルの権限と peer の uid で決まる。書かなければ
+    /// unit ごとの既定の置き場 ([`Server::unix_path`])。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "path_expand::serde_opt_path"
+    )]
+    pub unix: Option<PathBuf>,
 }
 
 impl Default for Server {
@@ -1023,9 +1035,54 @@ impl Default for Server {
             listen: default_listen(),
             disabled: false,
             binary_path: None,
+            unix: None,
         }
     }
 }
+
+impl Server {
+    /// unit `unit` の運用系の口。書かれていなければ制御口の隣
+    /// (`$XDG_STATE_HOME/llm-gateway/daemon/http/<unit>.sock`)。
+    ///
+    /// 既定が unit の名前で決まるのは、1 つの設定を土台 (`extends`) にして 2 台を
+    /// 走らせても socket を取り合わないため。台と CLI は同じ規則でここを引く。
+    pub fn unix_path(&self, unit: &str) -> PathBuf {
+        self.unix.clone().unwrap_or_else(|| {
+            gateway_core::daemon::protocol::operations_path(
+                &crate::daemon::protocol::operations_dir(),
+                unit,
+            )
+        })
+    }
+
+    /// `unix` を bind できる形か。相対パスは台と CLI で cwd が違うので同じ場所を
+    /// 指さず、`sun_path` に収まらない長さは bind も connect もできない。
+    fn check_unix(&self) -> Result<()> {
+        let Some(path) = &self.unix else {
+            return Ok(());
+        };
+        if !path.is_absolute() {
+            return Err(Error::Config(format!(
+                "[server] unix must be an absolute path, not `{}`; the unit and the CLI run in different directories",
+                path.display()
+            )));
+        }
+        let len = path.as_os_str().len();
+        if len > MAX_UNIX_PATH {
+            return Err(Error::Config(format!(
+                "[server] unix is {len} bytes long, but a socket path can be at most {MAX_UNIX_PATH} on this system: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Unix socket のパスの上限 (バイト)。`sockaddr_un.sun_path` から終端の NUL を除いた分
+/// (macOS 103、Linux 107)。`sun_path` は構造体の末尾の欄。
+const MAX_UNIX_PATH: usize = std::mem::size_of::<libc::sockaddr_un>()
+    - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+    - 1;
 
 /// 既定の待ち受け先。
 ///
@@ -1828,6 +1885,7 @@ impl Config {
         if let Some(reason) = refused.first() {
             return Err(Error::Config(format!("webhook destination {reason}")));
         }
+        self.server.check_unix()?;
         self.validate_callers()?;
         for (name, source) in &self.status.sources {
             if name.is_empty() {
@@ -2049,6 +2107,8 @@ impl Config {
             &self.server.disabled,
             &other.server.disabled,
         );
+        // 運用系の口の socket も起動時に bind する (DR-0043 決定 7)。
+        FixedChange::shown(c, "[server] unix", &self.server.unix, &other.server.unix);
         // credential の置き場は起動時に開く。
         FixedChange::shown(c, "[store]", &self.store, &other.store);
         // 集計の置き場と、送り直す役の上限 (keepalive の控え) は起動時に写す。
@@ -3616,6 +3676,58 @@ routes = ["a", "typo-here"]
             c.server.listen, "127.0.0.1:8402",
             "still remains as a queryable target"
         );
+    }
+
+    /// 運用系の口 (DR-0043 決定 7) は、書かなければ unit ごとの既定の置き場、書けば
+    /// その path。`~` は読み込んだ時点で開く。
+    #[test]
+    fn the_operations_socket_defaults_per_unit_and_can_be_written() {
+        let c = parse("").unwrap();
+        assert_eq!(c.server.unix, None);
+        let stable = c.server.unix_path("stable");
+        assert!(
+            stable.ends_with("llm-gateway/daemon/http/stable.sock"),
+            "{}",
+            stable.display()
+        );
+        assert_ne!(stable, c.server.unix_path("unstable"));
+
+        let home = std::env::var("HOME").expect("tests run with a home");
+        let c = parse("[server]\nunix = \"~/gw.sock\"\n").unwrap();
+        assert_eq!(
+            c.server.unix_path("stable"),
+            PathBuf::from(format!("{home}/gw.sock"))
+        );
+    }
+
+    /// `unix` は bind できる形でなければ `check` で断る: 相対パス (台と CLI で cwd が
+    /// 違う) と、`sun_path` に収まらない長さ。上限ちょうどは通す。
+    #[test]
+    fn an_operations_socket_path_that_cannot_be_bound_is_refused() {
+        let e = parse("[server]\nunix = \"gw.sock\"\n").unwrap_err();
+        assert!(e.to_string().contains("absolute"), "{e}");
+
+        let at_limit = format!("/{}", "a".repeat(MAX_UNIX_PATH - 1));
+        parse(&format!("[server]\nunix = \"{at_limit}\"\n")).unwrap();
+
+        let too_long = format!("/{}", "a".repeat(MAX_UNIX_PATH));
+        let e = parse(&format!("[server]\nunix = \"{too_long}\"\n")).unwrap_err();
+        let said = e.to_string();
+        assert!(said.contains("[server] unix"), "{said}");
+        assert!(said.contains(&format!("at most {MAX_UNIX_PATH}")), "{said}");
+    }
+
+    /// `unix` は起動時に bind するので、読み直しでは変えられない。
+    #[test]
+    fn the_operations_socket_is_fixed_at_start() {
+        let before = parse("").unwrap();
+        let after = parse("[server]\nunix = \"/run/gw.sock\"\n").unwrap();
+        let said: Vec<String> = before
+            .fixed_at_start_changes(&after)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(said, ["[server] unix changed (unset -> /run/gw.sock)"]);
     }
 
     #[test]

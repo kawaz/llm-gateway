@@ -320,6 +320,19 @@ pub fn control_path(dir: &Path, unit: &str) -> PathBuf {
     dir.join(format!("{unit}.sock"))
 }
 
+/// 子の運用系の口 (HTTP を Unix socket で出すもの、DR-0043 決定 7) の既定の置き場。
+///
+/// 制御口と同じく状態ディレクトリと unit の名前で決まるが、ディレクトリは分ける。
+/// 制御口は台の挙動を変える口、こちらは読み出しの口で、置き場でも混ぜない。
+pub fn operations_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("daemon").join("http")
+}
+
+/// 1 台ぶんの運用系の口。
+pub fn operations_path(dir: &Path, unit: &str) -> PathBuf {
+    dir.join(format!("{unit}.sock"))
+}
+
 /// 頼んで、1 行の答えを受け取る。
 pub async fn ask<T: Serialize>(socket: &Path, request: &T) -> std::io::Result<String> {
     let stream = UnixStream::connect(socket).await?;

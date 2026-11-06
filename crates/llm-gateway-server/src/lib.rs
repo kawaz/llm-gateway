@@ -34,7 +34,28 @@ use tokio::sync::broadcast::error::RecvError;
 /// メモリを食い潰されないため。
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
+pub mod socket;
+
+/// どの口で出す Router か。違うのは運用系の口に呼び手の署名を求めるかだけ (DR-0043 決定 7)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// `[server] listen` の TCP。Caddy 越しに外の呼び手も読むので、`[callers]` があれば署名を求める。
+    Tcp,
+    /// `[server] unix` の socket。相手は socket の権限と peer の uid で決まり
+    /// ([`socket::OperationsSocket`])、署名の層を掛けない。
+    Unix,
+}
+
+/// TCP の口の Router。
 pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> Router {
+    router_for(gateway, Transport::Tcp)
+}
+
+/// `transport` の口で出す Router。道筋と handler は口に関わらず同じ。
+pub fn router_for<P: CredentialPersistence + 'static>(
+    gateway: Arc<Gateway<P>>,
+    transport: Transport,
+) -> Router {
     Router::new()
         // namespace 付き。`/ns-personal/v1/messages` のように使う。
         .route("/{ns}/v1/messages", post(messages))
@@ -51,7 +72,7 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/version", get(version))
         .route("/llm-gateway/self", get(self_report))
-        .merge(callers_only(Arc::clone(&gateway)))
+        .merge(callers_only(Arc::clone(&gateway), transport))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
@@ -68,22 +89,27 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
 /// `login*` は監督者とブラウザが問う口なので、ここに入れない。
 ///
 /// 確かめるのは handler ごとでなく層にする: pause の `Json` のような extractor より先に
-/// 断り、求める口の一覧をこの 1 か所に置くため。
+/// 断り、求める口の一覧をこの 1 か所に置くため。層を掛けるかの切り替えもここだけで、
+/// Unix socket の口 ([`Transport::Unix`]) では同じ道筋を層なしで出す。
 fn callers_only<P: CredentialPersistence + 'static>(
     gateway: Arc<Gateway<P>>,
+    transport: Transport,
 ) -> Router<Arc<Gateway<P>>> {
-    Router::new()
+    let routes = Router::new()
         .route("/llm-gateway/usage", get(usage))
         .route("/llm-gateway/status", get(status))
         .route("/llm-gateway/stats", get(stats))
         .route("/llm-gateway/events", get(events))
         .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
         .route("/llm-gateway/sessions", get(sessions))
-        .route("/llm-gateway/sessions/{session_id}", get(session))
-        .route_layer(axum::middleware::from_fn_with_state(
+        .route("/llm-gateway/sessions/{session_id}", get(session));
+    match transport {
+        Transport::Tcp => routes.route_layer(axum::middleware::from_fn_with_state(
             gateway,
             require_caller::<P>,
-        ))
+        )),
+        Transport::Unix => routes,
+    }
 }
 
 /// 401 の本文。署名し直せば通りうる段 (署名、未知の `kid`、期限切れ、`jti` の再利用、
@@ -6361,6 +6387,70 @@ mod callers_tests {
                 assert_eq!(resp.status(), 200, "{method} {path} with {token:?}");
             }
         }
+    }
+
+    /// 同じ unit の Router を Unix socket の口 (DR-0043 決定 7) でも出し、その socket を
+    /// 読む client を返す。
+    async fn serve_unix(
+        gateway: Arc<Gateway<StaticStore>>,
+        path: &std::path::Path,
+    ) -> reqwest::Client {
+        let socket = socket::OperationsSocket::bind(path).unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                socket,
+                router_for(gateway, Transport::Unix).into_make_service(),
+            )
+            .await;
+        });
+        reqwest::Client::builder()
+            .unix_socket(path.to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    /// `[callers]` のある unit でも、Unix socket の口は署名を求めない。同じ unit の
+    /// TCP の口は未署名を 401 で断ったまま。
+    #[tokio::test]
+    async fn the_unix_socket_serves_operations_without_a_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, gateway) = serve_callers(dir.path(), true).await;
+        let client = serve_unix(gateway, &dir.path().join("gw.sock")).await;
+
+        for path in [
+            "/llm-gateway/usage",
+            "/llm-gateway/sessions",
+            "/llm-gateway/sessions/s-1",
+            "/llm-gateway/events",
+            "/llm-gateway/status",
+            "/llm-gateway/stats?days=1",
+        ] {
+            let resp = client
+                .get(format!("http://localhost{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "unix socket: GET {path}");
+            assert!(resp.headers().get("www-authenticate").is_none(), "{path}");
+
+            let unsigned = call(&base, "GET", path, None).await;
+            refused(unsigned, Unsigned, &format!("tcp: GET {path}")).await;
+        }
+        let pause = client
+            .post("http://localhost/llm-gateway/keepalive/pause")
+            .json(&json!({"session_id": "s-1"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pause.status(), 200, "unix socket: pause");
+
+        // 署名の層が無いだけで、道筋は同じ (監督者の口も、転送の口も生えている)。
+        let healthz = client
+            .get("http://localhost/llm-gateway/healthz")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(healthz.status(), 200);
     }
 
     /// 運用系の口は namespace の下に生えない。署名の有無に関わらず 404 のまま。

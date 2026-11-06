@@ -1002,6 +1002,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "gateway-core",
+ "libc",
  "llm-gateway",
  "reqwest",
  "serde",

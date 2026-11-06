@@ -26,6 +26,8 @@ futures-util = { workspace = true }
 # 運用系の口の呼び手を断った段 (DR-0043) を、応答の種類に分けてログに出す。
 # 置き場の試験用実装が返す汎用層の Result もここから引く。
 gateway-core = { path = "../gateway-core", version = "0.69" }
+# 運用系の口の socket に繋いできた相手が自分と同じ uid かを比べる (`geteuid`、DR-0043 決定 7)。
+libc = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }

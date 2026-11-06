@@ -28,6 +28,11 @@ pub mod protocol {
         gateway_core::daemon::protocol::control_dir(&crate::config::default_state_dir())
     }
 
+    /// 台ごとの運用系の口が並ぶ場所 (DR-0043 決定 7)。
+    pub fn operations_dir() -> PathBuf {
+        gateway_core::daemon::protocol::operations_dir(&crate::config::default_state_dir())
+    }
+
     /// 子が書いたものの置き場。
     pub fn log_dir() -> PathBuf {
         gateway_core::daemon::protocol::log_dir(&crate::config::default_state_dir())
@@ -50,6 +55,19 @@ pub mod protocol {
                 "{}",
                 log_dir().display()
             );
+        }
+
+        /// 運用系の口は制御口の隣のディレクトリに、unit の名前で並ぶ。
+        #[test]
+        fn the_operations_socket_sits_beside_the_control_sockets() {
+            let path = gateway_core::daemon::protocol::operations_path(&operations_dir(), "stable");
+            assert!(
+                path.ends_with("llm-gateway/daemon/http/stable.sock"),
+                "{}",
+                path.display()
+            );
+            assert_eq!(operations_dir().parent(), control_dir().parent());
+            assert_ne!(operations_dir(), control_dir());
         }
     }
 }
