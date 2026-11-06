@@ -157,7 +157,7 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 
 - `llm-gateway-server` の決定 2 の口に、`[callers]` が空でない時だけ効く検証の層が入る (`Authorization` の Bearer → 決定 4 の順序)。検証の部品 (compact JWS の parse、ed25519-dalek、JWK の読み込み) は `ns/jwt.rs` から借り、`typ` / `aud` / `jti` の扱いは本 DR の形で別に組む (`JwtAuth` は ns の token 用で `max_ttl` と `sub` を見る)
 - `config::Config` に `callers: BTreeMap<String, Caller>` (`jwks_url` / `jwks_file` / `iss`) が増え、`check` が決定 6 の組み合わせを断る。`daemon reload` で差し替えられる
-- 呼び手ごとの鍵キャッシュ (`jwks_url` → JWKS、最後の成功時刻、最後の再取得時刻) と、unit ごとの `jti` の集合 (`jti` を付けた token だけ、`exp` を過ぎたら掃く、上限 65,536 で満杯なら検証を飛ばす) がプロセスのメモリに増える。取得用の reqwest Client が 1 つ増える
+- 呼び手ごとの鍵キャッシュ (`jwks_url` → JWKS、最後の成功時刻、最後の再取得時刻) と、unit ごとの `jti` の集合 (`jti` を付けた token だけ、`exp` を過ぎたら掃く、上限 65,536 で満杯なら照合だけして記録を飛ばす) がプロセスのメモリに増える。取得用の reqwest Client が 1 つ増える
 - 401 / 400 の応答と `WWW-Authenticate` が運用系の口に初めて現れる。MANUAL の「Operations」の冒頭 (「None of them carry authentication」) を決定 2 / 6 の形に書き換え、`[callers]` の節と、呼び手が token を作る手順 (claims の形、`auth sign` での手動確認) を足す
 - `llm-gateway-cli` の `usage` / `stats` / `upstream status` に `--caller <name>` と署名の経路が増え、署名できる呼び手が無ければ `caller_required` で断る。`auth sign` の扱いは未決
 - Caddy の設定: 外へ通す path に、署名を求める口のうち外の呼び手が読むもの (`/llm-gateway/sessions*`、使うなら `/llm-gateway/keepalive/pause`) が加わる。求めない口 (`healthz` / `version` / `self` / `login*`) と、外の呼び手が読まない口は通さない (決定 2)
