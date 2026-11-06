@@ -227,31 +227,27 @@ impl RouteState {
     /// 使えるようになるのは全部が開いた時なので、早い方を返すとまだ塞がって
     /// いる経路を「もう開く」と伝えることになる。
     pub fn denial(&self, model: &str, now: i64) -> Option<Denial> {
-        self.latest_covering(model, now, |_| true)
+        self.latest_covering(model, |denial| denial.until > now)
     }
 
-    /// このモデルに上限の印 ([`Reason::Limited`]) が効いているなら、その期限
-    /// (Unix 秒)。複数効いていれば遅く開く方 ([`Self::denial`] と同じ規則)。
+    /// このモデルに効く上限の印 ([`Reason::Limited`]) の期限 (Unix 秒)。
+    /// 複数効いていれば遅く開く方 ([`Self::denial`] と同じ規則)。
     ///
     /// 会話の状態の答え (DR-0042) が「隣のレーンがいつ戻るか」だけを出すための
-    /// 口。混雑・組織の断りは、ここでは見ない。
-    pub fn limited(&self, model: &str, now: i64) -> Option<i64> {
-        self.latest_covering(model, now, |reason| reason == Reason::Limited)
+    /// 口。混雑・組織の断りは、ここでは見ない。**期限は見ない** — 答えは印の
+    /// 写しで、期限が過ぎているかは読む側が壁時計と比べる (DR-0042 決定 1)。
+    /// 期限の過ぎた印も、次に印を付け直すときに掃除されるまでは写る。
+    pub fn limited(&self, model: &str) -> Option<i64> {
+        self.latest_covering(model, |denial| denial.reason == Reason::Limited)
             .map(|denial| denial.until)
     }
 
-    /// このモデルに効く印のうち、理由が `wanted` に当てはまって最も遅く開くもの。
-    fn latest_covering(
-        &self,
-        model: &str,
-        now: i64,
-        wanted: impl Fn(Reason) -> bool,
-    ) -> Option<Denial> {
+    /// このモデルに効く印のうち、`wanted` に当てはまって最も遅く開くもの。
+    fn latest_covering(&self, model: &str, wanted: impl Fn(&Denial) -> bool) -> Option<Denial> {
         self.marks()
             .iter()
-            .filter(|(scope, denial)| scope.covers(model) && wanted(denial.reason))
+            .filter(|(scope, denial)| scope.covers(model) && wanted(denial))
             .map(|(_, denial)| denial.clone())
-            .filter(|d| d.until > now)
             .max_by_key(|d| d.until)
     }
 

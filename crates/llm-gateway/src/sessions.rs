@@ -129,3 +129,71 @@ impl SessionsReport {
         Self { sessions }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn series(prefix: &str, cache_since: i64) -> SeriesReport {
+        SeriesReport {
+            prefix: prefix.to_owned(),
+            ns: "default".to_owned(),
+            model: "m".to_owned(),
+            route: "a".to_owned(),
+            cache_notice: None,
+            cache_expires_at: cache_since + 3_570_000,
+            cache_since,
+            cache_count: 0,
+            next_keepalive_at: cache_since + 3_300_000,
+            cache_until: cache_since + 6_900_000,
+            cache_until_count: 1,
+            routes: Vec::new(),
+        }
+    }
+
+    fn prefixes(report: &SessionReport) -> Vec<&str> {
+        report.series.iter().map(|s| s.prefix.as_str()).collect()
+    }
+
+    /// 系列は `cache_since` の降順、同じ時刻なら `prefix` の昇順。渡された順に
+    /// 依らない。
+    #[test]
+    fn series_are_ordered_newest_first_then_by_prefix() {
+        for given in [["c", "a", "d", "b"], ["b", "d", "a", "c"]] {
+            let since = |prefix: &str| if prefix == "d" { 2 } else { 1 };
+            let report = SessionReport::new(
+                "s".to_owned(),
+                given.iter().map(|p| series(p, since(p))).collect(),
+            );
+            assert_eq!(prefixes(&report), ["d", "a", "b", "c"], "given {given:?}");
+        }
+    }
+
+    /// 会話は先頭の系列の `cache_since` の降順、同じ時刻なら `session_id` の
+    /// 昇順。系列の無い会話は落ちる。
+    #[test]
+    fn sessions_are_ordered_by_their_newest_series_then_by_id() {
+        let session = |id: &str, since: Option<i64>| {
+            SessionReport::new(
+                id.to_owned(),
+                since.map(|since| series("p", since)).into_iter().collect(),
+            )
+        };
+        for given in [
+            ["s-c", "s-a", "s-d", "s-b", "s-empty"],
+            ["s-empty", "s-b", "s-d", "s-a", "s-c"],
+        ] {
+            let report = SessionsReport::new(given.iter().map(|id| match *id {
+                "s-d" => session(id, Some(2)),
+                "s-empty" => session(id, None),
+                _ => session(id, Some(1)),
+            }));
+            let ids: Vec<&str> = report
+                .sessions
+                .iter()
+                .map(|s| s.session_id.as_str())
+                .collect();
+            assert_eq!(ids, ["s-d", "s-a", "s-b", "s-c"], "given {given:?}");
+        }
+    }
+}

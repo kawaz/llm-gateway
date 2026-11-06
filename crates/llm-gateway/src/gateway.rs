@@ -1617,8 +1617,6 @@ impl<P: CredentialPersistence> Gateway<P> {
         &self,
         kept: Vec<keepalive::KeptMeta>,
     ) -> Vec<(String, sessions::SeriesReport)> {
-        // 印は秒で持ち、答えに載る時刻はミリ秒 (usage の `denials` と同じ)。
-        let now_secs = now_unix();
         let mut routes_by: HashMap<(String, String), Vec<sessions::RouteReport>> = HashMap::new();
         let mut reports = Vec::with_capacity(kept.len());
         for kept in kept {
@@ -1626,7 +1624,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             let routes = match routes_by.get(&key) {
                 Some(routes) => routes.clone(),
                 None => {
-                    let routes = self.series_routes(&kept.ns, &kept.model, now_secs).await;
+                    let routes = self.series_routes(&kept.ns, &kept.model).await;
                     routes_by.insert(key, routes.clone());
                     routes
                 }
@@ -1641,12 +1639,8 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// このモデルに効く上限の印を添える (DR-0042 決定 1 の `routes`)。
     ///
     /// 面が設定から消えていれば空。経路の名前と印は同じ設定の世代から引く。
-    async fn series_routes(
-        &self,
-        ns_name: &str,
-        model: &str,
-        now_secs: i64,
-    ) -> Vec<sessions::RouteReport> {
+    /// 印は期限が過ぎていても写す — 判定は読む側が壁時計で行う (DR-0042 決定 1)。
+    async fn series_routes(&self, ns_name: &str, model: &str) -> Vec<sessions::RouteReport> {
         let Some(ns) = self.namespace(ns_name) else {
             return Vec::new();
         };
@@ -1662,7 +1656,8 @@ impl<P: CredentialPersistence> Gateway<P> {
                     .and_then(|route| route.credential.clone()),
                 limited: active
                     .preset(&name)
-                    .and_then(|preset| preset.limited(model, now_secs))
+                    .and_then(|preset| preset.limited(model))
+                    // 印は秒で持ち、答えに載る時刻はミリ秒 (usage の `denials` と同じ)。
                     .map(|until| sessions::Limited {
                         until: crate::credential::time::to_unix_ms(until),
                     }),
@@ -9907,6 +9902,71 @@ routes = ["a", "b"]
             json["series"][0]["routes"],
             json!([{"route": "a", "credential": "main"}, {"route": "b"}]),
         );
+    }
+
+    /// 期限の過ぎた上限の印も、残っている限りそのまま写す。
+    ///
+    /// 答えは印の写しで、問われた時点での判定はしない (DR-0042 決定 1)。過ぎて
+    /// いるかは読む側が `limited.until` を壁時計と比べて決める。
+    #[tokio::test]
+    async fn a_limit_past_its_time_is_still_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = sessions_gateway(
+            dir.path(),
+            &[kept_at("s-1", "2cf24dba", NS, 1_785_600_000_000)],
+        )
+        .await;
+        let now = now_unix();
+        // 100 秒前に付き、10 秒前に期限が過ぎた印。
+        preset_of(&gw, "a").deny(window_closed(now - 10), now - 100);
+        // 期限ちょうどの印も同じ。
+        preset_of(&gw, "b").deny(window_closed(now), now - 100);
+
+        let json = serde_json::to_value(gw.session("s-1").await).unwrap();
+        assert_eq!(
+            json["series"][0]["routes"],
+            json!([
+                {"route": "a", "credential": "main", "limited": {"until": (now - 10) * 1000}},
+                {"route": "b", "limited": {"until": now * 1000}},
+            ]),
+        );
+    }
+
+    /// 同じ `cache_since` の系列は `prefix` の昇順、先頭の系列の `cache_since` が
+    /// 同じ会話は `session_id` の昇順。置き場を読む順に依らず、並びは毎回同じ。
+    #[tokio::test]
+    async fn ties_are_ordered_by_prefix_and_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = 1_785_600_000_000;
+        let gw = sessions_gateway(
+            dir.path(),
+            &[
+                kept_at("s-b", "0000000c", NS, since),
+                kept_at("s-b", "0000000a", NS, since),
+                kept_at("s-b", "0000000b", NS, since),
+                kept_at("s-c", "0000000d", NS, since),
+                kept_at("s-a", "0000000e", NS, since),
+            ],
+        )
+        .await;
+
+        let prefixes: Vec<String> = gw
+            .session("s-b")
+            .await
+            .series
+            .into_iter()
+            .map(|s| s.prefix)
+            .collect();
+        assert_eq!(prefixes, ["0000000a", "0000000b", "0000000c"]);
+
+        let sessions: Vec<String> = gw
+            .sessions(None)
+            .await
+            .sessions
+            .into_iter()
+            .map(|session| session.session_id)
+            .collect();
+        assert_eq!(sessions, ["s-a", "s-b", "s-c"]);
     }
 
     /// 面が設定から消えた系列は、試す経路を持たない (`routes` は空)。

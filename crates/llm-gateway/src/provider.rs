@@ -376,9 +376,10 @@ impl Preset {
         self.state.denials(now)
     }
 
-    /// このモデルに効いている上限の印の期限 (Unix 秒)。遅く開く方。
-    pub fn limited(&self, model: &str, now: i64) -> Option<i64> {
-        self.state.limited(model, now)
+    /// このモデルに効く上限の印の期限 (Unix 秒)。遅く開く方。期限が過ぎて
+    /// いるかは見ない ([`RouteState::limited`])。
+    pub fn limited(&self, model: &str) -> Option<i64> {
+        self.state.limited(model)
     }
 
     /// 最後に観測した枠。
