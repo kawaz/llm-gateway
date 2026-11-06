@@ -401,7 +401,7 @@ async fn session<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(session_id): AxumPath<String>,
 ) -> Response {
-    // 控えの読み出しは同期のファイル I/O だが、pause と同じく handler の中で待つ (問われるのは hook のたびに 1 回、答えは経路の名前を引く async なので spawn_blocking に包むと中で block_on が要る)。
+    // 控えの読み出し (同期のファイル I/O) は Keepalive が blocking の枠へ出すので、ここで待っても転送や予定を回す worker は塞がない。
     json_utf8(Json(gateway.session(&session_id).await))
 }
 
@@ -415,7 +415,7 @@ async fn sessions<P: CredentialPersistence + 'static>(
     request: Request,
 ) -> Response {
     let ns = requested_ns(request.uri().query());
-    // 置き場の全件を同期で読む。session と同じく handler の中で待つ (使い手は daemon の再起動と webui の初期表示)。
+    // 全件の読み出しも session と同じく blocking の枠で行われる。
     json_utf8(Json(gateway.sessions(ns.as_deref()).await))
 }
 

@@ -640,7 +640,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
 ]}
 ```
 
-`series` には控えた系列が 1 系列 1 要素で、`cache_since` の新しい順に並ぶ。1 つの会話が複数の系列を持つことがある (`sub = "keepalive"` の面で main と並ぶ subagent の種類、`system` 先頭ブロックが変わった後の新旧)。`routes` 以外の欄は必ず出る。欄の名前は [`/llm-gateway/events`](#get-llm-gatewayevents) の `request` の知らせと [`/llm-gateway/usage`](#get-llm-gatewayusage) の `denials` と同じ意味。
+`series` には控えた系列が 1 系列 1 要素で、`cache_since` の新しい順に並ぶ。1 つの会話が複数の系列を持つことがある (`sub = "keepalive"` の面で main と並ぶ subagent の種類、`system` 先頭ブロックが変わった後の新旧)。欄は `routes` も含めて必ず出る (`routes` は空の配列のことがある)。当てはまらない時に欄ごと出ないのは `routes` の中の `credential` と `limited` だけ。欄の名前は [`/llm-gateway/events`](#get-llm-gatewayevents) の `request` の知らせと [`/llm-gateway/usage`](#get-llm-gatewayusage) の `denials` と同じ意味。
 
 | 欄 | 意味 |
 |---|---|
@@ -655,7 +655,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
 | `cache_until` / `cache_until_count` | 送り直しで継ぎ足せる終わりと、連鎖で送る総数 (知らせと同じ見立て) |
 | `routes` | この系列の `ns` と `model` で試される経路を試す順に、経路ごとに `{route, credential?, limited?}`。`credential` は認証情報の名前で、持たない経路 (relay) では出ない。`limited` はその経路にこの `model` に効く上限の印が付いている間だけ出て、`until` は再び候補になる時刻 (複数効くなら遅い方)。混雑と `org_not_allowed` の印はここに載らない (usage の `denials` で読む) |
 
-`routes[].limited` は**この unit の**印で、兄弟の unit とは違いうる。それ以外は控えから組むので、置き場を共有する unit ならどれに問うても同じ。`routes` が空になるのは、その namespace にそのモデルを扱える経路がもう無い時だけ。
+`routes` は**この unit の**今の設定 (どの経路をどの順に試すか、`credential`) と印 (`limited`。兄弟の unit とは違いうる) から組む。それ以外の欄は控えから組むので、置き場を共有する unit ならどれに問うても同じ。`routes` が空になるのは、その namespace にそのモデルを扱える経路がもう無い時だけ。
 
 `{"session_id":"…","series":[]}` (200) は「この会話について gateway は何も送り直していない」という答え。gateway が知っているのは控えだけなので、知らない会話と、`keepalive` 戦略の無い面の会話・道具を持たない 1 本だけの会話・pause した会話・cache か `keepalive_horizon` が尽きた会話を区別しない。エラーではなく状態。
 
@@ -677,7 +677,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
 {"sessions":[{"session_id":"0f3c6d1a-…","series":[{…}]}, …]}
 ```
 
-置き場を共有する unit ならどれに問うても、`routes[].limited` を除いて同じ一覧になる。
+置き場を共有する unit ならどれに問うても同じ一覧になる。違いうるのは、各 unit が自分の設定と印から組む `routes` だけ。
 
 ## 再認証 (login)
 

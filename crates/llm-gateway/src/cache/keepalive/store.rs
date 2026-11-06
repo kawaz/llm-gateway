@@ -158,6 +158,7 @@ fn read_kept<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 /// 系列の控えを置くディレクトリ 1 つ。
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
 }

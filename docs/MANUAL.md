@@ -638,7 +638,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
 ]}
 ```
 
-`series` holds one entry per kept series, newest `cache_since` first. One conversation can hold several: a subagent kind beside the main agent under `sub = "keepalive"`, or an old and a new series after the first `system` block changed. Every field except `routes` is always present. Field names mean what they mean in the `request` notice of [`/llm-gateway/events`](#get-llm-gatewayevents) and in `denials` of [`/llm-gateway/usage`](#get-llm-gatewayusage).
+`series` holds one entry per kept series, newest `cache_since` first. One conversation can hold several: a subagent kind beside the main agent under `sub = "keepalive"`, or an old and a new series after the first `system` block changed. Every field is always present, `routes` included (it may be an empty array); within `routes`, only `credential` and `limited` are omitted when they do not apply. Field names mean what they mean in the `request` notice of [`/llm-gateway/events`](#get-llm-gatewayevents) and in `denials` of [`/llm-gateway/usage`](#get-llm-gatewayusage).
 
 | Field | Meaning |
 |---|---|
@@ -653,7 +653,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
 | `cache_until` / `cache_until_count` | How far resends can carry the cache, and how many the chain sends in total (the same projection as the notices) |
 | `routes` | The routes this series' `ns` and `model` try, in the order they are tried, each `{route, credential?, limited?}`. `credential` is the credential name and is absent for a route without one (relay). `limited` appears only while the route carries a limit mark that applies to this `model`; `until` is when it becomes a candidate again (the later one if several apply). Busy and `org_not_allowed` marks are not listed here; `denials` in usage has them |
 
-`routes[].limited` is **this unit's** marks, which a sibling unit may not share; everything else comes from the kept requests, which all units sharing the directory read alike. `routes` is empty only when no route in that namespace serves that model any more.
+`routes` is drawn from **this unit's** current configuration (which routes, in what order, with which `credential`) and its marks (`limited`, which a sibling unit may not share). Every other field comes from the kept requests, which all units sharing the directory read alike. `routes` is empty only when no route in that namespace serves that model any more.
 
 `{"session_id":"…","series":[]}` with 200 means the gateway is resending nothing for that conversation. The gateway knows only what it keeps, so it cannot tell an unknown conversation from one in a namespace without a `keepalive` strategy, a single call without tools, a paused one, or one whose cache or `keepalive_horizon` ran out. It is a state, not an error.
 
@@ -675,7 +675,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
 {"sessions":[{"session_id":"0f3c6d1a-…","series":[{…}]}, …]}
 ```
 
-Any unit sharing the keepalive directory gives the same list, except for `routes[].limited`.
+Any unit sharing the keepalive directory gives the same list, except for `routes`, which each unit draws from its own configuration and marks.
 
 ## Re-authorization (login)
 

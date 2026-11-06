@@ -449,14 +449,18 @@ impl Keepalive {
     }
 
     /// この会話の控え (本文を除く、DR-0042)。控えが無ければ空。
-    pub fn kept_of(&self, session_id: &str) -> Vec<KeptMeta> {
-        self.store.load_meta_of(session_id)
+    pub async fn kept_of(&self, session_id: &str) -> Vec<KeptMeta> {
+        let store = self.store.clone();
+        let session_id = session_id.to_owned();
+        off_runtime(move || store.load_meta_of(&session_id)).await
     }
 
     /// 置いてある全系列の控え (本文を除く、DR-0042)。`ns` を渡すと、その面を
     /// 通った系列だけ。
-    pub fn kept_all(&self, ns: Option<&str>) -> Vec<KeptMeta> {
-        self.store.load_meta_all(ns)
+    pub async fn kept_all(&self, ns: Option<&str>) -> Vec<KeptMeta> {
+        let store = self.store.clone();
+        let ns = ns.map(str::to_owned);
+        off_runtime(move || store.load_meta_all(ns.as_deref())).await
     }
 
     /// 予定を 1 つ置く。
@@ -732,6 +736,22 @@ struct NoSender;
 impl Sender for NoSender {
     fn send<'a>(&'a self, _kept: &'a Kept) -> BoxFuture<'a, Outcome> {
         Box::pin(async { Outcome::Unsent })
+    }
+}
+
+/// 置き場の読み出しを、転送や予定を回す worker の外 (blocking の枠) で行う。
+///
+/// 問われるたびに置き場を `read_dir` し、1 系列 8MB までの控えを読んで欄を
+/// 取り出す (一覧なら全系列)。worker の上で同期に読むと、並んだ問い合わせが
+/// worker を塞いで転送や送り直しの予定を遅らせる。
+///
+/// 読み出しの中の panic は、呼び手の上でそのまま panic として続ける (worker の
+/// 上で同期に読んでいた時と同じ現れ方)。
+async fn off_runtime<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(read).await {
+        Ok(value) => value,
+        // 取り消しは runtime を畳む時だけ起き、その時は `into_panic` も panic する。
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
     }
 }
 

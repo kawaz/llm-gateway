@@ -1587,7 +1587,7 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// `series` が空。
     pub async fn session(&self, session_id: &str) -> sessions::SessionReport {
         let series = self
-            .series_reports(self.keepalive.kept_of(session_id))
+            .series_reports(self.keepalive.kept_of(session_id).await)
             .await
             .into_iter()
             .map(|(_, series)| series)
@@ -1600,7 +1600,7 @@ impl<P: CredentialPersistence> Gateway<P> {
     pub async fn sessions(&self, ns: Option<&str>) -> sessions::SessionsReport {
         let mut by_session: std::collections::BTreeMap<String, Vec<sessions::SeriesReport>> =
             std::collections::BTreeMap::new();
-        for (session_id, series) in self.series_reports(self.keepalive.kept_all(ns)).await {
+        for (session_id, series) in self.series_reports(self.keepalive.kept_all(ns).await).await {
             by_session.entry(session_id).or_default().push(series);
         }
         sessions::SessionsReport::new(
