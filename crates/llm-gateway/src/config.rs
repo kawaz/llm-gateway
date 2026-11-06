@@ -1867,8 +1867,12 @@ impl Config {
     }
 
     /// `[callers]` を確かめる (DR-0043 決定 6)。`jwks_url` へは取りに行かない。
+    ///
+    /// `iss` と `jwks_url` はどちらも呼び手ごとに 1 つ。同じ鍵束を 2 つの呼び手が指すと、
+    /// 片方の鍵でもう片方の `iss` を名乗った token が通り、鍵空間の分離が崩れる。
     fn validate_callers(&self) -> Result<()> {
         let mut issuers: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut key_sets: BTreeMap<&url::Url, &str> = BTreeMap::new();
         for (name, caller) in &self.callers {
             if !is_file_name_safe(name) {
                 return Err(Error::Config(format!(
@@ -1902,6 +1906,12 @@ impl Config {
             if let Some(other) = issuers.insert(iss, name) {
                 return Err(Error::Config(format!(
                     "[callers.{other}] and [callers.{name}] both use iss `{iss}`; give each caller its own iss"
+                )));
+            }
+            // URL は比べた形 (url の正規化の後) で同じかを見る。断る文に URL は出さない。
+            if let Some(other) = key_sets.insert(url, name) {
+                return Err(Error::Config(format!(
+                    "[callers.{other}] and [callers.{name}] have the same jwks_url; give each caller its own key set"
                 )));
             }
         }
@@ -3844,6 +3854,37 @@ jwks_url = "https://b.example/jwks.json"
         let err =
             parse("[callers.a]\njwks_url = \"https://a.example/j\"\niss = \"\"\n").unwrap_err();
         assert!(err.to_string().contains("iss is empty"), "{err}");
+    }
+
+    /// 1 つの鍵束は 1 つの呼び手だけが指す (DR-0043 決定 6)。URL は正規化してから比べる。
+    #[test]
+    fn caller_jwks_url_must_be_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unit.toml");
+        for (a, b) in [
+            (
+                "https://keys.example/jwks.json",
+                "https://keys.example/jwks.json",
+            ),
+            (
+                "https://Keys.Example:443/jwks.json",
+                "https://keys.example/jwks.json",
+            ),
+        ] {
+            std::fs::write(
+                &path,
+                format!("[callers.a]\njwks_url = {a:?}\n\n[callers.b]\njwks_url = {b:?}\n"),
+            )
+            .unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(err.contains("have the same jwks_url"), "{a} / {b}: {err}");
+        }
+        std::fs::write(
+            &path,
+            "[callers.a]\njwks_url = \"https://keys.example/a.json\"\n\n[callers.b]\njwks_url = \"https://keys.example/b.json\"\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().callers.len(), 2);
     }
 
     /// 呼び手の名前は `[ns.<name>]` (自動の鍵) と同じ規則。
