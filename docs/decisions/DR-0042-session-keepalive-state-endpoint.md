@@ -1,6 +1,6 @@
 # DR-0042: 会話 (session) 単位の cache / keepalive の状態を問う口 (`GET /llm-gateway/sessions[/{session_id}]`)
 
-- Status: Accepted (kawaz 2026-11-06)
+- Status: Accepted (kawaz 2026-11-06)。実装済み (`Gateway::session` / `sessions`、`GET /llm-gateway/sessions[/{session_id}]`、MANUAL)、DR-0043 の認証層と同じリリースで出す (決定 4)
 - Date: 2026-11-04
 
 ## 背景
