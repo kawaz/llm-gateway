@@ -12,11 +12,11 @@ llm-gateway が生やす HTTP 口と CLI コマンドのリファレンス。
 | 運用 | `/llm-gateway/...` | 死活・利用状況・統計・観測 |
 | 再認証 | `/llm-gateway/login...` | ブラウザから OAuth をやり直す |
 
-以下の例では gateway を `http://127.0.0.1:8402` で待ち受けている前提で書く。
+以下の例では gateway を `http://127.0.0.1:8402` で待ち受けている前提で書く。運用系の口の例は、代わりに台の運用系の socket を読む形で書き、`$SOCK` にその path を入れてある ([運用系の socket](#運用系の-socket-server-unix))。
 
 ## 設定に書くパス
 
-設定のパス欄 (`extends`、`[server] binary_path`、`[store] dir`、`[stats] dir`、`[webhook] token_file`) は、読み込むときに 1 回だけ `~` と環境変数を開く。
+設定のパス欄 (`extends`、`[server] binary_path`、`[server] unix`、`[store] dir`、`[stats] dir`、`[webhook] token_file`) は、読み込むときに 1 回だけ `~` と環境変数を開く。
 
 | 書き方 | 意味 |
 | --- | --- |
@@ -387,7 +387,7 @@ curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization:
 
 ## 運用系
 
-`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。会話・認証情報・使用量を読む口と keepalive を止める口は、`[callers.<name>]` を 1 つでも書くと呼び手の署名を求める。残りは手前で引いた境界を信頼する ([呼び手の署名](#呼び手の署名-callersname))。
+`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。会話・認証情報・使用量を読む口と keepalive を止める口は、`[callers.<name>]` を 1 つでも書くと呼び手の署名を求める。残りは手前で引いた境界を信頼する ([呼び手の署名](#呼び手の署名-callersname))。同じ口は運用者向けに Unix socket でも出していて、そちらは署名を求めない ([運用系の socket](#運用系の-socket-server-unix))。
 
 **時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べないので、人が読む形へは受け取った側で直す。名前に単位が入っている欄 (`window_seconds` / `cache_ttl_secs`) だけが**長さ**で、こちらは秒。
 
@@ -468,12 +468,36 @@ curl -sS https://gateway.example/llm-gateway/sessions -H "Authorization: Bearer 
 - 取り込むのは `kty: "OKP"`、`crv: "Ed25519"`、`use: "sig"` (あれば)、`alg` が `Ed25519` / `EdDSA` (あれば) の鍵だけで、合わない鍵は警告を出して飛ばす。同じ `kid` が 2 つある鍵も飛ばす。取得は redirect を追わず、5 秒で諦め、64 KiB までしか読まず、その場では再試行しない
 - 来た `jti` は台ごとにメモリで `exp` まで覚える (stable と unstable で共有せず、再起動で忘れる)。65,536 件を超えると、照合はするが記録はしない
 
+### 運用系の socket (`[server] unix`)
+
+台は `[server] listen` とは別に、同じ口を Unix domain socket でも出す。運用者が読むのはこちらで、CLI (`usage`、`stats`、`upstream status`) と手で叩く `curl` が使う。`[callers]` を書いた台でも socket の口は呼び手の署名を求めず、繋いでよい相手は socket 自体が決める (DR-0043)。
+
+```toml
+[server]
+listen = "127.0.0.1:11301"
+unix = "~/.local/state/llm-gateway/daemon/http/unstable.sock"   # 省略可。台 `unstable` の既定はこの path
+```
+
+- 既定では台ごとに `$XDG_STATE_HOME/llm-gateway/daemon/http/<unit>.sock` を開く (制御口の隣で、台の名前が付く)。同じ土台の設定から 2 台を走らせても 1 つの socket を取り合わない
+- socket ファイルは 0600 で、繋いできたプロセスが台と同じユーザで動いている時だけ受ける (macOS は `getpeereid`、Linux は `SO_PEERCRED`)。それ以外は HTTP を話す前に切る。親ディレクトリが無ければ 0700 で作り、既にあるディレクトリの権限は変えない
+- 起動時、落ちた台が残した socket は片付ける。誰かがまだ待っている socket と、socket でないファイルは消さずに socket を開かない (台は理由をログに残し、TCP の口は動かし続ける)。台が止まると socket ファイルは消える
+- `llm-gateway check` が断るのは、`unix` が絶対パスでない (台と CLI は別のディレクトリで動く) か、socket の path に収まらない長さ (macOS は 103 バイト、Linux は 107 バイトまで) の時
+- `unix` は台の起動時に読む。変えたら `daemon restart`
+- **socket をリバースプロキシで外へ出さない。** 外の呼び手は TCP の口を読み、そちらは `[callers]` を書けば署名を求める
+
+```bash
+SOCK=${XDG_STATE_HOME:-~/.local/state}/llm-gateway/daemon/http/unstable.sock
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/sessions
+```
+
+同じ request を TCP で送る (`curl -sS http://127.0.0.1:8402/llm-gateway/sessions`) なら、`[callers]` のある台では呼び手の鍵で署名した `-H "Authorization: Bearer $TOKEN"` が要る ([token の作り方](#token-の作り方))。
+
 ### `GET /llm-gateway/healthz`
 
 生きているかだけを返す。credential にも upstream にも触らない。前段のロードバランサが数秒ごとに叩く前提。
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/healthz   # => ok
 ```
 
 ### `GET /llm-gateway/version`
@@ -481,7 +505,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 **このプロセスが載せている版**を返す (`{"version": "0.44.0"}`)。ディスクに置かれた binary の版ではない。2 つを並べれば「入れ替えたのに上げ直していない」が分かる — `llm-gateway version` がやっているのはそれである。
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/version   # => {"version":"0.44.0"}
 ```
 
 ### `GET /llm-gateway/self`
@@ -489,7 +513,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 **走っているこのプロセスの状態**を返す。版と、起動の印 (`boot`、起動時刻の Unix ミリ秒。再起動で変わる) と、見る側が追いつけずに落とした知らせ (`/llm-gateway/events` と webhook) の数 (起動からの累積)。`events.dropped` は 0 でも出る。一時ダンプ (`dump`) の系列が動いている間だけ、`dump` に系列ごとの `{dump_id, ns, expires_at, bytes_written}` が並ぶ (置き場は載せない)。`daemon status` の各行はここから埋める。
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
 ```
 
 ### `GET /llm-gateway/usage`
@@ -503,7 +527,7 @@ credential ごとの利用状況 (DR-0007)。出すのは使用率・リセッ�
 既定では転送に便乗して読んだ分しか出さない。**usage の確認自体が usage を消費する** 構図を避けるため。`?refresh=true` を付けると休んでいる credential へ最小のリクエストを投げて読み直し、その消費量を `probe` に残す。
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
 ```
 
 ```json
@@ -542,7 +566,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
 | `refresh` | なし | `true` / `1` のとき公式ソースを取り直してから返す |
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/status?refresh=true'
 ```
 
 ```json
@@ -584,7 +608,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
 既定を 7 日にするのは、全期間を返すと日が経つほど応答が伸びるため。数字として読めない値を渡すと 400 を返す。
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/stats?days=3'
 ```
 
 ```json
@@ -634,7 +658,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 `Access-Control-Allow-Origin: *` を付けているので、`[callers]` の無い台ならブラウザから直接開いて様子を見られる (ブラウザは署名を付けられない、[呼び手の署名](#呼び手の署名-callersname))。本文もトークン数も流さない。
 
 ```bash
-curl -sSN http://127.0.0.1:8402/llm-gateway/events
+curl -sSN --unix-socket "$SOCK" http://localhost/llm-gateway/events
 ```
 
 ```
@@ -701,7 +725,7 @@ base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 1 つの会話の cache / keepalive の状態を返す (DR-0042)。中身は gateway がその会話について持っている控え ([keepalive の運用](#keepalive-の運用)) と、その会話が使う経路に付いている上限の印の写し。`{session_id}` は Claude Code が `X-Claude-Code-Session-Id` に載せる会話の id で、path には percent-encode して置く (署名する呼び手は encode した path を `aud` に入れる)。問われた時点での判定はしない — 期限が過ぎたか・経路が使えるかは gateway が送る直前に決める。時刻は受け取った側で壁時計と比べる。
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/sessions/0f3c6d1a-…
 ```
 
 ```json
@@ -747,7 +771,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
 | `ns` | なし | その namespace を通った系列だけを残す。系列が 1 つも残らない会話は落とす |
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/sessions?ns=personal'
 ```
 
 ```json
@@ -824,6 +848,8 @@ llm-gateway <command> [options]
 
 出力は JSON (追従は JSONL)、エラーは JSON を stderr に出して exit が非 0。help だけはテキストで、引数なしでも出る (DR-0028)。
 
+`usage`、`stats`、`upstream status` は `[server] listen` でなく台の[運用系の socket](#運用系の-socket-server-unix) を読むので、`[callers]` のある台でも呼び手の鍵は要らない。socket に繋げなければ `unit_unreachable` で断り、TCP には落ちない。socket を開かない版のまま走っている台は、版を上げて `daemon restart` する。
+
 ### `daemon` — 台の操作
 
 **unit** は設定ファイル 1 つ。名前を付けて登録簿 (`$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`) に置き、以後はその名前で指す。unit は設定ファイルのパスと、走らせる binary のパス (`[server] binary_path`、省略時は登録した時点の自分自身) を持つ。
@@ -868,7 +894,7 @@ $ llm-gateway daemon reload --all
 | `unreachable` | 制御口に繋げなかった | 旧設定のまま |
 | `bad_answer` | 台の答えが読めなかった (`message` には答えの先頭 200 バイトまで) | 不明 |
 
-reload で変えられない欄 (変えたら `daemon restart`): `[server]` の `listen` / `binary_path` / `disabled`、`[store]`、`[stats]`、`[discovery]`、`[webhook]`、`[status]`、`routes.<name>.status_source`、`[upstreams]`、`[secret_store]`、`[secrets]`、`[ratelimit]`。`message` には旧→新の値を並べる (`[webhook]` / `[upstreams]` / `[secrets]` は秘密を含みうるので欄名だけ)。
+reload で変えられない欄 (変えたら `daemon restart`): `[server]` の `listen` / `binary_path` / `disabled` / `unix`、`[store]`、`[stats]`、`[discovery]`、`[webhook]`、`[status]`、`routes.<name>.status_source`、`[upstreams]`、`[secret_store]`、`[secrets]`、`[ratelimit]`。`message` には旧→新の値を並べる (`[webhook]` / `[upstreams]` / `[secrets]` は秘密を含みうるので欄名だけ)。
 
 ### `dump` — 本文の一時ダンプ
 

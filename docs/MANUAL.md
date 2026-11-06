@@ -12,11 +12,11 @@ The endpoints fall into three groups.
 | Operations | `/llm-gateway/...` | Liveness, usage, statistics, observation |
 | Re-authorization | `/llm-gateway/login...` | Redo OAuth from a browser |
 
-The examples below assume the gateway listens on `http://127.0.0.1:8402`.
+The examples below assume the gateway listens on `http://127.0.0.1:8402`. The examples for the operations endpoints read the unit's operations socket instead, with `$SOCK` holding its path ([The operations socket](#the-operations-socket-server-unix)).
 
 ## Paths written in the configuration
 
-The path fields of the configuration (`extends`, `[server] binary_path`, `[store] dir`, `[stats] dir`, `[webhook] token_file`) expand `~` and environment variables once, when the file is read.
+The path fields of the configuration (`extends`, `[server] binary_path`, `[server] unix`, `[store] dir`, `[stats] dir`, `[webhook] token_file`) expand `~` and environment variables once, when the file is read.
 
 | Spelling | Meaning |
 | --- | --- |
@@ -385,7 +385,7 @@ curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization:
 
 ## Operations
 
-These live under `/llm-gateway/` so they never collide with upstream API names (DR-0006). The ones that read conversations, credentials and usage, and the one that stops a keepalive, ask the caller for a signature once at least one `[callers.<name>]` is written; the rest trust the boundary drawn in front ([Signed callers](#signed-callers-callersname)).
+These live under `/llm-gateway/` so they never collide with upstream API names (DR-0006). The ones that read conversations, credentials and usage, and the one that stops a keepalive, ask the caller for a signature once at least one `[callers.<name>]` is written; the rest trust the boundary drawn in front ([Signed callers](#signed-callers-callersname)). The same endpoints are also served on a Unix socket for the operator, without the signature ([The operations socket](#the-operations-socket-server-unix)).
 
 **Every moment these endpoints report is a single number in Unix milliseconds.** The same instant is never spelled a second way, so rendering it for a human is the receiver's job. Only fields whose name carries a unit (`window_seconds`, `cache_ttl_secs`) are *durations*, and those are in seconds.
 
@@ -466,12 +466,36 @@ A refused request gets the same JSON error as namespace authentication, with one
 - Only keys with `kty: "OKP"`, `crv: "Ed25519"`, `use: "sig"` (when present) and `alg` `Ed25519` / `EdDSA` (when present) are taken; other keys are skipped with a warning, and a `kid` listed twice is skipped. The fetch follows no redirect, gives up after 5 seconds, reads at most 64 KiB, and is not retried on the spot
 - Seen `jti` values are kept per unit in memory until their `exp` (stable and unstable do not share them; a restart forgets them). Past 65,536 entries a `jti` is still checked but not recorded
 
+### The operations socket (`[server] unix`)
+
+Besides `[server] listen`, a unit serves the same endpoints on a Unix domain socket. This is what the operator reads: the CLI (`usage`, `stats`, `upstream status`) and `curl` by hand. The socket asks for no caller signature even when `[callers]` is written; who may connect is decided by the socket itself (DR-0043).
+
+```toml
+[server]
+listen = "127.0.0.1:11301"
+unix = "~/.local/state/llm-gateway/daemon/http/unstable.sock"   # optional; this is what the unit `unstable` opens by default
+```
+
+- By default each unit opens `$XDG_STATE_HOME/llm-gateway/daemon/http/<unit>.sock` (next to its control socket, named after the unit), so two units built on the same base configuration do not fight over one socket
+- The socket file is mode 0600, and a connection is accepted only when the connecting process runs as the same user as the unit (`getpeereid` on macOS, `SO_PEERCRED` on Linux); anyone else is disconnected before HTTP is spoken. A missing parent directory is created with mode 0700; an existing one keeps its mode
+- At start, a socket left behind by a unit that died is removed. A socket some process still listens on, and a file that is not a socket, are left alone and the socket is not opened (the unit logs why and keeps serving TCP). The file is removed when the unit stops
+- `llm-gateway check` refuses a `unix` that is not an absolute path (the unit and the CLI run in different directories) or longer than a socket path can be (103 bytes on macOS, 107 on Linux)
+- `unix` is taken when the unit starts; changing it needs `daemon restart`
+- **Do not expose the socket through a reverse proxy.** Outside callers read the TCP endpoints, which ask for a signature once `[callers]` is written
+
+```bash
+SOCK=${XDG_STATE_HOME:-~/.local/state}/llm-gateway/daemon/http/unstable.sock
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/sessions
+```
+
+The same request over TCP (`curl -sS http://127.0.0.1:8402/llm-gateway/sessions`) needs `-H "Authorization: Bearer $TOKEN"` signed by a caller's key on a unit with `[callers]` ([Making a token](#making-a-token)).
+
 ### `GET /llm-gateway/healthz`
 
 Reports only that the process is alive. Touches neither credentials nor upstreams. Intended to be polled by a load balancer every few seconds.
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/healthz   # => ok
 ```
 
 ### `GET /llm-gateway/version`
@@ -479,7 +503,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/healthz   # => ok
 Reports the version **this process is running**, not what is installed on disk (`{"version": "0.44.0"}`). Comparing the two is how `llm-gateway version` tells that a binary was replaced but never restarted.
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/version   # => {"version":"0.44.0"}
 ```
 
 ### `GET /llm-gateway/self`
@@ -487,7 +511,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/version   # => {"version":"0.44.0"}
 Reports the state of **this running process**: its version, its start marker (`boot`, the start time in Unix ms; it changes on restart), and how many events (`/llm-gateway/events` and webhook) it dropped because a watcher could not keep up, counted since it started. `events.dropped` is present even when it is 0. While dumps (`dump`) are running, `dump` lists `{dump_id, ns, expires_at, bytes_written}` per series (without the directory). `daemon status` fills each row from this.
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/self   # => {"version":"0.51.1","boot":1785320000000,"events":{"dropped":0}}
 ```
 
 ### `GET /llm-gateway/usage`
@@ -501,7 +525,7 @@ Per-credential usage (DR-0007). It reports utilization, reset times, and denial 
 By default it reports only what was read by riding along with forwarded traffic, so that **checking usage does not itself consume usage**. With `?refresh=true`, idle credentials are sent a minimal request to be read again, and what that cost is recorded under `probe`.
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/usage?refresh=true'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
 ```
 
 ```json
@@ -540,7 +564,7 @@ The official and observed state of the configured upstream services (DR-0021).
 | `refresh` | absent | `true` / `1` re-fetches the official sources first |
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/status?refresh=true'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/status?refresh=true'
 ```
 
 ```json
@@ -582,7 +606,7 @@ Daily usage totals (DR-0011, DR-0029): token counts per day × credential × mod
 The default is 7 days because returning everything makes the response grow with time. A value that cannot be read as a number returns 400.
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/stats?days=3'
 ```
 
 ```json
@@ -632,7 +656,7 @@ Streams what happens on every forward, over SSE (DR-0012). You receive only what
 `Access-Control-Allow-Origin: *` is set, so a browser can open it directly to watch on a unit without `[callers]` (a browser cannot send the signature, see [Signed callers](#signed-callers-callersname)). Neither bodies nor token counts are streamed.
 
 ```bash
-curl -sSN http://127.0.0.1:8402/llm-gateway/events
+curl -sSN --unix-socket "$SOCK" http://localhost/llm-gateway/events
 ```
 
 ```
@@ -699,7 +723,7 @@ base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 Reports the cache / keepalive state of one conversation (DR-0042): a copy of what the gateway keeps for it ([Running keepalive](#running-keepalive)) and of the limit marks on the routes it would use. `{session_id}` is the conversation id Claude Code sends in `X-Claude-Code-Session-Id`, percent-encoded in the path (a signed caller puts that encoded path in `aud`). Nothing is judged at the time of asking — whether a deadline has passed or a route is usable is decided by the gateway right before it sends; compare the times with the wall clock on your side.
 
 ```bash
-curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
+curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/sessions/0f3c6d1a-…
 ```
 
 ```json
@@ -745,7 +769,7 @@ Lists every conversation that has a kept series, each in the shape above, ordere
 | `ns` | absent | Keep only the series that went through this namespace; a conversation left with none drops out |
 
 ```bash
-curl -sS 'http://127.0.0.1:8402/llm-gateway/sessions?ns=personal'
+curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/sessions?ns=personal'
 ```
 
 ```json
@@ -822,6 +846,8 @@ llm-gateway <command> [options]
 
 Results are JSON (JSONL when following), errors are JSON on stderr with a non-zero exit, and only the help is text — printed even with no arguments (DR-0028).
 
+`usage`, `stats` and `upstream status` read the unit through its [operations socket](#the-operations-socket-server-unix), not `[server] listen`, so they need no caller key on a unit with `[callers]`. When the socket cannot be reached they fail with `unit_unreachable` and do not fall back to TCP; a unit still running a version that does not open the socket needs updating and `daemon restart`.
+
 ### `daemon` — running the units
 
 A **unit** is one configuration file. It is registered under a name in `$XDG_STATE_HOME/llm-gateway/daemon/units/<name>.toml`, and pointed at by that name from then on. A unit holds the path of its configuration file and the path of the binary to run (`[server] binary_path`, defaulting to whatever registered it).
@@ -866,7 +892,7 @@ $ llm-gateway daemon reload --all
 | `unreachable` | The control socket could not be reached | Unchanged |
 | `bad_answer` | The unit's answer could not be read (`message` carries at most its first 200 bytes) | Unknown |
 
-Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `binary_path` / `disabled`, `[store]`, `[stats]`, `[discovery]`, `[webhook]`, `[status]`, `routes.<name>.status_source`, `[upstreams]`, `[secret_store]`, `[secrets]`, `[ratelimit]`. The `message` shows the old and new values (`[webhook]` / `[upstreams]` / `[secrets]` may hold secrets, so only the field is named).
+Fields a reload cannot change (use `daemon restart`): `[server]` `listen` / `binary_path` / `disabled` / `unix`, `[store]`, `[stats]`, `[discovery]`, `[webhook]`, `[status]`, `routes.<name>.status_source`, `[upstreams]`, `[secret_store]`, `[secrets]`, `[ratelimit]`. The `message` shows the old and new values (`[webhook]` / `[upstreams]` / `[secrets]` may hold secrets, so only the field is named).
 
 ### `dump` — dumping bodies for a limited time
 

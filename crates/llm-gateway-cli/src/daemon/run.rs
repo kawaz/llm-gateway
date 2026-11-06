@@ -103,6 +103,22 @@ remove disabled from [server], or register another configuration",
                 ))
             })?;
 
+        // 運用者の CLI と curl が読む口 (DR-0043 決定 7)。TCP の後に開く: 監督者が落ちて
+        // 残った子が居れば TCP の bind で先に止まり、その子の socket に触らない。開けなくても
+        // 台は動かす — 中継を止める理由にはならず、CLI は繋げない旨を言う。
+        let operations_path = config.server.unix_path(unit);
+        let operations = match llm_gateway_server::socket::OperationsSocket::bind(&operations_path) {
+            Ok(socket) => Some(socket),
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    socket = %operations_path.display(),
+                    "cannot open the operations socket; `llm-gateway usage` / `stats` / `upstream status` will not reach this unit"
+                );
+                None
+            }
+        };
+
         // 監督者から設定の読み直しを受ける口 (DR-0032 決定 2)。開けなくても
         // 台は動かす — 読み直しが restart で代わるだけで、中継を止める理由にはならない。
         let control = match llm_gateway::daemon::control::ControlSocket::open(unit) {
@@ -143,6 +159,7 @@ remove disabled from [server], or register another configuration",
         tracing::info!(
             unit,
             listen = %config.server.listen,
+            unix = %operations.as_ref().map_or_else(|| "-".to_owned(), |s| s.path().display().to_string()),
             credentials = %dir.display(),
             stats = %config.stats.resolve_dir().display(),
             namespaces = gateway.namespace_names().len(),
@@ -189,6 +206,9 @@ remove disabled from [server], or register another configuration",
         let serving = Arc::clone(&gateway);
         let shutdown_started = Arc::new(tokio::sync::Notify::new());
         let notifying = Arc::clone(&shutdown_started);
+        // TCP の口が畳み始めたら (合図でも、口が止まっても) socket の口も畳む。送り手が
+        // 落ちても受け手は起きる。
+        let (stopping, mut stop) = tokio::sync::watch::channel(());
         let server = axum::serve(
             listener,
             llm_gateway_server::router(serving)
@@ -197,9 +217,33 @@ remove disabled from [server], or register another configuration",
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             notifying.notify_one();
+            drop(stopping);
+        });
+        let operations_server = operations.map(|socket| {
+            let router = llm_gateway_server::router_for(
+                Arc::clone(&gateway),
+                llm_gateway_server::Transport::Unix,
+            );
+            axum::serve(socket, router.into_make_service()).with_graceful_shutdown(async move {
+                let _ = stop.changed().await;
+            })
         });
         let result = finish_serving(
-            async move { server.await },
+            async move {
+                // socket ファイルは listener が落ちた時に消える (猶予を過ぎて畳んだ時も、
+                // この future ごと落ちるので同じ)。
+                let operations = async move {
+                    match operations_server {
+                        Some(server) => server.await,
+                        None => Ok(()),
+                    }
+                };
+                let (tcp, unix) = tokio::join!(server, operations);
+                if let Err(e) = unix {
+                    tracing::warn!(%e, "the operations socket stopped");
+                }
+                tcp
+            },
             shutdown_started,
             SHUTDOWN_GRACE,
         )

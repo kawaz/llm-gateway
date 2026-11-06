@@ -92,7 +92,7 @@ reload:
   {units: [{unit, ok, error?, warnings?}]}, and the exit status is
   non-zero if any unit failed (--all still reloads the rest).
   fixed at start (changing them needs `restart`): [server] listen / binary_path /
-  disabled, [store], [stats], [discovery], [webhook], [status],
+  disabled / unix, [store], [stats], [discovery], [webhook], [status],
   routes.<name>.status_source, [upstreams], [secret_store], [secrets], [ratelimit]
 
 log options:

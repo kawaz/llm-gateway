@@ -130,3 +130,70 @@ fn sigterm_stops_daemon_with_an_events_subscription() {
 
     terminate(child);
 }
+
+/// 運用系の口 (DR-0043 決定 7) の socket に繋がるまで待ち、`endpoint` の応答の頭を読んだ
+/// 繋がりを返す。
+fn subscribe_unix(socket: &Path, endpoint: &str) -> std::os::unix::net::UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(stream) => break stream,
+            Err(error) if Instant::now() < deadline => {
+                std::thread::yield_now();
+                let _ = error;
+            }
+            Err(error) => panic!("{} did not listen: {error}", socket.display()),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET {endpoint} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    let mut byte = [0];
+    while !response.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        response.push(byte[0]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    stream.set_read_timeout(None).unwrap();
+    stream
+}
+
+/// 台は TCP と並んで、状態ディレクトリの既定の置き場に 0600 の socket を開き、CLI の
+/// `usage` はそこを読む。socket の口の SSE が繋がったままでも SIGTERM で猶予内に止まり、
+/// 止まった後に socket ファイルは残らない。
+#[test]
+fn the_unit_serves_its_operations_socket_until_it_stops() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let port = unused_port();
+    let child = start(root.path(), port);
+    let socket = root.path().join("state/llm-gateway/daemon/http/probe.sock");
+    let _subscription = subscribe_unix(&socket, "/llm-gateway/events");
+
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+
+    let usage = Command::new(binary())
+        .args(["usage", "--unit", "probe"])
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        usage.status.success(),
+        "{}",
+        String::from_utf8_lossy(&usage.stderr)
+    );
+
+    terminate(child);
+    assert!(
+        !socket.exists(),
+        "the socket file is removed when the unit stops"
+    );
+}
