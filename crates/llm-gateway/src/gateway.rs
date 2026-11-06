@@ -251,8 +251,8 @@ impl<P: CredentialPersistence> Gateway<P> {
     ///
     /// 走っている設定の `[callers]` が空なら確かめずに `Ok(None)` (この unit の運用系の
     /// 口は無認証)。空でなければ、通った呼び手か落ちた段を返す。`kid` が呼び手の鍵に
-    /// 無ければ、その呼び手の `jwks_url` を取り直して (間隔の下限の内なら取り直さずに)
-    /// もう 1 度だけ確かめる。落ちた段はログにも応答にも出さないので、呼び出し側が
+    /// 無いか呼び手の鍵が stale なら、その呼び手の `jwks_url` を取り直して (間隔の下限の
+    /// 内なら取り直さずに) もう 1 度だけ確かめる (DR-0043 決定 5)。落ちた段はログにも応答にも出さないので、呼び出し側が
     /// 段をログに出し、応答は [`gateway_core::caller::Reason::status`] ごとの固定文にする。
     pub async fn verify_caller(
         &self,
@@ -270,18 +270,19 @@ impl<P: CredentialPersistence> Gateway<P> {
             return Ok(None);
         }
         let audience = caller::audience(method, path);
-        let mut unknown_kid_of = None;
+        let mut refetch = None;
         let first = caller::verify(
             authorization,
             &audience,
             now,
-            |iss, kid| self.resolve_caller(callers, iss, kid, now, &mut unknown_kid_of),
+            |iss, kid| self.resolve_caller(callers, iss, kid, now, &mut refetch),
             &self.caller_jtis,
         );
-        let (Err(Reason::UnknownKid), Some(url)) = (&first, unknown_kid_of) else {
+        let (Err(Reason::UnknownKid | Reason::KeysStale), Some((url, name))) = (&first, refetch)
+        else {
             return first.map(Some);
         };
-        if !self.caller_keys.refetch_for_unknown_kid(&url, now).await {
+        if !self.caller_keys.refetch_for_request(&url, &name, now).await {
             return first.map(Some);
         }
         caller::verify(
@@ -295,14 +296,14 @@ impl<P: CredentialPersistence> Gateway<P> {
     }
 
     /// `iss` の呼び手を `callers` から引き、その呼び手の鍵だけから `kid` を引く。
-    /// `kid` が無かった時は、その呼び手の `jwks_url` を `unknown_kid_of` に残す。
+    /// `kid` が無いか鍵が stale だった時は、その呼び手の `jwks_url` と名前を `refetch` に残す。
     fn resolve_caller(
         &self,
         callers: &std::collections::BTreeMap<String, crate::config::Caller>,
         iss: &str,
         kid: &str,
         now: i64,
-        unknown_kid_of: &mut Option<url::Url>,
+        refetch: &mut Option<(url::Url, String)>,
     ) -> std::result::Result<gateway_core::caller::Resolved, gateway_core::caller::Missing> {
         use gateway_core::caller::{Missing, Resolved};
 
@@ -314,8 +315,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             .caller_keys
             .lookup(&found.jwks_url, kid, now)
             .inspect_err(|missing| {
-                if *missing == Missing::UnknownKid {
-                    *unknown_kid_of = Some(found.jwks_url.clone());
+                if matches!(missing, Missing::UnknownKid | Missing::Stale) {
+                    *refetch = Some((found.jwks_url.clone(), name.clone()));
                 }
             })?;
         Ok(Resolved {
@@ -629,8 +630,8 @@ impl<P: CredentialPersistence> Gateway<P> {
             .sync(&caller_urls, false, now_unix())
             .await
             .into_iter()
-            .map(|(url, why)| {
-                format!("cannot fetch the caller keys from {url} ({why}); trying again on the first request")
+            .map(|(name, why)| {
+                format!("cannot fetch the keys of [callers.{name}] ({why}); trying again on the first request")
             })
             .collect();
         warnings.extend(
@@ -10403,9 +10404,10 @@ routes = ["a", "b"]
             assert_eq!(fake.calls(&jwks_url("n")), 3);
         }
 
-        /// 最後の成功から 66 分を過ぎた束では通さず (401)、取り直しもしない (定期に任せる)。
+        /// 最後の成功から 66 分を過ぎた束では通さず (401)、request は取り直しの引き金になる
+        /// (最小 interval は未知の `kid` と共通)。取り直せたら通る。
         #[tokio::test]
-        async fn stale_keys_are_refused() {
+        async fn stale_keys_are_refused_and_refetched() {
             let (gw, fake) = callers_gateway(&[("notifier", "n")]);
             fake.serve(&jwks_url("n"), &[("n1", 1)]);
             gw.fetch_caller_keys().await;
@@ -10416,11 +10418,29 @@ routes = ["a", "b"]
                 verify(&gw, &bearer(1, "n1", "notifier", edge), edge).await,
                 passed("notifier", "n1")
             );
+            assert_eq!(fake.calls(&jwks_url("n")), 1);
+
+            fake.answer(&jwks_url("n"), Err("down".to_owned()));
             let late = fetched + STALE_AFTER_SECS + 1;
             let refused = verify(&gw, &bearer(1, "n1", "notifier", late), late).await;
             assert_eq!(refused, Err(Reason::KeysStale));
             assert_eq!(Reason::KeysStale.status(), Status::Unauthorized);
-            assert_eq!(fake.calls(&jwks_url("n")), 1);
+            assert_eq!(fake.calls(&jwks_url("n")), 2, "a stale request refetches");
+
+            fake.serve(&jwks_url("n"), &[("n1", 1)]);
+            let soon = late + REFETCH_INTERVAL_SECS - 1;
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", soon), soon).await,
+                Err(Reason::KeysStale)
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 2, "not inside the interval");
+
+            let back = late + REFETCH_INTERVAL_SECS;
+            assert_eq!(
+                verify(&gw, &bearer(1, "n1", "notifier", back), back).await,
+                passed("notifier", "n1")
+            );
+            assert_eq!(fake.calls(&jwks_url("n")), 3);
         }
 
         /// 取り直しに成功したら丸ごと置き換わり、消えた `kid` は通らない。
@@ -10476,7 +10496,7 @@ routes = ["a", "b"]
                 outcome
                     .warnings
                     .iter()
-                    .any(|w| w.contains("https://x.example/jwks.json")),
+                    .any(|w| w.contains("[callers.new]") && !w.contains("x.example")),
                 "{:?}",
                 outcome.warnings
             );

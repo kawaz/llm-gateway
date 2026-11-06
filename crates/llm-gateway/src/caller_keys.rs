@@ -9,12 +9,15 @@
 //! - 起動時に全呼び手分 ([`CallerKeys::sync`] を全部取り直す形で)
 //! - 設定の読み直しで増えた・変わった `jwks_url` (消えたものは捨てる)
 //! - 定期 ([`PERIOD_SECS`] ごとに全呼び手分、[`run`])
-//! - 検証で未知の `kid` を見た時 (`jwks_url` ごとに [`REFETCH_INTERVAL_SECS`] に 1 回まで)
+//! - 検証で未知の `kid` か stale を見た時 (`jwks_url` ごとに [`REFETCH_INTERVAL_SECS`] に 1 回まで)
+//!
+//! `jwks_url` は query や userinfo に秘密を含みうるので、ログと失敗の理由には出さず
+//! 呼び手の名前 (`[callers.<name>]`) で出す。
 //!
 //! token の検証の順序は [`gateway_core::caller::verify`] が持ち、ここは鍵を引く口
 //! ([`CallerKeys::lookup`]) だけを渡す。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -104,12 +107,14 @@ fn require_https(url: &Url) -> Result<(), String> {
 }
 
 /// 1 回だけ GET し、2xx の本文を [`MAX_JWKS_BYTES`] まで読む。redirect (3xx) も失敗。
+/// 失敗の理由に URL を載せない (query や userinfo に秘密を含みうるので、ログには呼び手の
+/// 名前で出す)。
 async fn get_bounded(client: &reqwest::Client, url: &Url) -> Result<Vec<u8>, String> {
     let response = client
         .get(url.clone())
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.without_url().to_string())?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("the JWKS URL answered {status}"));
@@ -124,7 +129,7 @@ async fn get_bounded(client: &reqwest::Client, url: &Url) -> Result<Vec<u8>, Str
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        let chunk = chunk.map_err(|e| e.without_url().to_string())?;
         if body.len() + chunk.len() > MAX_JWKS_BYTES {
             return Err(too_large());
         }
@@ -133,28 +138,31 @@ async fn get_bounded(client: &reqwest::Client, url: &Url) -> Result<Vec<u8>, Str
     Ok(body)
 }
 
-/// 設定の呼び手が使う `jwks_url` の集合。
-pub fn jwks_urls(callers: &BTreeMap<String, Caller>) -> BTreeSet<Url> {
+/// 設定の呼び手が使う `jwks_url` と、それを使う呼び手の名前。1 つの `jwks_url` を指す
+/// 呼び手は 1 つだけ (設定の検証が断る)。
+pub fn jwks_urls(callers: &BTreeMap<String, Caller>) -> BTreeMap<Url, String> {
     callers
-        .values()
-        .map(|caller| caller.jwks_url.clone())
+        .iter()
+        .map(|(name, caller)| (caller.jwks_url.clone(), name.clone()))
         .collect()
 }
 
 /// `jwks_url` 1 つ分の持ち物。
 #[derive(Debug, Default)]
 struct Entry {
+    /// ログに出す呼び手の名前 (`jwks_url` は秘密を含みうるのでログに出さない)。
+    caller: String,
     keys: PublicKeys,
     /// 最後に取れた取得の、取りに出た時刻 (unix 秒)。一度も取れていなければ `None`。
     fetched_at: Option<i64>,
-    /// 最後に未知の `kid` で取りに出た時刻 (unix 秒)。
+    /// 最後に request (未知の `kid` か stale) で取りに出た時刻 (unix 秒)。
     refetched_at: Option<i64>,
 }
 
 /// 呼び手の鍵のキャッシュ (`jwks_url` → JWKS)。unit のプロセスのメモリに持つ。
 ///
-/// Design rationale: 未知の `kid` の取り直しの間隔は、未知の `kid` で取りに出た回
-/// だけで数える (起動時・読み直し・定期の取得は数えない)。間隔は未知の `kid` の
+/// Design rationale: request での取り直しの間隔は、request (未知の `kid` か stale) で
+/// 取りに出た回だけで数える (起動時・読み直し・定期の取得は数えない)。間隔は request の
 /// 連打で取得を強いられないための歯止めで、起動・読み直し・定期は呼び手が強いられ
 /// ない契機なので、これらを数えても歯止めは強まらない。数えると、起動時の取得が
 /// 呼び手の起動と重なって失敗した直後の最初の request が取り直せず、「最初の
@@ -186,12 +194,16 @@ impl CallerKeys {
         entry.keys.get(kid).copied().ok_or(Missing::UnknownKid)
     }
 
-    /// 未知の `kid` を見た時に取り直す。前の取り直しから [`REFETCH_INTERVAL_SECS`] 経って
-    /// いなければ取りに出ずに `false`。取りに出たら (成否を問わず) `true`。
-    pub async fn refetch_for_unknown_kid(&self, url: &Url, now: i64) -> bool {
+    /// request で未知の `kid` か stale を見た時に、呼び手 `caller` の `jwks_url` を取り直す。
+    /// 前の取り直しから [`REFETCH_INTERVAL_SECS`] 経っていなければ取りに出ずに `false`。
+    /// 取りに出たら (成否を問わず) `true`。
+    pub async fn refetch_for_request(&self, url: &Url, caller: &str, now: i64) -> bool {
         {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = entries.entry(url.clone()).or_default();
+            let entry = entries.entry(url.clone()).or_insert_with(|| Entry {
+                caller: caller.to_owned(),
+                ..Entry::default()
+            });
             if entry
                 .refetched_at
                 .is_some_and(|at| now < at.saturating_add(REFETCH_INTERVAL_SECS))
@@ -201,37 +213,51 @@ impl CallerKeys {
             entry.refetched_at = Some(now);
         }
         // 失敗は fetch がログに出し、束は前のまま。
-        let _ = self.fetch(url, now).await;
+        let _ = self.fetch(url, caller, now).await;
         true
     }
 
-    /// 設定の `jwks_url` の集合 (`urls`) に合わせる。集合に無い `jwks_url` の束を捨て、
-    /// 集合の `jwks_url` のうち `all` なら全部、そうでなければまだ持っていないものだけを
-    /// 並行して取る。取れなかった `jwks_url` と理由を返す (束は前のまま)。
-    pub async fn sync(&self, urls: &BTreeSet<Url>, all: bool, now: i64) -> Vec<(Url, String)> {
-        let targets: Vec<Url> = {
+    /// 設定の `jwks_url` (`urls`、[`jwks_urls`] の形) に合わせる。無い `jwks_url` の束を捨て、
+    /// ある `jwks_url` のうち `all` なら全部、そうでなければまだ持っていないものだけを
+    /// 並行して取る。取れなかった呼び手の名前と理由を返す (束は前のまま)。
+    pub async fn sync(
+        &self,
+        urls: &BTreeMap<Url, String>,
+        all: bool,
+        now: i64,
+    ) -> Vec<(String, String)> {
+        let targets: Vec<(&Url, &String)> = {
             let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-            entries.retain(|url, _| urls.contains(url));
+            entries.retain(|url, _| urls.contains_key(url));
             urls.iter()
-                .filter(|url| {
-                    let known = entries.contains_key(*url);
-                    if !known {
-                        entries.insert((*url).clone(), Entry::default());
+                .filter(|(url, caller)| match entries.get_mut(*url) {
+                    Some(entry) => {
+                        // 同じ jwks_url のまま呼び手の名前が変わった時。
+                        entry.caller.clone_from(caller);
+                        all
                     }
-                    all || !known
+                    None => {
+                        entries.insert(
+                            (*url).clone(),
+                            Entry {
+                                caller: (*caller).clone(),
+                                ..Entry::default()
+                            },
+                        );
+                        true
+                    }
                 })
-                .cloned()
                 .collect()
         };
         let results = futures_util::future::join_all(
             targets
-                .iter()
-                .map(|url| async move { (url, self.fetch(url, now).await) }),
+                .into_iter()
+                .map(|(url, caller)| async move { (caller, self.fetch(url, caller, now).await) }),
         )
         .await;
         results
             .into_iter()
-            .filter_map(|(url, result)| result.err().map(|why| (url.clone(), why)))
+            .filter_map(|(caller, result)| result.err().map(|why| (caller.clone(), why)))
             .collect()
     }
 
@@ -240,26 +266,29 @@ impl CallerKeys {
     /// 持っていない `jwks_url` (取っている間に読み直しで消えたもの) の結果は捨てる。
     /// 遅れて終わった古い取得が、後から取れた束を上書きしないよう、取りに出た時刻が
     /// 今の束より前の結果も捨てる。
-    async fn fetch(&self, url: &Url, now: i64) -> Result<(), String> {
+    ///
+    /// `caller` はログと [`parse_jwks`] の取得元に添える呼び手の名前。
+    async fn fetch(&self, url: &Url, caller: &str, now: i64) -> Result<(), String> {
+        let source = format!("[callers.{caller}]");
         let fetched = self
             .fetcher
             .fetch(url)
             .await
-            .and_then(|body| parse_jwks(&body, url.as_str()));
+            .and_then(|body| parse_jwks(&body, &source));
         match fetched {
             Ok(keys) => {
                 let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = entries.get_mut(url)
                     && entry.fetched_at.is_none_or(|at| at <= now)
                 {
-                    tracing::debug!(jwks_url = %url, kids = keys.len(), "fetched the keys of a caller");
+                    tracing::debug!(caller, kids = keys.len(), "fetched the keys of a caller");
                     entry.keys = keys;
                     entry.fetched_at = Some(now);
                 }
                 Ok(())
             }
             Err(why) => {
-                tracing::warn!(jwks_url = %url, %why, "cannot fetch the keys of a caller; keeping the keys from the last fetch");
+                tracing::warn!(caller, %why, "cannot fetch the keys of a caller; keeping the keys from the last fetch");
                 Err(why)
             }
         }
@@ -267,7 +296,7 @@ impl CallerKeys {
 
     /// 持っている `jwks_url` (試験用)。
     #[cfg(test)]
-    pub(crate) fn urls(&self) -> BTreeSet<Url> {
+    pub(crate) fn urls(&self) -> std::collections::BTreeSet<Url> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
