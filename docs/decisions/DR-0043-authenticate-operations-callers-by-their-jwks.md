@@ -110,7 +110,7 @@ claims:  {
 
 `llm-gateway usage` / `stats` / `upstream status` は稼働中の unit の HTTP の口を読む (DR-0028 決定 6、登録簿から unit の設定を引く)。unit が `[callers]` を持てば TCP の口 (`[server] listen`) はこれらにも署名を求めるが、運用者の CLI と curl は呼び手の鍵を持たない。**unit は同じ Router を Unix domain socket でも listen し、CLI と curl はその口を読む** (実装は 1 つ、transport が 2 つ)。socket の口には呼び手の署名の層を掛けず、相手の確認は socket に任せる:
 
-- 設定は `[server] unix = "<path>"`。既定は登録簿 / runtime dir 配下の unit ごとの path (具体は実装の段で決める)
+- 設定は `[server] unix = "<path>"` (絶対パスのみ。台と CLI は cwd が違うので相対は `check` が断る。長さは `sockaddr_un` の上限まで)。既定は `<[stats] dir と同じ状態ディレクトリ>/daemon/http/<unit>.sock` (制御 socket `daemon/control/` の隣。台と CLI が同じ規則で引けるので教え合わなくて済み、unit 名で分けるので同じ土台を `extends` する 2 台でも取り合わない)。残骸の片付けは制御 socket より慎重に: socket でないファイルと誰かが待っている socket は消さずに断り、終了時に消すのは自分が bind したファイルだけ。socket を開けなくても台は TCP で動き続ける (log に error)
 - socket ファイルは 0600 (所有者だけ)。接続時に peer の uid が自分の uid と一致することを確かめる (`getpeereid` / `SO_PEERCRED`)
 - TCP の HTTP 側は今までどおり: `[callers]` があれば署名必須 (決定 6)。Caddy は TCP に繋ぐ。**Unix socket は Caddy に見せない** (外の呼び手は TCP の署名の口を読む)
 - CLI (`destination::ask`) は unit の socket を読む。呼び手の名指しも、署名できる呼び手が無いことを問う前に断る段も要らない
