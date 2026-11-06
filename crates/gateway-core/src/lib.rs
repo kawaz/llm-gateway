@@ -4,6 +4,7 @@
 //! 中身の語彙は利用側の crate が持ち、ここへは持ち込まない (DR-0030 §1)。
 //! 語彙が漏れていないことは `tests/vocabulary.rs` が確かめる。
 //!
+//! - [`caller`] 運用系の口の呼び手を、呼び手の JWKS で確かめる部品 (`request+jwt` の検証、`jti` の集合)
 //! - [`pattern`] `*` だけを扱う名前の照合
 //! - [`persist`] 書き手ごとのファイルを、途中の状態を読ませずに置く作法
 //! - [`upstream`] 無変換で中継する行き先の設定と、通してよいかの判定
@@ -19,6 +20,7 @@
 //! - [`events`] 起きたことを通し番号付きで見ている人へ流す口
 //! - [`ns`] namespace の入口での認証 ([`ns::NsAuth::verify`] → [`ns::Principal`])
 
+pub mod caller;
 pub mod config;
 pub mod counter;
 pub mod credential;

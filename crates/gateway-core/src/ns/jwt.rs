@@ -430,14 +430,9 @@ impl JwtAuth {
         token: &str,
         now_secs: i64,
     ) -> Result<Verified, Reason> {
-        let mut parts = token.split('.');
-        let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(Reason::Malformed);
-        };
+        let compact = Compact::split(token).ok_or(Reason::Malformed)?;
 
-        let header = decode_json(header_b64)?;
+        let header = decode_json(compact.header)?;
         let kid = header
             .get("kid")
             .and_then(Value::as_str)
@@ -450,19 +445,14 @@ impl JwtAuth {
             return Err(Reason::Crit);
         }
 
-        let sig: [u8; 64] = B64
-            .decode(sig_b64)
-            .map_err(|_| Reason::Malformed)?
-            .try_into()
-            .map_err(|_| Reason::BadSignature)?;
-        // 署名の入力は受け取った先頭 2 段の生のバイト列 (再エンコードしない)。
-        let signed = &token[..header_b64.len() + 1 + payload_b64.len()];
-        key.verify_strict(signed.as_bytes(), &Signature::from_bytes(&sig))
-            .map_err(|_| Reason::BadSignature)?;
+        let sig = compact.signature().ok_or(Reason::Malformed)?;
+        if !compact.is_signed_by(&key, &sig) {
+            return Err(Reason::BadSignature);
+        }
 
         // 時刻の計算は i128 で行う。claim は署名済みでも任意の i64 を持てるので、
         // i64 のまま足し引きすると端の値で桁あふれし、判定が逆転しうる。
-        let claims = decode_json(payload_b64)?;
+        let claims = decode_json(compact.payload)?;
         let time = |name: &str| -> Result<Option<i128>, Reason> {
             match claims.get(name) {
                 None => Ok(None),
@@ -527,13 +517,62 @@ impl JwtAuth {
 }
 
 fn decode_json(part: &str) -> Result<Value, Reason> {
-    let bytes = B64.decode(part).map_err(|_| Reason::Malformed)?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| Reason::Malformed)?;
-    if value.is_object() {
-        Ok(value)
-    } else {
-        Err(Reason::Malformed)
+    decode_object(part).ok_or(Reason::Malformed)
+}
+
+/// JWS compact (`b64(header).b64(payload).b64(sig)`) を 3 段に割ったもの。各段は
+/// 受け取った文字列のまま持つ (署名の入力は再エンコードしない)。
+///
+/// 段を読むこと ([`decode_object`]、[`Compact::signature`]) と署名を確かめること
+/// ([`Compact::is_signed_by`]) だけを持ち、header / claim の意味は使う側が決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compact<'a> {
+    pub header: &'a str,
+    pub payload: &'a str,
+    signature: &'a str,
+    /// 署名の入力 (先頭 2 段と間の `.`)。
+    signing_input: &'a str,
+}
+
+impl<'a> Compact<'a> {
+    /// ちょうど 3 段に割れなければ `None`。
+    pub fn split(token: &'a str) -> Option<Self> {
+        let mut parts = token.split('.');
+        let (Some(header), Some(payload), Some(signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        Some(Self {
+            header,
+            payload,
+            signature,
+            signing_input: &token[..header.len() + 1 + payload.len()],
+        })
     }
+
+    /// 署名の段のバイト列。base64url でなければ `None` (長さは見ない)。
+    pub fn signature(&self) -> Option<Vec<u8>> {
+        B64.decode(self.signature).ok()
+    }
+
+    /// `signature` ([`Compact::signature`] の値) が `key` による先頭 2 段の
+    /// Ed25519 署名か (`verify_strict`)。64 バイトでなければ合わない。
+    pub fn is_signed_by(&self, key: &VerifyingKey, signature: &[u8]) -> bool {
+        let Ok(sig) = <[u8; 64]>::try_from(signature) else {
+            return false;
+        };
+        key.verify_strict(self.signing_input.as_bytes(), &Signature::from_bytes(&sig))
+            .is_ok()
+    }
+}
+
+/// base64url の段を JSON のオブジェクトとして読む。読めない・オブジェクトでなければ `None`。
+pub fn decode_object(part: &str) -> Option<Value> {
+    let bytes = B64.decode(part).ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .filter(Value::is_object)
 }
 
 /// JWS compact で署名する (`alg = EdDSA`, `kid`)。`claims` は JSON のオブジェクト。

@@ -110,6 +110,13 @@ pub struct Config {
     #[serde(default)]
     pub webhook: Webhook,
 
+    /// 運用系の口を読む呼び手 (DR-0043 決定 1)。キーは呼び手の名前。
+    ///
+    /// 1 つでも書いた unit は、署名を求める口で呼び手の署名した token を求める
+    /// (決定 6)。読み直しで差し替えられる。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub callers: BTreeMap<String, Caller>,
+
     /// 無変換で中継する行き先 (DR-0030 §2)。`/ns-<ns>/<名前>/<rest>` で使う。
     ///
     /// 名前は既定で上流の FQDN を書く慣習で、任意のラベルも書ける。
@@ -1107,6 +1114,30 @@ fn destination_url(base: &str) -> std::result::Result<url::Url, String> {
     Ok(url)
 }
 
+/// 運用系の口の呼び手 1 つ (`[callers.<name>]`、DR-0043 決定 1)。
+///
+/// 呼び手は自分の鍵で request ごとに token を署名し、gateway は `jwks_url` の鍵で
+/// 確かめる。`jwks_url` へ取りに行くのは走っている unit で、設定の読み込みと
+/// `check` はネットワークに出ない。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Caller {
+    /// 呼び手の公開鍵の置き場 (JWKS)。https だけで、userinfo と fragment を持たない。
+    pub jwks_url: url::Url,
+
+    /// token の `iss` と完全一致で比べる名前。省略時は表の名前 ([`Caller::iss`])。
+    /// `[callers]` の中で重複しない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+}
+
+impl Caller {
+    /// 実効の `iss`。書いていなければ表の名前 (`name`)。
+    pub fn iss<'a>(&'a self, name: &'a str) -> &'a str {
+        self.iss.as_deref().unwrap_or(name)
+    }
+}
+
 /// 既定の合言葉の置き場。受け取る側 (ccmsg) が置く場所に合わせる。
 fn default_token_file() -> PathBuf {
     xdg_dir("XDG_DATA_HOME", ".local/share")
@@ -1781,6 +1812,7 @@ impl Config {
         if let Some(reason) = refused.first() {
             return Err(Error::Config(format!("webhook destination {reason}")));
         }
+        self.validate_callers()?;
         for (name, source) in &self.status.sources {
             if name.is_empty() {
                 return Err(Error::Config("status source name is empty".to_owned()));
@@ -1830,6 +1862,48 @@ impl Config {
                 return Err(Error::Config("namespace name is empty".to_owned()));
             }
             self.validate_namespace(name, ns)?;
+        }
+        Ok(())
+    }
+
+    /// `[callers]` を確かめる (DR-0043 決定 6)。`jwks_url` へは取りに行かない。
+    fn validate_callers(&self) -> Result<()> {
+        let mut issuers: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, caller) in &self.callers {
+            if !is_file_name_safe(name) {
+                return Err(Error::Config(format!(
+                    "caller name `{name}` may contain only letters, digits, `.`, `_` and `-`, and must not start with `.`"
+                )));
+            }
+            // URL は userinfo に秘密を含みうるので、断る文に URL を出さない。
+            let url = &caller.jwks_url;
+            if url.scheme() != "https" {
+                return Err(Error::Config(format!(
+                    "[callers.{name}] jwks_url must use https, not `{}`",
+                    url.scheme()
+                )));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(Error::Config(format!(
+                    "[callers.{name}] jwks_url must not contain userinfo"
+                )));
+            }
+            if url.fragment().is_some() {
+                return Err(Error::Config(format!(
+                    "[callers.{name}] jwks_url must not contain a fragment"
+                )));
+            }
+            let iss = caller.iss(name);
+            if iss.is_empty() {
+                return Err(Error::Config(format!(
+                    "[callers.{name}] iss is empty; write the caller's iss, or remove it to use `{name}`"
+                )));
+            }
+            if let Some(other) = issuers.insert(iss, name) {
+                return Err(Error::Config(format!(
+                    "[callers.{other}] and [callers.{name}] both use iss `{iss}`; give each caller its own iss"
+                )));
+            }
         }
         Ok(())
     }
@@ -3705,6 +3779,98 @@ base_urls = []",
                 assert!(parse(&source).is_err(), "{base} was accepted");
             }
         }
+    }
+
+    /// `iss` を省けば表の名前が実効の `iss` になる。`jwks_url` へは取りに行かない
+    /// (届かない宛先でも読める)。
+    #[test]
+    fn callers_take_the_table_name_as_iss_by_default() {
+        let c = parse(
+            r#"
+[callers.notifier]
+jwks_url = "https://notifier.invalid/.well-known/jwks.json?v=1"
+
+[callers.operator]
+jwks_url = "https://ops.invalid/jwks.json"
+iss = "ops"
+"#,
+        )
+        .unwrap();
+        let notifier = &c.callers["notifier"];
+        assert_eq!(notifier.iss("notifier"), "notifier");
+        assert_eq!(
+            notifier.jwks_url.as_str(),
+            "https://notifier.invalid/.well-known/jwks.json?v=1"
+        );
+        assert_eq!(c.callers["operator"].iss("operator"), "ops");
+        assert!(parse("").unwrap().callers.is_empty());
+    }
+
+    #[test]
+    fn caller_jwks_url_must_be_plain_https() {
+        for (url, said) in [
+            ("http://notifier.example/jwks.json", "https"),
+            ("file:///tmp/jwks.json", "https"),
+            ("https://user@notifier.example/jwks.json", "userinfo"),
+            ("https://user:pass@notifier.example/jwks.json", "userinfo"),
+            ("https://notifier.example/jwks.json#keys", "fragment"),
+        ] {
+            let err = parse(&format!("[callers.notifier]\njwks_url = {url:?}\n")).unwrap_err();
+            let err = err.to_string();
+            assert!(err.contains(said), "{url}: {err}");
+            assert!(!err.contains("pass"), "the URL is not echoed: {err}");
+        }
+        assert!(parse("[callers.notifier]\njwks_url = \"not a url\"\n").is_err());
+        assert!(
+            parse("[callers.notifier]\niss = \"n\"\n").is_err(),
+            "jwks_url is required"
+        );
+    }
+
+    #[test]
+    fn caller_iss_must_be_unique_and_not_empty() {
+        let err = parse(
+            r#"
+[callers.a]
+jwks_url = "https://a.example/jwks.json"
+iss = "b"
+
+[callers.b]
+jwks_url = "https://b.example/jwks.json"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("both use iss `b`"), "{err}");
+        let err =
+            parse("[callers.a]\njwks_url = \"https://a.example/j\"\niss = \"\"\n").unwrap_err();
+        assert!(err.to_string().contains("iss is empty"), "{err}");
+    }
+
+    /// 呼び手の名前は `[ns.<name>]` (自動の鍵) と同じ規則。
+    #[test]
+    fn caller_names_follow_the_file_name_rule() {
+        for name in ["", ".hidden", "..", "a/b", "a b", "名前"] {
+            let source = format!("[callers.{name:?}]\njwks_url = \"https://a.example/j\"\n");
+            let err = parse(&source).unwrap_err();
+            assert!(err.to_string().contains("caller name"), "{name}: {err}");
+        }
+        assert!(parse("[callers.\"a.b_c-1\"]\njwks_url = \"https://a.example/j\"\n").is_ok());
+    }
+
+    #[test]
+    fn unknown_caller_key_is_rejected() {
+        let err =
+            parse("[callers.a]\njwks_url = \"https://a.example/j\"\naud = \"x\"\n").unwrap_err();
+        assert!(err.to_string().contains("aud"), "{err}");
+    }
+
+    /// `[callers]` は読み直しで差し替えられる (DR-0043 決定 6)。
+    #[test]
+    fn callers_do_not_pin_the_reload() {
+        let before = parse("").unwrap();
+        let after = parse("[callers.a]\njwks_url = \"https://a.example/j\"\n").unwrap();
+        assert!(before.fixed_at_start_changes(&after).is_empty());
+        assert!(after.fixed_at_start_changes(&before).is_empty());
     }
 
     #[test]
