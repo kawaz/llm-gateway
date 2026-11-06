@@ -23,10 +23,11 @@ url = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
+# 運用系の口の呼び手を断った段 (DR-0043) を、応答の種類に分けてログに出す。
+# 置き場の試験用実装が返す汎用層の Result もここから引く。
+gateway-core = { path = "../gateway-core", version = "0.69" }
 
 [dev-dependencies]
-# 置き場の試験用実装が汎用層の Result を返すため。
-gateway-core = { path = "../gateway-core" }
 toml = { workspace = true }
 # ns 認証 `jwt` の試験で token を署名する。
 ed25519-dalek = { workspace = true }

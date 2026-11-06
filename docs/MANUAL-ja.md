@@ -387,9 +387,84 @@ curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization:
 
 ## 運用系
 
-`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。運用系はいずれも認証を持たない。境界は手前で引く。
+`/llm-gateway/` の下にまとめてあるのは、upstream の API 名と衝突させないため (DR-0006)。会話・認証情報・使用量を読む口と keepalive を止める口は、`[callers.<name>]` を 1 つでも書くと呼び手の署名を求める。残りは手前で引いた境界を信頼する ([呼び手の署名](#呼び手の署名-callersname))。
 
 **時刻の欄は数値 1 つで、単位は Unix ミリ秒**。同じ瞬間を 2 通りの形で並べないので、人が読む形へは受け取った側で直す。名前に単位が入っている欄 (`window_seconds` / `cache_ttl_secs`) だけが**長さ**で、こちらは秒。
+
+### 呼び手の署名 (`[callers.<name>]`)
+
+呼び手は request ごとに自分の短命の Ed25519 鍵で署名し、gateway は呼び手が JWKS として公開している公開鍵で確かめる (DR-0043)。秘密は共有しない: gateway に教えるのは呼び手の JWKS の置き場だけで、呼び手は鍵を JWKS から外せば失効させられる。
+
+| 署名を求める | 求めない |
+| --- | --- |
+| `GET /llm-gateway/sessions`<br>`GET /llm-gateway/sessions/{session_id}`<br>`GET /llm-gateway/usage`<br>`GET /llm-gateway/status`<br>`GET /llm-gateway/stats`<br>`GET /llm-gateway/events`<br>`POST /llm-gateway/keepalive/pause` | `GET /llm-gateway/healthz`<br>`GET /llm-gateway/version`<br>`GET /llm-gateway/self`<br>`GET /llm-gateway/login`<br>`GET /llm-gateway/login/{name}/start`<br>`POST /llm-gateway/login/{name}` |
+
+- **`[callers.<name>]` が 1 つでもあれば**、左の列の口は正しい token の無い request を断る (`Authorization` が無いものも)。署名の無い request を通す設定は無い
+- **`[callers]` が無ければ**何も確かめず、`Authorization` も読まない。右の列と同じく手前の境界 (tailnet、リバースプロキシ) を信頼する
+- 右の列を問うのは、呼び手の鍵を持たない監督者 (`daemon status` が `/self` と `/version` を読み、`restart` が `/healthz` を待つ) と、署名できないブラウザ (`login`)。リバースプロキシで信頼できる網の外へ出すなら、外の呼び手が読む左の列の口だけを出し、右の列は内側に留める
+
+```toml
+[callers.ccmsg]
+jwks_url = "https://ccmsg.example/.well-known/jwks.json"   # 必須。呼び手が公開鍵を出している置き場
+iss = "ccmsg"                                              # 省略可。省略時は表の名前
+```
+
+- `jwks_url` は `https://` で、userinfo も fragment も持たない
+- `iss` は token の `iss` と完全一致で比べ、どの呼び手の鍵で確かめるかを決める: ある呼び手の `iss` を名乗った token は、その呼び手の鍵だけで確かめる
+- `llm-gateway check` が断るのは、`jwks_url` が https の URL でない・userinfo か fragment を持つ、`iss` が空、`iss` が同じ呼び手が 2 つある、`jwks_url` が同じ呼び手が 2 つある (片方の鍵でもう片方を名乗れてしまう)、呼び手の名前が英数字と `.` / `_` / `-` 以外を含む (または `.` で始まる) 時。`jwks_url` へは取りに行かない。取れない URL は、走り出した台のログで分かる
+- `[callers]` は `daemon reload` で変えられる: 増えた呼び手の鍵を取り、消えた呼び手の鍵を捨て、空にすれば確かめるのをやめる
+- `[callers]` を知らない版の台は設定全体を断る。stable と unstable が同じファイルを読むなら、両方が `[callers]` を知る版で走ってから書く
+
+#### token の作り方
+
+呼び手は request ごとに署名し (token を使い回さない)、Bearer で送る:
+
+```
+GET /llm-gateway/sessions/0f3c6d1a-… HTTP/1.1
+Authorization: Bearer <compact JWS>
+
+header:  {"alg": "EdDSA", "kid": "<kid>", "typ": "request+jwt"}
+claims:  {"iss": "ccmsg", "aud": "GET /llm-gateway/sessions/0f3c6d1a-…", "iat": 1785600000, "exp": 1785600010, "jti": "<任意>"}
+```
+
+| 欄 | 入れるもの |
+| --- | --- |
+| `alg` | `EdDSA` か `Ed25519`。JWKS の JWK が `alg` を持つなら同じ値 |
+| `kid` | 呼び手の JWKS にある、署名した鍵の `kid` |
+| `typ` | `request+jwt` (大文字小文字は問わず、`application/request+jwt` も合う)。namespace の token (`JWT`) はここを通らない |
+| `iss` | 呼び手の `iss` (`[callers.<name>] iss`、無ければ表の名前) |
+| `aud` | method、空白 1 つ、**request line に載る path そのもの**: percent-encode されたまま、scheme・host・query を含めない。`GET /llm-gateway/sessions?ns=personal` なら `GET /llm-gateway/sessions`、会話の id `a b` を `/llm-gateway/sessions/a%20b` で送るなら `GET /llm-gateway/sessions/a%20b` |
+| `iat` | 署名した時刻 (Unix 秒) |
+| `exp` | `iat` + 10 |
+| `jti` | 任意。付けるなら request ごとに新しい文字列。`exp` までに同じ `jti` が来たら断る |
+
+gateway が時刻について見るのは `now < exp` と `0 ≤ exp − iat ≤ 10` の 2 つだけ。時計のずれの猶予は無く、`iat` が未来でも断らず、`nbf` は読まない。両側の時計は OS の時刻同期に任せる。query と body は署名で覆わない。手前のリバースプロキシは path を変えずに通すこと (書き換えた path は `aud` と合わなくなる)。
+
+`events` は繋ぐ時の request だけを確かめる。繋がった stream は確かめ直さず、token の `exp` を過ぎても流れ続ける。ブラウザの `EventSource` は header を付けられないので、`[callers]` のある台の `events` は開けない。
+
+```bash
+curl -sS https://gateway.example/llm-gateway/sessions -H "Authorization: Bearer $TOKEN"   # $TOKEN は "GET /llm-gateway/sessions" 宛てに 10 秒以内に署名したもの
+```
+
+断った応答は namespace の認証と同じ JSON のエラーで、`message` は status ごとの固定文。どの検査で落ちたかは応答に出さず、台のログに警告として残す (`refused an operations caller` に method、path、token が名乗った `iss`、理由を添える)。
+
+| status | 意味 | 呼び手がすること |
+| --- | --- | --- |
+| 401 + `WWW-Authenticate: Bearer error="invalid_token"` | `Authorization` が無い、未知の `kid`、署名が合わない、期限切れ、`jti` の使い回し、gateway が鍵を信じられなくなった | `iat` / `exp` を新しくして署名し直し、送り直す |
+| 400 | `Authorization` が `Bearer <token>` でない、token が読めないか `crit` を持つ、`alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` が無いかこの request と合わない (`exp − iat` が 0〜10 の外を含む)、`jti` が文字列でない | 同じものを送り直しても通らない。token の作り方を直す |
+
+```json
+{"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}
+```
+
+#### 呼び手の鍵
+
+- 台は起動時 (と `daemon reload` で呼び手が増えた時) に全呼び手の `jwks_url` を取る。取れなくても台は止まらず、ログに残して最初の request で取り直す
+- token の `kid` が手元の鍵に無ければ、その呼び手の `jwks_url` を取り直してもう 1 度確かめる。この取り直しは URL ごとに 30 秒に 1 回までで、その間に来た token は 401 になり、次の取り直しの後に送り直せば通る。新しい鍵は JWKS に載せてから署名に使う
+- これとは別に、全呼び手を 10 分ごとに取り直す
+- 取れたら呼び手の鍵を丸ごと置き換える (載らなくなった `kid` は通らなくなる)。取れなければ前の鍵を保ち、最後に取れてから 66 分までは信じる。過ぎるとその呼び手の token は全部 401 になり、そうした request のたびに取り直しを試みる (30 秒の間隔は同じ)
+- 取り込むのは `kty: "OKP"`、`crv: "Ed25519"`、`use: "sig"` (あれば)、`alg` が `Ed25519` / `EdDSA` (あれば) の鍵だけで、合わない鍵は警告を出して飛ばす。同じ `kid` が 2 つある鍵も飛ばす。取得は redirect を追わず、5 秒で諦め、64 KiB までしか読まず、その場では再試行しない
+- 来た `jti` は台ごとにメモリで `exp` まで覚える (stable と unstable で共有せず、再起動で忘れる)。65,536 件を超えると、照合はするが記録はしない
 
 ### `GET /llm-gateway/healthz`
 
@@ -554,7 +629,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 
 転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む。落とした数は `/llm-gateway/self` に出る)。20 秒ごとに keep-alive を送る。
 
-`Access-Control-Allow-Origin: *` を付けているので、ブラウザから直接開いて様子を見られる。本文もトークン数も流さない。
+`Access-Control-Allow-Origin: *` を付けているので、`[callers]` の無い台ならブラウザから直接開いて様子を見られる (ブラウザは署名を付けられない、[呼び手の署名](#呼び手の署名-callersname))。本文もトークン数も流さない。
 
 ```bash
 curl -sSN http://127.0.0.1:8402/llm-gateway/events
@@ -621,7 +696,7 @@ base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 
 ### `GET /llm-gateway/sessions/{session_id}`
 
-1 つの会話の cache / keepalive の状態を返す (DR-0042)。中身は gateway がその会話について持っている控え ([keepalive の運用](#keepalive-の運用)) と、その会話が使う経路に付いている上限の印の写し。`{session_id}` は Claude Code が `X-Claude-Code-Session-Id` に載せる会話の id で、path には percent-encode して置く。問われた時点での判定はしない — 期限が過ぎたか・経路が使えるかは gateway が送る直前に決める。時刻は受け取った側で壁時計と比べる。
+1 つの会話の cache / keepalive の状態を返す (DR-0042)。中身は gateway がその会話について持っている控え ([keepalive の運用](#keepalive-の運用)) と、その会話が使う経路に付いている上限の印の写し。`{session_id}` は Claude Code が `X-Claude-Code-Session-Id` に載せる会話の id で、path には percent-encode して置く (署名する呼び手は encode した path を `aud` に入れる)。問われた時点での判定はしない — 期限が過ぎたか・経路が使えるかは gateway が送る直前に決める。時刻は受け取った側で壁時計と比べる。
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
@@ -721,6 +796,7 @@ curl -sS http://127.0.0.1:8402/llm-gateway/login/personal \
 | credential (`<store>/<name>.json`) | 周期的に mtime を見張り、変わっていれば読み直す (`[discovery] watch_secs`) | 何もしない |
 | 鍵束 (`keys_file`) | JWT を検証するたびに stat し、mtime が変わっていれば読み直す | 何もしない (次のリクエストから効く) |
 | 自動の鍵 (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) | 同上。書くのは gateway 自身 | 手で書き換えない |
+| 呼び手の鍵 (`[callers.<name>] jwks_url`) | 起動時、`daemon reload`、10 分ごと、未知の `kid` か鍵が古い時 (URL ごとに 30 秒に 1 回まで) | 新しい鍵は JWKS に載せてから署名に使う |
 | 設定ファイル (`extends` の土台を含む) | `daemon reload` で命じた時だけ | `llm-gateway daemon reload <unit>\|--all` |
 
 設定ファイルだけは見張らない。保存途中や、`extends` の土台と派生を順に書き換える途中を拾わないため、書き終えたことを `daemon reload` で伝える。一部の欄は起動時に掴むので reload では変えられず、変えたら restart が要る (`daemon reload` の節)。

@@ -385,9 +385,84 @@ curl -sS http://127.0.0.1:8402/ns-personal/api.x.ai/v1/models -H 'authorization:
 
 ## Operations
 
-These live under `/llm-gateway/` so they never collide with upstream API names (DR-0006). None of them carry authentication; the boundary is drawn in front.
+These live under `/llm-gateway/` so they never collide with upstream API names (DR-0006). The ones that read conversations, credentials and usage, and the one that stops a keepalive, ask the caller for a signature once at least one `[callers.<name>]` is written; the rest trust the boundary drawn in front ([Signed callers](#signed-callers-callersname)).
 
 **Every moment these endpoints report is a single number in Unix milliseconds.** The same instant is never spelled a second way, so rendering it for a human is the receiver's job. Only fields whose name carries a unit (`window_seconds`, `cache_ttl_secs`) are *durations*, and those are in seconds.
+
+### Signed callers (`[callers.<name>]`)
+
+A caller signs each request with its own short-lived Ed25519 key, and the gateway checks it against the public keys the caller publishes as a JWKS (DR-0043). Nothing secret is shared: the gateway is told only where the caller's JWKS lives, and the caller revokes a key by taking it out of its JWKS.
+
+| Signature required | No signature |
+| --- | --- |
+| `GET /llm-gateway/sessions`<br>`GET /llm-gateway/sessions/{session_id}`<br>`GET /llm-gateway/usage`<br>`GET /llm-gateway/status`<br>`GET /llm-gateway/stats`<br>`GET /llm-gateway/events`<br>`POST /llm-gateway/keepalive/pause` | `GET /llm-gateway/healthz`<br>`GET /llm-gateway/version`<br>`GET /llm-gateway/self`<br>`GET /llm-gateway/login`<br>`GET /llm-gateway/login/{name}/start`<br>`POST /llm-gateway/login/{name}` |
+
+- **With at least one `[callers.<name>]`**, every endpoint in the left column refuses a request without a valid token, `Authorization` missing included. There is no setting that lets unsigned requests through
+- **With no `[callers]`**, nothing is checked and `Authorization` is not even read: the boundary in front (tailnet, a reverse proxy) is trusted, as for every endpoint in the right column
+- The right column is asked by the supervisor (`daemon status` reads `/self` and `/version`, `restart` waits on `/healthz`), which holds no caller key, and by a browser (`login`), which cannot sign. When a reverse proxy exposes the gateway beyond the trusted network, expose only the left-column endpoints an outside caller reads and keep the right column inside
+
+```toml
+[callers.ccmsg]
+jwks_url = "https://ccmsg.example/.well-known/jwks.json"   # required; where the caller publishes its public keys
+iss = "ccmsg"                                              # optional; defaults to the table name
+```
+
+- `jwks_url` must be `https://` and carry neither userinfo nor a fragment
+- `iss` is compared exactly with the token's `iss`, and picks whose keys verify the token: a token naming one caller's `iss` is checked only against that caller's keys
+- `llm-gateway check` refuses: a `jwks_url` that is not an https URL or carries userinfo or a fragment, an empty `iss`, two callers with the same `iss`, two callers with the same `jwks_url` (either could then sign as the other), and a caller name that is not letters, digits, `.`, `_` and `-` (or starts with `.`). It does not fetch `jwks_url`; a URL that cannot be fetched shows up in the unit's log once it runs
+- `[callers]` can be changed with `daemon reload`: keys of added callers are fetched, keys of removed ones dropped, and emptying it stops the checks
+- A unit running a version that does not know `[callers]` refuses the whole configuration. When stable and unstable read the same file, write `[callers]` only once both run a version that knows it
+
+#### Making a token
+
+The caller signs every request on its own (it does not reuse a token across requests) and sends it as a Bearer token:
+
+```
+GET /llm-gateway/sessions/0f3c6d1a-… HTTP/1.1
+Authorization: Bearer <compact JWS>
+
+header:  {"alg": "EdDSA", "kid": "<kid>", "typ": "request+jwt"}
+claims:  {"iss": "ccmsg", "aud": "GET /llm-gateway/sessions/0f3c6d1a-…", "iat": 1785600000, "exp": 1785600010, "jti": "<optional>"}
+```
+
+| Part | What to put |
+| --- | --- |
+| `alg` | `EdDSA` or `Ed25519`. When the JWK in the JWKS carries `alg`, the same value |
+| `kid` | The `kid` of the signing key in the caller's JWKS |
+| `typ` | `request+jwt` (compared case-insensitively; `application/request+jwt` also matches). Namespace tokens (`JWT`) do not pass here |
+| `iss` | The caller's `iss` (`[callers.<name>] iss`, or the table name) |
+| `aud` | The method, one space, and the path **exactly as it is on the request line**: still percent-encoded, without scheme, host or query. `GET /llm-gateway/sessions?ns=personal` signs `GET /llm-gateway/sessions`; a session id `a b` sent as `/llm-gateway/sessions/a%20b` signs `GET /llm-gateway/sessions/a%20b` |
+| `iat` | When it was signed (Unix seconds) |
+| `exp` | `iat` + 10 |
+| `jti` | Optional. When present, a string fresh for every request: a `jti` seen again before its `exp` is refused |
+
+The gateway checks time in exactly two ways: `now < exp`, and `0 ≤ exp − iat ≤ 10`. There is no allowance for clock skew, an `iat` in the future is not refused, and `nbf` is not read, so keep both clocks synchronized by the OS. The query and the body are not covered by the signature. A reverse proxy in front must pass the path unchanged; a rewritten path no longer matches `aud`.
+
+`events` is checked only on the request that connects. An open stream is not checked again and keeps flowing after the token's `exp`. A browser's `EventSource` cannot add the header, so it cannot open `events` on a unit with `[callers]`.
+
+```bash
+curl -sS https://gateway.example/llm-gateway/sessions -H "Authorization: Bearer $TOKEN"   # $TOKEN signed for "GET /llm-gateway/sessions" within the last 10 seconds
+```
+
+A refused request gets the same JSON error as namespace authentication, with one fixed `message` per status. Which check failed is never in the response; the unit logs it as a warning (`refused an operations caller` with the method, path, the `iss` the token claimed, and the reason).
+
+| Status | Meaning | What the caller does |
+| --- | --- | --- |
+| 401 + `WWW-Authenticate: Bearer error="invalid_token"` | No `Authorization`, an unknown `kid`, a signature that does not verify, an expired token, a reused `jti`, or keys the gateway can no longer trust | Sign again with fresh `iat` / `exp` and resend |
+| 400 | `Authorization` is not `Bearer <token>`, the token cannot be parsed or carries `crit`, `alg` / `typ` / `kid` / `iss` / `aud` / `iat` / `exp` are missing or do not match this request (including `exp − iat` outside 0 to 10), or `jti` is not a string | Resending the same will not pass; fix how the token is made |
+
+```json
+{"type":"error","error":{"type":"authentication_error","message":"caller authentication failed; sign the request again"}}
+```
+
+#### The caller's keys
+
+- When a unit starts (and when `daemon reload` adds a caller), it fetches every caller's `jwks_url`. A failed fetch does not stop the unit; it is logged and tried again on the first request
+- A token whose `kid` is not among the cached keys makes the unit fetch that caller's `jwks_url` again and check once more. Such fetches happen at most once every 30 seconds per URL; a token arriving inside that window is refused with 401 and passes once resent after the next fetch. Publish a new key in the JWKS before signing with it
+- Every caller is also fetched again every 10 minutes
+- A successful fetch replaces the caller's keys as a whole (a `kid` no longer listed stops passing). A failed fetch keeps the previous keys, trusted until 66 minutes after the last success; past that, every token of that caller is refused with 401, and each such request also triggers a fetch (with the same 30-second spacing)
+- Only keys with `kty: "OKP"`, `crv: "Ed25519"`, `use: "sig"` (when present) and `alg` `Ed25519` / `EdDSA` (when present) are taken; other keys are skipped with a warning, and a `kid` listed twice is skipped. The fetch follows no redirect, gives up after 5 seconds, reads at most 64 KiB, and is not retried on the spot
+- Seen `jti` values are kept per unit in memory until their `exp` (stable and unstable do not share them; a restart forgets them). Past 65,536 entries a `jti` is still checked but not recorded
 
 ### `GET /llm-gateway/healthz`
 
@@ -552,7 +627,7 @@ curl -sS 'http://127.0.0.1:8402/llm-gateway/stats?days=3'
 
 Streams what happens on every forward, over SSE (DR-0012). You receive only what happens **after** you connect; there is no replay. A slow watcher that misses events does not stall the gateway (events are dropped and it moves on; the count is in `/llm-gateway/self`). A keep-alive is sent every 20 seconds.
 
-`Access-Control-Allow-Origin: *` is set, so a browser can open it directly to watch. Neither bodies nor token counts are streamed.
+`Access-Control-Allow-Origin: *` is set, so a browser can open it directly to watch on a unit without `[callers]` (a browser cannot send the signature, see [Signed callers](#signed-callers-callersname)). Neither bodies nor token counts are streamed.
 
 ```bash
 curl -sSN http://127.0.0.1:8402/llm-gateway/events
@@ -619,7 +694,7 @@ base_urls = ["http://192.168.1.5:7777", "http://192.168.1.6:7777"]
 
 ### `GET /llm-gateway/sessions/{session_id}`
 
-Reports the cache / keepalive state of one conversation (DR-0042): a copy of what the gateway keeps for it ([Running keepalive](#running-keepalive)) and of the limit marks on the routes it would use. `{session_id}` is the conversation id Claude Code sends in `X-Claude-Code-Session-Id`, percent-encoded in the path. Nothing is judged at the time of asking — whether a deadline has passed or a route is usable is decided by the gateway right before it sends; compare the times with the wall clock on your side.
+Reports the cache / keepalive state of one conversation (DR-0042): a copy of what the gateway keeps for it ([Running keepalive](#running-keepalive)) and of the limit marks on the routes it would use. `{session_id}` is the conversation id Claude Code sends in `X-Claude-Code-Session-Id`, percent-encoded in the path (a signed caller puts that encoded path in `aud`). Nothing is judged at the time of asking — whether a deadline has passed or a route is usable is decided by the gateway right before it sends; compare the times with the wall clock on your side.
 
 ```bash
 curl -sS http://127.0.0.1:8402/llm-gateway/sessions/0f3c6d1a-…
@@ -719,6 +794,7 @@ A running unit rereads each input on a different trigger. What to do after chang
 | Credentials (`<store>/<name>.json`) | The mtime is watched periodically and the file reread when it changed (`[discovery] watch_secs`) | Nothing |
 | Key ring (`keys_file`) | Every JWT verification stats it and rereads it when the mtime changed | Nothing (effective from the next request) |
 | Automatic keys (`<[stats] dir>/jwt-keys/<ns>.jwks.jsonl`) | The same; the gateway itself writes them | Do not edit them by hand |
+| Callers' keys (`[callers.<name>] jwks_url`) | At start, on `daemon reload`, every 10 minutes, and on an unknown `kid` or stale keys (at most every 30 seconds per URL) | Publish a new key in the JWKS before signing with it |
 | Configuration file (including its `extends` bases) | Only when told to by `daemon reload` | `llm-gateway daemon reload <unit>\|--all` |
 
 The configuration file alone is not watched: watching would pick up a half-saved file, or a moment where an `extends` base is rewritten but the file deriving from it is not yet. Say it is finished with `daemon reload`. Some fields are taken when the unit starts and cannot change on a reload; changing them needs a restart (see `daemon reload`).

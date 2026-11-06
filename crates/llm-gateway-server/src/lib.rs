@@ -51,13 +51,7 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         .route("/llm-gateway/healthz", get(healthz))
         .route("/llm-gateway/version", get(version))
         .route("/llm-gateway/self", get(self_report))
-        .route("/llm-gateway/usage", get(usage))
-        .route("/llm-gateway/status", get(status))
-        .route("/llm-gateway/stats", get(stats))
-        .route("/llm-gateway/events", get(events))
-        .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
-        .route("/llm-gateway/sessions", get(sessions))
-        .route("/llm-gateway/sessions/{session_id}", get(session))
+        .merge(callers_only(Arc::clone(&gateway)))
         .route("/llm-gateway/login", get(login_index))
         .route("/llm-gateway/login/{name}/start", get(login_start))
         .route("/llm-gateway/login/{name}", post(login_finish))
@@ -68,6 +62,119 @@ pub fn router<P: CredentialPersistence + 'static>(gateway: Arc<Gateway<P>>) -> R
         // 先に当たるので、`v1` / `llm-gateway` / `llm` は行き先の名前にできない。
         .route("/{ns}/{upstream}/{*rest}", any(passthrough))
         .with_state(gateway)
+}
+
+/// 呼び手の署名を求める運用系の口 (DR-0043 決定 2)。`healthz` / `version` / `self` /
+/// `login*` は監督者とブラウザが問う口なので、ここに入れない。
+///
+/// 確かめるのは handler ごとでなく層にする: pause の `Json` のような extractor より先に
+/// 断り、求める口の一覧をこの 1 か所に置くため。
+fn callers_only<P: CredentialPersistence + 'static>(
+    gateway: Arc<Gateway<P>>,
+) -> Router<Arc<Gateway<P>>> {
+    Router::new()
+        .route("/llm-gateway/usage", get(usage))
+        .route("/llm-gateway/status", get(status))
+        .route("/llm-gateway/stats", get(stats))
+        .route("/llm-gateway/events", get(events))
+        .route("/llm-gateway/keepalive/pause", post(keepalive_pause))
+        .route("/llm-gateway/sessions", get(sessions))
+        .route("/llm-gateway/sessions/{session_id}", get(session))
+        .route_layer(axum::middleware::from_fn_with_state(
+            gateway,
+            require_caller::<P>,
+        ))
+}
+
+/// 401 の本文。署名し直せば通りうる段 (署名、未知の `kid`、期限切れ、`jti` の再利用、
+/// 鍵が古い) をまとめた固定文で、どの段かは出さない。
+const CALLER_UNAUTHORIZED: &str = "caller authentication failed; sign the request again";
+
+/// 400 の本文。直さないと通らない段 (形、`alg` / `typ` / `kid` / `aud` / `iss`、時刻の欄)
+/// をまとめた固定文。
+const CALLER_BAD_REQUEST: &str =
+    "the caller token is malformed or does not match this request; fix how the token is made";
+
+/// 呼び手の token を確かめ、通らなければ断る (DR-0043 決定 3・4・6)。
+///
+/// `aud` と比べるのは request line の path そのもの (percent-encode されたまま、query を
+/// 含めない)。呼び手が送った文字列と gateway が受けた文字列が同じなので、両側で正規化を
+/// 揃える仕事が無い。`[callers]` が空の unit は `verify_caller` が確かめずに通す。
+///
+/// SSE (`events`) も繋ぐ時のこの 1 回だけで、繋がった後の stream は確かめ直さない。
+async fn require_caller<P: CredentialPersistence + 'static>(
+    State(gateway): State<Arc<Gateway<P>>>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .map(header::HeaderValue::as_bytes);
+    let method = request.method().as_str();
+    let path = request.uri().path();
+    match gateway
+        .verify_caller(authorization, method, path, now_unix())
+        .await
+    {
+        Ok(_) => next.run(request).await,
+        Err(reason) => refused_caller(method, path, authorization, reason),
+    }
+}
+
+/// 呼び手を断る応答。落ちた段はログにだけ出し、応答は 401 / 400 ごとの固定文にする
+/// (kid の有無や期限切れを外から探らせない、ns 認証の [`denied`] と同じ方針)。
+fn refused_caller(
+    method: &str,
+    path: &str,
+    authorization: Option<&[u8]>,
+    reason: gateway_core::caller::Reason,
+) -> Response {
+    use gateway_core::caller::Status;
+
+    let (status, message) = match reason.status() {
+        Status::Unauthorized => (StatusCode::UNAUTHORIZED, CALLER_UNAUTHORIZED),
+        Status::BadRequest => (StatusCode::BAD_REQUEST, CALLER_BAD_REQUEST),
+    };
+    // 名乗りは署名を確かめる前の値なので、制御文字を逃がす `?` で出す。
+    let iss = authorization.and_then(claimed_iss);
+    warn!(
+        method,
+        path,
+        iss = ?iss,
+        reason = %reason,
+        status = status.as_u16(),
+        "refused an operations caller"
+    );
+    let mut response = error_body(status, "authentication_error", message);
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Bearer error=\"invalid_token\""),
+        );
+    }
+    response
+}
+
+/// ログに添える名乗り (claims の `iss`、署名を確かめる前の値)。読めなければ `None`。
+/// 相手が書いた値なので、長さを抑える。
+fn claimed_iss(authorization: &[u8]) -> Option<String> {
+    use gateway_core::ns::jwt::{Compact, decode_object};
+
+    const MAX_CHARS: usize = 64;
+    let (_, token) = std::str::from_utf8(authorization)
+        .ok()?
+        .trim()
+        .split_once(' ')?;
+    let claims = decode_object(Compact::split(token.trim_start())?.payload)?;
+    Some(
+        claims
+            .get("iss")?
+            .as_str()?
+            .chars()
+            .take(MAX_CHARS)
+            .collect(),
+    )
 }
 
 fn html_page(title: &str, body: &str) -> Response {
@@ -334,7 +441,8 @@ async fn version() -> Response {
 /// 落とした数は起動からの累積で、0 でも欄を出す — 数えていることが分かる
 /// ように (DR-0012)。
 ///
-/// 認証を掛けないのは healthz と同じ扱い。
+/// 認証を掛けないのは healthz と同じ扱い。監督者は呼び手の鍵を持たずにここを
+/// 問い、答えにも会話や認証情報の状態は無い (DR-0043 決定 2)。
 async fn self_report<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
 ) -> Response {
@@ -354,7 +462,7 @@ async fn self_report<P: CredentialPersistence + 'static>(
 
 /// credential ごとの利用状況を返す。
 ///
-/// 認証を掛けないのは healthz と同じ扱い (DR-0007)。出すのは使用率・
+/// 呼び手の認証は [`callers_only`] の層が持つ (DR-0043)。出すのは使用率・
 /// リセット時刻・フラグだけで、token も organization id も出さない。
 ///
 /// `?refresh=true` のときだけ能動プローブに入る。既定を便乗のみにするのは、
@@ -369,9 +477,8 @@ async fn usage<P: CredentialPersistence + 'static>(
 
 /// 頼まれた会話への cache keepalive を止める (DR-0024 §2 の pause API)。
 ///
-/// 認証は usage / status と同じ扱い (掛けない)。手前の tailnet の境界を信頼
-/// する。できるのは自分の会話の控えを落とすことだけで、転送も認証情報も
-/// 動かない。
+/// 呼び手の認証は [`callers_only`] の層が持ち、body は署名で覆わない (DR-0043
+/// 決定 3)。できるのは会話の控えを落とすことだけで、転送も認証情報も動かない。
 ///
 /// 解除の口は持たない。その会話から実リクエストが 1 本来れば、そこで控えが
 /// 置き直される (DR-0027 決定 3)。
@@ -395,8 +502,8 @@ struct PauseRequest {
 /// 無い会話」を区別できないので、エラーにしない。本文は載せない。
 ///
 /// `Access-Control-Allow-Origin` は付けない。呼び手はサーバ (ccmsg) で、
-/// ブラウザが直接読む使い方は無い (DR-0042 決定 4)。呼び手の認証は DR-0043
-/// で掛け、この口はそれより前に出さない。
+/// ブラウザが直接読む使い方は無い (DR-0042 決定 4)。呼び手の認証は
+/// [`callers_only`] の層が持つ (DR-0043)。
 async fn session<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
     AxumPath(session_id): AxumPath<String>,
@@ -457,13 +564,13 @@ fn json_utf8(body: impl IntoResponse) -> Response {
 /// SSE で返す。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。
 /// 見ている側が遅れて取りこぼしても、こちらは詰まらない (落として先へ進む)。
 ///
-/// 認証は usage / stats と同じ扱い (掛けない)。手前の tailnet の境界を信頼
-/// する。流すのは「いつ・どの会話が・どの経路に当たったか」までで、本文も
-/// トークン数も載せない。
+/// 呼び手の認証は [`callers_only`] の層が繋ぐ時の 1 回だけ持ち、繋がった後の
+/// stream は確かめ直さない (DR-0043 決定 3)。流すのは「いつ・どの会話が・どの
+/// 経路に当たったか」までで、本文もトークン数も載せない。
 ///
-/// どの生成元からでも読めるようにしておく。主な相手はサーバ同士で話す
-/// ccmsg だが、様子を見るのにブラウザから直接開けると早い。認証を持たない
-/// 口なので、生成元で絞っても守れるものが増えない。
+/// どの生成元からでも読めるようにしておく。`[callers]` の無い unit ではブラウザ
+/// から直接開いて様子を見られる。`[callers]` のある unit ではブラウザは署名の
+/// header を付けられないので届かないが、生成元で絞っても守れるものは増えない。
 async fn events<P: CredentialPersistence + 'static>(
     State(gateway): State<Arc<Gateway<P>>>,
 ) -> impl IntoResponse {
@@ -515,8 +622,8 @@ fn sse_line(notice: &llm_gateway::events::Notice) -> SseEvent {
 
 /// 使用量の日次集計を返す (DR-0011)。
 ///
-/// 認証は usage / healthz と同じ扱い (掛けない)。出すのはトークン数だけで、
-/// 何を書いたかは残していない。
+/// 呼び手の認証は [`callers_only`] の層が持つ (DR-0043)。出すのはトークン数
+/// だけで、何を書いたかは残していない。
 ///
 /// `?days=N` で直近 N 日に絞る。既定を 7 日にするのは、全期間を返すと日が
 /// 経つほど応答が伸びるため。`days=0` なら全部。
@@ -1323,7 +1430,11 @@ fn refused(ns: &str, status: StatusCode, kind: &str, message: &str) -> Response 
     } else {
         warn!(%ns, status = status_code, %message, "refused the request");
     }
+    error_body(status, kind, message)
+}
 
+/// Anthropic のエラー形式の応答 (ログは残さない)。
+fn error_body(status: StatusCode, kind: &str, message: &str) -> Response {
     json_utf8((
         status,
         Json(json!({
@@ -5932,5 +6043,432 @@ routes = ["a", "b"]
             Some("personal")
         );
         assert_eq!(requested_ns(Some("x=1&ns=a%2Db")).as_deref(), Some("a-b"));
+    }
+}
+
+#[cfg(test)]
+mod callers_tests {
+    use super::tests::{StaticStore, captured_logs};
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use ed25519_dalek::Signer as _;
+    use llm_gateway::caller_keys::{FetchJwks, Fetching};
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    const JWKS_URL: &str = "https://ccmsg.example/jwks.json";
+    /// 呼び手が JWKS に載せている鍵の `kid` と種 (`signing_key(&[種; 32])`)。
+    const KID: &str = "ccmsg-1";
+    const SEED: u8 = 7;
+
+    /// 署名を求める 7 つの口: (method, request line の path, `aud` に書く path)。
+    const REQUIRED: [(&str, &str, &str); 7] = [
+        (
+            "GET",
+            "/llm-gateway/sessions?ns=default",
+            "/llm-gateway/sessions",
+        ),
+        (
+            "GET",
+            "/llm-gateway/sessions/s-1",
+            "/llm-gateway/sessions/s-1",
+        ),
+        ("GET", "/llm-gateway/usage", "/llm-gateway/usage"),
+        ("GET", "/llm-gateway/status", "/llm-gateway/status"),
+        ("GET", "/llm-gateway/stats?days=1", "/llm-gateway/stats"),
+        ("GET", "/llm-gateway/events", "/llm-gateway/events"),
+        (
+            "POST",
+            "/llm-gateway/keepalive/pause",
+            "/llm-gateway/keepalive/pause",
+        ),
+    ];
+
+    /// 決まった JWKS を返す取得の口 (ネットワークに出ない)。
+    struct Served(Vec<u8>);
+
+    impl FetchJwks for Served {
+        fn fetch<'a>(&'a self, _url: &'a url::Url) -> Fetching<'a> {
+            let body = self.0.clone();
+            Box::pin(async move { Ok(body) })
+        }
+    }
+
+    fn jwks() -> Vec<u8> {
+        let key = gateway_core::ns::jwt::signing_key(&[SEED; 32]).verifying_key();
+        serde_json::to_vec(&json!({"keys": [gateway_core::ns::jwt::public_jwk(KID, &key)]}))
+            .unwrap()
+    }
+
+    /// unit を立てる。`with_callers` なら `[callers.ccmsg]` を書き、鍵を取ってから待ち受ける。
+    /// `[stats] dir` (控えと日次集計の置き場) は `dir`。
+    async fn serve_callers(
+        dir: &std::path::Path,
+        with_callers: bool,
+    ) -> (String, Arc<Gateway<StaticStore>>) {
+        let callers = if with_callers {
+            format!("[callers.ccmsg]\njwks_url = \"{JWKS_URL}\"\n")
+        } else {
+            String::new()
+        };
+        let config: llm_gateway::Config = toml::from_str(&format!(
+            "[stats]\ndir = \"{}\"\n\n{callers}\n[ns.default]\n",
+            dir.display()
+        ))
+        .unwrap();
+        config.validate().unwrap();
+        let mut gateway = Gateway::new(&config, StaticStore).unwrap();
+        gateway.set_jwks_fetcher(Arc::new(Served(jwks())));
+        gateway.fetch_caller_keys().await;
+        let gateway = Arc::new(gateway);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let serving = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router(serving).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        (base, gateway)
+    }
+
+    /// 鍵 `seed` で署名した compact JWS。
+    fn sign_with(seed: u8, header: &Value, claims: &Value) -> String {
+        let key = gateway_core::ns::jwt::signing_key(&[seed; 32]);
+        let input = format!(
+            "{}.{}",
+            B64.encode(serde_json::to_vec(header).unwrap()),
+            B64.encode(serde_json::to_vec(claims).unwrap())
+        );
+        format!(
+            "{input}.{}",
+            B64.encode(key.sign(input.as_bytes()).to_bytes())
+        )
+    }
+
+    fn sign(header: &Value, claims: &Value) -> String {
+        sign_with(SEED, header, claims)
+    }
+
+    /// JWKS の鍵 (`public_jwk`) は `alg: EdDSA` を持つので、header も `EdDSA`。
+    fn header() -> Value {
+        json!({"alg": "EdDSA", "typ": "request+jwt", "kid": KID})
+    }
+
+    /// 今署名した `aud` 宛ての claims (`exp` = `iat` + 10 秒)。
+    fn claims(aud: &str) -> Value {
+        let now = now_unix();
+        json!({"iss": "ccmsg", "aud": aud, "iat": now, "exp": now + 10})
+    }
+
+    /// 正しく署名した token。
+    fn signed(aud: &str) -> String {
+        sign(&header(), &claims(aud))
+    }
+
+    async fn call(base: &str, method: &str, path: &str, token: Option<&str>) -> reqwest::Response {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut builder = reqwest::Client::new().request(method.clone(), format!("{base}{path}"));
+        if method == reqwest::Method::POST {
+            builder = builder.json(&json!({"session_id": "s-1"}));
+        }
+        if let Some(token) = token {
+            builder = builder.bearer_auth(token);
+        }
+        builder.send().await.unwrap()
+    }
+
+    /// 断った応答の形を確かめ、本文を返す。401 だけが `WWW-Authenticate` を持つ。
+    async fn refused(resp: reqwest::Response, status: u16, what: &str) -> String {
+        assert_eq!(resp.status(), status, "{what}");
+        let challenge = resp
+            .headers()
+            .get("www-authenticate")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let message = if status == 401 {
+            assert_eq!(
+                challenge.as_deref(),
+                Some("Bearer error=\"invalid_token\""),
+                "{what}"
+            );
+            CALLER_UNAUTHORIZED
+        } else {
+            assert_eq!(challenge, None, "{what}");
+            CALLER_BAD_REQUEST
+        };
+        let text = resp.text().await.unwrap();
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body,
+            json!({"type": "error", "error": {"type": "authentication_error", "message": message}}),
+            "{what}"
+        );
+        text
+    }
+
+    /// `[callers]` を書いた unit では、7 つの口がどれも呼び手の署名を求める。
+    /// 通るのは正しく署名した token だけで、401 は署名し直せば通りうるもの、
+    /// 400 は直さないと通らないもの。
+    #[tokio::test]
+    async fn every_operations_endpoint_requires_a_signed_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), true).await;
+
+        for (n, (method, path, aud_path)) in REQUIRED.iter().enumerate() {
+            let aud = format!("{method} {aud_path}");
+            let what = |case: &str| format!("{case}: {method} {path}");
+
+            let unsigned = call(&base, method, path, None).await;
+            refused(unsigned, 401, &what("unsigned")).await;
+
+            let good = call(&base, method, path, Some(&signed(&aud))).await;
+            assert_eq!(good.status(), 200, "{}", what("signed"));
+
+            let other_path = signed(&format!("{method} /llm-gateway/self"));
+            let resp = call(&base, method, path, Some(&other_path)).await;
+            refused(resp, 400, &what("aud of another path")).await;
+
+            let now = now_unix();
+            let expired = sign(
+                &header(),
+                &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
+            );
+            let resp = call(&base, method, path, Some(&expired)).await;
+            refused(resp, 401, &what("expired")).await;
+
+            let jwt_typ = sign(
+                &json!({"alg": "EdDSA", "typ": "JWT", "kid": KID}),
+                &claims(&aud),
+            );
+            let resp = call(&base, method, path, Some(&jwt_typ)).await;
+            refused(resp, 400, &what("typ JWT")).await;
+
+            let mut once = claims(&aud);
+            once["jti"] = json!(format!("jti-{n}"));
+            let once = sign(&header(), &once);
+            let first = call(&base, method, path, Some(&once)).await;
+            assert_eq!(first.status(), 200, "{}", what("first jti"));
+            let again = call(&base, method, path, Some(&once)).await;
+            refused(again, 401, &what("reused jti")).await;
+        }
+    }
+
+    /// 監督者とブラウザが問う口は、`[callers]` のある unit でも署名を求めない。
+    #[tokio::test]
+    async fn the_supervisor_and_browser_endpoints_stay_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), true).await;
+
+        for path in [
+            "/llm-gateway/healthz",
+            "/llm-gateway/version",
+            "/llm-gateway/self",
+            "/llm-gateway/login",
+        ] {
+            let resp = call(&base, "GET", path, None).await;
+            assert_eq!(resp.status(), 200, "{path}");
+        }
+    }
+
+    /// `[callers]` の無い unit は確かめない。`Authorization` が無くても、読めない
+    /// 値が付いていても通す。
+    #[tokio::test]
+    async fn a_unit_without_callers_does_not_look_at_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), false).await;
+
+        for (method, path, _) in REQUIRED {
+            for token in [None, Some("junk")] {
+                let resp = call(&base, method, path, token).await;
+                assert_eq!(resp.status(), 200, "{method} {path} with {token:?}");
+            }
+        }
+    }
+
+    /// 運用系の口は namespace の下に生えない。署名の有無に関わらず 404 のまま。
+    #[tokio::test]
+    async fn operations_under_a_namespace_stay_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), true).await;
+
+        for path in [
+            "/ns-default/llm-gateway/sessions",
+            "/ns-default/llm-gateway/usage",
+            "/ns-default/llm-gateway/events",
+        ] {
+            let unsigned = call(&base, "GET", path, None).await;
+            assert_eq!(unsigned.status(), 404, "unsigned {path}");
+            let signed = call(&base, "GET", path, Some(&signed(&format!("GET {path}")))).await;
+            assert_eq!(signed.status(), 404, "signed {path}");
+        }
+    }
+
+    /// `aud` の path は request line の path そのもの (percent-encode されたまま) で、
+    /// query を含めない。decode した path や query 付きの `aud` は 400。
+    #[tokio::test]
+    async fn the_audience_is_the_path_as_sent_without_the_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), true).await;
+        let encoded = "/llm-gateway/sessions/s%201";
+
+        let resp = call(
+            &base,
+            "GET",
+            encoded,
+            Some(&signed(&format!("GET {encoded}"))),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let answer: Value = resp.json().await.unwrap();
+        assert_eq!(answer["session_id"], "s 1", "the handler still decodes");
+
+        let decoded = signed("GET /llm-gateway/sessions/s 1");
+        let resp = call(&base, "GET", encoded, Some(&decoded)).await;
+        refused(resp, 400, "a decoded path in aud").await;
+
+        let with_query = signed("GET /llm-gateway/sessions?ns=default");
+        let resp = call(
+            &base,
+            "GET",
+            "/llm-gateway/sessions?ns=default",
+            Some(&with_query),
+        )
+        .await;
+        refused(resp, 400, "the query in aud").await;
+
+        let other_method = signed("POST /llm-gateway/sessions");
+        let resp = call(&base, "GET", "/llm-gateway/sessions", Some(&other_method)).await;
+        refused(resp, 400, "another method in aud").await;
+    }
+
+    /// どの段で落ちても、応答は 401 / 400 ごとに同じ本文で、段の語を出さない。
+    /// 段はログにだけ残る (method / path / 名乗った `iss` と一緒に)。
+    #[tokio::test]
+    async fn refusals_name_no_stage_and_the_log_does() {
+        let logs = captured_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = serve_callers(dir.path(), true).await;
+        let path = "/llm-gateway/sessions/stage-probe";
+        let aud = format!("GET {path}");
+        let now = now_unix();
+
+        let unauthorized = [
+            None,
+            Some(sign(
+                &json!({"alg": "EdDSA", "typ": "request+jwt", "kid": "nobody"}),
+                &claims(&aud),
+            )),
+            Some(sign_with(SEED + 1, &header(), &claims(&aud))),
+            Some(sign(
+                &header(),
+                &json!({"iss": "ccmsg", "aud": aud, "iat": now - 20, "exp": now - 10}),
+            )),
+        ];
+        let bad_request = [
+            Some("not-a-jwt".to_owned()),
+            Some(sign(
+                &json!({"alg": "RS256", "typ": "request+jwt", "kid": KID}),
+                &claims(&aud),
+            )),
+            Some(signed("GET /llm-gateway/usage")),
+            Some(sign(
+                &header(),
+                &json!({"iss": "someone", "aud": aud, "iat": now, "exp": now + 10}),
+            )),
+            Some(sign(
+                &header(),
+                &json!({"iss": "ccmsg", "aud": aud, "iat": now, "exp": now + 60}),
+            )),
+        ];
+        for (status, tokens) in [(401, &unauthorized[..]), (400, &bad_request[..])] {
+            let mut bodies = std::collections::BTreeSet::new();
+            for token in tokens {
+                let resp = call(&base, "GET", path, token.as_deref()).await;
+                bodies.insert(refused(resp, status, &format!("{token:?}")).await);
+            }
+            assert_eq!(bodies.len(), 1, "every {status} reads the same: {bodies:?}");
+            let body = bodies.into_iter().next().unwrap();
+            // 段の語 (`Reason` のログの語) と、段を言い当てる欄の名前。
+            for stage in [
+                "missing_authorization",
+                "unknown_kid",
+                "bad_signature",
+                "expired",
+                "alg_not_accepted",
+                "aud_mismatch",
+                "unknown_iss",
+                "lifetime",
+                "kid",
+                "exp",
+            ] {
+                assert!(!body.contains(stage), "{status} names `{stage}`: {body}");
+            }
+        }
+
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        let line = text
+            .lines()
+            .find(|l| {
+                l.contains("refused an operations caller")
+                    && l.contains(path)
+                    && l.contains("unknown_kid")
+            })
+            .unwrap_or_else(|| panic!("the stage is logged:\n{text}"));
+        assert!(line.contains("GET"), "{line}");
+        assert!(line.contains("ccmsg"), "the claimed iss is logged: {line}");
+    }
+
+    /// `events` は繋ぐ時の 1 回だけ確かめる。token の `exp` を過ぎても、繋がった
+    /// stream は流れ続ける (同じ token で繋ぎ直すと断られる)。
+    #[tokio::test]
+    async fn an_events_stream_outlives_its_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, gateway) = serve_callers(dir.path(), true).await;
+        let path = "/llm-gateway/events";
+
+        refused(call(&base, "GET", path, None).await, 401, "unsigned events").await;
+
+        // 窓の残りを 1 秒にして、繋いだ後に `exp` を過ぎさせる。
+        let now = now_unix();
+        let exp = now + 1;
+        let token = sign(
+            &header(),
+            &json!({"iss": "ccmsg", "aud": format!("GET {path}"), "iat": exp - 10, "exp": exp}),
+        );
+        let mut watching = call(&base, "GET", path, Some(&token)).await;
+        assert_eq!(watching.status(), 200);
+        let events = Arc::clone(gateway.events());
+        while events.watchers() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        // Design rationale: `exp` は壁時計の秒で比べるので、壁時計がそこを過ぎるまで
+        // 待つしかない (通知してくれる口は無い)。待つ長さは `exp` から決まる。
+        let until_ms = (exp + 1) * 1000 - now_unix_ms();
+        if until_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(until_ms.unsigned_abs())).await;
+        }
+        refused(
+            call(&base, "GET", path, Some(&token)).await,
+            401,
+            "the same token after exp",
+        )
+        .await;
+
+        events.publish(llm_gateway::events::CacheExpired::new(
+            1_785_600_000_000,
+            "s-1",
+            "2cf24dba",
+            "n-1",
+        ));
+        let mut text = String::new();
+        while !text.contains("data:") {
+            let chunk = watching.chunk().await.unwrap().expect("still streaming");
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert!(text.contains("cache_expired"), "{text}");
     }
 }
