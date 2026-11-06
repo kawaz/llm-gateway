@@ -92,7 +92,7 @@ claims:  {
 6. `aud` が「method + 空白 + path」と完全一致。`iss` が引いた呼び手の `iss` と完全一致 (3 で引いた以上一致するが、検証後に改めて見る)
 7. `jti` があれば使用済み集合で検証し、使用済みなら拒否。無ければ断らない。集合は unit ごとに持ち、`exp` まで保持する (保持の寿命は `exp` の判定と同じ意味なので猶予を足さない。掃除は即時でなくてよく、次の検証のついでか定期でよい)。上限 (65,536 件) に達したら、**その token の `jti` 検証を飛ばす** (拒否しない)。読み出しの口で `exp` が短いので飛ばしても実害が無く、満杯で全拒否する方が可用性を削る
 
-応答は reference の表のとおり **401** (署名不一致、未知 `kid`、`exp` 切れ、`jti` 使用済み、鍵キャッシュが stale の上限超え。呼び手が署名し直せば通りうる) と **400** (`Authorization` の形、parse、`alg` / `typ` / `kid` / `aud` / `iss` の不一致、`iat` / `exp` の欠け、`exp` − `iat` の上限超え。直しても通らない)。401 には `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750) を付ける。本文は ns 認証と同じ JSON のエラー (`authentication_error`、DR-0008 のとおり英語) で、`message` にどの段で落ちたかを `ns/jwt.rs` の `Reason` の語 (`unknown_kid` / `expired` / …) を借りて書く。`[callers]` を 1 つも持たない unit は検証せず、`Authorization` があっても見ない。
+応答は reference の表のとおり **401** (署名不一致、未知 `kid`、`exp` 切れ、`jti` 使用済み、鍵キャッシュが stale の上限超え。呼び手が署名し直せば通りうる) と **400** (`Authorization` の形、parse、`alg` / `typ` / `kid` / `aud` / `iss` の不一致、`iat` / `exp` の欠け、`exp` − `iat` の上限超え。直しても通らない)。401 には `WWW-Authenticate: Bearer error="invalid_token"` (RFC 6750) を付ける。本文は ns 認証と同じ JSON のエラー (`authentication_error`、DR-0008 のとおり英語) で、**`message` は 401 / 400 ごとの固定文にし、どの段で落ちたかは応答に出さず log にだけ残す** (ns 認証と同じ方針: kid の有無や期限切れを外から探らせない。sessions は外へ通す口なのでこの根拠がそのまま当たる。kawaz 2026-11-06)。段の語彙は本 DR 用の `Reason` を新しく持つ (`ns/jwt.rs` の enum には `typ` / `aud` / `iss` / `jti` / stale / `Authorization` 欠落の語が無く、`UnknownKid` が kid 欠落 (400) と未知 kid (401) を兼ねている)。`[callers]` を 1 つも持たない unit は検証せず、`Authorization` があっても見ない。
 
 リプレイの窓は 5 の上限で `exp` の寿命 (10 秒) に閉じ、`jti` はその窓の中をさらに狭める任意の層。**`jti` の使用済み集合は unit ごと (プロセスのメモリ) に持ち、stable / unstable で共有しない** (reference の「`jti` を使う場合、使用済み集合は読み出しの口に限り R のインスタンスごとに持ってよい」)。共有するには request ごとに `[stats] dir` のファイルを flock で読み書きすることになり、読み出しの口の 1 request に書き込みが 1 回増える。守れるのは「同じ token を `exp` の窓の内側で兄弟の unit へ送り直す」リプレイだけで、その結果は読み出しなら同じ答え (控えは共有、DR-0042 決定 2)、pause なら 2 回目は既に落ちている控えに対する no-op。tailnet の内側で token を盗んで窓の内側で兄弟へ送れる相手は、転送系の面 (無認証、DR-0006) を直接叩ける相手でもあるので、ここだけ守っても境界は変わらない。集合はプロセスが落ちれば消え、再起動直後は再起動前の token が `exp` の窓の内側で通りうる (同じ理由で許容)。
 
@@ -182,6 +182,9 @@ curl での手動確認は、`auth sign` に `--typ request+jwt` と `--aud "GET
 - `typ` の値は `request+jwt`。reference に足す節で一般の値として提示し、llm-gateway 固有の名前にしない (決定 3 の部品)
 - age は 10 秒 (kawaz 2026-11-05: 10 秒で十分ぬるい。検証の規則は reference に置き、本 DR は値だけ持つ)、`jti` の集合の保持は `exp` まで、上限は 65,536 件。`10 秒 × 受信レート` を十分上回る固定値で、設定にしない (決定 3・4 の部品)
 - stale の上限 66 分、未知 `kid` の最小 interval 30 秒、定期 10 分。reference の標準値で固定 (決定 5 の部品)
+- 時刻のずれの許容は ns 認証の `SKEW_SECS` (60 秒) を流用せず、本 DR の検証器は猶予を持たない (決定 3 の部品)
+- `iat` の未来は見ない (reference の規則)。`nbf` が付いていても見ない (決定 4 の部品)
+- `events` の `Access-Control-Allow-Origin: *` はそのまま残す。署名を持たないブラウザは header を付けられないので ACAO は効かないが、外す理由も無い (決定 2 の部品)
 - `jwks_file` の相対パスは設定ファイルの置き場から (`keys_file` と同じ) (決定 1 の部品))
 
 ## 関連

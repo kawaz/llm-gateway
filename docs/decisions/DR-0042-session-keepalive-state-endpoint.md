@@ -1,6 +1,6 @@
 # DR-0042: 会話 (session) 単位の cache / keepalive の状態を問う口 (`GET /llm-gateway/sessions[/{session_id}]`)
 
-- Status: Proposed
+- Status: Accepted (kawaz 2026-11-06)
 - Date: 2026-11-04
 
 ## 背景
@@ -165,7 +165,8 @@ ANTHROPIC_BASE_URL=https://gw.example.net/ns-personal
 - 答えでは期限の判定をしない。判定は送る直前の 1 か所に置いたまま (DR-0024) で、読む側が壁時計と比べる (決定 1 の部品)
 - `routes` は系列ごとに置き、載せる印は `limited` だけ、`{until}` の 1 欄で `reason` / `model` は持たない (`model` は系列の欄で決まっている) (決定 1 の部品)
 - 一覧の絞り込みは `ns` だけ。モデルや経路で絞るのは受け取った側でできる (決定 2 の部品)
-- 口の名前は複数形 `sessions` で、1 件は `sessions/{session_id}`。`login/{name}` と同じ「名前の下に個別」の形に揃える (決定 1・2 の部品))
+- 口の名前は複数形 `sessions` で、1 件は `sessions/{session_id}`。`login/{name}` と同じ「名前の下に個別」の形に揃える (決定 1・2 の部品)
+- `cache_notice` を持たない古い控え (欄が足される前に置かれたもの) は `null` を出す。欄は必ず出す (決定 1 の「形を 2 通り扱わせない」) が、無い値を作らない。次の実リクエストで控えが置き直されれば消える (決定 1 の部品、実装前の偵察で決めた))
 
 ## 関連
 
