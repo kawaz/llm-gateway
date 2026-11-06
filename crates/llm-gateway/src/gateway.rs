@@ -189,7 +189,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             config.stats.uncached_limits(),
         ));
 
-        Ok(Self {
+        let gateway = Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             watch_interval: std::time::Duration::from_secs(config.discovery.watch_secs),
             router,
@@ -218,23 +218,39 @@ impl<P: CredentialPersistence> Gateway<P> {
                 crate::caller_keys::HttpFetcher::new()?,
             ))),
             caller_jtis: gateway_core::caller::JtiSet::new(),
-        })
+        };
+        gateway.track_callers();
+        Ok(gateway)
     }
 
     /// 呼び手の鍵を取る口を差し替える (試験用)。持っていた鍵は捨てる。
     pub fn set_jwks_fetcher(&mut self, fetcher: Arc<dyn crate::caller_keys::FetchJwks>) {
         self.caller_keys = Arc::new(crate::caller_keys::CallerKeys::new(fetcher));
+        self.track_callers();
+    }
+
+    /// 走っている設定の `[callers]` の `jwks_url` を、取りに出ずに鍵のキャッシュに載せる
+    /// (起動時の取得の前に来た request も取り直せるように)。
+    fn track_callers(&self) {
+        self.caller_keys
+            .track(|| crate::caller_keys::jwks_urls(&self.router.active().config().callers));
     }
 
     /// `[callers]` の全呼び手の鍵を取る (DR-0043 決定 5)。起動時、待ち受ける前に 1 回
     /// 呼ぶ。取れなかった呼び手はログに出し、最初の request で取り直す (起動は止めない)。
     pub async fn fetch_caller_keys(&self) {
-        let urls = crate::caller_keys::jwks_urls(&self.router.active().config().callers);
-        self.caller_keys.sync(&urls, true, now_unix()).await;
+        self.caller_keys
+            .sync(
+                || crate::caller_keys::jwks_urls(&self.router.active().config().callers),
+                true,
+                now_unix(),
+            )
+            .await;
     }
 
     /// 呼び手の鍵の定期の取り直しを始める (DR-0043 決定 5)。最初の回は
     /// [`crate::caller_keys::PERIOD_SECS`] 後 (起動時の分は [`Self::fetch_caller_keys`])。
+    /// task の handle は持たず、プロセスが終わるまで回す ([`Self::start_key_rotation`] と同じ)。
     pub fn start_caller_keys(&self) {
         tokio::spawn(crate::caller_keys::run(
             Arc::clone(&self.router),
@@ -278,13 +294,17 @@ impl<P: CredentialPersistence> Gateway<P> {
             |iss, kid| self.resolve_caller(callers, iss, kid, now, &mut refetch),
             &self.caller_jtis,
         );
-        let (Err(Reason::UnknownKid | Reason::KeysStale), Some((url, name))) = (&first, refetch)
-        else {
+        let (Err(Reason::UnknownKid | Reason::KeysStale), Some(url)) = (&first, refetch) else {
             return first.map(Some);
         };
-        if !self.caller_keys.refetch_for_request(&url, &name, now).await {
+        let started = tokio::time::Instant::now();
+        if !self.caller_keys.refetch_for_request(&url, now).await {
             return first.map(Some);
         }
+        // 取り直しを待った分だけ時刻を進めて確かめ直す。入口の `now` のままだと、`exp`
+        // 直前の token が取得の待ち (最大 [`crate::caller_keys::FETCH_TIMEOUT`]) の分だけ
+        // 長く通る。
+        let now = now.saturating_add_unsigned(started.elapsed().as_secs());
         caller::verify(
             authorization,
             &audience,
@@ -296,14 +316,14 @@ impl<P: CredentialPersistence> Gateway<P> {
     }
 
     /// `iss` の呼び手を `callers` から引き、その呼び手の鍵だけから `kid` を引く。
-    /// `kid` が無いか鍵が stale だった時は、その呼び手の `jwks_url` と名前を `refetch` に残す。
+    /// `kid` が無いか鍵が stale だった時は、その呼び手の `jwks_url` を `refetch` に残す。
     fn resolve_caller(
         &self,
         callers: &std::collections::BTreeMap<String, crate::config::Caller>,
         iss: &str,
         kid: &str,
         now: i64,
-        refetch: &mut Option<(url::Url, String)>,
+        refetch: &mut Option<url::Url>,
     ) -> std::result::Result<gateway_core::caller::Resolved, gateway_core::caller::Missing> {
         use gateway_core::caller::{Missing, Resolved};
 
@@ -316,7 +336,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             .lookup(&found.jwks_url, kid, now)
             .inspect_err(|missing| {
                 if matches!(missing, Missing::UnknownKid | Missing::Stale) {
-                    *refetch = Some((found.jwks_url.clone(), name.clone()));
+                    *refetch = Some(found.jwks_url.clone());
                 }
             })?;
         Ok(Resolved {
@@ -618,7 +638,6 @@ impl<P: CredentialPersistence> Gateway<P> {
             return Err(ReloadError::RestartRequired { changes });
         }
         warn_about_gaps(&config);
-        let caller_urls = crate::caller_keys::jwks_urls(&config.callers);
         self.router.reload(config).await;
         info!("reloaded the configuration");
         // `jwt` になった ns の鍵をすぐ作り、周期の変更をすぐ効かせる (DR-0037 §13)。
@@ -627,7 +646,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         // (DR-0043 決定 6)。取れなくても差し替えは済んでいて、最初の request で取り直す。
         let mut warnings: Vec<String> = self
             .caller_keys
-            .sync(&caller_urls, false, now_unix())
+            .sync(
+                || crate::caller_keys::jwks_urls(&self.router.active().config().callers),
+                false,
+                now_unix(),
+            )
             .await
             .into_iter()
             .map(|(name, why)| {
@@ -10441,6 +10464,28 @@ routes = ["a", "b"]
                 passed("notifier", "n1")
             );
             assert_eq!(fake.calls(&jwks_url("n")), 3);
+        }
+
+        /// 取り直しを待った分だけ時刻を進めて確かめ直す。`exp` 直前の token が、取得の
+        /// 待ちの分だけ長く通らない。
+        #[tokio::test(start_paused = true)]
+        async fn the_recheck_after_a_slow_refetch_uses_the_later_time() {
+            let now = now_unix();
+            for (delay, expected) in [(6, Err(Reason::Expired)), (4, passed("notifier", "n2"))] {
+                let (gw, fake) = callers_gateway(&[("notifier", "n")]);
+                fake.serve(&jwks_url("n"), &[("n1", 1)]);
+                gw.fetch_caller_keys().await;
+                fake.serve_once_after(
+                    &jwks_url("n"),
+                    &[("n1", 1), ("n2", 2)],
+                    std::time::Duration::from_secs(delay),
+                );
+                // exp = now + 5。
+                let token = bearer(2, "n2", "notifier", now - 5);
+                assert_eq!(verify(&gw, &token, now).await, expected, "delay {delay}s");
+                assert_eq!(fake.calls(&jwks_url("n")), 2);
+            }
+            assert_eq!(Reason::Expired.status(), Status::Unauthorized);
         }
 
         /// 取り直しに成功したら丸ごと置き換わり、消えた `kid` は通らない。

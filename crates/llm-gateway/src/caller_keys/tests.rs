@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use gateway_core::ns::jwt::{public_jwk, signing_key};
@@ -8,10 +8,15 @@ use super::*;
 
 const NOW: i64 = 1_791_270_000;
 
+/// 1 回ずつ使う答えと、答えるまでの待ち。
+type Queued = (Result<Vec<u8>, String>, Duration);
+
 /// 答えを差し替えられる取得の口。呼ばれた `jwks_url` を数える。
 #[derive(Default)]
 pub(crate) struct FakeJwks {
     answers: Mutex<HashMap<Url, Result<Vec<u8>, String>>>,
+    /// 1 回ずつ使う答えと、答えるまでの待ち。[`Self::answers`] より先に使う。
+    queued: Mutex<HashMap<Url, VecDeque<Queued>>>,
     calls: Mutex<Vec<Url>>,
 }
 
@@ -24,6 +29,16 @@ impl FakeJwks {
     /// `url` が次から `(kid, 鍵の種)` の公開鍵の JWKS を返す。
     pub(crate) fn serve(&self, url: &Url, keys: &[(&str, u8)]) {
         self.answer(url, Ok(jwks_body(keys)));
+    }
+
+    /// `url` の次の 1 回は、`delay` 待ってから `keys` の JWKS を返す (積んだ順に使う)。
+    pub(crate) fn serve_once_after(&self, url: &Url, keys: &[(&str, u8)], delay: Duration) {
+        self.queued
+            .lock()
+            .unwrap()
+            .entry(url.clone())
+            .or_default()
+            .push_back((Ok(jwks_body(keys)), delay));
     }
 
     /// `url` を取りに来た回数。
@@ -45,14 +60,28 @@ impl FakeJwks {
 impl FetchJwks for FakeJwks {
     fn fetch<'a>(&'a self, url: &'a Url) -> Fetching<'a> {
         self.calls.lock().unwrap().push(url.clone());
-        let answer = self
-            .answers
+        let queued = self
+            .queued
             .lock()
             .unwrap()
-            .get(url)
-            .cloned()
-            .unwrap_or_else(|| Err("nothing is served here".to_owned()));
-        Box::pin(async move { answer })
+            .get_mut(url)
+            .and_then(VecDeque::pop_front);
+        let (answer, delay) = queued.unwrap_or_else(|| {
+            let answer = self
+                .answers
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| Err("nothing is served here".to_owned()));
+            (answer, Duration::ZERO)
+        });
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            answer
+        })
     }
 }
 
@@ -98,7 +127,7 @@ async fn syncing_everything_fetches_every_url() {
     fake.serve(&url("a"), &[("a1", 1)]);
     let keys = keys_with(&fake);
 
-    let failed = keys.sync(&callers(&["a", "b"]), true, NOW).await;
+    let failed = keys.sync(|| callers(&["a", "b"]), true, NOW).await;
     assert_eq!(fake.calls(&url("a")), 1);
     assert_eq!(fake.calls(&url("b")), 1);
     assert_eq!(failed.len(), 1);
@@ -119,7 +148,7 @@ async fn keys_go_stale_66_minutes_after_the_last_success() {
     let fake = Arc::new(FakeJwks::default());
     fake.serve(&url("a"), &[("a1", 1)]);
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a"]), true, NOW).await;
+    keys.sync(|| callers(&["a"]), true, NOW).await;
 
     assert_eq!(has(&keys, "a", "a1", NOW + STALE_AFTER_SECS), Ok(()));
     assert_eq!(
@@ -139,14 +168,14 @@ async fn a_failed_fetch_keeps_the_previous_keys() {
     let fake = Arc::new(FakeJwks::default());
     fake.serve(&url("a"), &[("a1", 1)]);
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a"]), true, NOW).await;
+    keys.sync(|| callers(&["a"]), true, NOW).await;
 
     fake.answer(&url("a"), Err("down".to_owned()));
-    let failed = keys.sync(&callers(&["a"]), true, NOW + PERIOD_SECS).await;
+    let failed = keys.sync(|| callers(&["a"]), true, NOW + PERIOD_SECS).await;
     assert_eq!(failed, vec![("a".to_owned(), "down".to_owned())]);
     fake.answer(&url("a"), Ok(b"not json".to_vec()));
     let failed = keys
-        .sync(&callers(&["a"]), true, NOW + 2 * PERIOD_SECS)
+        .sync(|| callers(&["a"]), true, NOW + 2 * PERIOD_SECS)
         .await;
     assert_eq!(failed.len(), 1, "an unreadable JWKS is a failure too");
 
@@ -164,11 +193,11 @@ async fn a_successful_fetch_replaces_the_whole_set() {
     let fake = Arc::new(FakeJwks::default());
     fake.serve(&url("a"), &[("old", 1), ("current", 2)]);
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a"]), true, NOW).await;
+    keys.sync(|| callers(&["a"]), true, NOW).await;
     assert_eq!(has(&keys, "a", "old", NOW), Ok(()));
 
     fake.serve(&url("a"), &[("current", 2), ("next", 3)]);
-    keys.sync(&callers(&["a"]), true, NOW + PERIOD_SECS).await;
+    keys.sync(|| callers(&["a"]), true, NOW + PERIOD_SECS).await;
     assert_eq!(
         has(&keys, "a", "old", NOW + PERIOD_SECS),
         Err(Missing::UnknownKid)
@@ -177,7 +206,7 @@ async fn a_successful_fetch_replaces_the_whole_set() {
     assert_eq!(has(&keys, "a", "next", NOW + PERIOD_SECS), Ok(()));
 
     fake.serve(&url("a"), &[]);
-    keys.sync(&callers(&["a"]), true, NOW + 2 * PERIOD_SECS)
+    keys.sync(|| callers(&["a"]), true, NOW + 2 * PERIOD_SECS)
         .await;
     assert_eq!(
         has(&keys, "a", "current", NOW + 2 * PERIOD_SECS),
@@ -195,16 +224,16 @@ async fn syncing_new_urls_fetches_only_those_and_drops_the_gone() {
     fake.serve(&url("b"), &[("b1", 2)]);
     fake.serve(&url("c"), &[("c1", 3)]);
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a", "b"]), true, NOW).await;
+    keys.sync(|| callers(&["a", "b"]), true, NOW).await;
 
-    keys.sync(&callers(&["b", "c"]), false, NOW + 1).await;
+    keys.sync(|| callers(&["b", "c"]), false, NOW + 1).await;
     assert_eq!(fake.calls(&url("b")), 1, "b is kept as it is");
     assert_eq!(fake.calls(&url("c")), 1, "c is new");
     assert_eq!(keys.urls(), urls(&["b", "c"]));
     assert_eq!(has(&keys, "a", "a1", NOW + 1), Err(Missing::UnknownKid));
     assert_eq!(has(&keys, "c", "c1", NOW + 1), Ok(()));
 
-    keys.sync(&BTreeMap::new(), true, NOW + 2).await;
+    keys.sync(BTreeMap::new, true, NOW + 2).await;
     assert!(keys.urls().is_empty(), "no callers, no keys");
 }
 
@@ -215,21 +244,22 @@ async fn refetching_for_a_request_waits_the_minimum_interval() {
     fake.serve(&url("a"), &[("a1", 1)]);
     fake.serve(&url("b"), &[("b1", 2)]);
     let keys = keys_with(&fake);
+    keys.track(|| callers(&["a", "b"]));
 
-    assert!(keys.refetch_for_request(&url("a"), "a", NOW).await);
+    assert!(keys.refetch_for_request(&url("a"), NOW).await);
     assert_eq!(has(&keys, "a", "a1", NOW), Ok(()));
     assert!(
         !keys
-            .refetch_for_request(&url("a"), "a", NOW + REFETCH_INTERVAL_SECS - 1)
+            .refetch_for_request(&url("a"), NOW + REFETCH_INTERVAL_SECS - 1)
             .await
     );
     assert_eq!(fake.calls(&url("a")), 1);
     assert!(
-        keys.refetch_for_request(&url("b"), "b", NOW + 1).await,
+        keys.refetch_for_request(&url("b"), NOW + 1).await,
         "the interval is per jwks_url"
     );
     assert!(
-        keys.refetch_for_request(&url("a"), "a", NOW + REFETCH_INTERVAL_SECS)
+        keys.refetch_for_request(&url("a"), NOW + REFETCH_INTERVAL_SECS)
             .await
     );
     assert_eq!(fake.calls(&url("a")), 2);
@@ -241,33 +271,98 @@ async fn refetching_for_a_request_waits_the_minimum_interval() {
 async fn scheduled_fetches_do_not_hold_back_the_refetch() {
     let fake = Arc::new(FakeJwks::default());
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a"]), true, NOW).await;
+    keys.sync(|| callers(&["a"]), true, NOW).await;
     fake.serve(&url("a"), &[("a1", 1)]);
-    assert!(keys.refetch_for_request(&url("a"), "a", NOW + 1).await);
+    assert!(keys.refetch_for_request(&url("a"), NOW + 1).await);
     assert_eq!(has(&keys, "a", "a1", NOW + 1), Ok(()));
 }
 
-/// 遅れて終わった古い取得は、後から取れた束を上書きしない。
-#[tokio::test]
-async fn an_older_fetch_does_not_overwrite_a_newer_one() {
+/// 遅れて終わった古い取得は、後から始まって先に入った束を上書きしない。同じ秒に
+/// 始まった取得でも、始めた順で決まる。
+#[tokio::test(start_paused = true)]
+async fn an_older_fetch_finishing_later_does_not_overwrite_a_newer_one() {
     let fake = Arc::new(FakeJwks::default());
     let keys = keys_with(&fake);
-    keys.sync(&callers(&["a"]), false, NOW).await;
-    fake.serve(&url("a"), &[("new", 2)]);
-    keys.fetch(&url("a"), "a", NOW + 10).await.unwrap();
-    fake.serve(&url("a"), &[("old", 1)]);
-    keys.fetch(&url("a"), "a", NOW + 5).await.unwrap();
-    assert_eq!(has(&keys, "a", "new", NOW + 10), Ok(()));
-    assert_eq!(has(&keys, "a", "old", NOW + 10), Err(Missing::UnknownKid));
+    keys.track(|| callers(&["a"]));
+    // 先に始まる定期の取得は遅く、後に始まる request の取り直しは速い。
+    fake.serve_once_after(&url("a"), &[("old", 1)], Duration::from_secs(2));
+    fake.serve_once_after(&url("a"), &[("new", 2)], Duration::from_secs(1));
+
+    let a = url("a");
+    let (failed, refetched) = tokio::join!(
+        keys.sync(|| callers(&["a"]), true, NOW),
+        keys.refetch_for_request(&a, NOW),
+    );
+    assert!(failed.is_empty());
+    assert!(refetched);
+    assert_eq!(fake.calls(&url("a")), 2);
+    assert_eq!(has(&keys, "a", "new", NOW), Ok(()));
+    assert_eq!(has(&keys, "a", "old", NOW), Err(Missing::UnknownKid));
 }
 
-/// 取っている間に設定から消えた `jwks_url` の結果は捨てる。
+/// 取っている間に設定から消えた `jwks_url` の結果は入れず、消えた `jwks_url` を戻さない。
+/// 合わせる先は錠の中で読む設定なので、遅れて始まった定期の回も新しい設定に合わせる。
+#[tokio::test(start_paused = true)]
+async fn a_fetch_in_flight_for_a_removed_url_is_dropped() {
+    let fake = Arc::new(FakeJwks::default());
+    let keys = keys_with(&fake);
+    let config = Mutex::new(callers(&["a", "b"]));
+    let current = || config.lock().unwrap().clone();
+    fake.serve_once_after(&url("a"), &[("a1", 1)], Duration::from_secs(2));
+    fake.serve(&url("b"), &[("b1", 2)]);
+    fake.serve(&url("c"), &[("c1", 3)]);
+
+    let periodic = keys.sync(current, true, NOW);
+    let reload = async {
+        // 定期の回が a を取りに出た後に、a を消して c を足す読み直しが済む。
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        *config.lock().unwrap() = callers(&["b", "c"]);
+        keys.sync(current, false, NOW).await
+    };
+    let (periodic_failed, reload_failed) = tokio::join!(periodic, reload);
+    assert!(periodic_failed.is_empty() && reload_failed.is_empty());
+    assert_eq!(keys.urls(), urls(&["b", "c"]), "a is not put back");
+    assert_eq!(has(&keys, "a", "a1", NOW), Err(Missing::UnknownKid));
+    assert_eq!(has(&keys, "c", "c1", NOW), Ok(()));
+
+    // 遅れて始まった定期の回は、その時の設定に合わせる。
+    keys.sync(current, true, NOW + PERIOD_SECS).await;
+    assert_eq!(keys.urls(), urls(&["b", "c"]));
+    assert_eq!(fake.calls(&url("a")), 1);
+}
+
+/// 消えて同じ `jwks_url` で戻った呼び手に、消える前に始まった取得の結果は入れない
+/// (戻った後の取得が失敗して、まだ何も入っていない時も)。
+#[tokio::test(start_paused = true)]
+async fn a_fetch_from_before_the_removal_does_not_fill_the_readded_url() {
+    let fake = Arc::new(FakeJwks::default());
+    let keys = keys_with(&fake);
+    keys.track(|| callers(&["a"]));
+    fake.serve_once_after(&url("a"), &[("before", 1)], Duration::from_secs(2));
+    fake.answer(&url("a"), Err("down".to_owned()));
+
+    let a = url("a");
+    let stale_fetch = keys.refetch_for_request(&a, NOW);
+    let reload_twice = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        keys.sync(BTreeMap::new, false, NOW).await;
+        keys.sync(|| callers(&["a"]), false, NOW).await
+    };
+    let (refetched, failed) = tokio::join!(stale_fetch, reload_twice);
+    assert!(refetched);
+    assert_eq!(failed, vec![("a".to_owned(), "down".to_owned())]);
+    assert_eq!(fake.calls(&url("a")), 2);
+    assert_eq!(has(&keys, "a", "before", NOW), Err(Missing::UnknownKid));
+}
+
+/// 持っていない (設定から消えた) `jwks_url` は、request で取り直さず、載せもしない。
 #[tokio::test]
-async fn a_fetch_for_a_removed_url_is_dropped() {
+async fn a_request_does_not_refetch_an_untracked_url() {
     let fake = Arc::new(FakeJwks::default());
     fake.serve(&url("a"), &[("a1", 1)]);
     let keys = keys_with(&fake);
-    keys.fetch(&url("a"), "a", NOW).await.unwrap();
+    assert!(!keys.refetch_for_request(&url("a"), NOW).await);
+    assert_eq!(fake.total_calls(), 0);
     assert!(keys.urls().is_empty());
 }
 
@@ -379,13 +474,13 @@ async fn an_oversized_jwks_keeps_the_previous_keys() {
     let keys = CallerKeys::new(Arc::new(PlainHttp(jwks_client().unwrap())));
     let set = BTreeMap::from([(jwks.clone(), "a".to_owned())]);
 
-    assert!(keys.sync(&set, true, NOW).await.is_empty());
+    assert!(keys.sync(|| set.clone(), true, NOW).await.is_empty());
     assert!(keys.lookup(&jwks, "a1", NOW).is_ok());
 
     let mut oversized = jwks_body(&[("a2", 2)]);
     oversized.resize(MAX_JWKS_BYTES + 1, b' ');
     *body.lock().unwrap() = oversized;
-    let failed = keys.sync(&set, true, NOW + PERIOD_SECS).await;
+    let failed = keys.sync(|| set.clone(), true, NOW + PERIOD_SECS).await;
     assert_eq!(failed.len(), 1);
     assert!(failed[0].1.contains("exceeds"), "{}", failed[0].1);
     assert!(keys.lookup(&jwks, "a1", NOW + PERIOD_SECS).is_ok());
@@ -421,11 +516,11 @@ fn logs_name_the_caller_instead_of_the_url() {
     let keys = keys_with(&fake);
     let set = BTreeMap::from([(secret.clone(), "notifier".to_owned())]);
     let logs = crate::test_log::logs_of(|| async {
-        assert!(keys.sync(&set, true, NOW).await.is_empty());
+        assert!(keys.sync(|| set.clone(), true, NOW).await.is_empty());
         fake.answer(&secret, Err("down".to_owned()));
-        let failed = keys.sync(&set, true, NOW + 1).await;
+        let failed = keys.sync(|| set.clone(), true, NOW + 1).await;
         assert_eq!(failed, vec![("notifier".to_owned(), "down".to_owned())]);
-        assert!(keys.refetch_for_request(&secret, "notifier", NOW + 2).await);
+        assert!(keys.refetch_for_request(&secret, NOW + 2).await);
     });
     assert!(logs.contains("skipping a JWK"), "{logs}");
     assert!(logs.contains("[callers.notifier]"), "{logs}");
