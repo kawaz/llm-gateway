@@ -182,6 +182,8 @@ impl State {
 struct Target {
     url: Url,
     caller: String,
+    /// この取得の番号。Target を作るのと同じ錠の中で振る。
+    attempt: u64,
 }
 
 /// 呼び手の鍵のキャッシュ (`jwks_url` → JWKS)。unit のプロセスのメモリに持つ。
@@ -199,6 +201,8 @@ struct Target {
 /// 取得は錠の外で待つので、結果を入れる時に、取りに出た後に持ち物が作り直されて
 /// いないか、より後に始まった取得の結果が入っていないかを確かめる。持ち物の作成と取得に
 /// 同じ単調な番号を振り、壁時計でなく番号で比べる (同じ秒に始まった取得も前後が決まる)。
+/// 取得の番号は取りに出る先を決めるのと同じ錠の中で振るので、先を決めた後に持ち物が
+/// 消えて作り直されても、その取得の番号は作り直した時の番号より小さい。
 pub struct CallerKeys {
     fetcher: Arc<dyn FetchJwks>,
     state: Mutex<State>,
@@ -246,9 +250,11 @@ impl CallerKeys {
                 return false;
             }
             entry.refetched_at = Some(now);
+            let caller = entry.caller.clone();
             Target {
                 url: url.clone(),
-                caller: entry.caller.clone(),
+                caller,
+                attempt: state.next_id(),
             }
         };
         // 失敗は fetch がログに出し、束は前のまま。
@@ -306,13 +312,18 @@ impl CallerKeys {
                     },
                 );
             }
+            let attempt = (fresh || all).then(|| state.next_id());
             let Some(entry) = state.entries.get_mut(&url) else {
                 continue;
             };
             // 同じ jwks_url のまま呼び手の名前が変わった時。
             entry.caller.clone_from(&caller);
-            if fresh || all {
-                targets.push(Target { url, caller });
+            if let Some(attempt) = attempt {
+                targets.push(Target {
+                    url,
+                    caller,
+                    attempt,
+                });
             }
         }
         targets
@@ -323,7 +334,7 @@ impl CallerKeys {
     /// 取っている間に持ち物が消えた・作り直された時と、後から始まった取得の結果が
     /// 先に入っている時は、結果を捨てる。
     async fn fetch(&self, target: &Target, now: i64) -> Result<(), String> {
-        let attempt = self.state().next_id();
+        let attempt = target.attempt;
         let caller = target.caller.as_str();
         let source = format!("[callers.{caller}]");
         let fetched = self

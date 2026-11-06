@@ -355,6 +355,26 @@ async fn a_fetch_from_before_the_removal_does_not_fill_the_readded_url() {
     assert_eq!(has(&keys, "a", "before", NOW), Err(Missing::UnknownKid));
 }
 
+/// 取りに出る先を決めた後に、持ち物が消えて同じ `jwks_url` で作り直されたら、その先の
+/// 取得の結果は (作り直しの後に終わっても) 入れない。
+#[tokio::test]
+async fn a_target_from_before_the_removal_does_not_fill_the_readded_url() {
+    let fake = Arc::new(FakeJwks::default());
+    let keys = keys_with(&fake);
+    keys.track(|| callers(&["a"]));
+    let targets = keys.reconcile(|| callers(&["a"]), true);
+    assert_eq!(targets.len(), 1);
+
+    fake.answer(&url("a"), Err("down".to_owned()));
+    keys.sync(BTreeMap::new, false, NOW).await;
+    let failed = keys.sync(|| callers(&["a"]), false, NOW).await;
+    assert_eq!(failed.len(), 1, "the re-added url is not fetched yet");
+
+    fake.serve(&url("a"), &[("before", 1)]);
+    keys.fetch(&targets[0], NOW).await.unwrap();
+    assert_eq!(has(&keys, "a", "before", NOW), Err(Missing::UnknownKid));
+}
+
 /// 持っていない (設定から消えた) `jwks_url` は、request で取り直さず、載せもしない。
 #[tokio::test]
 async fn a_request_does_not_refetch_an_untracked_url() {

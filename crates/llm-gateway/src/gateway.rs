@@ -303,8 +303,11 @@ impl<P: CredentialPersistence> Gateway<P> {
         }
         // 取り直しを待った分だけ時刻を進めて確かめ直す。入口の `now` のままだと、`exp`
         // 直前の token が取得の待ち (最大 [`crate::caller_keys::FETCH_TIMEOUT`]) の分だけ
-        // 長く通る。
-        let now = now.saturating_add_unsigned(started.elapsed().as_secs());
+        // 長く通る。`now` は秒に切り捨てた値で 1 秒未満の位相を持たないので、待った秒は
+        // 切り上げて断る側に倒す。
+        let waited = started.elapsed();
+        let now =
+            now.saturating_add_unsigned(waited.as_secs() + u64::from(waited.subsec_nanos() > 0));
         caller::verify(
             authorization,
             &audience,
@@ -10470,19 +10473,27 @@ routes = ["a", "b"]
         /// 待ちの分だけ長く通らない。
         #[tokio::test(start_paused = true)]
         async fn the_recheck_after_a_slow_refetch_uses_the_later_time() {
+            use std::time::Duration;
             let now = now_unix();
-            for (delay, expected) in [(6, Err(Reason::Expired)), (4, passed("notifier", "n2"))] {
+            for (delay, exp_after, expected) in [
+                (Duration::from_secs(6), 5, Err(Reason::Expired)),
+                (Duration::from_secs(4), 5, passed("notifier", "n2")),
+                // 1 秒未満の待ちも切り上げて 1 秒進める。
+                (Duration::from_millis(200), 1, Err(Reason::Expired)),
+                (Duration::from_millis(200), 2, passed("notifier", "n2")),
+                (Duration::ZERO, 1, passed("notifier", "n2")),
+            ] {
                 let (gw, fake) = callers_gateway(&[("notifier", "n")]);
                 fake.serve(&jwks_url("n"), &[("n1", 1)]);
                 gw.fetch_caller_keys().await;
-                fake.serve_once_after(
-                    &jwks_url("n"),
-                    &[("n1", 1), ("n2", 2)],
-                    std::time::Duration::from_secs(delay),
+                fake.serve_once_after(&jwks_url("n"), &[("n1", 1), ("n2", 2)], delay);
+                // exp = now + exp_after。
+                let token = bearer(2, "n2", "notifier", now + exp_after - 10);
+                assert_eq!(
+                    verify(&gw, &token, now).await,
+                    expected,
+                    "waited {delay:?}, exp in {exp_after}s"
                 );
-                // exp = now + 5。
-                let token = bearer(2, "n2", "notifier", now - 5);
-                assert_eq!(verify(&gw, &token, now).await, expected, "delay {delay}s");
                 assert_eq!(fake.calls(&jwks_url("n")), 2);
             }
             assert_eq!(Reason::Expired.status(), Status::Unauthorized);
