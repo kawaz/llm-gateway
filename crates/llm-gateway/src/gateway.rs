@@ -9932,6 +9932,59 @@ routes = ["a", "b"]
         );
     }
 
+    /// 期限の過ぎた控えも、置き場に残っている限りそのまま写す。答えは控えを
+    /// 消さない。
+    ///
+    /// 答えは控えの写しで、問われた時点での判定はしない (DR-0042 決定 1)。
+    /// cache が切れたか・期間が終わったかは、読む側が `cache_expires_at` /
+    /// `cache_until` を壁時計と比べて決める。控えを畳むのは送る直前の判断だけ。
+    #[tokio::test]
+    async fn a_kept_series_past_its_time_is_still_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let now_ms = now_unix_ms();
+        // cache は 1 時間前に切れたが、期間 (8 時間) はまだ残っている控え。
+        let expired = kept_at("s-1", "0000000a", NS, now_ms - 2 * 60 * 60 * 1000);
+        // cache も期間も過ぎた控え。
+        let finished = kept_at("s-1", "0000000b", NS, now_ms - 10 * 60 * 60 * 1000);
+        assert!(expired.expires_at_ms < now_ms && expired.horizon_end_ms > now_ms);
+        assert!(finished.expires_at_ms < now_ms && finished.horizon_end_ms < now_ms);
+        let gw = sessions_gateway(dir.path(), &[expired.clone(), finished.clone()]).await;
+
+        let answer = gw.session("s-1").await;
+        let copied: Vec<(&str, i64, i64)> = answer
+            .series
+            .iter()
+            .map(|s| (s.prefix.as_str(), s.cache_expires_at, s.cache_since))
+            .collect();
+        assert_eq!(
+            copied,
+            [
+                ("0000000a", expired.expires_at_ms, expired.since_ms),
+                ("0000000b", finished.expires_at_ms, finished.since_ms),
+            ],
+            "both are answered as kept, with the times that have already passed"
+        );
+        // 8 時間の期間の連鎖は 9 本で、9 本目が置く cache の終わり
+        // (起点 + 9 × 55 分 + 1 時間) も 10 時間前の起点からはもう過ぎている。
+        assert_eq!(
+            answer.series[1].cache_until,
+            finished.since_ms + 9 * 55 * 60 * 1000 + 60 * 60 * 1000,
+            "cache_until is laid out from what was kept, even when it has passed"
+        );
+        assert!(answer.series[1].cache_until < now_ms);
+        assert_eq!(
+            gw.sessions(None).await.sessions.len(),
+            1,
+            "the list answers them too"
+        );
+        let store = keepalive::store::Store::new(dir.path());
+        assert_eq!(
+            store.load_meta_of("s-1").len(),
+            2,
+            "answering does not fold what was kept"
+        );
+    }
+
     /// 同じ `cache_since` の系列は `prefix` の昇順、先頭の系列の `cache_since` が
     /// 同じ会話は `session_id` の昇順。置き場を読む順に依らず、並びは毎回同じ。
     #[tokio::test]
