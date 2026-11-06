@@ -122,7 +122,7 @@ async fn require_caller<P: CredentialPersistence + 'static>(
     let method = request.method().as_str();
     let path = request.uri().path();
     match gateway
-        .verify_caller(authorization, method, path, now_unix())
+        .verify_caller(authorization, method, path, now_unix)
         .await
     {
         Ok(_) => next.run(request).await,
