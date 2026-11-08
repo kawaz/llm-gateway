@@ -1,6 +1,6 @@
 ---
 title: keepalive の控えのファイル名 stem が会話どうしで衝突し、後から書いた方が上書きする
-status: open
+status: resolved
 category: bug
 created: 2026-11-06T14:59:09+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered:
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-11-08T15:41:10+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["implemented","commit/557dd79709f9"]
 blocked_by:
 origin: 自リポ TODO (DR-0042 第 1 段の実装中に発見)
 ---
