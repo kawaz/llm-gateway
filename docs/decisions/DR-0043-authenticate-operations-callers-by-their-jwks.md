@@ -1,6 +1,6 @@
 # DR-0043: 運用系 HTTP の呼び手を、呼び手の JWKS で認証する (ccmsg が最初の呼び手)
 
-- Status: Accepted (kawaz 2026-11-06)
+- Status: Accepted (kawaz 2026-11-06)、実装済み (v0.70.0)
 - Date: 2026-11-05
 
 ## 背景
