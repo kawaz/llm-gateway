@@ -28,7 +28,7 @@ options:
 
 | label | binary | config |
 |---|---|---|
-| `com.kawaz.llm-gateway-unstable` | `~/.local/share/repos/github.com/kawaz/llm-gateway/main/target/release/llm-gateway` | `~/.config/llm-gateway/config-11301-unstable-new.toml` |
+| `com.kawaz.llm-gateway-unstable` | `~/.local/share/repos/github.com/kawaz/llm-gateway/main/target/release/llm-gateway` | `~/.config/llm-gateway/config-11301-unstable.toml` |
 | `com.kawaz.llm-gateway-stable` | `/opt/homebrew/bin/llm-gateway` | `~/.config/llm-gateway/config-11302-stable.toml` |
 
 台数ぶん plist があり、増減も再起動も `launchctl` を人が直接叩く。CLI は「何が登録されていて、何が動いているか」を答えられない。
@@ -81,7 +81,7 @@ llm-gateway daemon log [<unit>]|--all  [--follow]
 
 ### 2. unit = 設定ファイル 1 つ。登録簿は状態ディレクトリに置く
 
-`~/.local/state/llm-gateway/daemon/units/<name>.toml` に 1 unit 1 ファイル。`name` は `daemon add --name <name> <config-path>` で与え、省略時は設定ファイルの basename から拡張子を落としたもの (`config-11301-unstable-new.toml` → `config-11301-unstable-new`)。
+`~/.local/state/llm-gateway/daemon/units/<name>.toml` に 1 unit 1 ファイル。`name` は `daemon add --name <name> <config-path>` で与え、省略時は設定ファイルの basename から拡張子を落としたもの (`config-11301-unstable.toml` → `config-11301-unstable`)。
 
 unit が持つのは設定ファイルのパス、`enabled` (後述の desired state)、そして **実行する binary のパス**。binary は設定側の `[server] binary_path` を正とし、書かれていなければ登録した時点の自分自身の絶対パスを焼き込む。`binary_path` は設定の他のパス欄と同じく、読み込み時に `~` と環境変数を開いた値を使う (台をまたぐ dotfiles に置くため)。
 

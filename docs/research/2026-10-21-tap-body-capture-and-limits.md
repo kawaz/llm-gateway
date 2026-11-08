@@ -14,7 +14,7 @@
 
 ## 調査範囲
 
-- gateway: unstable unit (127.0.0.1:11301、0.68.0、`target/release` の binary。tap 関係のコード `tap.rs` / `exchange.rs` / `llm-gateway-server/src/lib.rs` / `cache.rs` の最終変更は binary のビルドより前)。設定は `~/.config/llm-gateway/config-11301-unstable-new.toml` の `ns.personal`
+- gateway: unstable unit (127.0.0.1:11301、0.68.0、`target/release` の binary。tap 関係のコード `tap.rs` / `exchange.rs` / `llm-gateway-server/src/lib.rs` / `cache.rs` の最終変更は binary のビルドより前)。設定は `~/.config/llm-gateway/config-11301-unstable.toml` の `ns.personal`
 - クライアント: Claude Code 2.1.304 を `claude -p --model claude-haiku-4-5-20251001` で実行。`CLAUDE_CONFIG_DIR` は `mktemp -d` の下に作り、その `settings.json` の `env` に `ANTHROPIC_BASE_URL=http://127.0.0.1:11301/ns-personal` と、token helper で鋳造した ns の JWT を書いた
 - Claude Code のコード: `~/.local/share/claude/versions/2.1.304` を bytes の検索で読んだ
 - 扱わないもの: prompt・thinking・tool の出力の本文 (構造と大きさだけを見る)。stable unit

@@ -16,11 +16,11 @@ DR-0027 の段階 B。gateway から合図方式 (marker / nonce / `cache_keepal
 
 ### 1. 設定から `replay` と `peers` を落とす
 
-両方の config (`config-11301-unstable-new.toml` / `config-11302-stable.toml`) で:
+両方の config (`config-11301-unstable.toml` / `config-11302-stable.toml`) で:
 
 ```bash
 cd ~/.config/llm-gateway
-sed -i '' 's/^main = "replay"$/main = "keepalive"/' config-11301-unstable-new.toml config-11302-stable.toml
+sed -i '' 's/^main = "replay"$/main = "keepalive"/' config-11301-unstable.toml config-11302-stable.toml
 ```
 
 `peers` は前後にコメント行が付いているので、手で消す:
@@ -33,7 +33,7 @@ peers = ["127.0.0.1:11301", "127.0.0.1:11302"]
 新しい binary で読めることを確かめる (`peers` が残っていれば `unknown field 'peers'`、`replay` が残っていれば戦略の値として弾かれる):
 
 ```bash
-<repo>/main/target/release/llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable-new.toml
+<repo>/main/target/release/llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable.toml
 <repo>/main/target/release/llm-gateway check --config ~/.config/llm-gateway/config-11302-stable.toml
 ```
 

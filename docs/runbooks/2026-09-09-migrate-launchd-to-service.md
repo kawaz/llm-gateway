@@ -7,7 +7,7 @@ launchd に直接載っている 2 つの plist を降ろし、`llm-gateway serv
 | label | binary | config | ログ |
 |---|---|---|---|
 | `com.kawaz.llm-gateway-stable` | `/opt/homebrew/bin/llm-gateway` | `~/.config/llm-gateway/config-11302-stable.toml` | `logs/stable.log` / `stable.err.log` |
-| `com.kawaz.llm-gateway-unstable` | `<repo>/main/target/release/llm-gateway` | `~/.config/llm-gateway/config-11301-unstable-new.toml` | `logs/unstable.log` / `unstable.err.log` |
+| `com.kawaz.llm-gateway-unstable` | `<repo>/main/target/release/llm-gateway` | `~/.config/llm-gateway/config-11301-unstable.toml` | `logs/unstable.log` / `unstable.err.log` |
 
 どちらの plist も `<binary> serve --config <path>` を `RunAtLoad` + `KeepAlive` で走らせている。Caddy は 11301 を優先し、落ちていれば 11302 に回す。
 
@@ -32,14 +32,14 @@ launchd に直接載っている 2 つの plist を降ろし、`llm-gateway serv
 [server]
 binary_path = "/opt/homebrew/bin/llm-gateway"
 
-# ~/.config/llm-gateway/config-11301-unstable-new.toml
+# ~/.config/llm-gateway/config-11301-unstable.toml
 [server]
 binary_path = "~/.local/share/repos/github.com/kawaz/llm-gateway/main/target/release/llm-gateway"
 ```
 
 ```bash
 llm-gateway check --config ~/.config/llm-gateway/config-11302-stable.toml
-llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable-new.toml
+llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable.toml
 ```
 
 ### (b) 2 台を登録簿に足す
@@ -48,7 +48,7 @@ llm-gateway check --config ~/.config/llm-gateway/config-11301-unstable-new.toml
 
 ```bash
 llm-gateway daemon add --name stable   ~/.config/llm-gateway/config-11302-stable.toml
-llm-gateway daemon add --name unstable ~/.config/llm-gateway/config-11301-unstable-new.toml
+llm-gateway daemon add --name unstable ~/.config/llm-gateway/config-11301-unstable.toml
 llm-gateway daemon list
 ```
 
