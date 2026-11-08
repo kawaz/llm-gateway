@@ -1,5 +1,5 @@
 /target
 *.local.code-workspace
 
-# auto mode classifier 向けの個人設定 (正本は privacy リポ、symlink)
-.claude/rules/*.local.md
+# 個人の permission allow (完全一致の Edit / Bash)。commit しない
+.claude/settings.local.json
