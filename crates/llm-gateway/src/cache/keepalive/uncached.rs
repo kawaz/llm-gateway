@@ -234,6 +234,14 @@ mod tests {
         }
     }
 
+    /// `session` の系列で `sent_at_ms` に送った 1 本の置き場での名前。
+    fn named(session: &str, sent_at_ms: i64) -> String {
+        format!(
+            "{}.{sent_at_ms}.json",
+            record(session, sent_at_ms).series().stem()
+        )
+    }
+
     fn set_aside(dir: &Path) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(dir.join("keepalive").join("uncached")) else {
             return Vec::new();
@@ -255,12 +263,9 @@ mod tests {
         let written = record("s-1", 1_800_000_000_000);
         quarantine.put(&written);
 
-        assert_eq!(set_aside(dir.path()), ["s-1.2cf24dba.1800000000000.json"]);
-        let raw = std::fs::read(
-            dir.path()
-                .join("keepalive/uncached/s-1.2cf24dba.1800000000000.json"),
-        )
-        .unwrap();
+        let name = named("s-1", 1_800_000_000_000);
+        assert_eq!(set_aside(dir.path()), [name.as_str()]);
+        let raw = std::fs::read(dir.path().join("keepalive/uncached").join(name)).unwrap();
         assert_eq!(
             serde_json::from_slice::<Uncached>(&raw).unwrap(),
             written,
@@ -280,11 +285,7 @@ mod tests {
 
         assert_eq!(
             set_aside(dir.path()),
-            [
-                "s-1.2cf24dba.1800000000002.json",
-                "s-1.2cf24dba.1800000000003.json",
-                "s-1.2cf24dba.1800000000004.json",
-            ],
+            [2, 3, 4].map(|nth| named("s-1", 1_800_000_000_000 + nth)),
             "the three newest survive"
         );
     }
@@ -301,7 +302,7 @@ mod tests {
 
         assert_eq!(
             set_aside(dir.path()),
-            [format!("s-new.2cf24dba.{now_ms}.json")],
+            [named("s-new", now_ms)],
             "only what is inside the window is left"
         );
     }
@@ -336,7 +337,7 @@ mod tests {
             quarantine.prune(now_ms + DAY_MS * 365);
             assert_eq!(
                 set_aside(dir.path()),
-                [format!("s-1.2cf24dba.{now_ms}.json")],
+                [named("s-1", now_ms)],
                 "nothing was written, and what was there stayed"
             );
         }

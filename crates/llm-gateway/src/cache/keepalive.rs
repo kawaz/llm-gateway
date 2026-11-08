@@ -396,6 +396,9 @@ impl Keepalive {
         let now_ms = now_unix_ms();
         // 落ちている間に古びた退避を、読み戻しのついでに切り詰める。
         self.quarantine.prune(now_ms);
+        // 名前で系列に届かない控えは、読み戻す前に名前を揃える。揃えずに
+        // 張った予定は、発火時に控えを読めず黙って畳まれる。
+        self.store.settle_names();
         let mut restored = 0;
         for kept in self.store.load_all() {
             let series = Series {
@@ -1344,6 +1347,32 @@ mod tests {
         let after = keepalive(dir.path(), &upstream, true);
         after.restore();
         assert_eq!(after.armed(), 1, "the kept series came back");
+
+        tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
+        upstream.until_sent(1).await;
+        assert_eq!(upstream.sent().len(), 1, "it replayed on the old schedule");
+    }
+
+    /// 会話のハッシュを持たない名前で置かれた控えも、読み戻して送り直す。
+    ///
+    /// 名前のままだと、張った予定が発火時に控えを読めず黙って畳まれる。
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_request_without_the_hash_in_its_name_is_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = FakeUpstream::new(answered(events::Cache::Hit));
+        let kept_dir = dir.path().join("keepalive");
+        std::fs::create_dir_all(&kept_dir).unwrap();
+        let unhashed = kept_dir.join("s-1.2cf24dba.json");
+        std::fs::write(
+            &unhashed,
+            serde_json::to_vec(&sent(now_unix_ms()).into_kept()).unwrap(),
+        )
+        .unwrap();
+
+        let keepalive = keepalive(dir.path(), &upstream, true);
+        keepalive.restore();
+        assert_eq!(keepalive.armed(), 1, "the kept series came back");
+        assert!(!unhashed.exists(), "it now lives under the series' name");
 
         tokio::time::advance(REFRESH_AFTER + Duration::from_secs(1)).await;
         upstream.until_sent(1).await;

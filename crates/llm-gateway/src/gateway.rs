@@ -10239,27 +10239,34 @@ routes = ["a", "b"]
         assert_eq!(json, json!({"sessions": []}));
     }
 
-    /// 置き場の名前は会話の id の英数字以外を潰した形なので、違う会話が同じ
-    /// 名前に落ちうる。1 つの会話の答えには、その id の控えだけが載る。
+    /// 会話の id は英数字以外を潰して置き場の名前に使うので、`a b` と `a/b`
+    /// は潰すと同じ形になる。同じ prefix で並べても、1 つの会話の答えには
+    /// その id の控えだけが載り、どちらも欠けない。
     #[tokio::test]
     async fn a_session_id_folding_to_the_same_name_is_kept_apart() {
         let dir = tempfile::tempdir().unwrap();
         let since = 1_785_600_000_000;
-        let gw = sessions_gateway(
-            dir.path(),
-            &[
-                kept_at("a b", "0000000a", NS, since),
-                kept_at("a/b", "0000000b", NS, since),
-            ],
-        )
-        .await;
+        let mut spaced = kept_at("a b", "0000000a", NS, since);
+        spaced.cache_notice = Some("notice-spaced".to_owned());
+        let mut slashed = kept_at("a/b", "0000000a", NS, since);
+        slashed.cache_notice = Some("notice-slashed".to_owned());
+        let gw = sessions_gateway(dir.path(), &[spaced, slashed]).await;
 
-        let prefixes = |answer: sessions::SessionReport| -> Vec<String> {
-            answer.series.into_iter().map(|s| s.prefix).collect()
+        let notices = |answer: sessions::SessionReport| -> Vec<Option<String>> {
+            answer.series.into_iter().map(|s| s.cache_notice).collect()
         };
-        assert_eq!(prefixes(gw.session("a b").await), ["0000000a"]);
-        assert_eq!(prefixes(gw.session("a/b").await), ["0000000b"]);
-        assert_eq!(prefixes(gw.session("a-b").await), Vec::<String>::new());
+        assert_eq!(
+            notices(gw.session("a b").await),
+            [Some("notice-spaced".to_owned())]
+        );
+        assert_eq!(
+            notices(gw.session("a/b").await),
+            [Some("notice-slashed".to_owned())]
+        );
+        assert_eq!(
+            notices(gw.session("a-b").await),
+            Vec::<Option<String>>::new()
+        );
     }
 
     /// 運用系の口の呼び手の確かめ方と鍵の持ち方 (DR-0043 決定 4〜6)。

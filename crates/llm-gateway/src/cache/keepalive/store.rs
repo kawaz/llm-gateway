@@ -95,32 +95,63 @@ pub struct Series {
 }
 
 impl Series {
-    /// ファイル名 (拡張子なし)。
+    /// ファイル名 (拡張子なし)。形は `<潰した会話の id>-<会話の id のハッシュ>.<prefix>`。
     ///
     /// 会話の id は client が名乗るものなので、区切りやパスに使える文字が
-    /// 混ざりうる。英数字以外を潰したうえで、潰した結果が衝突しないよう
-    /// **prefix を後ろに付ける** — prefix はこちらが本文から作る 16 進なので
-    /// そのまま名前に使える。
+    /// 混ざりうる。英数字以外を `-` に潰して名前に使える形にし、潰すと違う
+    /// 会話が同じ形に落ちる (`a b` と `a/b`) ので、**潰す前の id のハッシュ**を
+    /// 足して会話ごとに別の名前にする。prefix はこちらが本文から作る 16 進
+    /// なのでそのまま使う。
     pub(super) fn stem(&self) -> String {
         format!("{}.{}", session_stem(&self.session_id), self.prefix)
     }
 }
 
-/// ファイル名のうち会話の id を潰した部分 ([`Series::stem`] の `.` より前)。
+/// 会話の id から取るハッシュの桁数 (16 進)。
+const SESSION_HASH_DIGITS: usize = 8;
+
+/// ファイル名に残す、会話の id を潰した部分の長さの上限 (バイト)。
+const SESSION_READABLE_MAX: usize = 64;
+
+/// ファイル名のうち会話を表す部分 ([`Series::stem`] の `.` より前)。
 ///
-/// 潰すので、違う会話が同じ名前になりうる。名前で候補を絞った後は、中の
-/// `session_id` で確かめる ([`Store::load_meta_of`])。
+/// 潰した id は人が置き場を眺めて会話を見分けるためのもので、会話ごとに
+/// 別の名前になることはハッシュの側が受け持つ。
+///
+/// Design rationale: 潰さずに percent-encode する案 (`a/b` → `a%2Fb`) は
+/// 名前が id と 1 対 1 になるが、名前の長さが client の名乗る id の長さで
+/// 決まり (区切り 1 文字が 3 文字になる)、ファイル名の上限 (255 バイト) を
+/// 超えた会話は控えを置けず黙って keepalive から外れる。ハッシュを足す形なら
+/// 見分けをハッシュが持つので読める部分を切り詰められ、名前の長さが id に
+/// 依らず抑えられる。ハッシュは prefix と同じ SHA-256 の先頭で、8 桁
+/// (32 bit) あれば足りる — 衝突が効くのは潰した部分まで同じになった会話
+/// どうしだけで、そういう組は数個しか並ばない。万一衝突しても、読み出し側は
+/// 中の `session_id` の完全一致で確かめる ([`Store::load_meta_of`])。
 fn session_stem(session_id: &str) -> String {
     let cleaned: String = session_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let trimmed = cleaned.trim_matches('-');
-    if trimmed.is_empty() {
-        "unknown".to_owned()
+    // 潰した後は ASCII だけなので、バイト数で切っても文字の途中にならない。
+    let readable = cleaned.trim_matches('-');
+    let readable = readable[..readable.len().min(SESSION_READABLE_MAX)].trim_end_matches('-');
+    let readable = if readable.is_empty() {
+        "unknown"
     } else {
-        trimmed.to_owned()
-    }
+        readable
+    };
+    format!("{readable}-{}", session_hash(session_id))
+}
+
+/// 会話の id の SHA-256 の先頭 [`SESSION_HASH_DIGITS`] 桁。
+fn session_hash(session_id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    Sha256::digest(session_id.as_bytes())
+        .iter()
+        .take(SESSION_HASH_DIGITS.div_ceil(2))
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// この名前は自分が置いたものか ([`Series::stem`] の形をしているか)。
@@ -252,7 +283,8 @@ impl Store {
     /// この会話の控えを、本文を除いて読む (DR-0042)。無ければ空。
     ///
     /// 名前で候補を絞ってから、中の `session_id` が完全に一致するものだけを
-    /// 残す — 名前は会話の id を潰した形なので、違う会話が同じ名前に落ちる。
+    /// 残す — 名前の会話の部分はハッシュの先頭しか持たないので、確かめるのは
+    /// 中身の側。
     pub fn load_meta_of(&self, session_id: &str) -> Vec<KeptMeta> {
         let wanted = session_stem(session_id);
         self.our_files()
@@ -274,6 +306,48 @@ impl Store {
             .filter_map(|(path, _)| read_kept::<KeptMeta>(&path))
             .filter(|meta| ns.is_none_or(|ns| meta.ns == ns))
             .collect()
+    }
+
+    /// 名前が中身の系列の名前 ([`Series::stem`]) と違う控えを、その名前に
+    /// 付け替える。起動時に、読み戻す前に 1 回呼ぶ。
+    ///
+    /// 置き場には会話のハッシュを持たない形 (`<潰した会話の id>.<prefix>`) の
+    /// 控えが居ることがあり、この関数がそれを読む。名前のままでは [`Self::load`]
+    /// ・[`Self::claim`]・[`Self::remove`] がその系列に届かない。付け替え先が
+    /// 既にあればそちらを残し、こちらを捨てる — 付け替え先は今の名前で書く
+    /// 書き手が置いたもので、同じ系列の控えを 2 つ持つと読み戻しで二重に拾う。
+    pub fn settle_names(&self) {
+        for (path, stem) in self.our_files() {
+            let Some(meta) = read_kept::<KeptMeta>(&path) else {
+                continue;
+            };
+            let named = Series {
+                session_id: meta.session_id,
+                prefix: meta.prefix,
+            }
+            .stem();
+            if stem == named {
+                continue;
+            }
+            let target = self.dir.join(format!("{named}.json"));
+            // 付け替え先を上書きしないよう、リンクを張ってから元を消す
+            // (rename は付け替え先があれば黙って上書きする)。
+            match std::fs::hard_link(&path, &target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // 兄弟が先に付け替えた。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), %e, "cannot rename the kept request");
+                    continue;
+                }
+            }
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), %e, "cannot drop the kept request after renaming it");
+            }
+        }
     }
 
     /// 自分が置いた形の名前を持つ控えのファイルと、その名前 (拡張子なし)。
@@ -411,6 +485,93 @@ mod tests {
                 .body["a"],
             2
         );
+    }
+
+    /// 潰すと同じ形になる会話どうしも、別のファイルに置く。
+    ///
+    /// 会話の id の英数字以外は名前に使えないので潰すが、`a b` と `a/b` は
+    /// どちらも `a-b` になる。同じ prefix で並べても、後から書いた方が先の
+    /// 控えを上書きしない。
+    #[test]
+    fn conversations_folding_to_the_same_name_keep_their_own_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+
+        assert!(store.save(&kept("a b", serde_json::json!({"a": 1}))));
+        assert!(store.save(&kept("a/b", serde_json::json!({"a": 2}))));
+
+        assert_eq!(store.load(&series("a b")).unwrap().body["a"], 1);
+        assert_eq!(store.load(&series("a/b")).unwrap().body["a"], 2);
+        let mut sessions: Vec<String> = store
+            .load_all()
+            .into_iter()
+            .map(|kept| kept.session_id)
+            .collect();
+        sessions.sort();
+        assert_eq!(sessions, ["a b", "a/b"], "both are kept");
+    }
+
+    /// 長い会話の id でも控えを置ける。末尾だけ違う id どうしも別の控え。
+    ///
+    /// ファイル名には上限 (255 バイト) があるので、名前の長さを id の長さに
+    /// 任せると、長い id を名乗る会話は控えを置けずに keepalive から外れる。
+    #[test]
+    fn a_long_session_id_is_kept_under_a_name_of_bounded_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let one = format!("{}1", "x".repeat(1000));
+        let other = format!("{}2", "x".repeat(1000));
+
+        assert!(store.save(&kept(&one, serde_json::json!({"a": 1}))));
+        assert!(store.save(&kept(&other, serde_json::json!({"a": 2}))));
+
+        assert_eq!(store.load(&series(&one)).unwrap().body["a"], 1);
+        assert_eq!(store.load(&series(&other)).unwrap().body["a"], 2);
+    }
+
+    /// 名前が中身の系列と合わない控え (会話のハッシュを持たない形) は、
+    /// 名前を揃えると系列として読める。
+    #[test]
+    fn a_kept_request_without_the_hash_in_its_name_is_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let written = kept("s-1", serde_json::json!({"a": 1}));
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let unhashed = store.dir.join("s-1.2cf24dba.json");
+        std::fs::write(&unhashed, serde_json::to_vec(&written).unwrap()).unwrap();
+        assert_eq!(
+            store.load(&series("s-1")),
+            None,
+            "the series does not reach a file under that name"
+        );
+
+        store.settle_names();
+
+        assert_eq!(store.load(&series("s-1")), Some(written));
+        assert!(!unhashed.exists(), "it moved, not copied");
+        assert_eq!(store.load_meta_of("s-1").len(), 1);
+    }
+
+    /// 揃えた先に控えが既にあれば、そちらを残す。
+    ///
+    /// 両方残すと、読み戻しで同じ系列を 2 つ拾う。
+    #[test]
+    fn settling_names_keeps_what_is_already_under_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert!(store.save(&kept("s-1", serde_json::json!({"a": 1}))));
+        let unhashed = store.dir.join("s-1.2cf24dba.json");
+        std::fs::write(
+            &unhashed,
+            serde_json::to_vec(&kept("s-1", serde_json::json!({"a": 2}))).unwrap(),
+        )
+        .unwrap();
+
+        store.settle_names();
+
+        assert_eq!(store.load(&series("s-1")).unwrap().body["a"], 1);
+        assert!(!unhashed.exists());
+        assert_eq!(store.load_all().len(), 1, "one file per series");
     }
 
     /// 上限を超えた本文は保持しない = その系列は延命しない。
