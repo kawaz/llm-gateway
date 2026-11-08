@@ -109,7 +109,7 @@ data: {"type":"credential_expired","ts":1792777600000,"seq":205,"boot":178559000
 
 ## 影響
 
-- 転送の知らせの名前が `request` → `llm_request` に変わり、`type` 欄が付く (決定 1)。読み手のうち壊れるのは **`type` の無い件を転送として読む受け口** (ccmsg の `[webhook]` の受け口がこの形。ccmsg は DR-0042 の pull に移れば受け口を持たなくなる) と、SSE の `event: request` を名指しで選んでいるもの。知らない `type` を無視する読み手 (DR-0012) は新しい種類ではそのまま動く
+- 転送の知らせの名前が `request` → `llm_request` に変わり、`type` 欄が付く (決定 1)。読み手のうち壊れるのは **`type` の無い件を転送として読む受け口** (ccmsg の `[webhook]` の受け口がこの形。ccmsg は DR-0042 の pull に移れば受け口を持たなくなる) と、SSE の `event: request` を名指しで選んでいるもの。知らない `type` を無視する読み手 (DR-0012) は新しい種類ではそのまま動く。**入れるのは ccmsg が events の受け口を外した後** (決定 1・2 は同じリリースで、破壊的変更を 1 回にまとめる)
 - `llm_request` / `response` の `credential` が経路名から認証情報の名前に変わり、経路名は `route` に移る。`skipped` の要素も `{route, reason}` (決定 2)。`Event` / `Response` / `Skipped` と `Origin` に `route` が増え、`credential` は `Option`。`GET /llm-gateway/sessions` の `routes[]` と欄名が揃う
 - `Notice` の全種が `type` を持つので `untagged` の読み分けを `type` で引ける形にできる (読み戻しの順序依存が消える)
 - `Notice` に `CredentialRefreshFailed` / `CredentialExpiring` / `CredentialExpired` / `SecretExpiring` / `SecretExpired` が増える (決定 3・4 の 5 種)。SSE と hooks (DR-0040) の両方に流れる
