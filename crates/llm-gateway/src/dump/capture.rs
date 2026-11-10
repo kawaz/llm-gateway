@@ -70,7 +70,7 @@ pub struct Upstream<'a> {
     pub headers: &'a Headers,
     /// [`Capture::connect`] が返した時刻。
     pub connected_at: i64,
-    /// この経路へ送る形を決めるまでに gateway が本文に加えた書き換え。
+    /// この経路へ送る形を決めるまでに gateway が本文とヘッダに加えた書き換え。
     pub rewrites: Map<String, Value>,
 }
 

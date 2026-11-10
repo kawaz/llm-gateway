@@ -71,7 +71,10 @@ llm-gateway は upstream に圧縮を求めない (クライアントの `accept
 
 ### 7. gateway の書き換えは試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書く (files)
 
-記録本体 (`*.request.body`) は受けた形のまま、gateway がその経路へ送る形を決めるまでに加えた書き換えを、試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書く (統括の裁定)。model の別名の解決と経路ごとの名前、cache の戦略と寿命 (DR-0024) は経路ごとに効くので、試行が複数ある 1 本では `*.request.json` 1 つに収まらない。`*.request.json` には置かない。中身は `model: {received, sent}` (送った名前が受けた名前と違う時)、`thinking_display` (受け口が display を上書きした時)、`thinking_as_text` (跨ぎで text にした時)、`cache_strategy`、`cache_ttl_secs`。upstream へ送った本文そのものは残さない (reference `model`)。
+記録本体 (`*.request.body`) は受けた形のまま、gateway がその経路へ送る形を決めるまでに加えた書き換えを、試行ごとの `*.<attempt>.response.json` の `request_rewrites` に書く (統括の裁定)。model の別名の解決と経路ごとの名前、cache の戦略と寿命 (DR-0024) は経路ごとに効くので、試行が複数ある 1 本では `*.request.json` 1 つに収まらない。`*.request.json` には置かない。中身は `model: {received, sent}` (送った名前が受けた名前と違う時)、`thinking_display` (受け口が display を上書きした時)、`thinking_as_text` (跨ぎで text にした時)、`cache_strategy`、`cache_ttl_secs`、`headers` と `beta_dropped` (beta フラグの交渉 (DR-0003) でヘッダを書き換えた時)。upstream へ送った本文そのものは残さない (reference `model`)。
+
+- `headers` は reference `files` のヘッダの書き換えの形 (`{op, name, value?}` の配列) で、受けたヘッダから変わった分だけを載せる。認証系 (決定 8 の述語) は載せない
+- `beta_dropped` は落としたフラグと理由の `{flag, reason}` の配列で、クライアントが送った順。`reason` は `default` (経路の既定の拒否)、`learned` (その credential が覚えた拒否)、`retry` (この 1 本の 400 で拒否され、送り直しの試行で落とした)。フラグを落とした試行は `headers` に `anthropic-beta` の `set` (全部落ちたら `remove`) が並ぶ
 
 ### 8. 認証系ヘッダの述語は `gateway.rs` の `is_authorization`、ヘッダは同名を保つ配列 (capacity / files)
 

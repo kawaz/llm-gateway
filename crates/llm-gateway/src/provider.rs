@@ -193,16 +193,35 @@ pub struct ProbeRequest {
     pub request: EgressRequest,
 }
 
+/// [`Negotiation::prepare`] が整えた結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prepared {
+    /// 実際に載せたもの。400 を受けたときに何を責めるかがこれで決まる。
+    pub sent: Vec<String>,
+    /// クライアントが載せていたのに落としたものと、落とした理由。一時ダンプ
+    /// (DR-0038 決定 7) が書き換えとして残す。
+    pub dropped: Vec<(String, Dropped)>,
+}
+
+/// 送る前に落とした理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dropped {
+    /// その upstream の既定で受け付けないと分かっている。
+    Default,
+    /// この credential で拒否されたと覚えている。
+    Learned,
+}
+
 /// upstream が受け付けない要求ヘッダを、送る前に落として学習する任意 capability。
 ///
 /// DR-0003 の beta フラグ交渉がこれ。「何を載せたか」を返すのは、400 を受けた
 /// ときに何を責めるかがそれで決まるため。provider 1 つでは完結せず、学習した
 /// 分の保存は credential 側にあるので、往復の司会は転送側が持つ。
 pub trait Negotiation: Send + Sync {
-    /// 送るヘッダを整える。実際に載せたものを返す。
+    /// 送るヘッダを整える。実際に載せたものと、落としたものを返す。
     ///
     /// `learned` はこの credential で拒否されたと分かっている分。
-    fn prepare(&self, headers: &mut Headers, learned: &[String]) -> Vec<String>;
+    fn prepare(&self, headers: &mut Headers, learned: &[String]) -> Prepared;
 
     /// この失敗応答は、載せたもののせいか。そうなら責めるものの名前。
     fn blame(&self, body: &str, sent: &[String]) -> Option<Vec<String>>;

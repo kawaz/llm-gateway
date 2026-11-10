@@ -6,7 +6,7 @@
 //! 「何を載せたか」と「何を責めるか」の 2 つだけ。
 
 use crate::egress::Headers;
-use crate::provider::Negotiation;
+use crate::provider::{Dropped, Negotiation, Prepared};
 
 use super::beta;
 
@@ -27,10 +27,26 @@ impl Negotiation for BetaFlags {
     ///
     /// 同じ upstream でも region や契約で受け付ける beta が違うので、学習結果は
     /// 認証情報ごとに持つ (DR-0003)。
-    fn prepare(&self, headers: &mut Headers, learned: &[String]) -> Vec<String> {
+    fn prepare(&self, headers: &mut Headers, learned: &[String]) -> Prepared {
+        let asked = headers
+            .get(beta::HEADER)
+            .map(|value| beta::Policy::Passthrough.keep(value))
+            .unwrap_or_default();
         let mut policy = self.policy.clone();
         policy.deny_all(learned.iter().cloned());
-        policy.apply_to(headers)
+        let sent = policy.apply_to(headers);
+        let dropped = asked
+            .into_iter()
+            .filter(|flag| !sent.contains(flag))
+            .map(|flag| {
+                let why = match self.policy.keep(&flag).is_empty() {
+                    true => Dropped::Default,
+                    false => Dropped::Learned,
+                };
+                (flag, why)
+            })
+            .collect();
+        Prepared { sent, dropped }
     }
 
     fn blame(&self, body: &str, sent: &[String]) -> Option<Vec<String>> {
@@ -57,23 +73,32 @@ claude-code-20250219,advisor-tool-2026-03-01";
     #[test]
     fn passthrough_sends_what_the_client_asked_for() {
         let mut sending = headers();
-        let sent = BetaFlags::new(beta::Policy::Passthrough).prepare(&mut sending, &[]);
+        let prepared = BetaFlags::new(beta::Policy::Passthrough).prepare(&mut sending, &[]);
 
         assert_eq!(sending.get("anthropic-beta"), Some(CLIENT_BETA));
-        assert_eq!(sent.len(), 4, "returns what was sent: {sent:?}");
+        assert_eq!(
+            prepared.sent.len(),
+            4,
+            "returns what was sent: {prepared:?}"
+        );
+        assert!(prepared.dropped.is_empty(), "{prepared:?}");
     }
 
     /// 学習済みのフラグは、1 本目から落ちる。
     #[test]
     fn learned_flags_are_dropped_before_sending() {
         let mut sending = headers();
-        let sent = BetaFlags::new(beta::Policy::Passthrough)
+        let prepared = BetaFlags::new(beta::Policy::Passthrough)
             .prepare(&mut sending, &["advisor-tool-2026-03-01".to_owned()]);
 
         let value = sending.get("anthropic-beta").expect("something remains");
         assert!(!value.contains("advisor-tool-2026-03-01"), "{value}");
         assert!(value.contains("oauth-2025-04-20"), "{value}");
-        assert!(!sent.contains(&"advisor-tool-2026-03-01".to_owned()));
+        assert!(
+            !prepared
+                .sent
+                .contains(&"advisor-tool-2026-03-01".to_owned())
+        );
     }
 
     /// 既定の拒否リストと学習分は足し合わさる。
@@ -90,6 +115,35 @@ claude-code-20250219,advisor-tool-2026-03-01";
         );
     }
 
+    /// 落としたものは、既定の拒否か覚えた拒否かを添えて返す。
+    #[test]
+    fn dropped_flags_say_why() {
+        let mut sending = headers();
+        let prepared = BetaFlags::new(beta::Policy::bedrock())
+            .prepare(&mut sending, &["claude-code-20250219".to_owned()]);
+
+        assert_eq!(
+            prepared.dropped,
+            vec![
+                ("oauth-2025-04-20".to_owned(), Dropped::Default),
+                ("claude-code-20250219".to_owned(), Dropped::Learned),
+                ("advisor-tool-2026-03-01".to_owned(), Dropped::Default),
+            ],
+            "in the order the client sent them"
+        );
+        assert_eq!(prepared.sent, vec!["interleaved-thinking-2025-05-14"]);
+    }
+
+    /// クライアントが beta を載せていなければ、落としたものも無い。
+    #[test]
+    fn no_header_drops_nothing() {
+        let mut sending = Headers::new(Vec::new());
+        let prepared = BetaFlags::new(beta::Policy::bedrock())
+            .prepare(&mut sending, &["claude-code-20250219".to_owned()]);
+
+        assert_eq!(prepared, Prepared::default());
+    }
+
     /// 全部落ちたらヘッダごと消す (空の値を送らない)。
     #[test]
     fn nothing_left_removes_the_header() {
@@ -97,10 +151,10 @@ claude-code-20250219,advisor-tool-2026-03-01";
             "anthropic-beta".to_owned(),
             "oauth-2025-04-20,advisor-tool-2026-03-01".to_owned(),
         )]);
-        let sent = BetaFlags::new(beta::Policy::bedrock()).prepare(&mut sending, &[]);
+        let prepared = BetaFlags::new(beta::Policy::bedrock()).prepare(&mut sending, &[]);
 
         assert_eq!(sending.get("anthropic-beta"), None);
-        assert!(sent.is_empty());
+        assert!(prepared.sent.is_empty());
     }
 
     /// 名指しされていれば、そのフラグだけを責める。

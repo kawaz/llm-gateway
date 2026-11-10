@@ -1145,12 +1145,21 @@ impl<P: CredentialPersistence> Gateway<P> {
         let negotiation = route.preset.negotiation();
 
         let mut sending = Headers::new(headers.to_vec());
-        let sent = negotiation
+        let prepared = negotiation
             .map(|n| n.prepare(&mut sending, &learned))
             .unwrap_or_default();
+        let negotiated = negotiated_rewrites(call, headers, &sending, &prepared, &[]);
+        let sent = prepared.sent;
 
         let sent_response = self
-            .send(route, call, credential.as_ref(), sending, skipped)
+            .send(
+                route,
+                call,
+                credential.as_ref(),
+                sending,
+                negotiated,
+                skipped,
+            )
             .await?;
         let completion = sent_response.completion;
         let resp = self
@@ -1188,12 +1197,20 @@ impl<P: CredentialPersistence> Gateway<P> {
 
         let mut retrying = Headers::new(headers.to_vec());
         let mut learned = learned;
-        learned.extend(blamed);
-        negotiation.prepare(&mut retrying, &learned);
+        learned.extend(blamed.iter().cloned());
+        let prepared = negotiation.prepare(&mut retrying, &learned);
+        let negotiated = negotiated_rewrites(call, headers, &retrying, &prepared, &blamed);
 
         // 送り直すのは 1 回だけ。これでも失敗ならクライアントへ返す。
         let sent_response = self
-            .send(route, call, credential.as_ref(), retrying, skipped)
+            .send(
+                route,
+                call,
+                credential.as_ref(),
+                retrying,
+                negotiated,
+                skipped,
+            )
             .await?;
         let resp = self
             .admit(route, call.model, sent_response.response)
@@ -1499,6 +1516,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         call: &Call<'_>,
         credential: Option<&Credential>,
         headers: Headers,
+        negotiated: serde_json::Map<String, Value>,
         skipped: &[events::Skipped],
     ) -> std::result::Result<Sent, Failure> {
         // upstream での名前がクライアントの名前と違う経路にだけ、書き換えて
@@ -1570,6 +1588,7 @@ impl<P: CredentialPersistence> Gateway<P> {
             if let Some(ttl) = cache_ttl_secs {
                 rewrites.insert("cache_ttl_secs".to_owned(), Value::from(ttl));
             }
+            rewrites.extend(negotiated);
             move |status: u16, headers: &Headers, body: egress::BodyStream| {
                 capture.tee(
                     crate::dump::Upstream {
@@ -2383,6 +2402,84 @@ impl<P: CredentialPersistence> keepalive::Sender for Gateway<P> {
 /// 認証は送るたびに経路が付け直す (DR-0027 決定 1 の「認証差し替え後の形」)。
 /// 控えに残すと、期限の切れた token を抱えたまま送り直すことになる。一時ダンプも
 /// 同じ述語で落とす (DR-0038 決定 8)。
+/// 交渉 (DR-0003) がヘッダに加えた書き換えを、一時ダンプの `request_rewrites`
+/// (DR-0038 決定 7) の形にする。ダンプしていない 1 本では組まない。
+///
+/// - `headers`: 受けたヘッダから変わった分。reference `proxy-dump-design` の
+///   `{op, name, value?}` の配列で、認証系 ([`is_authorization`]) は載せない
+/// - `beta_dropped`: 落としたフラグと理由の `{flag, reason}` の配列。`reason` は
+///   `default` (経路の既定の拒否) / `learned` (credential が覚えた拒否) /
+///   `retry` (この 1 本の 400 で拒否され、送り直しで落とした)
+///
+/// `retried` は送り直しの時に、この 1 本の 400 で責めたフラグ。
+fn negotiated_rewrites(
+    call: &Call<'_>,
+    received: &[(String, String)],
+    sending: &Headers,
+    prepared: &crate::provider::Prepared,
+    retried: &[String],
+) -> serde_json::Map<String, Value> {
+    let mut rewrites = serde_json::Map::new();
+    if call.dump.is_none() {
+        return rewrites;
+    }
+    let changed = header_rewrites(received, sending.as_slice());
+    if !changed.is_empty() {
+        rewrites.insert("headers".to_owned(), Value::Array(changed));
+    }
+    if !prepared.dropped.is_empty() {
+        let dropped = prepared
+            .dropped
+            .iter()
+            .map(|(flag, why)| {
+                let reason = match why {
+                    _ if retried.contains(flag) => "retry",
+                    crate::provider::Dropped::Default => "default",
+                    crate::provider::Dropped::Learned => "learned",
+                };
+                serde_json::json!({"flag": flag, "reason": reason})
+            })
+            .collect();
+        rewrites.insert("beta_dropped".to_owned(), Value::Array(dropped));
+    }
+    rewrites
+}
+
+/// 受けたヘッダと送るヘッダの差分を `{op, name, value?}` の並びにする。名前は
+/// 大文字小文字を区別せず、受けた順・送る順に 1 度ずつ見る。値の並びが変わった
+/// 名前は、送る値が無ければ `remove`、あれば最初を `set`・残りを `add` にする。
+fn header_rewrites(received: &[(String, String)], sending: &[(String, String)]) -> Vec<Value> {
+    let values = |headers: &[(String, String)], name: &str| -> Vec<String> {
+        headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut ops = Vec::new();
+    for (name, _) in received.iter().chain(sending) {
+        let lower = name.to_ascii_lowercase();
+        if seen.contains(&lower) || is_authorization(&lower) {
+            continue;
+        }
+        seen.push(lower);
+        let before = values(received, name);
+        let after = values(sending, name);
+        if before == after {
+            continue;
+        }
+        if after.is_empty() {
+            ops.push(serde_json::json!({"op": "remove", "name": name}));
+        }
+        for (i, value) in after.into_iter().enumerate() {
+            let op = if i == 0 { "set" } else { "add" };
+            ops.push(serde_json::json!({"op": op, "name": name, "value": value}));
+        }
+    }
+    ops
+}
+
 pub(crate) fn is_authorization(name: &str) -> bool {
     const SECRETS: [&str; 4] = [
         "authorization",
@@ -7823,12 +7920,20 @@ routes = ["spare", "codex"]
 
         /// 試行 `attempt` の response の本文 (止めた後で読む)。
         fn response(&self, attempt: u64) -> String {
-            let suffix = format!(".{attempt}.response.body");
+            self.read(&format!(".{attempt}.response.body"))
+        }
+
+        /// 試行 `attempt` の response のメタ json (止めた後で読む)。
+        fn response_meta(&self, attempt: u64) -> Value {
+            serde_json::from_str(&self.read(&format!(".{attempt}.response.json"))).unwrap()
+        }
+
+        fn read(&self, suffix: &str) -> String {
             let name = std::fs::read_dir(&self.dir)
                 .unwrap()
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .find(|name| name.ends_with(&suffix))
+                .find(|name| name.ends_with(suffix))
                 .expect("a response file");
             std::fs::read_to_string(self.dir.join(name)).unwrap()
         }
@@ -7946,6 +8051,114 @@ routes = ["spare", "codex"]
             "{dumped}"
         );
         assert!(dumped.contains("response.completed"), "{dumped}");
+    }
+
+    /// 交渉で落とした beta は、試行ごとの `request_rewrites` に送った値と理由で
+    /// 載る。覚えていた分は 1 本目から `learned`、この 1 本の 400 で責めた分は
+    /// 送り直しの試行で `retry` (DR-0038 決定 7、DR-0003)。
+    #[tokio::test]
+    async fn a_dump_names_the_dropped_beta_flags_and_why() {
+        let up = FakeUpstream::start(|n, _| match n {
+            1 => (
+                400,
+                r#"{"type":"error","error":{"message":"unsupported beta: oauth-2025-04-20"}}"#
+                    .to_owned(),
+            ),
+            _ => (200, body_for(200)),
+        })
+        .await;
+        let mut known = valid_credential();
+        known
+            .ext
+            .record_denied_beta(&["advisor-tool-2026-03-01".to_owned()], now_unix());
+        let gw = gateway_with(&oauth_config(&up.url), StaticStore::holding(known)).await;
+        let stats = tempfile::tempdir().unwrap();
+        let rig = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+                Some(&rig.capture),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 200);
+        rig.events();
+
+        assert_eq!(
+            rig.response_meta(1)["request_rewrites"]["headers"],
+            json!([{
+                "op": "set",
+                "name": "anthropic-beta",
+                "value": "oauth-2025-04-20,claude-code-20250219",
+            }])
+        );
+        assert_eq!(
+            rig.response_meta(1)["request_rewrites"]["beta_dropped"],
+            json!([{"flag": "advisor-tool-2026-03-01", "reason": "learned"}])
+        );
+        assert_eq!(
+            rig.response_meta(2)["request_rewrites"]["headers"],
+            json!([{
+                "op": "set",
+                "name": "anthropic-beta",
+                "value": "claude-code-20250219",
+            }])
+        );
+        assert_eq!(
+            rig.response_meta(2)["request_rewrites"]["beta_dropped"],
+            json!([
+                {"flag": "oauth-2025-04-20", "reason": "retry"},
+                {"flag": "advisor-tool-2026-03-01", "reason": "learned"},
+            ]),
+            "in the order the client sent them"
+        );
+    }
+
+    /// 何も落とさなかった試行には、ヘッダの書き換えも `beta_dropped` も載らない。
+    #[tokio::test]
+    async fn a_dump_without_dropped_beta_has_no_header_rewrites() {
+        let up = FakeUpstream::always(200).await;
+        let gw = gateway_with(
+            &oauth_config(&up.url),
+            StaticStore::holding(valid_credential()),
+        )
+        .await;
+        let stats = tempfile::tempdir().unwrap();
+        let rig = dump_capture(stats.path());
+
+        let forwarded = gw
+            .forward_dumping(
+                None,
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                beta_header(),
+                Some(&rig.capture),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 200);
+        rig.events();
+
+        let rewrites = &rig.response_meta(1)["request_rewrites"];
+        assert!(rewrites.is_object(), "the field is written: {rewrites}");
+        assert!(rewrites.get("headers").is_none(), "{rewrites}");
+        assert!(rewrites.get("beta_dropped").is_none(), "{rewrites}");
     }
 
     /// 先に断った経路の応答 (429) を持ったまま次の経路を試し、そちらの 503 を本文を
