@@ -129,6 +129,24 @@ static TABLE: &[Row] = &[
     //     (1h の倍率は 2026-09-02 確認 / prompt-caching doc)。input はキャッシュ分を
     //     含まないので重ならない。1h だけは cache write の内数で、
     //     [`ANTHROPIC_REFINEMENTS`] が親を宣言している。
+    // Fable 5.2 / Mythos 5.2 は 5.1 より安く、cache read は 5.1 と同じく 0.025 倍
+    // ($0.20/MTok)。5 系の glob より前に置いて先に当てる (2026-11-10 確認 / pricing doc)。
+    row(
+        &[
+            "claude-fable-5-2",
+            "claude-fable-5-2-*",
+            "claude-mythos-5-2",
+            "claude-mythos-5-2-*",
+        ],
+        &[
+            (INPUT, 8.0),
+            (OUTPUT, 40.0),
+            (CACHE_WRITE, 10.0),
+            (CACHE_WRITE_1H, 16.0),
+            (CACHE_READ, 0.2),
+        ],
+        ANTHROPIC_REFINEMENTS,
+    ),
     // Fable 5.1 / Mythos 5.1 は cache read だけ 0.025 倍 ($0.25/MTok)。
     // 5 系の glob より前に置いて先に当てる (2026-09-02 確認 / prompt-caching doc)。
     row(
@@ -537,6 +555,23 @@ mod tests {
             rate("claude-opus-5", &TokenKind::input_cache_read()),
             Some(0.5)
         );
+    }
+
+    /// Fable 5.2 / Mythos 5.2 は 5 系の glob に飲まれず、5.1 より安い自分の行に当たる。
+    #[test]
+    fn fable_5_2_has_its_own_row_cheaper_than_5_1() {
+        for model in ["claude-fable-5-2", "claude-mythos-5-2"] {
+            assert_eq!(rate(model, &TokenKind::input()), Some(8.0));
+            assert_eq!(rate(model, &TokenKind::output()), Some(40.0));
+            assert_eq!(rate(model, &TokenKind::input_cache_creation()), Some(10.0));
+            assert_eq!(
+                rate(model, &TokenKind::input_cache_creation_1h()),
+                Some(16.0)
+            );
+            assert_eq!(rate(model, &TokenKind::input_cache_read()), Some(0.2));
+        }
+        assert_eq!(rate("claude-fable-5-1", &TokenKind::output()), Some(50.0));
+        assert_eq!(gaps(["claude-fable-5-2", "claude-mythos-5-2"]), vec![]);
     }
 
     /// Sonnet 5.5 は 5 と同額で、5 系の glob ではなく自分の行に当たる。
