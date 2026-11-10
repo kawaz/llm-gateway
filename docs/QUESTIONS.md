@@ -18,7 +18,15 @@
 
 ## 裁定待ち
 
-（現在なし）
+### FT-Q1 Fable 5.2 の preserved thinking と `thinking_as_text` (DR-0035) の扱い
+
+根拠は [findings](findings/2026-11-10-fable-5-2-preserved-thinking-vs-gateway-rewrites.md)。5.2 は「前の turn を書き換えた履歴」を全アカウントで 400 にする。gateway の `thinking_as_text` は履歴の thinking を text に変えて送り続ける仕組みなので、**変換が止まる** (24h 黙った後の `--resume`、`--fork-session`、出所ファイルの消失、方針を変える reload) と、元の履歴が戻って 400 になる (資料からの推論、実機未確認)。今 5.1 → 5.2 に跨いだ会話が 4 本あり、全部この状態。しかも 5.2 は 5.1 の thinking を読めるので、この 4 本は変換しなければ推論を持ち越せていた。
+
+- [ ] a: 判定を「送る先のモデルが読める跨ぎは変換しない」に直し (5.1 → 5.2 は素通し)、変換した会話で 400 (`bound to a different conversation`) を受けたら変換して 1 回だけ送り直す (記録を残す)。`account_bound_thinking` に 5.2 を足す。`thinking_as_text` の意図 (account を跨いでも推論を text で残す) を保つ ← 推し
+- [ ] b: 跨いだ会話は text 化をやめ、`thinking-binding-controls` の `drop_block` を gateway が付ける (本文を触らないので「変換が止まる」状態が無くなる。跨ぐ前の推論は残らない)
+- [ ] c: 先に実機で 400 を再現してから決める (5.1 → 5.2 → fork の 1 本、費用小)
+
+裁定を待たずに進めるもの: 料金表に 5.2 の行を足す、dump の `request_rewrites` に `anthropic-beta` の書き換えを記録する。
 
 ## 確認待ち
 
