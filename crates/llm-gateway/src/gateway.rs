@@ -1856,7 +1856,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         self.status.report().await
     }
 
-    /// credential ごとの利用状況。
+    /// 経路ごとの利用状況。
     ///
     /// `probe` が真なら、先に能動プローブを投げてから作る。既定を便乗のみに
     /// するのは、usage の確認が usage を勝手に消費する構図を避けるため

@@ -505,7 +505,7 @@ async fn self_report<P: CredentialPersistence + 'static>(
     json_utf8(Json(report))
 }
 
-/// credential ごとの利用状況を返す。
+/// 経路 (`[routes.<name>]`) ごとの利用状況を返す。1 件の `name` は経路の名前。
 ///
 /// 呼び手の認証は [`callers_only`] の層が持つ (DR-0043)。出すのは使用率・
 /// リセット時刻・フラグだけで、token も organization id も出さない。

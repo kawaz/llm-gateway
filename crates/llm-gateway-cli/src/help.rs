@@ -16,7 +16,7 @@ commands:
   upstream    show what the upstream services report
   check       read a configuration and verify it (without starting)
   models      list the models written in the configuration
-  usage       list usage per credential (asks a running unit)
+  usage       list usage per route (asks a running unit)
   stats       list token usage and USD cost per credential x model x day
   dump        have a running unit write request and response bodies to disk for a while
   login       authorize in a browser and save the credential to <name>.json

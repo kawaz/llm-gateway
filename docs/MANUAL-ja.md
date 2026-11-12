@@ -343,7 +343,7 @@ type = "file"               # 既定の置き場: $XDG_STATE_HOME/llm-gateway/se
 - 上流で別のパスに読み替わりうる `<rest>` は、許可の照合より前に **404** で断る。空の段 (`//`)、`.` や `..` の段、`\`、段の中の符号化された `/` `\` `.` (`%2F` / `%5C` / `%2E`、大小どちらも) が対象。正規化はしないので、素のパスで送る。末尾の `/` は通す
 - 上流の redirect (3xx) は**追わない**。`Location` も含めてそのままクライアントへ返すので、gateway が登録した行き先の外へ出ることはない
 - 設定に無い行き先・当たるパスが無い: **404**。パスは当たるが method が違う: **405**。秘密が読めない・上流に届かない: **502**。前の 3 つでは上流へ何も送らない
-- 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。gateway 自身が断った時は `refused` に理由が載る: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (上流が答えた時は状態コードに関わらず無い)。日次集計には積まない
+- 中継 1 本ごとに `/llm-gateway/events` へ `passthrough` の知らせを流す (`ns` / `upstream` / `method` / クエリを除いた `path` / `status` / `duration_ms` / `secret`)。gateway 自身が断った時は `refused` に理由が載る: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` / `rate_limited` / `ratelimit_unavailable` (上流が答えた時は状態コードに関わらず無い)。断った時の `status` はクライアントへ返した断りの状態コード (404 / 405 / 429 / 502 / 503)。日次集計には積まない
 
 ### 枠 (`[secrets.<id>] limits`)
 
@@ -519,13 +519,13 @@ curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/self   # => {"versio
 
 ### `GET /llm-gateway/usage`
 
-credential ごとの利用状況 (DR-0007)。出すのは使用率・リセット時刻・締め出しの状態だけで、token も organization id も出さない。
+経路 (`[routes.<name>]`) ごとの利用状況 (DR-0007)。`credentials` に経路 1 本につき 1 件が経路の名前の昇順で並び、`name` は経路の名前 (認証情報の名前ではない)、`type` はその経路が使う認証情報の `type` (認証情報を持たない経路は `none`)。同じ認証情報を使う経路が 2 本あれば 2 件になる。出すのは使用率・リセット時刻・締め出しの状態だけで、token も organization id も出さない。
 
 | パラメータ | 既定 | 意味 |
 | --- | --- | --- |
 | `refresh` | なし | `true` / `1` のときだけ能動プローブに入る |
 
-既定では転送に便乗して読んだ分しか出さない。**usage の確認自体が usage を消費する** 構図を避けるため。`?refresh=true` を付けると休んでいる credential へ最小のリクエストを投げて読み直し、その消費量を `probe` に残す。
+既定では転送に便乗して読んだ分しか出さない。**usage の確認自体が usage を消費する** 構図を避けるため。`?refresh=true` を付けると枠を聞ける経路に最小のリクエストを 1 本ずつ投げて読み直し、その消費量を `probe` に残す。
 
 ```bash
 curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
@@ -537,7 +537,7 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
   "probe": {"requests": 2, "model": "claude-haiku-4-5", "input_tokens": 18, "output_tokens": 1},
   "credentials": [
     {
-      "name": "personal",
+      "name": "claude-personal",
       "type": "claude_oauth",
       "support": "observed",
       "auth": {
@@ -556,7 +556,7 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
 }
 ```
 
-`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`claude_oauth` の `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの相対パスが入る。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの停止はその一例) が `auth.hint` に入る。
+`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`auth` は経路が使う認証情報の状態。`claude_oauth` の `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの相対パスが入る (パスに入るのは認証情報の名前で、経路の名前ではない)。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの停止はその一例) が `auth.hint` に入る。
 
 ### `GET /llm-gateway/status`
 
@@ -574,29 +574,62 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/status?refresh=true
 {
   "schema_version": 2,
   "generated_at": 1785326400000,
-  "overall": {"severity": "ok", "service_counts": {"ok": 2, "warning": 0, "critical": 0, "unknown": 0}},
+  "overall": {"severity": "warning", "service_counts": {"ok": 1, "warning": 1, "critical": 0, "unknown": 0}},
   "services": [
     {
       "id": "anthropic",
       "name": "Anthropic",
       "severity": "ok",
-      "routes": ["personal"],
+      "routes": ["claude-personal"],
       "official": {
         "state": "operational",
-        "source": "anthropic",
+        "source": "statuspage_v2",
         "source_url": "https://status.anthropic.com/",
         "observed_at": 1785326100000,
         "stale": false,
-        "components": [],
+        "components": [{"id": "c1", "name": "Claude API", "state": "operational"}],
         "incidents": []
       },
-      "observed": {"state": "ok", "observed_at": 1785326390000, "last_success_at": 1785326390000}
+      "observed": {"state": "reachable", "observed_at": 1785326390000, "expires_at": 1785326690000, "last_success_at": 1785326390000}
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "severity": "warning",
+      "routes": ["codex"],
+      "official": {
+        "state": "degraded",
+        "source": "statuspage_v2",
+        "source_url": "https://status.openai.com/",
+        "observed_at": 1785326100000,
+        "stale": false,
+        "components": [{"id": "c2", "name": "Chat Completions", "state": "operational"}, {"id": "c3", "name": "Codex", "state": "degraded"}],
+        "incidents": [
+          {
+            "id": "01K1EXAMPLE",
+            "name": "Elevated error rates",
+            "state": "investigating",
+            "impact": "minor",
+            "created_at": 1785325800000,
+            "updated_at": 1785326000000,
+            "latest_update": "We are investigating elevated error rates.",
+            "scope": "page"
+          }
+        ]
+      },
+      "observed": {"state": "unknown", "observed_at": null, "expires_at": null, "last_success_at": null}
     }
   ]
 }
 ```
 
 `official` は公式ステータスページ由来、`observed` はこの gateway 自身が転送で観測した成否。両方を並べるのは、公式が operational でも実際には通っていない (あるいはその逆の) 場面を見分けるため。
+
+- `official.source` は source の種類: `statuspage_v2` (ステータスページを取りに行く)、`link` (ページの URL を `source_url` に出すだけで、`state` は `unknown`)、`none` (source を持たない経路。`source_url` は空文字列)
+- `official.incidents` は進行中の障害。`url` は障害の個別ページで、ステータスページが障害ごとの URL を載せていなければ欄ごと出ない (gateway は URL を組み立てない)。`created_at` / `updated_at` も、ステータスページの時刻が読めなければ欄ごと出ない。`scope` はどのコンポーネントにも紐づかない (ページ全体の) 障害で `page` になり、それ以外では欄ごと出ない
+- 取りに行って失敗した時は `official.error` に理由が載り、`state` と `incidents` は最後に取れた値のまま残る
+- `observed.state` は `reachable` (直近の観測が成功)、`failing` (直近の観測が失敗)、`unknown` (観測が無いか、`[status]` の観測の寿命を過ぎた)
+- `observed.observed_at` / `expires_at` / `last_success_at` は欄として常に出て、無ければ `null`。`expires_at` はその観測を現在状態として扱わなくなる時刻 (`observed_at` に観測の寿命を足したもの)。`last_failure` (最後に観測した失敗) だけは、無ければ欄ごと出ない
 
 ### `GET /llm-gateway/stats`
 
@@ -841,7 +874,7 @@ llm-gateway <command> [options]
 | `upstream status` | upstream サービスの状態 (走っている台に問い合わせる) | `/llm-gateway/status` |
 | `check` | 設定を読んで検証する (起動はしない) | — |
 | `models` | 設定に書かれたモデルを一覧する | — |
-| `usage` | credential ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
+| `usage` | 経路ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
 | `stats` | credential × モデル × 日のトークン数と USD | `/llm-gateway/stats` |
 | `dump` | request / response の本文を時限で一時的にダンプする (走っている台に頼む) | — |
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |

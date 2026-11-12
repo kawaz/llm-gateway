@@ -432,7 +432,8 @@ pub struct Passthrough {
     pub method: String,
     /// `<rest>` のパス。クエリは含めない (秘密や個人の値が載りうるため)。
     pub path: String,
-    /// クライアントへ返した状態コード。gateway が断った場合 (404 / 405 / 502) も入る。
+    /// クライアントへ返した状態コード。上流が答えた時はその状態コード、gateway が断った時は
+    /// 断りの状態コード (404 / 405 / 429 / 502 / 503)。
     pub status: u16,
     /// 受けてから応答のヘッダが返るまで (ミリ秒)。
     pub duration_ms: u64,
@@ -441,8 +442,9 @@ pub struct Passthrough {
     /// gateway が断った理由。上流まで届いたものは無い (上流が返した 4xx / 5xx も無い)。
     ///
     /// `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` /
-    /// `secret` / `unreachable`。状態コードだけでは、404 が namespace の側か
-    /// 行き先の側か読めない。
+    /// `secret` / `unreachable` / `rate_limited` / `ratelimit_unavailable`
+    /// ([`crate::passthrough::Refusal::reason`])。状態コードだけでは、404 が
+    /// namespace の側か行き先の側か読めない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
     /// `rate_limited` のとき、埋まっていたバケット (`minute` / `hour` 等)。

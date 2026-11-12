@@ -404,7 +404,7 @@ pub struct CredentialDenial {
 
 pub use gateway_core::credential::{AuthState, AuthStatus};
 
-/// credential 1 件分の報告。
+/// 経路 (`[routes.<name>]`) 1 件分の報告。`name` は経路の名前。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialUsage {
     pub name: String,

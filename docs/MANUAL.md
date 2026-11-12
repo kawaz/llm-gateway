@@ -341,7 +341,7 @@ A secret file is kept apart from credentials. Its smallest form is `{"type":"sta
 - A `<rest>` that could be read as another path upstream is refused with **404** before the allow list is consulted: an empty segment (`//`), a `.` or `..` segment, a `\`, or an encoded `/` `\` `.` inside a segment (`%2F` / `%5C` / `%2E`, either case). Send the plain path; the gateway does not normalize it for you. A trailing `/` is fine
 - A redirect (3xx) from the upstream is **not followed**; it is returned to the client as it is, `Location` included, so the gateway never leaves the registered upstream
 - Not configured, or no allowed path matches: **404**. The path matches but the method does not: **405**. The secret cannot be read, or the upstream cannot be reached: **502**. In the first three cases nothing is sent to the upstream
-- Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). When the gateway itself refused, `refused` says why: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` (absent when the upstream answered, whatever its status). Nothing is added to the daily totals
+- Each relay is announced on `/llm-gateway/events` as a `passthrough` event (`ns` / `upstream` / `method` / `path` without the query / `status` / `duration_ms` / `secret`). When the gateway itself refused, `refused` says why: `unknown_upstream` / `unsafe_path` / `ns_allow` / `upstream_allow` / `secret` / `unreachable` / `rate_limited` / `ratelimit_unavailable` (absent when the upstream answered, whatever its status). On a refusal, `status` is the refusal's status code returned to the client (404 / 405 / 429 / 502 / 503). Nothing is added to the daily totals
 
 ### Limits (`[secrets.<id>] limits`)
 
@@ -517,13 +517,13 @@ curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/self   # => {"versio
 
 ### `GET /llm-gateway/usage`
 
-Per-credential usage (DR-0007). It reports utilization, reset times, and denial state — never tokens or organization ids.
+Usage per route (`[routes.<name>]`) (DR-0007). `credentials` holds one entry per route, in ascending order of route name: `name` is the route's name (not the name of a credential), and `type` is the `type` of the credential the route uses (`none` for a route without one). Two routes using the same credential make two entries. It reports utilization, reset times, and denial state — never tokens or organization ids.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `refresh` | absent | Only `true` / `1` starts an active probe |
 
-By default it reports only what was read by riding along with forwarded traffic, so that **checking usage does not itself consume usage**. With `?refresh=true`, idle credentials are sent a minimal request to be read again, and what that cost is recorded under `probe`.
+By default it reports only what was read by riding along with forwarded traffic, so that **checking usage does not itself consume usage**. With `?refresh=true`, each route whose quota can be asked for is sent one minimal request to be read again, and what that cost is recorded under `probe`.
 
 ```bash
 curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
@@ -535,7 +535,7 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
   "probe": {"requests": 2, "model": "claude-haiku-4-5", "input_tokens": 18, "output_tokens": 1},
   "credentials": [
     {
-      "name": "personal",
+      "name": "claude-personal",
       "type": "claude_oauth",
       "support": "observed",
       "auth": {
@@ -554,7 +554,7 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
 }
 ```
 
-`denials` holds the denials the gateway is currently honoring, with their reason and scope (DR-0020). `limits` holds quotas asked for through the quota API, kept separate from the header-derived `snapshot` (the two do not necessarily describe the same quota). Fields with nothing to report are omitted entirely. When `auth.status` is `relogin_required` for a `claude_oauth` credential, `auth.login_path` gives the relative Web login page. `auth.status` is `org_not_allowed` when the upstream refuses OAuth use for the whole organization: the login still works, so no `login_path` is offered, and `auth.hint` carries a guess at the cause (an inactive subscription is one) rather than a verdict.
+`denials` holds the denials the gateway is currently honoring, with their reason and scope (DR-0020). `limits` holds quotas asked for through the quota API, kept separate from the header-derived `snapshot` (the two do not necessarily describe the same quota). Fields with nothing to report are omitted entirely. `auth` is the state of the credential the route uses. When `auth.status` is `relogin_required` for a `claude_oauth` credential, `auth.login_path` gives the relative Web login page (the path carries the credential's name, not the route's). `auth.status` is `org_not_allowed` when the upstream refuses OAuth use for the whole organization: the login still works, so no `login_path` is offered, and `auth.hint` carries a guess at the cause (an inactive subscription is one) rather than a verdict.
 
 ### `GET /llm-gateway/status`
 
@@ -572,29 +572,62 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/status?refresh=true
 {
   "schema_version": 2,
   "generated_at": 1785326400000,
-  "overall": {"severity": "ok", "service_counts": {"ok": 2, "warning": 0, "critical": 0, "unknown": 0}},
+  "overall": {"severity": "warning", "service_counts": {"ok": 1, "warning": 1, "critical": 0, "unknown": 0}},
   "services": [
     {
       "id": "anthropic",
       "name": "Anthropic",
       "severity": "ok",
-      "routes": ["personal"],
+      "routes": ["claude-personal"],
       "official": {
         "state": "operational",
-        "source": "anthropic",
+        "source": "statuspage_v2",
         "source_url": "https://status.anthropic.com/",
         "observed_at": 1785326100000,
         "stale": false,
-        "components": [],
+        "components": [{"id": "c1", "name": "Claude API", "state": "operational"}],
         "incidents": []
       },
-      "observed": {"state": "ok", "observed_at": 1785326390000, "last_success_at": 1785326390000}
+      "observed": {"state": "reachable", "observed_at": 1785326390000, "expires_at": 1785326690000, "last_success_at": 1785326390000}
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "severity": "warning",
+      "routes": ["codex"],
+      "official": {
+        "state": "degraded",
+        "source": "statuspage_v2",
+        "source_url": "https://status.openai.com/",
+        "observed_at": 1785326100000,
+        "stale": false,
+        "components": [{"id": "c2", "name": "Chat Completions", "state": "operational"}, {"id": "c3", "name": "Codex", "state": "degraded"}],
+        "incidents": [
+          {
+            "id": "01K1EXAMPLE",
+            "name": "Elevated error rates",
+            "state": "investigating",
+            "impact": "minor",
+            "created_at": 1785325800000,
+            "updated_at": 1785326000000,
+            "latest_update": "We are investigating elevated error rates.",
+            "scope": "page"
+          }
+        ]
+      },
+      "observed": {"state": "unknown", "observed_at": null, "expires_at": null, "last_success_at": null}
     }
   ]
 }
 ```
 
 `official` comes from the vendor status page; `observed` is what this gateway itself saw while forwarding. Both are shown so you can tell apart the cases where the official page says operational but traffic is not getting through — or the reverse.
+
+- `official.source` is the kind of source: `statuspage_v2` (the status page is fetched), `link` (the page URL is only shown in `source_url`, and `state` is `unknown`), `none` (a route without a source; `source_url` is an empty string)
+- `official.incidents` lists incidents in progress. `url` is the incident's own page; when the status page gives no per-incident URL, the field is omitted (the gateway does not make one up). `created_at` / `updated_at` are likewise omitted when the status page's time cannot be read. `scope` is `page` for an incident tied to no component (the whole page) and is omitted otherwise
+- When fetching fails, `official.error` says why, and `state` and `incidents` keep the last values that were fetched
+- `observed.state` is `reachable` (the latest observation succeeded), `failing` (the latest observation failed) or `unknown` (nothing observed, or the observation is older than the `[status]` observation lifetime)
+- `observed.observed_at` / `expires_at` / `last_success_at` are always present, `null` when there is nothing. `expires_at` is when the observation stops counting as the current state (`observed_at` plus the observation lifetime). Only `last_failure` (the latest observed failure) is omitted when there is none
 
 ### `GET /llm-gateway/stats`
 
@@ -839,7 +872,7 @@ llm-gateway <command> [options]
 | `upstream status` | Upstream service status (asks a running unit) | `/llm-gateway/status` |
 | `check` | Read and verify the configuration (without starting) | — |
 | `models` | List the models written in the configuration | — |
-| `usage` | Usage per credential (asks a running unit) | `/llm-gateway/usage` |
+| `usage` | Usage per route (asks a running unit) | `/llm-gateway/usage` |
 | `stats` | Token counts and USD per credential × model × day | `/llm-gateway/stats` |
 | `dump` | Dump request / response bodies to disk for a limited time (asks a running unit) | — |
 | `login` | Authorize in a browser and save to `<name>.json` | `/llm-gateway/login` |
