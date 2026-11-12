@@ -1,0 +1,1686 @@
+openapi: 3.1.0
+info:
+  title: llm-gateway 運用系 HTTP API
+  version: 0.70.2
+  license:
+    name: MIT
+    identifier: MIT
+  description: |
+    llm-gateway が自分で提供している運用系の口 (`/llm-gateway/…`) の一覧と、クエリ・本文・応答の形。
+
+    **この文書の正本は実装である。** 口の道筋は `crates/llm-gateway-server/src/lib.rs` の `router_for` と `callers_only`、応答の形は各 handler が返す serde の struct から起こしてある。実装を変えたら、同じ変更でこのファイルも直す。食い違ったら実装が正しく、このファイルが誤り。
+
+    転送の口 (`/v1/…`、`/ns-<ns>/…`) は扱わない。
+
+    ## 説明の頭の根拠タグ
+
+    - `[code]` 実装の型・処理から読んだ
+    - `[observed]` 稼働中の unit に GET を投げて、応答に実際に現れたことを確かめた (状態を変える操作と、`usage?refresh=true` のような upstream を消費する操作は叩いていない)
+
+    両方付いている欄は、型から読んだうえで実応答にも現れたもの。
+
+    ## 口の出し方 (transport)
+
+    同じ Router を 2 つの transport で出す (DR-0043 決定 7)。道筋と handler は同じで、違うのは呼び手の署名を求めるかだけ。
+
+    - TCP (`[server] listen`): `[callers.<name>]` が設定に 1 つでもあれば、署名を求める口 (`callerJwt` を持つ operation) は署名の無い request を断る。1 つも無ければ確かめず、`Authorization` も読まない
+    - Unix domain socket (`[server] unix`、既定 `$XDG_STATE_HOME/llm-gateway/daemon/http/<unit>.sock`): 署名の層を掛けない。socket ファイルは 0600 で、繋いできたプロセスの uid が台と同じ時だけ HTTP を話す。`curl --unix-socket <path> http://localhost/llm-gateway/…` の形で読む (OpenAPI の `servers` では表せないのでここに書く)
+
+    ## 全体に共通すること
+
+    - 時刻の欄は数値 1 つで、単位は Unix ミリ秒 (DR-0012)。名前に単位が入っている欄 (`window_seconds` / `cache_ttl_secs` / `duration_ms`) だけが長さ
+    - gateway 自身が組み立てる JSON の応答は `Content-Type: application/json; charset=utf-8` を付ける
+    - 道筋に無い `/llm-gateway/…` と、namespace を前に付けた `/ns-<ns>/llm-gateway/…` は本文の無い 404 (DR-0006、DR-0042 決定 4)
+    - `GET` の口は axum の `get` が `HEAD` も受ける (本文を落とす)。署名を求める口に `HEAD` で来る時は、`aud` の method も `HEAD` にする
+    - 道筋はあるが method が違う request は、本文の無い 405 と `Allow` ヘッダで返る (axum の MethodRouter)
+  contact:
+    name: llm-gateway
+    url: https://github.com/kawaz/llm-gateway
+servers:
+  - url: http://127.0.0.1:{port}
+    description: "[code] `[server] listen` の TCP の口。Unix socket の口は info の説明を参照"
+    variables:
+      port:
+        default: "11301"
+        description: "[code] `[server] listen` に書いた port"
+tags:
+  - name: supervisor
+    description: 監督者 (`daemon status` / `restart`) とロードバランサが問う口。署名を求めない (DR-0043 決定 2)
+  - name: operations
+    description: 会話・認証情報・使用量・流れを読む口と keepalive を止める口。`[callers]` があれば TCP では署名を求める (DR-0043 決定 2・6)
+  - name: login
+    description: ブラウザで人が操作する OAuth の再認証の口 (DR-0023)。HTML を返す。署名を求めない
+security: []
+paths:
+  /llm-gateway/healthz:
+    get:
+      operationId: healthz
+      tags: [supervisor]
+      summary: 生きているかだけを返す
+      description: |
+        前段のロードバランサと `daemon restart` が叩く死活の口。namespace も credential も upstream も触らない。
+
+        関係する DR: DR-0006、DR-0028
+      security: []
+      responses:
+        "200":
+          description: "[code][observed] 常に `ok` の 2 バイト"
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: ok
+              example: ok
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/version:
+    get:
+      operationId: version
+      tags: [supervisor]
+      summary: 走っているプロセスが載せている版を返す
+      description: |
+        ディスクの binary ではなく、走っているこのプロセスに焼き込まれた版 (`CARGO_PKG_VERSION`)。`llm-gateway version` が置いてある版と並べて、入れ替えたのに上げ直していない台を見つける。
+
+        関係する DR: DR-0028 決定 9
+      security: []
+      responses:
+        "200":
+          description: "[code][observed] 版"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+              example:
+                version: 0.70.2
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/self:
+    get:
+      operationId: selfReport
+      tags: [supervisor]
+      summary: 走っているプロセスの状態を返す
+      description: |
+        版、起動の印、見る側が追いつけずに落とした知らせの数、動いている一時ダンプの系列。`daemon status` の各行はここから埋める。会話や認証情報の状態は載らない。
+
+        関係する DR: DR-0028 決定 9、DR-0012、DR-0038 決定 12、DR-0043 決定 2
+      security: []
+      responses:
+        "200":
+          description: "[code][observed] このプロセスの状態"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SelfReport"
+              examples:
+                idle:
+                  summary: ダンプが動いていない時
+                  description: "[observed] 稼働中の unit の応答"
+                  value:
+                    version: 0.70.2
+                    boot: 1794376614596
+                    events:
+                      dropped: 0
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/usage:
+    get:
+      operationId: usage
+      tags: [operations]
+      summary: 経路ごとの利用状況を返す
+      description: |
+        設定の `[routes.<name>]` ごとに、枠の使用率・リセット時刻・締め出しの印・認証の状態を返す。token も organization id も載らない。
+
+        既定では転送に便乗して読んだ観測だけを返す。`refresh=true` を付けると、枠を聞ける経路に最小のリクエストを 1 本ずつ投げてから返す (usage の確認が usage を消費するので、その量を `probe` に残す)。
+
+        関係する DR: DR-0007、DR-0018、DR-0019、DR-0020、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: "[code] 値が `true` か `1` の時だけ能動プローブに入る。それ以外の値と、`=` の無い `refresh` は付いていないのと同じ。値は percent-decode しない"
+          schema:
+            type: string
+            enum: ["true", "1"]
+      responses:
+        "200":
+          description: "[code][observed] 経路ごとの利用状況"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageReport"
+              examples:
+                observed:
+                  summary: 便乗の観測だけ (refresh なし)
+                  description: "[observed] 稼働中の unit の応答の形をもとに、経路名とモデル名を置き換え、件数を減らしたもの"
+                  value:
+                    generated_at: 1794486419192
+                    credentials:
+                      - name: bedrock
+                        type: bedrock_api_key
+                        support: not_applicable
+                      - name: claude-main
+                        type: claude_oauth
+                        support: observed
+                        auth:
+                          status: ok
+                          observed_at: 1794471072000
+                        snapshot:
+                          observed_at: 1794486415093
+                          7d:
+                            utilization: 0.61
+                            status: allowed
+                            reset: 1794733200000
+                            window_seconds: 604800
+                          overage:
+                            status: rejected
+                            disabled_reason: out_of_credits
+                        denials:
+                          - reason: busy
+                            until: 1794733199000
+                            model: claude-fable-5-2
+                          - reason: limited
+                            until: 1794733259000
+                            model: claude-fable-*
+                      - name: claude-sub
+                        type: claude_oauth
+                        support: observed
+                        auth:
+                          status: ok
+                          observed_at: 1794471072000
+                        snapshot:
+                          observed_at: 1793773884388
+                          5h:
+                            utilization: 0.5
+                            status: allowed
+                            reset: 1793785800000
+                            window_seconds: 18000
+                            expired: true
+                          7d:
+                            utilization: 0.11
+                            status: allowed
+                            reset: 1794114000000
+                            window_seconds: 604800
+                            expired: true
+                          overage:
+                            status: rejected
+                            disabled_reason: out_of_credits
+        "400":
+          $ref: "#/components/responses/CallerBadRequest"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/status:
+    get:
+      operationId: status
+      tags: [operations]
+      summary: upstream サービスの公式状態と実測状態を返す
+      description: |
+        `[status]` に書いた公式ステータスページ (source) ごとに、公式値と、この gateway が転送で観測した成否を並べる。公式が operational でも実際には通っていない (あるいはその逆) 場面を見分けるため。
+
+        関係する DR: DR-0021、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: "[code] 値が `true` か `1` の時だけ、取れる source (`statuspage_v2`) を取り直し、終わるのを待ってから返す。それ以外の値は付いていないのと同じ"
+          schema:
+            type: string
+            enum: ["true", "1"]
+      responses:
+        "200":
+          description: "[code][observed] サービスごとの状態"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusReport"
+              examples:
+                observed:
+                  summary: 3 サービス
+                  description: "[observed] 稼働中の unit の応答から、components を 1 件に減らしたもの"
+                  value:
+                    schema_version: 2
+                    generated_at: 1794486419300
+                    overall:
+                      severity: ok
+                      service_counts:
+                        ok: 1
+                        warning: 0
+                        critical: 0
+                        unknown: 2
+                    services:
+                      - id: anthropic
+                        name: Anthropic
+                        severity: ok
+                        routes: [claude-main, claude-sub]
+                        official:
+                          state: operational
+                          source: statuspage_v2
+                          source_url: https://status.claude.com/
+                          observed_at: 1794486360633
+                          stale: false
+                          components:
+                            - id: k8w3r06qmzrp
+                              name: Claude API (api.anthropic.com)
+                              state: operational
+                          incidents: []
+                        observed:
+                          state: reachable
+                          observed_at: 1794486415093
+                          expires_at: 1794486715093
+                          last_success_at: 1794486415093
+                          last_failure:
+                            at: 1794471459932
+                            kind: transport
+                      - id: aws
+                        name: AWS
+                        severity: unknown
+                        routes: [bedrock]
+                        official:
+                          state: unknown
+                          source: link
+                          source_url: https://health.aws.amazon.com/health/status
+                          observed_at: null
+                          stale: false
+                          components: []
+                          incidents: []
+                        observed:
+                          state: unknown
+                          observed_at: null
+                          expires_at: null
+                          last_success_at: null
+        "400":
+          $ref: "#/components/responses/CallerBadRequest"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/stats:
+    get:
+      operationId: stats
+      tags: [operations]
+      summary: 使用量の日次集計を返す
+      description: |
+        日 × 認証情報 × モデルのトークン数と、単価表にあるモデルの分の USD 換算。モデルの行には出した側 (`origin`) ごとの内訳が付く。何を書いたかは載らない。全 writer (同じ `[stats] dir` を使う全 unit) のファイルとメモリの分を足し合わせる。
+
+        関係する DR: DR-0011、DR-0029、DR-0031、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      parameters:
+        - name: days
+          in: query
+          required: false
+          description: "[code][observed] 直近 N 日 (今日を含む、ローカル日付) に絞る。既定 7。`0` で全期間。36500 を超える値は 36500 として扱う。0 以上の整数として読めなければ 400。最初に現れた `days` だけを見て、値は percent-decode しない"
+          schema:
+            type: integer
+            minimum: 0
+            default: 7
+      responses:
+        "200":
+          description: "[code][observed] 日次集計"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsReport"
+              examples:
+                oneDay:
+                  summary: days=1
+                  description: "[observed] 稼働中の unit の応答の形をもとに、認証情報名・数値を置き換え、1 行に減らしたもの"
+                  value:
+                    generated_at: 1794486419276
+                    days:
+                      "2026-11-12":
+                        credentials:
+                          claude-main:
+                            claude-fable-5-2:
+                              requests: 12
+                              tokens:
+                                input: 1200
+                                input.cache_creation: 3000
+                                input.cache_creation.ephemeral_1h: 3000
+                                input.cache_read: 8800
+                                output: 340
+                              usd: 0.42
+                              origins:
+                                keepalive:
+                                  requests: 2
+                                  tokens:
+                                    input: 200
+                                    input.cache_read: 4800
+                                    output: 2
+                                  usd: 0.03
+                                  input_basis: fresh
+                                main:
+                                  requests: 10
+                                  tokens:
+                                    input: 1000
+                                    input.cache_creation: 3000
+                                    input.cache_creation.ephemeral_1h: 3000
+                                    input.cache_read: 4000
+                                    output: 338
+                                  usd: 0.39
+                                  input_basis: fresh
+                              input_basis: fresh
+                        total_usd: 0.42
+                    total_usd: 0.42
+        "400":
+          description: "[code][observed] `days` が 0 以上の整数として読めない (`invalid_request_error`)。署名の段で断った 400 もこの status で、本文の `error.type` が `authentication_error` になる (CallerBadRequest を参照)"
+          headers:
+            WWW-Authenticate:
+              description: "[code] 署名の段で断った時だけ付く"
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                badDays:
+                  summary: days が整数でない
+                  description: "[observed] `?days=abc` への応答"
+                  value:
+                    type: error
+                    error:
+                      type: invalid_request_error
+                      message: "`days` must be a whole number, got `abc`"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/events:
+    get:
+      operationId: events
+      tags: [operations]
+      summary: 転送のたびに起きたことを SSE で流し続ける
+      description: |
+        繋いだ後に起きた分だけが届き、過去には遡らない。見る側が追いつけなければその分は落とされ (gateway は詰まらない)、落とした数は `/llm-gateway/self` の `events.dropped` に積まれる。流すのは「いつ・どの会話が・どの経路に当たったか」までで、本文もトークン数も載らない。
+
+        各メッセージは `event:` (種類の名前)、`id:` (通し番号 `seq`)、`data:` (1 行の JSON) の 3 行。種類ごとの `data` の形は `SseMessage` の `data` を参照。何も起きない間も 20 秒ごとに keep-alive のコメント行 (`:`) を送る。gateway は履歴を持たないので、再接続の `Last-Event-ID` は読まない。
+
+        線上の例 (稼働中の unit に現れた形をもとに、会話の id・namespace・経路名を置き換えたもの):
+
+        ```text
+        event: request
+        id: 42
+        data: {"ts":1785326400000,"seq":42,"boot":1785320000000,"session_id":"00000000-0000-4000-8000-000000000000","ns":"personal","model":"claude-fable-5-2","credential":"claude-main","status":200,"prefix":"3f9a1c02","origin":"main","cache_ttl_secs":3600,"cache_expires_at":1785330000000,"cache_notice":"kUu1xR4-tQ9nSp2Zc0dBvA"}
+
+        event: response
+        id: 43
+        data: {"type":"response","ts":1785326412000,"seq":43,"boot":1785320000000,"request_ts":1785326400000,"session_id":"00000000-0000-4000-8000-000000000000","prefix":"3f9a1c02","ns":"personal","model":"claude-fable-5-2","credential":"claude-main","origin":"main","status":200,"stop_reason":"end_turn","aborted":false,"cache":"hit"}
+
+        :
+        ```
+
+        署名を求める unit (TCP で `[callers]` あり) では、確かめるのは繋ぐ時の 1 回だけで、繋がった後の stream は token の `exp` を過ぎても切らない。ブラウザの `EventSource` はヘッダを付けられないので、その unit の TCP の口は開けない。
+
+        関係する DR: DR-0012、DR-0024、DR-0029、DR-0030、DR-0035、DR-0036、DR-0043 決定 3
+      security:
+        - callerJwt: []
+        - {}
+      responses:
+        "200":
+          description: "[code][observed] SSE の stream。閉じるのは gateway が終わる時だけ"
+          headers:
+            Access-Control-Allow-Origin:
+              description: "[code][observed] 常に `*`"
+              schema:
+                type: string
+                const: "*"
+            Cache-Control:
+              description: "[observed] `no-cache`"
+              schema:
+                type: string
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/SseMessage"
+        "400":
+          $ref: "#/components/responses/CallerBadRequest"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/keepalive/pause:
+    post:
+      operationId: keepalivePause
+      tags: [operations]
+      summary: 会話への cache keepalive を止める
+      description: |
+        その会話の控え (keepalive の系列) を落とし、送り直しを止める。止まるのは keepalive であって会話ではない。解除の口は無く、その会話から実リクエストが 1 本来れば控えが置き直される。控えの置き場は兄弟の unit と共有しているので、落とした時点で兄弟からも消える。控えの無い会話を頼んでも同じ 200 が返る。
+
+        署名を求める unit でも、本文は署名で覆わない (DR-0043 決定 3)。
+
+        関係する DR: DR-0024 §2、DR-0027 決定 3、DR-0042 決定 5、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PauseRequest"
+            example:
+              session_id: 00000000-0000-4000-8000-000000000000
+      responses:
+        "200":
+          description: "[code] 控えを落とした (無ければ何もしない)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PauseResponse"
+              example:
+                session_id: 00000000-0000-4000-8000-000000000000
+                paused: true
+        "400":
+          description: "[code] 本文が JSON として読めない (axum の `Json` の拒否、本文は text/plain)。署名の段で断った 400 もこの status で、その時は CallerBadRequest の JSON になる"
+          content:
+            text/plain:
+              schema:
+                type: string
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "415":
+          description: "[code] `Content-Type: application/json` が無い (axum の `Json` の拒否)"
+          content:
+            text/plain:
+              schema:
+                type: string
+        "422":
+          description: "[code] JSON だが `session_id` が文字列で無い・欠けている (axum の `Json` の拒否)"
+          content:
+            text/plain:
+              schema:
+                type: string
+  /llm-gateway/sessions:
+    get:
+      operationId: sessions
+      tags: [operations]
+      summary: 控えのある会話の一覧を返す
+      description: |
+        keepalive の控えを持つ会話を、各会話の先頭 (最新) の系列の `cache_since` の降順で並べる (同じ時刻なら `session_id` の昇順)。系列を 1 つも持たない会話は載らない。1 件の形は `GET /llm-gateway/sessions/{session_id}` と同じ。
+
+        控えは兄弟の unit と置き場を共有するので、`routes` 以外はどの unit に問うても同じ。`routes` はこの unit の設定と、この unit のメモリにある印から組む。
+
+        関係する DR: DR-0042 決定 2、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      parameters:
+        - name: ns
+          in: query
+          required: false
+          description: "[code] その namespace を通った系列だけを残す。系列が残らない会話は落ちる。値は percent-decode してから比べる。付いていなければ絞らない。署名の `aud` には含めない"
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "[code][observed] 会話の一覧"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionsReport"
+              examples:
+                one:
+                  summary: 1 会話 1 系列
+                  description: "[observed] 稼働中の unit の応答の形をもとに、会話の id・namespace・経路名・認証情報名を置き換え、1 件に減らしたもの"
+                  value:
+                    sessions:
+                      - session_id: 00000000-0000-4000-8000-000000000000
+                        series:
+                          - prefix: 2cf24dba
+                            ns: personal
+                            model: claude-fable-5-2
+                            route: claude-main
+                            cache_notice: kUu1xR4-tQ9nSp2Zc0dBvA
+                            cache_expires_at: 1785603570000
+                            cache_since: 1785600000000
+                            cache_count: 0
+                            next_keepalive_at: 1785603300000
+                            cache_until: 1785633300000
+                            cache_until_count: 9
+                            routes:
+                              - route: claude-main
+                                credential: main
+                              - route: claude-sub
+                                credential: sub
+                                limited:
+                                  until: 1785618060000
+        "400":
+          $ref: "#/components/responses/CallerBadRequest"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/sessions/{session_id}:
+    get:
+      operationId: session
+      tags: [operations]
+      summary: 1 つの会話の cache / keepalive の状態を返す
+      description: |
+        その会話の控え (keepalive の系列) と、各系列が使う経路の上限の印の写し。問われた時点での判定 (期限が過ぎたか、経路が使えるか) はしない。読む側が時刻を壁時計と比べる。本文は載らない。
+
+        控えの無い会話も 200 で `series: []` を返す。gateway は「無い会話」と「控えの無い会話」を区別しない。控えは応答を読み切った後に置かれるので、走行中の 1 本はまだ反映されない。
+
+        `Access-Control-Allow-Origin` は付けない (呼び手はサーバ)。
+
+        関係する DR: DR-0042 決定 1・3・4、DR-0043
+      security:
+        - callerJwt: []
+        - {}
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          description: "[code][observed] 会話の id (Claude Code が `x-claude-code-session-id` に載せる値)。path には percent-encode して置き、handler は decode した値で引く。署名の `aud` には encode したままの path を入れる"
+          schema:
+            type: string
+      responses:
+        "200":
+          description: "[code][observed] 会話の状態。控えが無ければ `series` が空"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionReport"
+              examples:
+                empty:
+                  summary: 控えの無い会話
+                  description: "[observed] 存在しない id への応答"
+                  value:
+                    session_id: no-such-session-probe
+                    series: []
+        "400":
+          $ref: "#/components/responses/CallerBadRequest"
+        "401":
+          $ref: "#/components/responses/CallerUnauthorized"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/login:
+    get:
+      operationId: loginIndex
+      tags: [login]
+      summary: Web login できる credential の一覧ページ
+      description: |
+        設定の credential を並べた HTML。`claude_oauth` には専用ページ (`/llm-gateway/login/{name}/start`) へのリンク、`codex_oauth` には手元で CLI を実行する案内を出す。それ以外の種類は載らない。
+
+        関係する DR: DR-0023
+      security: []
+      responses:
+        "200":
+          description: "[code][observed] HTML のページ"
+          content:
+            text/html:
+              schema:
+                type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/login/{name}/start:
+    get:
+      operationId: loginStart
+      tags: [login]
+      summary: OAuth の認可を始め、コード貼り付けのページを返す
+      description: |
+        state と PKCE verifier を作ってメモリに 10 分持ち (単回使用)、認可 URL・手順・コード貼り付けフォームを載せた HTML を返す。GET だがメモリの状態を作る。認可後に Anthropic console が表示する `code#state` を、このページのフォームで `POST /llm-gateway/login/{name}` へ送る。
+
+        関係する DR: DR-0023
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/CredentialName"
+      responses:
+        "200":
+          description: "[code] 認可のページ (`claude_oauth` の credential)"
+          content:
+            text/html:
+              schema:
+                type: string
+        "400":
+          description: "[code] `claude_oauth` 以外の credential (`Web login unavailable` のページ)"
+          content:
+            text/html:
+              schema:
+                type: string
+        "404":
+          description: "[code] 設定に無い名前 (`Credential not found` のページ)"
+          content:
+            text/html:
+              schema:
+                type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+  /llm-gateway/login/{name}:
+    post:
+      operationId: loginFinish
+      tags: [login]
+      summary: 貼り付けた認可コードを交換して credential を保存する
+      description: |
+        `code#state` の state で `start` が作ったセッションを引き当て (state が無ければ同じ credential の生きているセッション)、コードを token に交換して確かめ、CLI の login と同じ経路 (credential のロックを取り、既存を土台に書き戻す) で保存する。結果は HTML。
+
+        関係する DR: DR-0023、DR-0010
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/CredentialName"
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/LoginForm"
+      responses:
+        "200":
+          description: "[code] 保存した (`Authorization succeeded` のページ、`Credential <name> was updated.` を含む)"
+          content:
+            text/html:
+              schema:
+                type: string
+        "400":
+          description: "[code] `Authorization failed` のページ。`code` が空、`#` の片側が空、生きているセッションが無い、state が無効・使用済み・期限切れ・別の credential のもの、コードの交換や確認や保存に失敗した、のいずれか"
+          content:
+            text/html:
+              schema:
+                type: string
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "415":
+          description: "[code] `Content-Type: application/x-www-form-urlencoded` が無い (axum の `Form` の拒否)"
+          content:
+            text/plain:
+              schema:
+                type: string
+        "422":
+          description: "[code] フォームに `code` が無い (axum の `Form` の拒否)"
+          content:
+            text/plain:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    callerJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        [code] 運用系の口の呼び手の署名 (DR-0043)。`[callers.<name>]` を 1 つでも書いた unit の TCP の口でだけ求める。Unix socket の口と、`[callers]` の無い unit では確かめず (operation の `security` の空の選択肢がそれ)、`Authorization` も読まない。
+
+        呼び手は request ごとに自分の Ed25519 鍵で compact JWS に署名し、`Authorization: Bearer <token>` で送る。gateway は token の `iss` で `[callers.<name>]` を引き、その呼び手の `jwks_url` から取った鍵だけで確かめる。
+
+        - header: `alg` は `Ed25519` か `EdDSA`、`typ` は `request+jwt` (大文字小文字を問わず、`application/` 接頭辞も可)、`kid` は必須、`crit` があれば断る
+        - claims: `iss` (呼び手の `iss`)、`aud` (method、空白 1 つ、request line の path そのもの。percent-encode されたまま、query を含めない)、`iat` / `exp` (0 以上の整数の Unix 秒、`now < exp` かつ `0 ≤ exp − iat ≤ 10`)、任意の `jti` (文字列。同じ unit に `exp` までに同じ値が来たら断る)
+        - query と本文は覆わない
+
+        断る時は 401 (署名し直せば通りうる) か 400 (直さないと通らない) で、本文は status ごとの固定文。どの段で落ちたかは台のログにだけ残る。
+  parameters:
+    CredentialName:
+      name: name
+      in: path
+      required: true
+      description: "[code] 設定の `[credentials.<name>]` の名前。path では percent-encode し、handler は decode した値で引く"
+      schema:
+        type: string
+  responses:
+    CallerUnauthorized:
+      description: "[code] 呼び手の署名を確かめられなかった (署名し直せば通りうる段)。`Authorization` が無い、Bearer 以外の方式、未知の `kid`、署名が合わない、期限切れ、`jti` の使い回し、呼び手の鍵が最後の取得から 66 分を過ぎた、のいずれか"
+      headers:
+        WWW-Authenticate:
+          description: "[code] token の無い request (`Authorization` が無い、Bearer 以外) には `Bearer realm=\"llm-gateway\"`、それ以外には `Bearer realm=\"llm-gateway\", error=\"invalid_token\"`"
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            type: error
+            error:
+              type: authentication_error
+              message: caller authentication failed; sign the request again
+    CallerBadRequest:
+      description: "[code] 呼び手の token が読めないか、この request と合わない (直さないと通らない段)。compact JWS として読めない、`alg` / `typ` / `kid` / `crit` / `iss` / `aud` の不一致、`iat` / `exp` が無いか整数でない、`exp − iat` が 0〜10 の外、`jti` が文字列でない、のいずれか"
+      headers:
+        WWW-Authenticate:
+          description: "[code] `Bearer realm=\"llm-gateway\", error=\"invalid_request\"`"
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            type: error
+            error:
+              type: authentication_error
+              message: the caller token is malformed or does not match this request; fix how the token is made
+    MethodNotAllowed:
+      description: "[code][observed] 道筋はあるが method が違う。本文は無い"
+      headers:
+        Allow:
+          description: "[code][observed] この道筋が受ける method"
+          schema:
+            type: string
+  schemas:
+    Error:
+      type: object
+      description: "[code] gateway が組み立てるエラーの本文 (Anthropic のエラー形式)"
+      required: [type, error]
+      properties:
+        type:
+          description: "[code][observed] 常に `error`"
+          type: string
+          const: error
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              description: "[code][observed] 種類。署名の拒否は `authentication_error`、クエリの誤りは `invalid_request_error`"
+              type: string
+            message:
+              description: "[code][observed] 英語の説明"
+              type: string
+    Version:
+      type: object
+      required: [version]
+      properties:
+        version:
+          description: "[code][observed] このプロセスに焼き込まれた版 (`Cargo.toml` の `version`)"
+          type: string
+    SelfReport:
+      type: object
+      required: [version, boot, events]
+      properties:
+        version:
+          description: "[code][observed] このプロセスに焼き込まれた版"
+          type: string
+        boot:
+          description: "[code][observed] 起動の印 (知らせの器を作った時刻、Unix ミリ秒)。再起動で変わり、`/llm-gateway/events` の各知らせの `boot` と同じ値"
+          type: integer
+          format: int64
+        events:
+          type: object
+          required: [dropped]
+          properties:
+            dropped:
+              description: "[code][observed] 見る側 (events の購読者と webhook) が追いつけずに落とした知らせの数。起動からの累積で、0 でも出る"
+              type: integer
+              format: int64
+              minimum: 0
+        dump:
+          description: "[code] 動いている一時ダンプの系列。動いている間だけ欄が出る (置き場と labels は載らない)"
+          type: array
+          items:
+            $ref: "#/components/schemas/DumpRunning"
+    DumpRunning:
+      type: object
+      required: [dump_id, ns, expires_at, bytes_written]
+      properties:
+        dump_id:
+          description: "[code] 系列の id"
+          type: string
+        ns:
+          description: "[code] 対象の namespace"
+          type: string
+        expires_at:
+          description: "[code] 時限 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        bytes_written:
+          description: "[code] ここまでに書いたバイト数"
+          type: integer
+          format: int64
+          minimum: 0
+    UsageReport:
+      type: object
+      required: [generated_at, credentials]
+      properties:
+        generated_at:
+          description: "[code][observed] この報告を組んだ時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        probe:
+          $ref: "#/components/schemas/UsageProbe"
+        credentials:
+          description: "[code][observed] 設定の `[routes.<name>]` ごとに 1 件、名前の昇順"
+          type: array
+          items:
+            $ref: "#/components/schemas/CredentialUsage"
+    UsageProbe:
+      type: object
+      description: "[code] `refresh=true` の時だけ出る、能動プローブで使った量"
+      required: [requests, model, input_tokens, output_tokens]
+      properties:
+        requests:
+          description: "[code] 投げたリクエストの数 (経路ごとに 1 本)"
+          type: integer
+          minimum: 0
+        model:
+          description: "[code] 使ったモデル (最後に投げた 1 本のもの)"
+          type: string
+        input_tokens:
+          description: "[code] 入力トークンの合計"
+          type: integer
+          format: int64
+          minimum: 0
+        output_tokens:
+          description: "[code] 出力トークンの合計"
+          type: integer
+          format: int64
+          minimum: 0
+    CredentialUsage:
+      type: object
+      required: [name, type, support]
+      properties:
+        name:
+          description: "[code][observed] 経路の名前 (`[routes.<name>]`)。認証情報 (`[credentials.<name>]`) の名前ではない"
+          type: string
+        type:
+          description: "[code][observed] 経路が使う認証情報の `type` (config.toml に書く語)。認証情報を持たない経路は `none`"
+          type: string
+        support:
+          description: "[code][observed] この経路の利用状況をどこまで出せるか。`observed` 観測済み、`unobserved` 取れるがまだ観測していない、`not_applicable` 仕組みとして取れない、`upstream_dependent` 転送先の gateway 次第 (経路を組めなかった名前もこれ)"
+          type: string
+          enum: [observed, unobserved, not_applicable, upstream_dependent]
+        auth:
+          $ref: "#/components/schemas/AuthState"
+        snapshot:
+          $ref: "#/components/schemas/QuotaSnapshot"
+        denials:
+          description: "[code][observed] gateway が今控えている締め出しの印。期限が過ぎた印は載らない。無ければ欄ごと出ない"
+          type: array
+          items:
+            $ref: "#/components/schemas/CredentialDenial"
+        limits:
+          description: "[code] 枠照会 API から聞いた枠。`refresh=true` で聞けた経路にだけ出る。応答ヘッダ由来の `snapshot` とは別物 (同じ枠を指すとは限らない)"
+          type: array
+          items:
+            $ref: "#/components/schemas/QuotaLimit"
+        probe_error:
+          description: "[code] `refresh=true` の能動プローブがこの経路で失敗した理由"
+          type: string
+    AuthState:
+      type: object
+      description: "[code][observed] 認証が今生きているかの観測。観測前は欄ごと出ない"
+      required: [status, observed_at]
+      properties:
+        status:
+          description: "[code][observed] `ok`、`relogin_required` (再ログインが要る)、`degraded`、`org_not_allowed` (ログインは生きているが、上流がこの組織での OAuth の利用を断っている)"
+          type: string
+          enum: [ok, relogin_required, degraded, org_not_allowed]
+        reason:
+          description: "[code] 状態の理由 (英語)"
+          type: string
+        hint:
+          description: "[code] 観測から推し量れる原因と確かめ方 (推定)。推定を持たない状態では欄ごと出ない"
+          type: string
+        login_path:
+          description: "[code] `relogin_required` で、認証情報が Web login に対応している時だけ出る、ログインのページの相対パス (`/llm-gateway/login/<name>/start`)"
+          type: string
+        observed_at:
+          description: "[code][observed] この状態を観測した時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+    QuotaSnapshot:
+      type: object
+      description: "[code][observed] 転送のついでに応答ヘッダから読んだ枠の状況。1 度も観測していなければ欄ごと出ない。再起動を跨いで持つので古い値のことがある"
+      required: [observed_at]
+      properties:
+        observed_at:
+          description: "[code][observed] 観測した時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        5h:
+          $ref: "#/components/schemas/QuotaWindow"
+        7d:
+          $ref: "#/components/schemas/QuotaWindow"
+        overage:
+          $ref: "#/components/schemas/Overage"
+    QuotaWindow:
+      type: object
+      description: "[code][observed] 1 つの窓の状況。欄名 (`5h` / `7d`) は provider ごとに指すものが違うので、周期は `window_seconds` で読む。どの欄も欠けうる"
+      properties:
+        utilization:
+          description: "[code][observed] 使用率 (0.0〜1.0)"
+          type: number
+        status:
+          description: "[code][observed] 上流が言った状態 (`allowed` 等) をそのまま写したもの"
+          type: string
+        reset:
+          description: "[code][observed] リセット時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        window_seconds:
+          description: "[code][observed] この窓が回る周期の長さ (秒)"
+          type: integer
+          minimum: 0
+        expired:
+          description: "[code][observed] 報告を組んだ時点で `reset` を過ぎていて、現在値として扱えない観測。`true` の時だけ出る"
+          type: boolean
+          const: true
+    Overage:
+      type: object
+      description: "[code][observed] 従量課金へのフォールバックが使えるか (数値は取れない)"
+      properties:
+        status:
+          description: "[code][observed] 上流が言った状態をそのまま写したもの"
+          type: string
+        disabled_reason:
+          description: "[code][observed] 塞がれている理由 (`out_of_credits` 等)"
+          type: string
+    CredentialDenial:
+      type: object
+      required: [reason, until]
+      properties:
+        reason:
+          $ref: "#/components/schemas/DenialReason"
+        until:
+          description: "[code][observed] この印が解ける時刻 (Unix ミリ秒。印は秒で持ち、ミリ秒に直して出す)"
+          type: integer
+          format: int64
+        model:
+          description: "[code][observed] 印が効くモデルの名前か、`*` を含む glob。経路全体の印では欄ごと出ない"
+          type: string
+    DenialReason:
+      description: "[code][observed] 経路を外した理由。`limited` 上限に当たった (開く時刻が分かる)、`busy` 一時的に混んでいる、`paced` upstream は通すがこちらが自主的に控えている、`org_not_allowed` 組織ごと OAuth の利用を断られている"
+      type: string
+      enum: [limited, busy, paced, org_not_allowed]
+    QuotaLimit:
+      type: object
+      description: "[code] provider の枠照会 API から得た枠 1 本。`kind` とモデル名は upstream の語のまま"
+      required: [kind, percent, is_active]
+      properties:
+        kind:
+          description: "[code] 枠の種類 (upstream の語)"
+          type: string
+        percent:
+          description: "[code] 使用率 (0〜100)"
+          type: number
+        severity:
+          description: "[code] upstream が言った深刻度"
+          type: string
+        resets_at:
+          description: "[code] この枠が開く時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        model:
+          description: "[code] 枠が掛かるモデルの名前。経路全体の枠では欄ごと出ない"
+          type: string
+        model_id:
+          description: "[code] 枠が掛かるモデルの id"
+          type: string
+        window_seconds:
+          description: "[code] この枠が回る周期の長さ (秒)。読めた provider だけが入れる"
+          type: integer
+          minimum: 0
+        is_active:
+          description: "[code] upstream が言った、この枠が効いているか"
+          type: boolean
+    StatusReport:
+      type: object
+      required: [schema_version, generated_at, overall, services]
+      properties:
+        schema_version:
+          description: "[code][observed] 応答の形の版。常に 2"
+          type: integer
+          const: 2
+        generated_at:
+          description: "[code][observed] この報告を組んだ時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        overall:
+          type: object
+          required: [severity, service_counts]
+          properties:
+            severity:
+              description: "[code][observed] 全サービスの `severity` のうち最も重いもの (`unknown` < `ok` < `warning` < `critical`)。サービスが 1 つも無ければ `unknown`"
+              allOf:
+                - $ref: "#/components/schemas/Severity"
+            service_counts:
+              type: object
+              required: [ok, warning, critical, unknown]
+              properties:
+                ok:
+                  description: "[code][observed] `severity` が `ok` のサービスの数"
+                  type: integer
+                  minimum: 0
+                warning:
+                  description: "[code][observed] `warning` の数"
+                  type: integer
+                  minimum: 0
+                critical:
+                  description: "[code][observed] `critical` の数"
+                  type: integer
+                  minimum: 0
+                unknown:
+                  description: "[code][observed] `unknown` の数"
+                  type: integer
+                  minimum: 0
+        services:
+          description: "[code][observed] サービスごとの状態。`id` の昇順"
+          type: array
+          items:
+            $ref: "#/components/schemas/StatusService"
+    Severity:
+      type: string
+      enum: [unknown, ok, warning, critical]
+    StatusService:
+      type: object
+      required: [id, name, severity, routes, official, observed]
+      properties:
+        id:
+          description: "[code][observed] 設定の status source の名前。source を持たない経路は経路の名前がそのまま id になる"
+          type: string
+        name:
+          description: "[code][observed] source に書いた表示名。無ければ `id`"
+          type: string
+        severity:
+          description: "[code][observed] 公式と実測から決めた重さ。実測が `failing` か公式が `major_outage` なら `critical`、公式が `degraded` / `partial_outage` / `maintenance` なら `warning`、公式が `operational` か実測が `reachable` なら `ok`、それ以外は `unknown`"
+          allOf:
+            - $ref: "#/components/schemas/Severity"
+        routes:
+          description: "[code][observed] このサービスに属する経路の名前。source を書いたがどの経路も指していなければ空"
+          type: array
+          items:
+            type: string
+        official:
+          $ref: "#/components/schemas/StatusOfficial"
+        observed:
+          $ref: "#/components/schemas/StatusObserved"
+    OfficialState:
+      type: string
+      enum: [operational, degraded, partial_outage, major_outage, maintenance, unknown]
+    StatusOfficial:
+      type: object
+      description: "[code][observed] 公式ステータスページ由来の状態"
+      required: [state, source, source_url, observed_at, stale, components, incidents]
+      properties:
+        state:
+          description: "[code][observed] 公式の状態。まだ取れていない・取れない source では `unknown`"
+          allOf:
+            - $ref: "#/components/schemas/OfficialState"
+        source:
+          description: "[code][observed] source の種類。`statuspage_v2` (取りに行く)、`link` (ページの URL を出すだけ)、`none` (source を持たない経路)"
+          type: string
+          enum: [statuspage_v2, link, none]
+        source_url:
+          description: "[code][observed] 人が開くページの URL。`none` では空文字列"
+          type: string
+        observed_at:
+          description: "[code][observed] 公式値を取りに行けた時刻 (Unix ミリ秒)。取れていなければ `null`"
+          type: [integer, "null"]
+          format: int64
+        stale:
+          description: "[code][observed] 最後に取れた値が `[status]` の鮮度の上限を過ぎているか"
+          type: boolean
+        components:
+          description: "[code][observed] 対象のコンポーネント"
+          type: array
+          items:
+            $ref: "#/components/schemas/StatusComponent"
+        incidents:
+          description: "[code][observed] 進行中の障害"
+          type: array
+          items:
+            $ref: "#/components/schemas/StatusIncident"
+        error:
+          description: "[code][observed] 最後に取りに行って失敗した理由。無ければ欄ごと出ない"
+          type: string
+    StatusComponent:
+      type: object
+      required: [id, name, state]
+      properties:
+        id:
+          description: "[code][observed] ステータスページのコンポーネントの id"
+          type: string
+        name:
+          description: "[code][observed] コンポーネントの表示名"
+          type: string
+        state:
+          description: "[code][observed] コンポーネントの状態"
+          allOf:
+            - $ref: "#/components/schemas/OfficialState"
+    StatusIncident:
+      type: object
+      required: [id, name, state, impact, url, latest_update]
+      properties:
+        id:
+          description: "[code] 障害の id"
+          type: string
+        name:
+          description: "[code] 障害の見出し"
+          type: string
+        state:
+          description: "[code] 障害の段階 (ステータスページの語のまま)"
+          type: string
+        impact:
+          description: "[code] 影響の大きさ (ステータスページの語のまま)"
+          type: string
+        created_at:
+          description: "[code] 障害が立った時刻 (Unix ミリ秒)。読めなければ欄ごと出ない"
+          type: integer
+          format: int64
+        updated_at:
+          description: "[code] 最後に更新された時刻 (Unix ミリ秒)。読めなければ欄ごと出ない"
+          type: integer
+          format: int64
+        url:
+          description: "[code] 障害のページの URL"
+          type: string
+        latest_update:
+          description: "[code] 最新の更新の本文"
+          type: string
+        scope:
+          description: "[code] 対象の範囲"
+          type: string
+    StatusObserved:
+      type: object
+      description: "[code][observed] この gateway が転送で観測した成否 (このサービスに属する経路の分を合わせたもの)"
+      required: [state, observed_at, expires_at, last_success_at]
+      properties:
+        state:
+          description: "[code][observed] `reachable` 直近の観測が成功、`failing` 直近の観測が失敗、`unknown` 観測が無いか `[status]` の観測の寿命を過ぎた"
+          type: string
+          enum: [reachable, failing, unknown]
+        observed_at:
+          description: "[code][observed] 最後に何かを観測した時刻 (Unix ミリ秒)。無ければ `null`"
+          type: [integer, "null"]
+          format: int64
+        expires_at:
+          description: "[code][observed] その観測を現在状態として扱わなくなる時刻 (Unix ミリ秒)。無ければ `null`"
+          type: [integer, "null"]
+          format: int64
+        last_success_at:
+          description: "[code][observed] 最後に通った時刻 (Unix ミリ秒)。無ければ `null`"
+          type: [integer, "null"]
+          format: int64
+        last_failure:
+          $ref: "#/components/schemas/StatusFailure"
+    StatusFailure:
+      type: object
+      description: "[code][observed] 最後に観測した失敗。無ければ欄ごと出ない"
+      required: [at, kind]
+      properties:
+        at:
+          description: "[code][observed] 失敗を観測した時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        kind:
+          description: "[code][observed] 失敗の種類。`transport` (届かなかった)、`upstream_http` (上流が失敗の status を返した)、`busy` (混雑)"
+          type: string
+          enum: [transport, upstream_http, busy]
+        status:
+          description: "[code] 上流が返した status。`upstream_http` の時に出る"
+          type: integer
+    StatsReport:
+      type: object
+      required: [generated_at, days]
+      properties:
+        generated_at:
+          description: "[code][observed] この報告を組んだ時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        days:
+          description: "[code][observed] ローカル日付 (`YYYY-MM-DD`) から 1 日分への map"
+          type: object
+          propertyNames:
+            pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+          additionalProperties:
+            $ref: "#/components/schemas/StatsDay"
+        total_usd:
+          description: "[code][observed] 全期間の合計 USD。単価が分かる行の和で、1 行も出せなければ欄ごと出ない"
+          type: number
+    StatsDay:
+      type: object
+      required: [credentials]
+      properties:
+        credentials:
+          description: "[code][observed] 認証情報の名前 (認証情報を持たない経路は `-`) から、モデル名から行への map への map"
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              $ref: "#/components/schemas/StatsEntry"
+        total_usd:
+          description: "[code][observed] その日の合計 USD。単価が分かる行の和で、1 行も出せなければ欄ごと出ない"
+          type: number
+    StatsEntry:
+      type: object
+      required: [requests, tokens, input_basis]
+      properties:
+        requests:
+          description: "[code][observed] 応答の数"
+          type: integer
+          format: int64
+          minimum: 0
+        tokens:
+          description: "[code][observed] 区分の名前からトークン数への map。core が綴りを揃える区分は `input`、`output`、`input.cache_creation`、`input.cache_creation.ephemeral_1h`、`input.cache_creation.ephemeral_5m`、`input.cache_read`、`output.reasoning` で、provider 固有の区分もそのまま入る。`input.cache_creation.*` は `input.cache_creation` の内数"
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+            minimum: 0
+        usd:
+          description: "[code][observed] この行の USD。単価表に無いモデルでは欄ごと出ない"
+          type: number
+        origins:
+          description: "[code][observed] 出した側 (`main` / `sub` / `oneshot` / `codex` / `keepalive` / `unknown`) ごとの内訳。行の数は内訳の和。内訳の行は `origins` を持たない"
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/StatsEntry"
+        input_basis:
+          description: "[code][observed] `input` の数え方。`fresh` は単価表の内訳を引いて cache でない入力に揃えた数、`as_recorded` は upstream が言った数のまま (cache 分を含むことがある。単価表に無いモデル)"
+          type: string
+          enum: [fresh, as_recorded]
+    PauseRequest:
+      type: object
+      required: [session_id]
+      properties:
+        session_id:
+          description: "[code] keepalive を止める会話の id"
+          type: string
+    PauseResponse:
+      type: object
+      required: [session_id, paused]
+      properties:
+        session_id:
+          description: "[code] 頼まれた会話の id"
+          type: string
+        paused:
+          description: "[code] 常に `true`"
+          type: boolean
+          const: true
+    SessionsReport:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          description: "[code][observed] 控えのある会話。各会話の先頭の系列の `cache_since` の降順、同じなら `session_id` の昇順"
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionReport"
+    SessionReport:
+      type: object
+      required: [session_id, series]
+      properties:
+        session_id:
+          description: "[code][observed] 会話の id (percent-decode した値)"
+          type: string
+        series:
+          description: "[code][observed] その会話の系列 ((session_id, prefix) の控え 1 つが 1 要素)。`cache_since` の降順、同じなら `prefix` の昇順。控えが無ければ空"
+          type: array
+          items:
+            $ref: "#/components/schemas/SeriesReport"
+    SeriesReport:
+      type: object
+      description: "[code][observed] 系列 1 つの控えの写し。`routes` 以外の欄も含めて必ず出る"
+      required: [prefix, ns, model, route, cache_notice, cache_expires_at, cache_since, cache_count, next_keepalive_at, cache_until, cache_until_count, routes]
+      properties:
+        prefix:
+          description: "[code][observed] 系列の識別子 (`system` の先頭ブロックの SHA-256 の先頭 8 桁)。知らせの `prefix` と突き合わせる"
+          type: string
+        ns:
+          description: "[code][observed] 直前の実リクエストが通った namespace"
+          type: string
+        model:
+          description: "[code][observed] 解決後の実モデル名"
+          type: string
+        route:
+          description: "[code][observed] 直前の実リクエストが通った経路の名前 (知らせでは `credential` の欄に同じ値が載る)"
+          type: string
+        cache_notice:
+          description: "[code][observed] この系列について最後に約束した寿命の名前。`cache_expired` の `of` と突き合わせる。欄を持たない控えでは `null`"
+          type: [string, "null"]
+        cache_expires_at:
+          description: "[code][observed] gateway が送り直す直前に壁時計と比べる期限 (最後に送った 1 本の時刻 + 寿命から余裕の 30 秒を引いた値、Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_since:
+          description: "[code][observed] 連鎖の起点 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_count:
+          description: "[code][observed] ここまでに送り直した本数 (実リクエストの直後は 0)"
+          type: integer
+          minimum: 0
+        next_keepalive_at:
+          description: "[code][observed] 控えに書いてある次の送り直しの予定 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_until:
+          description: "[code][observed] 送り直しで継ぎ足せる終わり (Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_until_count:
+          description: "[code][observed] 連鎖で送る総数"
+          type: integer
+          minimum: 0
+        routes:
+          description: "[code][observed] この系列の `ns` と `model` で試される経路を試す順に。namespace が設定から消えた、そのモデルを扱える経路が無い時は空"
+          type: array
+          items:
+            $ref: "#/components/schemas/RouteReport"
+    RouteReport:
+      type: object
+      required: [route]
+      properties:
+        route:
+          description: "[code][observed] 経路の名前 (`[routes.<name>]`)"
+          type: string
+        credential:
+          description: "[code][observed] 経路が使う認証情報の名前。持たない経路 (relay) では欄ごと出ない"
+          type: string
+        limited:
+          type: object
+          description: "[code][observed] この `model` に効く上限 (`limited`) の印。無ければ欄ごと出ない。期限が過ぎた印も写す (判定は読む側)"
+          required: [until]
+          properties:
+            until:
+              description: "[code][observed] この時刻 (Unix ミリ秒) まで候補にしない"
+              type: integer
+              format: int64
+    LoginForm:
+      type: object
+      required: [code]
+      properties:
+        code:
+          description: "[code] Anthropic console が表示した `code#state`、または `#` の無いコード単体。前後の空白は落とす"
+          type: string
+    SseMessage:
+      type: object
+      description: "[code][observed] SSE の 1 メッセージを構造として表したもの。線上では `event: <event>`、`id: <id>`、`data: <data を 1 行の JSON にしたもの>` の 3 行と空行で届き、JSON のオブジェクトとしては届かない"
+      required: [event, id, data]
+      properties:
+        event:
+          description: "[code][observed] 知らせの種類。`request` 転送を送り始めた、`response` 応答の本文が閉じた、`cache_expired` 約束した cache の寿命が果たされずに終わった、`passthrough` 無変換の中継を 1 本扱った"
+          type: string
+          enum: [request, response, cache_expired, passthrough]
+        id:
+          description: "[code][observed] `data` の `seq` と同じ値"
+          type: string
+        data:
+          description: "[code][observed] `event` の種類ごとの本文"
+          oneOf:
+            - $ref: "#/components/schemas/RequestEvent"
+            - $ref: "#/components/schemas/ResponseEvent"
+            - $ref: "#/components/schemas/CacheExpiredEvent"
+            - $ref: "#/components/schemas/PassthroughEvent"
+    RequestEvent:
+      type: object
+      description: "[code][observed] `event: request` の本文。upstream へ 1 本を送り始めた知らせ。`type` の欄を持たない"
+      required: [ts, seq, boot, session_id, ns, model, credential, status, origin]
+      not:
+        required: [type]
+        properties:
+          type: {}
+      properties:
+        ts:
+          description: "[code][observed] upstream へこの 1 本を送り始めた時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        seq:
+          $ref: "#/components/schemas/EventSeq"
+        boot:
+          $ref: "#/components/schemas/EventBoot"
+        subject:
+          $ref: "#/components/schemas/EventSubject"
+        kid:
+          $ref: "#/components/schemas/EventKid"
+        session_id:
+          description: "[code][observed] 会話の id。ヘッダを付けてこないクライアントでは `null`"
+          type: [string, "null"]
+        agent_id:
+          description: "[code][observed] その会話の中でこの 1 本を出した subagent の id (`x-claude-code-agent-id`)。main の 1 本と名乗らないクライアントでは欄ごと出ない"
+          type: string
+        ns:
+          description: "[code][observed] 宛先の namespace"
+          type: string
+        model:
+          description: "[code][observed] 解決後の実モデル名"
+          type: string
+        credential:
+          description: "[code][observed] 答えた経路の名前 (`[routes.<name>]`)"
+          type: string
+        status:
+          description: "[code][observed] upstream が返した status"
+          type: integer
+        prefix:
+          description: "[code][observed] 会話系列の識別子 (`system` の先頭ブロックの SHA-256 の先頭 8 桁)。取れなければ欄ごと出ない"
+          type: string
+        origin:
+          $ref: "#/components/schemas/EventOrigin"
+        cache_ttl_secs:
+          description: "[code][observed] この 1 本が残すプレフィックスの寿命 (秒)。cache を使わない 1 本では欄ごと出ない"
+          type: integer
+          minimum: 0
+        cache_expires_at:
+          description: "[code][observed] その寿命が尽きる見込みの時刻 (`ts` + `cache_ttl_secs`、Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_notice:
+          description: "[code][observed] この 1 本が約束した寿命の id。`cache_expires_at` を出す 1 本だけが持ち、`cache_expired` の `of` がこれを名指しで取り消す"
+          type: string
+        skipped:
+          description: "[code][observed] 経路選定で外した経路と理由。無ければ欄ごと出ない"
+          type: array
+          items:
+            $ref: "#/components/schemas/SkippedRoute"
+        cache_since:
+          description: "[code][observed] 連鎖の起点 = この系列で最後に来た実リクエストを送った時刻 (Unix ミリ秒)。ここから `cache_until_count` までは keepalive の控えが付く系列にだけ出る"
+          type: integer
+          format: int64
+        next_keepalive_at:
+          description: "[code][observed] 次の送り直しの予定時刻 (Unix ミリ秒)。次が無ければ欄ごと出ない"
+          type: integer
+          format: int64
+        cache_count:
+          description: "[code][observed] この 1 本が連鎖の何番目か。実リクエストは 0、k 回目の送り直しは k"
+          type: integer
+          minimum: 0
+        cache_until:
+          description: "[code][observed] 送り直しで継ぎ足せる終わり = 最後に送る 1 本が置く cache が消える時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        cache_until_count:
+          description: "[code][observed] 連鎖で送る総数"
+          type: integer
+          minimum: 0
+        cache_breakeven_until:
+          description: "[code][observed] 損益分岐時間まで繋いだ場合の終わり (Unix ミリ秒)。単価が分からないモデルでは欄ごと出ない"
+          type: integer
+          format: int64
+        cache_breakeven_count:
+          description: "[code][observed] 損益分岐時間に収まる本数"
+          type: integer
+          minimum: 0
+        thinking_as_text:
+          description: "[code] 跨いだ会話の thinking を text にして送った 1 本で `true`。当てはまらなければ欄ごと出ない (DR-0035)"
+          type: boolean
+          const: true
+        thinking_dropped_by_switch:
+          description: "[code] 跨いだ先へ本文のまま送った 1 本 (履歴の thinking が API に捨てられる見込み) で `true`。当てはまらなければ欄ごと出ない (DR-0035)"
+          type: boolean
+          const: true
+        safeguards_dropped:
+          description: "[code] クライアントが送った server review を頼む欄を、答えた経路が上流へ渡せなかった 1 本で `true`。当てはまらなければ欄ごと出ない"
+          type: boolean
+          const: true
+        low_priority:
+          description: "[code] クライアントが低優先度で送った 1 本で `true` (429 / 529 でも経路を替えない)。当てはまらなければ欄ごと出ない (DR-0036)"
+          type: boolean
+          const: true
+    ResponseEvent:
+      type: object
+      description: "[code][observed] `event: response` の本文。応答の本文が閉じた (または途中で切れた) 知らせ。対応する `request` とは `request_ts` で結ぶ"
+      required: [type, ts, seq, boot, request_ts, session_id, ns, model, credential, origin, status, aborted, cache]
+      properties:
+        type:
+          description: "[code][observed] 常に `response`"
+          type: string
+          const: response
+        ts:
+          description: "[code][observed] 本文が閉じた (または切れた) 時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        seq:
+          $ref: "#/components/schemas/EventSeq"
+        boot:
+          $ref: "#/components/schemas/EventBoot"
+        subject:
+          $ref: "#/components/schemas/EventSubject"
+        kid:
+          $ref: "#/components/schemas/EventKid"
+        request_ts:
+          description: "[code][observed] 対応する `request` の `ts`"
+          type: integer
+          format: int64
+        session_id:
+          description: "[code][observed] 会話の id。ヘッダを付けてこないクライアントでは `null`"
+          type: [string, "null"]
+        agent_id:
+          description: "[code][observed] subagent の id。main では欄ごと出ない"
+          type: string
+        prefix:
+          description: "[code][observed] 会話系列の識別子。取れなければ欄ごと出ない"
+          type: string
+        ns:
+          description: "[code][observed] 宛先の namespace"
+          type: string
+        model:
+          description: "[code][observed] 解決後の実モデル名"
+          type: string
+        credential:
+          description: "[code][observed] 答えた経路の名前"
+          type: string
+        origin:
+          $ref: "#/components/schemas/EventOrigin"
+        status:
+          description: "[code][observed] upstream が返した status (対応する `request` と同じ値)"
+          type: integer
+        stop_reason:
+          description: "[code][observed] upstream が言った終わり方をそのまま写したもの (`end_turn` / `tool_use` 等)。取れなければ (途中で切れた等) 欄ごと出ない"
+          type: string
+        aborted:
+          description: "[code][observed] 本文が最後まで流れなかったか。常に出る"
+          type: boolean
+        cache:
+          description: "[code][observed] この 1 本で prompt cache がどう働いたか。`hit` 置いてあった cache から読めた、`written` 全量を書いた、`partial` 一部を読み残りを書いた、`none` cache を使わなかった、`unknown` usage が読めなかった。常に出る"
+          type: string
+          enum: [hit, written, partial, none, unknown]
+    CacheExpiredEvent:
+      type: object
+      description: "[code] `event: cache_expired` の本文。約束した寿命が果たされずに終わったことの取り消し。受け取る側は (会話, 系列) ごとに最後の `cache_notice` を覚え、`of` が一致した時だけ残りを 0 にする"
+      required: [type, ts, seq, boot, session_id, prefix, of]
+      properties:
+        type:
+          description: "[code] 常に `cache_expired`"
+          type: string
+          const: cache_expired
+        ts:
+          description: "[code] 消えたと分かった時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        seq:
+          $ref: "#/components/schemas/EventSeq"
+        boot:
+          $ref: "#/components/schemas/EventBoot"
+        session_id:
+          description: "[code] 会話の id"
+          type: string
+        prefix:
+          description: "[code] その会話の系列"
+          type: string
+        of:
+          description: "[code] 取り消す約束の id (`request` の `cache_notice`)"
+          type: string
+    PassthroughEvent:
+      type: object
+      description: "[code] `event: passthrough` の本文。登録した行き先への無変換の中継 1 本の知らせ (DR-0030)。モデルもトークンも載らない"
+      required: [type, ts, seq, boot, ns, upstream, method, path, status, duration_ms, secret]
+      properties:
+        type:
+          description: "[code] 常に `passthrough`"
+          type: string
+          const: passthrough
+        ts:
+          description: "[code] 受けた時刻 (Unix ミリ秒)"
+          type: integer
+          format: int64
+        seq:
+          $ref: "#/components/schemas/EventSeq"
+        boot:
+          $ref: "#/components/schemas/EventBoot"
+        subject:
+          $ref: "#/components/schemas/EventSubject"
+        kid:
+          $ref: "#/components/schemas/EventKid"
+        ns:
+          description: "[code] namespace"
+          type: string
+        upstream:
+          description: "[code] 行き先の名前 (`[upstreams.<name>]`)"
+          type: string
+        method:
+          description: "[code] request の method"
+          type: string
+        path:
+          description: "[code] 行き先の下のパス。クエリは含めない"
+          type: string
+        status:
+          description: "[code] クライアントへ返した status。gateway が断った場合も入る"
+          type: integer
+        duration_ms:
+          description: "[code] 受けてから応答のヘッダが返るまで (ミリ秒)"
+          type: integer
+          format: int64
+          minimum: 0
+        secret:
+          description: "[code] 載せた固定の秘密の識別子 (値ではない)。未登録の行き先では空文字列"
+          type: string
+        refused:
+          description: "[code] gateway が断った理由。上流まで届いたものでは欄ごと出ない"
+          type: string
+          enum: [unknown_upstream, unsafe_path, ns_allow, upstream_allow, secret, rate_limited, ratelimit_unavailable, unreachable]
+        bucket:
+          description: "[code] `rate_limited` の時、埋まっていた gateway の枠 (`minute` / `hour` 等)"
+          type: string
+        retry_after_secs:
+          description: "[code] `rate_limited` の時、クライアントへ返した `Retry-After` (秒)"
+          type: integer
+          minimum: 0
+    SkippedRoute:
+      type: object
+      required: [credential, reason]
+      properties:
+        credential:
+          description: "[code][observed] 外した経路の名前 (`[routes.<name>]`)"
+          type: string
+        reason:
+          $ref: "#/components/schemas/DenialReason"
+    EventSeq:
+      description: "[code][observed] gateway 全体の通し番号。起動から 1 ずつ増え (最初の 1 件が 1)、種類をまたいで同じ列を数える。前に受けた値 + 1 でなければ間が欠けている"
+      type: integer
+      format: int64
+      minimum: 1
+    EventBoot:
+      description: "[code][observed] どの起動の番号か (`/llm-gateway/self` の `boot` と同じ値、Unix ミリ秒)。変わったら `seq` は 1 から振り直し"
+      type: integer
+      format: int64
+    EventSubject:
+      description: "[code][observed] ns 認証 `jwt` で通った相手 (token の `sub`)。token 方式と無検査の namespace では欄ごと出ない"
+      type: string
+    EventKid:
+      description: "[code][observed] その token を確かめた鍵の `kid`。`subject` と同じく、無ければ欄ごと出ない"
+      type: string
+    EventOrigin:
+      description: "[code][observed] この 1 本を出した側。`main` / `sub` / `oneshot` (1 回きりの呼び出し) / `codex` (Responses 形式で受けた 1 本) / `keepalive` (gateway 自身の送り直し) / `unknown`"
+      type: string
+      enum: [main, sub, oneshot, codex, keepalive, unknown]
