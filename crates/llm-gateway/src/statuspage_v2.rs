@@ -53,7 +53,9 @@ struct RawIncident {
     impact: String,
     created_at: String,
     updated_at: String,
-    shortlink: String,
+    /// statuspage 互換を名乗る別実装には無いことがある。無ければ incident の URL は出さない。
+    #[serde(default)]
+    shortlink: Option<String>,
     #[serde(default)]
     incident_updates: Vec<Update>,
     #[serde(default)]
@@ -386,6 +388,32 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error, "configured components not found");
+    }
+
+    /// shortlink も components も持たない incident (statuspage 互換の別実装の形) でも取得は成功し、その incident は URL を持たない。
+    #[tokio::test]
+    async fn incident_without_shortlink_has_no_url() {
+        let base = server(
+            summary("none"),
+            br#"{"incidents":[{"id":"bare","name":"Bare incident","status":"investigating","impact":"minor","created_at":"2026-11-12T00:00:00Z","updated_at":"2026-11-12T00:05:00Z","page_id":"p","resolved_at":null,"incident_updates":[{"body":"looking"}]},{"id":"linked","name":"Linked incident","status":"investigating","impact":"minor","created_at":"c","updated_at":"u","shortlink":"https://stspg.io/l","components":[]}]}"#.to_vec(),
+            Duration::ZERO,
+        )
+        .await;
+        let snapshot = Adapter::new(Duration::from_secs(1))
+            .fetch(&spec(&base, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .incidents
+                .iter()
+                .map(|x| (x.id.as_str(), x.url.as_deref()))
+                .collect::<Vec<_>>(),
+            [("bare", None), ("linked", Some("https://stspg.io/l"))]
+        );
+        assert_eq!(snapshot.incidents[0].latest_update, "looking");
+        let json = serde_json::to_value(&snapshot.incidents[0]).unwrap();
+        assert!(json.get("url").is_none(), "{json}");
     }
 
     /// latest update は UTF-8 を壊さず 4 KiB 以下へ切り詰める。

@@ -96,10 +96,10 @@ fn render(report: &Report) -> String {
     }
     for service in &report.services {
         for incident in &service.official.incidents {
-            out.push_str(&format!(
-                "\n{}: {}\n  {}\n",
-                service.name, incident.name, incident.url
-            ));
+            out.push_str(&format!("\n{}: {}\n", service.name, incident.name));
+            if let Some(url) = &incident.url {
+                out.push_str(&format!("  {url}\n"));
+            }
         }
     }
     out
@@ -164,7 +164,7 @@ mod tests {
                             impact: "minor".into(),
                             created_at: None,
                             updated_at: None,
-                            url: "https://stspg.io/i".into(),
+                            url: Some("https://stspg.io/i".into()),
                             latest_update: "".into(),
                             scope: None,
                         })
@@ -215,6 +215,15 @@ mod tests {
             out.contains("Provider: Incident\n  https://stspg.io/i"),
             "{out}"
         );
+    }
+
+    /// URL を持たない incident は名前だけを出し、空の URL 行を作らない。
+    #[test]
+    fn status_formatter_omits_a_missing_incident_url() {
+        let mut report = status_report(OfficialState::Degraded, false, true);
+        report.services[0].official.incidents[0].url = None;
+        let out = render(&report);
+        assert!(out.ends_with("\nProvider: Incident\n"), "{out:?}");
     }
 
     /// 更新時刻は経過時間の表現をそのまま置く (`elapsed` が既に「いつ」を言い切る)。

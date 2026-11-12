@@ -1150,7 +1150,7 @@ components:
             - $ref: "#/components/schemas/OfficialState"
     StatusIncident:
       type: object
-      required: [id, name, state, impact, url, latest_update]
+      required: [id, name, state, impact, latest_update]
       properties:
         id:
           description: "[code] 障害の id"
@@ -1173,7 +1173,7 @@ components:
           type: integer
           format: int64
         url:
-          description: "[code] 障害のページの URL"
+          description: "[code] 障害のページの URL。ステータスページが障害ごとの URL を載せていなければ欄ごと出ない (URL を推測で組み立てない)"
           type: string
         latest_update:
           description: "[code] 最新の更新の本文"

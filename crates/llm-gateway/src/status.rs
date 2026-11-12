@@ -54,7 +54,9 @@ pub struct Incident {
     /// 最後に更新された時刻 (Unix ミリ秒)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<i64>,
-    pub url: String,
+    /// 障害の個別ページ。upstream が載せていなければ欄ごと出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub latest_update: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
