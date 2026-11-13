@@ -105,6 +105,24 @@ impl Scope {
         }
     }
 
+    /// この範囲の枠が開いていると分かったとき、`mark` の範囲の印も外れるか。
+    ///
+    /// 同じ範囲の印は外れる。モデル群の枠なら、その群に入るモデル単位の印も
+    /// 外れる — モデル別の枠は応答ヘッダに出ないので、その枠切れは窓を伴わない
+    /// 429 からモデル単位の印として付き、枠照会 API からはモデル群の形で答えが
+    /// 来る (DR-0009)。表し方が違うだけで同じ枠の話なので、群が開いたのに
+    /// モデルの印を残すと、`retry-after` が指す先 (数日になる) まで締め出し続ける。
+    ///
+    /// アカウント全体の枠が開いても、モデル単位の印は外さない。モデル単位の
+    /// 印は「窓は開いていたのにそのモデルが断られた」ときに付くので、全体が
+    /// 開いているという答えはそのモデルが断られた理由を打ち消さない。
+    fn lifts(&self, mark: &Scope) -> bool {
+        match (self, mark) {
+            (Self::Models(_), Self::Model(model)) => self.covers(model),
+            _ => self == mark,
+        }
+    }
+
     fn output_order(&self) -> (u8, &str) {
         match self {
             Self::Everything => (0, ""),
@@ -216,9 +234,10 @@ impl RouteState {
         self.marks().retain(|scope, _| !scope.covers(model));
     }
 
-    /// この範囲の印だけを消す。枠が塞がっていないと分かったときに呼ぶ。
+    /// この範囲の枠が塞がっていないと分かったときに呼ぶ。この範囲の印と、
+    /// この範囲の答えで外れる印 ([`Scope::lifts`]) を消す。
     pub fn clear(&self, scope: &Scope) {
-        self.marks().remove(scope);
+        self.marks().retain(|mark, _| !scope.lifts(mark));
     }
 
     /// このモデルで断られているか。断られていれば、その印。
@@ -293,12 +312,18 @@ impl RouteState {
     /// 「この範囲を、この印で締め出す (`Some`) / 開ける (`None`)」。どの枠が
     /// どの範囲に掛かるかの解釈は provider の知識なので、core は指示された
     /// とおりに印を付け外しするだけ (DR-0014 §3)。
+    ///
+    /// 開ける指示を先に、締め出しを後に処理する。開ける指示はモデル群の
+    /// 枠なら群に入るモデルの印まで外すので、並び順のまま処理すると、
+    /// 同じ答えが先に付けた印を後ろの指示が消しうる。1 つの答えの中で
+    /// 両方が同じモデルに掛かるなら、使い切った枠がある以上そのモデルは
+    /// 通らないので、締め出しが勝つ。
     pub fn apply(&self, entries: &[(Scope, Option<Denial>)], now: i64) {
-        for (scope, denial) in entries {
-            match denial {
-                Some(denial) => self.deny(denial.clone(), now),
-                None => self.clear(scope),
-            }
+        for (scope, _) in entries.iter().filter(|(_, denial)| denial.is_none()) {
+            self.clear(scope);
+        }
+        for denial in entries.iter().filter_map(|(_, denial)| denial.as_ref()) {
+            self.deny(denial.clone(), now);
         }
     }
 
@@ -614,6 +639,70 @@ mod tests {
             state.denial(FABLE, NOW).is_some(),
             "an unmentioned scope is untouched"
         );
+    }
+
+    /// モデル群の枠が開いていると分かったら、その群に入るモデル単位の印も
+    /// 外す。
+    ///
+    /// モデル単位の印は、窓を伴わない 429 から付く (応答にはモデル別の枠が
+    /// 載らない)。その正体がモデル群の枠切れなら、枠照会 API はモデル群の
+    /// 形で答える。範囲の表し方が違うだけで同じ枠の話なので、群が開いたのに
+    /// モデルの印を残すと、`retry-after` が指す数日先まで締め出し続ける。
+    #[test]
+    fn an_open_model_group_lifts_the_marks_of_its_models() {
+        let state = RouteState::new();
+        let group = Scope::Models("claude-fable-*".to_owned());
+        state.deny(busy(NOW + 200_000, FABLE), NOW);
+        state.deny(busy(NOW + 200_000, HAIKU), NOW);
+
+        state.apply(&[(group, None)], NOW);
+        assert_eq!(state.denial(FABLE, NOW), None, "covered by the group");
+        assert_eq!(
+            state.denial(HAIKU, NOW),
+            Some(busy(NOW + 200_000, HAIKU)),
+            "outside the group: the answer says nothing about it"
+        );
+    }
+
+    /// アカウント全体の枠が開いていても、モデル単位の印は外さない。
+    ///
+    /// モデル単位の印は「窓は開いていたのにそのモデルが断られた」ときに
+    /// 付く。全体の枠が開いているという答えは、その印を付けた時点で既に
+    /// 分かっていたことで、モデルが断られた理由を何も打ち消さない。
+    #[test]
+    fn an_open_account_limit_leaves_model_marks_alone() {
+        let state = RouteState::new();
+        state.deny(busy(NOW + 200_000, FABLE), NOW);
+
+        state.apply(&[(Scope::Everything, None)], NOW);
+        assert_eq!(state.denial(FABLE, NOW), Some(busy(NOW + 200_000, FABLE)));
+    }
+
+    /// 1 つの答えの中で、締め出しは開ける指示より強い。並び順で変わらない。
+    ///
+    /// 開ける指示が広い範囲 (モデル群) に効くので、締め出しの後に処理すると
+    /// 同じ答えが付けたばかりの印を消しうる。
+    #[test]
+    fn within_one_answer_a_closure_wins_over_an_opening() {
+        let group = Scope::Models("claude-fable-*".to_owned());
+        let model = Scope::Model(FABLE.to_owned());
+        let closed = Denial {
+            until: NOW + 5000,
+            reason: Reason::Limited,
+            scope: model.clone(),
+        };
+        for entries in [
+            vec![(model.clone(), Some(closed.clone())), (group.clone(), None)],
+            vec![(group.clone(), None), (model.clone(), Some(closed.clone()))],
+        ] {
+            let state = RouteState::new();
+            state.apply(&entries, NOW);
+            assert_eq!(
+                state.denial(FABLE, NOW),
+                Some(closed.clone()),
+                "{entries:?}"
+            );
+        }
     }
 
     /// 通りすがりに読めた枠は、経路が持つ。
