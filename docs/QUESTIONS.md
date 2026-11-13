@@ -49,8 +49,4 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 
 ## 確認待ち
 
-### LM-C1 zunsystem アカウントの OAuth 利用が組織として断られている
-
-2026-11-13 09:30 JST ごろから claude-zunsystem の実リクエスト・モデル一覧・枠照会が 403 (組織が OAuth の利用を許していない) で断られている。gateway 側では原因を観測できない。
-
-- [ ] a: claude.ai の zunsystem アカウントで、サブスクリプション・支払い・組織の設定 (Claude Code / OAuth の利用) を確かめた
+（現在なし）
