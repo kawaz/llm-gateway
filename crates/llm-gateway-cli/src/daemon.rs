@@ -253,7 +253,10 @@ mod tests {
         let registry = Registry::at(dir.path().join("units"));
         let config = config_file(dir.path(), "config-11301-unstable", "127.0.0.1:11301");
 
-        add(&registry, &args(&[config.to_str().unwrap()])).unwrap();
+        assert_eq!(
+            add(&registry, &args(&[config.to_str().unwrap()])).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let unit = registry.get("config-11301-unstable").unwrap();
         assert_eq!(unit.config, config);
@@ -292,11 +295,12 @@ mod tests {
         )
         .unwrap();
 
-        add(
+        let code = add(
             &registry,
             &args(&[config.to_str().unwrap(), "--name", "stable"]),
         )
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
 
         assert_eq!(
             registry.get("stable").unwrap().binary_path,
@@ -325,7 +329,10 @@ mod tests {
 
         // 相対で渡しても、絶対に直って入る。
         let relative = pathdiff(&config);
-        add(&registry, &args(&[&relative, "--name", "rel"])).unwrap();
+        assert_eq!(
+            add(&registry, &args(&[&relative, "--name", "rel"])).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         assert!(registry.get("rel").unwrap().config.is_absolute());
     }
@@ -343,9 +350,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let registry = Registry::at(dir.path().join("units"));
         let config = config_file(dir.path(), "a", "127.0.0.1:11301");
-        add(&registry, &args(&[config.to_str().unwrap()])).unwrap();
+        assert_eq!(
+            add(&registry, &args(&[config.to_str().unwrap()])).unwrap(),
+            ExitCode::SUCCESS
+        );
 
-        remove(&registry, &args(&["a"])).unwrap();
+        assert_eq!(remove(&registry, &args(&["a"])).unwrap(), ExitCode::SUCCESS);
         assert!(registry.names().is_empty());
         assert_eq!(
             remove(&registry, &args(&["a"])).unwrap_err().kind(),
@@ -359,7 +369,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let registry = Registry::at(dir.path().join("units"));
         let config = config_file(dir.path(), "a", "127.0.0.1:11301");
-        add(&registry, &args(&[config.to_str().unwrap()])).unwrap();
+        assert_eq!(
+            add(&registry, &args(&[config.to_str().unwrap()])).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let row = entry("a", &registry.get("a").unwrap());
         assert_eq!(

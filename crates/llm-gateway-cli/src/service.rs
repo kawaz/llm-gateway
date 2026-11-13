@@ -782,7 +782,10 @@ mod tests {
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(&plan, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &runner, Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let written = std::fs::read_to_string(&plan.unit_path).unwrap();
         assert_eq!(written, plan.unit_text);
@@ -805,7 +808,10 @@ mod tests {
         std::fs::write(&plan.unit_path, &plan.unit_text).unwrap();
 
         let runner = loaded_recorder();
-        register(&plan, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &runner, Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         // 見に行っただけで、降ろしも載せもしていない。
         assert_eq!(
@@ -829,7 +835,10 @@ mod tests {
         .unwrap();
 
         let runner = loaded_recorder();
-        register(&plan, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &runner, Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         assert_eq!(
             std::fs::read_to_string(&plan.unit_path).unwrap(),
@@ -854,7 +863,10 @@ mod tests {
 
         // `launchctl print` だけが断る = ファイルはあるが載っていない。
         let runner = NotLoaded::default();
-        register(&plan, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &runner, Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             runner.calls(),
             vec![
@@ -931,7 +943,7 @@ mod tests {
         )
         .unit_text;
         let runner = loaded_recorder();
-        register(
+        let code = register(
             &moved,
             &runner,
             Options {
@@ -941,6 +953,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
 
         let written = std::fs::read_to_string(&moved.unit_path).unwrap();
         assert_eq!(written, moved.unit_text);
@@ -963,7 +976,10 @@ mod tests {
         .unwrap();
 
         let runner = loaded_recorder();
-        register(&before, &runner, Options::default(), None).unwrap();
+        assert_eq!(
+            register(&before, &runner, Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             std::fs::read_to_string(&before.unit_path).unwrap(),
             before.unit_text
@@ -999,7 +1015,7 @@ mod tests {
         let plan = plan_in(dir.path());
         let runner = Recorder::default();
 
-        register(
+        let code = register(
             &plan,
             &runner,
             Options {
@@ -1009,6 +1025,7 @@ mod tests {
             Some("a dev build"),
         )
         .unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
 
         assert!(!plan.unit_path.exists());
         assert!(runner.calls().is_empty());
@@ -1032,14 +1049,17 @@ mod tests {
     fn unregistering_tells_the_system_before_removing_the_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let refused = unregister(&plan, &Refuses).unwrap_err();
         assert_eq!(refused.kind(), "command_failed");
         assert!(plan.unit_path.exists(), "the file was removed anyway");
 
         let runner = Recorder::default();
-        unregister(&plan, &runner).unwrap();
+        assert_eq!(unregister(&plan, &runner).unwrap(), ExitCode::SUCCESS);
         assert_eq!(
             runner.calls(),
             vec!["launchctl bootout gui/501/com.github.kawaz.llm-gateway.supervise"]
@@ -1079,10 +1099,13 @@ mod tests {
     fn starting_kickstarts_the_registered_label() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let runner = Recorder::default();
-        start(&plan, &runner).unwrap();
+        assert_eq!(start(&plan, &runner).unwrap(), ExitCode::SUCCESS);
         assert_eq!(
             runner.calls(),
             vec!["launchctl kickstart gui/501/com.github.kawaz.llm-gateway.supervise"]
@@ -1097,7 +1120,10 @@ mod tests {
     fn stopping_waits_on_the_socket_it_was_given() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         // 掴ませてから離す監督者役。
         let socket = dir.path().join("supervisor.sock");
@@ -1119,10 +1145,16 @@ mod tests {
     fn stopping_something_that_holds_nothing_returns_at_once() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let runner = Recorder::default();
-        stop(&plan, &runner, &dir.path().join("supervisor.sock")).unwrap();
+        assert_eq!(
+            stop(&plan, &runner, &dir.path().join("supervisor.sock")).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             runner.calls(),
             vec!["launchctl kill SIGTERM gui/501/com.github.kawaz.llm-gateway.supervise"]
@@ -1150,14 +1182,20 @@ mod tests {
     fn the_status_separates_registration_from_running_from_units() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
 
         let runner = Recorder::saying(Output {
             code: 0,
             stdout: "\tstate = running\n\tpid = 4242\n\tlast exit code = 0\n".to_owned(),
             stderr: String::new(),
         });
-        status(&plan, &runner, Some(json!({"units": [{"unit": "stable"}]}))).unwrap();
+        assert_eq!(
+            status(&plan, &runner, Some(json!({"units": [{"unit": "stable"}]}))).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert_eq!(
             runner.calls(),
             vec!["launchctl print gui/501/com.github.kawaz.llm-gateway.supervise"]
@@ -1222,7 +1260,10 @@ mod tests {
     fn the_log_directory_is_made_before_the_service_is_loaded() {
         let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
-        register(&plan, &Recorder::default(), Options::default(), None).unwrap();
+        assert_eq!(
+            register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
+            ExitCode::SUCCESS
+        );
         assert!(dir.path().join("logs").is_dir());
     }
 
