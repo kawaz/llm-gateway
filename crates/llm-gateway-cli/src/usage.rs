@@ -89,7 +89,17 @@ fn render(report: &Report) -> String {
                     .as_ref()
                     .and_then(|auth| auth.hint.as_deref().or(auth.reason.as_deref()))
                     .unwrap_or("the upstream refuses OAuth use for this organization");
-                out.push_str(&format!("org not allowed — {hint}"));
+                // 上流に聞けたサブスクリプションの状態は、上流の語のまま添える。
+                match c
+                    .auth
+                    .as_ref()
+                    .and_then(|auth| auth.subscription_status.as_deref())
+                {
+                    Some(status) => out.push_str(&format!(
+                        "org not allowed (subscription: {status}) — {hint}"
+                    )),
+                    None => out.push_str(&format!("org not allowed — {hint}")),
+                }
             }
             Some(llm_gateway::quota::AuthStatus::Degraded) => {
                 let reason = c
@@ -361,6 +371,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth claude-personal`".to_owned()),
+            subscription_status: None,
             hint: None,
             login_path: None,
             observed_at: NOW,
@@ -385,6 +396,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::OrgNotAllowed,
             reason: Some("the login still works, but the upstream refuses it".to_owned()),
+            subscription_status: None,
             hint: Some("an inactive subscription is one cause; check the account".to_owned()),
             login_path: None,
             observed_at: NOW,
@@ -402,6 +414,27 @@ mod tests {
         );
     }
 
+    /// 上流に聞けたサブスクリプションの状態があれば、そのまま添えて、
+    /// それに応じた対処を hint として続ける。
+    #[test]
+    fn an_org_refusal_shows_the_subscription_status_it_learned() {
+        let mut credential = observed();
+        credential.auth = Some(llm_gateway::quota::AuthState {
+            status: llm_gateway::quota::AuthStatus::OrgNotAllowed,
+            reason: Some("the login still works, but the upstream refuses it".to_owned()),
+            subscription_status: Some("past_due".to_owned()),
+            hint: Some("the subscription payment is past due; pay the overdue invoice at https://example.com/pay".to_owned()),
+            login_path: None,
+            observed_at: NOW,
+        });
+        let out = render(&report(vec![credential]));
+        assert!(
+            out.contains("org not allowed (subscription: past_due) — "),
+            "{out}"
+        );
+        assert!(out.contains("https://example.com/pay"), "{out}");
+    }
+
     /// 一時的な refresh 失敗は再認可を促さず、再試行可能な degraded 状態として区別する。
     #[test]
     fn degraded_auth_is_rendered_as_transient() {
@@ -409,6 +442,7 @@ mod tests {
         credential.auth = Some(llm_gateway::quota::AuthState {
             status: llm_gateway::quota::AuthStatus::Degraded,
             reason: Some("the refresh endpoint returned 503".to_owned()),
+            subscription_status: None,
             hint: None,
             login_path: None,
             observed_at: NOW,

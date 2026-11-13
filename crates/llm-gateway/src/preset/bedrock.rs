@@ -203,6 +203,12 @@ extended-cache-ttl-2025-04-11";
         );
     }
 
+    /// 組織ごと断られた理由を聞く口 (OAuth の profile) も持たない。
+    #[test]
+    fn has_no_account_api() {
+        assert!(bedrock().account_api().is_none());
+    }
+
     /// 認証情報が要るのに渡されなければ、送る前に落とす。
     #[test]
     fn missing_credential_is_an_error() {

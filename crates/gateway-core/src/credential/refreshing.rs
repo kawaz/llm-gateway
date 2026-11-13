@@ -428,6 +428,7 @@ where
             AuthState {
                 status,
                 reason,
+                subscription_status: None,
                 hint: None,
                 login_path: None,
                 observed_at: observed_at_ms,

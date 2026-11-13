@@ -170,6 +170,32 @@ pub struct RouteState {
     /// 受けた直後など) ので、印にぶら下げると聞きに行けない相手ができる。
     /// [`Probing`] が札を返すので、鍵の実体を共有する。
     ask: Arc<Mutex<Ask>>,
+    /// 組織ごとの断りについて、理由を聞きに行った記録。
+    ///
+    /// 印とは別に持つ。印は同じ範囲に付け直されると上書きされるが、こちらは
+    /// 「この締め出しの間に 1 度聞いた」を覚えておく必要がある。
+    standing: Mutex<Option<StandingCheck>>,
+}
+
+/// 組織ごと断られた理由を確かめるために、上流に聞けた口座の状態。
+///
+/// 断りの応答そのものは理由を持たない (DR-0009 追補)。上流が別の口で状態を
+/// 答えるなら、それを推定より確かな手掛かりとして添える。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Standing {
+    /// サブスクリプションの状態。上流の語のまま (例: `past_due`)。
+    pub subscription_status: Option<String>,
+    /// 状態から言える対処。値の読み方は provider の語彙なので provider が組む。
+    /// 言えることが無ければ `None`。
+    pub hint: Option<String>,
+}
+
+/// 1 回の締め出しにつき 1 度だけ聞くための記録。
+struct StandingCheck {
+    /// 聞きに行ったときの締め出しの期限 (Unix 秒)。これが過ぎたら記録ごと無効。
+    until: i64,
+    /// 聞けた答え。聞いている最中・聞けなかったときは `None`。
+    found: Option<Standing>,
 }
 
 #[derive(Default)]
@@ -193,6 +219,10 @@ impl RouteState {
 
     fn ask(&self) -> MutexGuard<'_, Ask> {
         self.ask.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn standing(&self) -> MutexGuard<'_, Option<StandingCheck>> {
+        self.standing.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// 断られたことを控える。
@@ -293,6 +323,41 @@ impl RouteState {
             .filter(|d| d.reason == Reason::OrgNotAllowed && d.until > now)
             .map(|d| d.until)
             .max()
+    }
+
+    /// 期限 `until` の組織ごとの締め出しについて、理由を聞きに行く役を
+    /// 引き受ける。引き受けられたら `true`。
+    ///
+    /// 締め出しがまだ効いている間に聞いた記録があれば引き受けない。断りは
+    /// 締め出しが付くまでに何本か続けて届くことがあり、その本数ぶん聞きに
+    /// 行くと同じ答えを何度も貰うだけになる。
+    pub fn claim_standing_check(&self, until: i64, now: i64) -> bool {
+        let mut slot = self.standing();
+        if slot.as_ref().is_some_and(|check| check.until > now) {
+            return false;
+        }
+        *slot = Some(StandingCheck { until, found: None });
+        true
+    }
+
+    /// 期限 `until` の締め出しについて聞けた答えを控える。
+    ///
+    /// 聞いている間に別の締め出しへ切り替わっていたら捨てる — 古い締め出しの
+    /// 答えを、新しい締め出しの理由として出さない。
+    pub fn record_standing(&self, until: i64, standing: Standing) {
+        if let Some(check) = self.standing().as_mut()
+            && check.until == until
+        {
+            check.found = Some(standing);
+        }
+    }
+
+    /// 今効いている組織ごとの締め出しについて、聞けた答え。
+    pub fn standing_of_org(&self, now: i64) -> Option<Standing> {
+        self.standing()
+            .as_ref()
+            .filter(|check| check.until > now)
+            .and_then(|check| check.found.clone())
     }
 
     /// このモデルを今この経路へ流せるか。
@@ -838,6 +903,62 @@ mod tests {
             NOW,
         );
         assert!(state.claim_probe(NOW + PROBE_INTERVAL).is_none());
+    }
+
+    fn past_due() -> Standing {
+        Standing {
+            subscription_status: Some("past_due".to_owned()),
+            hint: Some("pay the overdue invoice".to_owned()),
+        }
+    }
+
+    /// 理由を聞きに行くのは 1 回の締め出しにつき 1 度。締め出しが明けて
+    /// 付き直したら、また 1 度聞く。
+    #[test]
+    fn the_cause_of_an_org_refusal_is_asked_once_per_hold() {
+        let state = RouteState::new();
+        let until = NOW + ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(state.claim_standing_check(until, NOW), "first refusal");
+        assert!(
+            !state.claim_standing_check(until + 1, NOW + 1),
+            "a refusal that arrives while the hold is in effect does not ask again"
+        );
+
+        let next = until + ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(
+            state.claim_standing_check(next, until),
+            "a new hold asks again"
+        );
+    }
+
+    /// 聞けた答えは、その締め出しが効いている間だけ出る。
+    #[test]
+    fn the_cause_is_shown_only_while_its_hold_lasts() {
+        let state = RouteState::new();
+        let until = NOW + ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(state.claim_standing_check(until, NOW));
+        assert_eq!(state.standing_of_org(NOW), None, "still asking");
+
+        state.record_standing(until, past_due());
+        assert_eq!(state.standing_of_org(NOW), Some(past_due()));
+        assert_eq!(
+            state.standing_of_org(until),
+            None,
+            "an answer about an expired hold is not shown"
+        );
+    }
+
+    /// 聞いている間に締め出しが付き直したら、古い答えは捨てる。
+    #[test]
+    fn an_answer_about_an_older_hold_is_dropped() {
+        let state = RouteState::new();
+        let first = NOW + ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(state.claim_standing_check(first, NOW));
+        let second = first + ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(state.claim_standing_check(second, first));
+
+        state.record_standing(first, past_due());
+        assert_eq!(state.standing_of_org(first), None);
     }
 
     /// 上限で止まっている経路は、組織ごとの断りとは別物。

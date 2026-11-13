@@ -1022,6 +1022,18 @@ impl<P: CredentialPersistence> Gateway<P> {
                                     hint = ORG_NOT_ALLOWED_HINT,
                                     "the upstream refuses OAuth use for this organization; holding this route"
                                 );
+                                // 断りの応答は理由を持たないので、答えられる
+                                // 経路なら別の口に聞いて一覧に添える。締め出し
+                                // 1 回につき 1 度だけ聞く。
+                                if let Some(id) = &route.credential
+                                    && route.preset.claim_standing_check(denial.until, now)
+                                {
+                                    self.check_standing_in_background(
+                                        id,
+                                        &route.preset,
+                                        denial.until,
+                                    );
+                                }
                             } else {
                                 warn!(
                                     route = route.name(),
@@ -1914,20 +1926,25 @@ impl<P: CredentialPersistence> Gateway<P> {
                 })
                 .collect();
             // 組織ごと断られているのは「ログインは生きている」状態なので、
-            // refresh の結果より新しい観測になる。断りの理由までは観測できない
-            // ので、推定は hint へ回す。再ログインでは直らないので
-            // `login_path` は付けない。
-            if preset
-                .and_then(|preset| preset.org_not_allowed(now_secs))
-                .is_some()
+            // refresh の結果より新しい観測になる。断りの応答は理由を持たない
+            // ので、別の口に聞けた状態があればそれを、無ければ推定を hint へ
+            // 回す。再ログインでは直らないので `login_path` は付けない。
+            if let Some(preset) = preset
+                && preset.org_not_allowed(now_secs).is_some()
             {
+                let standing = preset.standing_of_org(now_secs).unwrap_or_default();
                 entry.auth = Some(quota::AuthState {
                     status: quota::AuthStatus::OrgNotAllowed,
                     reason: Some(
                         "the login still works, but the upstream refuses OAuth use for this organization"
                             .to_owned(),
                     ),
-                    hint: Some(ORG_NOT_ALLOWED_HINT.to_owned()),
+                    subscription_status: standing.subscription_status,
+                    hint: Some(
+                        standing
+                            .hint
+                            .unwrap_or_else(|| ORG_NOT_ALLOWED_HINT.to_owned()),
+                    ),
                     login_path: None,
                     observed_at: now_ms,
                 });
@@ -2139,6 +2156,53 @@ impl<P: CredentialPersistence> Gateway<P> {
         })
     }
 
+    /// 組織ごと断られた理由を、裏で聞きに行く。
+    ///
+    /// 聞くのは理由を答える口 ([`crate::provider::AccountApi`]) で、トークンを
+    /// 使わない。答えは期限 `until` の締め出しの理由として経路に控え、利用状況の
+    /// 一覧が読む。聞けなければ何も控えない — 一覧は推定の hint のまま出る。
+    ///
+    /// 要求から切り離した仕事として走らせる ([`Self::probe_in_background`] と
+    /// 同じ形)。返すのは走らせた仕事で、転送の側は待たないが、試験は終わりを
+    /// 見届けられる。
+    fn check_standing_in_background(
+        &self,
+        id: &CredentialId,
+        preset: &Arc<Preset>,
+        until: i64,
+    ) -> tokio::task::JoinHandle<()> {
+        let id = id.clone();
+        let preset = Arc::clone(preset);
+        let http = self.http.clone();
+        let credentials = self.credentials.clone();
+
+        tokio::spawn(async move {
+            let Some(api) = preset.account_api() else {
+                return;
+            };
+            let credential = match credentials.acquire(&id).await {
+                Ok(credential) => credential,
+                Err(e) => {
+                    warn!(credential = %id, %e, "cannot prepare credentials to ask why the organization is refused");
+                    return;
+                }
+            };
+            match api.standing(&http, &credential).await {
+                Ok(standing) => {
+                    info!(
+                        credential = %id,
+                        subscription_status = standing.subscription_status.as_deref().unwrap_or("-"),
+                        "asked why the upstream refuses OAuth use for this organization"
+                    );
+                    preset.record_standing(until, standing);
+                }
+                Err(e) => {
+                    warn!(credential = %id, %e, "cannot ask why the organization is refused");
+                }
+            }
+        })
+    }
+
     /// 最小のリクエストを 1 本投げて、返ってきたものを持ち帰る。
     ///
     /// 何を投げるかは経路が組んだもの ([`ProbeRequest`]) をそのまま使う。
@@ -2299,9 +2363,10 @@ const COUNT_TOKENS: &str = "/count_tokens";
 
 /// 組織ごと断られたときに添える推定 (`auth.hint`)。
 ///
-/// 観測できるのは「この組織には許可されていない」までで、その理由は応答の
-/// どこにも無い。契約が止まっているのはよくある原因の 1 つでしかないので、
-/// 断定せずに確かめ先を示す。
+/// 断りの応答から分かるのは「この組織には許可されていない」までで、その理由は
+/// 応答のどこにも無い。別の口 ([`crate::provider::AccountApi`]) に聞けて対処が
+/// 言えたときはそちらを出し、言えないときにこれを出す。契約が止まっているのは
+/// よくある原因の 1 つでしかないので、断定せずに確かめ先を示す。
 const ORG_NOT_ALLOWED_HINT: &str =
     "the organization refuses OAuth use (an inactive subscription is one cause); check the account";
 
@@ -6015,6 +6080,174 @@ models = ["m"]
         );
     }
 
+    /// 組織ごとの断りで、profile が答える支払いの滞り (実測 2026-11-13 の抜粋)。
+    const PAST_DUE_PROFILE: &str = r#"{"organization":{"billing_type":"stripe_subscription",
+        "subscription_status":"past_due",
+        "payment_auth_hosted_invoice_url":"https://claude.ai/settings/billing?action=pay_overdue_invoice"}}"#;
+
+    /// 組織ごとに断る本文 (実測 2026-11-13、機械向けの符号つき)。
+    const ORG_REFUSAL: &str = r#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_visibility":"user_facing","error_code":"oauth_not_allowed_for_organization"}}}"#;
+
+    /// 組織ごとの締め出しを付け、理由を聞きに行く役を取る。
+    fn hold_for_org_refusal<P: CredentialPersistence>(gw: &Gateway<P>, now: i64) -> i64 {
+        let until = now + crate::denial::ORG_NOT_ALLOWED_COOLDOWN;
+        let preset = preset_of(gw, "a");
+        preset.deny(
+            Denial {
+                until,
+                reason: Reason::OrgNotAllowed,
+                scope: Scope::Everything,
+            },
+            now,
+        );
+        assert!(preset.claim_standing_check(until, now), "first time");
+        until
+    }
+
+    /// 組織ごと断られたら、profile に理由を聞きに行く。聞くのは締め出し
+    /// 1 回につき 1 度で、トークンを使う転送は増やさない。
+    #[tokio::test]
+    async fn an_org_refusal_asks_the_profile_why() {
+        let up = FakeUpstream::start(|_, req| {
+            if req.starts_with("GET /api/oauth/profile") {
+                (200, PAST_DUE_PROFILE.to_owned())
+            } else {
+                (403, ORG_REFUSAL.to_owned())
+            }
+        })
+        .await;
+        let gw = gateway(&oauth_config(&up.url)).await;
+
+        let forwarded = gw
+            .forward(
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(forwarded.response.status, 403);
+        // 転送の 1 本と、裏で聞きに行く 1 本。
+        for _ in 0..2 {
+            tokio::time::timeout(std::time::Duration::from_secs(5), up.next_request())
+                .await
+                .expect("the profile is asked in the background");
+        }
+        let asked = |up: &FakeUpstream| {
+            up.requests()
+                .iter()
+                .filter(|req| req.starts_with("GET /api/oauth/profile"))
+                .count()
+        };
+        assert_eq!(asked(&up), 1);
+
+        // 締め出しの間に届いた次のリクエストは経路に当たらず、聞き直しもしない。
+        let _ = gw
+            .forward(
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await;
+        assert_eq!(up.forwards(), 1, "the held route is not tried again");
+        assert_eq!(asked(&up), 1, "asked once per hold");
+        let now = now_unix();
+        assert_eq!(
+            preset_of(&gw, "a").org_not_allowed(now),
+            Some(now + crate::denial::ORG_NOT_ALLOWED_COOLDOWN),
+            "asking why does not change how long the route is held"
+        );
+    }
+
+    /// profile が支払いの滞りを答えたら、一覧の `auth` に状態をそのまま出し、
+    /// hint は推定から「未払いの請求を払う」対処に替わる。
+    #[tokio::test]
+    async fn usage_report_names_a_past_due_subscription() {
+        let up = FakeUpstream::start(|_, req| {
+            assert!(
+                req.starts_with("GET /api/oauth/profile"),
+                "only the profile is asked: {req}"
+            );
+            (200, PAST_DUE_PROFILE.to_owned())
+        })
+        .await;
+        let gw = gateway(&oauth_config(&up.url)).await;
+        let now = now_unix();
+        let until = hold_for_org_refusal(&gw, now);
+
+        gw.check_standing_in_background(&CredentialId::new("a"), &preset_of(&gw, "a"), until)
+            .await
+            .unwrap();
+
+        let report = gw.usage_report(false).await;
+        let entry = report
+            .credentials
+            .iter()
+            .find(|entry| entry.name == "a")
+            .unwrap();
+        let auth = entry.auth.as_ref().expect("the state is observed");
+        assert_eq!(auth.status, quota::AuthStatus::OrgNotAllowed);
+        assert_eq!(auth.subscription_status.as_deref(), Some("past_due"));
+        let hint = auth.hint.as_deref().unwrap();
+        assert!(hint.contains("past due"), "{hint}");
+        assert!(
+            hint.contains("https://claude.ai/settings/billing?action=pay_overdue_invoice"),
+            "{hint}"
+        );
+        assert_eq!(auth.login_path, None);
+        assert_eq!(
+            serde_json::to_value(auth).unwrap()["subscription_status"],
+            "past_due"
+        );
+    }
+
+    /// profile が読めなければ、一覧は今までどおり推定の hint だけを出す。
+    #[tokio::test]
+    async fn usage_report_keeps_the_guess_when_the_profile_cannot_be_read() {
+        for (status, body) in [
+            (403, ORG_REFUSAL.to_owned()),
+            (200, "<html>".to_owned()),
+            (200, r#"{"organization":"changed"}"#.to_owned()),
+        ] {
+            let up = FakeUpstream::start(move |_, _| (status, body.clone())).await;
+            let gw = gateway(&oauth_config(&up.url)).await;
+            let now = now_unix();
+            let until = hold_for_org_refusal(&gw, now);
+
+            gw.check_standing_in_background(&CredentialId::new("a"), &preset_of(&gw, "a"), until)
+                .await
+                .unwrap();
+
+            let report = gw.usage_report(false).await;
+            let auth = report
+                .credentials
+                .iter()
+                .find(|entry| entry.name == "a")
+                .and_then(|entry| entry.auth.clone())
+                .expect("the state is observed");
+            assert_eq!(auth.status, quota::AuthStatus::OrgNotAllowed);
+            assert_eq!(auth.subscription_status, None, "{status}");
+            assert_eq!(auth.hint.as_deref(), Some(ORG_NOT_ALLOWED_HINT), "{status}");
+            assert_eq!(
+                preset_of(&gw, "a").org_not_allowed(now),
+                Some(until),
+                "the hold is untouched"
+            );
+        }
+    }
+
     /// 転送のついでに読めた枠は、そのまま一覧に出る。
     ///
     /// 観測を持つのは経路だが、外から見える形は変わらない (DR-0007)。
@@ -6919,6 +7152,7 @@ routes = ["route"]
             Some(crate::quota::AuthState {
                 status,
                 reason: None,
+                subscription_status: None,
                 hint: None,
                 login_path: None,
                 observed_at: 100_000,

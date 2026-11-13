@@ -110,24 +110,36 @@ impl Metering for AnthropicMetering {
     }
 }
 
-/// 組織ごと OAuth を断る 403 の本文か (実測 2026-09-09、DR-0009 追補)。
+/// 組織ごと OAuth を断る 403 の本文か (実測 2026-09-09 / 2026-11-13、
+/// DR-0009 追補)。
 ///
 /// ```json
 /// {"type":"error","error":{"type":"permission_error",
-///  "message":"OAuth authentication is currently not allowed for this organization."}}
+///  "message":"OAuth authentication is currently not allowed for this organization.",
+///  "details":{"error_visibility":"user_facing",
+///             "error_code":"oauth_not_allowed_for_organization"}}}
 /// ```
 ///
-/// 文言は前方一致で見る。組織名や案内の続きが後ろに足されても、頭は
-/// 「この組織では OAuth 認証が許可されていない」の 1 文で始まる。
-/// `permission_error` だけでは足りない — 同じ型で「この API を使う権限が
-/// ない」も返り、そちらは待っても直らない。
+/// 機械向けの符号 (`details.error_code`) があればそれで決める。人向けの
+/// 文言より言い回しの変更に強い。符号が付いていればそれだけで決め、文言は
+/// 見ない — 符号が別の値なら、文言が似ていても別の断りとして扱う。
+///
+/// 符号が無い本文 (2026-09-09 の実測はこちら) は文言で見る。前方一致にする
+/// のは、組織名や案内の続きが後ろに足されても、頭は「この組織では OAuth
+/// 認証が許可されていない」の 1 文で始まるため。`permission_error` だけでは
+/// 足りない — 同じ型で「この API を使う権限がない」も返り、そちらは待っても
+/// 直らない。
 fn org_not_allowed(body: &[u8]) -> bool {
+    const ERROR_CODE: &str = "oauth_not_allowed_for_organization";
     const PREFIX: &str = "OAuth authentication is currently not allowed";
 
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
     let error = &value["error"];
+    if let Some(code) = error["details"]["error_code"].as_str() {
+        return code == ERROR_CODE;
+    }
     error["type"] == "permission_error"
         && error["message"]
             .as_str()
@@ -870,6 +882,39 @@ mod tests {
             rejection(403, &Headers::default(), FABLE),
             None,
             "a 403 whose body could not be read says nothing"
+        );
+    }
+
+    /// 機械向けの符号が付いた本文 (実測 2026-11-13) も組織ごとの断りとして読む。
+    #[test]
+    fn an_org_refusal_with_an_error_code_holds_the_whole_route() {
+        let body = br#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_visibility":"user_facing","error_code":"oauth_not_allowed_for_organization"}},"request_id":"req_x"}"#;
+        assert_eq!(
+            AnthropicMetering
+                .rejection(403, &Headers::default(), Some(body), FABLE, NOW)
+                .map(|denial| denial.reason),
+            Some(Reason::OrgNotAllowed)
+        );
+    }
+
+    /// 符号があれば文言より符号を信じる。文言が変わっても符号で分かり、
+    /// 文言が同じでも符号が違えば別の断り。
+    #[test]
+    fn the_error_code_decides_over_the_message() {
+        let reworded = br#"{"type":"error","error":{"type":"permission_error","message":"OAuth is disabled for your organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#;
+        assert_eq!(
+            AnthropicMetering
+                .rejection(403, &Headers::default(), Some(reworded), FABLE, NOW)
+                .map(|denial| denial.reason),
+            Some(Reason::OrgNotAllowed),
+            "a reworded message is still recognized by its code"
+        );
+
+        let other_code = br#"{"type":"error","error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"some_other_refusal"}}}"#;
+        assert_eq!(
+            AnthropicMetering.rejection(403, &Headers::default(), Some(other_code), FABLE, NOW),
+            None,
+            "a different code is a different refusal"
         );
     }
 

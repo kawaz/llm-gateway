@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::credential::Credential;
-use crate::denial::{Availability, Denial, Probing, RouteState, Scope};
+use crate::denial::{Availability, Denial, Probing, RouteState, Scope, Standing};
 use crate::egress::{
     BoxFuture, EgressRequest, EncodedRequest, Headers, RequestShape, Response, UpstreamRequest,
 };
@@ -184,6 +184,19 @@ pub trait QuotaApi: Send + Sync {
     fn probe_request(&self) -> Option<ProbeRequest>;
 }
 
+/// 組織ごと断られた理由を上流に聞く任意 capability。
+///
+/// 断りの応答は「この組織には許可されていない」までしか言わない。口座の
+/// 状態を別の口で答える upstream なら、それを聞いて理由の手掛かりにする。
+/// どの口に聞き、どの値が何を意味するかは方言の知識なので provider が持つ。
+pub trait AccountApi: Send + Sync {
+    fn standing<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        credential: &'a Credential,
+    ) -> BoxFuture<'a, Result<Standing>>;
+}
+
 /// 枠ヘッダを引き出すための 1 本 (DR-0007)。
 #[derive(Debug, Clone)]
 pub struct ProbeRequest {
@@ -237,6 +250,7 @@ pub struct Preset {
     metering: Arc<dyn Metering>,
     response_admission: Option<Arc<dyn ResponseAdmission>>,
     quota_api: Option<Arc<dyn QuotaApi>>,
+    account_api: Option<Arc<dyn AccountApi>>,
     negotiation: Option<Arc<dyn Negotiation>>,
     /// まだ何も観測していないときに、枠について言えること。
     unobserved: Support,
@@ -260,6 +274,7 @@ impl Preset {
             metering,
             response_admission: None,
             quota_api: None,
+            account_api: None,
             negotiation: None,
             // 何も宣言しない経路について言えることは無い。「取れない」と
             // 断じるのも「まだ観測していない」と言うのも、こちらの推測になる。
@@ -287,6 +302,11 @@ impl Preset {
 
     pub fn with_quota_api(mut self, quota_api: Arc<dyn QuotaApi>) -> Self {
         self.quota_api = Some(quota_api);
+        self
+    }
+
+    pub fn with_account_api(mut self, account_api: Arc<dyn AccountApi>) -> Self {
+        self.account_api = Some(account_api);
         self
     }
 
@@ -340,6 +360,10 @@ impl Preset {
         self.quota_api.as_deref()
     }
 
+    pub fn account_api(&self) -> Option<&dyn AccountApi> {
+        self.account_api.as_deref()
+    }
+
     pub fn negotiation(&self) -> Option<&dyn Negotiation> {
         self.negotiation.as_deref()
     }
@@ -388,6 +412,24 @@ impl Preset {
     /// 組織ごと断られているか。断られているなら、空ける時刻。
     pub fn org_not_allowed(&self, now: i64) -> Option<i64> {
         self.state.org_not_allowed(now)
+    }
+
+    /// 期限 `until` の組織ごとの締め出しについて、理由を聞きに行く役を
+    /// 引き受ける。
+    ///
+    /// 聞く口 ([`AccountApi`]) を持たない経路では引き受けない。
+    pub fn claim_standing_check(&self, until: i64, now: i64) -> bool {
+        self.account_api.is_some() && self.state.claim_standing_check(until, now)
+    }
+
+    /// 期限 `until` の締め出しについて聞けた答えを控える。
+    pub fn record_standing(&self, until: i64, standing: Standing) {
+        self.state.record_standing(until, standing);
+    }
+
+    /// 今効いている組織ごとの締め出しについて、聞けた答え。
+    pub fn standing_of_org(&self, now: i64) -> Option<Standing> {
+        self.state.standing_of_org(now)
     }
 
     /// 現在有効な締め出しの印。
@@ -474,6 +516,7 @@ impl std::fmt::Debug for Preset {
         f.debug_struct("Preset")
             .field("name", &self.name)
             .field("quota_api", &self.quota_api.is_some())
+            .field("account_api", &self.account_api.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -836,5 +879,30 @@ mod tests {
                 .claim_probe(NOW + crate::denial::PROBE_INTERVAL)
                 .is_none()
         );
+    }
+
+    /// 理由を答える口があれば、組織ごとの締め出しにつき 1 度聞きに行く。
+    struct StubAccountApi;
+
+    impl AccountApi for StubAccountApi {
+        fn standing<'a>(
+            &'a self,
+            _http: &'a reqwest::Client,
+            _credential: &'a Credential,
+        ) -> BoxFuture<'a, Result<Standing>> {
+            Box::pin(async { Ok(Standing::default()) })
+        }
+    }
+
+    /// 理由を答える口が無い経路 (Bedrock など) は、組織ごとに断られても
+    /// 聞きに行かない。「無い」は型に出ているので、設定の種別は見ない。
+    #[test]
+    fn only_a_route_that_can_answer_asks_why_the_org_is_refused() {
+        let until = NOW + crate::denial::ORG_NOT_ALLOWED_COOLDOWN;
+        assert!(preset().account_api().is_none());
+        assert!(!preset().claim_standing_check(until, NOW));
+
+        let asking = preset().with_account_api(Arc::new(StubAccountApi));
+        assert!(asking.claim_standing_check(until, NOW));
     }
 }

@@ -964,6 +964,7 @@ mod tests {
         credential.auth = Some(AuthState {
             status: AuthStatus::ReloginRequired,
             reason: Some("run `llm-gateway login --type claude_oauth a`".to_owned()),
+            subscription_status: None,
             hint: None,
             login_path: None,
             observed_at: NOW,
@@ -987,6 +988,7 @@ mod tests {
         credential.auth = Some(AuthState {
             status: AuthStatus::OrgNotAllowed,
             reason: Some("the login still works, but the upstream refuses it".to_owned()),
+            subscription_status: None,
             hint: Some("an inactive subscription is one cause; check the account".to_owned()),
             login_path: None,
             observed_at: NOW,
@@ -1007,6 +1009,7 @@ mod tests {
         credential.auth = Some(AuthState {
             status: AuthStatus::Ok,
             reason: None,
+            subscription_status: None,
             hint: None,
             login_path: None,
             observed_at: NOW,

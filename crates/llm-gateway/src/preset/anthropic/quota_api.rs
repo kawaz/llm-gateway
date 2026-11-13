@@ -20,12 +20,6 @@ use crate::provider::{ProbeRequest, QuotaApi};
 use crate::quota::QuotaLimit;
 use crate::{Error, Result};
 
-/// 問い合わせを諦めるまで。
-///
-/// 利用状況の一覧は人が見て待つ画面なので、上限を短く切る。相手が黙っていても
-/// 他の credential の分まで返らなくなることはない。
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// 使い切ったとみなす使用率。
 const EXHAUSTED: f64 = 100.0;
 
@@ -131,39 +125,7 @@ async fn fetch(
     base_url: &str,
     credential: &Credential,
 ) -> Option<Vec<QuotaLimit>> {
-    let url = format!("{}/api/oauth/usage", base_url.trim_end_matches('/'));
-    let resp = http
-        .get(&url)
-        .header("authorization", credential.bearer())
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("anthropic-version", "2023-06-01")
-        .timeout(TIMEOUT)
-        .send()
-        .await;
-
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(credential = %credential.id, %e, "cannot query the quota");
-            return None;
-        }
-    };
-    let status = resp.status();
-    let body = match resp.text().await {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::warn!(credential = %credential.id, %e, "cannot read the quota response");
-            return None;
-        }
-    };
-    if !status.is_success() {
-        tracing::warn!(
-            credential = %credential.id,
-            status = status.as_u16(),
-            "failed to query quota"
-        );
-        return None;
-    }
+    let body = super::oauth_get(http, base_url, "/api/oauth/usage", credential).await?;
     parse(&body)
 }
 

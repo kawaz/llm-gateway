@@ -8,6 +8,7 @@
 //! 内部正規形が Anthropic Messages 形式 (DR-0014 §5) なので、この Wire の
 //! 変換は「接続先と付随ヘッダを合わせる」だけで済む。
 
+mod account_api;
 mod auth;
 pub mod beta;
 mod metering;
@@ -17,14 +18,70 @@ mod wire;
 
 use std::sync::Arc;
 
+pub use account_api::OauthProfile;
 pub use auth::OauthBearer;
 pub use metering::AnthropicMetering;
 pub use negotiation::BetaFlags;
 pub use quota_api::OauthUsage;
 pub use wire::AnthropicWire;
 
+use crate::credential::Credential;
 use crate::provider::Preset;
 use crate::quota::Support;
+
+/// OAuth の照会口 (`/api/oauth/*`) に聞くのを諦めるまで。
+///
+/// 枠照会は人が見て待つ利用状況の一覧から呼ばれるので、上限を短く切る。
+/// 相手が黙っていても他の credential の分まで返らなくなることはない。
+const OAUTH_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// OAuth の照会口に GET で聞き、成功した応答の本文を返す。
+///
+/// 照会口はどれも公開ドキュメントに無いので、届かない・失敗した・本文が
+/// 読めないものは**情報なし** (`None`) に落とし、gateway の他の動きを
+/// 巻き込まない。何が起きたかはログに残す。
+async fn oauth_get(
+    http: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+    credential: &Credential,
+) -> Option<String> {
+    let url = format!("{}{path}", base_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .header("authorization", credential.bearer())
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .timeout(OAUTH_GET_TIMEOUT)
+        .send()
+        .await;
+
+    let resp = match resp {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(credential = %credential.id, path, %e, "cannot reach the OAuth endpoint");
+            return None;
+        }
+    };
+    let status = resp.status();
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::warn!(credential = %credential.id, path, %e, "cannot read the OAuth endpoint response");
+            return None;
+        }
+    };
+    if !status.is_success() {
+        tracing::warn!(
+            credential = %credential.id,
+            path,
+            status = status.as_u16(),
+            "the OAuth endpoint refused the query"
+        );
+        return None;
+    }
+    Some(body)
+}
 
 /// 枠の呼び名から、その枠が回る周期 (秒) を起こす (DR-0018 §6)。
 ///
@@ -49,11 +106,12 @@ fn window_seconds(kind: &str) -> Option<u64> {
 /// Anthropic 公式の preset。
 ///
 /// サブスクの OAuth token をそのまま載せ、トークンを消費しない枠照会 API を
-/// 持つ (DR-0007)。beta フラグは公式なら全部通るので、既定は素通し。
+/// 持つ (DR-0007)。組織ごと断られたときに理由を聞く口 (profile) も持つ。beta フラグは公式なら全部通るので、既定は素通し。
 ///
 /// 枠は応答ヘッダに載るので、まだ観測が無い状態は「取れるがまだ」と言える。
 pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
     let quota_api = OauthUsage::new(wire.base_url());
+    let account_api = OauthProfile::new(wire.base_url());
     Preset::new(
         name,
         Arc::new(OauthBearer::new(name)),
@@ -61,6 +119,7 @@ pub fn official(name: &str, wire: Arc<AnthropicWire>) -> Preset {
         Arc::new(AnthropicMetering),
     )
     .with_quota_api(Arc::new(quota_api))
+    .with_account_api(Arc::new(account_api))
     .with_negotiation(Arc::new(BetaFlags::new(beta::Policy::Passthrough)))
     .with_quota_support(Support::Unobserved)
 }
@@ -94,6 +153,12 @@ mod tests {
             Support::Unobserved,
             "quota rides on the response headers, so using it makes it visible"
         );
+    }
+
+    /// 公式は、組織ごと断られた理由を聞ける口も持つ。
+    #[test]
+    fn official_can_ask_why_the_org_is_refused() {
+        assert!(official("claude-personal", wire()).account_api().is_some());
     }
 
     /// モデル別の週の枠を使い切った 429 は、応答の窓が `allowed` のままで

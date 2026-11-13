@@ -919,8 +919,11 @@ components:
         reason:
           description: "[code] 状態の理由 (英語)"
           type: string
+        subscription_status:
+          description: "[code][observed] `org_not_allowed` の理由を確かめるために上流 (Claude の `/api/oauth/profile`) に聞けたサブスクリプションの状態。上流の語のまま (例: `past_due` = 支払いが滞っている)。締め出しが付いた時に 1 度だけ聞き、その締め出しが続く間だけ出る。聞けなかった時・聞く口の無い経路では欄ごと出ない"
+          type: string
         hint:
-          description: "[code] 観測から推し量れる原因と確かめ方 (推定)。推定を持たない状態では欄ごと出ない"
+          description: "[code] 観測から言える対処 (英語)。`org_not_allowed` で `subscription_status` が `past_due` なら未払いの請求を払う先 (上流が返した URL) を示し、それ以外は原因の推定と確かめ方。推定を持たない状態では欄ごと出ない"
           type: string
         login_path:
           description: "[code] `relogin_required` で、認証情報が Web login に対応している時だけ出る、ログインのページの相対パス (`/llm-gateway/login/<name>/start`)"

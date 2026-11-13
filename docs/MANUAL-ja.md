@@ -556,7 +556,7 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/usage?refresh=true'
 }
 ```
 
-`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`auth` は経路が使う認証情報の状態。`claude_oauth` の `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの相対パスが入る (パスに入るのは認証情報の名前で、経路の名前ではない)。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、ログイン自体は生きているので `login_path` は付かず、原因の推定 (サブスクリプションの停止はその一例) が `auth.hint` に入る。
+`denials` は gateway が現在控えている締め出しと、その理由・範囲 (DR-0020)。`limits` は枠照会 API から聞いた枠で、応答ヘッダ由来の `snapshot` とは別物として持つ (同じ枠を指すとは限らない)。値が取れない欄は出力ごと省かれる。`auth` は経路が使う認証情報の状態。`claude_oauth` の `auth.status` が `relogin_required` のときは、`auth.login_path` に Web login ページの相対パスが入る (パスに入るのは認証情報の名前で、経路の名前ではない)。組織ごと OAuth の利用を断られているときは `org_not_allowed` で、ログイン自体は生きているので `login_path` は付かない。断りの応答は理由を持たないので、締め出しが付いた時に 1 度だけ上流 (Claude の `/api/oauth/profile`) にサブスクリプションの状態を聞き、聞けたら `auth.subscription_status` に上流の語のまま入れる (例: `past_due` は支払いが滞っている)。`past_due` なら `auth.hint` は未払いの請求を払う先を示し、聞けなかった時やそれ以外の値では原因の推定 (サブスクリプションの停止はその一例) が入る。聞くかどうかで締め出しの長さは変わらない。
 
 ### `GET /llm-gateway/status`
 
