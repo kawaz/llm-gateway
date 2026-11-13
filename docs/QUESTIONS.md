@@ -18,8 +18,39 @@
 
 ## 裁定待ち
 
-（現在なし）
+### LM-Q1 長い busy の締め出しも 1 時間ごとの枠照会の対象にするか
+
+窓を伴わない 429 (Fable の週の枠切れ等) は `retry-after` で数日先までの `busy` になる。`claim_probe` は `limited` の締め出しにしか定期の枠照会を立てないので、`limited` の印が無い状況 (その場の照会が失敗した、照会直後に枠が尽きた) では外でリセットされても `retry-after` まで残る。枠照会はトークンを使わない。DR-0009 の「定期の様子見は上限で締め出している経路にだけ立てる」の変更になる。関係: [denial.rs の claim_probe](../crates/llm-gateway/src/denial.rs)
+
+- [ ] a: 残り期限が `PROBE_INTERVAL` (1 時間) より先の `busy` も定期照会の対象にする (統括推し。増えるのはトークンを使わない照会が 1 時間に 1 回)
+- [ ] b: 今のまま (再起動か日曜で解ける)
+
+### LM-Q2 components で絞っている source で、紐づきの無い incident (scope=page) を表示するか
+
+OpenAI の incident は components を持たないので、`components = ["Responses"]` で絞ると incident が全部落ちて 1 件も出ない。DR-0021 は「参考表示できる、severity は上げない」としか決めていない。
+
+- [ ] a: 絞り込み中でも `scope = "page"` の incident は表示する (統括推し。severity は components から決まるので警告レベルは上がらない。Codex と無関係な障害も並ぶ)
+- [ ] b: 今のまま (絞り込み中は紐づきの無い incident を出さない)
+
+### LM-Q3 DR-0043 の「署名を求めない口」から未実装の hooks/jwks を書き分けるか
+
+DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed で router に無い) を署名を求めない口として挙げている。
+
+- [ ] a: 「DR-0041 を実装したら hooks/jwks もこちら」と書き分ける (統括推し)
+- [ ] b: 決定 2 は変えず、DR 末尾に「hooks/jwks は DR-0041 (Proposed) の口で現時点で router に無い」の 1 行だけ足す
+
+### LM-Q4 usage の型名と JSON 欄名を「経路」に合わせるか
+
+`/llm-gateway/usage` の 1 件は経路 (`[routes.<name>]`) ごとだが、型は `CredentialUsage`、JSON の欄は `credentials`。コメントと MANUAL は「経路ごと」に直してある。
+
+- [ ] a: 型名と JSON 欄名を経路の語に変える (読む側 = ccmsg 等の追従が要る)
+- [ ] b: 型名だけ変え、JSON 欄名は据え置く
+- [ ] c: 今のまま
 
 ## 確認待ち
 
-（現在なし）
+### LM-C1 zunsystem アカウントの OAuth 利用が組織として断られている
+
+2026-11-13 09:30 JST ごろから claude-zunsystem の実リクエスト・モデル一覧・枠照会が 403 (組織が OAuth の利用を許していない) で断られている。gateway 側では原因を観測できない。
+
+- [ ] a: claude.ai の zunsystem アカウントで、サブスクリプション・支払い・組織の設定 (Claude Code / OAuth の利用) を確かめた
