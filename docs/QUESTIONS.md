@@ -54,15 +54,6 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 - [ ] a: `active` のときは hint からサブスクリプションの話を外す (統括推し。原因が契約の外にあると分かっているので)
 - [ ] b: 今のまま
 
-### DS-Q3 監督者が落ちた後に残った子を、次の監督者がどう止めるか
-
-対象は kawaz 製 CLI 共通の標準 (正本は claude-rules-personal の reference `cli-design/daemon-subcommands`)。直す案と、決まった点・統括が埋めた点の一覧は [/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/](/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/) の `daemon-subcommands.md` と `NOTES.md`。
-
-方針は決まった (kawaz 2026-11-14): 監督者がやるのは死活の監視だけ。残った子は役目を続け、次の監督者が気づいて、前のを止めて起こし直すか、情報を出す。unit が他の unit を知るために監督者へ問い合わせる設計は禁じる。残るのは止め方。llm-gateway の DR-0028 決定 11 は「引き取らない、人が畳む」で、理由は pid が使い回されて自分の子だと確かめられないこと。今の unit の制御口は停止の頼みを受けない (設定の読み直しと一時ダンプだけ)。
-
-- [ ] a: unit の制御口に停止を頼んで引き継ぐ。pid は使わない (制御口に答えるのは、その置き場を握っている本人だけ)。unit の制御口が停止の頼みを受けることを必須にする。答えない時は触らず、status に出す (統括推し。案はこの形で書いてある)
-- [ ] b: 次の監督者は止めない。status に出すだけにして、人が止める (今の llm-gateway の決まりのまま)
-
 ## 確認待ち
 
 （現在なし）
