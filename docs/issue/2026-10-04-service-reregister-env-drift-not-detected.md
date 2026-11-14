@@ -3,17 +3,6 @@ title: service register は XDG を plist に固定しているが、re-register
 status: open
 category: design
 created: 2026-10-04T14:00:00+09:00
-last_read: 2026-10-04T14:00:00+09:00
-open_entered: 2026-10-04T14:00:00+09:00
-wip_entered:
-blocked_entered:
-pending_entered:
-discarded_entered:
-resolved_entered:
-discard_reason:
-pending_reason:
-close_reason:
-blocked_by:
 ---
 
 # service register は XDG を plist に固定しているが、re-register で値が変わっても止まらず、client 側の検知も無い

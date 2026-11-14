@@ -3,17 +3,6 @@ title: 永続化の器を Store 層として責務で切り、file backend を�
 status: open
 category: design
 created: 2026-09-15T11:27:30+09:00
-last_read:
-open_entered: 2026-09-15T11:27:30+09:00
-wip_entered:
-blocked_entered:
-pending_entered:
-discarded_entered:
-resolved_entered:
-discard_reason:
-pending_reason:
-close_reason:
-blocked_by:
 origin: 自リポ TODO
 ---
 

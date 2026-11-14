@@ -3,17 +3,6 @@ title: stats / event で subagent 別・effort 別のコストを分離できる
 status: open
 category: request
 created: 2026-09-07T19:14:06+09:00
-last_read:
-open_entered: 2026-09-07T19:14:06+09:00
-wip_entered:
-blocked_entered:
-pending_entered:
-discarded_entered:
-resolved_entered:
-discard_reason:
-pending_reason:
-close_reason:
-blocked_by:
 origin: ccmsg
 ---
 

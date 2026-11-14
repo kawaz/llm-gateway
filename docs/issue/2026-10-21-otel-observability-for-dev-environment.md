@@ -3,17 +3,6 @@ title: 手元の開発全般で使う OpenTelemetry 観測基盤の検討 (Claud
 status: open
 category: design
 created: 2026-10-21T00:31:52+09:00
-last_read:
-open_entered: 2026-10-21T00:31:52+09:00
-wip_entered:
-blocked_entered:
-pending_entered:
-discarded_entered:
-resolved_entered:
-discard_reason:
-pending_reason:
-close_reason:
-blocked_by:
 origin: 自リポ TODO
 ---
 

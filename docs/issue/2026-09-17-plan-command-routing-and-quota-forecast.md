@@ -3,17 +3,6 @@ title: plan command — routing 解決 + quota forecast を pull 型で出す
 status: open
 category: design
 created: 2026-09-17T13:47:08+09:00
-last_read:
-open_entered: 2026-09-17T13:47:08+09:00
-wip_entered:
-blocked_entered:
-pending_entered:
-discarded_entered:
-resolved_entered:
-discard_reason:
-pending_reason:
-close_reason:
-blocked_by:
 origin: 自リポ TODO
 ---
 
