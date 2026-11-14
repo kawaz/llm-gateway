@@ -54,21 +54,14 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 - [ ] a: `active` のときは hint からサブスクリプションの話を外す (統括推し。原因が契約の外にあると分かっているので)
 - [ ] b: 今のまま
 
-### DS-Q3 監督者が落ちた時の子の扱いを、llm-gateway の決まりのまま標準に上げるか
+### DS-Q3 監督者が落ちた後に残った子を、次の監督者がどう止めるか
 
 対象は kawaz 製 CLI 共通の標準 (正本は claude-rules-personal の reference `cli-design/daemon-subcommands`)。直す案と、決まった点・統括が埋めた点の一覧は [/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/](/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/) の `daemon-subcommands.md` と `NOTES.md`。
 
-llm-gateway は DR-0028 決定 11 で決めてある: 行儀よく降りる時は子を道連れにする / 異常終了で消えた時は子が残る / 次の監督者は引き取らずに起こし直す (pid は使い回されるので、自分の子だと確かめられない) / 残った子は人が畳み、status にポートを握っている pid を出す。標準の文書にはこの決まりが無く、第三者レビューで「二重起動の保証が 1 つしか持てない kind にしか無い」と指摘された。
+方針は決まった (kawaz 2026-11-14): 監督者がやるのは死活の監視だけ。残った子は役目を続け、次の監督者が気づいて、前のを止めて起こし直すか、情報を出す。unit が他の unit を知るために監督者へ問い合わせる設計は禁じる。残るのは止め方。llm-gateway の DR-0028 決定 11 は「引き取らない、人が畳む」で、理由は pid が使い回されて自分の子だと確かめられないこと。今の unit の制御口は停止の頼みを受けない (設定の読み直しと一時ダンプだけ)。
 
-- [ ] a: この決まりをそのまま標準に上げる。加えて「同じ unit は同じ置き場で 2 つ上がらない」を、全 unit に対する保証として書く (統括推し)
-- [ ] b: 標準には書かず、ツールごとの DR に任せる
-
-### DS-Q4 enable / disable を入れた後、監督者が抱える unit の一覧を別に持つか
-
-`service stop` は一時的な停止にし、永続するのは `service enable` / `disable` だけにする (kawaz 裁定 2026-11-14)。そうなると「監督者の起動時に上げるか」は `enabled` で表せる。
-
-- [ ] a: 一覧を持たない。`units/` にある設定ファイルを全部 unit として扱い、上げるかどうかは `enabled` だけで決める。`service add` は disable の状態で作る (統括推し。悪い面: `service remove` が「一覧から外す」ではなくなり、設定ファイルを消すか退避するかを決める必要がある)
-- [ ] b: `units/supervise.<ext>` に一覧を持つ。一覧に無いファイルは unit として見ない (悪い面: 一覧と `enabled` の 2 段になり、「一覧にあるが disable」と「一覧に無い」の違いを説明する必要がある)
+- [ ] a: unit の制御口に停止を頼んで引き継ぐ。pid は使わない (制御口に答えるのは、その置き場を握っている本人だけ)。unit の制御口が停止の頼みを受けることを必須にする。答えない時は触らず、status に出す (統括推し。案はこの形で書いてある)
+- [ ] b: 次の監督者は止めない。status に出すだけにして、人が止める (今の llm-gateway の決まりのまま)
 
 ## 確認待ち
 
