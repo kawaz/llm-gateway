@@ -1,6 +1,6 @@
 ---
 title: request-dump-with-timeout (リクエスト本文の一時ダンプ)
-status: wip
+status: resolved
 category: request
 created: 2026-10-21T00:52:57+09:00
 last_read:
@@ -9,10 +9,10 @@ wip_entered: 2026-10-21T01:04:45+09:00
 blocked_entered:
 pending_entered:
 discarded_entered:
-resolved_entered:
+resolved_entered: 2026-11-14T20:12:01+09:00
 discard_reason:
 pending_reason:
-close_reason:
+close_reason: ["dr/DR-0038","implemented"]
 blocked_by:
 origin: 自リポ TODO
 ---

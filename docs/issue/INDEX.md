@@ -2,7 +2,6 @@
 
 | date | category | status | issue | 概要 |
 |---|---|---|---|---|
-| 2026-10-21 | request | wip | [request-dump-with-timeout](./2026-10-21-request-dump-with-timeout.md) | リクエスト本文の一時ダンプ。外部から時限で on/off、古いものは自動で片付け |
 | 2026-11-06 | bug | open | [openai-translation-rejects-non-text-system-blocks](./2026-11-06-openai-translation-rejects-non-text-system-blocks.md) | OpenAI 変換が text 以外の system block で request 全体を 400 で断る |
 | 2026-11-06 | design | open | [keychain-persistence-backend-for-credentials](./2026-11-06-keychain-persistence-backend-for-credentials.md) | credential の置き場に macOS keychain backend を足す (ACL で llm-gateway の binary だけに読ませる) |
 | 2026-10-21 | design | open | [otel-observability-for-dev-environment](./2026-10-21-otel-observability-for-dev-environment.md) | 手元の開発全般で使う OpenTelemetry 観測基盤の検討 (Claude Code の classifier 理由から着手) |
