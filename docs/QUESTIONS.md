@@ -60,4 +60,6 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 
 2026-11-14 の Release で `xcrun notarytool store-credentials` が 403 (`A required agreement is missing or has expired`) を返した。再実行では直らない。v0.70.8 (quinn-udp 0.5.16、RUSTSEC-2026-0538) は tag も brew も未公開で、stable は 0.70.7 のまま。同じ Apple ID で署名している他のリポのリリースも同じ理由で止まる。
 
-- [ ] a: https://developer.apple.com/account で同意待ちの契約を承認した (済んだら統括が失敗した Release を再実行し、brew upgrade と unit の入れ替えまで進める)
+同じ理由で、監督者の二重起動の修正 (`fix(daemon): 監督者は頼み口の lock を握れた時だけ上がり…`) も commit 済みのまま push を待たせている。常駐の監督者は brew 版なので、リリースが通って監督者を上げ直すまで、端末から `daemon supervise` を叩くと常駐側の頼み口を奪う状態が続く。
+
+- [ ] a: https://developer.apple.com/account で同意待ちの契約を承認した (済んだら統括が版を上げて push し、brew upgrade と unit・監督者の入れ替えまで進める)
