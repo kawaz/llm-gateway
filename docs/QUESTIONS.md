@@ -54,21 +54,9 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 - [ ] a: `active` のときは hint からサブスクリプションの話を外す (統括推し。原因が契約の外にあると分かっているので)
 - [ ] b: 今のまま
 
-### DS-Q1 daemon / service 標準で、全ツール同一にする範囲
-
-対象は kawaz 製 CLI 共通の標準 (正本は claude-rules-personal の reference `cli-design/daemon-subcommands`)。直す案は [/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/daemon-subcommands.md](/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/daemon-subcommands.md)。第三者レビューの最重要の指摘は「正本と言いながら、サブコマンドは削除可・field 名は自由・エラー種別は『相当』で、どこまで外すと標準から外れるのか判定できない」。
-
-- [ ] a: コマンド名と対象の指し方、引数なしの挙動、エラーの種別の語、核になる field 名 (`enabled` / `running` 等) を必須にする。reload や `--wait` は任意、それ以外の field 名は例示 (統括推し)
-- [ ] b: コマンド名と対象の指し方、引数なしの挙動だけを必須にし、出力の語は今のまま例示にとどめる
-
-### DS-Q2 監督者の restart_needed を何で立てるか
-
-監督者はツールと同じ binary なので、ツールを更新するたびに監督者の `restart_needed` が `true` になる。一方で標準は「監督者は滅多に上げ直さない」と教えており、表示と方針が食い違う (上げ直すと全 unit が同時に止まる)。
-
-- [ ] a: 版の違いでは立てず、CLI と監督者の頼み口の約束事が合わなくなった時だけ立てる。頼み口に約束事の版を持たせる (統括推し)
-- [ ] b: 今のまま版の違いで立て、help に「監督者は急いで上げ直さなくてよい」と書く
-
 ### DS-Q3 監督者が落ちた時の子の扱いを、llm-gateway の決まりのまま標準に上げるか
+
+対象は kawaz 製 CLI 共通の標準 (正本は claude-rules-personal の reference `cli-design/daemon-subcommands`)。直す案と、決まった点・統括が埋めた点の一覧は [/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/](/Users/kawaz/.local/share/repos/github.com/kawaz/llm-gateway/artifacts/cli-daemon-service-draft/) の `daemon-subcommands.md` と `NOTES.md`。
 
 llm-gateway は DR-0028 決定 11 で決めてある: 行儀よく降りる時は子を道連れにする / 異常終了で消えた時は子が残る / 次の監督者は引き取らずに起こし直す (pid は使い回されるので、自分の子だと確かめられない) / 残った子は人が畳み、status にポートを握っている pid を出す。標準の文書にはこの決まりが無く、第三者レビューで「二重起動の保証が 1 つしか持てない kind にしか無い」と指摘された。
 
