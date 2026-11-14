@@ -47,6 +47,17 @@ DR-0043 決定 2 と INDEX が `GET /llm-gateway/hooks/jwks` (DR-0041、Proposed
 - [ ] b: 型名だけ変え、JSON 欄名は据え置く
 - [ ] c: 今のまま
 
+### LM-Q5 締め出し中に subscription_status が active のとき、hint からサブスクリプションの話を外すか
+
+組織ごと断られた経路の `auth` は、`past_due` 以外では既定の hint (「an inactive subscription is one cause」) を出す。`subscription_status: active` と並ぶと、状態は有効なのに hint が停止を示唆する形になる。
+
+- [ ] a: `active` のときは hint からサブスクリプションの話を外す (統括推し。原因が契約の外にあると分かっているので)
+- [ ] b: 今のまま
+
 ## 確認待ち
 
-（現在なし）
+### LM-C2 Apple Developer の契約への同意 (v0.70.8 のリリースが notarize で止まっている)
+
+2026-11-14 の Release で `xcrun notarytool store-credentials` が 403 (`A required agreement is missing or has expired`) を返した。再実行では直らない。v0.70.8 (quinn-udp 0.5.16、RUSTSEC-2026-0538) は tag も brew も未公開で、stable は 0.70.7 のまま。同じ Apple ID で署名している他のリポのリリースも同じ理由で止まる。
+
+- [ ] a: https://developer.apple.com/account で同意待ちの契約を承認した (済んだら統括が失敗した Release を再実行し、brew upgrade と unit の入れ替えまで進める)
