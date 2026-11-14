@@ -21,11 +21,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use crate::daemon::port;
 use crate::daemon::protocol::{
     self, ControlRequest, DumpRelay, LogLine, Reloaded, Request, UnitStatus, Which,
 };
 use crate::daemon::registry::{Registry, Unit};
+use crate::daemon::{port, socket};
 
 /// 落ちた子を起こし直すまでの、最初の間。
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
@@ -160,6 +160,50 @@ impl From<crate::daemon::registry::Error> for Refused {
 
 type Answer = Result<serde_json::Value, Refused>;
 
+/// 監督を始められなかった理由。
+#[derive(Debug)]
+pub enum NotStarted {
+    /// 同じ頼み口を、既に別の監督者が持っている。先に居る方には何も触れていない。
+    AlreadyRunning(String),
+    /// 置き場を作れない・開けない等、それ以外。
+    Failed(String),
+}
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// 開いている頼み口。持っている間 `<socket>.lock` を握り続け、同じ頼み口を開こうと
+/// する他の監督者を締め出す。
+///
+/// 落とすと、自分が開いた socket ファイルだけを消してから lock を外す。同じ path に
+/// 別の者が置いた socket は消さない。
+struct Listening {
+    listener: UnixListener,
+    path: PathBuf,
+    /// bind した socket ファイル (device, inode)。消す時に比べる。
+    file: (u64, u64),
+    /// 脇の `<socket>.lock` の flock。外れるのは socket を消した後 (欄は `drop` の
+    /// 本体の後で落ちる)。
+    _lock: std::fs::File,
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+
+        let ours = std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|meta| (meta.dev(), meta.ino()) == self.file);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 impl Supervisor {
     pub fn new(
         registry: Registry,
@@ -185,55 +229,88 @@ impl Supervisor {
     ///
     /// 先に socket を開いてから子を起こす。逆にすると、起きた直後に来た
     /// 頼みが「監督者が居ない」と断られる。
-    pub async fn supervise(self: &Arc<Self>) -> Result<(), String> {
-        let listener = self.listen()?;
+    ///
+    /// 頼み口を開けなければ、台には何も触れずに戻る (既に別の監督者が居るなら
+    /// [`NotStarted::AlreadyRunning`])。
+    pub async fn supervise(self: &Arc<Self>) -> Result<(), NotStarted> {
+        let socket = self.listen()?;
         self.reload().await;
 
-        let stopped = self.serve(listener);
-        tokio::pin!(stopped);
-        tokio::select! {
-            _ = &mut stopped => {}
-            _ = terminated() => {}
-        }
+        let mut serving = Box::pin(self.serve(socket));
+        let stopped = tokio::select! {
+            socket = &mut serving => Some(socket),
+            _ = terminated() => None,
+        };
 
         self.shutdown().await;
-        let _ = std::fs::remove_file(&self.socket);
+        // 頼み口と lock は、子を畳み終えてから手放す。先に手放すと、降りている間に
+        // 上がった次の監督者が同じ台を起こし、待ち受けポートを取り合う。
+        drop(stopped);
+        drop(serving);
         Ok(())
     }
 
-    /// 待ち受けを開く。
+    /// 頼み口を開く。
     ///
-    /// 前回の残骸があれば消してから開く。消さないと `Address already in use`
-    /// になり、監督者が二度と上がらない。同時に 2 つ上がるのを止めているのは
-    /// OS への登録が 1 つであること (DR-0028 決定 7)。
-    fn listen(&self) -> Result<UnixListener, String> {
+    /// 同じ頼み口を持つ監督者は同時に 1 つだけ (DR-0028 決定 7)。脇の
+    /// `<socket>.lock` を握れた時だけ進み、握れなければ先に居る監督者の socket に
+    /// 触れずに断る。握れた後で、前回落ちた監督者の残骸 (誰も待っていない socket) を
+    /// 消してから開く。残骸を消さないと `Address already in use` になり、監督者が
+    /// 二度と上がらない。lock を知らない古い版の監督者が待っている socket も、消さずに断る。
+    fn listen(&self) -> Result<Listening, NotStarted> {
         if let Some(dir) = self.socket.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+            std::fs::create_dir_all(dir).map_err(|e| {
+                NotStarted::Failed(format!("could not make {}: {e}", dir.display()))
+            })?;
         }
-        let _ = std::fs::remove_file(&self.socket);
-        let listener = UnixListener::bind(&self.socket)
-            .map_err(|e| format!("could not listen on {}: {e}", self.socket.display()))?;
+        let refused = |e: std::io::Error| match e.kind() {
+            std::io::ErrorKind::AddrInUse => {
+                NotStarted::AlreadyRunning(format!("another supervisor is already running ({e})"))
+            }
+            _ => NotStarted::Failed(format!(
+                "could not listen on {}: {e}",
+                self.socket.display()
+            )),
+        };
+        let lock = socket::hold(&self.socket).map_err(refused)?;
+        socket::clear_stale(&self.socket).map_err(refused)?;
+        let listener = UnixListener::bind(&self.socket).map_err(refused)?;
 
         // 頼めば台が動く口なので、他の利用者には開けない。
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&self.socket, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("could not close {} to others: {e}", self.socket.display()))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::fs::set_permissions(&self.socket, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                NotStarted::Failed(format!(
+                    "could not close {} to others: {e}",
+                    self.socket.display()
+                ))
+            },
+        )?;
+        let meta = std::fs::symlink_metadata(&self.socket).map_err(|e| {
+            NotStarted::Failed(format!("could not read {}: {e}", self.socket.display()))
+        })?;
 
         tracing::info!(socket = %self.socket.display(), "supervising");
-        Ok(listener)
+        Ok(Listening {
+            listener,
+            path: self.socket.clone(),
+            file: (meta.dev(), meta.ino()),
+            _lock: lock,
+        })
     }
 
-    async fn serve(self: &Arc<Self>, listener: UnixListener) {
+    /// 頼みを受け続ける。受けられなくなったら、開いていた頼み口を返す (手放す時機は
+    /// 呼んだ側が決める)。
+    async fn serve(self: &Arc<Self>, socket: Listening) -> Listening {
         loop {
-            match listener.accept().await {
+            match socket.listener.accept().await {
                 Ok((stream, _)) => {
                     let me = Arc::clone(self);
                     tokio::spawn(async move { me.answer(stream).await });
                 }
                 Err(e) => {
                     tracing::error!(%e, "stopped accepting requests");
-                    return;
+                    return socket;
                 }
             }
         }
@@ -1393,6 +1470,7 @@ async fn terminated() {
 mod tests {
     use super::*;
     use crate::daemon::registry::Unit;
+    use std::os::unix::fs::MetadataExt;
 
     /// 子の代わりに走らせる小さな実行ファイル。
     ///
@@ -2549,5 +2627,150 @@ mod tests {
 
         let value = Refused::new("unit_required", "say which").to_json();
         assert_eq!(value["error"].get("unit"), None);
+    }
+
+    /// 同じ頼み口を見る、もう 1 つの監督者 (別の端末で `daemon supervise` を叩いた形)。
+    fn another_supervisor(world: &World) -> Arc<Supervisor> {
+        Arc::new(Supervisor::new(
+            world.registry.clone(),
+            world.root.join("logs"),
+            world.root.join("supervisor.sock"),
+            world.root.join("control"),
+            PROBE,
+        ))
+    }
+
+    /// 既に監督者が居る頼み口で 2 つ目を起こしても、2 つ目は断られ、台にも先に居る方の
+    /// 頼み口にも触れない。2 つ目が終わった後も、頼みは先に居る方に届き続ける。
+    #[tokio::test]
+    async fn a_second_supervisor_is_refused_and_leaves_the_first_alone() {
+        let world = world();
+        // 起こされたら 1 行書いてすぐ終わる台。起こされたかはログの有無で分かる。
+        let binary = fake_binary(&world.root, "quick", "echo up");
+        world.register("stable", &binary, true);
+        let socket = world.root.join("supervisor.sock");
+
+        let listener = world.supervisor.listen().unwrap();
+        let serving = Arc::clone(&world.supervisor);
+        let accepting = tokio::spawn(async move { serving.serve(listener).await });
+        let before = std::fs::symlink_metadata(&socket).unwrap();
+
+        let second = another_supervisor(&world);
+        let refused = tokio::time::timeout(Duration::from_secs(5), second.supervise())
+            .await
+            .expect("the second one returns at once instead of supervising");
+        match refused {
+            Err(NotStarted::AlreadyRunning(message)) => {
+                assert!(message.contains("already running"), "{message}");
+            }
+            other => panic!("expected to be refused as already running: {other:?}"),
+        }
+
+        // 2 つ目は台を起こしていない。
+        let log = protocol::log_path(&world.root.join("logs"), "stable");
+        assert!(!log.exists(), "the refused supervisor started a unit");
+        // 頼み口は先に居る方のもののまま (消されも置き換えられもしていない)。
+        let after = std::fs::symlink_metadata(&socket).expect("the socket is still there");
+        assert_eq!(
+            (before.dev(), before.ino()),
+            (after.dev(), after.ino()),
+            "the socket was replaced"
+        );
+        drop(second);
+        let answer = protocol::ask(&socket, &Request::Status(Which::all()))
+            .await
+            .expect("the first one still answers");
+        let value: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(value["units"][0]["unit"], serde_json::json!("stable"));
+
+        accepting.abort();
+        world.supervisor.shutdown().await;
+    }
+
+    /// 同時に 2 つが頼み口を開こうとしても、開けるのは片方だけ。もう片方は
+    /// 断られ、開いた側には頼みが届く。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_supervisors_racing_for_one_socket_do_not_both_open_it() {
+        let world = world();
+        for round in 0..50 {
+            // 回ごとに別の頼み口。前の回の勝者が手放した lock は、同じバイナリの別の試験が
+            // 起こした子 (fork から exec までの間) がまだ写しを持っていることがある。
+            let socket = world.root.join(format!("supervisor-{round}.sock"));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let racers: Vec<_> = (0..2)
+                .map(|_| {
+                    let supervisor = Arc::new(Supervisor::new(
+                        world.registry.clone(),
+                        world.root.join("logs"),
+                        socket.clone(),
+                        world.root.join("control"),
+                        PROBE,
+                    ));
+                    let barrier = Arc::clone(&barrier);
+                    tokio::task::spawn_blocking(move || {
+                        barrier.wait();
+                        supervisor.listen()
+                    })
+                })
+                .collect();
+            let mut opened = Vec::new();
+            let mut refused = Vec::new();
+            for racer in racers {
+                match racer.await.unwrap() {
+                    Ok(listening) => opened.push(listening),
+                    Err(e) => refused.push(e),
+                }
+            }
+            assert_eq!(opened.len(), 1, "round {round}: {refused:?}");
+            assert!(
+                matches!(refused.as_slice(), [NotStarted::AlreadyRunning(_)]),
+                "round {round}: {refused:?}"
+            );
+            tokio::net::UnixStream::connect(&socket)
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: the winner listens: {e}"));
+            drop(opened);
+        }
+    }
+
+    /// lock を知らない監督者 (古い版) が待っている頼み口は、lock を握れても奪わない。
+    #[tokio::test]
+    async fn a_socket_an_older_supervisor_listens_on_is_not_taken() {
+        let world = world();
+        let socket = world.root.join("supervisor.sock");
+        let older = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        match world.supervisor.listen() {
+            Err(NotStarted::AlreadyRunning(message)) => {
+                assert!(message.contains("listening"), "{message}");
+            }
+            other => panic!(
+                "expected to be refused as already running: {:?}",
+                other.err()
+            ),
+        }
+        assert!(socket.exists(), "the older one's socket stays");
+        drop(older);
+    }
+
+    /// 頼み口を開けない置き場 (ディレクトリであるべき所がファイル) は、既に居る
+    /// 監督者とは別の失敗として言う。
+    #[test]
+    fn a_place_that_cannot_hold_the_socket_is_a_plain_failure() {
+        let world = world();
+        std::fs::write(world.root.join("file"), "").unwrap();
+        let supervisor = Supervisor::new(
+            world.registry.clone(),
+            world.root.join("logs"),
+            world.root.join("file").join("supervisor.sock"),
+            world.root.join("control"),
+            PROBE,
+        );
+        match supervisor.listen() {
+            Err(e @ NotStarted::Failed(_)) => {
+                assert!(e.to_string().contains("could not make"), "{e}");
+            }
+            other => panic!("expected a plain failure: {:?}", other.err()),
+        }
     }
 }

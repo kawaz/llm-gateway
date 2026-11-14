@@ -8,9 +8,10 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use gateway_core::daemon::socket::{clear_stale, hold};
 use tokio::net::{UnixListener, UnixStream};
 
 /// 開いている運用系の口。落とすと socket ファイルも消す。
@@ -40,7 +41,8 @@ impl OperationsSocket {
     ///
     /// 脇の `<path>.lock` を flock で握れた時だけ進む (握れなければ別の台がこの path を
     /// 開いている)。握った後で、前回の残骸 (誰も待っていない socket) を消してから開く。
-    /// socket でないファイルと、誰かが待っている socket は消さずに断る。
+    /// socket でないファイルと、誰かが待っている socket は消さずに断る
+    /// (監督者の頼み口と同じ流儀、[`gateway_core::daemon::socket`])。
     pub fn bind(path: &Path) -> io::Result<Self> {
         // SAFETY: geteuid は引数を取らず、失敗しない。
         let owner = unsafe { libc::geteuid() };
@@ -143,72 +145,10 @@ fn check_dir(uid: libc::uid_t, mode: u32, owner: libc::uid_t) -> Result<(), Stri
     Ok(())
 }
 
-/// `<path>.lock` を握る。握れなければ (別の台がこの path を開いている) `AddrInUse`。
-/// 待たないのは、握っている台は開いている間ずっと離さないため。`.lock` は消さない
-/// (消して作り直すと、握っている側と後から来た側が別のファイルを見て締め出しが破れる)。
-fn hold(path: &Path) -> io::Result<File> {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".lock");
-    let lock_path = path.with_file_name(name);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&lock_path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!(
-                "another unit holds {} ({} is locked)",
-                path.display(),
-                lock_path.display()
-            ),
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
-    }
-}
-
-/// `path` に残っている socket を片付ける。`<path>.lock` を握った後で呼ぶ。
-///
-/// 片付けるのは誰も待っていない socket だけ。lock を握れた以上この path を開いている
-/// 台は居ないが、lock を知らない別のプロセスが待っていることはありうる。その socket を
-/// 消すと、その者は待ち続けたまま誰にも繋がれなくなる。
-/// socket でないファイルは、path の書き間違いで設定ファイル等を消さないよう断る。
-fn clear_stale(path: &Path) -> io::Result<()> {
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if !meta.file_type().is_socket() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} exists and is not a socket; not replacing it",
-                path.display()
-            ),
-        ));
-    }
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!("another process is listening on {}", path.display()),
-        )),
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-            match std::fs::remove_file(path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            }
-        }
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileTypeExt;
 
     /// 通すのは自分と同じ uid だけ。別の uid と、uid を読めなかった相手は断る。
     ///

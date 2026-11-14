@@ -4,10 +4,12 @@
 //! - [`supervisor`] 登録された台を抱えて生かし続ける監督者
 //! - [`protocol`] 監督者に頼むときの言葉
 //! - [`port`] 台の待ち受けポートを今だれが握っているか
+//! - [`socket`] 1 つの Unix socket の path を同時に 1 つのプロセスにだけ開かせる
 //!
 //! 置き場 (状態ディレクトリ) と台への問い合わせ方は利用側が渡す。
 
 pub mod port;
 pub mod protocol;
 pub mod registry;
+pub mod socket;
 pub mod supervisor;

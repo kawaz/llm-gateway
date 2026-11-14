@@ -900,6 +900,8 @@ A **unit** is one configuration file. It is registered under a name in `$XDG_STA
 
 `start` / `stop` / `restart` / `status` / `reload` ask the supervisor. If it is not running they refuse with `supervisor_not_running` rather than starting a child themselves — otherwise there would be no telling who owns the process. `restart --all` goes one at a time, waiting for `/llm-gateway/healthz` before moving on.
 
+One supervisor runs per state directory. A second `daemon supervise` (say, typed in a terminal while the registered service is running) refuses with `supervisor_already_running` and exits non-zero, without touching the running supervisor, its socket, or its units: `daemon status` asks the running one, and `service stop` stops the registered one. A supervisor that died leaves its socket file behind; the next one clears it and comes up.
+
 `port` says who holds the unit's listen port: `{listen, held, pids, foreign}`. `held` is whether something is listening there, `pids` the processes holding it (looked up with `lsof`; `null` when they cannot be named, empty when nobody holds it), and `foreign` is `true` when the holder is not the supervisor's current child (`null` when a child is running but the holder cannot be named). A supervisor that died by SIGKILL leaves its children behind, still holding their ports; the next supervisor does not adopt or kill them, so the new child keeps failing to listen, and `last_exit` names the holder. Folding them is a manual step: see the [runbook](./runbooks/supervisor-orphan-children.md). Units whose listen address cannot be read carry no `port`.
 
 #### `daemon reload <unit>|--all`

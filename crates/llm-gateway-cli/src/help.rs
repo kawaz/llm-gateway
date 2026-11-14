@@ -66,7 +66,9 @@ usage:
 
 a unit is one configuration file, registered under a name. `run` starts one in
 the foreground; `start` / `stop` / `restart` / `status` / `reload` ask the
-supervisor, and say so if it is not running.
+supervisor, and say so if it is not running. one supervisor runs per state
+directory: a second `supervise` refuses (supervisor_already_running) and leaves
+the running one alone.
 
 commands:
   run <unit>              run one unit in the foreground

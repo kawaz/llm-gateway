@@ -902,6 +902,8 @@ llm-gateway <command> [options]
 
 `start` / `stop` / `restart` / `status` / `reload` は監督者に頼む。監督者が動いていなければ `supervisor_not_running` で断り、代わりに子を起こしたりはしない (止める相手が分からなくなるため)。`restart --all` は 1 台ずつ、`/llm-gateway/healthz` が戻ってから次へ進む。
 
+監督者は状態ディレクトリにつき 1 つだけ走る。2 つ目の `daemon supervise` (常駐の監督者が居る時に端末で叩いた等) は `supervisor_already_running` で断って非 0 で終わり、走っている監督者にも、その socket にも台にも触れない。走っている方の様子は `daemon status` で見て、登録した常駐を止めるなら `service stop`。落ちた監督者が残した socket ファイルは、次の監督者が片付けて上がる。
+
 `port` は台の待ち受けポートを誰が握っているか: `{listen, held, pids, foreign}`。`held` はそこで誰かが待ち受けているか、`pids` は握っているプロセス (`lsof` で引く。引けなければ `null`、誰も握っていなければ空)、`foreign` は握っているのが監督者の今の子でなければ `true` (子が居て握っている者を引けなければ `null`)。SIGKILL で落ちた監督者の子は、ポートを握ったまま残る。次の監督者はそれを引き取りも畳みもしないので、新しい子は待ち受けられずに落ち続け、`last_exit` に握っている者が載る。畳むのは人で、手順は [runbook](./runbooks/supervisor-orphan-children.md) にある。待ち受け先を読めない台には `port` が付かない。
 
 #### `daemon reload <unit>|--all`

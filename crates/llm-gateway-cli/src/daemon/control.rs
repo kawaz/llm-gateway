@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use llm_gateway::daemon::protocol::{self, Request, Which};
+use llm_gateway::daemon::supervisor::NotStarted;
 
 use crate::failure::Failure;
 use crate::options::split;
@@ -24,8 +25,21 @@ pub fn supervise(args: &[String]) -> Result<ExitCode, Failure> {
     let supervisor = Arc::new(llm_gateway::daemon::supervisor::open());
     runtime()?
         .block_on(async move { supervisor.supervise().await })
-        .map_err(Failure::from)?;
+        .map_err(not_started)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// 監督を始められなかった。既に居るなら、居る方の見方と止め方まで言う。
+fn not_started(e: NotStarted) -> Failure {
+    match e {
+        NotStarted::AlreadyRunning(message) => Failure::new("supervisor_already_running", message)
+            .with(
+                "hint",
+                "see it with `llm-gateway daemon status`; to stop it, run `llm-gateway service stop` \
+                 (or stop the `llm-gateway daemon supervise` running in another terminal)",
+            ),
+        NotStarted::Failed(message) => Failure::from(message),
+    }
 }
 
 /// 監督者に頼んで、答えをそのまま出す。
@@ -275,6 +289,25 @@ mod tests {
             print(r#"{"units":[{"unit":"a","ok":true},{"unit":"b","ok":false}]}"#).unwrap(),
             ExitCode::FAILURE
         );
+    }
+
+    /// 既に監督者が居て断られたら、種別で分かり、居る方の見方と止め方まで言う。
+    /// それ以外の失敗は文章だけの失敗のまま。
+    #[test]
+    fn a_second_supervisor_says_how_to_see_and_stop_the_first() {
+        let failure = not_started(NotStarted::AlreadyRunning(
+            "another supervisor is already running on /s/supervisor.sock".to_owned(),
+        ));
+        assert_eq!(failure.kind(), "supervisor_already_running");
+        assert!(failure.message().contains("already running"));
+        let value: serde_json::Value = serde_json::from_str(&failure.to_json()).unwrap();
+        let hint = value["error"]["hint"].as_str().unwrap();
+        assert!(hint.contains("daemon status"), "{value}");
+        assert!(hint.contains("service stop"), "{value}");
+
+        let other = not_started(NotStarted::Failed("could not make /s".to_owned()));
+        assert_eq!(other.kind(), crate::failure::GENERIC);
+        assert_eq!(other.message(), "could not make /s");
     }
 
     /// 繋がらないときは、繋げる方法まで言う。

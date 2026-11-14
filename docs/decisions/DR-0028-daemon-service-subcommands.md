@@ -128,6 +128,8 @@ llm-gateway service log [--follow]
 
 既存 2 plist は runbook の手順で `launchctl bootout` してからファイルを消す。
 
+**同じ頼み口を持つ監督者が同時に 1 つだけであることは、監督者自身も守る。** OS への登録が 1 つでも、常駐中に端末で `daemon supervise` を叩けば 2 つ目は起こせる。監督者は頼み口 (`daemon/supervisor.sock`) の脇の `supervisor.sock.lock` を flock で握れた時だけ頼み口を開き、握れなければ `supervisor_already_running` で断って終わる。断られた側は、先に居る監督者の socket にも台にも触れない。flock は持ち主が落ちれば OS が外すので、落ちた監督者の残骸 (誰も待っていない socket ファイル、持ち主の居ない lock ファイル) は次の監督者を止めず、片付けて上がる (launchd の上げ直しが効く)。lock を持たない版の監督者が待っている socket は、繋がるなら消さずに断る。降りる時に消すのは自分が開いた socket だけ。台の運用系の口 (DR-0043 決定 7) と同じ部品 (`gateway_core::daemon::socket`) を使う。
+
 **焼き込む binary のパスは stable-which に選ばせる**。`current_exe` をそのまま焼くと `target/debug` や `Cellar/<version>` が plist に残り、次のビルド・次の `brew upgrade` で指す先が消える。`resolve_stable_path(current_exe, SameBinary)` で、同じ binary を指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそちらを焼く。安定な場所が無くても登録は止めず (開発中は `target/release` を常駐させるのが正しい)、警告を出力の `warning` と stderr に添える。`--executable <path>` で明示もできる。hyoui DR-0031 / cache-warden DR-0019 §2.5 と同じ方針で、`daemon add` の `binary_path` 既定も同じ解決を通す。
 
 **`register` は冪等**。描いた unit ファイルが既にそのまま置いてあり、OS 側にも載っていれば何もしない (`changed: false`)。違えば同じ label を降ろして置き換え、載せ直す (`changed: true`)。「既に登録されている」を理由に断ると、中身を直したいだけの人に `unregister` を挟ませることになる。
