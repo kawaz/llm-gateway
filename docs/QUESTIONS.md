@@ -18,6 +18,14 @@
 
 ## 裁定待ち
 
+### UH-Q1 モデル別の枠 (Fable の週枠) の推移を取るため、枠照会 API を定期的に叩くか
+
+usage-history (DR-0044) は、応答ヘッダに出る `5h` / `7d` なら 1 % ごとに行が残る。しかし Fable の週枠 (`weekly_scoped`) は枠照会 API (`/api/oauth/usage`) でしか取れず、今は `usage?refresh=true` などの契機でしか聞かないので、行がまばらになる。照会はトークンを使わないが、公開ドキュメントに無い口を定期的に叩くことになる。関係: [DR-0044 の未確定](decisions/DR-0044-usage-history-per-window.md)
+
+- [ ] a: 前回の照会から転送があった credential だけを 5 分ごとに照会する (統括推し。使っていない credential は叩かない。1 回の照会の間に何 % 動くかは、貯まった 7d の行から後で確かめて間隔を見直す)
+- [ ] b: 全 credential を固定の間隔で照会する (間隔は別途)
+- [ ] c: 定期照会は入れない (`llm-gateway usage --refresh` を手で叩いた時だけ取る)
+
 ### LM-Q1 長い busy の締め出しも 1 時間ごとの枠照会の対象にするか
 
 窓を伴わない 429 (Fable の週の枠切れ等) は `retry-after` で数日先までの `busy` になる。`claim_probe` は `limited` の締め出しにしか定期の枠照会を立てないので、`limited` の印が無い状況 (その場の照会が失敗した、照会直後に枠が尽きた) では外でリセットされても `retry-after` まで残る。枠照会はトークンを使わない。DR-0009 の「定期の様子見は上限で締め出している経路にだけ立てる」の変更になる。関係: [denial.rs の claim_probe](../crates/llm-gateway/src/denial.rs)
