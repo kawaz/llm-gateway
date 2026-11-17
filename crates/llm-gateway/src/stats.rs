@@ -238,6 +238,14 @@ impl gateway_core::stats::Mergeable for ByOrigin {
 /// 呼ばれる。await できない場所なので、積むのは同期で済ませる。
 pub struct Stats {
     inner: gateway_core::stats::Stats<ByCredential>,
+    /// このプロセスが起動してから積んだ分。認証情報 → モデル → 集計。
+    ///
+    /// 日をまたいでも区切らず、ディスクにも落とさない。枠の利用率の推移
+    /// ([`crate::quota::history`]) が「前に枠が動いてから今までに流した量」を
+    /// 2 時点の差で数えるためのもの。日次の器から引くと、日の境目と読み戻した
+    /// 前回までの分が差に混ざる。素性 (origin) は分けない — どの素性の 1 本も
+    /// 同じ枠を減らす。
+    running: std::sync::Mutex<BTreeMap<String, BTreeMap<String, Counters>>>,
 }
 
 impl Stats {
@@ -247,6 +255,7 @@ impl Stats {
     pub fn new(dir: impl Into<PathBuf>, writer: &str) -> Self {
         Self {
             inner: gateway_core::stats::Stats::new(dir, writer),
+            running: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -274,6 +283,14 @@ impl Stats {
             return;
         }
         let credential = credential.unwrap_or(NO_CREDENTIAL).to_owned();
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(credential.clone())
+            .or_default()
+            .entry(model.to_owned())
+            .or_default()
+            .add(usage);
         self.inner.add(at_secs, |day| {
             day.entry(credential)
                 .or_default()
@@ -283,6 +300,19 @@ impl Stats {
                 .or_default()
                 .add(usage);
         });
+    }
+
+    /// この認証情報について、プロセスが起動してから積んだ分 (モデル → 集計)。
+    ///
+    /// 減ることはない。2 時点で読んだ差が、その間にこのプロセスが流した量。
+    /// 他のプロセスが流した分は入らない。
+    pub fn running_totals(&self, credential: &str) -> BTreeMap<String, Counters> {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(credential)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// メモリに積んである分。
@@ -519,6 +549,42 @@ mod tests {
 
     fn stats(dir: &Path) -> Stats {
         Stats::new(dir, "8402")
+    }
+
+    /// 起動してからの累計は、日も素性もまたいで認証情報 × モデルで足す。
+    ///
+    /// 枠の利用率の推移は「前に枠が動いてから今まで」の差をこれで取る。日で
+    /// 区切ると、深夜をまたぐ区間の差が日の境目で崩れる。素性で分けないのは、
+    /// gateway の自送信 (keepalive) も手元の 1 本と同じ枠を減らすため。読み戻した
+    /// 前回までの日次の分は入らない (このプロセスが流した分だけを数える)。
+    #[test]
+    fn running_totals_span_days_and_origins_but_not_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let before = stats(dir.path());
+            before.record(NOW, Some("a"), "m", MAIN, &tokens(1000, 1000));
+            before.flush().unwrap();
+        }
+        let s = stats(dir.path());
+        s.restore(NOW);
+        assert!(
+            s.running_totals("a").is_empty(),
+            "what an earlier process recorded is not counted"
+        );
+
+        s.record(NOW - 86_400, Some("a"), "m", MAIN, &tokens(10, 1));
+        s.record(NOW, Some("a"), "m", "keepalive", &tokens(20, 2));
+        s.record(NOW, Some("a"), "n", MAIN, &tokens(5, 5));
+        s.record(NOW, Some("b"), "m", MAIN, &tokens(7, 7));
+        s.record(NOW, Some("a"), "m", MAIN, &TokenUsage::default());
+
+        let a = s.running_totals("a");
+        assert_eq!(a["m"].requests, 2, "the empty reading is not a request");
+        assert_eq!(input_of(&a["m"]), 30);
+        assert_eq!(output_of(&a["m"]), 3);
+        assert_eq!(input_of(&a["n"]), 5);
+        assert_eq!(input_of(&s.running_totals("b")["m"]), 7);
+        assert!(s.running_totals("nobody").is_empty());
     }
 
     /// 試験用の単価。実際の表は provider の側にあるので、ここは形だけ真似る。

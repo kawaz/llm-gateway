@@ -26,6 +26,9 @@
 //! 書き込み先は日次集計と同じ置き場の、**このプロセス専用のファイル**
 //! (`usage-latest.<書き手>.json`)。他の writer の分は読まない — 向こうの
 //! 観測は向こうが持っている。
+//!
+//! 最新の 1 つは上書きされるので、推移は残らない。枠ごとの利用率の推移は
+//! [`history`] が別に貯める (DR-0044)。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -37,6 +40,8 @@ use tokio::sync::RwLock;
 
 use crate::credential::CredentialId;
 use crate::persist::{sanitize_writer, sweep_temporaries, write_atomically};
+
+pub mod history;
 
 /// provider の枠照会 API から得た枠 1 本。
 ///

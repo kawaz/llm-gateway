@@ -683,6 +683,19 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/stats?days=3'
 
 `input` counts only the input that did not come from or go into the cache (`input_basis: "fresh"`); cache reads and writes have their own counts (`input.cache_read` / `input.cache_creation`). Upstreams disagree here — some report `input` as a total that already contains the cached tokens — so the stored files keep each upstream's own count and the gateway takes the cached part out when it answers, using the same price-table breakdown that the USD figure uses. A model the price table does not cover cannot be aligned: its `input` is left as recorded and marked `input_basis: "as_recorded"` (it may include cached tokens). In `llm-gateway stats` such cells, and any total they flow into, carry a `*` with a footnote under the table.
 
+#### Usage history per window (files)
+
+Under the same `[stats] dir` as the daily totals, `usage-history/<YYYY-MM-DD>.<writer>.jsonl` gets one line appended each time the utilization of a window moves — the `5h` / `7d` windows from response headers, and the windows the quota API returns, including per-model ones (DR-0044). There is no HTTP endpoint; read the files directly. The date is the local date of the observation and the writer is the listen address. Lines are written on the same 60-second save cycle as the daily totals and at shutdown. Old days are never deleted (removing them by hand is safe).
+
+```json
+{"observed_at":1785326460000,"credential":"claude-a","change":"step","source":"headers","window":"7d","utilization":0.31,"status":"allowed","reset":1785888000000,"window_seconds":604800,"from":0.30,"since":1785326400000,"tokens":{"claude-opus-5":{"requests":4,"tokens":{"input":120,"input.cache_read":480000,"output":3100}}}}
+```
+
+- `change`: `start` (this process saw the window for the first time; the baseline), `step` (the utilization went up), `rollover` (the window turned over or the value fell; the baseline is set again). An observation with an unchanged value writes no line
+- `source`: `headers` is a window from the response headers, with the same fields as a window in the `snapshot` of `usage` (`window` names the field; the value is `utilization`, 0.0–1.0). `quota_api` is a window from the quota API, with the same fields as one entry of `limits[]` in `usage` (the value is `percent`, 0–100). The two are different yardsticks even for the same period
+- In a `step`, `from` is the previous line's value, `since` is the previous line's time, and `tokens` is what this process sent with that credential in between (model → request count and tokens per kind; kinds and counting are the same as in the daily-total files)
+- Only this process's own traffic is counted. Siblings sharing the credential (stable / unstable) have their own files, and use that bypasses the gateway (another machine, the web) appears nowhere
+
 ### `GET /llm-gateway/events`
 
 Streams what happens on every forward, over SSE (DR-0012). You receive only what happens **after** you connect; there is no replay. A slow watcher that misses events does not stall the gateway (events are dropped and it moves on; the count is in `/llm-gateway/self`). A keep-alive is sent every 20 seconds.

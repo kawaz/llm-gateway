@@ -685,6 +685,19 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/stats?days=3'
 
 `input` は cache を読み書きしなかった入力だけを数える (`input_basis: "fresh"`)。cache の読み出し・書き込みはそれぞれの数 (`input.cache_read` / `input.cache_creation`) にある。upstream によっては `input` を cache 分込みの総数で返すため、ファイルには upstream の数のまま積み、gateway が答えるときに cache 分を引いて揃える。引く相手は USD の計算と同じ単価表の内訳の宣言。単価表に無いモデルは揃えられないので、`input` を積んだ数のまま出し `input_basis: "as_recorded"` を付ける (cache 分を含むことがある)。`llm-gateway stats` ではその欄と、それを足し込んだ合計の欄に `*` が付き、表の下に脚注が出る。
 
+#### 枠の利用率の推移 (ファイル)
+
+日次集計と同じ `[stats] dir` の下の `usage-history/<YYYY-MM-DD>.<書き手>.jsonl` に、枠 (応答ヘッダの `5h` / `7d` の窓、枠照会 API が返すモデル別の枠など) の利用率が動くたびに 1 行が追記される (DR-0044)。HTTP の口は無く、ファイルを直接読む。日付は観測時刻の地方時、書き手は待ち受け先で、書くのは日次集計と同じ 60 秒の保存の周回と終了時。古い日のファイルは消さない (手で消してもよい)。
+
+```json
+{"observed_at":1785326460000,"credential":"claude-a","change":"step","source":"headers","window":"7d","utilization":0.31,"status":"allowed","reset":1785888000000,"window_seconds":604800,"from":0.30,"since":1785326400000,"tokens":{"claude-opus-5":{"requests":4,"tokens":{"input":120,"input.cache_read":480000,"output":3100}}}}
+```
+
+- `change`: `start` (このプロセスがその枠を初めて見た起点)、`step` (利用率が上がった)、`rollover` (窓が切り替わったか値が下がった。起点を置き直す)。値が変わらない観測は行にならない
+- `source`: `headers` は応答ヘッダの窓で、欄は `usage` の `snapshot` の窓と同じ (`window` が欄名、値は `utilization` 0.0〜1.0)。`quota_api` は枠照会 API の枠で、欄は `usage` の `limits[]` の 1 件と同じ (値は `percent` 0〜100)。両者は同じ周期でも別の物差し
+- `step` の `from` は前の行の値、`since` は前の行の時刻、`tokens` はその間にこのプロセスがその credential で流した量 (モデル → 本数と区分ごとのトークン、区分と数え方は日次集計のファイルと同じ)
+- 数えられるのはこのプロセスが流した分だけ。stable / unstable のように同じ credential を使う兄弟の分はそれぞれのファイルにあり、gateway を通らない利用 (別のマシン、Web) はどこにも無い
+
 ### `GET /llm-gateway/events`
 
 転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む。落とした数は `/llm-gateway/self` に出る)。20 秒ごとに keep-alive を送る。

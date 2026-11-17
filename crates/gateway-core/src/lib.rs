@@ -12,6 +12,7 @@
 //! - [`stats`] 日次の集計を書き手ごとのファイルに置き、読むときに合わせる器
 //! - [`config`] 設定を土台に重ねる規則、パスの開き方、既定の置き場
 //! - [`counter`] 書き手ごとに書いて読むときに合わせるカウンタ (`CounterStore`)
+//! - [`daily_log`] 日ごと・書き手ごとのファイルに 1 行 1 件で追記する器
 //! - [`credential`] 認証情報の置き場 ([`credential::Persistence`]) と、その平文ファイル実装
 //! - [`credential::refreshing`] 更新を束ねて使える状態で渡す窓口 ([`credential::refreshing::CredentialStore`])
 //! - [`credential::time`] 認証情報が持つ時刻 (RFC 3339) の読み書き
@@ -25,6 +26,7 @@ pub mod config;
 pub mod counter;
 pub mod credential;
 pub mod daemon;
+pub mod daily_log;
 pub mod error;
 pub mod events;
 pub mod ns;

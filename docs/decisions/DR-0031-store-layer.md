@@ -15,6 +15,7 @@ unit 間の連携は今、全部「共有ファイル + flock」で実装され�
 | keepalive の控えと発火 | `cache/keepalive/store.rs` | 系列ごとの `.lock` を非ブロッキングで掴めた 1 台だけが送る。掴めなければ待たずに引く (DR-0027) |
 | 日次集計 | `stats.rs` | writer ごとのファイルに自分の分だけ書き、閲覧時に `merge` で合算する (DR-0011 / DR-0029) |
 | usage スナップショット | `persist.rs` + `quota.rs` | writer ごとのファイル (`usage-latest.<writer>.json`) に一時ファイル経由の原子的な rename で書き、起動時に自分の分だけを読み戻す。他の writer の分は読まず、時刻の比較も無い (LWW ではない) |
+| 利用率の推移 (DR-0044) | `daily_log.rs` + `quota/history.rs` | writer ごとの日次ファイル (`usage-history/<日付>.<writer>.jsonl`) に行を追記するだけで、書いた行は書き換えない。読む側が全 writer の行を合わせる |
 
 締め出しと upstream status (DR-0021) はメモリのみで、永続化していない。
 
@@ -28,7 +29,7 @@ unit 間の連携は今、全部「共有ファイル + flock」で実装され�
 |---|---|---|---|
 | 1 | 単一 writer の更新 | credential、静的 secret、`issued` の JWKS | `Persistence` (既存を位置づけ直す) |
 | 2 | リース | keepalive の系列ごとの発火担当 | `LeaseStore` |
-| 3 | 合算可能なカウンタ | 日次集計、日次のレート制限バケット (DR-0030 §3) | `CounterStore` |
+| 3 | 合算可能なカウンタ | 日次集計、日次のレート制限バケット (DR-0030 §3)、利用率の推移 (DR-0044。合わせ方は行の和集合、書き込みは追記) | `CounterStore` |
 | 4 | LWW スナップショット | usage スナップショット、締め出し | `SnapshotStore` |
 
 名前と下の signature は**案**で、確定は gateway-core 分割の段 1 (`docs/design/gateway-core-split.md`) で行う。本 DR が固定するのは意味論と契約 (各操作が fail-closed か best-effort か、fencing token、merge 則、LWW の時刻源) で、Rust の型の細部は縛らない。

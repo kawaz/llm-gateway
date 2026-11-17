@@ -27,7 +27,8 @@ use crate::events::{self, Events};
 use crate::exchange;
 use crate::metering::{Pricing, PricingSource, TokenKind, TokenUsage, UsageObserver};
 use crate::provider::{Admission, Preset, ProbeRequest, RequestOrigin};
-use crate::quota::{self, QuotaLimit, QuotaStore};
+use crate::quota::history::UsageHistory;
+use crate::quota::{self, QuotaLimit, QuotaStore, Snapshot};
 use crate::router::{Crossing, NamespaceView, Route, Router, Selection, ThinkingSession};
 use crate::session;
 use crate::sessions;
@@ -44,6 +45,9 @@ pub struct Gateway<P: CredentialPersistence> {
     watch_interval: std::time::Duration,
     /// 枠の観測を再起動を跨いで持つ置き場。裏で走る仕事とも共有する。
     usage: Arc<QuotaStore>,
+    /// 枠ごとの利用率の推移 (DR-0044)。枠が動くたびに 1 行、その間に流した
+    /// トークンを添えて貯める。裏で走る枠照会とも共有する。
+    usage_history: Arc<UsageHistory>,
     stats: Arc<Stats>,
     /// 転送のたびに起きたことを見ている人へ流す口 (DR-0012)。
     ///
@@ -189,16 +193,25 @@ impl<P: CredentialPersistence> Gateway<P> {
             config.stats.uncached_limits(),
         ));
 
+        // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
+        // 共有しても、互いのファイルを書かない (DR-0011)。
+        let stats = Arc::new(Stats::new(
+            config.stats.resolve_dir(),
+            &config.server.listen,
+        ));
+        // 推移も同じ置き場の下・同じ書き手の名前で持つ。日次集計の器が積んだ
+        // トークンを読んで、枠が動いた間の量を添える (DR-0044)。
+        let usage_history = Arc::new(UsageHistory::new(
+            config.stats.resolve_dir().join(quota::history::DIR),
+            &config.server.listen,
+            Arc::clone(&stats),
+        ));
+
         let gateway = Self {
             refresh_interval: std::time::Duration::from_secs(config.discovery.refresh_secs),
             watch_interval: std::time::Duration::from_secs(config.discovery.watch_secs),
             router,
-            // 書き手の名前に待ち受け先を使う。同じ置き場を別ポートの gateway と
-            // 共有しても、互いのファイルを書かない (DR-0011)。
-            stats: Arc::new(Stats::new(
-                config.stats.resolve_dir(),
-                &config.server.listen,
-            )),
+            stats,
             credentials: CredentialStore::new(persistence, http.clone()),
             http,
             // 利用状況も同じ置き場・同じ書き手の名前で持つ (DR-0007)。
@@ -206,6 +219,7 @@ impl<P: CredentialPersistence> Gateway<P> {
                 config.stats.resolve_dir(),
                 &config.server.listen,
             )),
+            usage_history,
             keepalive,
             events,
             // 兄弟の unit と共有する走行状態の置き場 (DR-0038 決定 6)。
@@ -525,6 +539,17 @@ impl<P: CredentialPersistence> Gateway<P> {
         if let Err(e) = self.usage.save().await {
             tracing::warn!(%e, "cannot save usage");
         }
+        if let Err(e) = self.usage_history.flush() {
+            tracing::warn!(%e, "cannot save the usage history");
+        }
+    }
+
+    /// 応答ヘッダから読めた枠を控える。最新の 1 つ (DR-0007) と推移 (DR-0044)
+    /// の両方へ渡す。ヘッダを読む場所はここを通す — 片方だけに渡すと、一覧には
+    /// 出るのに推移に残らない観測ができる。
+    async fn observe_usage(&self, id: &CredentialId, snapshot: Snapshot) {
+        self.usage_history.observe_snapshot(id, &snapshot);
+        self.usage.observe(id, snapshot).await;
     }
 
     /// 一定の間隔で落とし続ける。
@@ -1684,7 +1709,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         if let Some(id) = &route.credential
             && let Some(snapshot) = route.preset.observe_quota(&resp.response.headers, now_ms)
         {
-            self.usage.observe(id, snapshot).await;
+            self.observe_usage(id, snapshot).await;
         }
 
         // 届いた 1 本だけを控える。断られた応答の経路を控えると、送り直しは
@@ -2074,7 +2099,12 @@ impl<P: CredentialPersistence> Gateway<P> {
             }
         };
         match api.fetch(&self.http, &credential).await {
-            Ok(limits) => Some(limits),
+            Ok(limits) => {
+                // 聞けた枠は推移にも残す。モデル別の枠はこの口にしか出ない (DR-0044)。
+                self.usage_history
+                    .observe_limits(id, &limits, now_unix_ms());
+                Some(limits)
+            }
             Err(e) => {
                 warn!(credential = %id, %e, "cannot query the quota");
                 None
@@ -2127,6 +2157,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         let preset = Arc::clone(preset);
         let http = self.http.clone();
         let credentials = self.credentials.clone();
+        let history = Arc::clone(&self.usage_history);
 
         tokio::spawn(async move {
             // 札は、走り切っても落ちても [`Drop`] で外れる。
@@ -2147,6 +2178,8 @@ impl<P: CredentialPersistence> Gateway<P> {
                 return;
             };
 
+            // [`Self::ask_limits`] と同じく、聞けた枠は推移にも残す。
+            history.observe_limits(&id, &limits, now_unix_ms());
             preset.apply_quota(&limits, now_unix());
             info!(
                 credential = %id,
@@ -2230,7 +2263,7 @@ impl<P: CredentialPersistence> Gateway<P> {
         let status = resp.status;
         let content_type = resp.headers.get("content-type").map(str::to_owned);
         if let Some(snapshot) = preset.observe_quota(&resp.headers, now_unix_ms()) {
-            self.usage.observe(id, snapshot).await;
+            self.observe_usage(id, snapshot).await;
         }
 
         let raw = egress::collect_body(resp.body)
@@ -6289,6 +6322,122 @@ models = ["m"]
                 .and_then(|s| s.five_hour.as_ref())
                 .and_then(|w| w.utilization),
             Some(0.42)
+        );
+    }
+
+    /// 落とした推移の行を全部読む (日付のファイル順・行の順)。
+    fn history_lines(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir.join(quota::history::DIR))
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        paths.sort();
+        paths
+            .iter()
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    /// 転送のついでに読めた枠は、推移にも残る (DR-0044)。
+    ///
+    /// 置き場は `[stats] dir` の下の `usage-history/`。同じ値が続く応答は行に
+    /// しないので、2 本流しても起点の 1 行だけ。落とすのは保存の周回 (`save`)。
+    #[tokio::test]
+    async fn forwarded_headers_are_kept_in_the_usage_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let reset = now_unix() + 3600;
+        let up = FakeUpstream::start_with_headers(
+            &[
+                ("anthropic-ratelimit-unified-5h-utilization", "0.42"),
+                ("anthropic-ratelimit-unified-5h-reset", &reset.to_string()),
+            ],
+            |_, _| (200, body_for(200)),
+        )
+        .await;
+        let gw = gateway(&format!(
+            "[stats]\ndir = \"{}\"\n{}",
+            dir.path().display(),
+            oauth_config(&up.url)
+        ))
+        .await;
+
+        for _ in 0..2 {
+            gw.forward(
+                &ns(&gw),
+                NS,
+                Ingress {
+                    path: "/v1/messages",
+                    query: None,
+                    shape: RequestShape::Messages,
+                },
+                request(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+        assert!(
+            history_lines(dir.path()).is_empty(),
+            "held until the save cycle"
+        );
+        gw.save().await;
+
+        let lines = history_lines(dir.path());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["credential"], "a");
+        assert_eq!(lines[0]["source"], "headers");
+        assert_eq!(lines[0]["window"], "5h");
+        assert_eq!(lines[0]["utilization"], 0.42);
+        assert_eq!(lines[0]["change"], "start");
+    }
+
+    /// 枠照会 API で聞けたモデル別の枠も、推移に残る (DR-0044)。
+    ///
+    /// モデル別の枠は応答ヘッダに出ないので、聞きに行った答えを残さないと
+    /// その枠の推移はどこにも無い。
+    #[tokio::test]
+    async fn queried_scoped_limits_are_kept_in_the_usage_history() {
+        const LIMITS: &str = r#"{"limits":[
+            {"kind":"weekly_all","percent":40,"severity":"normal",
+             "resets_at":"2026-08-02T08:59:59Z","scope":null,"is_active":true},
+            {"kind":"weekly_scoped","percent":20,"severity":"normal",
+             "resets_at":"2026-08-02T08:59:59Z",
+             "scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":false}]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let up = FakeUpstream::start(|_, req| {
+            if req.starts_with("GET /api/oauth/usage") {
+                (200, LIMITS.to_owned())
+            } else {
+                (200, body_for(200))
+            }
+        })
+        .await;
+        let gw = gateway(&format!(
+            "[stats]\ndir = \"{}\"\n{}",
+            dir.path().display(),
+            oauth_config(&up.url)
+        ))
+        .await;
+
+        gw.usage_report(true).await;
+        gw.save().await;
+
+        let lines = history_lines(dir.path());
+        let scoped = lines
+            .iter()
+            .find(|line| line["kind"] == "weekly_scoped")
+            .unwrap_or_else(|| panic!("the scoped limit is kept: {lines:?}"));
+        assert_eq!(scoped["source"], "quota_api");
+        assert_eq!(scoped["model"], "Fable");
+        assert_eq!(scoped["percent"], 20.0);
+        assert!(
+            lines.iter().any(|line| line["kind"] == "weekly_all"),
+            "{lines:?}"
         );
     }
 
