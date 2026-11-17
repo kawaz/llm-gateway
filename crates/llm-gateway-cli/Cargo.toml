@@ -30,8 +30,9 @@ stable-which = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
-# 置き場の試験用実装が汎用層の Result を返すため。
-gateway-core = { path = "../gateway-core" }
+# 置き場の試験用実装が汎用層の Result を返すため。socket を置く試験の一時ディレクトリ
+# (`gateway_core::test_support`) も使う。
+gateway-core = { path = "../gateway-core", features = ["test-support"] }
 # 設定ファイルを試験ごとに使い捨てる (実運用の設定を触らせない)。
 tempfile = { workspace = true }
 # `auth jwks` の出力 (TOML の断片) を読んで確かめる。

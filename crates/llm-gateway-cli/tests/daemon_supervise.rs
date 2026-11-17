@@ -3,6 +3,7 @@
 //! 同じ状態ディレクトリで `daemon supervise` を 2 つ起こした時と、落ちた監督者の後に
 //! 起こした時 (DR-0028 決定 7)。
 
+use gateway_core::test_support::SocketTempDir;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -89,7 +90,7 @@ fn signal(supervising: &Supervising, name: &str) {
 /// 1 つ目が SIGKILL で落ちて残骸 (誰も待っていない socket) を置いていっても、次は上がれる。
 #[test]
 fn a_second_supervisor_is_refused_and_a_dead_ones_leftovers_do_not_block_the_next() {
-    let root = tempfile::TempDir::new().unwrap();
+    let root = SocketTempDir::new().unwrap();
     let state = root.path().join("state");
     let socket = state.join("llm-gateway/daemon/supervisor.sock");
 

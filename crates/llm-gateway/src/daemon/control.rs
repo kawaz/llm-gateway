@@ -368,9 +368,10 @@ fn dump_failed(unit: &str, kind: &str, message: impl Into<String>) -> serde_json
 mod tests {
     use super::*;
     use crate::credential::file::FileStore;
+    use gateway_core::test_support::SocketTempDir;
 
     struct Unit {
-        dir: tempfile::TempDir,
+        dir: SocketTempDir,
         config: PathBuf,
         gateway: Arc<Gateway<FileStore>>,
     }
@@ -403,7 +404,7 @@ routes = ["a"]
     }
 
     fn unit() -> Unit {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let config = dir.path().join("u.toml");
         std::fs::write(&config, body(dir.path(), "127.0.0.1:11301", "")).unwrap();
         let loaded = Config::load(&config).unwrap();

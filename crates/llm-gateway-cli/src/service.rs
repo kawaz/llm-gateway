@@ -670,6 +670,7 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway_core::test_support::SocketTempDir;
     use std::cell::RefCell;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1118,7 +1119,7 @@ mod tests {
     /// 引いていると、手元で本物が動いているときに試験がそれを掴んでしまう。
     #[test]
     fn stopping_waits_on_the_socket_it_was_given() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let plan = plan_in(dir.path());
         assert_eq!(
             register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
@@ -1143,7 +1144,7 @@ mod tests {
     /// 監督者が居なければ、止めた瞬間に終わっている。
     #[test]
     fn stopping_something_that_holds_nothing_returns_at_once() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let plan = plan_in(dir.path());
         assert_eq!(
             register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
@@ -1164,7 +1165,7 @@ mod tests {
     /// 掴んだ繋がりが切れたら、畳み終わったということ。
     #[test]
     fn the_wait_ends_when_the_supervisor_lets_go_of_its_socket() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let socket = dir.path().join("supervisor.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 

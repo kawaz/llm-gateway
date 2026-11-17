@@ -24,7 +24,14 @@ url = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt", "process", "io-util", "fs", "time"] }
 reqwest = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+# 利用側の crate の試験が使う部品 (`test_support`)。dev-dependencies からだけ有効にする。
+test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# 自分の試験 (tests/) でも `test_support` を使う。
+gateway-core = { path = ".", features = ["test-support"] }
 axum = { workspace = true }

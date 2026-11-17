@@ -30,6 +30,8 @@ gateway-core = { path = "../gateway-core", version = "0.70" }
 libc = { workspace = true }
 
 [dev-dependencies]
+# socket を置く試験の一時ディレクトリ (`gateway_core::test_support`)。
+gateway-core = { path = "../gateway-core", features = ["test-support"] }
 toml = { workspace = true }
 # ns 認証 `jwt` の試験で token を署名する。
 ed25519-dalek = { workspace = true }

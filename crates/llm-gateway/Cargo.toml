@@ -31,6 +31,8 @@ rustix = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# socket を置く試験の一時ディレクトリ (`gateway_core::test_support`)。
+gateway-core = { path = "../gateway-core", features = ["test-support"] }
 tempfile = { workspace = true }
 # 記録が残ることを試験で確かめるための受け取り先。
 tracing-subscriber = { workspace = true }

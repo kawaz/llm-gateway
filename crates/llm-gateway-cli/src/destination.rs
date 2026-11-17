@@ -142,6 +142,7 @@ does not open this socket needs updating and `llm-gateway daemon restart {unit}`
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway_core::test_support::SocketTempDir;
     use llm_gateway::daemon::registry::Unit;
     use std::path::Path;
 
@@ -284,7 +285,7 @@ mod tests {
     /// CLI は台の socket の口を読む (TCP には行かない)。
     #[test]
     fn ask_reads_the_unit_through_its_socket() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let router = axum::Router::new().route(
             "/llm-gateway/usage",
             axum::routing::get(|query: axum::extract::RawQuery| async move {
@@ -308,7 +309,7 @@ mod tests {
     /// 落ちずに断り、どの socket を見たかと、版を上げて restart することを言う。
     #[test]
     fn a_missing_socket_is_refused_with_how_to_fix_it() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let target = Target {
             unit: "unstable".to_owned(),
             socket: dir.path().join("absent.sock"),

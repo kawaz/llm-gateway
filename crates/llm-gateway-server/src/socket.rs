@@ -148,6 +148,7 @@ fn check_dir(uid: libc::uid_t, mode: u32, owner: libc::uid_t) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway_core::test_support::SocketTempDir;
     use std::os::unix::fs::FileTypeExt;
 
     /// 通すのは自分と同じ uid だけ。別の uid と、uid を読めなかった相手は断る。
@@ -184,7 +185,7 @@ mod tests {
     /// group / other が書き込めるディレクトリ (sticky でも) には socket を開かない。
     #[tokio::test]
     async fn a_directory_others_can_write_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         for mode in [0o777, 0o1777, 0o770] {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
@@ -201,7 +202,7 @@ mod tests {
     /// `AddrInUse` で断られ、先に開いた側の socket は生きたまま。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_units_racing_for_one_path_do_not_steal_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         for round in 0..50 {
             let path = dir.path().join(format!("gw-{round}.sock"));
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -239,7 +240,7 @@ mod tests {
     /// 開いた台が手放せば lock は外れ、次の台が同じ path を開ける。
     #[tokio::test]
     async fn the_path_is_free_again_once_the_holder_drops_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         drop(OperationsSocket::bind(&path).unwrap());
         let _again = OperationsSocket::bind(&path).unwrap();
@@ -248,7 +249,7 @@ mod tests {
     /// 開いた socket は 0600 で、親ディレクトリが無ければ 0700 で作る。落とすと消える。
     #[tokio::test]
     async fn the_socket_is_private_and_removed_when_dropped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("made").join("gw.sock");
 
         let socket = OperationsSocket::bind(&path).unwrap();
@@ -269,7 +270,7 @@ mod tests {
     /// 既にある親ディレクトリの権限は変えない (運用者が `$HOME` の下を指しうる)。
     #[tokio::test]
     async fn an_existing_directory_keeps_its_mode() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _socket = OperationsSocket::bind(&dir.path().join("gw.sock")).unwrap();
@@ -280,7 +281,7 @@ mod tests {
     /// 前回落ちた台が残した socket (誰も待っていない) は片付けて開ける。
     #[tokio::test]
     async fn a_stale_socket_is_cleared() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         // 待ち受けを閉じても、std の UnixListener はファイルを消さない (落ちた台の残骸)。
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
@@ -296,7 +297,7 @@ mod tests {
     /// 誰かが待っている socket は消さずに断る (同じ path を書いた 2 台の取り合い)。
     #[tokio::test]
     async fn a_socket_someone_listens_on_is_not_taken() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         let first = OperationsSocket::bind(&path).unwrap();
 
@@ -311,7 +312,7 @@ mod tests {
     /// socket でないファイルは、path の書き間違いを疑って消さない。
     #[tokio::test]
     async fn a_file_that_is_not_a_socket_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[server]\n").unwrap();
 
@@ -324,7 +325,7 @@ mod tests {
     /// socket は残す。
     #[tokio::test]
     async fn dropping_leaves_a_socket_someone_else_put_there() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         let socket = OperationsSocket::bind(&path).unwrap();
         // 退けるだけで消さない (inode が生きている間は、置き直す socket に同じ番号が付かない)。

@@ -1470,6 +1470,7 @@ async fn terminated() {
 mod tests {
     use super::*;
     use crate::daemon::registry::Unit;
+    use crate::test_support::SocketTempDir;
     use std::os::unix::fs::MetadataExt;
 
     /// 子の代わりに走らせる小さな実行ファイル。
@@ -1528,14 +1529,14 @@ mod tests {
     };
 
     struct World {
-        _dir: tempfile::TempDir,
+        _dir: SocketTempDir,
         supervisor: Arc<Supervisor>,
         registry: Registry,
         root: PathBuf,
     }
 
     fn world() -> World {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = SocketTempDir::new().unwrap();
         let root = dir.path().to_path_buf();
         let registry = Registry::at(root.join("units"));
         let supervisor = Arc::new(Supervisor::new(

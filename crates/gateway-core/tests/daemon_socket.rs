@@ -15,6 +15,7 @@ use gateway_core::daemon::protocol::{self, Request, Which};
 use gateway_core::daemon::registry::Registry;
 use gateway_core::daemon::socket::{clear_stale, hold, lock_path};
 use gateway_core::daemon::supervisor::{NotStarted, Supervisor, UnitProbe};
+use gateway_core::test_support::SocketTempDir;
 
 /// 台を抱えないので、問い合わせ方は使われない。
 const PROBE: UnitProbe = UnitProbe {
@@ -79,7 +80,7 @@ fn stale_socket(path: &Path) {
 /// 握っている間、同じ path はもう握れない。手放せばまた握れる。
 #[test]
 fn one_holder_at_a_time() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = SocketTempDir::new().unwrap();
     let path = dir.path().join("a.sock");
 
     let first = hold(&path).unwrap();
@@ -99,7 +100,7 @@ fn one_holder_at_a_time() {
 /// ファイルは残して断る。何も無ければ何もしない。
 #[test]
 fn only_a_socket_nobody_listens_on_is_cleared() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = SocketTempDir::new().unwrap();
 
     clear_stale(&dir.path().join("none.sock")).unwrap();
 
@@ -125,7 +126,7 @@ fn only_a_socket_nobody_listens_on_is_cleared() {
 /// 次の監督者は上がって頼みに答える。
 #[tokio::test]
 async fn a_supervisor_comes_up_over_what_a_dead_one_left() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = SocketTempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
     stale_socket(&socket);
     std::fs::write(lock_path(&socket), "").unwrap();
@@ -141,7 +142,7 @@ async fn a_supervisor_comes_up_over_what_a_dead_one_left() {
 /// 頼み口は消え、次の監督者が上がれる。
 #[tokio::test]
 async fn a_second_supervisor_is_refused_and_the_first_keeps_its_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = SocketTempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
 
     let first = begin(supervisor(dir.path(), &socket)).await.unwrap();
@@ -167,7 +168,7 @@ async fn a_second_supervisor_is_refused_and_the_first_keeps_its_socket() {
 /// 残す。
 #[tokio::test]
 async fn letting_go_removes_only_its_own_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = SocketTempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
 
     let supervising = begin(supervisor(dir.path(), &socket)).await.unwrap();

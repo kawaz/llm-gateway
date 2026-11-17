@@ -20,6 +20,7 @@
 //! - [`error`] この層のエラー
 //! - [`events`] 起きたことを通し番号付きで見ている人へ流す口
 //! - [`ns`] namespace の入口での認証 ([`ns::NsAuth::verify`] → [`ns::Principal`])
+//! - `test_support` 試験の部品 (feature `test-support` の時だけ)
 
 pub mod caller;
 pub mod config;
@@ -34,6 +35,8 @@ pub mod pattern;
 pub mod persist;
 pub mod ratelimit;
 pub mod stats;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod upstream;
 
 pub use error::{Error, Result};

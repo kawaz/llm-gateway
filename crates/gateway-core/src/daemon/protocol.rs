@@ -5,6 +5,8 @@
 //!
 //! 監督者が居なければ socket も無い。CLI はそれを「監督者が動いていない」と
 //! して断り、代わりに子を起こしたりはしない (所有者が 2 つになる)。
+//!
+//! socket の path が sun_path に収まるかは、状態ディレクトリを決める側の責務。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

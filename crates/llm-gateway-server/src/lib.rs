@@ -6413,7 +6413,7 @@ mod callers_tests {
     /// TCP の口は未署名を 401 で断ったまま。
     #[tokio::test]
     async fn the_unix_socket_serves_operations_without_a_signature() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = gateway_core::test_support::SocketTempDir::new().unwrap();
         let (base, gateway) = serve_callers(dir.path(), true).await;
         let client = serve_unix(gateway, &dir.path().join("gw.sock")).await;
 
