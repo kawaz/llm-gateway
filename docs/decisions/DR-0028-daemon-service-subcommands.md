@@ -130,6 +130,13 @@ llm-gateway service log [--follow]
 
 **同じ頼み口を持つ監督者が同時に 1 つだけであることは、監督者自身も守る。** OS への登録が 1 つでも、常駐中に端末で `daemon supervise` を叩けば 2 つ目は起こせる。監督者は頼み口 (`daemon/supervisor.sock`) の脇の `supervisor.sock.lock` を flock で握れた時だけ頼み口を開き、握れなければ `supervisor_already_running` で断って終わる。断られた側は、先に居る監督者の socket にも台にも触れない。flock は持ち主が落ちれば OS が外すので、落ちた監督者の残骸 (誰も待っていない socket ファイル、持ち主の居ない lock ファイル) は次の監督者を止めず、片付けて上がる (launchd の上げ直しが効く)。lock を持たない版の監督者が待っている socket は、繋がるなら消さずに断る。降りる時に消すのは自分が開いた socket だけ。台の運用系の口 (DR-0043 決定 7) と同じ部品 (`gateway_core::daemon::socket`) を使う。
 
+**頼み口・台の制御口 (DR-0032)・運用系の口 (DR-0043 決定 7) は、bind も connect も sockat を通し (`gateway_core::unix_socket`)、path の長さに上限を置かない。** 状態ディレクトリ (`$XDG_STATE_HOME`) と `[server] unix` の深さは利用者と環境が決め、`sun_path` (NUL 込みで macOS 104 / Linux 108 バイト) に収まる保証は無い (深い `$TMPDIR` の下で走る試験もそう)。sockat は長い path にも、渡した path そのものに socket を作る (繋ぐ時はそこを引く)。sockat が長い path で std と違う点のうち、この作りに関わる 2 つは次のとおり扱う:
+
+- カーネルが答える socket の名前 (`local_addr` / `peer_addr`) は渡した path ではない (相対パス、ファイル名だけ等)。socket を消す・log に書く・残骸かを確かめるのは、どれも自分が持つ path で行い、カーネルが答える名前は使わない
+- fork の経路 (macOS で他の経路が使えない時、`/proc` の無い Linux) で繋ぐと、受けた側に見える相手の pid が短命の子になる (uid / gid は繋いだプロセスのまま)。相手を確かめるのは運用系の口の uid だけで (DR-0043 決定 7)、pid は見ない
+
+運用系の口を読む CLI は reqwest でなく hyper を直に使う。reqwest の `unix_socket` は内部で connect し (長い path に届かない)、connect を差し替える口が無い。外の道具 (`curl --unix-socket`) は上限を超える path を断るので、MANUAL にディレクトリへ入って名前で渡す手を書く。
+
 **焼き込む binary のパスは stable-which に選ばせる**。`current_exe` をそのまま焼くと `target/debug` や `Cellar/<version>` が plist に残り、次のビルド・次の `brew upgrade` で指す先が消える。`resolve_stable_path(current_exe, SameBinary)` で、同じ binary を指す PATH 上の安定な場所 (`/opt/homebrew/bin/llm-gateway`) があればそちらを焼く。安定な場所が無くても登録は止めず (開発中は `target/release` を常駐させるのが正しい)、警告を出力の `warning` と stderr に添える。`--executable <path>` で明示もできる。hyoui DR-0031 / cache-warden DR-0019 §2.5 と同じ方針で、`daemon add` の `binary_path` 既定も同じ解決を通す。
 
 **`register` は冪等**。描いた unit ファイルが既にそのまま置いてあり、OS 側にも載っていれば何もしない (`changed: false`)。違えば同じ label を降ろして置き換え、載せ直す (`changed: true`)。「既に登録されている」を理由に断ると、中身を直したいだけの人に `unregister` を挟ませることになる。
@@ -189,6 +196,7 @@ llm-gateway version
 - **監督者が登録簿を定期的に舐めて差分を取る**: 間隔に根拠が無く、間隔の内側で起きた往復 (stop → start) を取りこぼす
 - **監督者不在時に detached で子を起動する**: 子プロセスの所有者が CLI と監督者の 2 つになり、停止・再起動・状態確認の経路が分岐する
 - **`daemon restart --all` を同時再起動にする**: 短くても全断が出る。rolling で避けられるものを受け入れる理由がない
+- **socket の path の長さを設定の時点で断る (状態ディレクトリを決める側の責務にする)**: 置き場の深さは利用者と環境が決めるので、断ると置き場を変えさせることになる。試験だけ `/tmp` の短い symlink を経由して逃がす手は、本体の制約を残したまま試験だけを通す
 - **版を binary のファイルから読み取る**: 走っているプロセスが載せている版は、置いてあるファイルからは分からない (入れ替えても走っている側は変わらない)。それが分からないなら、そもそも 2 つを並べる意味が無い
 
 ## 影響

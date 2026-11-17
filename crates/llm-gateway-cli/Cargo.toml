@@ -22,7 +22,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
-# usage は server の HTTP 越しに取る (CLI 単独では持たない、DR-0007)。
+# 台が webhook を配る client (`daemon run`)。usage 等を台に聞くのは運用系の口
+# (`llm_gateway_server::socket::request`) で、reqwest は通らない。
 reqwest = { workspace = true }
 # service register / daemon add が焼き込むパスの安定化。
 stable-which = { workspace = true }
@@ -30,9 +31,11 @@ stable-which = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
-# 置き場の試験用実装が汎用層の Result を返すため。socket を置く試験の一時ディレクトリ
-# (`gateway_core::test_support`) も使う。
-gateway-core = { path = "../gateway-core", features = ["test-support"] }
+# 置き場の試験用実装が汎用層の Result を返すため。試験から socket に繋ぐ
+# (`gateway_core::unix_socket`) のにも使う。
+gateway-core = { path = "../gateway-core" }
+# 試験で socket を置く・繋ぐ (path が sun_path を超えても届く)。
+sockat = { workspace = true }
 # 設定ファイルを試験ごとに使い捨てる (実運用の設定を触らせない)。
 tempfile = { workspace = true }
 # `auth jwks` の出力 (TOML の断片) を読んで確かめる。

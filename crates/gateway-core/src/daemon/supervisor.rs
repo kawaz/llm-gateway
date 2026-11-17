@@ -274,7 +274,7 @@ impl Supervisor {
         };
         let lock = socket::hold(&self.socket).map_err(refused)?;
         socket::clear_stale(&self.socket).map_err(refused)?;
-        let listener = UnixListener::bind(&self.socket).map_err(refused)?;
+        let listener = crate::unix_socket::bind(&self.socket).map_err(refused)?;
 
         // 頼めば台が動く口なので、他の利用者には開けない。
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -603,7 +603,7 @@ impl Supervisor {
             return;
         }
         let path = protocol::control_path(&self.controls, &name);
-        let connected = tokio::time::timeout(DUMP_WAIT, UnixStream::connect(&path)).await;
+        let connected = tokio::time::timeout(DUMP_WAIT, crate::unix_socket::connect(&path)).await;
         let stream = match connected {
             Ok(Ok(stream)) => stream,
             Ok(Err(e))
@@ -1470,7 +1470,6 @@ async fn terminated() {
 mod tests {
     use super::*;
     use crate::daemon::registry::Unit;
-    use crate::test_support::SocketTempDir;
     use std::os::unix::fs::MetadataExt;
 
     /// 子の代わりに走らせる小さな実行ファイル。
@@ -1529,14 +1528,14 @@ mod tests {
     };
 
     struct World {
-        _dir: SocketTempDir,
+        _dir: tempfile::TempDir,
         supervisor: Arc<Supervisor>,
         registry: Registry,
         root: PathBuf,
     }
 
     fn world() -> World {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().to_path_buf();
         let registry = Registry::at(root.join("units"));
         let supervisor = Arc::new(Supervisor::new(
@@ -1827,7 +1826,7 @@ mod tests {
     ) {
         let dir = world.root.join("control");
         std::fs::create_dir_all(&dir).unwrap();
-        let listener = UnixListener::bind(protocol::control_path(&dir, unit)).unwrap();
+        let listener = crate::unix_socket::bind(&protocol::control_path(&dir, unit)).unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (reading, mut writing) = stream.into_split();
@@ -1962,7 +1961,7 @@ mod tests {
 
         let dir = world.root.join("control");
         std::fs::create_dir_all(&dir).unwrap();
-        let unit = UnixListener::bind(protocol::control_path(&dir, "a")).unwrap();
+        let unit = crate::unix_socket::bind(&protocol::control_path(&dir, "a")).unwrap();
         let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (stream, _) = unit.accept().await.unwrap();
@@ -2001,7 +2000,7 @@ mod tests {
             })
         };
 
-        let stream = UnixStream::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).await.unwrap();
         let mut lines = protocol::send(stream, &follow("a")).await.unwrap();
         assert_eq!(
             lines.next_line().await.unwrap().as_deref(),
@@ -2019,7 +2018,7 @@ mod tests {
 
         // 止まっている台・登録の無い台には 1 行で断る。
         for (unit, kind) in [("d", "not_running"), ("e", "unknown_unit")] {
-            let stream = UnixStream::connect(&socket).await.unwrap();
+            let stream = crate::unix_socket::connect(&socket).await.unwrap();
             let mut lines = protocol::send(stream, &follow(unit)).await.unwrap();
             let answer: serde_json::Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -2108,7 +2107,7 @@ mod tests {
         let serving = Arc::clone(&world.supervisor);
         let accepting = tokio::spawn(async move { serving.serve(listener).await });
 
-        let stream = UnixStream::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).await.unwrap();
         let (reading, mut writing) = stream.into_split();
         writing.write_all(b"{\"op\":\"fly\"}\n").await.unwrap();
         let mut lines = BufReader::new(reading).lines();
@@ -2222,7 +2221,7 @@ mod tests {
         let accepting = tokio::spawn(async move { serving.serve(listener).await });
         world.supervisor.reload().await;
 
-        let stream = UnixStream::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).await.unwrap();
         let mut lines = protocol::send(stream, &Request::Log(Which::all()))
             .await
             .unwrap();
@@ -2727,7 +2726,7 @@ mod tests {
                 matches!(refused.as_slice(), [NotStarted::AlreadyRunning(_)]),
                 "round {round}: {refused:?}"
             );
-            tokio::net::UnixStream::connect(&socket)
+            crate::unix_socket::connect(&socket)
                 .await
                 .unwrap_or_else(|e| panic!("round {round}: the winner listens: {e}"));
             drop(opened);
@@ -2739,7 +2738,7 @@ mod tests {
     async fn a_socket_an_older_supervisor_listens_on_is_not_taken() {
         let world = world();
         let socket = world.root.join("supervisor.sock");
-        let older = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let older = sockat::bind(&socket).unwrap();
 
         match world.supervisor.listen() {
             Err(NotStarted::AlreadyRunning(message)) => {

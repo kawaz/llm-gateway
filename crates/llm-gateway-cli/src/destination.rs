@@ -77,26 +77,21 @@ pub fn ask<T: serde::de::DeserializeOwned>(
     name: &str,
     query: &str,
 ) -> Result<T, Failure> {
-    // socket の上の HTTP なので host は飾り。台は host を見ない。
-    let url = format!("http://localhost/llm-gateway/{name}{query}");
+    let request = axum::http::Request::get(format!("/llm-gateway/{name}{query}"))
+        .body(axum::body::Body::empty())
+        .map_err(|e| Failure::from(format!("could not prepare the request: {e}")))?;
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| Failure::from(format!("could not start the async runtime: {e}")))?;
 
     runtime.block_on(async move {
-        let client = reqwest::Client::builder()
-            .unix_socket(target.socket.as_path())
-            .build()
-            .map_err(|e| Failure::from(format!("could not prepare the HTTP client: {e}")))?;
-        let resp = client
-            .get(&url)
-            .send()
+        let resp = llm_gateway_server::socket::request(&target.socket, request)
             .await
             .map_err(|e| unreachable(target, &causes(&e)))?;
         let status = resp.status();
-        let body = resp
-            .text()
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .map_err(|e| Failure::from(format!("could not read the response: {e}")))?;
+        let body = String::from_utf8_lossy(&body);
         if !status.is_success() {
             return Err(Failure::new(
                 "unit_refused",
@@ -108,8 +103,8 @@ pub fn ask<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// エラーとその原因を順に並べる。reqwest の表の文は「送れなかった」だけで、socket が
-/// 無いのか誰も待っていないのかは原因の側にある。
+/// エラーとその原因を順に並べる。HTTP の層のエラーの表の文は「送れなかった」程度で、
+/// 何が起きたかは原因の側にある。
 fn causes(e: &dyn std::error::Error) -> String {
     let mut said = e.to_string();
     let mut source = e.source();
@@ -142,9 +137,9 @@ does not open this socket needs updating and `llm-gateway daemon restart {unit}`
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_core::test_support::SocketTempDir;
     use llm_gateway::daemon::registry::Unit;
     use std::path::Path;
+    use tempfile::TempDir;
 
     fn register(registry: &Registry, dir: &Path, name: &str, listen: &str) {
         let config = dir.join(format!("{name}.toml"));
@@ -285,7 +280,7 @@ mod tests {
     /// CLI は台の socket の口を読む (TCP には行かない)。
     #[test]
     fn ask_reads_the_unit_through_its_socket() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let router = axum::Router::new().route(
             "/llm-gateway/usage",
             axum::routing::get(|query: axum::extract::RawQuery| async move {
@@ -309,7 +304,7 @@ mod tests {
     /// 落ちずに断り、どの socket を見たかと、版を上げて restart することを言う。
     #[test]
     fn a_missing_socket_is_refused_with_how_to_fix_it() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let target = Target {
             unit: "unstable".to_owned(),
             socket: dir.path().join("absent.sock"),

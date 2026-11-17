@@ -15,7 +15,7 @@ use gateway_core::daemon::protocol::{self, Request, Which};
 use gateway_core::daemon::registry::Registry;
 use gateway_core::daemon::socket::{clear_stale, hold, lock_path};
 use gateway_core::daemon::supervisor::{NotStarted, Supervisor, UnitProbe};
-use gateway_core::test_support::SocketTempDir;
+use tempfile::TempDir;
 
 /// 台を抱えないので、問い合わせ方は使われない。
 const PROBE: UnitProbe = UnitProbe {
@@ -72,15 +72,15 @@ async fn answers(socket: &Path) -> bool {
 }
 
 fn stale_socket(path: &Path) {
-    // 待ち受けを閉じても、std の UnixListener はファイルを消さない (落ちたプロセスの残骸)。
-    drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+    // 待ち受けを閉じても、ファイルは消えない (std と同じ。落ちたプロセスの残骸)。
+    drop(sockat::bind(path).unwrap());
     assert!(path.exists());
 }
 
 /// 握っている間、同じ path はもう握れない。手放せばまた握れる。
 #[test]
 fn one_holder_at_a_time() {
-    let dir = SocketTempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let path = dir.path().join("a.sock");
 
     let first = hold(&path).unwrap();
@@ -100,7 +100,7 @@ fn one_holder_at_a_time() {
 /// ファイルは残して断る。何も無ければ何もしない。
 #[test]
 fn only_a_socket_nobody_listens_on_is_cleared() {
-    let dir = SocketTempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
 
     clear_stale(&dir.path().join("none.sock")).unwrap();
 
@@ -110,7 +110,7 @@ fn only_a_socket_nobody_listens_on_is_cleared() {
     assert!(!stale.exists());
 
     let live = dir.path().join("live.sock");
-    let _listening = std::os::unix::net::UnixListener::bind(&live).unwrap();
+    let _listening = sockat::bind(&live).unwrap();
     let e = clear_stale(&live).expect_err("refused");
     assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
     assert!(live.exists());
@@ -126,7 +126,7 @@ fn only_a_socket_nobody_listens_on_is_cleared() {
 /// 次の監督者は上がって頼みに答える。
 #[tokio::test]
 async fn a_supervisor_comes_up_over_what_a_dead_one_left() {
-    let dir = SocketTempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
     stale_socket(&socket);
     std::fs::write(lock_path(&socket), "").unwrap();
@@ -142,7 +142,7 @@ async fn a_supervisor_comes_up_over_what_a_dead_one_left() {
 /// 頼み口は消え、次の監督者が上がれる。
 #[tokio::test]
 async fn a_second_supervisor_is_refused_and_the_first_keeps_its_socket() {
-    let dir = SocketTempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
 
     let first = begin(supervisor(dir.path(), &socket)).await.unwrap();
@@ -168,13 +168,13 @@ async fn a_second_supervisor_is_refused_and_the_first_keeps_its_socket() {
 /// 残す。
 #[tokio::test]
 async fn letting_go_removes_only_its_own_socket() {
-    let dir = SocketTempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let socket = dir.path().join("supervisor.sock");
 
     let supervising = begin(supervisor(dir.path(), &socket)).await.unwrap();
     // 退けるだけで消さない (inode が生きている間は、置き直す socket に同じ番号が付かない)。
     std::fs::rename(&socket, dir.path().join("moved.sock")).unwrap();
-    let _other = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let _other = sockat::bind(&socket).unwrap();
     stop(supervising).await;
     assert!(socket.exists(), "a socket someone else put there stays");
 }

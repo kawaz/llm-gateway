@@ -1066,21 +1066,24 @@ impl Server {
         }
     }
 
-    /// unit `unit` が開く socket ([`Server::unix_path`]) が bind できる形か。書かれた
-    /// `unix` も既定の path も同じ規則で見る。既定が長すぎる (`XDG_STATE_HOME` や unit
-    /// の名前が長い) なら、短い path を `[server] unix` に書く案内を添える。
+    /// unit `unit` が開く socket ([`Server::unix_path`]) が台と CLI で同じ場所を指すか。
+    /// 書かれた `unix` も既定の path も同じ規則で見る。既定が相対パスになる (`$HOME`
+    /// が相対パス) なら、絶対パスを `[server] unix` に書く案内を添える。
     pub fn check_unix_for(&self, unit: &str) -> Result<()> {
         if self.unix.is_some() {
             return self.check_unix();
         }
         let path = self.unix_path(unit);
         check_socket_path(&path, &format!("the default operations socket of `{unit}`"))
-            .map_err(|e| Error::Config(format!("{e}; write a shorter path as [server] unix")))
+            .map_err(|e| Error::Config(format!("{e}; write an absolute path as [server] unix")))
     }
 }
 
-/// socket の path が bind できる形か。相対パスは台と CLI で cwd が違うので同じ場所を
-/// 指さず、`sun_path` に収まらない長さは bind も connect もできない。
+/// socket の path が台と CLI で同じ場所を指すか。相対パスは台と CLI で cwd が違うので
+/// 同じ場所を指さない。
+///
+/// 長さは見ない。台も CLI も sockat で bind / connect するので、`sun_path` に収まらない
+/// path にも届く (`gateway_core::unix_socket`)。
 fn check_socket_path(path: &Path, what: &str) -> std::result::Result<(), String> {
     if !path.is_absolute() {
         return Err(format!(
@@ -1088,21 +1091,8 @@ fn check_socket_path(path: &Path, what: &str) -> std::result::Result<(), String>
             path.display()
         ));
     }
-    let len = path.as_os_str().len();
-    if len > MAX_UNIX_PATH {
-        return Err(format!(
-            "{what} is {len} bytes long, but a socket path can be at most {MAX_UNIX_PATH} on this system: {}",
-            path.display()
-        ));
-    }
     Ok(())
 }
-
-/// Unix socket のパスの上限 (バイト)。`sockaddr_un.sun_path` から終端の NUL を除いた分
-/// (macOS 103、Linux 107)。`sun_path` は構造体の末尾の欄。
-const MAX_UNIX_PATH: usize = std::mem::size_of::<libc::sockaddr_un>()
-    - std::mem::offset_of!(libc::sockaddr_un, sun_path)
-    - 1;
 
 /// 既定の待ち受け先。
 ///
@@ -3720,40 +3710,44 @@ routes = ["a", "typo-here"]
         );
     }
 
-    /// `unix` は bind できる形でなければ `check` で断る: 相対パス (台と CLI で cwd が
-    /// 違う) と、`sun_path` に収まらない長さ。上限ちょうどは通す。
+    /// `unix` は相対パスなら `check` で断る: 台と CLI は別のディレクトリで動くので、
+    /// 相対パスは両者で別の場所を指し、CLI が台に届かない。
+    ///
+    /// 長さでは断らない。`sun_path` (NUL 込みで macOS 104 / Linux 108 バイト) を超える
+    /// path も、台と CLI は sockat で bind / connect できる。置き場の深さは運用者が
+    /// 決めるので、長さで断るとその人の置き場を拒むことになる。
     #[test]
-    fn an_operations_socket_path_that_cannot_be_bound_is_refused() {
+    fn an_operations_socket_path_must_be_absolute_but_may_be_long() {
         let e = parse("[server]\nunix = \"gw.sock\"\n").unwrap_err();
-        assert!(e.to_string().contains("absolute"), "{e}");
-
-        let at_limit = format!("/{}", "a".repeat(MAX_UNIX_PATH - 1));
-        parse(&format!("[server]\nunix = \"{at_limit}\"\n")).unwrap();
-
-        let too_long = format!("/{}", "a".repeat(MAX_UNIX_PATH));
-        let e = parse(&format!("[server]\nunix = \"{too_long}\"\n")).unwrap_err();
         let said = e.to_string();
         assert!(said.contains("[server] unix"), "{said}");
-        assert!(said.contains(&format!("at most {MAX_UNIX_PATH}")), "{said}");
+        assert!(said.contains("absolute"), "{said}");
+
+        let long = format!("/{}/gw.sock", "a".repeat(200));
+        parse(&format!("[server]\nunix = \"{long}\"\n")).unwrap();
     }
 
-    /// 既定の path も、unit の名前が分かる所で同じ規則で見る。長すぎれば `[server] unix`
-    /// に短い path を書く案内を添える。書いた `unix` があればそちらを見る。
+    /// 既定の path も、unit の名前が分かる所で同じ規則で見る。unit の名前が長くて既定の
+    /// path が `sun_path` を超えても断らない。書いた `unix` があればそちらを見る
+    /// (相対パスを書けば、名前に依らず断る)。
+    ///
+    /// 既定が相対パスになるのは `$HOME` が相対パスの時だけで、環境変数を試験の中で
+    /// 書き換えると並行する試験に漏れるので、そこは確かめない。
     #[test]
     fn the_default_operations_socket_is_checked_with_the_unit_name() {
         let c = parse("").unwrap();
         c.server.check_unix_for("stable").unwrap();
 
-        let long_unit = "u".repeat(MAX_UNIX_PATH);
-        let said = c.server.check_unix_for(&long_unit).unwrap_err().to_string();
-        assert!(said.contains("default operations socket"), "{said}");
-        assert!(
-            said.contains("write a shorter path as [server] unix"),
-            "{said}"
-        );
+        let long_unit = "u".repeat(200);
+        c.server.check_unix_for(&long_unit).unwrap();
 
-        let written = parse("[server]\nunix = \"/run/gw.sock\"\n").unwrap();
-        written.server.check_unix_for(&long_unit).unwrap();
+        let relative = Server {
+            unix: Some(PathBuf::from("gw.sock")),
+            ..Server::default()
+        };
+        let said = relative.check_unix_for("stable").unwrap_err().to_string();
+        assert!(said.contains("[server] unix"), "{said}");
+        assert!(said.contains("absolute"), "{said}");
     }
 
     /// `unix` は起動時に bind するので、読み直しでは変えられない。

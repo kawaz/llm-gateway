@@ -83,7 +83,7 @@ pub fn log(args: &[String]) -> Result<ExitCode, Failure> {
 
     let socket = protocol::socket_path();
     runtime()?.block_on(async move {
-        let stream = tokio::net::UnixStream::connect(&socket)
+        let stream = protocol::connect(&socket)
             .await
             .map_err(|e| not_running(&e))?;
         let mut lines = protocol::send(stream, &Request::Log(which))

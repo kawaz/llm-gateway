@@ -6,7 +6,8 @@
 //! 監督者が居なければ socket も無い。CLI はそれを「監督者が動いていない」と
 //! して断り、代わりに子を起こしたりはしない (所有者が 2 つになる)。
 //!
-//! socket の path が sun_path に収まるかは、状態ディレクトリを決める側の責務。
+//! socket は [`crate::unix_socket`] で開いて繋ぐので、状態ディレクトリがどれだけ深くても
+//! (path が sun_path に収まらなくても) 届く。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -335,9 +336,15 @@ pub fn operations_path(dir: &Path, unit: &str) -> PathBuf {
     dir.join(format!("{unit}.sock"))
 }
 
+/// 頼み口 (監督者の socket、台の制御口) に繋ぐ。path の長さは問わない
+/// ([`crate::unix_socket`])。繋いだ後は [`send`] で頼む。
+pub async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
+    crate::unix_socket::connect(socket).await
+}
+
 /// 頼んで、1 行の答えを受け取る。
 pub async fn ask<T: Serialize>(socket: &Path, request: &T) -> std::io::Result<String> {
-    let stream = UnixStream::connect(socket).await?;
+    let stream = connect(socket).await?;
     let mut lines = send(stream, request).await?;
     match lines.next_line().await? {
         Some(line) => Ok(line),

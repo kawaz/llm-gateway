@@ -6389,12 +6389,8 @@ mod callers_tests {
         }
     }
 
-    /// 同じ unit の Router を Unix socket の口 (DR-0043 決定 7) でも出し、その socket を
-    /// 読む client を返す。
-    async fn serve_unix(
-        gateway: Arc<Gateway<StaticStore>>,
-        path: &std::path::Path,
-    ) -> reqwest::Client {
+    /// 同じ unit の Router を Unix socket の口 (DR-0043 決定 7) でも出す。
+    fn serve_unix(gateway: Arc<Gateway<StaticStore>>, path: &std::path::Path) {
         let socket = socket::OperationsSocket::bind(path).unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(
@@ -6403,19 +6399,34 @@ mod callers_tests {
             )
             .await;
         });
-        reqwest::Client::builder()
-            .unix_socket(path.to_path_buf())
-            .build()
-            .unwrap()
+    }
+
+    /// 運用系の口に 1 つ送り、応答をヘッダまで受ける (CLI と同じ読み手 [`socket::request`]。
+    /// `events` は流れ続けるので本文は読まない)。
+    async fn over_unix(
+        socket: &std::path::Path,
+        method: &str,
+        path: &str,
+        json: Option<serde_json::Value>,
+    ) -> axum::http::Response<axum::body::Body> {
+        let request = axum::http::Request::builder().method(method).uri(path);
+        let request = match json {
+            Some(json) => request
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json.to_string())),
+            None => request.body(axum::body::Body::empty()),
+        };
+        socket::request(socket, request.unwrap()).await.unwrap()
     }
 
     /// `[callers]` のある unit でも、Unix socket の口は署名を求めない。同じ unit の
     /// TCP の口は未署名を 401 で断ったまま。
     #[tokio::test]
     async fn the_unix_socket_serves_operations_without_a_signature() {
-        let dir = gateway_core::test_support::SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let (base, gateway) = serve_callers(dir.path(), true).await;
-        let client = serve_unix(gateway, &dir.path().join("gw.sock")).await;
+        let sock = dir.path().join("gw.sock");
+        serve_unix(gateway, &sock);
 
         for path in [
             "/llm-gateway/usage",
@@ -6425,31 +6436,24 @@ mod callers_tests {
             "/llm-gateway/status",
             "/llm-gateway/stats?days=1",
         ] {
-            let resp = client
-                .get(format!("http://localhost{path}"))
-                .send()
-                .await
-                .unwrap();
+            let resp = over_unix(&sock, "GET", path, None).await;
             assert_eq!(resp.status(), 200, "unix socket: GET {path}");
             assert!(resp.headers().get("www-authenticate").is_none(), "{path}");
 
             let unsigned = call(&base, "GET", path, None).await;
             refused(unsigned, Unsigned, &format!("tcp: GET {path}")).await;
         }
-        let pause = client
-            .post("http://localhost/llm-gateway/keepalive/pause")
-            .json(&json!({"session_id": "s-1"}))
-            .send()
-            .await
-            .unwrap();
+        let pause = over_unix(
+            &sock,
+            "POST",
+            "/llm-gateway/keepalive/pause",
+            Some(json!({"session_id": "s-1"})),
+        )
+        .await;
         assert_eq!(pause.status(), 200, "unix socket: pause");
 
         // 署名の層が無いだけで、道筋は同じ (監督者の口も、転送の口も生えている)。
-        let healthz = client
-            .get("http://localhost/llm-gateway/healthz")
-            .send()
-            .await
-            .unwrap();
+        let healthz = over_unix(&sock, "GET", "/llm-gateway/healthz", None).await;
         assert_eq!(healthz.status(), 200);
     }
 

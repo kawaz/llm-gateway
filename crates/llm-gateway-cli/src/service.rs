@@ -388,7 +388,7 @@ fn wait_while_stopping(
 ) -> Result<bool, Failure> {
     let runtime = runtime()?;
     runtime.block_on(async move {
-        let held = tokio::net::UnixStream::connect(socket).await.ok();
+        let held = protocol::connect(socket).await.ok();
         tell()?;
         // 掴めなかったのなら、そもそも監督者は答えていない。
         let Some(mut held) = held else {
@@ -670,7 +670,6 @@ fn runtime() -> Result<tokio::runtime::Runtime, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_core::test_support::SocketTempDir;
     use std::cell::RefCell;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -1119,7 +1118,7 @@ mod tests {
     /// 引いていると、手元で本物が動いているときに試験がそれを掴んでしまう。
     #[test]
     fn stopping_waits_on_the_socket_it_was_given() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
         assert_eq!(
             register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
@@ -1128,7 +1127,7 @@ mod tests {
 
         // 掴ませてから離す監督者役。
         let socket = dir.path().join("supervisor.sock");
-        let listening = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listening = sockat::bind(&socket).unwrap();
         let held = std::thread::spawn(move || {
             // 受けてすぐ手放す = 監督者が畳み終わった時と同じ EOF。
             drop(listening.accept());
@@ -1144,7 +1143,7 @@ mod tests {
     /// 監督者が居なければ、止めた瞬間に終わっている。
     #[test]
     fn stopping_something_that_holds_nothing_returns_at_once() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let plan = plan_in(dir.path());
         assert_eq!(
             register(&plan, &Recorder::default(), Options::default(), None).unwrap(),
@@ -1165,9 +1164,9 @@ mod tests {
     /// 掴んだ繋がりが切れたら、畳み終わったということ。
     #[test]
     fn the_wait_ends_when_the_supervisor_lets_go_of_its_socket() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("supervisor.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = sockat::bind(&socket).unwrap();
 
         // 監督者の代わり。1 本受けたら、そのまま終わる (= 待ち受けも繋がりも落ちる)。
         let supervisor = std::thread::spawn(move || {

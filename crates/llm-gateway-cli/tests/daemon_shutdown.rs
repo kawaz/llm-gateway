@@ -1,11 +1,11 @@
 #![cfg(unix)]
 
-use gateway_core::test_support::SocketTempDir;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_llm-gateway")
@@ -124,7 +124,7 @@ fn terminate(mut daemon: Daemon) {
 /// 監督者が 10 秒後に SIGKILL する前に daemon run 自身が exit 0 する。
 #[test]
 fn sigterm_stops_daemon_with_an_events_subscription() {
-    let root = SocketTempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
     let port = unused_port();
     let child = start(root.path(), port);
     let _subscription = subscribe(port, "/llm-gateway/events");
@@ -137,7 +137,7 @@ fn sigterm_stops_daemon_with_an_events_subscription() {
 fn subscribe_unix(socket: &Path, endpoint: &str) -> std::os::unix::net::UnixStream {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut stream = loop {
-        match std::os::unix::net::UnixStream::connect(socket) {
+        match sockat::connect(socket) {
             Ok(stream) => break stream,
             Err(error) if Instant::now() < deadline => {
                 std::thread::yield_now();
@@ -172,7 +172,7 @@ fn subscribe_unix(socket: &Path, endpoint: &str) -> std::os::unix::net::UnixStre
 fn the_unit_serves_its_operations_socket_until_it_stops() {
     use std::os::unix::fs::PermissionsExt;
 
-    let root = SocketTempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
     let port = unused_port();
     let child = start(root.path(), port);
     let socket = root.path().join("state/llm-gateway/daemon/http/probe.sock");

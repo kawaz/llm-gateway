@@ -47,7 +47,7 @@ impl ControlSocket {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
+        let listener = gateway_core::unix_socket::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(Self {
             listener,
@@ -368,10 +368,9 @@ fn dump_failed(unit: &str, kind: &str, message: impl Into<String>) -> serde_json
 mod tests {
     use super::*;
     use crate::credential::file::FileStore;
-    use gateway_core::test_support::SocketTempDir;
 
     struct Unit {
-        dir: SocketTempDir,
+        dir: tempfile::TempDir,
         config: PathBuf,
         gateway: Arc<Gateway<FileStore>>,
     }
@@ -404,7 +403,7 @@ routes = ["a"]
     }
 
     fn unit() -> Unit {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("u.toml");
         std::fs::write(&config, body(dir.path(), "127.0.0.1:11301", "")).unwrap();
         let loaded = Config::load(&config).unwrap();
@@ -501,7 +500,7 @@ routes = ["a"]
         let task = tokio::spawn(async move { serving.serve("u", &config, gateway).await });
 
         // 改行を寄越さない繋がりがあっても、上限で閉じて次の頼みに答える。
-        let mut silent = UnixStream::connect(&path).await.unwrap();
+        let mut silent = gateway_core::unix_socket::connect(&path).await.unwrap();
         silent.write_all(b"{\"op\":").await.unwrap();
         let mut rest = Vec::new();
         tokio::time::timeout(
@@ -683,7 +682,7 @@ routes = ["a"]
         if let DumpRequest::Start { follow, .. } = &mut start {
             *follow = true;
         }
-        let stream = UnixStream::connect(&path).await.unwrap();
+        let stream = gateway_core::unix_socket::connect(&path).await.unwrap();
         let mut lines = protocol::send(stream, &ControlRequest::Dump(start))
             .await
             .unwrap();

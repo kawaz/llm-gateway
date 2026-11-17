@@ -2,12 +2,12 @@
 
 //! `daemon reload` を監督者 + 台 2 つで通す (DR-0032 段 4)。
 
-use gateway_core::test_support::SocketTempDir;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_llm-gateway")
@@ -112,7 +112,7 @@ fn lists_n(port: u16) -> bool {
 /// 1 台が失敗しても残りの台は読み直され、全台の結果が並び、exit は非 0。
 #[test]
 fn reloading_everything_reports_every_unit_and_fails_if_one_failed() {
-    let root = SocketTempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
     let state: PathBuf = root.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
     let [port_a, port_b, moved] = unused_ports();

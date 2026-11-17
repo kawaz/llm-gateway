@@ -5,13 +5,20 @@
 //! (自分と同じこと)。どちらも同じ uid のプロセスだけを通す線で、そのプロセスは
 //! 設定も `[stats] dir` の控えも credential ファイルも読める者なので、信頼の境界は
 //! 変わらない。
+//!
+//! 開くのも繋ぐのも [`gateway_core::unix_socket`] (sockat) を通すので、path の長さは
+//! `sun_path` に縛られない。CLI 側の読み手 [`request`] も同じ理由でここに置く
+//! (reqwest の Unix socket は自前で connect し、長い path に届かない)。
 
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use axum::body::Body;
+use axum::http::{Request, Response, header};
 use gateway_core::daemon::socket::{clear_stale, hold};
+use hyper_util::rt::TokioIo;
 use tokio::net::{UnixListener, UnixStream};
 
 /// 開いている運用系の口。落とすと socket ファイルも消す。
@@ -64,7 +71,7 @@ impl OperationsSocket {
 
         let lock = hold(path)?;
         clear_stale(path)?;
-        let listener = UnixListener::bind(path)?;
+        let listener = gateway_core::unix_socket::bind(path)?;
         // 制御口と同じく bind の後で閉じる。umask を触るとプロセス全体に効き、他の
         // スレッドが作るファイルまで巻き込む。閉じるまでの間に繋いだ相手も、
         // 受ける時の uid の検査で落ちる。
@@ -112,9 +119,44 @@ impl axum::serve::Listener for OperationsSocket {
         }
     }
 
+    /// カーネルが答える socket の名前。path が長いと、開いた時の path ではない
+    /// (相対パスやファイル名だけ等、[`gateway_core::unix_socket`])。開いた path は
+    /// [`OperationsSocket::path`] が持つ。
     fn local_addr(&self) -> io::Result<Self::Addr> {
         self.listener.local_addr()
     }
+}
+
+/// `path` の運用系の口に 1 つの request を送り、応答を返す。
+///
+/// request の URI は path と query だけ (`/llm-gateway/usage?refresh=true`) を書く。
+/// `Host` が無ければ `localhost` を足す (台は host を見ないが、HTTP/1.1 は必須とする)。
+/// 返るのはヘッダまでで、本文は読み手が読む (`events` のように流れ続ける口もある)。
+/// 繋がらない時は繋ぐ時の `io::Error` (`NotFound` / `ConnectionRefused` 等) をそのまま、
+/// HTTP を話せなかった時はその理由を包んだ `io::Error` を返す。
+///
+/// Design rationale: HTTP の client は reqwest でなく hyper を直に使う。reqwest の
+/// `unix_socket` は内部で tokio の connect を呼び、path が `sun_path` に収まらないと
+/// 繋げない。connect を差し替える口 (`connector_layer`) も、包めるのは reqwest 自身の
+/// connector だけで、返す接続の型が外から作れない。1 本の接続で 1 往復するだけなので、
+/// sockat で繋いだ stream の上で HTTP/1 の handshake から行う。
+pub async fn request(path: &Path, mut request: Request<Body>) -> io::Result<Response<Body>> {
+    if !request.headers().contains_key(header::HOST) {
+        request
+            .headers_mut()
+            .insert(header::HOST, header::HeaderValue::from_static("localhost"));
+    }
+    let stream = gateway_core::unix_socket::connect(path).await?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(io::Error::other)?;
+    // 接続を回す側。sender (この関数を出る時に落ちる) と応答の本文が落ちれば終わる。
+    tokio::spawn(connection);
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(io::Error::other)?;
+    Ok(response.map(Body::new))
 }
 
 /// 繋いできた相手を通すか。通すのは uid が `owner` と同じ相手だけで、uid を
@@ -148,8 +190,64 @@ fn check_dir(uid: libc::uid_t, mode: u32, owner: libc::uid_t) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway_core::test_support::SocketTempDir;
     use std::os::unix::fs::FileTypeExt;
+    use tempfile::TempDir;
+
+    /// どの OS の `sun_path` (NUL 込みで macOS 104 / Linux 108 バイト) にも収まらない
+    /// 深さの path。置き場の `$TMPDIR` が短い環境でも長くなるよう、深さを足して作る。
+    fn beyond_sun_path(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("d".repeat(120)).join("gw.sock");
+        assert!(path.as_os_str().len() > 108, "{}", path.display());
+        path
+    }
+
+    /// 運用系の口は `sun_path` に収まらない path でも開き、CLI の読み手 ([`request`]) は
+    /// そこへ繋いで HTTP を話せる。socket ファイルは書いた path そのものにでき、落とせば
+    /// そこから消える。
+    ///
+    /// 置き場 (`[server] unix`、既定は `$XDG_STATE_HOME` の下) の深さは運用者と環境が
+    /// 決めるので、長さで断ると「TCP は動くのに CLI が台に届かない」台ができる。開く側と
+    /// 読む側のどちらかが std / reqwest の connect に戻ると、ここで落ちる。
+    #[tokio::test]
+    async fn a_path_longer_than_sun_path_is_opened_and_read() {
+        let dir = TempDir::new().unwrap();
+        let path = beyond_sun_path(dir.path());
+
+        let socket = OperationsSocket::bind(&path).unwrap();
+        assert_eq!(socket.path(), path, "keeps the path it was given");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_socket()
+        );
+        let router = axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve(socket, router.into_make_service()).await;
+        });
+
+        let get = Request::get("/ping").body(Body::empty()).unwrap();
+        let answer = request(&path, get).await.unwrap();
+        assert_eq!(answer.status(), 200);
+        let body = axum::body::to_bytes(answer.into_body(), 64).await.unwrap();
+        assert_eq!(body.as_ref(), b"pong");
+
+        serving.abort();
+        let _ = serving.await;
+        assert!(!path.exists(), "the socket file is removed by its path");
+    }
+
+    /// 誰も開いていない path へは、繋ぐ時の理由 (`NotFound`) がそのまま返る。CLI は
+    /// これを「台に届かない」の理由として見せる。
+    #[tokio::test]
+    async fn requesting_a_missing_socket_says_it_is_not_there() {
+        let dir = TempDir::new().unwrap();
+        let get = Request::get("/ping").body(Body::empty()).unwrap();
+        let e = request(&dir.path().join("absent.sock"), get)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+    }
 
     /// 通すのは自分と同じ uid だけ。別の uid と、uid を読めなかった相手は断る。
     ///
@@ -185,7 +283,7 @@ mod tests {
     /// group / other が書き込めるディレクトリ (sticky でも) には socket を開かない。
     #[tokio::test]
     async fn a_directory_others_can_write_is_refused() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         for mode in [0o777, 0o1777, 0o770] {
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
@@ -202,7 +300,7 @@ mod tests {
     /// `AddrInUse` で断られ、先に開いた側の socket は生きたまま。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_units_racing_for_one_path_do_not_steal_it() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         for round in 0..50 {
             let path = dir.path().join(format!("gw-{round}.sock"));
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -231,7 +329,7 @@ mod tests {
                 "round {round}: {}",
                 refused[0]
             );
-            tokio::net::UnixStream::connect(&path)
+            gateway_core::unix_socket::connect(&path)
                 .await
                 .unwrap_or_else(|e| panic!("round {round}: the winner still listens: {e}"));
         }
@@ -240,7 +338,7 @@ mod tests {
     /// 開いた台が手放せば lock は外れ、次の台が同じ path を開ける。
     #[tokio::test]
     async fn the_path_is_free_again_once_the_holder_drops_it() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         drop(OperationsSocket::bind(&path).unwrap());
         let _again = OperationsSocket::bind(&path).unwrap();
@@ -249,7 +347,7 @@ mod tests {
     /// 開いた socket は 0600 で、親ディレクトリが無ければ 0700 で作る。落とすと消える。
     #[tokio::test]
     async fn the_socket_is_private_and_removed_when_dropped() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("made").join("gw.sock");
 
         let socket = OperationsSocket::bind(&path).unwrap();
@@ -270,7 +368,7 @@ mod tests {
     /// 既にある親ディレクトリの権限は変えない (運用者が `$HOME` の下を指しうる)。
     #[tokio::test]
     async fn an_existing_directory_keeps_its_mode() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _socket = OperationsSocket::bind(&dir.path().join("gw.sock")).unwrap();
@@ -281,14 +379,14 @@ mod tests {
     /// 前回落ちた台が残した socket (誰も待っていない) は片付けて開ける。
     #[tokio::test]
     async fn a_stale_socket_is_cleared() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
-        // 待ち受けを閉じても、std の UnixListener はファイルを消さない (落ちた台の残骸)。
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        // 待ち受けを閉じても、ファイルは消えない (std と同じ。落ちた台の残骸)。
+        drop(sockat::bind(&path).unwrap());
         assert!(path.exists());
 
         let socket = OperationsSocket::bind(&path).unwrap();
-        tokio::net::UnixStream::connect(&path)
+        gateway_core::unix_socket::connect(&path)
             .await
             .expect("the new socket listens");
         drop(socket);
@@ -297,13 +395,13 @@ mod tests {
     /// 誰かが待っている socket は消さずに断る (同じ path を書いた 2 台の取り合い)。
     #[tokio::test]
     async fn a_socket_someone_listens_on_is_not_taken() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         let first = OperationsSocket::bind(&path).unwrap();
 
         let e = OperationsSocket::bind(&path).err().expect("refused");
         assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
-        tokio::net::UnixStream::connect(&path)
+        gateway_core::unix_socket::connect(&path)
             .await
             .expect("the first one still listens");
         drop(first);
@@ -312,7 +410,7 @@ mod tests {
     /// socket でないファイルは、path の書き間違いを疑って消さない。
     #[tokio::test]
     async fn a_file_that_is_not_a_socket_is_left_alone() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[server]\n").unwrap();
 
@@ -325,12 +423,12 @@ mod tests {
     /// socket は残す。
     #[tokio::test]
     async fn dropping_leaves_a_socket_someone_else_put_there() {
-        let dir = SocketTempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.path().join("gw.sock");
         let socket = OperationsSocket::bind(&path).unwrap();
         // 退けるだけで消さない (inode が生きている間は、置き直す socket に同じ番号が付かない)。
         std::fs::rename(&path, dir.path().join("moved.sock")).unwrap();
-        let _other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _other = sockat::bind(&path).unwrap();
 
         drop(socket);
         assert!(path.exists(), "the other socket stays");

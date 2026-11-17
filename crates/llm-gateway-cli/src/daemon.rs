@@ -265,20 +265,44 @@ mod tests {
         assert!(!unit.added_at.is_empty());
     }
 
-    /// 運用系の口の既定の path が socket の path の上限を超える名前は、登録の前に断る。
+    /// 運用系の口の既定の path (状態ディレクトリの下、unit の名前で決まる) が
+    /// `sun_path` (NUL 込みで macOS 104 / Linux 108 バイト) を超える名前でも登録できる。
+    /// 台も CLI も sockat で bind / connect するので、長さは台に届くかを左右しない。
     #[test]
-    fn add_refuses_a_name_whose_default_socket_path_is_too_long() {
+    fn add_accepts_a_name_whose_default_socket_path_is_long() {
         let dir = tempfile::TempDir::new().unwrap();
         let registry = Registry::at(dir.path().join("units"));
         let config = config_file(dir.path(), "c", "127.0.0.1:11301");
         let name = "n".repeat(110);
 
-        let e = add(
-            &registry,
-            &args(&[config.to_str().unwrap(), "--name", &name]),
+        assert_eq!(
+            add(
+                &registry,
+                &args(&[config.to_str().unwrap(), "--name", &name]),
+            )
+            .unwrap(),
+            ExitCode::SUCCESS
+        );
+        registry.get(&name).unwrap();
+    }
+
+    /// 運用系の口が相対パスなら、登録の前に断る。台と CLI は別のディレクトリで動くので、
+    /// 相対パスでは CLI が台の開いた socket に届かない (登録してから気づくと、TCP は
+    /// 動くのに CLI だけが台に届かない台ができる)。
+    #[test]
+    fn add_refuses_a_relative_operations_socket() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let registry = Registry::at(dir.path().join("units"));
+        let config = dir.path().join("c.toml");
+        std::fs::write(
+            &config,
+            "[server]\nlisten = \"127.0.0.1:11301\"\nunix = \"gw.sock\"\n",
         )
-        .unwrap_err();
+        .unwrap();
+
+        let e = add(&registry, &args(&[config.to_str().unwrap()])).unwrap_err();
         assert!(e.message().contains("[server] unix"), "{e:?}");
+        assert!(e.message().contains("absolute"), "{e:?}");
         assert!(registry.list().unwrap().is_empty(), "nothing is registered");
     }
 

@@ -480,13 +480,16 @@ unix = "~/.local/state/llm-gateway/daemon/http/unstable.sock"   # optional; this
 - The socket file is mode 0600, and a connection is accepted only when the connecting process runs as the same user as the unit (`getpeereid` on macOS, `SO_PEERCRED` on Linux); anyone else is disconnected before HTTP is spoken. A missing parent directory is created with mode 0700; an existing one keeps its mode, but it must be owned by the unit's user and not writable by group or others (sticky included), or the socket is not opened — otherwise another user could swap the socket for a fake one the CLI would believe
 - While the socket is open the unit holds a lock on `<path>.lock` next to it (left in place when the unit stops). A second unit pointed at the same path does not get the lock and does not open the socket
 - At start, a socket left behind by a unit that died is removed. A socket some process still listens on, and a file that is not a socket, are left alone and the socket is not opened (the unit logs why and keeps serving TCP). The file is removed when the unit stops
-- `llm-gateway check` refuses a `unix` that is not an absolute path (the unit and the CLI run in different directories) or longer than a socket path can be (103 bytes on macOS, 107 on Linux). The default path depends on the unit's name, so `daemon add` checks it by the same rule and refuses a name (or `$XDG_STATE_HOME`) that makes it too long; write a shorter path as `unix` then
+- `llm-gateway check` refuses a `unix` that is not an absolute path (the unit and the CLI run in different directories). The default path depends on the unit's name, so `daemon add` checks it by the same rule
+- The path has no length limit. The unit and the CLI open and reach a socket even past the Unix socket path limit (103 bytes on macOS, 107 on Linux). `curl --unix-socket` refuses such a path (`Unix socket path too long`), though; enter the socket's directory and pass just the name then (the second line of the example below)
 - `unix` is taken when the unit starts; changing it needs `daemon restart`
 - **Do not expose the socket through a reverse proxy.** Outside callers read the TCP endpoints, which ask for a signature once `[callers]` is written
 
 ```bash
 SOCK=${XDG_STATE_HOME:-~/.local/state}/llm-gateway/daemon/http/unstable.sock
 curl -sS --unix-socket "$SOCK" http://localhost/llm-gateway/sessions
+# when the path is too long for curl
+(cd "$(dirname "$SOCK")" && curl -sS --unix-socket "$(basename "$SOCK")" http://localhost/llm-gateway/sessions)
 ```
 
 The same request over TCP (`curl -sS http://127.0.0.1:8402/llm-gateway/sessions`) needs `-H "Authorization: Bearer $TOKEN"` signed by a caller's key on a unit with `[callers]` ([Making a token](#making-a-token)).

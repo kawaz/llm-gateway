@@ -56,6 +56,10 @@ pub fn hold(path: &Path) -> io::Result<File> {
 /// いることはありうる。その socket を消すと、その者は待ち続けたまま誰にも繋がれなく
 /// なるので、`AddrInUse` で断る。
 /// socket でないファイルは、path の書き間違いで設定ファイル等を消さないよう断る。
+///
+/// 待っている者が居るかは、繋いでみて確かめる。繋ぐのは bind と同じく [`sockat`] で、
+/// path の長さを問わない (std で繋ぐと、`sun_path` に収まらない path では居ても
+/// 居なくても `InvalidInput` で断られ、残骸を片付けられない)。
 pub fn clear_stale(path: &Path) -> io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -71,7 +75,7 @@ pub fn clear_stale(path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    match std::os::unix::net::UnixStream::connect(path) {
+    match sockat::connect(path) {
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("another process is listening on {}", path.display()),

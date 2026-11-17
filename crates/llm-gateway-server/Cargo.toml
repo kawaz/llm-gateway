@@ -28,10 +28,14 @@ futures-util = { workspace = true }
 gateway-core = { path = "../gateway-core", version = "0.71" }
 # 運用系の口の socket に繋いできた相手が自分と同じ uid かを比べる (`geteuid`、DR-0043 決定 7)。
 libc = { workspace = true }
+# 運用系の口を読む client (`socket::request`)。reqwest の Unix socket は長い path に
+# 届かないので、sockat で繋いだ stream の上で HTTP/1 を話す。
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 
 [dev-dependencies]
-# socket を置く試験の一時ディレクトリ (`gateway_core::test_support`)。
-gateway-core = { path = "../gateway-core", features = ["test-support"] }
+# 落ちた台の残骸 (誰も待っていない socket) を試験で置く。
+sockat = { workspace = true }
 toml = { workspace = true }
 # ns 認証 `jwt` の試験で token を署名する。
 ed25519-dalek = { workspace = true }

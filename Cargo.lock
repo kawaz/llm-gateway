@@ -486,7 +486,6 @@ dependencies = [
  "axum",
  "base64",
  "ed25519-dalek",
- "gateway-core",
  "jiff",
  "libc",
  "reqwest",
@@ -494,6 +493,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sockat",
  "subtle",
  "tempfile",
  "thiserror 2.0.19",
@@ -956,7 +956,6 @@ dependencies = [
  "futures-util",
  "gateway-core",
  "humantime",
- "libc",
  "rand",
  "reqwest",
  "rustix",
@@ -986,6 +985,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sockat",
  "stable-which",
  "tempfile",
  "tokio",
@@ -1003,11 +1003,14 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "gateway-core",
+ "hyper",
+ "hyper-util",
  "libc",
  "llm-gateway",
  "reqwest",
  "serde",
  "serde_json",
+ "sockat",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -1624,6 +1627,15 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
+name = "sockat"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad645331844fd9ec75ee2a82c88ba6058020ad861e8a19a6ff07236734a624c3"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "socket2"

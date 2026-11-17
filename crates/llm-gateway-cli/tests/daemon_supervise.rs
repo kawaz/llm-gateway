@@ -3,11 +3,11 @@
 //! 同じ状態ディレクトリで `daemon supervise` を 2 つ起こした時と、落ちた監督者の後に
 //! 起こした時 (DR-0028 決定 7)。
 
-use gateway_core::test_support::SocketTempDir;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_llm-gateway")
@@ -43,7 +43,7 @@ fn supervise(state: &Path) -> Supervising {
 /// 頼み口に繋がるようになるまで待つ (別プロセスなので、開いた合図を受ける口が無い)。
 fn wait_until_listening(socket: &Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while std::os::unix::net::UnixStream::connect(socket).is_err() {
+    while sockat::connect(socket).is_err() {
         assert!(
             Instant::now() < deadline,
             "{} did not listen",
@@ -90,7 +90,7 @@ fn signal(supervising: &Supervising, name: &str) {
 /// 1 つ目が SIGKILL で落ちて残骸 (誰も待っていない socket) を置いていっても、次は上がれる。
 #[test]
 fn a_second_supervisor_is_refused_and_a_dead_ones_leftovers_do_not_block_the_next() {
-    let root = SocketTempDir::new().unwrap();
+    let root = TempDir::new().unwrap();
     let state = root.path().join("state");
     let socket = state.join("llm-gateway/daemon/supervisor.sock");
 
