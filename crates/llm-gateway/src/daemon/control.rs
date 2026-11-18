@@ -500,7 +500,7 @@ routes = ["a"]
         let task = tokio::spawn(async move { serving.serve("u", &config, gateway).await });
 
         // 改行を寄越さない繋がりがあっても、上限で閉じて次の頼みに答える。
-        let mut silent = gateway_core::unix_socket::connect(&path).await.unwrap();
+        let mut silent = gateway_core::unix_socket::connect(&path).unwrap();
         silent.write_all(b"{\"op\":").await.unwrap();
         let mut rest = Vec::new();
         tokio::time::timeout(
@@ -682,7 +682,7 @@ routes = ["a"]
         if let DumpRequest::Start { follow, .. } = &mut start {
             *follow = true;
         }
-        let stream = gateway_core::unix_socket::connect(&path).await.unwrap();
+        let stream = gateway_core::unix_socket::connect(&path).unwrap();
         let mut lines = protocol::send(stream, &ControlRequest::Dump(start))
             .await
             .unwrap();

@@ -483,7 +483,7 @@ unix = "~/.local/state/llm-gateway/daemon/http/unstable.sock"   # 省略可。�
 - socket を開いている間、台は隣の `<path>.lock` を握る (台が止まってもファイルは残す)。同じ path を指した 2 台目は lock を取れず、socket を開かない
 - 起動時、落ちた台が残した socket は片付ける。誰かがまだ待っている socket と、socket でないファイルは消さずに socket を開かない (台は理由をログに残し、TCP の口は動かし続ける)。台が止まると socket ファイルは消える
 - `llm-gateway check` は、`unix` が絶対パスでないと断る (台と CLI は別のディレクトリで動く)。既定の path は台の名前で決まるので、`daemon add` が同じ規則で見る
-- path の長さに上限は無い。台と CLI は、Unix socket の path の上限 (macOS は 103 バイト、Linux は 107 バイト) を超える path にも socket を開いて繋ぐ。ただし `curl --unix-socket` はこの上限を超える path を断る (`Unix socket path too long`)。その時は socket のディレクトリに入って名前だけを渡す (下の例の 2 つ目)
+- ディレクトリの深さは問わない。台と CLI は、Unix socket の path の上限 (macOS は 103 バイト、Linux は 107 バイト) を超える path にも socket を開いて繋ぐ。CLI は fork せずに繋ぐので、届かないのは珍しい環境 (`$TMPDIR` にも `/tmp` にも書けない sandbox で、Linux なら `/proc` も無い) だけで、その時は `File name too long` で断るので path を短くする。ただし `curl --unix-socket` はこの上限を超える path を断る (`Unix socket path too long`)。その時は socket のディレクトリに入って名前だけを渡す (下の例の 2 つ目)
 - `unix` は台の起動時に読む。変えたら `daemon restart`
 - **socket をリバースプロキシで外へ出さない。** 外の呼び手は TCP の口を読み、そちらは `[callers]` を書けば署名を求める
 

@@ -603,10 +603,9 @@ impl Supervisor {
             return;
         }
         let path = protocol::control_path(&self.controls, &name);
-        let connected = tokio::time::timeout(DUMP_WAIT, crate::unix_socket::connect(&path)).await;
-        let stream = match connected {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e))
+        let stream = match crate::unix_socket::connect(&path) {
+            Ok(stream) => stream,
+            Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
@@ -619,21 +618,13 @@ impl Supervisor {
                 let _ = write_line(&mut writing, &refused).await;
                 return;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 let refused = refuse(
                     "unreachable",
                     format!(
                         "could not reach `{name}` at {}: {e}. restart the unit",
                         path.display()
                     ),
-                );
-                let _ = write_line(&mut writing, &refused).await;
-                return;
-            }
-            Err(_) => {
-                let refused = refuse(
-                    "no_answer",
-                    format!("`{name}` did not accept within {}s", DUMP_WAIT.as_secs()),
                 );
                 let _ = write_line(&mut writing, &refused).await;
                 return;
@@ -2000,7 +1991,7 @@ mod tests {
             })
         };
 
-        let stream = crate::unix_socket::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).unwrap();
         let mut lines = protocol::send(stream, &follow("a")).await.unwrap();
         assert_eq!(
             lines.next_line().await.unwrap().as_deref(),
@@ -2018,7 +2009,7 @@ mod tests {
 
         // 止まっている台・登録の無い台には 1 行で断る。
         for (unit, kind) in [("d", "not_running"), ("e", "unknown_unit")] {
-            let stream = crate::unix_socket::connect(&socket).await.unwrap();
+            let stream = crate::unix_socket::connect(&socket).unwrap();
             let mut lines = protocol::send(stream, &follow(unit)).await.unwrap();
             let answer: serde_json::Value =
                 serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -2107,7 +2098,7 @@ mod tests {
         let serving = Arc::clone(&world.supervisor);
         let accepting = tokio::spawn(async move { serving.serve(listener).await });
 
-        let stream = crate::unix_socket::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).unwrap();
         let (reading, mut writing) = stream.into_split();
         writing.write_all(b"{\"op\":\"fly\"}\n").await.unwrap();
         let mut lines = BufReader::new(reading).lines();
@@ -2221,7 +2212,7 @@ mod tests {
         let accepting = tokio::spawn(async move { serving.serve(listener).await });
         world.supervisor.reload().await;
 
-        let stream = crate::unix_socket::connect(&socket).await.unwrap();
+        let stream = crate::unix_socket::connect(&socket).unwrap();
         let mut lines = protocol::send(stream, &Request::Log(Which::all()))
             .await
             .unwrap();
@@ -2727,7 +2718,6 @@ mod tests {
                 "round {round}: {refused:?}"
             );
             crate::unix_socket::connect(&socket)
-                .await
                 .unwrap_or_else(|e| panic!("round {round}: the winner listens: {e}"));
             drop(opened);
         }

@@ -10,9 +10,12 @@
 //! - **`local_addr()` / `peer_addr()` は渡した path を返さない** (相対パス、
 //!   `/proc/self/fd/...`、消えた symlink、ファイル名だけ等)。消す・表示するには、
 //!   渡した path を自分で持って使う
-//! - **fork の経路 (macOS で他の経路が使えない時、`/proc` の無い Linux) で繋ぐと、
-//!   受けた側から見える相手の pid が短命の子になる**。uid / gid は繋いだプロセスの
-//!   もののまま。相手を uid で確かめるのはよいが、pid で確かめてはいけない
+//! - **connect は fork しない**。ふつうの環境 (`$TMPDIR` か `/tmp` に短い symlink を
+//!   置ける) ならどの深さの path にも届き、fork でしか届かない珍しい環境 (`/proc` も
+//!   安全な一時ディレクトリも無い等) では `ENAMETOOLONG` で断る。fork してでも繋ぐ
+//!   `sockat::connect_any` は使わない: その経路で繋ぐと受けた側に見える相手の pid が
+//!   既に終わった子になり、届かない環境は珍しいので、その副作用を負ってまで繋ぐ理由が
+//!   無い (DR-0028 決定 7)
 
 use std::io;
 use std::path::Path;
@@ -30,18 +33,13 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
 
 /// `path` に繋ぐ。
 ///
-/// Design rationale: sockat の connect は std と同じくブロックする (非同期の口は
-/// 無い)。ローカルの connect はふつうすぐ返るが、相手の backlog が満杯だと Linux では
-/// 空くまで待ち、fork の経路では子を待つ。runtime の worker を止めず、呼んだ側の
-/// timeout も効くよう、blocking の pool で呼ぶ。timeout で見捨てた connect は、
-/// pool の中で返るまで残る。
-pub async fn connect(path: &Path) -> io::Result<UnixStream> {
-    let path = path.to_path_buf();
-    let stream = tokio::task::spawn_blocking(move || sockat::connect(path))
-        .await
-        .map_err(io::Error::other)??;
-    stream.set_nonblocking(true)?;
-    UnixStream::from_std(stream)
+/// `sockat::connect_nonblocking` は待たない (Unix domain の connect は呼んだ中で
+/// 終わり、相手の backlog が満杯なら Linux ではすぐ `WouldBlock`、macOS では
+/// `ConnectionRefused` で返る) ので、runtime の worker の上でそのまま呼ぶ。
+///
+/// tokio の runtime の中で呼ぶ (`from_std` が reactor に登録する)。
+pub fn connect(path: &Path) -> io::Result<UnixStream> {
+    UnixStream::from_std(sockat::connect_nonblocking(path)?)
 }
 
 #[cfg(test)]
@@ -66,7 +64,7 @@ mod tests {
         let path = beyond_sun_path(dir.path());
 
         let listener = bind(&path).unwrap();
-        let mut client = connect(&path).await.unwrap();
+        let mut client = connect(&path).unwrap();
         let (mut server, _) = listener.accept().await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut got = [0; 4];
@@ -89,11 +87,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = beyond_sun_path(dir.path());
 
-        let absent = connect(&path).await.unwrap_err();
+        let absent = connect(&path).unwrap_err();
         assert_eq!(absent.kind(), io::ErrorKind::NotFound, "{absent}");
 
         drop(bind(&path).unwrap());
-        let refused = connect(&path).await.unwrap_err();
+        let refused = connect(&path).unwrap_err();
         assert_eq!(
             refused.kind(),
             io::ErrorKind::ConnectionRefused,

@@ -65,9 +65,8 @@ fn follow(unit: &str, dump: DumpRequest) -> Result<ExitCode, Failure> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| Failure::from(format!("could not start the async runtime: {e}")))?;
     let streamed = runtime.block_on(async move {
-        let stream = protocol::connect(&socket)
-            .await
-            .map_err(|e| crate::daemon::control::not_running(&e))?;
+        let stream =
+            protocol::connect(&socket).map_err(|e| crate::daemon::control::not_running(&e))?;
         let mut lines = protocol::send(stream, &request)
             .await
             .map_err(|e| crate::daemon::control::not_running(&e))?;

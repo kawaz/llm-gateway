@@ -146,7 +146,7 @@ pub async fn request(path: &Path, mut request: Request<Body>) -> io::Result<Resp
             .headers_mut()
             .insert(header::HOST, header::HeaderValue::from_static("localhost"));
     }
-    let stream = gateway_core::unix_socket::connect(path).await?;
+    let stream = gateway_core::unix_socket::connect(path)?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(io::Error::other)?;
@@ -330,7 +330,6 @@ mod tests {
                 refused[0]
             );
             gateway_core::unix_socket::connect(&path)
-                .await
                 .unwrap_or_else(|e| panic!("round {round}: the winner still listens: {e}"));
         }
     }
@@ -386,9 +385,7 @@ mod tests {
         assert!(path.exists());
 
         let socket = OperationsSocket::bind(&path).unwrap();
-        gateway_core::unix_socket::connect(&path)
-            .await
-            .expect("the new socket listens");
+        gateway_core::unix_socket::connect(&path).expect("the new socket listens");
         drop(socket);
     }
 
@@ -401,9 +398,7 @@ mod tests {
 
         let e = OperationsSocket::bind(&path).err().expect("refused");
         assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
-        gateway_core::unix_socket::connect(&path)
-            .await
-            .expect("the first one still listens");
+        gateway_core::unix_socket::connect(&path).expect("the first one still listens");
         drop(first);
     }
 

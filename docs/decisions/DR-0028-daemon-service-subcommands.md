@@ -133,7 +133,7 @@ llm-gateway service log [--follow]
 **頼み口・台の制御口 (DR-0032)・運用系の口 (DR-0043 決定 7) は、bind も connect も sockat を通し (`gateway_core::unix_socket`)、path の長さに上限を置かない。** 状態ディレクトリ (`$XDG_STATE_HOME`) と `[server] unix` の深さは利用者と環境が決め、`sun_path` (NUL 込みで macOS 104 / Linux 108 バイト) に収まる保証は無い (深い `$TMPDIR` の下で走る試験もそう)。sockat は長い path にも、渡した path そのものに socket を作る (繋ぐ時はそこを引く)。sockat が長い path で std と違う点のうち、この作りに関わる 2 つは次のとおり扱う:
 
 - カーネルが答える socket の名前 (`local_addr` / `peer_addr`) は渡した path ではない (相対パス、ファイル名だけ等)。socket を消す・log に書く・残骸かを確かめるのは、どれも自分が持つ path で行い、カーネルが答える名前は使わない
-- fork の経路 (macOS で他の経路が使えない時、`/proc` の無い Linux) で繋ぐと、受けた側に見える相手の pid が短命の子になる (uid / gid は繋いだプロセスのまま)。相手を確かめるのは運用系の口の uid だけで (DR-0043 決定 7)、pid は見ない
+- connect は fork しない `sockat::connect` (同期の箇所) と `sockat::connect_nonblocking` (tokio の上。待たずに非ブロッキングの stream を返すので、`from_std` にそのまま渡し、blocking の pool を挟まない) で行い、fork してでも繋ぐ `connect_any` は使わない。fork しない経路でも `$TMPDIR` か `/tmp` に短い symlink を置ける環境ならどの深さの path にも届き、届かないのは `/proc` も安全な一時ディレクトリも無い等の珍しい環境だけ (その時は `ENAMETOOLONG` で断る)。fork の経路で繋ぐと受けた側に見える相手の pid が既に終わった子になる副作用があり、珍しい環境のためにそれを負う理由は無い。bind は最後の手段で fork するが、子は bind だけをして終わり、listen は呼んだ側が行うので、待ち受けの socket に fork の跡は残らない。相手を確かめるのは運用系の口の uid だけで (DR-0043 決定 7)、pid は見ない
 
 運用系の口を読む CLI は reqwest でなく hyper を直に使う。reqwest の `unix_socket` は内部で connect し (長い path に届かない)、connect を差し替える口が無い。外の道具 (`curl --unix-socket`) は上限を超える path を断るので、MANUAL にディレクトリへ入って名前で渡す手を書く。
 

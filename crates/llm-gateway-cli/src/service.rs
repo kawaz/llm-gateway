@@ -388,7 +388,7 @@ fn wait_while_stopping(
 ) -> Result<bool, Failure> {
     let runtime = runtime()?;
     runtime.block_on(async move {
-        let held = protocol::connect(socket).await.ok();
+        let held = protocol::connect(socket).ok();
         tell()?;
         // 掴めなかったのなら、そもそも監督者は答えていない。
         let Some(mut held) = held else {

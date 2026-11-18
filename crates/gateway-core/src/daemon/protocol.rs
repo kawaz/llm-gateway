@@ -338,13 +338,13 @@ pub fn operations_path(dir: &Path, unit: &str) -> PathBuf {
 
 /// 頼み口 (監督者の socket、台の制御口) に繋ぐ。path の長さは問わない
 /// ([`crate::unix_socket`])。繋いだ後は [`send`] で頼む。
-pub async fn connect(socket: &Path) -> std::io::Result<UnixStream> {
-    crate::unix_socket::connect(socket).await
+pub fn connect(socket: &Path) -> std::io::Result<UnixStream> {
+    crate::unix_socket::connect(socket)
 }
 
 /// 頼んで、1 行の答えを受け取る。
 pub async fn ask<T: Serialize>(socket: &Path, request: &T) -> std::io::Result<String> {
-    let stream = connect(socket).await?;
+    let stream = connect(socket)?;
     let mut lines = send(stream, request).await?;
     match lines.next_line().await? {
         Some(line) => Ok(line),
