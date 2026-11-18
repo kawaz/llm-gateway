@@ -1630,9 +1630,9 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "sockat"
-version = "0.2.1"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ef1397ec5c631005ff446f072d7dce99c9817be04670204140b2e8d923bde47"
+checksum = "63428c99e5f19ca331e65ac07001985d959c79f79af9b023efc43e61ced60af8"
 dependencies = [
  "libc",
 ]

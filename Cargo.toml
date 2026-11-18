@@ -89,7 +89,7 @@ ed25519-dalek = "2"
 subtle = "2"
 # Unix socket の bind / connect。path が sun_path (macOS 104 / Linux 108 バイト) を
 # 超えても届く。std の型を返すので、tokio へは from_std で渡す。
-sockat = "0.2.1"
+sockat = "0.2.5"
 # 運用系の口 (Unix socket の上の HTTP) を読む client。reqwest は Unix socket へ自前で
 # connect し (std と同じ sun_path の上限が残る)、connect を差し替える口を持たないので、
 # sockat で繋いだ stream の上で hyper の HTTP/1 を直に話す。どちらも axum / reqwest が
