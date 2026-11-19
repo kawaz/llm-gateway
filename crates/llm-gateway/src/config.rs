@@ -68,6 +68,8 @@ use crate::{Error, Result};
 
 use gateway_core::config::{extends, path_expand, xdg_dir};
 
+pub(crate) mod duration;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -908,7 +910,7 @@ impl std::str::FromStr for WindowSpan {
         if text.ends_with('%') {
             return Ok(Self::Ratio(text.parse()?));
         }
-        let duration = humantime::parse_duration(text).map_err(|_| {
+        let duration = duration::parse(text).map_err(|_| {
             Error::Config(format!(
                 "`{text}` is neither a percentage (`25%`) nor a duration (`40h`)"
             ))
@@ -922,11 +924,7 @@ impl std::fmt::Display for WindowSpan {
         match self {
             Self::Ratio(ratio) => write!(f, "{ratio}"),
             Self::Absolute(seconds) => {
-                write!(
-                    f,
-                    "{}",
-                    humantime::format_duration(Duration::from_secs(*seconds))
-                )
+                write!(f, "{}", duration::format(Duration::from_secs(*seconds)))
             }
         }
     }
@@ -1691,13 +1689,13 @@ mod human_duration {
         value: &Duration,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(&humantime::format_duration(*value).to_string())
+        serializer.serialize_str(&duration::format(*value).to_string())
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Duration, D::Error> {
         let text = String::deserialize(deserializer)?;
-        humantime::parse_duration(&text).map_err(serde::de::Error::custom)
+        duration::parse(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1868,8 +1866,8 @@ impl Config {
         if self.dump.max_timeout > self.dump.cleanup_ttl {
             return Err(Error::Config(format!(
                 "[dump] max_timeout ({}) must not exceed cleanup_ttl ({}); a dump would be removed while it is still running",
-                humantime::format_duration(self.dump.max_timeout),
-                humantime::format_duration(self.dump.cleanup_ttl)
+                duration::format(self.dump.max_timeout),
+                duration::format(self.dump.cleanup_ttl)
             )));
         }
         if self.dump.max_concurrency == 0 || self.dump.default_max_bytes == 0 {
@@ -1881,8 +1879,8 @@ impl Config {
         {
             return Err(Error::Config(format!(
                 "[dump] default_timeout ({}) must be longer than zero and at most max_timeout ({})",
-                humantime::format_duration(self.dump.default_timeout),
-                humantime::format_duration(self.dump.max_timeout)
+                duration::format(self.dump.default_timeout),
+                duration::format(self.dump.max_timeout)
             )));
         }
         if self.account_bound_thinking.iter().any(String::is_empty) {
@@ -3208,7 +3206,7 @@ routes = [["a", "b"], "c"]
         assert_eq!(within.seconds_in(7 * 24 * 60 * 60), 40 * 60 * 60);
         assert_eq!(within.seconds_in(5 * 60 * 60), 40 * 60 * 60);
 
-        // humantime の複合表記も読める。
+        // 数 + 単位を並べた複合表記も読め、並べた分を足し合わせる。
         assert_eq!(
             "2d 6h".parse::<WindowSpan>().unwrap(),
             WindowSpan::Absolute((2 * 24 + 6) * 60 * 60)

@@ -534,7 +534,7 @@ impl Dumps {
                 "invalid_duration",
                 format!(
                     "--timeout must be longer than zero and at most {} ([dump] max_timeout)",
-                    humantime::format_duration(config.max_timeout)
+                    crate::config::duration::format(config.max_timeout)
                 ),
             ));
         }

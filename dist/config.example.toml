@@ -157,7 +157,7 @@ routes = ["bedrock", "claude-work", "claude-personal"]
 # (7d 枠なら "25%" = 42 時間手前から)。credential ごとに周期が違っても
 # 1 つの規則で書ける。
 #
-# 絶対時間 (humantime 形式) でも書ける。窓長に関係なく同じ幅になる。
+# 絶対時間 ("40h"、"2d 6h" のように数 + 単位を並べる) でも書ける。窓長に関係なく同じ幅になる。
 #   spend_down_within = "40h"
 #
 # 書かなければ繰り上げない。会話の途中で credential は切り替わらない
