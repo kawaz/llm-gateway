@@ -16,6 +16,8 @@
 //! # cache に乗らなかった request を研究用に取っておく量と期間 (0 で取らない)
 //! uncached_keep = 50
 //! uncached_days = 7
+//! # 枠照会 API を聞く周期 (前の周期から流した credential だけ、0 で止める)
+//! quota_poll_interval = "5m"
 //!
 //! # 認証情報の中身 (token 等) はここに書かない。store に置いた
 //! # <key>.json を type と結びつけるだけ。
@@ -1433,7 +1435,26 @@ pub struct Stats {
     /// 同じく、何日まで取っておくか。
     #[serde(default = "default_uncached_days")]
     pub uncached_days: u32,
+    /// 枠照会 API を定期的に聞く周期 (DR-0044 決定 9)。`0` で聞かない。
+    ///
+    /// 聞くのは前の周期で聞けてから流した credential だけ。モデル別の枠は
+    /// 応答ヘッダに出ないので、これが推移 (`usage-history/`) の行の密度を決める。
+    #[serde(default = "default_quota_poll_interval", with = "human_duration")]
+    pub quota_poll_interval: Duration,
 }
+
+/// 枠照会 API を定期的に聞く周期の既定 (kawaz 裁定 2026-11-21)。
+///
+/// 貯まった推移から後で見直す前提の値。
+fn default_quota_poll_interval() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+/// 枠照会 API を定期的に聞く周期の下限 (`0` で止める時を除く)。
+///
+/// 照会の口は公開ドキュメントに無い。行の密度のために 1 分より細かく聞く
+/// 意味は無く (利用率は 1 % 刻み)、聞きすぎで断られる危険だけが増える。
+pub const MIN_QUOTA_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 取っておく本数の既定。
 ///
@@ -1453,6 +1474,7 @@ impl Default for Stats {
             dir: None,
             uncached_keep: default_uncached_keep(),
             uncached_days: default_uncached_days(),
+            quota_poll_interval: default_quota_poll_interval(),
         }
     }
 }
@@ -1881,6 +1903,14 @@ impl Config {
                 "[dump] default_timeout ({}) must be longer than zero and at most max_timeout ({})",
                 duration::format(self.dump.default_timeout),
                 duration::format(self.dump.max_timeout)
+            )));
+        }
+        let poll = self.stats.quota_poll_interval;
+        if !poll.is_zero() && poll < MIN_QUOTA_POLL_INTERVAL {
+            return Err(Error::Config(format!(
+                "[stats] quota_poll_interval ({}) must be 0 (off) or at least {}; the quota API is not meant to be polled that often",
+                duration::format(poll),
+                duration::format(MIN_QUOTA_POLL_INTERVAL)
             )));
         }
         if self.account_bound_thinking.iter().any(String::is_empty) {
@@ -2586,6 +2616,32 @@ o = "claude-opus-*"
         assert!(
             parse("[dump]\nenabled = true\n").is_err(),
             "no on / off in the table"
+        );
+    }
+
+    /// 枠照会 API を定期的に聞く周期 (`[stats] quota_poll_interval`、DR-0044 決定 9)。
+    ///
+    /// 書かなければ 5 分 (kawaz 裁定 2026-11-21)。`0` は「聞かない」で、それ以外は
+    /// 1 分以上。照会の口は公開ドキュメントに無く、利用率は 1 % 刻みでしか動かない
+    /// ので、1 分より細かく聞いても行は増えず、聞きすぎで断られる危険だけが増える。
+    /// 境界は 1 分ちょうどを通し、59 秒を断る。
+    #[test]
+    fn the_quota_poll_interval_is_off_or_at_least_a_minute() {
+        let c = parse("").unwrap();
+        assert_eq!(c.stats.quota_poll_interval, Duration::from_secs(300));
+
+        let c = parse("[stats]\nquota_poll_interval = \"0\"\n").unwrap();
+        assert!(c.stats.quota_poll_interval.is_zero(), "0 turns it off");
+        let c = parse("[stats]\nquota_poll_interval = \"1m\"\n").unwrap();
+        assert_eq!(c.stats.quota_poll_interval, Duration::from_secs(60));
+        let c = parse("[stats]\nquota_poll_interval = \"1h\"\n").unwrap();
+        assert_eq!(c.stats.quota_poll_interval, Duration::from_secs(3600));
+
+        let err = parse("[stats]\nquota_poll_interval = \"59s\"\n").unwrap_err();
+        assert!(err.to_string().contains("quota_poll_interval"), "{err}");
+        assert!(
+            parse("[stats]\nquota_poll_interval = 300\n").is_err(),
+            "a bare number has no unit"
         );
     }
 

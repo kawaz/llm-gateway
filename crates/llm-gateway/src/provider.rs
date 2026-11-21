@@ -476,7 +476,16 @@ impl Preset {
             return;
         };
         self.state.apply(&api.denials(limits, now_secs), now_secs);
+        self.fill_quota(limits, now_secs);
+    }
 
+    /// 枠照会 API の答えを、スナップショットの穴埋めにだけ使う。印は触らない。
+    ///
+    /// 定期の照会 (DR-0044 決定 9) が使う。印を作るのは応答を受けたときと、
+    /// 断られた経路の様子を聞きに行ったときだけにする (DR-0009)。定期の照会は
+    /// 推移を密に残すためのもので、締め出しの判断の経路を増やさない。
+    /// 埋める規則は [`Self::apply_quota`] と同じで、使える窓が無い時だけ。
+    pub fn fill_quota(&self, limits: &[QuotaLimit], now_secs: i64) {
         // 締め出しの印は秒で持ち、スナップショットが運ぶ時刻はミリ秒。
         let now_ms = crate::credential::time::to_unix_ms(now_secs);
         let known = self

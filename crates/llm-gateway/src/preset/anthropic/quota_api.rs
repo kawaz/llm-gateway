@@ -8,7 +8,8 @@
 //! 空実装ではなく [`crate::provider::Preset`] が `None` を返すことで示す。
 //!
 //! 公開ドキュメントにも無い。返る形が変われば読めなくなるので、読めない
-//! ものは**情報なし** (`None`) に落とし、gateway の他の動きを巻き込まない。
+//! ものは失敗として返し、呼び出し側が**情報なし**として扱う (gateway の他の
+//! 動きを巻き込まない)。
 
 use serde::Deserialize;
 
@@ -49,14 +50,14 @@ impl QuotaApi for OauthUsage {
         credential: &'a Credential,
     ) -> BoxFuture<'a, Result<Vec<QuotaLimit>>> {
         Box::pin(async move {
-            fetch(http, &self.base_url, credential)
-                .await
-                .ok_or_else(|| {
-                    Error::upstream_response(
-                        "Anthropic quota API",
-                        "could not fetch or parse the quota response".to_owned(),
-                    )
-                })
+            let body =
+                super::oauth_get(http, &self.base_url, "/api/oauth/usage", credential).await?;
+            parse(&body).ok_or_else(|| {
+                Error::upstream_response(
+                    "Anthropic quota API",
+                    "could not parse the quota response".to_owned(),
+                )
+            })
         })
     }
 
@@ -117,16 +118,6 @@ impl QuotaApi for OauthUsage {
             },
         })
     }
-}
-
-/// この credential の枠を聞く。読めなければ `None`。
-async fn fetch(
-    http: &reqwest::Client,
-    base_url: &str,
-    credential: &Credential,
-) -> Option<Vec<QuotaLimit>> {
-    let body = super::oauth_get(http, base_url, "/api/oauth/usage", credential).await?;
-    parse(&body)
 }
 
 /// 応答を読む。知っている形でなければ `None`。

@@ -699,6 +699,13 @@ Under the same `[stats] dir` as the daily totals, `usage-history/<YYYY-MM-DD>.<w
 - In a `step`, `from` is the previous line's value, `since` is the previous line's time, and `tokens` is what this process sent with that credential in between (model → request count and tokens per kind; kinds and counting are the same as in the daily-total files)
 - Only this process's own traffic is counted. Siblings sharing the credential (stable / unstable) have their own files, and use that bypasses the gateway (another machine, the web) appears nowhere
 
+Per-model windows (such as the weekly Fable window) never appear in response headers, so the gateway asks the quota API (Claude's `/api/oauth/usage`, Codex's `wham/usage`) on a fixed period to keep their lines. It asks only the credentials this process has sent at least one request with since the last answer, and the query spends no tokens. The answer goes to the history and to the `snapshot` of `usage` (only for routes without a usable window); it is never used to hold a route back. A failed query is retried on the next period, repeated failures stretch the gap up to an hour, and a 429 makes it wait an hour.
+
+```toml
+[stats]
+quota_poll_interval = "5m"   # how often to ask (default 5m). 0 turns it off; otherwise at least 1m
+```
+
 ### `GET /llm-gateway/events`
 
 Streams what happens on every forward, over SSE (DR-0012). You receive only what happens **after** you connect; there is no replay. A slow watcher that misses events does not stall the gateway (events are dropped and it moves on; the count is in `/llm-gateway/self`). A keep-alive is sent every 20 seconds.

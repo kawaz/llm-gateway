@@ -29,6 +29,9 @@ type = "file"
 # 使用量の日次集計の置き場。省略時は $XDG_STATE_HOME/llm-gateway/stats
 # (llm-gateway stats / /llm-gateway/stats で見る)
 # dir = "/path/to/stats"
+# 枠照会 API を聞く周期。モデル別の枠の推移 (usage-history/) を密に残すため、
+# 前の周期から流した credential だけに聞く (トークンは使わない)。0 で聞かない。
+# quota_poll_interval = "5m"
 
 [discovery]
 # 一覧を取り直す間隔。新しいモデルが出たときに再起動せず拾える。

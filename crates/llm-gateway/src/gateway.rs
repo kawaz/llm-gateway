@@ -48,6 +48,10 @@ pub struct Gateway<P: CredentialPersistence> {
     /// 枠ごとの利用率の推移 (DR-0044)。枠が動くたびに 1 行、その間に流した
     /// トークンを添えて貯める。裏で走る枠照会とも共有する。
     usage_history: Arc<UsageHistory>,
+    /// 枠照会 API を定期的に聞く周期 (DR-0044 決定 9)。0 なら聞かない。
+    quota_poll_interval: std::time::Duration,
+    /// 定期の照会で、周期ごとにどの credential へ聞くか。
+    quota_poll: quota::poll::Schedule,
     stats: Arc<Stats>,
     /// 転送のたびに起きたことを見ている人へ流す口 (DR-0012)。
     ///
@@ -220,6 +224,8 @@ impl<P: CredentialPersistence> Gateway<P> {
                 &config.server.listen,
             )),
             usage_history,
+            quota_poll_interval: config.stats.quota_poll_interval,
+            quota_poll: quota::poll::Schedule::new(config.stats.quota_poll_interval),
             keepalive,
             events,
             // 兄弟の unit と共有する走行状態の置き場 (DR-0038 決定 6)。
@@ -2091,23 +2097,104 @@ impl<P: CredentialPersistence> Gateway<P> {
     /// 返せなくする理由にはならない。
     async fn ask_limits(&self, id: &CredentialId, preset: &Preset) -> Option<Vec<QuotaLimit>> {
         let api = preset.quota_api()?;
-        let credential = match self.credentials.acquire(id).await {
-            Ok(credential) => credential,
-            Err(e) => {
-                warn!(credential = %id, %e, "cannot prepare credentials to query the quota");
-                return None;
-            }
-        };
-        match api.fetch(&self.http, &credential).await {
-            Ok(limits) => {
-                // 聞けた枠は推移にも残す。モデル別の枠はこの口にしか出ない (DR-0044)。
-                self.usage_history
-                    .observe_limits(id, &limits, now_unix_ms());
-                Some(limits)
-            }
+        match query_limits(&self.http, &self.credentials, &self.usage_history, id, api).await {
+            Ok(limits) => Some(limits),
             Err(e) => {
                 warn!(credential = %id, %e, "cannot query the quota");
                 None
+            }
+        }
+    }
+
+    /// 枠照会 API を周期ごとに聞き続ける (DR-0044 決定 9)。周期が 0 なら何もしない。
+    ///
+    /// モデル別の枠は応答ヘッダに出ないので、聞く契機が手動の確認や締め出しの
+    /// 周りだけだと、推移の行がまばらになる。
+    pub async fn keep_polling_quota(&self) {
+        if self.quota_poll_interval.is_zero() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(self.quota_poll_interval);
+        // 1 周期が長引いても、溜まった周期をまとめて回さない (同じ相手に続けて聞く
+        // ことになる)。
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 起動直後の 1 回目は飛ばす。まだ何も流していない。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            self.poll_quota().await;
+        }
+    }
+
+    /// 定期の照会の 1 周期。前の周期で聞けてから流した credential にだけ聞く。
+    ///
+    /// 聞けた枠は推移 (DR-0044) と経路のスナップショットの穴埋めに流す。
+    /// **締め出しの印は触らない** — 印を作るのは応答を受けたときと、断られた経路の
+    /// 様子を聞きに行ったときだけ (DR-0009)。
+    ///
+    /// 聞くのは credential ごとに 1 回。同じ credential を使う経路が複数あっても、
+    /// 枠は credential (アカウント) のものなので 1 回で足り、答えを全部の経路へ渡す。
+    ///
+    /// Design rationale: 兄弟のプロセス (stable / unstable) と照会を譲り合う仕掛け
+    /// (共有ファイルに最後に聞いた時刻を置く、keepalive の `.lock` のような flock)
+    /// は持たない。推移は書き手ごとに「自分が流した量」を添えて残すので、片方が
+    /// 聞くのを譲ると、譲った側の系列が疎になって 1 段あたりの量が読めなくなる。
+    /// 両方が同じ credential で流していた周期だけ照会が 2 回になるが、照会は
+    /// トークンを使わず、聞きすぎと言われたら 1 時間控える。
+    async fn poll_quota(&self) {
+        let active = self.router.active();
+        let config = active.config();
+        let mut by_credential: std::collections::BTreeMap<&str, Vec<&Arc<Preset>>> =
+            std::collections::BTreeMap::new();
+        for (name, preset) in active.presets() {
+            if preset.quota_api().is_none() {
+                continue;
+            }
+            let Some(credential) = config
+                .routes
+                .get(name)
+                .and_then(|route| route.credential.as_deref())
+            else {
+                continue;
+            };
+            by_credential.entry(credential).or_default().push(preset);
+        }
+
+        for (credential, presets) in by_credential {
+            // 組織ごと断られている間は聞いても断られる (DR-0009)。
+            if presets
+                .iter()
+                .any(|preset| preset.org_not_allowed(now_unix()).is_some())
+            {
+                continue;
+            }
+            let requests: u64 = self
+                .stats
+                .running_totals(credential)
+                .values()
+                .map(|counters| counters.requests)
+                .sum();
+            if !self.quota_poll.due(credential, requests) {
+                continue;
+            }
+            let Some(api) = presets.first().and_then(|preset| preset.quota_api()) else {
+                continue;
+            };
+            let id = CredentialId::new(credential);
+            match query_limits(&self.http, &self.credentials, &self.usage_history, &id, api).await {
+                Ok(limits) => {
+                    for preset in &presets {
+                        preset.fill_quota(&limits, now_unix());
+                    }
+                    self.quota_poll.answered(credential, requests);
+                    debug!(credential, limits = limits.len(), "polled the quota");
+                }
+                Err(e) => {
+                    let rate_limited =
+                        matches!(e, crate::Error::UpstreamStatus { status: 429, .. });
+                    warn!(credential, %e, rate_limited, "cannot poll the quota; asking again later");
+                    self.quota_poll.failed(credential, rate_limited);
+                }
             }
         }
     }
@@ -2162,24 +2249,18 @@ impl<P: CredentialPersistence> Gateway<P> {
         tokio::spawn(async move {
             // 札は、走り切っても落ちても [`Drop`] で外れる。
             let _probing = probing;
-            let credential = match credentials.acquire(&id).await {
-                Ok(credential) => credential,
-                Err(e) => {
-                    warn!(credential = %id, %e, "cannot prepare credentials to query the quota");
-                    return;
-                }
-            };
             let Some(api) = preset.quota_api() else {
                 return;
             };
-            let Ok(limits) = api.fetch(&http, &credential).await else {
-                // 読めなかった。印は据え置き、期限が来たときの実リクエストに
-                // 判断を任せる。
-                return;
+            let limits = match query_limits(&http, &credentials, &history, &id, api).await {
+                Ok(limits) => limits,
+                Err(e) => {
+                    // 読めなかった。印は据え置き、期限が来たときの実リクエストに
+                    // 判断を任せる。
+                    warn!(credential = %id, %e, "cannot query the quota");
+                    return;
+                }
             };
-
-            // [`Self::ask_limits`] と同じく、聞けた枠は推移にも残す。
-            history.observe_limits(&id, &limits, now_unix_ms());
             preset.apply_quota(&limits, now_unix());
             info!(
                 credential = %id,
@@ -2838,6 +2919,27 @@ fn mark_expired_windows(snapshot: &mut quota::Snapshot, now_ms: i64) {
     {
         window.expired = window.reset.is_some_and(|reset| reset < now_ms);
     }
+}
+
+/// 1 つの credential の枠を、枠照会 API に聞く。トークンを使わない。
+///
+/// 聞けた枠は推移にも残す (DR-0044)。モデル別の枠はこの口にしか出ないので、
+/// 照会の契機 (一覧の確認、上限の判定の前、締め出し中の様子見、定期の照会) は
+/// どれもここを通す — 残し忘れた契機があると、その分だけ推移の行が欠ける。
+///
+/// 失敗は呼び出し側へ返す (ログも呼び出し側)。定期の照会は失敗の種類 (429) で
+/// 控え方を変える。
+async fn query_limits<P: CredentialPersistence>(
+    http: &reqwest::Client,
+    credentials: &CredentialStore<P>,
+    history: &UsageHistory,
+    id: &CredentialId,
+    api: &dyn crate::provider::QuotaApi,
+) -> Result<Vec<QuotaLimit>> {
+    let credential = credentials.acquire(id).await?;
+    let limits = api.fetch(http, &credential).await?;
+    history.observe_limits(id, &limits, now_unix_ms());
+    Ok(limits)
 }
 
 #[cfg(test)]
@@ -6439,6 +6541,265 @@ models = ["m"]
             lines.iter().any(|line| line["kind"] == "weekly_all"),
             "{lines:?}"
         );
+    }
+
+    // ---------- 枠照会 API の定期照会 (DR-0044 決定 9) ----------
+    //
+    // モデル別の枠 (Fable の週枠など) は応答ヘッダに出ず、枠照会 API でしか
+    // 取れない。推移 (usage-history) にその枠の行を密に残すため、周期ごとに
+    // 「前の周期で聞けてから、このプロセスが 1 本でも流した credential」だけに
+    // 聞く (kawaz 裁定 2026-11-21)。流した本数は日次集計の器が起動から積んだ
+    // 累計で見るので、ここでは転送の代わりに集計へ直に 1 本積んで再現する。
+    // 周期の進め方 (失敗が続いた時の空け方) の境界は `quota::poll` の試験が
+    // 引いていて、ここでは gateway の配線 (どの credential に何回聞くか、
+    // 答えをどこへ流すか、どの失敗を 429 と読むか) を見る。
+
+    /// 定期の照会が返す枠。経路全体の週枠と、モデル別の週枠。
+    const POLLED_LIMITS: &str = r#"{"limits":[
+        {"kind":"weekly_all","percent":40,"severity":"normal",
+         "resets_at":"2099-08-02T08:59:59Z","scope":null,"is_active":true},
+        {"kind":"weekly_scoped","percent":20,"severity":"normal",
+         "resets_at":"2099-08-02T08:59:59Z",
+         "scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":false}]}"#;
+
+    /// 枠照会 API の口に `usage` を、それ以外に 200 を返す upstream。
+    async fn quota_upstream(usage: (u16, &'static str)) -> FakeUpstream {
+        FakeUpstream::start(move |_, req| {
+            if req.starts_with("GET /api/oauth/usage") {
+                (usage.0, usage.1.to_owned())
+            } else {
+                (200, body_for(200))
+            }
+        })
+        .await
+    }
+
+    /// 定期の照会の試験に使う設定。credential `a` を経路 `a` と `a2` の 2 本が、
+    /// credential `b` を経路 `b` が使う。
+    fn polling_config(dir: &std::path::Path, a: &str, b: &str) -> String {
+        format!(
+            r#"
+[stats]
+dir = "{}"
+
+[credentials.a]
+type = "claude_oauth"
+
+[credentials.b]
+type = "claude_oauth"
+
+[routes.a]
+provider = "anthropic"
+credential = "a"
+url = "{a}"
+
+[routes.a2]
+provider = "anthropic"
+credential = "a"
+url = "{a}"
+
+[routes.b]
+provider = "anthropic"
+credential = "b"
+url = "{b}"
+
+[[ns.default.routing]]
+models = ["m"]
+routes = ["a", "a2", "b"]
+"#,
+            dir.display()
+        )
+    }
+
+    /// その credential で 1 本流したことにする (日次集計の器に積む)。
+    fn carried<P: CredentialPersistence>(gw: &Gateway<P>, credential: &str) {
+        let mut usage = TokenUsage::default();
+        usage.set(TokenKind::input(), 10);
+        gw.stats().record(
+            now_unix(),
+            Some(credential),
+            "claude-fable-5",
+            RequestOrigin::Main.as_str(),
+            &usage,
+        );
+    }
+
+    /// 聞くのは、前の周期で聞けてから流した credential だけ。credential ごとに 1 回。
+    ///
+    /// - 起動から何も流していなければ誰にも聞かない (使っていない credential を
+    ///   叩かない。照会しても行に添えるトークンが無い)
+    /// - 流した `a` にだけ聞き、流していない `b` には聞かない
+    /// - `a` を使う経路が 2 本 (`a` / `a2`) あっても、枠は credential (アカウント)
+    ///   のものなので聞くのは 1 回
+    /// - 聞けた後は、また流すまで聞かない
+    /// - 聞けたモデル別の枠は推移に `quota_api` の行として残る (これが目的)
+    #[tokio::test]
+    async fn the_poll_asks_only_credentials_that_carried_traffic_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_a = quota_upstream((200, POLLED_LIMITS)).await;
+        let up_b = quota_upstream((200, POLLED_LIMITS)).await;
+        let gw = gateway(&polling_config(dir.path(), &up_a.url, &up_b.url)).await;
+
+        gw.poll_quota().await;
+        assert_eq!((up_a.hits(), up_b.hits()), (0, 0), "nothing flowed yet");
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        assert_eq!(
+            (up_a.hits(), up_b.hits()),
+            (1, 0),
+            "only a, and once for its two routes"
+        );
+
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 1, "nothing flowed since the answer");
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 2, "new traffic makes it due again");
+
+        gw.save().await;
+        let lines = history_lines(dir.path());
+        let scoped = lines
+            .iter()
+            .find(|line| line["kind"] == "weekly_scoped")
+            .unwrap_or_else(|| panic!("the scoped limit is kept: {lines:?}"));
+        assert_eq!(scoped["credential"], "a");
+        assert_eq!(scoped["source"], "quota_api");
+        assert!(
+            lines.iter().all(|line| line["credential"] == "a"),
+            "b was never asked: {lines:?}"
+        );
+    }
+
+    /// 聞けた答えは経路のスナップショットの穴を埋めるが、締め出しの印は作らない。
+    ///
+    /// 経路全体の週枠が 100 % と答えても、定期の照会からは締め出さない。印を
+    /// 作るのは応答を受けたときと、断られた経路の様子を聞きに行ったときだけ
+    /// (DR-0009「利用状況の定期的な取り直しから印を作ることはしない」)。定期の
+    /// 照会は推移を密にするためのもので、締め出しの判断の経路を増やさない。
+    /// 埋めるのは使える窓を持たない経路だけで、同じ credential の 2 本とも埋まる
+    /// (一覧の `snapshot` は経路ごと)。
+    #[tokio::test]
+    async fn polled_limits_fill_the_snapshot_but_never_deny() {
+        const EXHAUSTED: &str = r#"{"limits":[
+            {"kind":"weekly_all","percent":100,"severity":"critical",
+             "resets_at":"2099-08-02T08:59:59Z","scope":null,"is_active":true}]}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let up_a = quota_upstream((200, EXHAUSTED)).await;
+        let up_b = quota_upstream((200, EXHAUSTED)).await;
+        let gw = gateway(&polling_config(dir.path(), &up_a.url, &up_b.url)).await;
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 1);
+
+        for route in ["a", "a2"] {
+            let preset = preset_of(&gw, route);
+            let snapshot = preset
+                .quota()
+                .unwrap_or_else(|| panic!("{route} has no snapshot"));
+            assert_eq!(
+                snapshot.longest_window().and_then(|w| w.utilization),
+                Some(1.0),
+                "{route}"
+            );
+            assert!(
+                preset.denials(now_unix()).is_empty(),
+                "{route} is not denied by a periodic poll"
+            );
+        }
+    }
+
+    /// 聞けなかった (5xx) 相手には、次の周期でもう一度聞く。
+    ///
+    /// 流した分の行をまだ取れていないので、その後に流していなくても聞き直す
+    /// (best-effort、次の周期で再試行)。
+    #[tokio::test]
+    async fn a_failed_poll_is_retried_on_the_next_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_a = quota_upstream((500, "{}")).await;
+        let up_b = quota_upstream((200, POLLED_LIMITS)).await;
+        let gw = gateway(&polling_config(dir.path(), &up_a.url, &up_b.url)).await;
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 2, "asked again without new traffic");
+    }
+
+    /// 429 (聞きすぎ) を返した相手には 1 時間 (5 分周期で 12 周期) 聞かない。
+    ///
+    /// 枠照会の口は公開ドキュメントに無く、どれだけ聞いてよいかを upstream が
+    /// 言うのは 429 だけ。同じ間隔で聞き直すとまた 429 を貰う。Anthropic の口が
+    /// 断りの状態コードを落とさずに返していないと、ここは 5xx と同じ扱いになり
+    /// 次の周期で聞き直してしまう。11 周期は黙り、12 周期目に聞き直す。
+    #[tokio::test]
+    async fn a_rate_limited_poll_waits_an_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_a = quota_upstream((429, "{}")).await;
+        let up_b = quota_upstream((200, POLLED_LIMITS)).await;
+        let gw = gateway(&polling_config(dir.path(), &up_a.url, &up_b.url)).await;
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 1);
+        for _ in 0..11 {
+            carried(&gw, "a");
+            gw.poll_quota().await;
+        }
+        assert_eq!(up_a.hits(), 1, "quiet for the rest of the hour");
+        gw.poll_quota().await;
+        assert_eq!(up_a.hits(), 2, "asked again an hour later");
+    }
+
+    /// 組織ごと断られている credential には聞かない。聞いても同じ断りが返る
+    /// だけで、周期ごとに警告が積み上がる (DR-0009)。
+    #[tokio::test]
+    async fn the_poll_skips_a_credential_refused_for_its_organization() {
+        let dir = tempfile::tempdir().unwrap();
+        let up_a = quota_upstream((200, POLLED_LIMITS)).await;
+        let up_b = quota_upstream((200, POLLED_LIMITS)).await;
+        let gw = gateway(&polling_config(dir.path(), &up_a.url, &up_b.url)).await;
+        let now = now_unix();
+        preset_of(&gw, "a2").deny(
+            Denial {
+                until: now + 3600,
+                reason: Reason::OrgNotAllowed,
+                scope: Scope::Everything,
+            },
+            now,
+        );
+
+        carried(&gw, "a");
+        gw.poll_quota().await;
+        assert_eq!(
+            up_a.hits(),
+            0,
+            "one refused route is enough to know the account is refused"
+        );
+    }
+
+    /// 周期を `0` にすると、定期の照会は始まらずにすぐ戻る。
+    ///
+    /// 時計を止めた試験で、戻らなければ (周期を回し続ければ) 上限の 1 日が
+    /// 先に来て失敗する。
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_interval_turns_the_poll_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let gw = gateway(&format!(
+            "[stats]\ndir = \"{}\"\nquota_poll_interval = \"0\"\n{}",
+            dir.path().display(),
+            oauth_config("http://127.0.0.1:9")
+        ))
+        .await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(24 * 60 * 60),
+            gw.keep_polling_quota(),
+        )
+        .await
+        .expect("returns at once when turned off");
     }
 
     /// 聞きに行くときは、専用の口から枠も取って一覧に載せる。

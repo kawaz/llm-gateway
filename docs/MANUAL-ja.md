@@ -701,6 +701,13 @@ curl -sS --unix-socket "$SOCK" 'http://localhost/llm-gateway/stats?days=3'
 - `step` の `from` は前の行の値、`since` は前の行の時刻、`tokens` はその間にこのプロセスがその credential で流した量 (モデル → 本数と区分ごとのトークン、区分と数え方は日次集計のファイルと同じ)
 - 数えられるのはこのプロセスが流した分だけ。stable / unstable のように同じ credential を使う兄弟の分はそれぞれのファイルにあり、gateway を通らない利用 (別のマシン、Web) はどこにも無い
 
+モデル別の枠 (Fable の週枠など) は応答ヘッダに出ないので、gateway は枠照会 API (Claude の `/api/oauth/usage`、Codex の `wham/usage`) を周期ごとに聞いてその行を残す。聞くのは前の周期で聞けてから、このプロセスが 1 本でも流した credential だけで、照会はトークンを使わない。答えは推移と `usage` の `snapshot` (使える窓が無い経路だけ) に入り、締め出しには使わない。聞けなければ次の周期で聞き直し、失敗が続けば 1 時間まで間を空け、429 を受けたら 1 時間控える。
+
+```toml
+[stats]
+quota_poll_interval = "5m"   # 聞く周期 (既定 5m)。0 で聞かない。それ以外は 1m 以上
+```
+
 ### `GET /llm-gateway/events`
 
 転送のたびに起きたことを SSE で流し続ける (DR-0012)。届くのは**繋いだ後**に起きた分だけで、過去には遡らない。見ている側が遅れて取りこぼしても gateway は詰まらない (落として先へ進む。落とした数は `/llm-gateway/self` に出る)。20 秒ごとに keep-alive を送る。

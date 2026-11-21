@@ -189,6 +189,11 @@ remove disabled from [server], or register another configuration",
         let refresher = Arc::clone(&gateway);
         tokio::spawn(async move { refresher.keep_models_fresh().await });
 
+        // モデル別の枠を推移に密に残すため、流した credential の枠を周期ごとに聞く
+        // (DR-0044 決定 9、`[stats] quota_poll_interval` が 0 なら何もしない)。
+        let poller = Arc::clone(&gateway);
+        tokio::spawn(async move { poller.keep_polling_quota().await });
+
         // 集計と利用状況を定期的に落とす。
         let flusher = Arc::clone(&gateway);
         let flushing = tokio::spawn(async move { flusher.keep_saving(SAVE_INTERVAL).await });

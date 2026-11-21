@@ -38,15 +38,18 @@ const OAUTH_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// OAuth の照会口に GET で聞き、成功した応答の本文を返す。
 ///
 /// 照会口はどれも公開ドキュメントに無いので、届かない・失敗した・本文が
-/// 読めないものは**情報なし** (`None`) に落とし、gateway の他の動きを
-/// 巻き込まない。何が起きたかはログに残す。
+/// 読めないものは失敗として返し、呼び出し側が**情報なし**として扱う (gateway の
+/// 他の動きを巻き込まない)。失敗の状態コードは落とさずに返す — 定期の照会
+/// (DR-0044 決定 9) は 429 を「聞きすぎ」と読んで控える。本文は返さない
+/// (この口の断りの本文を使う先が無い)。何が起きたかのログは呼び出し側が残す。
 async fn oauth_get(
     http: &reqwest::Client,
     base_url: &str,
     path: &str,
     credential: &Credential,
-) -> Option<String> {
+) -> crate::Result<String> {
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
+    let endpoint = || format!("the OAuth endpoint {path}");
     let resp = http
         .get(&url)
         .header("authorization", credential.bearer())
@@ -54,33 +57,23 @@ async fn oauth_get(
         .header("anthropic-version", "2023-06-01")
         .timeout(OAUTH_GET_TIMEOUT)
         .send()
-        .await;
-
-    let resp = match resp {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(credential = %credential.id, path, %e, "cannot reach the OAuth endpoint");
-            return None;
-        }
-    };
+        .await
+        .map_err(|source| crate::Error::UpstreamUnreachable {
+            provider: endpoint(),
+            source,
+        })?;
     let status = resp.status();
-    let body = match resp.text().await {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::warn!(credential = %credential.id, path, %e, "cannot read the OAuth endpoint response");
-            return None;
-        }
-    };
+    let body = resp.text().await.map_err(|e| {
+        crate::Error::upstream_response(endpoint(), format!("could not read the response: {e}"))
+    })?;
     if !status.is_success() {
-        tracing::warn!(
-            credential = %credential.id,
-            path,
-            status = status.as_u16(),
-            "the OAuth endpoint refused the query"
-        );
-        return None;
+        return Err(crate::Error::UpstreamStatus {
+            provider: endpoint(),
+            status: status.as_u16(),
+            body: String::new(),
+        });
     }
-    Some(body)
+    Ok(body)
 }
 
 /// 枠の呼び名から、その枠が回る周期 (秒) を起こす (DR-0018 §6)。

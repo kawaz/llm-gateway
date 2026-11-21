@@ -45,11 +45,11 @@ impl AccountApi for OauthProfile {
     ) -> BoxFuture<'a, Result<Standing>> {
         Box::pin(async move {
             let body =
-                super::oauth_get(http, &self.base_url, "/api/oauth/profile", credential).await;
-            body.as_deref().and_then(parse).ok_or_else(|| {
+                super::oauth_get(http, &self.base_url, "/api/oauth/profile", credential).await?;
+            parse(&body).ok_or_else(|| {
                 Error::upstream_response(
                     "Anthropic profile API",
-                    "could not fetch or parse the profile response".to_owned(),
+                    "could not parse the profile response".to_owned(),
                 )
             })
         })
