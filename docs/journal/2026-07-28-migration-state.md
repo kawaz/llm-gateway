@@ -24,7 +24,7 @@
 1. **llm-gateway のリリースを作り Homebrew で入れられるようにする**
 2. **stable は Homebrew のバイナリで起動** (私のビルドと物理的に無関係になる)
 3. **unstable はローカル main ws の release ビルド**
-4. **Caddy のフォールバックは unstable → stable の 2 段** (`https://llm-gateway.kawaz-mbp16-20211217.kawaz.jp`)
+4. **Caddy のフォールバックは unstable → stable の 2 段** (`https://llm-gateway.<host>`)
 5. Caddy 経由で動作確認できたら、kawaz が `settings.json` を書き換えて **このセッションのプロセスを実験台として再起動する**
 
 ### 却下した案とその理由

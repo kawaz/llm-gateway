@@ -69,7 +69,7 @@ Claude Code 2.1.284 を `ANTHROPIC_BASE_URL=http://127.0.0.1:11301/ns-personal`�
 
 ### Claude Code 2.1.284 の実行ファイルから読めた判定
 
-`/Users/kawaz/.local/bin/claude` の実体は `/Users/kawaz/.local/share/claude/versions/2.1.284`。同実行ファイルの組み込み JavaScript を文字列検索し、以下を確認した。
+`~/.local/bin/claude` の実体は `~/.local/share/claude/versions/2.1.284`。同実行ファイルの組み込み JavaScript を文字列検索し、以下を確認した。
 
 - `oee(e)` は third-party 経路で auto mode が有効な場合、`_St()&&!QJ()&&!hRe()&&!(Ie()==="firstParty"&&SRe())` を満たせば `arbiterWithLocalFallback` を返す。`_St()` は `CLAUDE_CODE_AUTO_MODE_SERVER` の明示値を優先し、指定が無ければ `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` が設定され、かつ `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` が無いときに無効にする。関数名を持つ他の条件の詳細は今回未追跡。
 - classifier 用 beta の定義は `auto_mode_classifier` = `auto-mode-classifier-2026-07-16`、`dangerous_tool_use` = `dangerous-tool-use-2026-09-03`。実 request ヘッダの両値の有無は tap がヘッダを収録しないため未確認。

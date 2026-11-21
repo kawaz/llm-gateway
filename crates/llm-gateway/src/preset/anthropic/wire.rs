@@ -289,12 +289,12 @@ extended-cache-ttl-2025-04-11";
             .encode(request(
                 json!({"model": "m"}),
                 headers(&[
-                    ("X-Forwarded-For", "100.76.5.89"),
+                    ("X-Forwarded-For", "192.0.2.89"),
                     ("X-Forwarded-Proto", "https"),
                     ("X-Forwarded-Host", "llm-gateway.example.internal"),
                     ("X-Forwarded-Port", "443"),
-                    ("X-Real-IP", "100.76.5.89"),
-                    ("Forwarded", "for=100.76.5.89;proto=https"),
+                    ("X-Real-IP", "192.0.2.89"),
+                    ("Forwarded", "for=192.0.2.89;proto=https"),
                     ("Via", "1.1 caddy"),
                     ("anthropic-version", "2023-06-01"),
                 ]),

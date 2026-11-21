@@ -27,7 +27,7 @@ keepalive の合図を ccmsg 経由でなく Claude Code の messaging socket �
 
 根拠: `docs/research/2026-09-08-session-injection-and-json-port.md` — `${XDG_RUNTIME_DIR:-$TMPDIR}/cc-socks/<pid>.sock` に `{"type":"user","message":{"content":"<marker>"}}` を 1 行書くだけで idle セッションが即起動し、macOS では認証不検証。
 
-kawaz 2026-09-08: 「webui のゴミ対応 (nonce 1 行返しルール) もこれで無くせそう」。
+kawaz 2026-09-08: 「webui の回避策 (nonce 1 行返しルール) もこれで無くせそう」。
 
 効果: webhook → ccmsg → Monitor 通知の経路が不要になり、webui に ping が流れない。
 

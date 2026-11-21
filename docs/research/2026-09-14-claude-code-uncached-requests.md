@@ -144,6 +144,6 @@ replay ログは 55 分間隔 (`since_ms` + 約 55 分から開始):
 ## 一次資料
 
 - 保持 request: `~/.local/state/llm-gateway/stats/keepalive/49a66dfd-8ae0-4388-bdc1-a28c9960308e.7d121f2e.json`
-- subagent transcript: `~/.claude-personal/projects/-Users-kawaz--local-share-repos-github-com-kawaz-ccmsg-main/49a66dfd-8ae0-4388-bdc1-a28c9960308e/subagents/agent-awebui-first-connect-22f1409eaba15865.jsonl`
+- subagent transcript: `<CLAUDE_CONFIG_DIR>/projects/<プロジェクト>/<session id>/subagents/agent-<id>.jsonl`
 - 親 transcript: 同ディレクトリの `49a66dfd-8ae0-4388-bdc1-a28c9960308e.jsonl`
 - gateway ログ: `~/.local/state/llm-gateway/logs/unstable.log`
