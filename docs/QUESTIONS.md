@@ -18,6 +18,13 @@
 
 ## 裁定待ち
 
+### SAN-Q1 公開履歴に 1 語だけ残る業務先の組織名を、履歴の書き換えで消すか
+
+今の HEAD には無いが、過去の findings (2026-07-29、commit 3235854〜99c8155 の間) に業務先の組織名が 1 語だけ残っている。業務の中身は書かれていない。GitHub の History と、tag v0.1.5〜v0.18.5 のソースアーカイブから辿れる。release の binary と本文には入っていない。
+
+- [ ] a: 書き換えない (統括推し。露出は名前 1 語だけ。書き換えると全 tag の付け直しと force push が要り、SLSA provenance と署名が元の SHA と食い違い、手元の workspace も同期し直しになる。GitHub のキャッシュは Support への依頼なしには消えない)
+- [ ] b: `git filter-repo --replace-text` でその 1 語を `emrd` に置き換え、全 tag の付け直し・force push・GitHub Support への purge 依頼まで行う
+
 ### LM-Q1 長い busy の締め出しも 1 時間ごとの枠照会の対象にするか
 
 窓を伴わない 429 (Fable の週の枠切れ等) は `retry-after` で数日先までの `busy` になる。`claim_probe` は `limited` の締め出しにしか定期の枠照会を立てないので、`limited` の印が無い状況 (その場の照会が失敗した、照会直後に枠が尽きた) では外でリセットされても `retry-after` まで残る。枠照会はトークンを使わない。DR-0009 の「定期の様子見は上限で締め出している経路にだけ立てる」の変更になる。関係: [denial.rs の claim_probe](../crates/llm-gateway/src/denial.rs)
