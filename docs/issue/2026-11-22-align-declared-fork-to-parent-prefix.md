@@ -56,8 +56,18 @@ origin: ccmsg 統括経由の kawaz 依頼 (2026-11-22、btw の fork の cache 
 - 条件のどれかが外れる組み合わせで本文が素通しになる
 - 実機 (unstable、使い捨てのセッション) で、名乗った fork が親の会話の分を cache_read で読む
 
+## client 側の手が見つかった後の位置づけ (2026-11-22)
+
+[btw-fork-cache-client-side-fix](../findings/2026-11-22-btw-fork-cache-client-side-fix.md) で、launch スクリプトに環境変数を 2 つ足すと、既知の違い (`Tool loaded.`、直された tool_use の input) が消え、fork が親の prefix を全部読んだ (Haiku 5.5)。この issue は、その手が Claude Code の版上げで効かなくなった時と、知らない種類の違いが出た時の網になる。着手の優先は下がるが、DR で決める時に次を使う。
+
+- 名乗りのヘッダは、fork の process の環境の `ANTHROPIC_CUSTOM_HEADERS` で載る (`--resume --fork-session` で実測)。`--settings` を合成しなくてよい
+- 揃えるのは messages だけでよい。system の 0 番 (請求ヘッダの `cc_entrypoint`)、会話の最初の role:system の message の `output_config`、top-level の `safeguards` / `max_tokens` / `thinking.display` / `metadata` は、違っていても親の prefix を全部読んだ。「role:system の message を置き換えるか残すか」は残してよい
+- tool_use の input の文字列と配列は、綴りによって同じ cache の key になる時とならない時がある (findings の表 4)。key の同じさに頼らず、bytes で揃える
+- 受け入れ試験の親は、Claude Code の知らない model の名前 (`ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku` と `--model haiku`) で作り、ToolSearch を含めると、btw と同じ形の fork が `Tool loaded.` の違いで部分読みになる (findings の表 1 の C)
+
 ## 関連
 
+- [btw-fork-cache-client-side-fix](../findings/2026-11-22-btw-fork-cache-client-side-fix.md) (client 側の手と実測)
 - [prefix-divergence-diff](./archive/2026-11-22-prefix-divergence-diff.md) (`dump diff` として実装済み。その CLI で実物の fork 3 件以上を比べ、範囲の決め方を確かめてから DR を起こす)
 - DR-0024 (cache の方針と禁則)、DR-0027 (控え)、DR-0035 (thinking の変換。控えは変換後の形なので、比べる段を揃える)
 - `docs/findings/2026-11-10-fable-5-2-preserved-thinking-vs-gateway-rewrites.md`
