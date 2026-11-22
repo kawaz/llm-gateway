@@ -23,6 +23,18 @@ pub struct Target {
 /// 複数あって未指定のときに既定を作らない。どちらに聞いたか分からないまま
 /// 数字を読むと、面を取り違えたことに気づけない。
 pub fn resolve(registry: &Registry, unit: Option<&str>) -> Result<Target, Failure> {
+    let (name, config) = configured(registry, unit)?;
+    let socket = config.server.unix_path(&name);
+    Ok(Target { unit: name, socket })
+}
+
+/// 名前で 1 台を選び、その設定を読む ([`resolve`] と同じ選び方)。
+///
+/// 台に聞かずに、台の置き場 (`[stats] dir` など) を手元で読む命令が使う。
+pub fn configured(
+    registry: &Registry,
+    unit: Option<&str>,
+) -> Result<(String, llm_gateway::Config), Failure> {
     let name = match unit {
         Some(name) => name.to_owned(),
         None => {
@@ -60,8 +72,7 @@ pub fn resolve(registry: &Registry, unit: Option<&str>) -> Result<Target, Failur
             ),
         )
     })?;
-    let socket = config.server.unix_path(&name);
-    Ok(Target { unit: name, socket })
+    Ok((name, config))
 }
 
 /// 選んだ台に聞いて、返ってきた報告を読む。

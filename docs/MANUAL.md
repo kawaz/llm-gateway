@@ -897,7 +897,7 @@ llm-gateway <command> [options]
 | `models` | List the models written in the configuration | — |
 | `usage` | Usage per route (asks a running unit) | `/llm-gateway/usage` |
 | `stats` | Token counts and USD per credential × model × day | `/llm-gateway/stats` |
-| `dump` | Dump request / response bodies to disk for a limited time (asks a running unit) | — |
+| `dump` | Dump request / response bodies to disk for a limited time (asks a running unit). `dump diff` lists where two bodies differ, locally | — |
 | `login` | Authorize in a browser and save to `<name>.json` | `/llm-gateway/login` |
 | `version` | What is installed, what is running, and whether they differ | `/llm-gateway/version` |
 
@@ -963,6 +963,7 @@ Asks a running unit to write the request and response bodies passing through one
 | `dump stop <dump_id>` | Stop that series without waiting for its time. Succeeds even if the series has already stopped, returning why it stopped. An unknown id is `unknown_dump` |
 | `dump list [<selector>]...` | The unit's series, including stopped ones, those waiting to be deleted and those left from before a restart. Everything without a selector; `state=active` for the running ones only |
 | `dump prune --dump-id <id>\|<selector>...` | Delete series, directory and all. A running series is stopped with `stop` first. Without `--dump-id` or a selector nothing is deleted (the help is shown) |
+| `dump diff <a> <b>` / `dump diff --kept <session_id> <b>` | Compare two request bodies that should share a prefix and list every place where they differ. Asks no unit and reads local files ([below](#dump-diff--listing-where-two-requests-that-should-share-a-prefix-differ)) |
 
 Selectors are `state=active` / `state=stopped` and, over labels, `owner=kawaz` / `pr!=1234` / `owner` (the key exists). Label keys and values are 1 to 63 letters, digits, `-`, `_` or `.`, starting and ending with a letter or digit. Labels stay in `index.jsonl` in plain text; keep secrets out of them.
 
@@ -1004,6 +1005,52 @@ Every answer starts with `unit` and `ok`, as `daemon reload` does; a refusal is 
 | `dump_dir_unwritable` | The series directory could not be made |
 | `not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` | The supervisor could not hand the request to the unit (same as the `daemon reload` table; `restart_required` means a version without a control socket is running) |
 | `supervisor_not_running` / `unit_required` / `no_units` / `unknown_unit` | The CLI could not settle where to ask, or could not reach the supervisor (`unit` is absent when no unit was settled; `unit_required` carries the registered names in `units`) |
+
+#### `dump diff` — listing where two requests that should share a prefix differ
+
+Compares two request bodies from a dump, or one body and a keepalive copy (DR-0027), and lists **every** place where they differ, in the order of the prompt cache prefix (`tools` → `system` → `messages`). The prompt cache cannot read past a single difference, so it does not stop at the first one. It is a tool for finding out why a `--resume --fork-session` fork does not read its parent's cache. It asks no unit and only reads local files.
+
+```
+llm-gateway dump diff <a> <b>
+llm-gateway dump diff --kept <session_id> [--prefix <prefix>] [--unit <name>] <b>
+```
+
+- `<a>` and `<b>` are request bodies as JSON files (such as a dump's `<ts>-<seq>.request.body`). Put the one sent first (the parent) as `<a>`
+- `--kept <session_id>` makes that conversation's keepalive copy `<a>`. Copies are read from `keepalive/` under the unit's `[stats]` directory (which unit is `--unit`, or the only registered one; sibling units share the directory). If the conversation has more than one series it is refused with `prefix_required`, listing `{prefix, ns, model}` in `series`; pick one with `--prefix`. Without a copy it is `no_kept_copy`
+- Left out before comparing: `cache_control` and the top-level `model`. A string content (and `system`, and a tool_result's content) counts the same as a single text block. Top-level fields other than `tools` / `system` / `messages` (`max_tokens` / `thinking` / `metadata` / `safeguards` and so on) are listed per field as `params` and are not counted as a prefix position
+- Values that differ only in key order are differences too (`key_order: true`), since the cache compares bytes
+- **The conversation itself is never printed.** Only positions (section, message / block / tool number, role), kinds, field names (including the keys of a tool_use `input`), types, sizes and hashes (the first 12 hex digits of SHA-256). It does not add a way to show the body of a kept copy (DR-0042 decision 1)
+- A kept copy is what the gateway **sent** upstream; a dump is what it **received**. Comparing one with the other shows the gateway's rewrites (model, thinking display and thinking turned into text, cache lifetimes) as differences. The input line of the dumped side carries `request_rewrites` of the last attempt of that request, and the summary line says so in `note`
+- The exit status is 0 whether or not they differ (non-zero only when they could not be compared, with the error as JSON on stderr)
+
+The output is JSON Lines: two input lines (`record: "input"`, `side: "a"` / `"b"`, `form: "received"` / `"sent"`), one line per difference (`record: "difference"`), and a summary line at the end (`record: "summary"`).
+
+| `kind` of a difference | Meaning |
+| --- | --- |
+| `count` | The number of tools / system blocks / messages differs (the number is the shorter length, the first position past it) |
+| `role` | Messages at the same number have different roles (blocks are not compared) |
+| `block_count` | Messages at the same number have a different number of blocks. Adds the block types and sizes of each side, and the comparison of the text blocks' text joined together (`text_joined`: `same` = only the split differs / `same_apart_from_whitespace` / `different`) |
+| `block_type` | Blocks (tools) at the same number have a different `type` |
+| `fields` | Blocks / tools of the same type, or a message's fields other than role and content (such as `output_config` of a role:system message), differ. `fields` lists the paths that differ and each side's shape (`type` / `bytes` / `len` for arrays and objects / `text_bytes` for strings). Strings also get the length of the common start and end (`common_prefix_bytes` / `common_suffix_bytes`). Up to 16 fields per place |
+| `value` | A `params` field differs |
+
+In the summary line, `first_difference` is the first position that differs in cache order (`params` excluded; `null` when all match), `matched_prefix` says whether `tools` / `system` match (`true` / `false`) and how many messages match from the start and their size, and `identical_messages` counts messages that match at the same number (whether or not they are contiguous).
+
+```
+$ llm-gateway dump diff --kept <parent conversation id> --unit unstable <body of the fork's request>
+{"record":"input","side":"a","form":"sent","source":"kept","session_id":"…","prefix":"7b8d6b3c","ns":"personal","model":"claude-opus-5-5","bytes":4433896}
+{"record":"input","side":"b","form":"received","source":"file","path":"…","bytes":4437343}
+{"record":"difference","section":"messages","message":173,"role":"assistant","kind":"fields","block":1,"fields":[{"path":"input.commands","a":{"type":"string","bytes":222,"text_bytes":212},"b":{"type":"array","bytes":209,"len":1}}],"a":{"type":"tool_use","bytes":699,"hash":"baa717967b36"},"b":{"type":"tool_use","bytes":682,"hash":"4060a35b5dc5"}}
+{"record":"difference","section":"messages","message":785,"role":"user","kind":"block_count","a":{"blocks":1,"types":["tool_result"],"bytes":[130]},"b":{"blocks":2,"types":["tool_result","text"],"bytes":[130,37]},"text_joined":"different"}
+{"record":"summary","identical":false,"differences":12,"tools":{"a":15,"b":15},"system":{"a":3,"b":3},"messages":{"a":916,"b":917},"first_difference":{"section":"system","block":0},"matched_prefix":{"tools":true,"system":false,"messages":1,"message_bytes":117620},"identical_messages":911,"note":"…"}
+```
+
+| `error.kind` | Meaning |
+| --- | --- |
+| `body_unreadable` | A body file cannot be read, or is not a JSON object |
+| `no_kept_copy` | There is no copy of that conversation (and `--prefix`). Only conversations kept alive have one, and it goes away when the series ends |
+| `prefix_required` | The conversation has more than one kept series (candidates in `series`) |
+| `unit_required` / `no_units` / `unit_config_unreadable` | The unit whose directory `--kept` reads cannot be chosen, or its configuration cannot be read |
 
 ### `auth` — keys and tokens for `jwt` namespaces
 
@@ -1079,13 +1126,15 @@ Options:
 | Option | Applies to | Meaning |
 | --- | --- | --- |
 | `--config <path>` | `check` / `models` / `daemon add` / `login` | Only the commands that take a configuration file itself |
-| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | Which running unit to ask (the only one, if only one is registered) |
+| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | Which running unit to ask (the only one, if only one is registered). For `dump diff --kept`, whose directory holds the kept copies |
 | `--ns <ns>` | `dump start` (required) | The namespace |
 | `--timeout <duration>` | `dump start` | How long to dump from now (`10m` / `1h`; 5 minutes by default, 24 hours at most) |
 | `--max-bytes <n>` | `dump start` | Cap on bytes written to that series; it stops on reaching it |
 | `--store raw` | `dump start` | Keep bodies as the bytes on the wire (`raw` is the only value) |
 | `--label <k>=<v>` | `dump start` | Free kv on the series (selectors for `list` / `prune`). Repeatable |
 | `--dump-id <id>` | `dump prune` | A series to remove. Repeatable |
+| `--kept <session_id>` | `dump diff` | Compare with that conversation's keepalive copy as `<a>` |
+| `--prefix <prefix>` | `dump diff --kept` | Which kept series to use, when the conversation has more than one |
 | `--embed bodies` | `dump start --follow` | Include the bodies in the streamed lines |
 | `--no-persist` | `dump start --follow --embed bodies` | Stream only, keep nothing |
 | `--name <name>` | `daemon add` | Name of the unit (default: the configuration file name without its extension) |

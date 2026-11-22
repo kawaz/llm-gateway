@@ -899,7 +899,7 @@ llm-gateway <command> [options]
 | `models` | 設定に書かれたモデルを一覧する | — |
 | `usage` | 経路ごとの利用状況 (走っている台に問い合わせる) | `/llm-gateway/usage` |
 | `stats` | credential × モデル × 日のトークン数と USD | `/llm-gateway/stats` |
-| `dump` | request / response の本文を時限で一時的にダンプする (走っている台に頼む) | — |
+| `dump` | request / response の本文を時限で一時的にダンプする (走っている台に頼む)。`dump diff` は 2 本の本文の食い違いを手元で並べる | — |
 | `login` | ブラウザで認可して `<name>.json` に保存する | `/llm-gateway/login` |
 | `version` | 置いてある版と走っている版、食い違っているか | `/llm-gateway/version` |
 
@@ -965,6 +965,7 @@ reload で変えられない欄 (変えたら `daemon restart`): `[server]` の 
 | `dump stop <dump_id>` | その系列を時限を待たずに止める。既に止まっていても成功し、止まった理由を返す。知らない id は `unknown_dump` |
 | `dump list [<選択子>]...` | その台の系列の一覧 (止まったもの・削除待ち・restart 前の分も)。選択子が無ければ全部。`state=active` で動いているものだけ |
 | `dump prune --dump-id <id>\|<選択子>...` | 系列をディレクトリごと消す。動いていれば `stop` で止めてから消す。`--dump-id` も選択子も無ければ消さない (help を出す) |
+| `dump diff <a> <b>` / `dump diff --kept <session_id> <b>` | 同じ prefix のはずの 2 本の request の本文を比べ、食い違う位置を全部並べる。台には聞かず手元のファイルを読む ([下](#dump-diff--同じ-prefix-のはずの-2-本の食い違いを並べる)) |
 
 選択子は `state=active` / `state=stopped` と、labels に対する `owner=kawaz` / `pr!=1234` / `owner` (キーがある)。labels のキーと値は 1〜63 文字で、英数字と `-` `_` `.`、先頭と末尾は英数字。labels は `index.jsonl` に平文で残るので秘密を入れない。
 
@@ -1006,6 +1007,52 @@ $ llm-gateway dump prune owner=kawaz --unit unstable
 | `dump_dir_unwritable` | 系列のディレクトリを作れなかった |
 | `not_running` / `restart_required` / `unreachable` / `no_answer` / `bad_answer` / `unknown_unit` | 監督者が台に渡せなかった (`daemon reload` の表と同じ。`restart_required` は制御口を持たない版が走っている) |
 | `supervisor_not_running` / `unit_required` / `no_units` / `unknown_unit` | CLI が頼む先を決められなかった・監督者に届かなかった (頼む先が決まっていなければ `unit` は付かない。`unit_required` には登録されている名前の `units` が付く) |
+
+#### `dump diff` — 同じ prefix のはずの 2 本の食い違いを並べる
+
+ダンプの request の本文 2 本、または本文 1 本と keepalive の控え (DR-0027) を比べ、prompt cache の prefix の順 (`tools` → `system` → `messages`) で食い違う位置を**全部**並べる。prompt cache は 1 か所でも違えばそこから後ろを読めないので、最初の 1 か所で止めない。`--resume --fork-session` の fork が親の cache を読めない時に、どこが違うかを調べるための道具。台には聞かず、手元のファイルだけを読む。
+
+```
+llm-gateway dump diff <a> <b>
+llm-gateway dump diff --kept <session_id> [--prefix <prefix>] [--unit <name>] <b>
+```
+
+- `<a>` と `<b>` は request の本文の JSON のファイル (ダンプの `<ts>-<seq>.request.body` など)。先に送られた方 (親) を `<a>` に置く
+- `--kept <session_id>` はその会話の控えを `<a>` にする。控えは台の `[stats]` の置き場の `keepalive/` から読む (どの台の置き場かは `--unit`、登録が 1 つならその台。兄弟の台は同じ置き場を共有する)。1 つの会話に系列が複数あれば `prefix_required` で断り、`series` に `{prefix, ns, model}` を並べるので `--prefix` で選ぶ。控えが無ければ `no_kept_copy`
+- 比べる前に除くもの: `cache_control`、top-level の `model`。文字列の content (と `system`、tool_result の content) は text block 1 つと同じに扱う。`tools` / `system` / `messages` 以外の top-level の欄 (`max_tokens` / `thinking` / `metadata` / `safeguards` など) は `params` として欄ごとに並べ、prefix の位置には数えない
+- 鍵の順だけが違う値も違いとして出す (`key_order: true`)。cache は bytes で比べるため
+- **会話の中身は出さない**。出るのは位置 (区分・message / block / tool の番号・role)・種類・欄の名前 (tool_use の `input` の鍵を含む)・型・大きさ・hash (SHA-256 の先頭 12 桁) だけ。控えの本文を見せる口は増やさない (DR-0042 決定 1)
+- 控えは gateway が upstream へ**送った**形、ダンプは gateway が**受けた**形。混ぜて比べると、gateway の書き換え (model・thinking の display と text への変換・cache の寿命) が違いとして出る。ダンプの側の入力の行に、その 1 本の最後の試行の `request_rewrites` を添え、要約の行の `note` にもそのことを書く
+- exit は、違いがあっても無くても 0 (比べられなかった時だけ非 0 で、エラーは JSON で stderr)
+
+出力は JSON Lines で、入力の行が 2 行 (`record: "input"`、`side: "a"` / `"b"`、`form: "received"` / `"sent"`)、違いの行が 1 か所 1 行 (`record: "difference"`)、最後に要約の行 (`record: "summary"`)。
+
+| 違いの行の `kind` | 意味 |
+| --- | --- |
+| `count` | tools / system の block / messages の数が違う (番号は短い方の長さ = はみ出した最初の位置) |
+| `role` | 同じ番号の message の role が違う (block には降りない) |
+| `block_count` | 同じ番号の message の block の数が違う。両側の block の型と大きさの並びと、text block の text をつなげて比べた結果 (`text_joined`: `same` = 割り方だけの違い / `same_apart_from_whitespace` / `different`) を添える |
+| `block_type` | 同じ番号の block (tool) の `type` が違う |
+| `fields` | 同じ型の block / tool、または message の role と content 以外の欄 (role:system の message の `output_config` など) が違う。`fields` に違う欄の path と両側の形 (`type` / `bytes` / 配列と object は `len` / 文字列は `text_bytes`) を並べる。文字列は先頭と末尾の一致の長さ (`common_prefix_bytes` / `common_suffix_bytes`) も出す。1 か所に 16 欄まで |
+| `value` | `params` の欄の値が違う |
+
+要約の行の `first_difference` は cache の順で最初に違った位置 (`params` は除く。全部一致なら `null`)、`matched_prefix` は `tools` / `system` が一致したか (`true` / `false`) と、先頭から続けて一致した messages の数と大きさ、`identical_messages` は同じ番号どうしで一致した messages の数 (続いていなくても数える)。
+
+```
+$ llm-gateway dump diff --kept <親の会話の id> --unit unstable <fork の request の本文>
+{"record":"input","side":"a","form":"sent","source":"kept","session_id":"…","prefix":"7b8d6b3c","ns":"personal","model":"claude-opus-5-5","bytes":4433896}
+{"record":"input","side":"b","form":"received","source":"file","path":"…","bytes":4437343}
+{"record":"difference","section":"messages","message":173,"role":"assistant","kind":"fields","block":1,"fields":[{"path":"input.commands","a":{"type":"string","bytes":222,"text_bytes":212},"b":{"type":"array","bytes":209,"len":1}}],"a":{"type":"tool_use","bytes":699,"hash":"baa717967b36"},"b":{"type":"tool_use","bytes":682,"hash":"4060a35b5dc5"}}
+{"record":"difference","section":"messages","message":785,"role":"user","kind":"block_count","a":{"blocks":1,"types":["tool_result"],"bytes":[130]},"b":{"blocks":2,"types":["tool_result","text"],"bytes":[130,37]},"text_joined":"different"}
+{"record":"summary","identical":false,"differences":12,"tools":{"a":15,"b":15},"system":{"a":3,"b":3},"messages":{"a":916,"b":917},"first_difference":{"section":"system","block":0},"matched_prefix":{"tools":true,"system":false,"messages":1,"message_bytes":117620},"identical_messages":911,"note":"…"}
+```
+
+| `error.kind` | 意味 |
+| --- | --- |
+| `body_unreadable` | 本文のファイルが読めない、JSON の object でない |
+| `no_kept_copy` | その会話 (と `--prefix`) の控えが無い。控えがあるのは keepalive の対象の会話だけで、系列が終わると消える |
+| `prefix_required` | 会話に控えの系列が複数ある (`series` に候補) |
+| `unit_required` / `no_units` / `unit_config_unreadable` | `--kept` の置き場を決める台を選べない・設定を読めない |
 
 ### `auth` — `jwt` の namespace の鍵と token
 
@@ -1081,13 +1128,15 @@ OS に載せるのは監督者 (`daemon supervise`) 1 つだけ。どの台を�
 | オプション | 対象 | 意味 |
 | --- | --- | --- |
 | `--config <path>` | `check` / `models` / `daemon add` / `login` | 設定ファイルそのものを対象にするコマンドだけが取る |
-| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | どの台に聞くか (登録が 1 つならその台) |
+| `--unit <name>` | `usage` / `stats` / `upstream status` / `dump` | どの台に聞くか (登録が 1 つならその台)。`dump diff --kept` ではどの台の置き場の控えを読むか |
 | `--ns <ns>` | `dump start` (必須) | 対象の namespace |
 | `--timeout <長さ>` | `dump start` | 今からどれだけの間ダンプするか (`10m` / `1h`。既定 5 分、上限 24 時間) |
 | `--max-bytes <n>` | `dump start` | その系列に書く量の上限。達したら止まる |
 | `--store raw` | `dump start` | 本文を通信上のバイト列のまま保存する (`raw` だけ) |
 | `--label <k>=<v>` | `dump start` | 系列に付ける自由な kv (`list` / `prune` の選択子)。複数可 |
 | `--dump-id <id>` | `dump prune` | 消す系列。複数可 |
+| `--kept <session_id>` | `dump diff` | その会話の keepalive の控えを `<a>` として比べる |
+| `--prefix <prefix>` | `dump diff --kept` | 会話に控えの系列が複数ある時に、どれを使うか |
 | `--embed bodies` | `dump start --follow` | 流す行に本文も同梱する |
 | `--no-persist` | `dump start --follow --embed bodies` | 流すだけで残さない |
 | `--name <name>` | `daemon add` | unit の名前 (既定: 設定ファイル名から拡張子を落としたもの) |

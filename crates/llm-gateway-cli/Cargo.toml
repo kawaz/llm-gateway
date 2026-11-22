@@ -29,6 +29,8 @@ reqwest = { workspace = true }
 stable-which = { workspace = true }
 # `auth keygen` の鍵の種。OS 由来の生成器。
 rand = { workspace = true }
+# `dump diff` が違う要素に添える hash。
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # 置き場の試験用実装が汎用層の Result を返すため。試験から socket に繋ぐ

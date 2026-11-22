@@ -13,12 +13,18 @@ use crate::failure::Failure;
 use crate::help;
 use crate::options::{split, take_value};
 
+mod diff;
+
 pub fn dispatch(args: &[String]) -> Result<ExitCode, Failure> {
     if args.is_empty() || help::wanted(args) {
         print!("{}", help::DUMP);
         return Ok(ExitCode::SUCCESS);
     }
     let rest = &args[1..];
+    if args[0] == "diff" {
+        // 台に頼まず、手元のファイルだけを読む。
+        return diff::run(rest);
+    }
     let parsed = match args[0].as_str() {
         "start" => start(rest)?,
         "stop" => stop(rest)?,
@@ -414,7 +420,7 @@ mod tests {
     /// 受け付ける命令と、help に並ぶ命令は同じ (cli-design-preferences)。
     #[test]
     fn every_command_it_takes_is_written_in_the_help() {
-        for command in ["start", "stop", "list", "prune"] {
+        for command in ["start", "stop", "list", "prune", "diff"] {
             assert!(
                 help::DUMP.contains(&format!("  {command} ")),
                 "the help does not offer `{command}`"
@@ -447,6 +453,7 @@ mod tests {
             vec!["start"],
             vec!["stop"],
             vec!["prune"],
+            vec!["diff"],
         ] {
             assert_eq!(
                 dispatch(&args(&level)).unwrap(),

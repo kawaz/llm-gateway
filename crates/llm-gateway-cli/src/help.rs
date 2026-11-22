@@ -126,6 +126,10 @@ commands:
                     list this unit's dumps, stopped and left-over ones included
   prune --dump-id <id>|<selector>...
                     stop (if running) and remove dumps, directory and all
+  diff <a> <b>      compare two request bodies that should share a prefix and list
+                    every place where they differ (reads files only, asks no unit)
+  diff --kept <session_id> <b>
+                    the same, with the keepalive copy of a conversation as <a>
 
 start options:
   --ns <ns>         the namespace to dump (required)
@@ -148,7 +152,30 @@ prune options:
 selectors (list and prune):
   key=value, key!=value, key (the label exists), and state=active|stopped
 
-options of every command:
+diff:
+  <a> and <b> are request bodies as JSON, such as <ts>-<seq>.request.body of a dump.
+  put the earlier one (the parent) as <a>. they are compared in the order of the
+  prompt cache prefix (tools, system, messages), message by message and block by
+  block; cache_control, the top-level model, and a string content versus a single
+  text block are not counted as differences. other top-level fields are listed as
+  params. it prints JSON lines: one input line per side, one difference line per
+  place (section, message / block / tool number, role, kind = count / role /
+  block_count / block_type / fields, the differing fields, sizes and hashes), and a
+  summary line (identical, first_difference, matched_prefix). the text of the
+  conversation is never printed, only positions, field names, types and sizes.
+  a kept copy is what the gateway sent upstream, while a dump holds what it
+  received: the rewrites in the dump's request_rewrites (shown on its input line)
+  show up as differences.
+
+diff options:
+  --kept <session_id>
+                    use the keepalive copy of this conversation as <a>
+  --prefix <prefix> which kept series of that conversation, when it has more than one
+  --unit <name>     with --kept, whose [stats] dir holds the kept copies
+                    (default: the only registered one)
+  --                the arguments after it are paths
+
+options of start, stop, list and prune:
   --unit <name>     which running unit to ask
                     (default: the only registered one; `daemon list` shows them)
 
@@ -167,7 +194,9 @@ where it writes:
 
 output:
   answers are JSON {unit, ok, ...} on stdout; when ok is false the answer goes to
-  stderr and the exit status is non-zero. this help is text
+  stderr and the exit status is non-zero. diff prints JSON lines on stdout and exits
+  with zero whether or not the bodies differ; its errors are JSON on stderr. this
+  help is text
 ";
 
 /// `service` の下。

@@ -20,13 +20,13 @@
 - keepalive の控え (DR-0027 決定 3) は、系列 (会話の id + `prefix`) ごとに「最後に upstream へ送った 1 本」の本文とヘッダ (認証を除く) を、送出直前の形 (model の書き換え・thinking の変換・cache の整形の後) でファイルに持つ。兄弟の unit (stable / unstable) は同じ置き場を共有する
 - 控えがあるのは、main の戦略が `keepalive` の ns の、`tools` を持つ main の会話で、応答が cache に乗った (`hit` / `written` / `partial`) 1 本だけ (DR-0024 §2、DR-0027 決定 8)。oneshot (`claude -p` の fork はこれ) は sub の戦略に落ち、personal の ns では `passthrough` なので控えない
 - 控えに入るのは **request だけで、その応答は入らない**。本体が最後の turn に返した答えは控えに無い
-- 1 系列の本文は 8MB を蓋にして、超えた系列は控えない (= 延命もしない、`BODY_LIMIT`)。手元の置き場の 17 系列は 224KB〜4.39MB (中央値 1.31MB)。今回の 55 万 token の本体が何 MB かは測っていない
+- 1 系列の本文は 8MB を蓋にして、超えた系列は控えない (= 延命もしない、`BODY_LIMIT`)。手元の置き場の 17 系列は 224KB〜4.39MB (中央値 1.31MB)。今回の 55 万 token の本体は約 4MB で収まっている (「dump diff での実測」)
 - gateway から見ると fork は**別の会話**: `--fork-session` で会話の id が変わり、origin は `oneshot` (system 先頭の請求ヘッダが `cc_entrypoint=sdk-cli`)。fork の request の中に親の会話の id は無い
 
 ### 3. fork に親の会話を名乗らせる口は、Claude Code の既存の設定で作れる
 
 - `--settings '{"env":{"ANTHROPIC_CUSTOM_HEADERS":"<name>: <value>"}}'` で渡したヘッダは、その `claude -p` が出す request の全部に載った (記録用サーバで 8 本中 8 本、改行区切りで 2 つ渡して 2 つとも)。ccmsg の btw は既に `--settings` を渡す起動なので、fork の起動に 1 項目足せば親の会話の id を gateway に伝えられる
-- 測ったのは fork なしの `claude -p` 1 回。`--resume --fork-session` でも同じく載るかは測っていない (env はプロセス単位の設定なので変わらない見込み、未検証)
+- `--resume <親> --fork-session --session-id <新> --no-session-persistence --settings <file>` の fork でも全部の request に載った (「dump diff での実測」)
 
 ### 4. 本体の bytes に揃えると、thinking の署名は壊れるのではなく元に戻る
 
@@ -118,9 +118,31 @@ gateway の責務は「認証を client の外に置いた薄い proxy」で、�
 - A の効果 (揃えた fork が会話の分を読むか): 「同じ本文の送り直しは当たる」(DR-0027 の根拠の実測) と「prefix が 100% 一致すれば当たる」(一次資料) から決まるので、実装前に測る価値が小さい。A を実装した時の受け入れ試験で測る
 - 使い捨ての Opus のセッションで btw の形を再現すること: user の instruction 群だけで 1 request が 6〜8 万 token になり (ccmsg の findings)、ここで確かめたいこと (gateway の側の手の得失) に対して費用が見合わない
 
+## dump diff での実測
+
+`llm-gateway dump diff` (issue `prefix-divergence-diff`) を作った後に、実物の fork を比べた (2026-11-22、llm-gateway v0.74.0 + `dump diff`、Claude Code 2.1.330)。
+
+方法:
+
+- **使い捨て**: リポの外の一時ディレクトリを cwd に、空の `CLAUDE_CONFIG_DIR` で、unstable の cache の戦略を持たない ns に向けた haiku の `claude -p` で親 (2 turn、Bash の tool_use あり) を作った。その親を `--resume <親> --fork-session --session-id <新> --no-session-persistence --settings <file>` で fork した (Bash の tool_use あり、2 request)。両方の本文を unstable のダンプで取った
+- **長い会話**: 発端の Opus 5.5 の会話 (personal、keepalive の控えあり) を、btw と同じ形の fork で 1 回起動した。向け先は upstream に出さない記録用サーバ (本文とヘッダ (認証系を除く) を保存して 400 を返す)。その本文と、その時点の控えを `dump diff --kept` で比べた。元の会話には何も送っていない
+- **583 番目**: 元の会話の transcript の `api-request` の行 (`keep` = 前の request から引き継いだ message の数、`tail` = 後ろに足した message の hash) と `api-request-blob` の行を読み、親が message 583 を送った形の移り変わりを追った
+
+| 比べた 2 本 | 違い |
+|---|---|
+| 使い捨ての親の最後の 1 本 (11 message) と fork の 1 本目 (14 message) | tools・system・messages の 11 件が全部一致。違いは message の数と params の `metadata` だけ<br>fork の 1 本目の cache_read は 18,224 (親の最後の 1 本は read 18,120 + write 104) で、親の prefix を全部読んだ |
+| 長い会話の控え (916 message) と fork (917 message) | system の 0 番 (請求ヘッダの `cc_entrypoint` が `cli` と `sdk-cli`)<br>message 1 (`output_config` が fork だけにある)<br>173 と 297 (tool_use の `input` の欄が控えでは文字列、fork では配列。173 は 2 欄、297 は 3 欄)<br>785 (fork だけ text block が 1 つ多い)<br>915 (控えの末尾の user message と、fork 自身の入力)<br>message の数<br>params (`thinking`・`safeguards`・`max_tokens`・`metadata`)<br>同じ番号どうしで一致した message は 916 件中 911 件 |
+
+考察:
+
+- **583 番目は fork と控えの違いではない**。親自身が 583 を送り直していた。ある 1 本では 583 は 3 block (tool_result 2 つと text) で、次の 1 本は `keep` 583 で 583 を 4 block の形に差し替えた。差し替えで、前の text の末尾に改行 1 byte が付き、後から届いた入力の text block が 1 つ足された (割り方だけでなく中身が増えている)。以後の親の request はこの形で、最新の控えも fork も同じ形だった。所見の発端の比較は、差し替える前の古い blob と比べていた。最新の控えに揃える A では、この種の違いは出ない。親はこの差し替えの 1 本で自分の cache を 583 から先で外したはず (usage は見ていない、未検証)
+- **控えの大きさ**: 916 message の時点で本文 4,433,896 B (ファイルは約 4.8MB)。このうち `safeguards` が約 22 万 B。所見の時点の 803 message (約 55 万 token) まででは約 4MB で、8MB の蓋の半分。この 1 点の比 (約 7 B / token) なら 1M context でも蓋に収まるが、thinking の署名や tool の出力の割合で比は変わる (1 点だけの概算)
+- **請求ヘッダ (system の 0 番)**: main の会話 (`cli`) と `claude -p` の fork (`sdk-cli`) では必ず違う。所見の fork の cache_read (15,396) が system と tools の分なら、API はこの block の違いを prefix の違いに数えていない。`docs/knowledge/2026-09-02-prompt-cache-and-thinking-facts.md` の「subagent は請求ヘッダが違うので先頭から不一致」と食い違うが、subagent は system の他の文も違うので、請求ヘッダが効いたとは切り分けられていない。A は messages しか揃えないので、ここが効くなら A は効かない。A の受け入れ試験の実測で確かめる
+- **境界 (915)**: 控えの末尾の message は親の最新の user 入力 (text だけ) で、fork の履歴にはそれが無く、同じ位置に fork 自身の入力が来た (fork を起動した時に親の turn が走っていた)。text だけの user message は tool の id を持たないので、A の範囲の判定を id の並びだけでするとここを範囲に入れてしまう。中身 (bytes) の一致も条件にする必要がある
+- **`ANTHROPIC_CUSTOM_HEADERS`**: 使い捨ての fork の 2 本と、長い会話の fork の 6 本 (400 を受けての再試行を含む) の全部に、`--settings` で渡した 2 つのヘッダが載った。`x-claude-code-session-id` は fork の新しい id だった
+- **params**: `thinking` は gateway が display を書き換えた分 (控えは送った形)。`safeguards` は auto mode の classifier の文脈 (作業ディレクトリ・git の状態) で、fork を起動した cwd で変わる
+
 ## 分かっていないこと
 
-- `--resume --fork-session` の fork にも `ANTHROPIC_CUSTOM_HEADERS` が載るか (載る見込み)
-- 今回の 55 万 token の本体の控えが 8MB に収まっていたか。1M context の会話は蓋を超えうる
-- 583 番目 (turn の途中で届いた入力) の違いが、表現だけの違い (同じ文字列の block の割り方) か、内容の違いか。A の境界の扱いを決めるのに要る
+- 請求ヘッダ (system の 0 番) の `cc_entrypoint` の違いが prompt cache の prefix を切るか (「dump diff での実測」)
 - fork の 1 番目の system message の effort の印 (`output_config`) を本体の形に揃えるべきか、fork の形のまま残すべきか。sonnet の 1 件では印の有無が違っても当たった (ccmsg の findings)。A では role:system の message は fork の形のまま残す方が安全と見ている (未検証)
