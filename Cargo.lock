@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-core"
-version = "0.74.0"
+version = "0.75.0"
 dependencies = [
  "axum",
  "base64",
@@ -941,7 +941,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llm-gateway"
-version = "0.74.0"
+version = "0.75.0"
 dependencies = [
  "axum",
  "base64",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "llm-gateway-cli"
-version = "0.74.0"
+version = "0.75.0"
 dependencies = [
  "axum",
  "base64",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "llm-gateway-server"
-version = "0.74.0"
+version = "0.75.0"
 dependencies = [
  "axum",
  "base64",
