@@ -178,7 +178,7 @@ impl<P: CredentialPersistence> CredentialStore<P> {
         let saved = self
             .inner
             .update(id, |existing| {
-                Ok(Some(tokens.to_stored(kind, existing.ok().as_ref())))
+                tokens.to_stored(kind, existing.ok().as_ref()).map(Some)
             })
             .await?;
         self.inner.record_auth(id, &Ok(())).await;

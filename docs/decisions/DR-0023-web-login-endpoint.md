@@ -21,6 +21,16 @@ gateway の HTTP 口に web login フローを足す。**claude_oauth のみ**�
 
 CLI login と同じ経路: `store.lock(id)` で締め出し (DR-0010) → 既存を土台に `tokens.to_stored` → `store.store`。常駐 refresh との消し合いを防ぐ。
 
+### 再ログインのアカウント照合
+
+既に保存されている認証情報に再ログインするとき、今回承認されたアカウントが保存済みのアカウントと違えば保存しない。ブラウザで別のアカウント (別のプロファイルにログイン中のもの等) を承認したまま上書きすると、2 つの認証情報が同じアカウントを指す状態に黙って落ち、どちらの枠を使っているのか分からなくなるため。
+
+- 照合は `tokens.to_stored` で、ロックの内側で読み直した既存の内容に対して行う。Web と CLI はどちらもここを通る。refresh はこの関数を通らないので、照合の対象外
+- 比べるのは保存済みの欄だけ: `email` (両 type)、`codex_oauth` はさらに `account_id`。比べるのは保存済みの側と今回の側の両方に値がある欄だけで、どちらかが空・無しならその欄では断らない (email を持たない古いファイルや、応答に email が無い場合を弾かないため)。email は ASCII の大文字小文字を区別せず比べ、account_id は完全一致で比べる
+- 保存済みのファイルが無い名前への初回ログインは比べる相手が無いので通る
+- 断るときはファイルに一切書かず、エラー (`could not complete authorization: ...`) に保存済みと今回のアカウント (email、または account_id) と対処を載せる。Web では失敗のページに出る。token は載せない
+- アカウントを意図して替えたいときは、その認証情報のファイル (`<store>/<name>.json`) を消してからログインし直す。上書きを強制するオプションは持たない。替える操作は頻繁に起きるものではなく、ファイルを消す手順で足りる。強制のオプションがあると、取り違えたときにもそれを付けて押し通す道ができ、照合の意味が薄れる
+
 ### 対象外 (codex_oauth)
 
 OpenAI 側にコード表示ページの公知の実績が無く、redirect_uri は Codex CLI 登録の localhost:1455 のみ。web ページでは「CLI (`llm-gateway login --type codex_oauth
@@ -32,7 +42,7 @@ OpenAI 側にコード表示ページの公知の実績が無く、redirect_uri 
 
 ## リスク
 
-- redirect_uri は client_id に登録済みの値に限定される。gateway 自身の URL では `Redirect URI https://…/llm-gateway/login/claude-kawazzz/callback is not supported by client.` と認可画面で拒否される。Web login は登録済みの Anthropic console redirect_uri に固定する
+- redirect_uri は client_id に登録済みの値に限定される。gateway 自身の URL では `Redirect URI https://…/llm-gateway/login/<name>/callback is not supported by client.` と認可画面で拒否される。Web login は登録済みの Anthropic console redirect_uri に固定する
 - 交換時の redirect_uri は認可時と一致が必須。web フローは AuthProfile の redirect_uri を console 変種に差し替えて交換まで通す
 
 ## 不採用案

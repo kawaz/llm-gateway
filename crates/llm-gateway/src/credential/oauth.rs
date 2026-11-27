@@ -722,8 +722,53 @@ impl Drop for Tokens {
 
 impl Tokens {
     /// 保存する形にする。
-    pub fn to_stored(&self, kind: Kind, base: Option<&StoredCredential>) -> StoredCredential {
-        self.to_stored_at(kind, base, now_unix())
+    ///
+    /// `base` は再ログイン時の既存の内容。承認されたアカウントが `base` の
+    /// アカウントと違えば断る。ブラウザで別アカウントを承認したまま保存すると、
+    /// 2 つの認証情報が同じアカウントを指す状態に黙って落ち、どちらの枠を
+    /// 使っているのか分からなくなる。
+    ///
+    /// 照合はここ (login の保存) だけで行う。refresh はこの関数を通らない。
+    pub fn to_stored(
+        &self,
+        kind: Kind,
+        base: Option<&StoredCredential>,
+    ) -> gateway_core::Result<StoredCredential> {
+        if let Some(base) = base {
+            self.ensure_same_account(&base.payload)?;
+        }
+        Ok(self.to_stored_at(kind, base, now_unix()))
+    }
+
+    /// 承認されたアカウントが保存済みのものと同じか確かめる。
+    ///
+    /// 比べるのは保存済みの側と今回の側の両方に値がある欄だけ。片方が空なら
+    /// その欄では断らない — email を持たない古いファイルや、応答に email が
+    /// 無かった場合を弾かないため。email は ASCII の大文字小文字を区別しない
+    /// (プロバイダが表記を揺らしても同じアカウント)。account_id はプロバイダが
+    /// 振る識別子なので完全一致で比べる。
+    fn ensure_same_account(&self, saved: &Payload) -> gateway_core::Result<()> {
+        let emails = both_present(Some(saved.email()), self.email.as_deref());
+        let account_ids = both_present(saved.account_id(), self.account_id.as_deref());
+
+        let (approved, kept) = match (emails, account_ids) {
+            (Some((saved, approved)), _) if !saved.eq_ignore_ascii_case(approved) => {
+                (approved.to_owned(), saved.to_owned())
+            }
+            (_, Some((saved, approved))) if saved != approved => (
+                format!("account ID {approved}"),
+                format!("account ID {saved}"),
+            ),
+            _ => return Ok(()),
+        };
+        Err(gateway_core::Error::Login {
+            reason: format!(
+                "the approved account ({approved}) is not the account saved for this credential \
+({kept}), so nothing was saved. To renew this credential, start authorization again and \
+approve it as {kept}. To use a different account, delete this credential's file \
+(<name>.json in the credential store), then log in again"
+            ),
+        })
     }
 
     /// 時刻を指定して保存する形にする。`now_unix` は試験用。
@@ -784,6 +829,14 @@ impl Tokens {
         };
         next.ext.last_refresh = format_rfc3339(now_unix);
         next
+    }
+}
+
+/// 両方に値があるときだけ組にする。空文字は「値が無い」と同じに扱う。
+fn both_present<'a>(saved: Option<&'a str>, now: Option<&'a str>) -> Option<(&'a str, &'a str)> {
+    match (saved, now) {
+        (Some(saved), Some(now)) if !saved.is_empty() && !now.is_empty() => Some((saved, now)),
+        _ => None,
     }
 }
 
@@ -1532,6 +1585,176 @@ mod tests {
         assert!(
             json["payload"].get("id_token").is_none(),
             "does not carry over leftovers from before: {json}"
+        );
+    }
+
+    // 再ログインの照合 (アカウントの取り違えを保存しない)。
+    //
+    // ブラウザ側で別のアカウントを承認したまま保存すると、2 つの認証情報が
+    // 同じアカウントを指す状態に黙って落ちる。保存済みの内容と今回承認された
+    // token を比べ、違えば保存の形を作らずに断る。
+    //
+    // 比べるのは保存済みの欄だけ: email (両 type)、codex はさらに account_id。
+    // 比べるのは「両側に値がある欄」だけで、片側が空・無しならその欄では
+    // 断らない (email を持たない古いファイルや応答を弾かないため)。
+    //
+    // | 保存済み            | 今回                 | 結果 |
+    // |---------------------|----------------------|------|
+    // | 無し (初回)         | 何でも               | 通す |
+    // | email A             | email B              | 断る |
+    // | email A             | email a (大小違い)   | 通す |
+    // | email 空            | email B              | 通す |
+    // | email A             | email 無し           | 通す |
+    // | codex id X          | codex id Y (email 同) | 断る |
+    // | codex id 無し       | codex id Y           | 通す |
+
+    fn claude_saved(email: &str) -> StoredCredential {
+        tokens_as("at", "rt", Some(email), None).to_stored_at(Kind::Claude, None, NOW)
+    }
+
+    fn codex_saved(email: &str, account_id: Option<&str>) -> StoredCredential {
+        tokens_as("at", "rt", Some(email), account_id).to_stored_at(Kind::Codex, None, NOW)
+    }
+
+    fn approved(email: Option<&str>, account_id: Option<&str>) -> Tokens {
+        tokens_as("at-new", "rt-new", email, account_id)
+    }
+
+    fn tokens_as(
+        access_token: &str,
+        refresh_token: &str,
+        email: Option<&str>,
+        account_id: Option<&str>,
+    ) -> Tokens {
+        Tokens {
+            access_token: access_token.into(),
+            refresh_token: refresh_token.into(),
+            id_token: None,
+            expires_in: 28_800,
+            email: email.map(str::to_owned),
+            account_id: account_id.map(str::to_owned),
+        }
+    }
+
+    /// 初回 (保存済みが無い) は比べる相手が無いので通す。
+    #[test]
+    fn first_login_is_not_compared() {
+        let stored = approved(Some("someone@example.com"), None)
+            .to_stored(Kind::Claude, None)
+            .unwrap();
+        assert_eq!(stored.payload.email(), "someone@example.com");
+    }
+
+    /// 同じアカウントでの再ログインは今までどおり通り、token が入れ替わる。
+    #[test]
+    fn relogin_with_the_same_account_is_saved() {
+        let base = claude_saved("someone@example.com");
+        let next = approved(Some("someone@example.com"), None)
+            .to_stored(Kind::Claude, Some(&base))
+            .unwrap();
+        assert_eq!(next.payload.secret(), "at-new");
+    }
+
+    /// 違う email を承認した再ログインは断る。
+    ///
+    /// 文言は原因 (どのアカウントとどのアカウントが違うか) と対処 (保存済みの
+    /// アカウントで承認し直す / 替えるならファイルを消してから) を両方持つ。
+    /// 取り違えに気づくための email は出すが、token は出さない。
+    #[test]
+    fn relogin_with_another_email_is_refused() {
+        let base = claude_saved("saved@example.com");
+        let err = approved(Some("other@example.com"), None)
+            .to_stored(Kind::Claude, Some(&base))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("saved@example.com"), "{err}");
+        assert!(err.contains("other@example.com"), "{err}");
+        assert!(err.contains("nothing was saved"), "{err}");
+        assert!(
+            err.contains("<name>.json"),
+            "names the file to delete: {err}"
+        );
+        for secret in ["at-new", "rt-new"] {
+            assert!(
+                !err.contains(secret),
+                "does not show a token ({secret}): {err}"
+            );
+        }
+    }
+
+    /// email は ASCII の大文字小文字を区別しない。プロバイダが表記を揺らしても
+    /// 同じアカウントで、それを取り違えとして断ると再ログインできなくなる。
+    #[test]
+    fn email_case_does_not_count_as_another_account() {
+        let base = claude_saved("Someone@Example.com");
+        assert!(
+            approved(Some("someone@example.COM"), None)
+                .to_stored(Kind::Claude, Some(&base))
+                .is_ok()
+        );
+    }
+
+    /// 片側に email が無ければ、email では断らない。
+    ///
+    /// 保存済みが空なのは email を記録していなかった古いファイル、今回が無いのは
+    /// 応答に email が含まれなかった場合。どちらも「違う」とは言えない。
+    #[test]
+    fn a_missing_email_on_either_side_is_not_compared() {
+        let blank = claude_saved("");
+        assert!(
+            approved(Some("someone@example.com"), None)
+                .to_stored(Kind::Claude, Some(&blank))
+                .is_ok(),
+            "saved side is blank"
+        );
+
+        let base = claude_saved("someone@example.com");
+        let next = approved(None, None)
+            .to_stored(Kind::Claude, Some(&base))
+            .unwrap();
+        assert_eq!(
+            next.payload.email(),
+            "someone@example.com",
+            "the approved side has none, so the saved one is kept"
+        );
+        assert!(
+            approved(Some(""), None)
+                .to_stored(Kind::Claude, Some(&base))
+                .is_ok(),
+            "an empty string counts as no value"
+        );
+    }
+
+    /// codex は email が同じでも account_id が違えば断る (同じ人が別の
+    /// ChatGPT アカウントを持つことがある)。account_id はプロバイダが振る
+    /// 識別子なので完全一致で比べる。
+    #[test]
+    fn codex_relogin_with_another_account_id_is_refused() {
+        let base = codex_saved("someone@example.com", Some("acc-saved"));
+        let err = approved(Some("someone@example.com"), Some("acc-other"))
+            .to_stored(Kind::Codex, Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("acc-saved"), "{err}");
+        assert!(err.contains("acc-other"), "{err}");
+
+        assert!(
+            approved(Some("someone@example.com"), Some("acc-saved"))
+                .to_stored(Kind::Codex, Some(&base))
+                .is_ok(),
+            "the same account ID passes"
+        );
+    }
+
+    /// account_id を持たない保存済みの codex は account_id では断らない。
+    #[test]
+    fn codex_without_a_saved_account_id_is_not_compared() {
+        let base = codex_saved("someone@example.com", None);
+        assert!(
+            approved(Some("someone@example.com"), Some("acc-new"))
+                .to_stored(Kind::Codex, Some(&base))
+                .is_ok()
         );
     }
 

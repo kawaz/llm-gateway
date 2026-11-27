@@ -76,7 +76,7 @@ pub enum Error {
 
     /// 認可 (login) が最後まで進まなかった。
     ///
-    /// 転送の最中には起きない (CLI からの login でだけ出る)。
+    /// 転送の最中には起きない (CLI と Web の login でだけ出る)。
     #[error("could not complete authorization: {reason}")]
     Login { reason: String },
 

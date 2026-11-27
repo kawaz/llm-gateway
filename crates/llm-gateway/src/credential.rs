@@ -25,7 +25,8 @@ impl<P: Persistence<Value = StoredCredential>> CredentialPersistence for P {}
 
 /// login で得た token を、現在の内容を土台にして保存する。
 ///
-/// 書き換えの権利 (`guard`) の下で読み直してから書く (DR-0010)。
+/// 書き換えの権利 (`guard`) の下で読み直してから書く (DR-0010)。承認された
+/// アカウントが保存済みのものと違えば、何も書かずに断る ([`oauth::Tokens::to_stored`])。
 pub fn save_login<P: CredentialPersistence>(
     store: &P,
     guard: &P::Guard,
@@ -33,7 +34,7 @@ pub fn save_login<P: CredentialPersistence>(
     tokens: &oauth::Tokens,
 ) -> Result<StoredCredential> {
     let existing = store.reload(guard).ok();
-    let credential = tokens.to_stored(kind, existing.as_ref());
+    let credential = tokens.to_stored(kind, existing.as_ref())?;
     store.store(guard, &credential)?;
     Ok(credential)
 }

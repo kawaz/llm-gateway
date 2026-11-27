@@ -358,6 +358,82 @@ mod tests {
         assert_eq!(saved.ext.excluded_models, vec!["claude-opus-*"]);
     }
 
+    /// 置き場のファイルに、指定の email で保存済みの claude_oauth を置く。
+    fn file_store_holding(email: &str) -> (tempfile::TempDir, FileStore, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"claude_oauth","priority":10,
+                    "payload":{{"access_token":"at-old","refresh_token":"rt-old",
+                    "expired":"2026-07-28T02:54:00+09:00","email":"{email}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let store = FileStore::open(dir.path()).unwrap();
+        (dir, store, path)
+    }
+
+    /// 別のアカウントを承認した再ログインは断り、置き場のファイルを 1 バイトも
+    /// 変えない。
+    ///
+    /// ブラウザで別アカウントを承認したまま上書きすると、2 つの認証情報が同じ
+    /// アカウントを指す状態に黙って落ちる。断った後に元の内容が残っていれば、
+    /// 正しいアカウントで承認し直すだけで済む。
+    #[test]
+    fn a_login_as_another_account_leaves_the_file_untouched() {
+        let (_dir, store, path) = file_store_holding("saved@example.com");
+        let before = std::fs::read(&path).unwrap();
+
+        let err = save(
+            &store,
+            &CredentialId::new("c"),
+            Kind::Claude,
+            &fresh_tokens(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("saved@example.com"), "{err}");
+        assert!(err.contains("someone@example.com"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    }
+
+    /// 同じアカウントの再ログインは今までどおり保存される。
+    #[test]
+    fn a_login_as_the_same_account_is_saved_to_the_file() {
+        let (_dir, store, path) = file_store_holding("someone@example.com");
+
+        save(
+            &store,
+            &CredentialId::new("c"),
+            Kind::Claude,
+            &fresh_tokens(),
+        )
+        .unwrap();
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("at-new"), "{saved}");
+    }
+
+    /// ファイルがまだ無い名前への初回ログインは、比べる相手が無いので通る。
+    #[test]
+    fn a_first_login_creates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path()).unwrap();
+
+        save(
+            &store,
+            &CredentialId::new("c"),
+            Kind::Claude,
+            &fresh_tokens(),
+        )
+        .unwrap();
+
+        assert!(dir.path().join("c.json").exists());
+    }
+
     fn parse_login(list: &[&str]) -> Result<Args, Failure> {
         parse(&args(list))
     }

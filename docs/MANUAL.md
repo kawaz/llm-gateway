@@ -868,6 +868,15 @@ On success it returns HTML saying "Credential `<name>` was updated." An empty st
 
 Saving goes through the same path as the CLI login (it takes the credential lock and writes back on top of what exists), so it never fights with the background refresh.
 
+### Logging in again checks the account
+
+When you log in again to a credential that is already saved (from the web page or with `llm-gateway login` on the CLI), the login is refused without saving if the approved account differs from the saved one. Even if you approve another account in the browser by mistake, the saved `<name>.json` stays unchanged.
+
+- The fields compared are the email (`claude_oauth` / `codex_oauth`) and, for `codex_oauth`, the `account_id`. Emails are compared case-insensitively. A field with no value on either the saved side or the new side is not compared
+- When the login is refused, the error shows both the saved account and the account you just approved (on the web, on the failure page). Approving again with the saved account goes through
+- To switch a credential to another account, delete that credential's file (`<store>/<name>.json`) and log in again. There is no option to force an overwrite
+- A first login to a name that has no file yet is not checked
+
 ## Making changes take effect
 
 A running unit rereads each input on a different trigger. What to do after changing one:

@@ -4461,6 +4461,115 @@ type = "claude_oauth"
         );
     }
 
+    /// 置き場のファイルに claude_oauth を 1 つ置き、交換で `approved` を名乗る
+    /// token が返る Web login を最後まで通す。戻り値は応答と、置き場のファイルの
+    /// 前後の中身。
+    async fn web_relogin(saved: &str, approved: &str) -> (Response, Vec<u8>, Vec<u8>) {
+        let exchange_body = format!(
+            r#"{{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800,
+                "account":{{"email_address":"{approved}"}}}}"#
+        );
+        let exchange = fake_upstream(move || {
+            (
+                200,
+                exchange_body.clone(),
+                vec![("content-type".into(), "application/json".into())],
+            )
+        })
+        .await;
+        let verify = fake_upstream(|| {
+            (
+                200,
+                r#"{"data":[{"id":"m","created_at":"2026-07-24T00:00:00Z"}]}"#.into(),
+                vec![("content-type".into(), "application/json".into())],
+            )
+        })
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"claude_oauth","priority":10,
+                    "payload":{{"access_token":"at-old","refresh_token":"rt-old",
+                    "expired":"2099-01-01T00:00:00Z","email":"{saved}"}}}}"#
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let config: llm_gateway::Config = toml::from_str(
+            r#"
+[credentials.web]
+type = "claude_oauth"
+"#,
+        )
+        .unwrap();
+        let store = llm_gateway::credential::file::FileStore::open(dir.path()).unwrap();
+        let gateway = Gateway::new(&config, store).unwrap();
+
+        let authorization = llm_gateway::credential::oauth::begin_web();
+        let state = authorization.state().to_owned();
+        gateway
+            .begin_web_login("web", "claude_oauth", authorization, now_unix())
+            .unwrap();
+        let auth = gateway
+            .take_web_login("web", Some(&state), now_unix())
+            .unwrap();
+        let response = finish_web_login(
+            &gateway,
+            "web",
+            auth,
+            "the-code",
+            Some(&exchange),
+            Some(&verify),
+        )
+        .await;
+        let after = std::fs::read(&path).unwrap();
+        (response, before, after)
+    }
+
+    /// Web login で別のアカウントを承認したら、保存せずに失敗のページを返す。
+    ///
+    /// ブラウザで別アカウントを承認したまま上書きすると、2 つの認証情報が同じ
+    /// アカウントを指す状態に黙って落ちる。ページには両方のアカウント (email) と
+    /// 直し方を出し、置き場のファイルは 1 バイトも変えない。email は利用者が
+    /// 入れた値ではないが、画面に差し込む値は全てエスケープする。
+    #[tokio::test]
+    async fn web_login_as_another_account_is_refused_without_saving() {
+        let (response, before, after) =
+            web_relogin("saved@example.com", "other+<b>@example.com").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_body(response).await;
+        assert!(body.contains("Authorization failed"), "{body}");
+        assert!(body.contains("saved@example.com"), "{body}");
+        assert!(
+            body.contains("other+&lt;b&gt;@example.com"),
+            "escaped: {body}"
+        );
+        assert!(
+            body.contains("&lt;name&gt;.json"),
+            "says what to delete: {body}"
+        );
+        assert!(
+            !body.contains("at-new") && !body.contains("rt-new"),
+            "{body}"
+        );
+        assert_eq!(after, before, "nothing was written");
+    }
+
+    /// 同じアカウントの再ログインは今までどおり保存される。
+    #[tokio::test]
+    async fn web_login_as_the_same_account_is_saved() {
+        let (response, before, after) =
+            web_relogin("someone@example.com", "Someone@example.com").await;
+
+        assert_eq!(response.status(), 200);
+        assert_ne!(after, before);
+        assert!(String::from_utf8(after).unwrap().contains("at-new"));
+    }
+
     /// callback は公開 endpoint ではないため、同じ形のパスは 404 になる。
     #[tokio::test]
     async fn callback_route_is_not_found() {
